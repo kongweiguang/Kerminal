@@ -163,11 +163,15 @@ jobs:
       - name: Setup Rust
         if: matrix.target == ''
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # 打包与质量门禁使用同一已验证工具链，保证各平台发布环境一致。
+          toolchain: 1.98.1
 
       - name: Setup Rust target
         if: matrix.target != ''
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
 
       - name: Cache Rust

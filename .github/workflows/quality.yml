@@ -49,6 +49,8 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          # 固定到上一版通过完整发布验证的工具链，避免 stable 更新改变门禁行为。
+          toolchain: 1.98.1
           components: clippy,rustfmt
 
       - name: Cache Rust
@@ -251,6 +253,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
 
       - name: Install Windows native build dependencies
         if: runner.os == 'Windows'
