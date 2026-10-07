@@ -13,7 +13,7 @@
     ·
     <a href="#源码开发">源码开发</a>
   </p>
-  <p><sub>当前稳定版 v0.3.42 · Tauri 2 · Windows / Linux / macOS</sub></p>
+  <p><sub>当前稳定版 v0.3.43 · Tauri 2 · Windows / Linux / macOS</sub></p>
 </div>
 
 ![Kerminal 中的 SSH 终端与 Codex Agent 并行工作](docs/assets/kerminal-hero.png)
@@ -39,7 +39,7 @@ Kerminal 是一个本地优先的桌面终端和远程运维工作台。它围�
 
 ## 下载与安装
 
-前往 [GitHub Releases](https://github.com/kongweiguang/Kerminal/releases/latest) 获取当前稳定版。v0.3.42 提供以下产物：
+前往 [GitHub Releases](https://github.com/kongweiguang/Kerminal/releases/latest) 获取当前稳定版。v0.3.43 提供以下产物：
 
 | 平台 | 发布产物 |
 | --- | --- |

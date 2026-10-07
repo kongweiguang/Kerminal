@@ -252,9 +252,10 @@ jobs:
           releaseBody: |
             **Kerminal ${{ env.RELEASE_TAG }}**
 
-            - SFTP 后台传输不再受固定总时长限制；连接阶段继续使用主机 SSH 连接超时，连续无进度默认 3 分钟才会失败。
-            - 无进度失败会保留 `.kerminal-part`，队列直接说明网络无响应并提供唯一“继续传输”动作，按已确认偏移恢复且仅在最终大小一致后提交。
-            - MCP 的 `sftp.transfer.enqueue` 只快速返回任务 id；使用 `list`、`cancel` 和重试形成闭环。旧同步传输工具已下线并返回迁移提示。
+            - 应用、安装器和桌面展示名称统一为 Kerminal，项目描述与 GitHub 仓库名称保持一致。
+            - 同步关于页、下载和自动更新链接，统一使用规范的 Kerminal 仓库地址。
+            - Windows MSI 保留既有升级标识；配置目录、协议和 MCP 工具标识保持兼容。
+            - 修复 source-map-js 间接依赖的高危漏洞。
           releaseDraft: true
           releaseName: "Kerminal ${{ env.RELEASE_TAG }}"
           tagName: ${{ env.RELEASE_TAG }}

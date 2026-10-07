@@ -2,7 +2,7 @@
   "name": "kerminal",
   "description": "Kerminal：AI 原生的本地与远程终端工作台",
   "private": true,
-  "version": "0.3.42",
+  "version": "0.3.43",
   "type": "module",
   "license": "GPL-3.0-or-later",
   "packageManager": "pnpm@10.33.0",
@@ -127,7 +127,8 @@
     "overrides": {
       "dompurify": "3.4.13",
       "nanoid": "3.3.18",
-      "postcss": "8.5.23"
+      "postcss": "8.5.23",
+      "source-map-js": "1.2.2"
     }
   }
 }

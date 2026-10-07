@@ -2,7 +2,7 @@
 
 [package]
 name = "kerminal"
-version = "0.3.42"
+version = "0.3.43"
 description = "Kerminal：AI 原生的本地与远程终端工作台"
 authors = ["you"]
 edition = "2021"
