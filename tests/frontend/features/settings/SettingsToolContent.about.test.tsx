@@ -13,6 +13,7 @@ import {
 import { normalizeAppSettings } from "../../../../src/features/settings/settingsModel";
 
 describe("SettingsToolContent about section", () => {
+  // 仓库仅调整名称大小写，关于页仍通过既有 opener 打开规范地址。
   it("shows only essential about information and opens GitHub", async () => {
     const user = userEvent.setup();
 
@@ -34,7 +35,7 @@ describe("SettingsToolContent about section", () => {
     await user.click(screen.getByRole("button", { name: "打开 GitHub" }));
     await waitFor(() => {
       expect(openerApiMock.openUrl).toHaveBeenCalledWith(
-        "https://github.com/kongweiguang/kerminal",
+        "https://github.com/kongweiguang/Kerminal",
       );
     });
 

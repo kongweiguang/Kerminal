@@ -33,11 +33,9 @@ dist-ssr
 # BEGIN UPDENG
 # @author kongweiguang
 /.agents/
-/.claude/
 /.codex/
 /.updeng/
 /AGENTS.md
-/CLAUDE.md
 .env
 .env.*
 !.env.example

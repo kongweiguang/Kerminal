@@ -1,5 +1,6 @@
 {
   "name": "kerminal",
+  "description": "Kerminal：AI 原生的本地与远程终端工作台",
   "private": true,
   "version": "0.3.42",
   "type": "module",

@@ -5,7 +5,7 @@
   <h1>Kerminal</h1>
   <p><strong>把终端、远程服务器、文件传输、容器运维与 AI Agent 放进同一个桌面工作台。</strong></p>
   <p>
-    <a href="https://github.com/kongweiguang/kerminal/releases/latest">下载最新版</a>
+    <a href="https://github.com/kongweiguang/Kerminal/releases/latest">下载最新版</a>
     ·
     <a href="#快速开始">快速开始</a>
     ·
@@ -39,7 +39,7 @@ Kerminal 是一个本地优先的桌面终端和远程运维工作台。它围�
 
 ## 下载与安装
 
-前往 [GitHub Releases](https://github.com/kongweiguang/kerminal/releases/latest) 获取当前稳定版。v0.3.42 将提供以下产物：
+前往 [GitHub Releases](https://github.com/kongweiguang/Kerminal/releases/latest) 获取当前稳定版。v0.3.42 提供以下产物：
 
 | 平台 | 发布产物 |
 | --- | --- |
@@ -47,6 +47,8 @@ Kerminal 是一个本地优先的桌面终端和远程运维工作台。它围�
 | Linux x64 | AppImage、Deb |
 | macOS Apple Silicon | App、DMG |
 | macOS Intel | App、DMG |
+
+应用显示名和后续安装包使用 `Kerminal`。已发布的历史安装包保留原文件名；`~/.kerminal` 配置目录、`kerminal://` 协议、MCP 工具标识及命令行可执行文件名继续使用小写，兼容已有配置与外部接入。Windows MSI 固定沿用改名前的 Upgrade Code，避免仅因显示名大小写变化而被识别为另一款应用。
 
 macOS 产物目前没有 Apple Developer ID 签名和公证。如果确认应用来自本仓库 Releases，但仍被 Gatekeeper 阻止，可在将应用拖入“应用程序”后运行：
 

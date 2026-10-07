@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "kerminal",
+  "productName": "Kerminal",
   "version": "0.3.42",
   "identifier": "io.github.kongweiguang.kerminal",
   "build": {
@@ -52,6 +52,9 @@
       "icons/icon.ico"
     ],
     "windows": {
+      "wix": {
+        "upgradeCode": "514264c0-15e7-573c-a9fa-685a1ae008cd"
+      },
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico"
@@ -64,7 +67,7 @@
     },
     "updater": {
       "endpoints": [
-        "https://github.com/kongweiguang/kerminal/releases/latest/download/latest.json"
+        "https://github.com/kongweiguang/Kerminal/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc5QjdDMkI5MTlDRDBBOUEKUldTYUNzMFp1Y0szZWJYTEN0Q0hyREpHMlc5T3FuVkJyUElrb3NrRVFvYThEMUI0QldMZ0E0Vm8K",
       "windows": {

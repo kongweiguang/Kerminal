@@ -35,7 +35,7 @@ import {
 import type { DesktopNotificationSettings } from "../settingsModel";
 import { desktopRuntime } from "../../../lib/desktopRuntimeApi";
 
-const githubRepositoryUrl = "https://github.com/kongweiguang/kerminal";
+const githubRepositoryUrl = "https://github.com/kongweiguang/Kerminal";
 const appVersion = `v${packageJson.version}`;
 const licenseName = packageJson.license ?? "GPL-3.0-or-later";
 const aboutPanelClassName =
@@ -64,6 +64,7 @@ interface AboutSettingsSectionProps {
   desktopNotifications: DesktopNotificationSettings;
 }
 
+/** 关于页沿用 GitHub 仓库的规范名称，让展示地址与实际打开地址保持一致。 */
 export function AboutSettingsSection({
   desktopNotifications,
 }: AboutSettingsSectionProps) {
@@ -185,7 +186,7 @@ export function AboutSettingsSection({
             error={linkError}
             icon={GitBranch}
             label="GitHub"
-            value="github.com/kongweiguang/kerminal"
+            value="github.com/kongweiguang/Kerminal"
           />
           <button
             aria-label="打开 GitHub"
