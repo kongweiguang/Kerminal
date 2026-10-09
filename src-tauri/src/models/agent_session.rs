@@ -368,8 +368,8 @@ impl AgentProviderSession {
             // latest conversation created in this Kerminal session instead of opening
             // a new transcript after an app restart or an explicit "继续上次" action.
             AgentProvider::Claude => (true, Some("claude --continue".to_owned())),
-            // PI discovers the session-scoped MCP adapter from the generated config and
-            // scopes `--continue` by the stable session cwd, matching its native CLI model.
+            // Pi discovers native MCP config from the stable session cwd; keeping the
+            // default command free of legacy adapter flags lets that project config load.
             AgentProvider::Pi => (true, Some(PI_AGENT_RESUME_COMMAND.to_owned())),
             AgentProvider::Custom => (false, None),
         };

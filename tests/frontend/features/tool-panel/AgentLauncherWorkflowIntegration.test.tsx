@@ -1,6 +1,6 @@
 // @author kongweiguang
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { AgentLauncherView } from "../../../../src/features/tool-panel/agent-launcher/AgentLauncherView";
 
@@ -243,6 +243,39 @@ describe("AgentLauncher workflow integration", () => {
     fireEvent.click(screen.getByRole("button", { name: "同 Agent 新会话" }));
     expect(onWorkflowContinue).toHaveBeenCalledWith("ags-1");
     expect(onWorkflowNewSession).toHaveBeenCalledWith("ags-1");
+  });
+
+  it("Pi 历史会话的身份标签与自定义标题独立显示", () => {
+    render(
+      <AgentLauncherView
+        {...baseProps}
+        onWorkflowContinue={vi.fn()}
+        onWorkflowNewSession={vi.fn()}
+        workflowSnapshot={{
+          disposed: false,
+          historyMetadata: [],
+          loading: false,
+          queueMetadata: [],
+          revision: 1,
+          sessions: [
+            {
+              agentId: "pi",
+              agentSessionId: "ags-pi",
+              repositoryStatus: "active",
+              runtimeStatus: "waitingForUser",
+              statusSource: "terminalSignal",
+              title: "服务器排查",
+            },
+          ],
+          stale: false,
+        }}
+      />,
+    );
+
+    const card = screen.getByRole("heading", { name: "服务器排查" }).closest("article");
+    expect(card).not.toBeNull();
+    expect(within(card!).getByText("PI Agent")).toBeInTheDocument();
+    expect(within(card!).queryByText("Codex")).not.toBeInTheDocument();
   });
 
   it("历史仅展示 metadata，不渲染 prompt 正文", () => {

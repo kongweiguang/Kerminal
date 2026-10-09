@@ -594,6 +594,7 @@ function terminalTab(id: string) {
   } as never;
 }
 
+/** 生命周期测试沿用原生 Pi 状态，不要求已经移除的 MCP adapter。 */
 function workspaceStatus(): ExternalAgentWorkspaceStatus {
   return {
     agents: {
@@ -629,12 +630,12 @@ function workspaceStatus(): ExternalAgentWorkspaceStatus {
       },
       pi: {
         adapterAvailable: true,
-        cliCommand: "pi --approve --mcp-config .mcp.json",
-        configPath: "C:/Users/me/.kerminal/.mcp.json",
+        cliCommand: "pi --approve",
+        configPath: "C:/Users/me/.kerminal/.pi/mcp.json",
         configReady: true,
         id: "pi",
         installed: true,
-        statusDetail: "PI Agent and MCP Adapter detected.",
+        statusDetail: "PI Agent CLI detected. Native MCP config ready.",
         title: "PI Agent",
       },
     },

@@ -8,6 +8,7 @@ use crate::{
     error::{AppError, AppResult},
     models::agent_session::{
         AgentId, AgentProvider, AgentProviderSession, AgentSessionId, PI_AGENT_LAUNCH_COMMAND,
+        PI_AGENT_RESUME_COMMAND,
     },
     services::agent_session_file_store::AgentSessionFileStore,
 };
@@ -48,7 +49,7 @@ pub struct ExternalAgentWorkspaceService {
 }
 
 impl ExternalAgentWorkspaceService {
-    /// 创建 workspace adapter；CLI/adapter 状态保持惰性读取，避免初始化产生子进程副作用。
+    /// 创建 workspace service；CLI 状态延迟到 status() 探测，避免初始化产生子进程副作用。
     pub fn new(
         workspace_dir: impl Into<PathBuf>,
         mcp_endpoint: Option<String>,
@@ -61,7 +62,7 @@ impl ExternalAgentWorkspaceService {
         }
     }
 
-    /// 返回四类 provider 的可用性快照，PI 的 CLI 与 MCP adapter 分别报告。
+    /// 返回四类 provider 的可用性快照；Pi 保留兼容 adapter 字段但不探测旧 adapter。
     pub fn status(&self) -> ExternalAgentWorkspaceStatus {
         ExternalAgentWorkspaceStatus {
             workspace_dir: path_to_string(&self.workspace_dir),
@@ -205,7 +206,7 @@ impl ExternalAgentWorkspaceService {
         }
     }
 
-    /// 为右栏 Agent session 准备隔离 cwd、通用上下文与 provider 专属启动配置。
+    /// 为右栏 Agent session 准备隔离 cwd 和上下文；Pi 的原生配置必须与启动 cwd 同目录。
     pub fn prepare_agent_session_workspace(
         &self,
         request: &PrepareExternalAgentWorkspaceRequest,
@@ -285,6 +286,7 @@ impl ExternalAgentWorkspaceService {
                 let mut operations = self.prepare_pi_files(&options)?;
                 operations
                     .extend(self.prepare_agent_session_common_files(&context, false, &options)?);
+                operations.push(self.ensure_agent_session_pi_mcp_json(&context, &options)?);
                 let (_command_label, shell, args) = self.agent_session_launch_command(
                     AgentId::Pi,
                     PI_AGENT_LAUNCH_COMMAND,
@@ -372,7 +374,7 @@ impl ExternalAgentWorkspaceService {
         Ok((command, shell, args))
     }
 
-    /// 优先采用 session provider 快照，旧文件缺少命令时回退当前 provider 原生默认值。
+    /// 优先采用 provider 恢复能力；Pi 强制归一到原生命令，避免旧快照重启 adapter 参数。
     fn provider_resume_command(
         &self,
         agent_id: AgentId,
@@ -389,6 +391,9 @@ impl ExternalAgentWorkspaceService {
             .unwrap_or_else(|| defaults.clone());
         if !provider.resume_supported {
             return None;
+        }
+        if agent_id == AgentId::Pi {
+            return Some(PI_AGENT_RESUME_COMMAND.to_owned());
         }
         provider
             .resume_command

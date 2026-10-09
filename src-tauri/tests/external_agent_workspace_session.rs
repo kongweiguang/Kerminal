@@ -2,6 +2,8 @@
 //!
 //! @author kongweiguang
 
+#[path = "external_agent_workspace_session/pi_native_mcp.rs"]
+mod pi_native_mcp;
 mod support;
 
 use std::fs;
@@ -10,7 +12,7 @@ use kerminal_lib::{
     models::agent_session::{
         AgentId, AgentProviderSession, AgentSession, AgentSessionId, AgentSessionLaunch,
         AgentSessionScope, AgentSessionStatus, AgentSessionTarget, AgentTargetLiveStatus,
-        AGENT_SESSION_SCHEMA_VERSION, PI_AGENT_LAUNCH_COMMAND, PI_AGENT_RESUME_COMMAND,
+        AGENT_SESSION_SCHEMA_VERSION,
     },
     services::{
         agent_session_file_store::AgentSessionFileStore,
@@ -351,71 +353,6 @@ fn prepare_claude_agent_session_resume_uses_directory_scoped_continue_command() 
 
     assert_agent_launch_command(&spec, "claude --continue");
     assert_eq!(spec.cwd, path_to_string(&session_root));
-}
-
-#[test]
-/// 验证 PI 新建与恢复均使用 session cwd、标准 MCP 文件和同一组 Kerminal 环境变量。
-fn prepare_pi_agent_session_uses_native_mcp_adapter_commands() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let service = ExternalAgentWorkspaceService::new(
-        temp.path(),
-        Some("http://127.0.0.1:3031/mcp".to_owned()),
-        true,
-    );
-    let agent_session_id = "ags_pi_20260824";
-    let scoped_endpoint = format!("http://127.0.0.1:3031/mcp/agents/{agent_session_id}");
-    let session_root = temp
-        .path()
-        .join("agents")
-        .join("sessions")
-        .join(agent_session_id);
-
-    let start = service
-        .prepare(&PrepareExternalAgentWorkspaceRequest {
-            agent_id: "pi".to_owned(),
-            agent_session_id: Some(agent_session_id.to_owned()),
-            custom_command: None,
-            resume_provider_session: false,
-            dry_run: false,
-            overwrite_policy: ExternalAgentOverwritePolicy::BackupAndReplaceInvalid,
-        })
-        .expect("prepare PI session");
-    assert_agent_launch_command(&start, PI_AGENT_LAUNCH_COMMAND);
-    assert_eq!(start.title, "PI Agent");
-    assert_eq!(start.cwd, path_to_string(&session_root));
-    assert_session_env(
-        &start,
-        agent_session_id,
-        temp.path(),
-        &session_root,
-        &scoped_endpoint,
-    );
-    assert!(session_root.join("AGENTS.md").is_file());
-    assert!(session_root.join(".mcp.json").is_file());
-    assert!(!session_root.join("CLAUDE.md").exists());
-    assert!(!session_root.join(".codex").exists());
-    let mcp: Value = serde_json::from_str(
-        &fs::read_to_string(session_root.join(".mcp.json")).expect("PI MCP config"),
-    )
-    .expect("PI MCP JSON");
-    assert_eq!(
-        mcp.pointer("/mcpServers/kerminal/url")
-            .and_then(Value::as_str),
-        Some(scoped_endpoint.as_str())
-    );
-
-    let resumed = service
-        .prepare(&PrepareExternalAgentWorkspaceRequest {
-            agent_id: "pi".to_owned(),
-            agent_session_id: Some(agent_session_id.to_owned()),
-            custom_command: None,
-            resume_provider_session: true,
-            dry_run: false,
-            overwrite_policy: ExternalAgentOverwritePolicy::BackupAndReplaceInvalid,
-        })
-        .expect("resume PI session");
-    assert_agent_launch_command(&resumed, PI_AGENT_RESUME_COMMAND);
-    assert_eq!(resumed.cwd, path_to_string(&session_root));
 }
 
 #[test]

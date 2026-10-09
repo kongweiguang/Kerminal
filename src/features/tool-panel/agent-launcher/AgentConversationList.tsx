@@ -460,9 +460,13 @@ function formatSessionTime(session: AgentWorkflowSessionSnapshot) {
   }).format(date);
 }
 
+/** 标签按保存的 Agent 身份派生，让旧 Pi 历史也能与 Codex 记录明确区分。 */
 function agentLabel(agentId?: AgentWorkflowSessionSnapshot["agentId"]) {
   if (agentId === "claude") {
     return "Claude";
+  }
+  if (agentId === "pi") {
+    return "PI Agent";
   }
   if (agentId === "custom") {
     return "Custom";

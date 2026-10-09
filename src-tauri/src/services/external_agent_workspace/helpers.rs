@@ -211,7 +211,8 @@ pub(super) fn replace_toml_table(content: &str, table_header: &str, replacement:
     format!("{}\n", next_lines.join("\n").trim_end())
 }
 
-pub(super) fn parse_claude_mcp_json(
+/// 复用 MCP JSON 结构解析，但让错误定位落在各客户端真实使用的配置路径上。
+pub(super) fn parse_mcp_json(
     path: &Path,
     current: Option<&str>,
     options: &WorkspaceWriteOptions,
@@ -228,7 +229,7 @@ pub(super) fn parse_claude_mcp_json(
             ExternalAgentOverwritePolicy::BackupAndReplaceInvalid => Ok(None),
             ExternalAgentOverwritePolicy::PreserveUserContent => Err(AppError::InvalidInput(
                 format!(
-                    "{} is not a valid Claude MCP JSON object. Use overwritePolicy=backupAndReplaceInvalid to back it up and repair it.",
+                    "{} is not a valid MCP JSON object. Use overwritePolicy=backupAndReplaceInvalid to back it up and repair it.",
                     path_to_string(path)
                 ),
             )),
@@ -287,7 +288,8 @@ pub(super) fn codex_config_ready(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) fn claude_config_ready(path: &Path) -> bool {
+/// readiness 只检查配置中是否存在 Kerminal endpoint，不依赖特定客户端 adapter。
+pub(super) fn mcp_json_config_ready(path: &Path) -> bool {
     let Ok(content) = fs::read_to_string(path) else {
         return false;
     };
@@ -479,39 +481,6 @@ pub(super) fn executable_on_path(command: &str) -> bool {
     })
 }
 
-/// 轻量探测 PI MCP adapter，避免每次状态刷新都启动 `pi --help` 子进程。
-///
-/// PI 的扩展目录允许通过 `PI_CODING_AGENT_DIR` 重定向；未设置时沿用 PI 原生的
-/// `~/.pi/agent` 默认目录。这里只检查 adapter 包目录，CLI 本身由 PATH 独立探测。
-pub(super) fn pi_mcp_adapter_available() -> bool {
-    let Some(agent_dir) =
-        resolve_pi_coding_agent_dir(env::var_os("PI_CODING_AGENT_DIR"), dirs::home_dir())
-    else {
-        return false;
-    };
-    pi_mcp_adapter_available_in(&agent_dir)
-}
-
-/// 把可选环境覆盖与 home fallback 收敛为可测试的 PI 配置根目录解析。
-fn resolve_pi_coding_agent_dir(
-    configured: Option<OsString>,
-    home_dir: Option<PathBuf>,
-) -> Option<PathBuf> {
-    configured
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home_dir.map(|home| home.join(".pi").join("agent")))
-}
-
-/// 在已解析的 PI 配置根目录下检查官方 adapter 包目录。
-fn pi_mcp_adapter_available_in(agent_dir: &Path) -> bool {
-    agent_dir
-        .join("npm")
-        .join("node_modules")
-        .join("pi-mcp-adapter")
-        .is_dir()
-}
-
 fn executable_names(command: &str) -> Vec<OsString> {
     #[cfg(windows)]
     {
@@ -560,48 +529,5 @@ pub(super) fn workspace_display_path(workspace_dir: &Path, path: &Path) -> Strin
         "~/.kerminal".to_owned()
     } else {
         format!("~/.kerminal/{suffix}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{pi_mcp_adapter_available_in, resolve_pi_coding_agent_dir};
-    use std::{ffi::OsString, fs, path::PathBuf};
-
-    #[test]
-    /// 环境覆盖优先于 home fallback，空覆盖则保持 PI 原生默认目录。
-    fn pi_agent_dir_resolution_prefers_non_empty_override() {
-        assert_eq!(
-            resolve_pi_coding_agent_dir(
-                Some(OsString::from("D:/portable/pi-agent")),
-                Some(PathBuf::from("C:/Users/test")),
-            ),
-            Some(PathBuf::from("D:/portable/pi-agent"))
-        );
-        assert_eq!(
-            resolve_pi_coding_agent_dir(
-                Some(OsString::new()),
-                Some(PathBuf::from("C:/Users/test")),
-            ),
-            Some(PathBuf::from("C:/Users/test/.pi/agent"))
-        );
-    }
-
-    #[test]
-    /// adapter 探测只认约定包目录，不把仅存在 npm 根目录的半安装状态误报为可用。
-    fn pi_mcp_adapter_probe_requires_package_directory() {
-        let temp = tempfile::tempdir().expect("temp PI root");
-        fs::create_dir_all(temp.path().join("npm").join("node_modules"))
-            .expect("create node_modules");
-        assert!(!pi_mcp_adapter_available_in(temp.path()));
-
-        fs::create_dir_all(
-            temp.path()
-                .join("npm")
-                .join("node_modules")
-                .join("pi-mcp-adapter"),
-        )
-        .expect("create adapter package");
-        assert!(pi_mcp_adapter_available_in(temp.path()));
     }
 }

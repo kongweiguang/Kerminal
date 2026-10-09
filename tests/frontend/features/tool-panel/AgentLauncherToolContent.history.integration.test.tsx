@@ -316,7 +316,7 @@ function terminalTab(id: string) {
   } as never;
 }
 
-/** 返回内置 Agent 可用且 MCP 已启动的最小 workspace 状态。 */
+/** 历史恢复复用原生 Pi 状态，防止旧 adapter fixture 掩盖启动配置回归。 */
 function workspaceStatus(): ExternalAgentWorkspaceStatus {
   return {
     agents: {
@@ -352,12 +352,12 @@ function workspaceStatus(): ExternalAgentWorkspaceStatus {
       },
       pi: {
         adapterAvailable: true,
-        cliCommand: "pi --approve --mcp-config .mcp.json",
-        configPath: "C:/Users/me/.kerminal/.mcp.json",
+        cliCommand: "pi --approve",
+        configPath: "C:/Users/me/.kerminal/.pi/mcp.json",
         configReady: true,
         id: "pi",
         installed: true,
-        statusDetail: "PI Agent and MCP Adapter detected.",
+        statusDetail: "PI Agent CLI detected. Native MCP config ready.",
         title: "PI Agent",
       },
     },

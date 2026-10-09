@@ -17,6 +17,7 @@ Read this file before editing Kerminal configuration. Do not guess field names o
   kerminal-config.md
   .codex/config.toml
   .mcp.json
+  .pi/mcp.json
   settings.toml
   profiles/*.toml
   hosts/groups.toml
@@ -32,6 +33,13 @@ Read this file before editing Kerminal configuration. Do not guess field names o
   secrets/vault.toml
   secrets/vault-key.toml
 ```
+
+## Agent MCP Discovery
+
+- `.mcp.json` remains the project config used by Claude and compatible custom clients.
+- Pi uses its native project config at `.pi/mcp.json`. Pi loads it for a trusted working directory; the file in `~/.kerminal` applies to the global Kerminal workspace, while each isolated session has its own `<session-root>/.pi/mcp.json`.
+- Pi's project server name overrides a same-named user-level server. Kerminal updates only `mcpServers.kerminal`, preserves other servers and top-level settings, and writes its session endpoint to the same value recorded in `context/mcp-endpoint.json`.
+- Pi's `timeout` is measured in seconds and Kerminal sets it to `60`.
 
 ## Cross-platform Paths
 

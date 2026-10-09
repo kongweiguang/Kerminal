@@ -24,7 +24,7 @@ export async function launchAgent(
   await user.click(screen.getByRole("button", { name: `使用 ${name} 进入` }));
 }
 
-/** 统一四类 provider 的 ready fixture，使状态契约升级只需维护一份测试数据。 */
+/** 共用状态契约，Pi 使用原生配置而非 adapter，避免测试继续认可旧启动路径。 */
 export function workspaceStatus(): ExternalAgentWorkspaceStatus {
   return {
     agents: {
@@ -60,12 +60,12 @@ export function workspaceStatus(): ExternalAgentWorkspaceStatus {
       },
       pi: {
         adapterAvailable: true,
-        cliCommand: "pi --approve --mcp-config .mcp.json",
-        configPath: "C:/Users/me/.kerminal/.mcp.json",
+        cliCommand: "pi --approve",
+        configPath: "C:/Users/me/.kerminal/.pi/mcp.json",
         configReady: true,
         id: "pi",
         installed: true,
-        statusDetail: "PI Agent and MCP Adapter detected.",
+        statusDetail: "PI Agent CLI detected. Native MCP config ready.",
         title: "PI Agent",
       },
     },

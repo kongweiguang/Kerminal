@@ -82,7 +82,7 @@ export function buildAgentLauncherViewModel(
   );
 }
 
-/** PI 的 CLI、MCP adapter 与配置是三个独立探测项，必须分别映射可用性。 */
+/** 原生 MCP 不需要额外 adapter，可用性只由 CLI 和受管配置决定。 */
 export function buildAgentActionViewModel(
   agent: ExternalAgentStatus,
   options: AgentActionOptions,
@@ -127,11 +127,7 @@ export function buildAgentActionViewModel(
       : agent.configPath.trim() || "Config path not generated",
     disabled: Boolean(disabledReason),
     disabledReason,
-    installLabel: !installed
-      ? "Missing CLI"
-      : agent.id === "pi" && !agent.adapterAvailable
-        ? "Missing MCP adapter"
-        : "Installed",
+    installLabel: installed ? "Installed" : "Missing CLI",
     statusDetail,
     title: agent.title,
     tone: resolveAgentTone(agent, disabledReason),
@@ -310,7 +306,7 @@ function resolveAgentDisabledReason(
   return undefined;
 }
 
-/** PI adapter 缺失与 CLI 缺失分开反馈，便于用户安装正确的运行时组件。 */
+/** 配置可在进入时生成，因此只把缺失 CLI 映射为安装提示。 */
 function resolveAgentAvailability(
   agent: ExternalAgentStatus,
   disabledReason: string | undefined,
@@ -335,12 +331,6 @@ function resolveAgentAvailability(
       label: "需安装",
     };
   }
-  if (agent.id === "pi" && !agent.adapterAvailable) {
-    return {
-      detail: "PI MCP Adapter 尚未安装。",
-      label: "需安装",
-    };
-  }
   if (!agent.configReady) {
     return {
       detail: "需要先完成必要设置，打开时会自动准备。",
@@ -353,7 +343,7 @@ function resolveAgentAvailability(
   };
 }
 
-/** PI 三项探测任一未就绪都使用警告色，不把部分可用误报为 ready。 */
+/** CLI 或受管配置未就绪时保持警告色，不使用旧 adapter 字段阻断原生 MCP。 */
 function resolveAgentTone(
   agent: ExternalAgentStatus,
   disabledReason: string | undefined,
@@ -365,9 +355,6 @@ function resolveAgentTone(
     return "ready";
   }
   if (!agent.installed) {
-    return "warning";
-  }
-  if (agent.id === "pi" && !agent.adapterAvailable) {
     return "warning";
   }
   if (!agent.configReady) {

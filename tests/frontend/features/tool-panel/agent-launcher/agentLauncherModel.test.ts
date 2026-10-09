@@ -179,8 +179,8 @@ describe("agentLauncherModel", () => {
         },
         pi: {
           ...readyCodex,
-          cliCommand: "pi --approve --mcp-config .mcp.json",
-          configPath: "C:/Users/me/.kerminal/.mcp.json",
+          cliCommand: "pi --approve",
+          configPath: "C:/Users/me/.kerminal/.pi/mcp.json",
           id: "pi",
           title: "PI Agent",
         },
@@ -195,12 +195,14 @@ describe("agentLauncherModel", () => {
     ).toEqual(["codex", "claude", "pi", "custom"]);
   });
 
-  it("keeps PI adapter availability separate from CLI and config readiness", () => {
+  // 旧后端的 adapter 字段为 false 时也不能误导原生 MCP 用户安装插件。
+  it("uses native PI MCP without requiring the legacy adapter", () => {
     const view = buildAgentActionViewModel(
       {
         ...readyCodex,
         adapterAvailable: false,
-        cliCommand: "pi --approve --mcp-config .mcp.json",
+        cliCommand: "pi --approve",
+        configPath: "C:/Users/me/.kerminal/.pi/mcp.json",
         id: "pi",
         title: "PI Agent",
       },
@@ -210,10 +212,11 @@ describe("agentLauncherModel", () => {
       },
     );
 
-    expect(view.availabilityLabel).toBe("需安装");
-    expect(view.availabilityDetail).toBe("PI MCP Adapter 尚未安装。");
-    expect(view.installLabel).toBe("Missing MCP adapter");
-    expect(view.tone).toBe("warning");
+    expect(view.availabilityLabel).toBe("可用");
+    expect(view.availabilityDetail).toBe("可直接打开。");
+    expect(view.installLabel).toBe("Installed");
+    expect(view.configPath).toBe("C:/Users/me/.kerminal/.pi/mcp.json");
+    expect(view.tone).toBe("ready");
   });
 
   it("builds MCP status and copyable config snippets from endpoint", () => {

@@ -212,7 +212,7 @@ describe("AgentLauncherToolContent", () => {
         const command =
           request.customCommand ??
           (request.agentId === "pi"
-            ? "pi --approve --mcp-config .mcp.json"
+            ? "pi --approve"
             : request.agentId);
         const title =
           request.agentId === "claude"
@@ -472,6 +472,7 @@ describe("AgentLauncherToolContent", () => {
     );
   });
 
+  // 用户入口应显示原生 CLI 命令，旧 adapter 参数不再进入终端启动。
   it("launches PI as a native built-in Agent", async () => {
     const user = userEvent.setup();
     renderAgentLauncher();
@@ -495,7 +496,11 @@ describe("AgentLauncherToolContent", () => {
       "PI Agent",
     );
     expect(screen.getByTestId("agent-terminal-command")).toHaveTextContent(
-      "pi --approve --mcp-config .mcp.json",
+      "pi --approve",
+    );
+    expect(screen.getByTestId("agent-xterm")).toHaveAttribute(
+      "data-args",
+      "-NoLogo -NoProfile -NoExit -Command pi --approve",
     );
   });
 

@@ -197,67 +197,32 @@ enabled = true
         )
     }
 
-    /// 为所有外部 Agent 写入通用 `.mcp.json`，使支持该标准的自定义 CLI（如 PI）
-    /// 与 Claude 一样自动发现当前 session-scoped Kerminal MCP endpoint。
+    /// 为共用标准 `.mcp.json` 的 Agent 写入 session endpoint；Pi 另写原生项目配置。
     pub(super) fn ensure_agent_session_mcp_json(
         &self,
         context: &AgentSessionWorkspaceContext,
         options: &WorkspaceWriteOptions,
     ) -> AppResult<ExternalAgentFileOperation> {
-        let path = context.session_root.join(".mcp.json");
-        let current = read_optional_string(&path)?;
-        let mut root = match parse_claude_mcp_json(&path, current.as_deref(), options)? {
-            Some(root) => root,
-            None => json!({}),
-        };
-        let previous_server = root
-            .pointer("/mcpServers/kerminal")
-            .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
-        let object = root.as_object_mut().ok_or_else(|| {
-            AppError::InvalidInput(
-                ".mcp.json must be a JSON object. Use overwritePolicy=backupAndReplaceInvalid to repair it."
-                    .to_owned(),
-            )
-        })?;
-        let servers = object
-            .entry("mcpServers")
-            .or_insert_with(|| Value::Object(Map::new()));
-        if !servers.is_object() {
-            match options.overwrite_policy {
-                ExternalAgentOverwritePolicy::BackupAndReplaceInvalid => {
-                    *servers = Value::Object(Map::new());
-                }
-                ExternalAgentOverwritePolicy::PreserveUserContent => {
-                    return Err(AppError::InvalidInput(
-                        ".mcp.json mcpServers must be a JSON object. Use overwritePolicy=backupAndReplaceInvalid to repair it."
-                            .to_owned(),
-                    ));
-                }
-            }
-        }
-        let servers_object = servers.as_object_mut().expect("mcpServers object");
-        servers_object.insert(
-            "kerminal".to_owned(),
-            json!({
-                "type": "http",
-                "url": context.mcp_endpoint.as_str(),
-                "timeout": 60000
-            }),
-        );
-        let next = serde_json::to_string_pretty(&root)?;
-        apply_text_plan(
-            WorkspaceTextPlan {
-                path,
-                next: format!("{next}\n"),
-                current,
-                current_snippet: previous_server,
-                next_snippet: serde_json::to_string_pretty(&json!({
-                    "type": "http",
-                    "url": context.mcp_endpoint.as_str(),
-                    "timeout": 60000
-                }))?,
-                reason: "Update session MCP server entry.".to_owned(),
-            },
+        ensure_mcp_json_server(
+            context.session_root.join(".mcp.json"),
+            context.mcp_endpoint.as_str(),
+            60_000,
+            "Update session MCP server entry.",
+            options,
+        )
+    }
+
+    /// 为 Pi session 写 cwd-scoped 原生配置，保证它能自行发现会话专属 endpoint。
+    pub(super) fn ensure_agent_session_pi_mcp_json(
+        &self,
+        context: &AgentSessionWorkspaceContext,
+        options: &WorkspaceWriteOptions,
+    ) -> AppResult<ExternalAgentFileOperation> {
+        ensure_mcp_json_server(
+            context.session_root.join(".pi").join("mcp.json"),
+            context.mcp_endpoint.as_str(),
+            60,
+            "Update Pi session MCP server entry.",
             options,
         )
     }
@@ -378,7 +343,7 @@ enabled = true
         }
     }
 
-    /// 汇总无需额外 adapter 的内置 provider 状态；PI 使用专门入口区分 CLI 与 adapter。
+    /// 汇总内置 provider 状态；共享 DTO 的 adapter 字段仅为旧调用方兼容保留。
     pub(super) fn agent_status(
         &self,
         id: &str,
@@ -394,7 +359,7 @@ enabled = true
                     && self.config_reference_path().is_file()
             }
             "claude" => {
-                claude_config_ready(&config_path)
+                mcp_json_config_ready(&config_path)
                     && self.agents_file_path().is_file()
                     && self.config_reference_path().is_file()
                     && self.claude_instructions_path().is_file()
@@ -420,20 +385,17 @@ enabled = true
         }
     }
 
-    /// 独立报告 PI CLI、MCP adapter 与 workspace config，避免任一缺失被误报为可启动。
+    /// 报告 Pi CLI 与原生项目配置；旧 adapter 字段恒为 true，不参与可用性判断。
     pub(super) fn pi_agent_status(&self) -> ExternalAgentStatus {
-        let config_path = self.claude_config_path();
+        let config_path = self.pi_config_path();
         let installed = executable_on_path("pi");
-        let adapter_available = pi_mcp_adapter_available();
-        let config_ready = claude_config_ready(&config_path)
+        let config_ready = mcp_json_config_ready(&config_path)
             && self.agents_file_path().is_file()
             && self.config_reference_path().is_file();
         let status_detail = if !installed {
             "PI CLI not found in PATH"
-        } else if !adapter_available {
-            "PI MCP adapter is not installed"
         } else if !config_ready {
-            "PI CLI and MCP adapter are ready; workspace files need regeneration"
+            "PI CLI installed; workspace files need regeneration"
         } else {
             "Ready"
         };
@@ -443,7 +405,7 @@ enabled = true
             title: "PI Agent".to_owned(),
             cli_command: PI_AGENT_LAUNCH_COMMAND.to_owned(),
             installed,
-            adapter_available,
+            adapter_available: true,
             config_ready,
             config_path: path_to_string(&config_path),
             status_detail: status_detail.to_owned(),
@@ -486,7 +448,7 @@ enabled = true
         Ok(operations)
     }
 
-    /// PI 与 Claude 共享标准 `.mcp.json`，但不生成 Claude 专用说明文件。
+    /// 为 Pi 准备共享说明和 Pi 原生 `.pi/mcp.json`，不触碰 Claude 的根 `.mcp.json`。
     pub(super) fn prepare_pi_files(
         &self,
         options: &WorkspaceWriteOptions,
@@ -494,7 +456,7 @@ enabled = true
         Ok(vec![
             self.ensure_shared_instructions(options)?,
             self.ensure_config_reference(options)?,
-            self.ensure_claude_mcp_json(options)?,
+            self.ensure_pi_mcp_json(options)?,
         ])
     }
 
@@ -667,64 +629,30 @@ enabled = true
         ])
     }
 
+    /// 保留 Claude 使用的根 `.mcp.json` 入口，与 Pi 的 `.pi/mcp.json` 相互独立。
     pub(super) fn ensure_claude_mcp_json(
         &self,
         options: &WorkspaceWriteOptions,
     ) -> AppResult<ExternalAgentFileOperation> {
-        let path = self.claude_config_path();
-        let current = read_optional_string(&path)?;
-        let mut root = match parse_claude_mcp_json(&path, current.as_deref(), options)? {
-            Some(root) => root,
-            None => json!({}),
-        };
-        let previous_server = root
-            .pointer("/mcpServers/kerminal")
-            .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
-        let object = root.as_object_mut().ok_or_else(|| {
-            AppError::InvalidInput(
-                ".mcp.json must be a JSON object. Use overwritePolicy=backupAndReplaceInvalid to repair it."
-                    .to_owned(),
-            )
-        })?;
-        let servers = object
-            .entry("mcpServers")
-            .or_insert_with(|| Value::Object(Map::new()));
-        if !servers.is_object() {
-            match options.overwrite_policy {
-                ExternalAgentOverwritePolicy::BackupAndReplaceInvalid => {
-                    *servers = Value::Object(Map::new());
-                }
-                ExternalAgentOverwritePolicy::PreserveUserContent => {
-                    return Err(AppError::InvalidInput(
-                        ".mcp.json mcpServers must be a JSON object. Use overwritePolicy=backupAndReplaceInvalid to repair it."
-                            .to_owned(),
-                    ));
-                }
-            }
-        }
-        let servers_object = servers.as_object_mut().expect("mcpServers object");
-        servers_object.insert(
-            "kerminal".to_owned(),
-            json!({
-                "type": "http",
-                "url": self.mcp_endpoint,
-                "timeout": 60000
-            }),
-        );
-        let next = serde_json::to_string_pretty(&root)?;
-        apply_text_plan(
-            WorkspaceTextPlan {
-                path,
-                next: format!("{next}\n"),
-                current,
-                current_snippet: previous_server,
-                next_snippet: serde_json::to_string_pretty(&json!({
-                    "type": "http",
-                    "url": self.mcp_endpoint,
-                    "timeout": 60000
-                }))?,
-                reason: "Update Claude project MCP server entry.".to_owned(),
-            },
+        ensure_mcp_json_server(
+            self.claude_config_path(),
+            self.mcp_endpoint.as_str(),
+            60_000,
+            "Update Claude project MCP server entry.",
+            options,
+        )
+    }
+
+    /// Pi reads trusted project MCP settings from `.pi/mcp.json`; 60 is expressed in seconds.
+    pub(super) fn ensure_pi_mcp_json(
+        &self,
+        options: &WorkspaceWriteOptions,
+    ) -> AppResult<ExternalAgentFileOperation> {
+        ensure_mcp_json_server(
+            self.pi_config_path(),
+            self.mcp_endpoint.as_str(),
+            60,
+            "Update Pi project MCP server entry.",
             options,
         )
     }
@@ -748,4 +676,71 @@ enabled = true
     pub(super) fn claude_config_path(&self) -> PathBuf {
         self.workspace_dir.join(".mcp.json")
     }
+
+    /// 返回 Pi 原生项目 MCP 配置路径；目录布局与其实际启动 cwd 保持一致。
+    pub(super) fn pi_config_path(&self) -> PathBuf {
+        self.workspace_dir.join(".pi").join("mcp.json")
+    }
+}
+
+/// 更新配置中唯一由 Kerminal 管理的 server，同时保留其他 server 与顶层用户内容。
+///
+/// 统一复用解析、diff、备份和 dry-run 流程；timeout 数值沿用客户端 schema 的单位，
+/// Pi 使用秒，现有 `.mcp.json` provider 继续使用毫秒。
+fn ensure_mcp_json_server(
+    path: PathBuf,
+    endpoint: &str,
+    timeout_value: u64,
+    reason: &str,
+    options: &WorkspaceWriteOptions,
+) -> AppResult<ExternalAgentFileOperation> {
+    let current = read_optional_string(&path)?;
+    let mut root = match parse_mcp_json(&path, current.as_deref(), options)? {
+        Some(root) => root,
+        None => json!({}),
+    };
+    let previous_server = root
+        .pointer("/mcpServers/kerminal")
+        .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
+    let object = root.as_object_mut().ok_or_else(|| {
+        AppError::InvalidInput(format!(
+            "{} must be a JSON object. Use overwritePolicy=backupAndReplaceInvalid to repair it.",
+            path_to_string(&path)
+        ))
+    })?;
+    let servers = object
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !servers.is_object() {
+        match options.overwrite_policy {
+            ExternalAgentOverwritePolicy::BackupAndReplaceInvalid => {
+                *servers = Value::Object(Map::new());
+            }
+            ExternalAgentOverwritePolicy::PreserveUserContent => {
+                return Err(AppError::InvalidInput(format!(
+                    "{}.mcpServers must be a JSON object. Use overwritePolicy=backupAndReplaceInvalid to repair it.",
+                    path_to_string(&path)
+                )));
+            }
+        }
+    }
+    let servers_object = servers.as_object_mut().expect("mcpServers object");
+    let next_server = json!({
+        "type": "http",
+        "url": endpoint,
+        "timeout": timeout_value
+    });
+    servers_object.insert("kerminal".to_owned(), next_server.clone());
+    let next = serde_json::to_string_pretty(&root)?;
+    apply_text_plan(
+        WorkspaceTextPlan {
+            path,
+            next: format!("{next}\n"),
+            current,
+            current_snippet: previous_server,
+            next_snippet: serde_json::to_string_pretty(&next_server)?,
+            reason: reason.to_owned(),
+        },
+        options,
+    )
 }

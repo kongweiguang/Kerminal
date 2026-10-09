@@ -2,7 +2,7 @@
   "name": "kerminal",
   "description": "Kerminal：AI 原生的本地与远程终端工作台",
   "private": true,
-  "version": "0.3.43",
+  "version": "0.3.44",
   "type": "module",
   "license": "GPL-3.0-or-later",
   "packageManager": "pnpm@10.33.0",

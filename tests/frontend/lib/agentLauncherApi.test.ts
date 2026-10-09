@@ -83,9 +83,9 @@ describe("agentLauncherApi", () => {
     await expect(getExternalAgentWorkspaceStatus()).resolves.toMatchObject({
       agents: {
         pi: {
-          adapterAvailable: false,
-          cliCommand: "pi --approve --mcp-config .mcp.json",
-          configPath: "~/.kerminal/.mcp.json",
+          adapterAvailable: true,
+          cliCommand: "pi --approve",
+          configPath: "~/.kerminal/.pi/mcp.json",
           id: "pi",
           title: "PI Agent",
         },
@@ -98,7 +98,7 @@ describe("agentLauncherApi", () => {
         resumeProviderSession: true,
       }),
     ).resolves.toMatchObject({
-      args: ["--approve", "--mcp-config", ".mcp.json", "--continue"],
+      args: ["--approve", "--continue"],
       cwd: "~/.kerminal/agents/sessions/ags-preview-pi",
       shell: "pi",
       title: "PI Agent",

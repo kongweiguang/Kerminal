@@ -13,7 +13,7 @@
     ·
     <a href="#源码开发">源码开发</a>
   </p>
-  <p><sub>当前稳定版 v0.3.43 · Tauri 2 · Windows / Linux / macOS</sub></p>
+  <p><sub>当前稳定版 v0.3.44 · Tauri 2 · Windows / Linux / macOS</sub></p>
 </div>
 
 ![Kerminal 中的 SSH 终端与 Codex Agent 并行工作](docs/assets/kerminal-hero.png)
@@ -39,7 +39,7 @@ Kerminal 是一个本地优先的桌面终端和远程运维工作台。它围�
 
 ## 下载与安装
 
-前往 [GitHub Releases](https://github.com/kongweiguang/Kerminal/releases/latest) 获取当前稳定版。v0.3.43 提供以下产物：
+前往 [GitHub Releases](https://github.com/kongweiguang/Kerminal/releases/latest) 获取当前稳定版。v0.3.44 提供以下产物：
 
 | 平台 | 发布产物 |
 | --- | --- |
@@ -88,10 +88,12 @@ sudo xattr -rd com.apple.quarantine /Applications/Kerminal.app
 | --- | --- |
 | Codex | 已安装 `codex` CLI，并完成账号登录。 |
 | Claude | 已安装 `claude` CLI，并完成账号登录。 |
-| PI Agent | 已安装 PI CLI 和 `pi-mcp-adapter`，且 Kerminal 探测通过。 |
+| PI Agent | 已安装支持原生 MCP 的 Pi CLI（已验证 Pi 1.1.0），且 Kerminal 探测通过。 |
 | 自定义 Agent | 在选择器中保存可执行命令；命令会以明文写入 `settings.toml`，不要放密码、API Key 或 token。 |
 
 首次进入会创建独立会话；已有历史会话时，可以继续上次或新建会话。
+
+PI Agent 使用 `pi --approve` 启动，继续会话使用 `pi --approve --continue`。Kerminal 在会话工作目录生成 `.pi/mcp.json`，Pi 通过本次运行的项目信任自动加载当前会话的 MCP endpoint。旧会话继续时也会生成该原生配置，无需安装 `pi-mcp-adapter`。Kerminal 保留配置中的其它 MCP 服务，不修改用户级 `~/.pi/agent/mcp.json`。
 
 ![Kerminal Agent 会话恢复与会话列表](docs/assets/kerminal-agent-session.png)
 

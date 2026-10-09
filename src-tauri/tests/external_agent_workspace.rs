@@ -2,11 +2,12 @@
 //!
 //! @author kongweiguang
 
+#[path = "external_agent_workspace/pi_native_mcp.rs"]
+mod pi_native_mcp;
 mod support;
 
 use std::{fs, path::Path};
 
-use kerminal_lib::models::agent_session::PI_AGENT_LAUNCH_COMMAND;
 use kerminal_lib::services::external_agent_workspace::{
     rules, ExternalAgentFileAction, ExternalAgentOverwritePolicy, ExternalAgentWorkspaceService,
     PrepareExternalAgentWorkspaceRequest,
@@ -190,6 +191,7 @@ fn prepare_codex_writes_managed_files_without_clobbering_user_content() {
 }
 
 #[test]
+/// 启动初始化同时生成各内置 provider 的原生配置文件，供全局 workspace 直接发现。
 fn default_initialization_writes_codex_claude_and_config_guide_files() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service = ExternalAgentWorkspaceService::new(
@@ -205,50 +207,9 @@ fn default_initialization_writes_codex_claude_and_config_guide_files() {
     assert!(temp.path().join(CONFIG_REFERENCE_FILE_NAME).is_file());
     assert!(temp.path().join(".codex").join("config.toml").is_file());
     assert!(temp.path().join(".mcp.json").is_file());
+    assert!(temp.path().join(".pi").join("mcp.json").is_file());
     assert!(!temp.path().join("custom-agent.toml").exists());
     assert!(!temp.path().join(".custom-agent").exists());
-}
-
-#[test]
-/// 验证 PI 以原生命令加载标准 `.mcp.json`，且状态分别暴露 CLI、adapter 和配置。
-fn prepare_pi_writes_standard_mcp_and_reports_native_status() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let service = ExternalAgentWorkspaceService::new(
-        temp.path(),
-        Some("http://127.0.0.1:3030/mcp".to_owned()),
-        true,
-    );
-
-    let spec = service
-        .prepare(&PrepareExternalAgentWorkspaceRequest {
-            agent_id: "pi".to_owned(),
-            agent_session_id: None,
-            custom_command: None,
-            resume_provider_session: false,
-            dry_run: false,
-            overwrite_policy: ExternalAgentOverwritePolicy::BackupAndReplaceInvalid,
-        })
-        .expect("prepare PI");
-    assert_agent_launch_command(&spec, PI_AGENT_LAUNCH_COMMAND);
-    assert_eq!(spec.title, "PI Agent");
-    assert_eq!(spec.cwd, path_to_string(temp.path()));
-    assert!(temp.path().join("AGENTS.md").is_file());
-    assert!(temp.path().join(CONFIG_REFERENCE_FILE_NAME).is_file());
-    assert!(temp.path().join(".mcp.json").is_file());
-    assert!(!temp.path().join("CLAUDE.md").exists());
-    assert!(!temp.path().join(".codex").exists());
-
-    let status = service.status();
-    assert_eq!(status.agents.pi.id, "pi");
-    assert_eq!(status.agents.pi.title, "PI Agent");
-    assert_eq!(status.agents.pi.cli_command, PI_AGENT_LAUNCH_COMMAND);
-    assert!(status.agents.pi.config_ready);
-    assert_eq!(
-        status.agents.pi.config_path,
-        path_to_string(&temp.path().join(".mcp.json"))
-    );
-    let wire = serde_json::to_value(&status.agents.pi).expect("serialize PI status");
-    assert!(wire.get("adapterAvailable").is_some_and(Value::is_boolean));
 }
 
 #[test]

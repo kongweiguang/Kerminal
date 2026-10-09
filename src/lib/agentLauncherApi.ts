@@ -13,7 +13,7 @@ export interface ExternalAgentStatus {
   id: ExternalAgentId;
   title: string;
   cliCommand: string;
-  /** PI 单独探测 MCP adapter；其它 provider 始终返回 true。 */
+  /** 保留 IPC 兼容字段；内置 provider 已原生支持 MCP，不再依赖额外 adapter。 */
   adapterAvailable: boolean;
   installed: boolean;
   configReady: boolean;
@@ -381,6 +381,7 @@ export function prepareExternalAgentWorkspace(
   });
 }
 
+/** 预览沿用原生 MCP 配置位置；CLI 是否安装仍由真实桌面运行态确认。 */
 function previewExternalAgentWorkspaceStatus(): ExternalAgentWorkspaceStatus {
   const workspaceDir = "~/.kerminal";
   const endpoint = "http://127.0.0.1:37657/mcp";
@@ -417,14 +418,14 @@ function previewExternalAgentWorkspaceStatus(): ExternalAgentWorkspaceStatus {
         title: "Custom",
       },
       pi: {
-        adapterAvailable: false,
-        cliCommand: "pi --approve --mcp-config .mcp.json",
-        configPath: `${workspaceDir}/.mcp.json`,
+        adapterAvailable: true,
+        cliCommand: "pi --approve",
+        configPath: `${workspaceDir}/.pi/mcp.json`,
         configReady: true,
         id: "pi",
         installed: false,
         statusDetail:
-          "PI Agent and its MCP adapter were not detected in browser preview.",
+          "PI Agent CLI was not detected in browser preview.",
         title: "PI Agent",
       },
     },

@@ -256,10 +256,10 @@ jobs:
           releaseBody: |
             **Kerminal ${{ env.RELEASE_TAG }}**
 
-            - 应用、安装器和桌面展示名称统一为 Kerminal，项目描述与 GitHub 仓库名称保持一致。
-            - 同步关于页、下载和自动更新链接，统一使用规范的 Kerminal 仓库地址。
-            - Windows MSI 保留既有升级标识；配置目录、协议和 MCP 工具标识保持兼容。
-            - 修复 source-map-js 间接依赖的高危漏洞。
+            - PI Agent 接入 Pi 原生 MCP，自动生成会话专属的 `.pi/mcp.json`，不再依赖额外 MCP adapter。
+            - 更新 Pi 启动与继续命令，旧会话继续时自动适配原生 MCP 配置。
+            - 保留用户配置中的其它 MCP 服务，并修正 Pi 历史记录的身份标签。
+            - 使用支持原生 MCP 的 Pi CLI（已验证 Pi 1.1.0）；Codex、Claude 和自定义 Agent 的接入方式保持兼容。
           releaseDraft: true
           releaseName: "Kerminal ${{ env.RELEASE_TAG }}"
           tagName: ${{ env.RELEASE_TAG }}
