@@ -2,7 +2,7 @@
 
 [package]
 name = "kerminal"
-version = "0.3.45"
+version = "0.3.46"
 description = "Kerminal：AI 原生的本地与远程终端工作台"
 authors = ["you"]
 edition = "2021"
@@ -83,7 +83,7 @@ tauri-plugin-window-state = "2"
 [dev-dependencies]
 rand = { version = "0.10", features = ["thread_rng"] }
 rmcp = { version = "1.7.0", features = ["client", "transport-streamable-http-client-reqwest"] }
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 tauri = { version = "2", features = ["test"] }
 tempfile = "3.27.0"
 
