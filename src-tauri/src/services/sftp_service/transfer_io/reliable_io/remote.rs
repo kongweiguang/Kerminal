@@ -137,11 +137,14 @@ async fn prepare_selected_remote_reliable_write_target(
         .unwrap_or_else(|| reliable_remote_partial_path(final_path));
     let mut partial_bytes = remote_partial_bytes(sftp, &partial_path).await?;
     if source.is_some() && existing_checkpoint.is_none() && partial_bytes.is_some() {
-        partial_path = format!(
-            "{final_path}.{}{RELIABLE_PARTIAL_SUFFIX}",
-            uuid::Uuid::new_v4().simple()
+        partial_path = join_remote_path(
+            &remote_parent_path(final_path),
+            &format!(
+                ".{}{RELIABLE_PARTIAL_SUFFIX}",
+                uuid::Uuid::new_v4().simple()
+            ),
         );
-        // 随机路径由下方 CREATE|EXCLUDE 原子占用；绝不把历史长度作为恢复依据。
+        // 固定长度的同目录名称不挤占长文件名上限；CREATE|EXCLUDE 原子占用，绝不复用历史长度。
         partial_bytes = None;
     }
     let checkpoint = existing_checkpoint.or_else(|| {

@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// 旧任务残留不属于新任务；空、非空及超长残留均保留，新上传仍按所选正式路径提交。
+/// 旧任务残留不属于新任务；空、非空及超长残留均保留，长文件名也不能因隔离后缀而失败。
 #[tokio::test]
 async fn native_upload_isolates_untrusted_partial_without_changing_final_name() {
     let server_root = tempdir().expect("server root");
@@ -38,11 +38,20 @@ async fn native_upload_isolates_untrusted_partial_without_changing_final_name() 
             b"old".as_slice(),
             b"".as_slice(),
         ),
+        (
+            SftpTransferConflictPolicy::Overwrite,
+            b"old".as_slice(),
+            b"new".as_slice(),
+        ),
     ]
     .into_iter()
     .enumerate()
     {
-        let name = format!("reject-fsetstat-orphan-{index}.bin");
+        let name = if index == 5 {
+            format!("{}.bin", "l".repeat(220))
+        } else {
+            format!("reject-fsetstat-orphan-{index}.bin")
+        };
         let source = client_root.path().join(&name);
         let partial = server_root.path().join(format!("{name}.kerminal-part"));
         fs::write(&source, contents).await.expect("source");
@@ -79,8 +88,8 @@ async fn native_upload_isolates_untrusted_partial_without_changing_final_name() 
         count += 1;
     }
     assert_eq!(
-        count, 10,
-        "only five final files and five untouched orphans remain"
+        count, 12,
+        "only six final files and six untouched orphans remain"
     );
 }
 
