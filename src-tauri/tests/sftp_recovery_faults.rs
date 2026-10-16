@@ -360,7 +360,7 @@ async fn stalled_read_cancel_is_fast_and_does_not_commit_final_file() {
     );
 }
 
-/// 延迟 ACK 的单文件传输应固定实际目标；重试不能从 rename (1) 漂移到 rename (2)。
+/// 孤儿临时文件旁的新上传应固定独立临时路径；取消后重试不能误用孤儿或漂移正式目标。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retry_keeps_the_first_renamed_target_and_final_hash() {
     let server_root = tempdir().expect("create fault server root");
@@ -370,6 +370,10 @@ async fn retry_keeps_the_first_renamed_target_and_final_hash() {
     fs::write(server_root.path().join("artifact.bin"), b"pre-existing")
         .await
         .expect("seed rename conflict target");
+    let orphan = server_root.path().join("artifact (1).bin.kerminal-part");
+    fs::write(&orphan, b"untrusted orphan")
+        .await
+        .expect("seed orphan beside renamed target");
 
     let server = start_fault_server(
         server_root.path().to_path_buf(),
@@ -433,6 +437,19 @@ async fn retry_keeps_the_first_renamed_target_and_final_hash() {
     assert!(
         !server_root.path().join("artifact (2).bin").exists(),
         "retry must reuse the chosen rename target"
+    );
+    assert_eq!(
+        fs::read(&orphan).await.expect("preserved orphan"),
+        b"untrusted orphan"
+    );
+    let mut entries = fs::read_dir(server_root.path()).await.expect("directory");
+    let mut count = 0;
+    while entries.next_entry().await.expect("entry").is_some() {
+        count += 1;
+    }
+    assert_eq!(
+        count, 3,
+        "original, committed renamed file and orphan only; owned partial was committed"
     );
 }
 

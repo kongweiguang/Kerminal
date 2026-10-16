@@ -2,6 +2,88 @@
 
 use super::*;
 
+/// 旧任务残留不属于新任务；空、非空及超长残留均保留，新上传仍按所选正式路径提交。
+#[tokio::test]
+async fn native_upload_isolates_untrusted_partial_without_changing_final_name() {
+    let server_root = tempdir().expect("server root");
+    let client_root = tempdir().expect("client root");
+    let server = start_loopback_sftp_server(server_root.path().to_path_buf()).await;
+    let (_home, state) = test_state();
+    let host_id = create_password_remote_host(&state, "loopback", server.addr.port());
+    trust_loopback_host(&state, &host_id).await;
+
+    for (index, (policy, old_partial, contents)) in [
+        (
+            SftpTransferConflictPolicy::Overwrite,
+            b"".as_slice(),
+            b"new".as_slice(),
+        ),
+        (
+            SftpTransferConflictPolicy::Overwrite,
+            b"untrusted old bytes".as_slice(),
+            b"new".as_slice(),
+        ),
+        (
+            SftpTransferConflictPolicy::Skip,
+            b"old".as_slice(),
+            b"new".as_slice(),
+        ),
+        (
+            SftpTransferConflictPolicy::Rename,
+            b"old".as_slice(),
+            b"new".as_slice(),
+        ),
+        (
+            SftpTransferConflictPolicy::Overwrite,
+            b"old".as_slice(),
+            b"".as_slice(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("reject-fsetstat-orphan-{index}.bin");
+        let source = client_root.path().join(&name);
+        let partial = server_root.path().join(format!("{name}.kerminal-part"));
+        fs::write(&source, contents).await.expect("source");
+        fs::write(&partial, old_partial)
+            .await
+            .expect("orphan partial");
+        state
+            .sftp()
+            .upload(
+                state.paths(),
+                SftpTransferRequest {
+                    host_id: host_id.clone(),
+                    remote_path: format!("/{name}"),
+                    local_path: source.to_string_lossy().into_owned(),
+                    conflict_policy: policy,
+                },
+            )
+            .await
+            .expect("orphan must not block a fresh upload");
+        assert_eq!(
+            fs::read(server_root.path().join(&name))
+                .await
+                .expect("final"),
+            contents
+        );
+        assert_eq!(
+            fs::read(&partial).await.expect("preserved orphan"),
+            old_partial
+        );
+    }
+    let mut entries = fs::read_dir(server_root.path()).await.expect("directory");
+    let mut count = 0;
+    while entries.next_entry().await.expect("entry").is_some() {
+        count += 1;
+    }
+    assert_eq!(
+        count, 10,
+        "only five final files and five untouched orphans remain"
+    );
+}
+
 /// 新文件与空文件只要求创建和写入；禁止 FSETSTAT 的服务端仍须完成大小确认与提交。
 #[tokio::test]
 async fn native_upload_does_not_require_fsetstat_for_new_partial() {

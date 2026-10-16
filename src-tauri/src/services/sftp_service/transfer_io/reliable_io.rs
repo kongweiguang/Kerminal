@@ -167,7 +167,7 @@ async fn remote_path_exists(sftp: &SftpSession, remote_path: &str) -> AppResult<
     }
 }
 
-/// 为真实源文件准备远端 partial；没有同一任务的可信 checkpoint 时拒绝未知 partial。
+/// 为真实源文件准备远端 partial；新任务隔离历史残留，同任务恢复只信任已登记的路径和偏移。
 pub(in crate::services::sftp_service) async fn prepare_remote_reliable_write_target_for_source(
     sftp: &SftpSession,
     remote_path: &str,

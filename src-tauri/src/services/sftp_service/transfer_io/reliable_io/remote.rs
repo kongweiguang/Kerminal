@@ -3,6 +3,7 @@
 
 use super::*;
 
+/// 恢复使用已登记的实际路径；新任务的正式文件冲突策略不受历史临时文件影响。
 pub(in crate::services::sftp_service) async fn prepare_remote_target_with_checkpoint(
     sftp: &SftpSession,
     remote_path: &str,
@@ -96,14 +97,6 @@ pub(in crate::services::sftp_service) async fn prepare_remote_target_with_checkp
                 if remote_path_exists(sftp, &candidate).await? {
                     continue;
                 }
-                if remote_partial_bytes(sftp, &reliable_remote_partial_path(&candidate))
-                    .await?
-                    .is_some()
-                    && source.is_some()
-                {
-                    // 新任务不能猜旧 partial 的来源；rename 策略选择新的独立目标。
-                    continue;
-                }
                 return prepare_selected_remote_reliable_write_target(
                     sftp,
                     &candidate,
@@ -124,8 +117,8 @@ pub(in crate::services::sftp_service) async fn prepare_remote_target_with_checkp
     }
 }
 
-/// 只有同任务 checkpoint 能提供可信偏移；新 partial 直接创建，不额外依赖 FSETSTAT 权限。
-/// 真实断点仍需裁掉未确认尾部，旧 partial 长度不能直接成为新上传位置。
+/// 只有同任务 checkpoint 能提供可信偏移和临时路径；孤儿文件保留并隔离到新路径上传。
+/// 全新文件用排他创建避免检查与 OPEN 之间覆盖其它任务，恢复仍须裁掉未确认尾部。
 #[allow(clippy::too_many_arguments)]
 async fn prepare_selected_remote_reliable_write_target(
     sftp: &SftpSession,
@@ -138,8 +131,19 @@ async fn prepare_selected_remote_reliable_write_target(
     checkpoints: Option<&RecoveryCheckpoints>,
     checkpoint_key: &str,
 ) -> AppResult<Option<PreparedRemoteReliableWriteTarget>> {
-    let partial_path = reliable_remote_partial_path(final_path);
-    let partial_bytes = remote_partial_bytes(sftp, &partial_path).await?;
+    let mut partial_path = existing_checkpoint
+        .as_ref()
+        .map(|record| record.partial_path.clone())
+        .unwrap_or_else(|| reliable_remote_partial_path(final_path));
+    let mut partial_bytes = remote_partial_bytes(sftp, &partial_path).await?;
+    if source.is_some() && existing_checkpoint.is_none() && partial_bytes.is_some() {
+        partial_path = format!(
+            "{final_path}.{}{RELIABLE_PARTIAL_SUFFIX}",
+            uuid::Uuid::new_v4().simple()
+        );
+        // 随机路径由下方 CREATE|EXCLUDE 原子占用；绝不把历史长度作为恢复依据。
+        partial_bytes = None;
+    }
     let checkpoint = existing_checkpoint.or_else(|| {
         (source.is_some() && partial_bytes.is_none()).then(|| RecoveryCheckpointRecord {
             actual_target: final_path.to_owned(),
@@ -169,9 +173,9 @@ async fn prepare_selected_remote_reliable_write_target(
             Some(checkpoint.confirmed_offset)
         }
         (Some(_), Some(_), None) => {
-            return Err(AppError::Sftp(
-                "可靠传输无法恢复：partial 没有同一任务的可信 checkpoint".to_owned(),
-            ));
+            return Err(AppError::Sftp(format!(
+                "无法恢复上传：临时文件“{partial_path}”缺少本任务的断点记录。请重新添加上传任务；现有文件已保留。"
+            )));
         }
         (Some(_), None, Some(record)) if record.confirmed_offset > 0 => {
             return Err(AppError::Sftp(
@@ -214,7 +218,13 @@ async fn prepare_selected_remote_reliable_write_target(
                 final_path,
                 partial_path,
                 0,
-                true,
+                OpenFlags::CREATE
+                    | OpenFlags::WRITE
+                    | if source.is_some() && partial_bytes.is_none() {
+                        OpenFlags::EXCLUDE
+                    } else {
+                        OpenFlags::TRUNCATE
+                    },
                 source,
                 checkpoints,
                 checkpoint_key,
@@ -227,7 +237,7 @@ async fn prepare_selected_remote_reliable_write_target(
             final_path,
             partial_path,
             offset,
-            false,
+            OpenFlags::CREATE | OpenFlags::WRITE,
             source,
             checkpoints,
             checkpoint_key,
@@ -239,7 +249,7 @@ async fn prepare_selected_remote_reliable_write_target(
             final_path,
             partial_path,
             source_bytes,
-            false,
+            OpenFlags::CREATE | OpenFlags::WRITE,
             source,
             checkpoints,
             checkpoint_key,
@@ -285,7 +295,7 @@ pub(in crate::services::sftp_service) async fn retry_empty_remote_partial_after_
         final_path,
         partial_path.to_owned(),
         0,
-        true,
+        OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
         Some(source),
         Some(checkpoints),
         checkpoint_key,
@@ -321,29 +331,25 @@ pub(in crate::services::sftp_service) async fn cleanup_empty_owned_remote_partia
     sftp.remove_file(partial_path.to_owned()).await.is_ok()
 }
 
-/// 新上传用 OPEN 创建空文件；恢复才用 FSETSTAT 裁掉未确认尾部，且保留失败操作供诊断。
+/// 排他创建的新文件与已确认可截断的空文件都不依赖 FSETSTAT；恢复句柄才裁掉未确认尾部。
 #[allow(clippy::too_many_arguments)]
 async fn open_remote_reliable_partial_target(
     sftp: &SftpSession,
     final_path: &str,
     partial_path: String,
     offset: u64,
-    truncate: bool,
+    flags: OpenFlags,
     source: Option<&RecoverySourceFingerprint>,
     checkpoints: Option<&RecoveryCheckpoints>,
     checkpoint_key: &str,
 ) -> AppResult<PreparedRemoteReliableWriteTarget> {
-    let flags = if truncate {
-        OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
-    } else {
-        OpenFlags::CREATE | OpenFlags::WRITE
-    };
+    let starts_empty = flags.intersects(OpenFlags::EXCLUDE | OpenFlags::TRUNCATE);
     let mut file = sftp
         .open_with_flags(partial_path.clone(), flags)
         .await
         .map_err(|error| {
             remote_write_error(
-                if truncate {
+                if starts_empty {
                     "创建上传临时文件（OPEN）"
                 } else {
                     "打开上传断点文件（OPEN）"
@@ -351,7 +357,7 @@ async fn open_remote_reliable_partial_target(
                 error,
             )
         })?;
-    if !truncate {
+    if !starts_empty {
         file.set_metadata(russh_sftp::protocol::FileAttributes {
             size: Some(offset),
             ..Default::default()
