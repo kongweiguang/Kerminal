@@ -124,7 +124,8 @@ pub(in crate::services::sftp_service) async fn prepare_remote_target_with_checkp
     }
 }
 
-/// 只有同任务 checkpoint 能提供可信偏移；旧 partial 长度不能直接成为新上传位置。
+/// 只有同任务 checkpoint 能提供可信偏移；新 partial 直接创建，不额外依赖 FSETSTAT 权限。
+/// 真实断点仍需裁掉未确认尾部，旧 partial 长度不能直接成为新上传位置。
 #[allow(clippy::too_many_arguments)]
 async fn prepare_selected_remote_reliable_write_target(
     sftp: &SftpSession,
@@ -183,6 +184,7 @@ async fn prepare_selected_remote_reliable_write_target(
     let decision = if source.is_some() {
         match (final_exists, conflict_policy, resume_offset) {
             (true, SftpTransferConflictPolicy::Skip, _) => ReliableWriteDecision::SkipExistingFinal,
+            (_, _, Some(0)) if partial_bytes.is_none() => ReliableWriteDecision::Fresh,
             (true, SftpTransferConflictPolicy::Rename, Some(offset)) => {
                 ReliableWriteDecision::Resume { offset }
             }
@@ -247,11 +249,12 @@ async fn prepare_selected_remote_reliable_write_target(
     }
 }
 
+/// 单独标识临时文件的 STAT，便于区分目录不可访问与旧断点文件不可访问。
 async fn remote_partial_bytes(sftp: &SftpSession, partial_path: &str) -> AppResult<Option<u64>> {
     match sftp.metadata(partial_path.to_owned()).await {
         Ok(metadata) => Ok(metadata.size),
         Err(error) if is_no_such_file_error(&error) => Ok(None),
-        Err(error) => Err(native_sftp_error(error)),
+        Err(error) => Err(remote_write_error("检查上传临时文件（STAT）", error)),
     }
 }
 
@@ -318,7 +321,7 @@ pub(in crate::services::sftp_service) async fn cleanup_empty_owned_remote_partia
     sftp.remove_file(partial_path.to_owned()).await.is_ok()
 }
 
-/// 写入前裁掉未确认尾部，保证新连接从连续确认偏移重新写，不继承乱序残留。
+/// 新上传用 OPEN 创建空文件；恢复才用 FSETSTAT 裁掉未确认尾部，且保留失败操作供诊断。
 #[allow(clippy::too_many_arguments)]
 async fn open_remote_reliable_partial_target(
     sftp: &SftpSession,
@@ -338,14 +341,23 @@ async fn open_remote_reliable_partial_target(
     let mut file = sftp
         .open_with_flags(partial_path.clone(), flags)
         .await
-        .map_err(native_sftp_error)?;
+        .map_err(|error| {
+            remote_write_error(
+                if truncate {
+                    "创建上传临时文件（OPEN）"
+                } else {
+                    "打开上传断点文件（OPEN）"
+                },
+                error,
+            )
+        })?;
     if !truncate {
         file.set_metadata(russh_sftp::protocol::FileAttributes {
             size: Some(offset),
             ..Default::default()
         })
         .await
-        .map_err(native_sftp_error)?;
+        .map_err(|error| remote_write_error("裁掉未确认上传尾部（FSETSTAT）", error))?;
     }
     if offset > 0 {
         file.seek(SeekFrom::Start(offset))
@@ -383,7 +395,7 @@ pub(in crate::services::sftp_service) async fn commit_remote_reliable_write_targ
     let actual_bytes = sftp
         .metadata(partial_path.to_owned())
         .await
-        .map_err(native_sftp_error)?
+        .map_err(|error| remote_write_error("核对上传临时文件大小（STAT）", error))?
         .size
         .unwrap_or(0);
     match confirm_reliable_write_size(expected_bytes, actual_bytes) {
@@ -409,6 +421,6 @@ pub(in crate::services::sftp_service) async fn commit_remote_reliable_write_targ
                 "服务器不支持原子覆盖；原文件未改，partial 保留".to_owned(),
             ))
         }
-        Err(error) => Err(native_sftp_error(error)),
+        Err(error) => Err(remote_write_error("提交上传文件（RENAME）", error)),
     }
 }

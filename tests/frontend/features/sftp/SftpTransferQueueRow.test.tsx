@@ -11,6 +11,53 @@ import { SftpTransferQueueRow } from "../../../../src/features/sftp/SftpTransfer
 import { createSftpTransferSummary } from "../../support/sftp/SftpToolContent.testSupport";
 
 describe("SftpTransferQueueRow", () => {
+  /** 服务端拒绝的具体操作必须默认可见，展开详情也不能重复输出同一条错误。 */
+  it("shows the concrete permission failure without expanding details", async () => {
+    const message = "创建上传临时文件（OPEN）失败: Permission denied: Permission denied";
+    render(<SftpTransferQueueRow
+      onCancel={vi.fn()}
+      onRetry={vi.fn()}
+      transfer={createSftpTransferSummary({
+        error: message,
+        failureKind: "other",
+        retryable: false,
+        status: "failed",
+      })}
+    />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(message);
+    expect(screen.getByRole("alert")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /继续传输|重新传输/ })).not.toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole("button", { name: /查看传输详情/ }));
+    expect(screen.getAllByText(message)).toHaveLength(1);
+  });
+
+  /** 普通失败沿用后端的重试资格，显示错误后也只提供一个可执行入口。 */
+  it("keeps one inline retry action for a retryable ordinary failure", async () => {
+    const onRetry = vi.fn();
+    const transfer = createSftpTransferSummary({
+      error: "打开上传断点文件（OPEN）失败: connection closed",
+      failureKind: "other",
+      resumable: true,
+      retryable: true,
+      status: "failed",
+    });
+    render(<SftpTransferQueueRow onCancel={vi.fn()} onRetry={onRetry} transfer={transfer} />);
+    const actions = screen.getAllByRole("button", { name: /继续传输/ });
+    expect(actions).toHaveLength(1);
+    await userEvent.setup().click(actions[0]);
+    expect(onRetry).toHaveBeenCalledWith(transfer);
+  });
+
+  /** 没有底层错误时承认信息缺失，不能留下一个只有失败 badge 的空状态。 */
+  it("shows an explicit fallback when the failed task has no error details", () => {
+    render(<SftpTransferQueueRow
+      onCancel={vi.fn()}
+      transfer={createSftpTransferSummary({ error: null, status: "failed" })}
+    />);
+    expect(screen.getByRole("alert")).toHaveTextContent("传输失败，未收到详细错误信息。");
+  });
+
   it("keeps the idle-timeout recovery action singular and exposes its stable message", async () => {
     const user = userEvent.setup();
     const onRetry = vi.fn();

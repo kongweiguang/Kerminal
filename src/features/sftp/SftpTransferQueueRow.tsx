@@ -40,7 +40,7 @@ interface SftpTransferQueueRowProps {
 }
 
 /**
- * 保持普通任务为单行摘要；无进度失败给唯一恢复动作，提交不明只提示核对。
+ * 失败原因直接出现在任务行，避免用户展开详情才能定位；每项失败只保留一个恢复动作。
  *
  * 长路径、字节明细仍按需展开，避免正常队列因错误说明而持续增高；但网络失联不能藏在
  * 详情里，否则用户无法判断刷新图标是否会安全地从断点继续。
@@ -74,9 +74,11 @@ export function SftpTransferQueueRow({
   const directionLabel = transfer.direction === "upload" ? "上传" : "下载";
   const title = transferTitle(transfer);
   const isInlineFailure =
+    transfer.status === "failed" ||
     transfer.failureKind === "idleTimeout" ||
     transfer.failureKind === "commitUnknown";
-  const failureMessage = transferFailureMessage(transfer);
+  const failureMessage = transferFailureMessage(transfer) ||
+    (transfer.status === "failed" ? "传输失败，未收到详细错误信息。" : null);
   const isWaiting = isTransferWaiting(transfer);
   const normalizedPhase = transfer.phase?.toLowerCase();
   const hasExplicitLifecyclePhase = [
@@ -291,10 +293,10 @@ export function SftpTransferQueueRow({
       </div>
       {isInlineFailure && failureMessage && !hasSuccessor ? (
         <div className="mt-1.5 flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-[var(--radius-control)] border border-rose-500/20 bg-rose-500/8 px-2 py-1 text-[11px] text-rose-700 dark:border-rose-300/20 dark:bg-rose-400/10 dark:text-rose-200">
-          <span className="min-w-0 flex-1 break-words" role="alert">
+          <span className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]" role="alert">
             {failureMessage}
           </span>
-          {transfer.failureKind === "idleTimeout" && retryDecision?.canRetry && onRetry ? (
+          {retryDecision?.canRetry && onRetry ? (
             <Button
               aria-label={`${retryDecision.actionLabel} ${title}`}
               className="h-6 shrink-0 gap-1 rounded-[var(--radius-control)] border border-current/25 bg-transparent px-2 text-[11px] text-current hover:bg-rose-500/10 dark:hover:bg-rose-300/10"
@@ -322,7 +324,7 @@ export function SftpTransferQueueRow({
           <div className="break-all font-mono" title={transferPathSummary(transfer)}>
             {transferPathSummary(transfer)}
           </div>
-          {failureMessage && !isInlineFailure ? (
+          {failureMessage && (!isInlineFailure || hasSuccessor) ? (
             <div className="break-words text-rose-600 dark:text-rose-300">
               {failureMessage}
             </div>

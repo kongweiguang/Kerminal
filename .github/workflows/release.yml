@@ -256,10 +256,9 @@ jobs:
           releaseBody: |
             **Kerminal ${{ env.RELEASE_TAG }}**
 
-            - PI Agent 接入 Pi 原生 MCP，自动生成会话专属的 `.pi/mcp.json`，不再依赖额外 MCP adapter。
-            - 更新 Pi 启动与继续命令，旧会话继续时自动适配原生 MCP 配置。
-            - 保留用户配置中的其它 MCP 服务，并修正 Pi 历史记录的身份标签。
-            - 使用支持原生 MCP 的 Pi CLI（已验证 Pi 1.1.0）；Codex、Claude 和自定义 Agent 的接入方式保持兼容。
+            - 修复 SFTP 全新上传多余的文件属性请求，兼容允许创建和写入、但限制修改属性的服务器，覆盖普通文件与空文件。
+            - 上传失败直接在传输队列显示具体原因，并标明检查目标、打开临时文件、恢复断点或提交文件等失败步骤，无需展开详情。
+            - 保留安全续传、取消和原文件保护；提交结果不明时仍提示先核对目标文件，避免重复写入。
           releaseDraft: true
           releaseName: "Kerminal ${{ env.RELEASE_TAG }}"
           tagName: ${{ env.RELEASE_TAG }}

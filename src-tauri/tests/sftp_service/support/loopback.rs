@@ -458,6 +458,7 @@ impl russh_sftp::server::Handler for LoopbackSftpFs {
         StatusCode::OpUnsupported
     }
 
+    /// 用独立路径模拟服务端拒绝创建，避免依赖 Windows 与 Unix 不同的权限位语义。
     async fn open(
         &mut self,
         id: u32,
@@ -465,6 +466,9 @@ impl russh_sftp::server::Handler for LoopbackSftpFs {
         pflags: OpenFlags,
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
+        if filename.contains("reject-upload-open") {
+            return Err(StatusCode::PermissionDenied);
+        }
         let local_path = self.resolve_path(&filename)?;
         let options: std::fs::OpenOptions = pflags.into();
         let file = options.open(local_path).map_err(Self::io_status)?;
@@ -566,12 +570,17 @@ impl russh_sftp::server::Handler for LoopbackSftpFs {
         Ok(Self::ok(id))
     }
 
+    /// 模拟允许 OPEN/WRITE 却禁止修改属性的服务端，捕获新上传对 FSETSTAT 的多余依赖。
     async fn fsetstat(
         &mut self,
         id: u32,
-        _handle: String,
+        handle: String,
         _attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
+        if matches!(self.handles.get(&handle), Some(LoopbackSftpHandle::File { path, .. }) if path.contains("reject-fsetstat"))
+        {
+            return Err(StatusCode::PermissionDenied);
+        }
         Ok(Self::ok(id))
     }
 
@@ -639,7 +648,11 @@ impl russh_sftp::server::Handler for LoopbackSftpFs {
         Ok(Self::ok(id))
     }
 
+    /// 将 STAT 拒绝与 OPEN 拒绝分开注入，保证上传诊断不会只保留相同的协议错误。
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        if path.contains("reject-upload-stat") {
+            return Err(StatusCode::PermissionDenied);
+        }
         self.attrs_for_path(id, path).await
     }
 

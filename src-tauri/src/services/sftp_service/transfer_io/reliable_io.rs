@@ -153,11 +153,17 @@ pub(in crate::services::sftp_service) async fn remote_create_conflict_confirmed(
     }
 }
 
+/// 在具体请求处保留操作名称；同一个权限状态不能掩盖 STAT、OPEN 或断点截断的差别。
+fn remote_write_error(operation: &str, error: russh_sftp::client::error::Error) -> AppError {
+    AppError::Sftp(format!("{operation}失败: {error}"))
+}
+
+/// 只有明确不存在才按新目标处理，权限错误保留 STAT 阶段，避免误走创建或覆盖。
 async fn remote_path_exists(sftp: &SftpSession, remote_path: &str) -> AppResult<bool> {
     match sftp.metadata(remote_path.to_owned()).await {
         Ok(_) => Ok(true),
         Err(error) if is_no_such_file_error(&error) => Ok(false),
-        Err(error) => Err(native_sftp_error(error)),
+        Err(error) => Err(remote_write_error("检查正式目标文件（STAT）", error)),
     }
 }
 

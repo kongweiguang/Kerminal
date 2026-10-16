@@ -2,6 +2,96 @@
 
 use super::*;
 
+/// 新文件与空文件只要求创建和写入；禁止 FSETSTAT 的服务端仍须完成大小确认与提交。
+#[tokio::test]
+async fn native_upload_does_not_require_fsetstat_for_new_partial() {
+    let server_root = tempdir().expect("server root");
+    let client_root = tempdir().expect("client root");
+    let server = start_loopback_sftp_server(server_root.path().to_path_buf()).await;
+    let (_home, state) = test_state();
+    let host_id = create_password_remote_host(&state, "loopback", server.addr.port());
+    trust_loopback_host(&state, &host_id).await;
+
+    for (name, contents) in [
+        (
+            "reject-fsetstat.txt",
+            b"upload without changing attributes".as_slice(),
+        ),
+        ("reject-fsetstat-empty.txt", b"".as_slice()),
+    ] {
+        let source = client_root.path().join(name);
+        fs::write(&source, contents).await.expect("local source");
+        fs::write(server_root.path().join(name), b"old final")
+            .await
+            .expect("existing final stays safe until commit");
+        state
+            .sftp()
+            .upload(
+                state.paths(),
+                SftpTransferRequest {
+                    host_id: host_id.clone(),
+                    remote_path: format!("/{name}"),
+                    local_path: source.to_string_lossy().into_owned(),
+                    conflict_policy: SftpTransferConflictPolicy::Overwrite,
+                },
+            )
+            .await
+            .expect("fresh upload needs no FSETSTAT");
+        assert_eq!(
+            fs::read(server_root.path().join(name))
+                .await
+                .expect("committed file"),
+            contents
+        );
+        assert!(!server_root
+            .path()
+            .join(format!("{name}.kerminal-part"))
+            .exists());
+    }
+}
+
+/// 同样的服务端状态必须带上失败操作，不能要求用户从 0% 猜测 STAT 还是 OPEN 被拒绝。
+#[tokio::test]
+async fn native_upload_permission_error_identifies_remote_operation() {
+    let server_root = tempdir().expect("server root");
+    let client_root = tempdir().expect("client root");
+    let source = client_root.path().join("source.txt");
+    fs::write(&source, b"diagnostic probe")
+        .await
+        .expect("local source");
+    let server = start_loopback_sftp_server(server_root.path().to_path_buf()).await;
+    let (_home, state) = test_state();
+    let host_id = create_password_remote_host(&state, "loopback", server.addr.port());
+    trust_loopback_host(&state, &host_id).await;
+
+    for (name, operation) in [
+        ("reject-upload-stat.txt", "检查正式目标文件（STAT）"),
+        ("reject-upload-open.txt", "创建上传临时文件（OPEN）"),
+    ] {
+        let error = state
+            .sftp()
+            .upload(
+                state.paths(),
+                SftpTransferRequest {
+                    host_id: host_id.clone(),
+                    remote_path: format!("/{name}"),
+                    local_path: source.to_string_lossy().into_owned(),
+                    conflict_policy: SftpTransferConflictPolicy::Overwrite,
+                },
+            )
+            .await
+            .expect_err("server rejects the selected operation");
+        let message = error.to_string();
+        assert!(message.contains(operation), "{message}");
+        assert!(message.contains("Permission denied"), "{message}");
+        assert!(
+            !message.contains(&host_id),
+            "diagnostics must not expose host ids"
+        );
+        assert!(!server_root.path().join(name).exists());
+    }
+}
+
 #[tokio::test]
 async fn sftp_only_host_browses_files_and_rejects_command_before_transport() {
     let server_root = tempdir().expect("server root");
