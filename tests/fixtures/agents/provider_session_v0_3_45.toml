@@ -1,0 +1,7 @@
+# v0.3.45 provider.toml persistence contract from 17c5d4be46172ca508f92546bfae5fe5ef477f11.
+# All values are synthetic; last_resume_at is intentionally absent as in valid old data.
+schema_version = 1
+provider = "codex"
+provider_session_id = "provider-session-fixture"
+resume_command = "codex resume --last"
+resume_supported = true

@@ -1,0 +1,15 @@
+# @author kongweiguang
+# 合成的 host-v2 迁移输入；未覆盖任何已有历史 fixture。
+schema_version = 2 # keep migration note
+protocol = "serial"
+id = "serial-legacy"
+name = "Legacy console"
+host = "fallback-device"
+port = 22
+username = ""
+auth_type = "agent"
+tags = ["serial", "serial-port:COM11", "serial-baud:115200", "serial-data-bits:7", "serial-stop-bits:2", "serial-parity:E", "serial-flow:X", "lab"]
+sort_order = 2
+created_at = "1"
+updated_at = "2"
+vendor_extension = "preserve-me"

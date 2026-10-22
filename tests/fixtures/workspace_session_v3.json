@@ -1,0 +1,109 @@
+{
+  "version": 3,
+  "activeTabId": "tab-terminal",
+  "focusedPaneId": "pane-a",
+  "selectedMachineId": "machine-a",
+  "sidebarMachines": [],
+  "terminalTabGroups": {
+    "group-a": {
+      "title": "Production",
+      "color": "blue",
+      "collapsed": false,
+      "futureGroup": 7
+    }
+  },
+  "terminalPanes": [
+    {
+      "id": "pane-a",
+      "title": "A",
+      "machineId": "machine-a",
+      "mode": "ssh",
+      "target": {
+        "kind": "ssh",
+        "hostId": "host-a",
+        "futureTarget": "kept"
+      },
+      "remoteHostId": "host-a",
+      "prompt": "PS>",
+      "status": "offline",
+      "futurePane": {
+        "value": true
+      },
+      "lines": ["volatile"]
+    },
+    {
+      "id": "pane-b",
+      "title": "B",
+      "machineId": "machine-a",
+      "mode": "ssh",
+      "target": {
+        "kind": "ssh",
+        "hostId": "host-a"
+      },
+      "prompt": "PS>",
+      "status": "offline"
+    }
+  ],
+  "terminalTabs": [
+    {
+      "id": "tab-terminal",
+      "title": "Terminal",
+      "machineId": "machine-a",
+      "tabGroupId": "group-a",
+      "layout": {
+        "type": "split",
+        "id": "split-a",
+        "direction": "horizontal",
+        "children": [
+          {
+            "type": "pane",
+            "paneId": "pane-a",
+            "futureLeaf": "kept"
+          },
+          {
+            "type": "pane",
+            "paneId": "pane-b"
+          }
+        ],
+        "sizes": {
+          "pane-a": 0.4,
+          "pane-b": 0.6
+        },
+        "futureSplit": "kept"
+      },
+      "futureTab": ["kept"]
+    },
+    {
+      "kind": "sftpTransfer",
+      "id": "tab-transfer",
+      "title": "Transfer",
+      "machineId": "machine-a",
+      "leftHostId": "host-a",
+      "initialLeftPath": "C:/Users/example/Downloads",
+      "initialRightPath": "/tmp",
+      "futureTransfer": 1
+    },
+    {
+      "kind": "workspaceFile",
+      "id": "tab-file",
+      "title": "Container file",
+      "machineId": "machine-a",
+      "target": {
+        "kind": "dockerContainer",
+        "hostId": "host-a",
+        "containerId": "container-a",
+        "runtime": "podman"
+      },
+      "path": "/app/config.toml",
+      "access": "editable",
+      "source": "container",
+      "futureFile": 2
+    }
+  ],
+  "shellLayout": {
+    "leftPanelWidth": 280
+  },
+  "futureRoot": {
+    "keep": true
+  }
+}

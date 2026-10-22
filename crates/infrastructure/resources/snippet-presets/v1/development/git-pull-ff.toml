@@ -1,0 +1,25 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version=1
+id="snippet.builtin.development.git_pull_ff"
+catalog_version="1.0.0"
+pack="development"
+category="git"
+sort_order=110
+title="Git 快进拉取"
+description="仅在可快进时拉取当前分支"
+template="git pull --ff-only"
+command_spec="git"
+scope="local"
+platforms=["linux","macos","windows"]
+shells=["bash","zsh","fish","power_shell","cmd"]
+capabilities=["git","network"]
+tags=["git","network"]
+risk="change"
+duration="instant"
+default_action="insert"
+owner="kerminal"
+tested_version="Git 2.50"
+updated_at="2026-07-13"
+source={name="git-pull reference",url="https://git-scm.com/docs/git-pull"}

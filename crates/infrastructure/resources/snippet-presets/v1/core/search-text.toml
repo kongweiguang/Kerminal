@@ -1,0 +1,26 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version=1
+id="snippet.builtin.core.search_text"
+catalog_version="1.0.0"
+pack="core"
+category="logs"
+sort_order=120
+title="文本关键字搜索"
+description="在指定路径递归搜索关键字并限制为 50 条"
+template="grep -R -- {{ keyword }} {{ path }} | head -n 50"
+command_spec="grep"
+scope="ssh"
+platforms=["linux","macos"]
+shells=["bash","zsh"]
+capabilities=["grep","head"]
+tags=["logs","files"]
+risk="inspect"
+duration="high_io"
+default_action="insert"
+variables=[{name="keyword",label="关键字",description="要搜索的文本",kind="text",required=true,render_strategy="shell_arg"},{name="path",label="搜索路径",description="要递归搜索的目录",kind="path",required=true,render_strategy="shell_arg"}]
+owner="kerminal"
+tested_version="GNU grep 3.12"
+updated_at="2026-07-13"
+source={name="GNU grep manual",url="https://www.gnu.org/software/grep/manual/grep.html"}

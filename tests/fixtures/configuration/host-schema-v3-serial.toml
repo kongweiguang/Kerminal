@@ -1,0 +1,20 @@
+# @author kongweiguang
+# 当前格式样本：串口设备仅保存在 serial 表中。
+schema_version = 3
+protocol = "serial"
+id = "serial-current"
+name = "Current console"
+auth_type = "agent"
+tags = ["lab"]
+sort_order = 2
+created_at = "1"
+updated_at = "2"
+vendor_extension = "preserve-me"
+
+[serial]
+device = "COM7"
+baud_rate = 115200
+data_bits = 8
+stop_bits = 1
+parity = "none"
+flow_control = "none"

@@ -1,0 +1,38 @@
+# @author kongweiguang
+# Linux 发布只生成既有支持的 AppImage 与 DEB，不启用 packager 默认的 Pacman。
+product-name = "Kerminal"
+identifier = "io.github.kongweiguang.kerminal"
+out-dir = "../target/package-output"
+publisher = "github"
+authors = ["kongweiguang"]
+description = "Desktop terminal workspace for local and remote sessions"
+long-description = "Kerminal provides a native desktop workspace for managing local and remote terminal sessions."
+license-file = "../LICENSE"
+icons = [
+  "../resources/icons/32x32.png",
+  "../resources/icons/128x128.png",
+  "../resources/icons/128x128@2x.png",
+]
+formats = ["appimage", "deb"]
+resources = [
+  { src = "../LICENSE", target = "licenses/LICENSE" },
+  { src = "../THIRD_PARTY_NOTICES.md", target = "licenses/THIRD_PARTY_NOTICES.md" },
+  { src = "../licenses/THIRD_PARTY_DEPENDENCIES.html", target = "licenses/THIRD_PARTY_DEPENDENCIES.html" },
+  { src = "../licenses/GPUI_KIT_LUCIDE_LICENSE.txt", target = "licenses/GPUI_KIT_LUCIDE_LICENSE.txt" },
+  { src = "../licenses/NOTO-CJK-SIL-OFL-1.1.txt", target = "licenses/NOTO-CJK-SIL-OFL-1.1.txt" },
+  { src = "kerminal-migrate.ps1", target = "migration/kerminal-migrate.ps1" },
+  { src = "kerminal-migrate.sh", target = "migration/kerminal-migrate.sh" },
+]
+
+[deb]
+depends = ["libc6 (>= 2.35)", "libegl1", "libgcc-s1", "libudev1", "libvulkan1", "libwayland-client0", "libxcb1", "libxkbcommon0", "libxkbcommon-x11-0"]
+
+[[binaries]]
+# 显式固定旧快捷方式和更新器所依赖的主程序名，目标目录由 xtask 按平台注入。
+path = "kerminal"
+main = true
+
+# 桌面入口只声明应用自有 scheme；ssh/sftp 仍由应用解析，不改系统通用处理程序。
+[[deep-link-protocols]]
+schemes = ["kerminal"]
+role = "viewer"

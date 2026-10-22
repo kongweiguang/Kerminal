@@ -1,0 +1,47 @@
+<!--
+@author kongweiguang
+This is a project-authored cargo-about template. Template data follows the
+official cargo-about generate template interface.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kerminal third-party dependency licenses</title>
+    <style>
+        body { font-family: system-ui, sans-serif; line-height: 1.5; margin: 2rem auto; max-width: 72rem; padding: 0 1rem; }
+        pre { overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+        section { border-top: 1px solid #888; margin-top: 2rem; padding-top: 1rem; }
+    </style>
+</head>
+<body>
+    <h1>Kerminal third-party dependency licenses</h1>
+    <p>This report is generated from the workspace dependency graph and locked crate metadata.</p>
+
+    <h2>License index</h2>
+    <ul>
+        {{#each overview}}
+        <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+        {{/each}}
+    </ul>
+
+    <h2>Dependency notices and license texts</h2>
+    {{#each licenses}}
+    <section id="{{id}}-{{@index}}">
+        <h3>{{name}}</h3>
+        <p>Used by:</p>
+        <ul>
+            {{#each used_by}}
+            <li>
+                <a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">
+                    {{crate.name}} {{crate.version}}
+                </a>
+            </li>
+            {{/each}}
+        </ul>
+        <pre>{{text}}</pre>
+    </section>
+    {{/each}}
+</body>
+</html>

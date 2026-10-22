@@ -1,0 +1,3000 @@
+{
+  "baseline": "v0.3.45",
+  "sourceCommit": "17c5d4be46172ca508f92546bfae5fe5ef477f11",
+  "source": {
+    "registry": "src-tauri/src/services/mcp_tool_catalog_service/registry.rs::ToolId::CATALOG_ORDER",
+    "definitions": "src-tauri/src/services/mcp_tool_catalog_service/catalog/*.rs",
+    "schema": "src-tauri/src/services/mcp_tool_catalog_service/schema.rs"
+  },
+  "tools": [
+    {
+      "name": "kerminal.capabilities",
+      "title": "读取 Kerminal MCP 能力指南",
+      "description": "返回外部 Agent 使用 Kerminal MCP 的结构化能力地图、global 终端 scope、外部 MCP 默认后台执行规则、内置 Agent 的 targetBinding 首选目标、文件型配置边界和故意不提供的 MCP CRUD/UI 编排工具族。",
+      "category": "diagnostics",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "kerminal.app_guide",
+      "title": "读取 Kerminal 应用导航指南",
+      "description": "返回面向外部 Agent 的 Kerminal 产品结构地图：左栏主机、中间终端工作区、右栏工具、Agent 会话、global 终端 scope、外部 MCP 默认后台工具、内置 Agent 的 targetBinding 首选目标、文件型配置和对应 MCP 工具族；不执行 UI 编排。",
+      "category": "diagnostics",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "kerminal.config_guide",
+      "title": "读取 Kerminal 配置指南",
+      "description": "返回与工作空间 kerminal-config.md 同源的文件型配置规则正文、可编辑文件、受保护路径、验证入口和 secret 边界；只读，不做配置 CRUD。",
+      "category": "diagnostics",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "kerminal.tool_help",
+      "title": "读取 Kerminal 工具帮助",
+      "description": "按 toolId、family 或 query 返回当前暴露 MCP tool 的 schema、示例参数和安全标注，并说明故意缺席的配置 CRUD/UI 编排/历史写入工具族；只读，不执行动作。",
+      "category": "diagnostics",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "toolId": {
+            "type": "string",
+            "description": "精确 MCP tool id，例如 terminal.write。"
+          },
+          "family": {
+            "type": "string",
+            "description": "工具族过滤，可用于读取一组相关 tools。",
+            "enum": [
+              "discovery",
+              "agent-session",
+              "terminal",
+              "ssh",
+              "sftp",
+              "tmux",
+              "container",
+              "port-forward",
+              "server-info",
+              "history",
+              "diagnostics",
+              "config",
+              "credentials"
+            ]
+          },
+          "query": {
+            "type": "string",
+            "description": "按工具 id、标题、描述或分类做大小写不敏感搜索。"
+          },
+          "includeSchemas": {
+            "type": "boolean",
+            "description": "是否返回 inputSchema，默认 true；false 时只返回摘要、示例和安全标注。"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "kerminal.operation_guide",
+      "title": "读取 Kerminal 操作指南",
+      "description": "按任务意图返回外部 Agent 操作 Kerminal 的推荐 MCP 调用顺序，默认使用后台工具；持久/交互/local shell 才创建 headless PTY，并说明内置 Agent 的 targetBinding、显式 UI Tab 边界、文件优先配置和缺席工具；不读取 secrets，不执行动作。",
+      "category": "diagnostics",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "intent": {
+            "type": "string",
+            "description": "操作意图，默认 overview。",
+            "enum": [
+              "overview",
+              "terminal",
+              "session-terminal",
+              "ssh-command",
+              "sftp",
+              "tmux",
+              "container",
+              "port-forward",
+              "server-info",
+              "history",
+              "config",
+              "credentials",
+              "diagnostics"
+            ]
+          },
+          "goal": {
+            "type": "string",
+            "description": "用户目标的可选自然语言摘要；仅回显帮助 Agent 对齐上下文。"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "kerminal.runtime_snapshot",
+      "title": "读取 Kerminal 运行态快照",
+      "description": "返回当前 Kerminal 运行态摘要：终端、Agent session、targetBinding、端口转发、本机代理入口和 MCP 工具数量，并说明外部 MCP 默认后台、headless PTY 与显式 UI Tab 的执行路径；不读取 secrets，不提供文件型配置 CRUD。",
+      "category": "diagnostics",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "terminal.create",
+      "title": "创建后台终端",
+      "description": "为持久、交互或 local shell 创建可操作的 headless PTY；target=local 支持本地 shell，target=ssh 使用已保存 SSH 主机的登录 shell，返回 sessionId 供 terminal.snapshot/write/resize/close 使用，不创建 UI pane 或 Tab。外部 MCP 必须沿用该显式 sessionId；内置右栏 Agent 的 session-terminal 才可按 targetBinding 解析现有用户终端。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "终端目标，local（默认）或 ssh。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "已保存 SSH 主机 id；target=ssh 时必填，只引用保存凭据，不接收密码或私钥。"
+          },
+          "cwd": {
+            "type": "string",
+            "description": "可选工作目录；local 使用本机路径，ssh 使用远端路径。"
+          },
+          "shell": {
+            "type": "string",
+            "description": "可选 shell；仅 target=local 时生效，target=ssh 使用已保存主机的登录 shell。"
+          },
+          "cols": {
+            "type": "number",
+            "description": "可选列数，默认 120。"
+          },
+          "rows": {
+            "type": "number",
+            "description": "可选行数，默认 30。"
+          },
+          "agentSessionId": {
+            "type": "string",
+            "description": "可选 Agent session id，仅作为调用关联信息，不限制 global scope；省略时创建可供第三方 MCP 使用的全局 headless session。"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "terminal.write",
+      "title": "写入终端",
+      "description": "向既有终端写入原始输入。外部 MCP 仅在 terminal.create 返回的 headless sessionId 或用户明确指定并确认的 UI Tab sessionId 上使用；可见输入/输出不是默认路径。内置右栏 Agent/session-terminal 仍使用 global scope 和 targetBinding 首选目标，不额外创建 Kerminal 确认步骤。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "外部 MCP 使用 terminal.create 后必须传回的显式 session id，或用户明确指定并确认的 UI Tab session id；内置右栏 Agent 可省略并按 targetBinding 解析，Agent session 的 scope 为 global。"
+          },
+          "agentSessionId": {
+            "type": "string",
+            "description": "Kerminal Agent session id；仅内置右栏 Agent/session-terminal 用于解析 targetBinding 和 global scope。"
+          },
+          "bindingGeneration": {
+            "type": "number",
+            "description": "兼容旧调用的可选 generation；当前 targetBinding 或显式 sessionId 路径无需提供。"
+          },
+          "data": {
+            "type": "string",
+            "description": "写入终端的原始输入。"
+          }
+        },
+        "required": [
+          "data"
+        ]
+      }
+    },
+    {
+      "name": "terminal.snapshot",
+      "title": "读取终端快照",
+      "description": "读取指定 headless session 或用户明确指定的 UI Tab 的最近输出快照，用于写入前确认上下文；内置右栏 Agent/session-terminal 也可按 targetBinding 读取 global scope 成员。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "外部 MCP 使用 terminal.create 返回的显式 session id，或用户明确确认的 UI Tab session id；内置 Agent 可省略。"
+          },
+          "agentSessionId": {
+            "type": "string",
+            "description": "Kerminal Agent session id；仅内置右栏 Agent/session-terminal 用于解析 targetBinding 和 global scope。"
+          },
+          "maxBytes": {
+            "type": "number",
+            "description": "最多读取的最近输出字节数，默认 24576。"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "terminal.resolve_agent_target",
+      "title": "解析 Agent 目标终端",
+      "description": "把内置右栏 Agent session id 解析为当前 targetBinding 首选终端，并返回 live/stale 状态；该解析不改变外部 MCP 的后台默认，也不限制 Agent global scope 中的其它终端。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agentSessionId": {
+            "type": "string",
+            "description": "Kerminal Agent session id。"
+          }
+        },
+        "required": [
+          "agentSessionId"
+        ]
+      }
+    },
+    {
+      "name": "kerminal.agent.current_session",
+      "title": "读取 Agent 会话",
+      "description": "读取当前 Kerminal Agent session 文件元数据、provider 和关键路径。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agentSessionId": {
+            "type": "string",
+            "description": "Kerminal Agent session id。"
+          }
+        },
+        "required": [
+          "agentSessionId"
+        ]
+      }
+    },
+    {
+      "name": "kerminal.agent.target_context",
+      "title": "读取 Agent 目标上下文",
+      "description": "读取内置右栏 Agent 的 targetBinding 首选目标、global scope、live/stale 状态和最近终端输出快照；外部 MCP 默认不因该上下文切换到可见 Tab。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agentSessionId": {
+            "type": "string",
+            "description": "Kerminal Agent session id。"
+          },
+          "maxBytes": {
+            "type": "number",
+            "description": "最多读取的最近输出字节数，默认 24576。"
+          }
+        },
+        "required": [
+          "agentSessionId"
+        ]
+      }
+    },
+    {
+      "name": "kerminal.config.validate",
+      "title": "校验文件配置",
+      "description": "只读校验当前 Kerminal 文件型配置是否可被运行时代码加载；用于外部 Agent 编辑 settings/profiles/hosts/snippets/workflows 后验证，不做配置 CRUD，不读取 secrets。",
+      "category": "diagnostics",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "scope": {
+            "type": "string",
+            "description": "校验范围，默认 all。",
+            "enum": [
+              "all",
+              "settings",
+              "profiles",
+              "hosts",
+              "snippets",
+              "workflows"
+            ]
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "terminal.resize",
+      "title": "调整终端尺寸",
+      "description": "同步 rows/cols 到后端会话。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "终端 session id。"
+          },
+          "agentSessionId": {
+            "type": "string",
+            "description": "Agent session id；提供时校验当前 scope。"
+          },
+          "cols": {
+            "type": "number",
+            "description": "目标列数。"
+          },
+          "rows": {
+            "type": "number",
+            "description": "目标行数。"
+          }
+        },
+        "required": [
+          "sessionId",
+          "cols",
+          "rows"
+        ]
+      }
+    },
+    {
+      "name": "terminal.list",
+      "title": "列出终端会话",
+      "description": "读取当前运行时全部用户终端会话摘要；Agent endpoint 默认按 global scope 返回所有 Kerminal tabs 的用户终端及断开 pane 成员，targetBinding 仅标记内置 Agent 的首选目标。外部 MCP 可用该列表做后台会话查询、诊断和清理；列表可见不等于 UI 操作授权，只有用户明确要求操作某个 UI Tab 时才可选择对应 sessionId 写入。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agentSessionId": {
+            "type": "string",
+            "description": "Agent session id；由 session-scoped endpoint 自动注入。"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "terminal.reconnect",
+      "title": "重连终端 pane",
+      "description": "仅当首选或所选 pane 确实断开时，请求前端按 paneId 复用现有连接配置执行真实重连；不要求用户重新打开或切换 scope，也不在 Rust 猜测主机凭据。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "paneId": {
+            "type": "string",
+            "description": "需要重连的终端 pane id。"
+          },
+          "agentSessionId": {
+            "type": "string",
+            "description": "Agent session id；提供时校验 pane 属于当前 scope。"
+          },
+          "timeoutMs": {
+            "type": "number",
+            "description": "等待前端确认的超时毫秒数，默认 30000，最大 60000。"
+          }
+        },
+        "required": [
+          "paneId"
+        ]
+      }
+    },
+    {
+      "name": "terminal.close",
+      "title": "关闭终端会话",
+      "description": "关闭并移除指定本地终端会话；调用前确认由 MCP host 负责。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "终端 session id。"
+          },
+          "agentSessionId": {
+            "type": "string",
+            "description": "Agent session id；提供时校验当前 scope。"
+          }
+        },
+        "required": [
+          "sessionId"
+        ]
+      }
+    },
+    {
+      "name": "terminal.log.start",
+      "title": "开始终端日志",
+      "description": "开始把指定终端 session 的新输出写入本地日志文件。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "终端 session id。"
+          },
+          "agentSessionId": {
+            "type": "string",
+            "description": "Agent session id；提供时校验当前 scope。"
+          }
+        },
+        "required": [
+          "sessionId"
+        ]
+      }
+    },
+    {
+      "name": "terminal.log.stop",
+      "title": "停止终端日志",
+      "description": "停止日志记录并返回路径摘要。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "终端 session id。"
+          },
+          "agentSessionId": {
+            "type": "string",
+            "description": "Agent session id；提供时校验当前 scope。"
+          }
+        },
+        "required": [
+          "sessionId"
+        ]
+      }
+    },
+    {
+      "name": "terminal.log.state",
+      "title": "读取终端日志状态",
+      "description": "读取指定终端 session 当前日志记录状态。",
+      "category": "terminal",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "终端 session id。"
+          },
+          "agentSessionId": {
+            "type": "string",
+            "description": "Agent session id；提供时校验当前 scope。"
+          }
+        },
+        "required": [
+          "sessionId"
+        ]
+      }
+    },
+    {
+      "name": "kerminal.host.upsert_with_credential",
+      "title": "保存主机和凭据",
+      "description": "创建或更新 SSH password 主机，并把明文密码写入 Kerminal encrypted vault；公开 hosts/*.toml 只保存 secret_ref。调用前确认由 MCP host 负责。",
+      "category": "ssh",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "可选主机 id；传入时更新该主机。"
+          },
+          "groupId": {
+            "type": "string",
+            "description": "可选主机分组 id。"
+          },
+          "name": {
+            "type": "string",
+            "description": "主机名称。"
+          },
+          "host": {
+            "type": "string",
+            "description": "SSH 主机名或 IP。"
+          },
+          "port": {
+            "type": "number",
+            "description": "SSH 端口；默认 22。"
+          },
+          "username": {
+            "type": "string",
+            "description": "SSH 用户名。"
+          },
+          "password": {
+            "type": "string",
+            "description": "本次保存的 SSH 明文密码；只写入 encrypted vault。"
+          }
+        },
+        "required": [
+          "name",
+          "host",
+          "username",
+          "password"
+        ]
+      }
+    },
+    {
+      "name": "kerminal.vault.encrypt_secret",
+      "title": "加密保存凭据",
+      "description": "把授权提供的明文凭据加密写入 Kerminal encrypted vault，并返回可写入 host metadata 的 secret_ref。",
+      "category": "ssh",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "secret 类型。",
+            "enum": [
+              "ssh-host",
+              "jump-host",
+              "rdp-host"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "关联的 host id。"
+          },
+          "scope": {
+            "type": "string",
+            "description": "secret 作用域，例如 target 或 jump-0。"
+          },
+          "material": {
+            "type": "string",
+            "description": "凭据材料类型。",
+            "enum": [
+              "password",
+              "private-key",
+              "key-passphrase"
+            ]
+          },
+          "plaintext": {
+            "type": "string",
+            "description": "授权提供的明文凭据；只写入 encrypted vault。"
+          }
+        },
+        "required": [
+          "kind",
+          "hostId",
+          "scope",
+          "material",
+          "plaintext"
+        ]
+      }
+    },
+    {
+      "name": "ssh.command",
+      "title": "执行远程命令",
+      "description": "外部 MCP 默认后台执行非交互 SSH 命令并返回结构化 stdout/stderr；结果不会显示在左侧终端。持久/交互任务请先用 terminal.create 创建 headless PTY，再用显式 sessionId 调用 terminal.snapshot/write/close；只有用户明确要求操作 UI Tab 时才确认可见目标。MCP host 仍可按自身策略处理调用，不需要 Kerminal 额外创建确认步骤。",
+      "category": "ssh",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "远程主机 id。"
+          },
+          "command": {
+            "type": "string",
+            "description": "远程 shell 命令或脚本片段。"
+          },
+          "proxyUrl": {
+            "type": "string",
+            "description": "本次远程命令临时代理，不写远端 profile。"
+          },
+          "proxyProtocol": {
+            "type": "string",
+            "description": "proxyUrl 的协议；缺省时根据 URL 推断。",
+            "enum": [
+              "http",
+              "socks5"
+            ]
+          },
+          "timeoutSeconds": {
+            "type": "number",
+            "description": "执行超时时间，单位秒。"
+          },
+          "maxOutputBytes": {
+            "type": "number",
+            "description": "stdout/stderr 最大保留字节数。"
+          }
+        },
+        "required": [
+          "hostId",
+          "command"
+        ]
+      }
+    },
+    {
+      "name": "ssh.command_on_resolved_host",
+      "title": "解析目标后执行远程命令",
+      "description": "外部 MCP 默认解析已保存 SSH 主机并后台执行非交互命令；结果不会显示在左侧终端。持久/交互任务请先用 terminal.create 创建 headless PTY，再用显式 sessionId 调用 terminal.snapshot/write/close；只有用户明确要求操作 UI Tab 时才确认可见目标。",
+      "category": "ssh",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "可选远程主机 id；已知时优先传入。"
+          },
+          "groupId": {
+            "type": "string",
+            "description": "可选主机分组 id。"
+          },
+          "groupName": {
+            "type": "string",
+            "description": "可选主机分组名称。"
+          },
+          "name": {
+            "type": "string",
+            "description": "可选主机名称。"
+          },
+          "host": {
+            "type": "string",
+            "description": "可选主机名或 IP。"
+          },
+          "username": {
+            "type": "string",
+            "description": "可选 SSH 用户名。"
+          },
+          "port": {
+            "type": "number",
+            "description": "可选 SSH 端口。"
+          },
+          "command": {
+            "type": "string",
+            "description": "远程 shell 命令或脚本片段。"
+          },
+          "proxyUrl": {
+            "type": "string",
+            "description": "本次远程命令临时代理，不写远端 profile。"
+          },
+          "proxyProtocol": {
+            "type": "string",
+            "description": "proxyUrl 的协议；缺省时根据 URL 推断。",
+            "enum": [
+              "http",
+              "socks5"
+            ]
+          },
+          "timeoutSeconds": {
+            "type": "number",
+            "description": "执行超时时间，单位秒。"
+          },
+          "maxOutputBytes": {
+            "type": "number",
+            "description": "stdout/stderr 最大保留字节数。"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    },
+    {
+      "name": "sftp.list",
+      "title": "列出远程目录",
+      "description": "读取当前 SSH 主机上的远程目录内容。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "远程主机 id。"
+          },
+          "path": {
+            "type": "string",
+            "description": "远程目录路径。"
+          }
+        },
+        "required": [
+          "hostId",
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "sftp.rename",
+      "title": "重命名远程路径",
+      "description": "重命名远程文件或目录；调用前确认由 MCP host 负责。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "远程主机 id。"
+          },
+          "fromPath": {
+            "type": "string",
+            "description": "原远程路径。"
+          },
+          "toPath": {
+            "type": "string",
+            "description": "新远程路径。"
+          }
+        },
+        "required": [
+          "hostId",
+          "fromPath",
+          "toPath"
+        ]
+      }
+    },
+    {
+      "name": "sftp.move",
+      "title": "移动远程路径",
+      "description": "移动远程文件或目录；调用前确认由 MCP host 负责。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "远程主机 id。"
+          },
+          "fromPath": {
+            "type": "string",
+            "description": "原远程路径。"
+          },
+          "toPath": {
+            "type": "string",
+            "description": "目标远程路径。"
+          }
+        },
+        "required": [
+          "hostId",
+          "fromPath",
+          "toPath"
+        ]
+      }
+    },
+    {
+      "name": "sftp.preview",
+      "title": "预览远程文件",
+      "description": "读取远程文本文件预览。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "远程主机 id。"
+          },
+          "path": {
+            "type": "string",
+            "description": "远程文件路径。"
+          },
+          "maxBytes": {
+            "type": "number",
+            "description": "最多读取字节数。"
+          }
+        },
+        "required": [
+          "hostId",
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "sftp.delete",
+      "title": "删除远程文件",
+      "description": "删除远程文件或空目录；调用前确认由 MCP host 负责。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "远程主机 id。"
+          },
+          "path": {
+            "type": "string",
+            "description": "远程路径。"
+          },
+          "directory": {
+            "type": "boolean",
+            "description": "是否按空目录删除。"
+          }
+        },
+        "required": [
+          "hostId",
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "sftp.create_directory",
+      "title": "创建远程目录",
+      "description": "创建远程目录；调用前确认由 MCP host 负责。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "远程主机 id。"
+          },
+          "path": {
+            "type": "string",
+            "description": "远程目录路径。"
+          }
+        },
+        "required": [
+          "hostId",
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "sftp.chmod",
+      "title": "修改远程权限",
+      "description": "修改远程路径权限；调用前确认由 MCP host 负责。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "远程主机 id。"
+          },
+          "path": {
+            "type": "string",
+            "description": "远程路径。"
+          },
+          "mode": {
+            "type": "string",
+            "description": "八进制权限模式，例如 644 或 0755。"
+          }
+        },
+        "required": [
+          "hostId",
+          "path",
+          "mode"
+        ]
+      }
+    },
+    {
+      "name": "sftp.transfer.enqueue",
+      "title": "创建 SFTP 传输任务",
+      "description": "按 source -> destination 快速入队并返回任务 id；后台传输没有总时长限制，默认 180 秒无确认进度才触发保护。随后用 sftp.transfer.list 按 transferId 查询终态；安全文件任务首次停滞自动恢复一次，终态 retryable=true 再用 sftp.transfer.retry 继续。大文件无需擅自提高 idleTimeoutSeconds，正式文件尚未出现不代表传输失败。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "required": [
+              "source",
+              "destination",
+              "kind",
+              "conflictPolicy"
+            ]
+          }
+        ],
+        "properties": {
+          "source": {
+            "description": "源端点",
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "type",
+                  "path"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "local",
+                    "description": "运行 Kerminal 的本机。"
+                  },
+                  "path": {
+                    "type": "string",
+                    "description": "本机文件或目录路径。"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "type",
+                  "hostId",
+                  "path"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "remote",
+                    "description": "保存的 SSH/SFTP 主机。"
+                  },
+                  "hostId": {
+                    "type": "string",
+                    "description": "保存的远程主机 id。"
+                  },
+                  "path": {
+                    "type": "string",
+                    "description": "远程文件或目录路径。"
+                  }
+                }
+              }
+            ]
+          },
+          "destination": {
+            "description": "目标端点",
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "type",
+                  "path"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "local",
+                    "description": "运行 Kerminal 的本机。"
+                  },
+                  "path": {
+                    "type": "string",
+                    "description": "本机文件或目录路径。"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "type",
+                  "hostId",
+                  "path"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "remote",
+                    "description": "保存的 SSH/SFTP 主机。"
+                  },
+                  "hostId": {
+                    "type": "string",
+                    "description": "保存的远程主机 id。"
+                  },
+                  "path": {
+                    "type": "string",
+                    "description": "远程文件或目录路径。"
+                  }
+                }
+              }
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "description": "传输对象类型。",
+            "enum": [
+              "file",
+              "directory"
+            ]
+          },
+          "conflictPolicy": {
+            "type": "string",
+            "description": "目标已存在时的处理方式。",
+            "enum": [
+              "overwrite",
+              "skip",
+              "rename"
+            ]
+          },
+          "idleTimeoutSeconds": {
+            "type": "number",
+            "description": "可选的连续无字节进度保护秒数；30-3600，未传时使用全局设置。不会限制传输总时长。",
+            "minimum": 30,
+            "maximum": 3600
+          }
+        }
+      }
+    },
+    {
+      "name": "sftp.transfer.list",
+      "title": "列出 SFTP 传输任务",
+      "description": "读取 SFTP 队列、状态和进度；可按 transferId 精确查询。status=running 且 phase=waiting 时继续查询，recoveryAttempt=1 表示一次自动恢复进行过。终态 retryable=true 时可按 id 使用 sftp.transfer.retry。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "transferId": {
+            "type": "string",
+            "description": "可选的 SFTP 传输任务 id；不传则返回全部任务。"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "sftp.transfer.cancel",
+      "title": "取消 SFTP 传输任务",
+      "description": "请求取消指定传输任务；调用是短请求，继续按 transferId 查询，直到 canceled、failed 或 succeeded。若原子提交已成功，保留 succeeded。调用前确认由 MCP host 负责。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "transferId": {
+            "type": "string",
+            "description": "SFTP 传输任务 id。"
+          }
+        },
+        "required": [
+          "transferId"
+        ]
+      }
+    },
+    {
+      "name": "sftp.transfer.retry",
+      "title": "继续 SFTP 传输任务",
+      "description": "继续指定的可重试 SFTP 传输；复用原始端点、冲突策略和无进度阈值。resumable=true 时从已确认断点继续，resumable=false 时从头传输；调用只表示已入队，不代表已完成。调用前确认由 MCP host 负责。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "transferId": {
+            "type": "string",
+            "description": "允许重试的 SFTP 传输任务 id（由 list 返回 retryable=true）。"
+          }
+        },
+        "required": [
+          "transferId"
+        ]
+      }
+    },
+    {
+      "name": "sftp.transfer.clear_completed",
+      "title": "清理已结束 SFTP 任务",
+      "description": "清理成功、失败或取消的任务。",
+      "category": "sftp",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "server_info.snapshot",
+      "title": "读取服务器信息",
+      "description": "读取 SSH 主机 CPU、内存、磁盘、网络和运行时间摘要。",
+      "category": "serverInfo",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "远程主机 id。"
+          }
+        },
+        "required": [
+          "hostId"
+        ]
+      }
+    },
+    {
+      "name": "port_forward.create",
+      "title": "创建端口转发",
+      "description": "创建 SSH 端口转发，包括本机和远端 SOCKS 转发。",
+      "category": "portForward",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "远程主机 id。"
+          },
+          "name": {
+            "type": "string",
+            "description": "用户可见转发名称。"
+          },
+          "kind": {
+            "type": "string",
+            "description": "转发类型。",
+            "enum": [
+              "local",
+              "remote",
+              "remoteDynamic",
+              "dynamic"
+            ]
+          },
+          "proxyProtocol": {
+            "type": "string",
+            "description": "SOCKS 转发代理协议。",
+            "enum": [
+              "socks5"
+            ]
+          },
+          "bindHost": {
+            "type": "string",
+            "description": "监听地址，默认 127.0.0.1。"
+          },
+          "localBindHost": {
+            "type": "string",
+            "description": "本机侧监听地址或本机代理绑定地址。"
+          },
+          "remoteBindHost": {
+            "type": "string",
+            "description": "远端监听地址。"
+          },
+          "sourcePort": {
+            "type": "number",
+            "description": "监听端口；remote 时为远端端口。"
+          },
+          "targetHost": {
+            "type": "string",
+            "description": "目标主机；dynamic 转发可为空。"
+          },
+          "targetPort": {
+            "type": "number",
+            "description": "目标端口；dynamic 转发可为空。"
+          },
+          "remoteAccessScope": {
+            "type": "string",
+            "description": "远端监听范围；非 loopback 需 GatewayPorts。",
+            "enum": [
+              "loopback",
+              "privateNetwork",
+              "allInterfaces",
+              "custom"
+            ]
+          },
+          "proxyApplyScope": {
+            "type": "string",
+            "description": "代理应用范围；MCP 默认不写远端 profile。",
+            "enum": [
+              "none",
+              "currentTerminal",
+              "futureTerminals",
+              "userProfile",
+              "toolOnly"
+            ]
+          }
+        },
+        "required": [
+          "hostId",
+          "kind",
+          "sourcePort"
+        ]
+      }
+    },
+    {
+      "name": "port_forward.list",
+      "title": "列出端口转发",
+      "description": "读取端口转发配置和状态。",
+      "category": "portForward",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "port_forward.close",
+      "title": "停止端口转发",
+      "description": "停止转发会话并保留配置；调用前确认由 MCP host 负责。",
+      "category": "portForward",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "forwardId": {
+            "type": "string",
+            "description": "端口转发会话 id。"
+          }
+        },
+        "required": [
+          "forwardId"
+        ]
+      }
+    },
+    {
+      "name": "container.list",
+      "title": "列出容器",
+      "description": "读取 Docker/Podman 容器列表。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "includeStopped": {
+            "type": "boolean",
+            "description": "是否包含已停止容器。"
+          }
+        },
+        "required": [
+          "hostId"
+        ]
+      }
+    },
+    {
+      "name": "container.inspect",
+      "title": "读取容器详情",
+      "description": "读取 Docker/Podman inspect 精简摘要。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId"
+        ]
+      }
+    },
+    {
+      "name": "container.logs.tail",
+      "title": "读取容器日志",
+      "description": "读取容器最近日志；tail 会被服务端限制在安全范围内。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "tail": {
+            "type": "number",
+            "description": "读取最近多少行日志。"
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId"
+        ]
+      }
+    },
+    {
+      "name": "container.stats",
+      "title": "读取容器监控",
+      "description": "读取一次性 no-stream stats 摘要。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId"
+        ]
+      }
+    },
+    {
+      "name": "container.start",
+      "title": "启动容器",
+      "description": "启动指定 Docker/Podman 容器。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId"
+        ]
+      }
+    },
+    {
+      "name": "container.stop",
+      "title": "停止容器",
+      "description": "停止指定 Docker/Podman 容器。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId"
+        ]
+      }
+    },
+    {
+      "name": "container.restart",
+      "title": "重启容器",
+      "description": "重启指定 Docker/Podman 容器。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId"
+        ]
+      }
+    },
+    {
+      "name": "container.remove",
+      "title": "删除容器",
+      "description": "删除指定 Docker/Podman 容器；force=true 会强制删除运行中容器。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "force": {
+            "type": "boolean",
+            "description": "删除容器时是否强制删除运行中的容器。"
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId"
+        ]
+      }
+    },
+    {
+      "name": "container.files.list",
+      "title": "列出容器目录",
+      "description": "读取容器目录。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "容器内目录路径。"
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId",
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "container.files.preview",
+      "title": "预览容器文件",
+      "description": "读取容器文本文件预览。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "容器内文件路径。"
+          },
+          "maxBytes": {
+            "type": "number",
+            "description": "最多读取字节数。"
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId",
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "container.files.write_text",
+      "title": "写入容器文本文件",
+      "description": "写入容器内 UTF-8 文本文件；expectedRevision 可用于保存前冲突检测。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "容器内文件路径。"
+          },
+          "content": {
+            "type": "string",
+            "description": "要写入的 UTF-8 文本内容。"
+          },
+          "encoding": {
+            "type": "string",
+            "description": "文本编码，目前只接受 utf-8 或 utf-8-lossy。",
+            "enum": [
+              "utf-8",
+              "utf-8-lossy"
+            ]
+          },
+          "expectedRevision": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "size": {
+                "type": "number",
+                "description": "文件大小，单位字节。"
+              },
+              "modified": {
+                "type": "string",
+                "description": "修改时间文本。"
+              },
+              "permissions": {
+                "type": "string",
+                "description": "权限文本。"
+              },
+              "permissionsMode": {
+                "type": "number",
+                "description": "原始权限 mode。"
+              },
+              "contentSha256": {
+                "type": "string",
+                "description": "文件内容 SHA-256。"
+              }
+            },
+            "required": [
+              "size"
+            ],
+            "description": "打开文件时记录的 revision；为空时新建或显式覆盖不做 CAS 比对。"
+          },
+          "create": {
+            "type": "boolean",
+            "description": "是否按新建文件处理。"
+          },
+          "overwriteOnConflict": {
+            "type": "boolean",
+            "description": "revision 冲突或目标存在时是否显式覆盖。"
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId",
+          "path",
+          "content",
+          "encoding",
+          "create",
+          "overwriteOnConflict"
+        ]
+      }
+    },
+    {
+      "name": "container.files.create_directory",
+      "title": "创建容器目录",
+      "description": "创建容器内目录；调用前确认由 MCP host 负责。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "容器内目录路径。"
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId",
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "container.files.rename",
+      "title": "重命名容器路径",
+      "description": "重命名容器内文件或目录；调用前确认由 MCP host 负责。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "fromPath": {
+            "type": "string",
+            "description": "原容器内路径。"
+          },
+          "toPath": {
+            "type": "string",
+            "description": "新容器内路径。"
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId",
+          "fromPath",
+          "toPath"
+        ]
+      }
+    },
+    {
+      "name": "container.files.chmod",
+      "title": "修改容器路径权限",
+      "description": "修改容器内路径权限；调用前确认由 MCP host 负责。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "容器内路径。"
+          },
+          "mode": {
+            "type": "string",
+            "description": "八进制权限模式，例如 644 或 0755。"
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId",
+          "path",
+          "mode"
+        ]
+      }
+    },
+    {
+      "name": "container.files.upload",
+      "title": "上传到容器",
+      "description": "上传本地文件或目录到容器；调用前确认由 MCP host 负责。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "remotePath": {
+            "type": "string",
+            "description": "容器内路径。"
+          },
+          "localPath": {
+            "type": "string",
+            "description": "本地路径。"
+          },
+          "kind": {
+            "type": "string",
+            "description": "传输对象类型。",
+            "enum": [
+              "file",
+              "directory"
+            ]
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId",
+          "remotePath",
+          "localPath",
+          "kind"
+        ]
+      }
+    },
+    {
+      "name": "container.files.download",
+      "title": "从容器下载",
+      "description": "下载容器内文件或目录到本地；调用前确认由 MCP host 负责。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "remotePath": {
+            "type": "string",
+            "description": "容器内路径。"
+          },
+          "localPath": {
+            "type": "string",
+            "description": "本地路径。"
+          },
+          "kind": {
+            "type": "string",
+            "description": "传输对象类型。",
+            "enum": [
+              "file",
+              "directory"
+            ]
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId",
+          "remotePath",
+          "localPath",
+          "kind"
+        ]
+      }
+    },
+    {
+      "name": "container.files.delete",
+      "title": "删除容器路径",
+      "description": "删除容器内文件或目录；directory=true 会递归删除目录。",
+      "category": "container",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "hostId": {
+            "type": "string",
+            "description": "容器宿主 SSH 主机 id。"
+          },
+          "containerId": {
+            "type": "string",
+            "description": "容器 id 或名称。"
+          },
+          "runtime": {
+            "type": "string",
+            "description": "容器运行时；为空时使用 Docker。",
+            "enum": [
+              "docker",
+              "podman"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "容器内路径。"
+          },
+          "directory": {
+            "type": "boolean",
+            "description": "是否按目录递归删除。"
+          }
+        },
+        "required": [
+          "hostId",
+          "containerId",
+          "path",
+          "directory"
+        ]
+      }
+    },
+    {
+      "name": "tmux.probe",
+      "title": "探测 tmux",
+      "description": "探测本地或已保存 SSH 主机上的 tmux 是否可用。",
+      "category": "tmux",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "targetKind": {
+            "type": "string",
+            "description": "tmux 目标类型。local 使用本机 tmux；ssh 使用已保存 SSH 主机。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "targetKind=ssh 时必填的已保存 SSH 主机 id。"
+          },
+          "profileId": {
+            "type": "string",
+            "description": "targetKind=local 时可选的本地 profile id。"
+          },
+          "socketName": {
+            "type": "string",
+            "description": "tmux -L socket 名称；不能和 socketPath 同时使用。"
+          },
+          "socketPath": {
+            "type": "string",
+            "description": "tmux -S socket 路径；由目标机器解释。"
+          },
+          "tmuxPath": {
+            "type": "string",
+            "description": "可选 tmux 可执行文件路径。"
+          }
+        },
+        "required": [
+          "targetKind"
+        ]
+      }
+    },
+    {
+      "name": "tmux.list_sessions",
+      "title": "列出 tmux sessions",
+      "description": "读取本地或已保存 SSH 主机上的 tmux session 列表。",
+      "category": "tmux",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "targetKind": {
+            "type": "string",
+            "description": "tmux 目标类型。local 使用本机 tmux；ssh 使用已保存 SSH 主机。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "targetKind=ssh 时必填的已保存 SSH 主机 id。"
+          },
+          "profileId": {
+            "type": "string",
+            "description": "targetKind=local 时可选的本地 profile id。"
+          },
+          "socketName": {
+            "type": "string",
+            "description": "tmux -L socket 名称；不能和 socketPath 同时使用。"
+          },
+          "socketPath": {
+            "type": "string",
+            "description": "tmux -S socket 路径；由目标机器解释。"
+          },
+          "tmuxPath": {
+            "type": "string",
+            "description": "可选 tmux 可执行文件路径。"
+          }
+        },
+        "required": [
+          "targetKind"
+        ]
+      }
+    },
+    {
+      "name": "tmux.create_session",
+      "title": "创建 tmux session",
+      "description": "创建 detached tmux session；调用前确认由 MCP host 负责。",
+      "category": "tmux",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "targetKind": {
+            "type": "string",
+            "description": "tmux 目标类型。local 使用本机 tmux；ssh 使用已保存 SSH 主机。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "targetKind=ssh 时必填的已保存 SSH 主机 id。"
+          },
+          "profileId": {
+            "type": "string",
+            "description": "targetKind=local 时可选的本地 profile id。"
+          },
+          "socketName": {
+            "type": "string",
+            "description": "tmux -L socket 名称；不能和 socketPath 同时使用。"
+          },
+          "socketPath": {
+            "type": "string",
+            "description": "tmux -S socket 路径；由目标机器解释。"
+          },
+          "tmuxPath": {
+            "type": "string",
+            "description": "可选 tmux 可执行文件路径。"
+          },
+          "name": {
+            "type": "string",
+            "description": "新 session 名称。"
+          },
+          "cwd": {
+            "type": "string",
+            "description": "可选初始目录，由目标机器解释。"
+          }
+        },
+        "required": [
+          "targetKind",
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "tmux.rename_session",
+      "title": "重命名 tmux session",
+      "description": "重命名 tmux session；调用前确认由 MCP host 负责。",
+      "category": "tmux",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "targetKind": {
+            "type": "string",
+            "description": "tmux 目标类型。local 使用本机 tmux；ssh 使用已保存 SSH 主机。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "targetKind=ssh 时必填的已保存 SSH 主机 id。"
+          },
+          "profileId": {
+            "type": "string",
+            "description": "targetKind=local 时可选的本地 profile id。"
+          },
+          "socketName": {
+            "type": "string",
+            "description": "tmux -L socket 名称；不能和 socketPath 同时使用。"
+          },
+          "socketPath": {
+            "type": "string",
+            "description": "tmux -S socket 路径；由目标机器解释。"
+          },
+          "tmuxPath": {
+            "type": "string",
+            "description": "可选 tmux 可执行文件路径。"
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "session id 或名称。"
+          },
+          "name": {
+            "type": "string",
+            "description": "新 session 名称。"
+          }
+        },
+        "required": [
+          "targetKind",
+          "sessionId",
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "tmux.kill_session",
+      "title": "结束 tmux session",
+      "description": "结束指定 tmux session；调用前确认由 MCP host 负责。",
+      "category": "tmux",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "targetKind": {
+            "type": "string",
+            "description": "tmux 目标类型。local 使用本机 tmux；ssh 使用已保存 SSH 主机。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "targetKind=ssh 时必填的已保存 SSH 主机 id。"
+          },
+          "profileId": {
+            "type": "string",
+            "description": "targetKind=local 时可选的本地 profile id。"
+          },
+          "socketName": {
+            "type": "string",
+            "description": "tmux -L socket 名称；不能和 socketPath 同时使用。"
+          },
+          "socketPath": {
+            "type": "string",
+            "description": "tmux -S socket 路径；由目标机器解释。"
+          },
+          "tmuxPath": {
+            "type": "string",
+            "description": "可选 tmux 可执行文件路径。"
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "session id 或名称。"
+          }
+        },
+        "required": [
+          "targetKind",
+          "sessionId"
+        ]
+      }
+    },
+    {
+      "name": "tmux.list_windows",
+      "title": "列出 tmux windows",
+      "description": "读取指定 tmux session 下的 window 列表。",
+      "category": "tmux",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "targetKind": {
+            "type": "string",
+            "description": "tmux 目标类型。local 使用本机 tmux；ssh 使用已保存 SSH 主机。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "targetKind=ssh 时必填的已保存 SSH 主机 id。"
+          },
+          "profileId": {
+            "type": "string",
+            "description": "targetKind=local 时可选的本地 profile id。"
+          },
+          "socketName": {
+            "type": "string",
+            "description": "tmux -L socket 名称；不能和 socketPath 同时使用。"
+          },
+          "socketPath": {
+            "type": "string",
+            "description": "tmux -S socket 路径；由目标机器解释。"
+          },
+          "tmuxPath": {
+            "type": "string",
+            "description": "可选 tmux 可执行文件路径。"
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "session id 或名称。"
+          }
+        },
+        "required": [
+          "targetKind",
+          "sessionId"
+        ]
+      }
+    },
+    {
+      "name": "tmux.list_panes",
+      "title": "列出 tmux panes",
+      "description": "读取指定 tmux session、window 或 pane 下的 pane 列表。",
+      "category": "tmux",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "targetKind": {
+            "type": "string",
+            "description": "tmux 目标类型。local 使用本机 tmux；ssh 使用已保存 SSH 主机。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "targetKind=ssh 时必填的已保存 SSH 主机 id。"
+          },
+          "profileId": {
+            "type": "string",
+            "description": "targetKind=local 时可选的本地 profile id。"
+          },
+          "socketName": {
+            "type": "string",
+            "description": "tmux -L socket 名称；不能和 socketPath 同时使用。"
+          },
+          "socketPath": {
+            "type": "string",
+            "description": "tmux -S socket 路径；由目标机器解释。"
+          },
+          "tmuxPath": {
+            "type": "string",
+            "description": "可选 tmux 可执行文件路径。"
+          },
+          "targetId": {
+            "type": "string",
+            "description": "session、window 或 pane id。"
+          }
+        },
+        "required": [
+          "targetKind",
+          "targetId"
+        ]
+      }
+    },
+    {
+      "name": "tmux.capture_pane",
+      "title": "捕获 tmux pane 输出",
+      "description": "读取指定 tmux pane 的最近输出并脱敏。",
+      "category": "tmux",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "targetKind": {
+            "type": "string",
+            "description": "tmux 目标类型。local 使用本机 tmux；ssh 使用已保存 SSH 主机。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "targetKind=ssh 时必填的已保存 SSH 主机 id。"
+          },
+          "profileId": {
+            "type": "string",
+            "description": "targetKind=local 时可选的本地 profile id。"
+          },
+          "socketName": {
+            "type": "string",
+            "description": "tmux -L socket 名称；不能和 socketPath 同时使用。"
+          },
+          "socketPath": {
+            "type": "string",
+            "description": "tmux -S socket 路径；由目标机器解释。"
+          },
+          "tmuxPath": {
+            "type": "string",
+            "description": "可选 tmux 可执行文件路径。"
+          },
+          "paneId": {
+            "type": "string",
+            "description": "pane id，例如 %1。"
+          },
+          "lines": {
+            "type": "number",
+            "description": "最多读取最近多少行，默认 200，上限 1000。"
+          }
+        },
+        "required": [
+          "targetKind",
+          "paneId"
+        ]
+      }
+    },
+    {
+      "name": "tmux.attach_plan",
+      "title": "生成 tmux attach 启动规格",
+      "description": "生成 attach 到指定 tmux session 的终端启动规格；不会创建 Kerminal pane。",
+      "category": "tmux",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "targetKind": {
+            "type": "string",
+            "description": "tmux 目标类型。local 使用本机 tmux；ssh 使用已保存 SSH 主机。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "hostId": {
+            "type": "string",
+            "description": "targetKind=ssh 时必填的已保存 SSH 主机 id。"
+          },
+          "profileId": {
+            "type": "string",
+            "description": "targetKind=local 时可选的本地 profile id。"
+          },
+          "socketName": {
+            "type": "string",
+            "description": "tmux -L socket 名称；不能和 socketPath 同时使用。"
+          },
+          "socketPath": {
+            "type": "string",
+            "description": "tmux -S socket 路径；由目标机器解释。"
+          },
+          "tmuxPath": {
+            "type": "string",
+            "description": "可选 tmux 可执行文件路径。"
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "session id 或名称。"
+          },
+          "sessionName": {
+            "type": "string",
+            "description": "展示用 session 名称；为空时使用 sessionId。"
+          },
+          "cwd": {
+            "type": "string",
+            "description": "可选初始目录，由目标机器解释。"
+          }
+        },
+        "required": [
+          "targetKind",
+          "sessionId"
+        ]
+      }
+    },
+    {
+      "name": "history.search",
+      "title": "搜索命令历史",
+      "description": "读取本地命令历史摘要；不会执行命令。",
+      "category": "history",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索关键词。"
+          },
+          "target": {
+            "type": "string",
+            "description": "目标类型。",
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "description": "命令来源。",
+            "enum": [
+              "user",
+              "snippet",
+              "broadcast",
+              "tool"
+            ]
+          },
+          "paneId": {
+            "type": "string",
+            "description": "前端 pane id。"
+          },
+          "remoteHostId": {
+            "type": "string",
+            "description": "SSH 主机 id。"
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "终端 session id。"
+          },
+          "limit": {
+            "type": "number",
+            "description": "返回数量上限。"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "diagnostics.runtime_health",
+      "title": "读取运行体检",
+      "description": "读取进程、资源和数据目录体检摘要。",
+      "category": "diagnostics",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "diagnostics.create_bundle",
+      "title": "生成诊断包",
+      "description": "生成本地脱敏诊断包，不上传。",
+      "category": "diagnostics",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      },
+      "enabled": true,
+      "exposedToMcp": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    }
+  ]
+}

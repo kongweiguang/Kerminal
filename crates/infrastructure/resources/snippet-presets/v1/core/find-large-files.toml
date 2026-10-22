@@ -1,0 +1,36 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version = 1
+id = "snippet.builtin.core.find_large_files"
+catalog_version = "1.0.0"
+pack = "core"
+category = "storage"
+sort_order = 600
+title = "查找大文件"
+description = "在指定挂载内列出前 20 个大于 100MB 的文件"
+template = "find {{ path }} -xdev -type f -size +100M -printf '%s %p\\n' | sort -nr | head -n 20"
+command_spec = "find"
+scope = "ssh"
+platforms = ["linux"]
+shells = ["bash", "zsh"]
+capabilities = ["find", "sort", "head"]
+tags = ["storage", "files", "inspect"]
+risk = "inspect"
+duration = "high_io"
+default_action = "insert"
+owner = "kerminal"
+tested_version = "GNU findutils 4.9"
+updated_at = "2026-07-13"
+
+[[variables]]
+name = "path"
+label = "搜索路径"
+description = "限制在该挂载点内搜索，例如 /var"
+kind = "path"
+required = true
+render_strategy = "shell_arg"
+
+[source]
+name = "GNU find manual"
+url = "https://www.gnu.org/software/findutils/manual/html_mono/find.html"

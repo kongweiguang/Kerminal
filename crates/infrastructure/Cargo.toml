@@ -1,0 +1,76 @@
+# @author kongweiguang
+[package]
+name = "kerminal-infrastructure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+cargo_packager_updater.workspace = true
+chacha20poly1305.workspace = true
+dirs.workspace = true
+fast-socks5.workspace = true
+getrandom.workspace = true
+image.workspace = true
+kerminal-application.workspace = true
+kerminal-domain.workspace = true
+kerminal-terminal.workspace = true
+keyring.workspace = true
+justelnet_core.workspace = true
+minisign_verify.workspace = true
+notify_rust.workspace = true
+notify.workspace = true
+portable-pty.workspace = true
+process-wrap.workspace = true
+rfd.workspace = true
+rusqlite.workspace = true
+russh.workspace = true
+russh_sftp.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+serialport.workspace = true
+sha2.workspace = true
+sysinfo.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio-socks.workspace = true
+tokio.workspace = true
+tokio_serial.workspace = true
+tokio-util.workspace = true
+tray_icon.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zip.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+
+[[example]]
+name = "session-acceptance"
+path = "../../tests/acceptance/session_runtime.rs"
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "=5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+windows-sys.workspace = true
+
+

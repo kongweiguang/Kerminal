@@ -1,0 +1,40 @@
+# @author kongweiguang
+[package]
+name = "kerminal-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+acceptance-metrics = ["gpui_kit/profiler"]
+
+[dependencies]
+zeroize.workspace = true
+chrono.workspace = true
+gpui_kit = { workspace = true, features = ["tree-sitter-languages"] }
+gpui_pre.workspace = true
+image.workspace = true
+linkify.workspace = true
+kerminal-application.workspace = true
+kerminal-domain.workspace = true
+kerminal-terminal.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
+unicode_segmentation.workspace = true
+unicode_width.workspace = true
+
+[dev-dependencies]
+# Headless tests exercise the selected GPUI backend without resolving Kit's optional fast backend.
+gpui_pre = { workspace = true, features = ["test-support"] }
+

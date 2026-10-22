@@ -1,0 +1,7 @@
+# @author kongweiguang
+
+[build]
+jobs = 2
+
+[alias]
+xtask = "run --package xtask --"

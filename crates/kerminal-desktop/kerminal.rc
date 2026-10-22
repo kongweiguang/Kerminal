@@ -1,0 +1,3 @@
+// @author kongweiguang
+// GPUI 从当前模块加载 ID 1；复用原版多尺寸 ICO，让任务栏和可执行文件显示同一品牌图标。
+1 ICON "../../resources/icons/icon.ico"

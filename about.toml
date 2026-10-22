@@ -1,0 +1,53 @@
+# @author kongweiguang
+# cargo-about 只选择经过审查的许可证；未识别或未批准的表达式必须阻断报告生成。
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "BSD-2-Clause",
+    "0BSD",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unlicense",
+]
+
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# 工作区自身的 crate 与根项目采用相同 GPL 版本，单独按名称放行，
+# 不把 GPL 加入第三方依赖的全局接受集。
+[kerminal-domain]
+accepted = ["GPL-3.0-or-later"]
+
+[kerminal-application]
+accepted = ["GPL-3.0-or-later"]
+
+[kerminal-terminal]
+accepted = ["GPL-3.0-or-later"]
+
+[kerminal-infrastructure]
+accepted = ["GPL-3.0-or-later"]
+
+[kerminal-ui]
+accepted = ["GPL-3.0-or-later"]
+
+[kerminal-mcp]
+accepted = ["GPL-3.0-or-later"]
+
+[kerminal-desktop]
+accepted = ["GPL-3.0-or-later"]
+
+[xtask]
+accepted = ["GPL-3.0-or-later"]

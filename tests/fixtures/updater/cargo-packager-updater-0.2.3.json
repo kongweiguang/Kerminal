@@ -1,0 +1,27 @@
+{
+  "version": "0.4.0-dev.0",
+  "notes": "fixture only",
+  "pub_date": "2026-10-16T02:00:00Z",
+  "platforms": {
+    "linux-x86_64": {
+      "url": "https://updates.invalid/kerminal/0.4.0/Kerminal_0.4.0_amd64.AppImage.tar.gz",
+      "signature": "untrusted comment: new test key\nAQID",
+      "format": "appimage"
+    },
+    "macos-aarch64": {
+      "url": "https://updates.invalid/kerminal/0.4.0/Kerminal-aarch64.app.tar.gz",
+      "signature": "untrusted comment: new test key\nAQID",
+      "format": "app"
+    },
+    "macos-x86_64": {
+      "url": "https://updates.invalid/kerminal/0.4.0/Kerminal-x86_64.app.tar.gz",
+      "signature": "untrusted comment: new test key\nAQID",
+      "format": "app"
+    },
+    "windows-x86_64": {
+      "url": "https://updates.invalid/kerminal/0.4.0/Kerminal_0.4.0_x64-setup.exe",
+      "signature": "untrusted comment: new test key\nAQID",
+      "format": "nsis"
+    }
+  }
+}

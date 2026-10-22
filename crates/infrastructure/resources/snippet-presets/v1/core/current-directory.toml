@@ -1,0 +1,25 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version=1
+id="snippet.builtin.core.current_directory"
+catalog_version="1.0.0"
+pack="core"
+category="files"
+sort_order=100
+title="当前目录"
+description="确认当前路径并列出目录内容"
+template="pwd && ls -la"
+command_spec="pwd"
+scope="any"
+platforms=["linux","macos"]
+shells=["bash","zsh","fish"]
+capabilities=["pwd","ls"]
+tags=["files","daily"]
+risk="inspect"
+duration="instant"
+default_action="insert"
+owner="kerminal"
+tested_version="POSIX.1-2024"
+updated_at="2026-07-13"
+source={name="POSIX utilities",url="https://pubs.opengroup.org/onlinepubs/9799919799/"}

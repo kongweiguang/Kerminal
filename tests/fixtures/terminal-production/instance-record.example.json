@@ -1,0 +1,7 @@
+{
+  "pid": 12345,
+  "executablePath": "C:\\kong\\personal-projects\\Kerminal\\代码\\kerminal-gpui\\target\\release\\kerminal.exe",
+  "startedAtUtc": "2026-10-20T00:00:00.000Z",
+  "mcpEndpoint": "http://127.0.0.1:37658/mcp",
+  "configRoot": "C:\\kong\\personal-projects\\Kerminal\\代码\\kerminal-gpui\\target\\diagnostics\\terminal-production-20261020\\config"
+}

@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "2e71af6d882157e706062b99f978c1723c9c5c64"
+  },
+  "path_in_vcs": "crates/updater"
+}

@@ -1,0 +1,5 @@
+schema_version = 1
+key_id = "workspace-default"
+algorithm = "xchacha20poly1305"
+created_at = "1700000000"
+master_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="

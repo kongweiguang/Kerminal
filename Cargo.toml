@@ -1,0 +1,121 @@
+# @author kongweiguang
+[workspace]
+resolver = "3"
+members = [
+    "crates/domain",
+    "crates/application",
+    "crates/terminal",
+    "crates/infrastructure",
+    "crates/kerminal-ui",
+    "crates/kerminal-mcp",
+    "crates/kerminal-desktop",
+    "xtask",
+]
+exclude = [
+    "vendor/alacritty_terminal",
+    "vendor/gpui-component",
+    "vendor/gpui-pre",
+    "vendor/gpui-pre-linux",
+    "vendor/gpui-pre-macos",
+    "vendor/gpui-pre-windows",
+    "vendor/portable-pty",
+    "vendor/single-application",
+    "vendor/cargo-packager-updater",
+]
+
+[workspace.package]
+version = "0.4.0-dev.0"
+edition = "2024"
+rust-version = "1.98"
+authors = ["kongweiguang"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/kongweiguang/Kerminal.git"
+
+[workspace.dependencies]
+kerminal-domain = { path = "crates/domain", version = "0.4.0-dev.0" }
+kerminal-application = { path = "crates/application", version = "0.4.0-dev.0" }
+kerminal-terminal = { path = "crates/terminal", version = "0.4.0-dev.0" }
+kerminal-infrastructure = { path = "crates/infrastructure", version = "0.4.0-dev.0" }
+kerminal-ui = { path = "crates/kerminal-ui", version = "0.4.0-dev.0" }
+kerminal-mcp = { path = "crates/kerminal-mcp", version = "0.4.0-dev.0" }
+kerminal-desktop = { path = "crates/kerminal-desktop", version = "0.4.0-dev.0" }
+
+async-trait = "0.1"
+anyhow = "1"
+alacritty_terminal = "0.26"
+axum = "0.8"
+base64 = "0.22"
+chacha20poly1305 = "=0.11.0"
+cargo_packager_updater = { package = "cargo-packager-updater", version = "=0.2.3" }
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+dirs = "6"
+fast-socks5 = "=1.0.0"
+getrandom = "=0.3.4"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+linkify = "=0.11.0"
+justelnet_core = { package = "justelnet-core", version = "=0.1.0" }
+tray_icon = { package = "tray-icon", version = "=0.26.1", default-features = false, features = ["ksni"] }
+notify_rust = { package = "notify-rust", version = "=4.18.2" }
+notify = "=8.2.0"
+minisign_verify = { package = "minisign-verify", version = "=0.2.5" }
+sys_locale = { package = "sys-locale", version = "=0.3.2" }
+gpui_kit = { package = "gpui-kit", version = "=0.7.3" }
+gpui_pre = { package = "gpui-pre", version = "=0.3.9" }
+gpui_pre_macos = { package = "gpui-pre-macos", version = "=0.3.9" }
+gpui_pre_macros = { package = "gpui-pre-macros", version = "=0.3.9" }
+gpui_pre_platform = { package = "gpui-pre-platform", version = "=0.3.9" }
+keyring = "=4.1.1"
+libc = "0.2"
+portable-pty = "=0.9.0"
+percent-encoding = "=2.3.2"
+process-wrap = { version = "=10.0.1", default-features = false, features = ["std", "tokio1", "job-object", "creation-flags", "kill-on-drop", "process-group"] }
+regex = "1.12"
+rfd = { version = "=0.15.4", default-features = false, features = ["tokio", "xdg-portal"] }
+rmcp = "=2.1.0"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "=2.2.0"
+single_application = { package = "single-application", version = "=0.1.1", features = ["tokio"] }
+tokio-socks = "=0.5.3"
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+rusqlite = { version = "=0.40.1", features = ["backup", "bundled"] }
+russh = { version = "=0.62.5", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh_sftp = { package = "bssh-russh-sftp", version = "=2.3.0" }
+serialport = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sysinfo = "=0.31.4"
+tar = "=0.4.46"
+tempfile = "=3.27.0"
+sha2 = "0.10"
+toml = "0.9"
+thiserror = "=2.0.18"
+tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio_serial = { package = "tokio-serial", version = "=5.5.0", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["io-util", "rt"] }
+url = "=2.5.8"
+vte = "=0.15.0"
+toml_edit = { version = "0.25", features = ["serde"] }
+unicode_segmentation = { package = "unicode-segmentation", version = "=1.13.3" }
+unicode_width = { package = "unicode-width", version = "=0.2.2" }
+tracing = "0.1"
+tracing_appender = { package = "tracing-appender", version = "=0.2.5" }
+tracing_subscriber = { package = "tracing-subscriber", version = "=0.3.23", default-features = false, features = ["fmt", "env-filter"] }
+uuid = { version = "=1.23.3", features = ["v4", "serde"] }
+zip = { version = "=9.0.4", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "=0.62.2", features = ["Win32_System_Threading"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[patch.crates-io]
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
+gpui-base = { path = "vendor/gpui-base" }
+gpui-component = { path = "vendor/gpui-component" }
+gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+cargo-packager-updater = { path = "vendor/cargo-packager-updater" }
+portable-pty = { path = "vendor/portable-pty" }
+single-application = { path = "vendor/single-application" }
+

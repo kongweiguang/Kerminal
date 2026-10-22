@@ -1,0 +1,31 @@
+# @author kongweiguang
+# Tauri 旧版 NSIS 安装身份：Kerminal、github 制造商、current-user、kerminal.exe。
+product-name = "Kerminal"
+identifier = "io.github.kongweiguang.kerminal"
+out-dir = "../target/package-output"
+publisher = "github"
+license-file = "../LICENSE"
+icons = ["../resources/icons/icon.ico"]
+formats = ["nsis"]
+resources = [
+  { src = "../LICENSE", target = "licenses/LICENSE" },
+  { src = "../THIRD_PARTY_NOTICES.md", target = "licenses/THIRD_PARTY_NOTICES.md" },
+  { src = "../licenses/THIRD_PARTY_DEPENDENCIES.html", target = "licenses/THIRD_PARTY_DEPENDENCIES.html" },
+  { src = "../licenses/GPUI_KIT_LUCIDE_LICENSE.txt", target = "licenses/GPUI_KIT_LUCIDE_LICENSE.txt" },
+  { src = "kerminal-migrate.ps1", target = "migration/kerminal-migrate.ps1" },
+  { src = "kerminal-migrate.sh", target = "migration/kerminal-migrate.sh" },
+]
+
+[[binaries]]
+# 显式固定旧快捷方式和更新器所依赖的主程序名，目标目录由 xtask 按平台注入。
+path = "kerminal"
+main = true
+
+[nsis]
+# 旧版只安装到当前用户；固定该模式以沿用 HKCU 注册表和本地用户目录。
+installMode = "currentUser"
+
+# 应用自有链接由安装器注册，卸载时由 packager 清理；不接管系统 ssh/sftp 关联。
+[[deep-link-protocols]]
+schemes = ["kerminal"]
+role = "viewer"

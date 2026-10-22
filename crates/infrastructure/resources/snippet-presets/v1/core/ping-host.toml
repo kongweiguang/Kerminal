@@ -1,0 +1,26 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version=1
+id="snippet.builtin.core.ping_host"
+catalog_version="1.0.0"
+pack="core"
+category="network"
+sort_order=140
+title="Ping 连通性"
+description="向目标主机发送四个 ICMP 请求"
+template="ping -c 4 {{ host }}"
+command_spec="ping"
+scope="ssh"
+platforms=["linux","macos"]
+shells=["bash","zsh"]
+capabilities=["ping"]
+tags=["network","connectivity"]
+risk="inspect"
+duration="instant"
+default_action="insert"
+variables=[{name="host",label="目标主机",description="主机名或 IP 地址",kind="host",required=true,render_strategy="shell_arg"}]
+owner="kerminal"
+tested_version="iputils 20250605"
+updated_at="2026-07-13"
+source={name="ping manual",url="https://man7.org/linux/man-pages/man8/ping.8.html"}

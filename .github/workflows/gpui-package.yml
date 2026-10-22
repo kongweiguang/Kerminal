@@ -1,0 +1,151 @@
+# @author kongweiguang
+name: GPUI unsigned candidate packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - name: Windows x64 NSIS
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: Linux x64 AppImage and DEB
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: macOS x64 APP and DMG
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: macOS arm64 APP and DMG
+            runner: macos-15
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up packaging collector Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Linux GPUI and package dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake pkg-config file patchelf squashfs-tools libfuse2 \
+            desktop-file-utils libfontconfig1-dev libvulkan-dev libwayland-dev \
+            libx11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-xkb-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libegl1-mesa-dev
+
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis --version=3.11.0 --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $makensis = Get-Command makensis -ErrorAction SilentlyContinue
+          if ($makensis) {
+            $makensisPath = $makensis.Source
+          } else {
+            $candidates = @(
+              (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'),
+              (Join-Path $env:ProgramFiles 'NSIS\makensis.exe')
+            )
+            $makensisPath = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          }
+          if (-not $makensisPath) { throw 'NSIS makensis.exe was not found after installation.' }
+          Split-Path -Parent $makensisPath | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8NoBOM
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: gpui-package-${{ matrix.target }}
+
+      - name: Install pinned packaging tools
+        shell: pwsh
+        run: |
+          cargo install cargo-about --version 0.9.2 --locked --root target/tools/cargo-about
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo install cargo-packager --version 0.11.8 --locked --root target/tools/cargo-packager
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Join-Path $env:GITHUB_WORKSPACE 'target/tools/cargo-packager/bin' |
+            Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8NoBOM
+
+      - name: Build and package unsigned candidate
+        shell: bash
+        env:
+          PACKAGE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo --locked build --release --package kerminal-desktop --target "$PACKAGE_TARGET"
+          cargo --locked xtask package --target "$PACKAGE_TARGET"
+
+      - name: Upload unsigned candidate packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-candidate-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/package-candidates/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  validate-candidate-set:
+    name: Validate and aggregate unsigned candidate matrix
+    needs: package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up validation Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Download all target candidates without flattening target paths
+        uses: actions/download-artifact@v7
+        with:
+          pattern: unsigned-candidate-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/candidate-set
+          merge-multiple: true
+
+      - name: Validate actual unsigned candidate matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python packaging/build_candidate_inventory.py \
+            --candidate-dir target/candidate-set \
+            --validate-unsigned
+          printf '%s\n' \
+            'Candidate file layout is complete. No signature, updater feed, installation, or upgrade was verified.' \
+            'Signed inventory generation remains a separate step requiring independently supplied new and legacy public keys plus matching sidecars.' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload validated unsigned candidate set
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-candidate-set-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/candidate-set/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

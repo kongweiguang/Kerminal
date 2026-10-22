@@ -1,0 +1,25 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version=1
+id="snippet.builtin.core.system_errors"
+catalog_version="1.0.0"
+pack="core"
+category="logs"
+sort_order=110
+title="系统错误日志"
+description="查看本次启动以来最近 100 条错误级日志"
+template="journalctl -b -p err -n 100 --no-pager"
+command_spec="journalctl"
+scope="ssh"
+platforms=["linux"]
+shells=["bash","zsh"]
+capabilities=["journalctl"]
+tags=["logs","system"]
+risk="inspect"
+duration="instant"
+default_action="insert"
+owner="kerminal"
+tested_version="systemd 257"
+updated_at="2026-07-13"
+source={name="journalctl manual",url="https://www.freedesktop.org/software/systemd/man/latest/journalctl.html"}

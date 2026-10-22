@@ -1,5 +1,0 @@
-id = "unknown-field"
-title = "保留未知字段"
-command = "uptime"
-scope = "ssh"
-future_owner = "platform-team"

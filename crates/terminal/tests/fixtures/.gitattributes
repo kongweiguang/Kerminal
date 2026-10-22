@@ -1,0 +1,3 @@
+# Preserve captured VT byte sequences across Windows checkouts.
+# @author kongweiguang
+conpty-history-*.vt -text

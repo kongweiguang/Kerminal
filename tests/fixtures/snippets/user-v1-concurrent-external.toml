@@ -1,6 +1,0 @@
-id = "concurrent-edit"
-title = "外部编辑后的标题"
-command = "journalctl -n 200 --no-pager"
-scope = "ssh"
-revision = 8
-external_note = "必须在冲突解决后保留"

@@ -1,0 +1,25 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version=1
+id="snippet.builtin.development.npm_build"
+catalog_version="1.0.0"
+pack="development"
+category="javascript"
+sort_order=100
+title="NPM 构建"
+description="运行项目声明的生产构建脚本"
+template="npm run build"
+command_spec="npm"
+scope="local"
+platforms=["linux","macos","windows"]
+shells=["bash","zsh","fish","power_shell","cmd"]
+capabilities=["npm"]
+tags=["javascript","build"]
+risk="change"
+duration="high_io"
+default_action="insert"
+owner="kerminal"
+tested_version="npm 11"
+updated_at="2026-07-13"
+source={name="npm run-script",url="https://docs.npmjs.com/cli/v11/commands/npm-run-script"}

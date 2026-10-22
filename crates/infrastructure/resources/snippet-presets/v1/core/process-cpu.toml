@@ -1,0 +1,28 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version = 1
+id = "snippet.builtin.core.process_cpu"
+catalog_version = "1.0.0"
+pack = "core"
+category = "process"
+sort_order = 200
+title = "CPU 高占用进程"
+description = "按 CPU 占用查看前 15 个进程"
+template = "ps -eo pid,ppid,stat,pcpu,pmem,comm --sort=-pcpu | head -n 15"
+command_spec = "ps"
+scope = "ssh"
+platforms = ["linux"]
+shells = ["bash", "zsh"]
+capabilities = ["ps", "head"]
+tags = ["process", "cpu", "inspect"]
+risk = "inspect"
+duration = "instant"
+default_action = "insert"
+owner = "kerminal"
+tested_version = "procps-ng 4"
+updated_at = "2026-07-13"
+
+[source]
+name = "procps ps manual"
+url = "https://man7.org/linux/man-pages/man1/ps.1.html"

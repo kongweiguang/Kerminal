@@ -1,0 +1,12 @@
+schema_version = 1
+
+[[entries]]
+id = "credential:kerminal:ssh-host:fixture-host:target:password:v1"
+kind = "ssh-password"
+algorithm = "xchacha20poly1305"
+key_id = "workspace-default"
+associated_data = "Y3JlZGVudGlhbDprZXJtaW5hbDpzc2gtaG9zdDpmaXh0dXJlLWhvc3Q6dGFyZ2V0OnBhc3N3b3JkOnYx"
+nonce = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYX"
+ciphertext = "+Kt3C+Wg6INcKkq36yHRhj8vTdGUtT2bHmlMwVLfkQapkVTJIhvcaJnQsG5mn/A="
+created_at = "1700000000"
+updated_at = "1700000000"

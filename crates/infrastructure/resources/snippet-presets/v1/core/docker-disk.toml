@@ -1,0 +1,28 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version = 1
+id = "snippet.builtin.core.docker_disk"
+catalog_version = "1.0.0"
+pack = "core"
+category = "container"
+sort_order = 520
+title = "Docker 磁盘占用"
+description = "查看镜像、容器、卷和构建缓存占用"
+template = "docker system df"
+command_spec = "docker"
+scope = "any"
+platforms = ["linux", "macos", "windows"]
+shells = ["bash", "zsh", "fish", "power_shell"]
+capabilities = ["docker"]
+tags = ["container", "storage", "inspect"]
+risk = "inspect"
+duration = "instant"
+default_action = "insert"
+owner = "kerminal"
+tested_version = "Docker 27"
+updated_at = "2026-07-13"
+
+[source]
+name = "Docker system df reference"
+url = "https://docs.docker.com/reference/cli/docker/system/df/"

@@ -1,0 +1,26 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version=1
+id="snippet.builtin.core.docker_logs"
+catalog_version="1.0.0"
+pack="core"
+category="containers"
+sort_order=120
+title="Docker 日志"
+description="查看指定容器最近 200 条日志"
+template="docker logs --tail 200 {{ container }}"
+command_spec="docker"
+scope="any"
+platforms=["linux","macos","windows"]
+shells=["bash","zsh","fish","power_shell"]
+capabilities=["docker"]
+tags=["containers","docker","logs"]
+risk="inspect"
+duration="instant"
+default_action="insert"
+variables=[{name="container",label="容器",description="容器名称或 ID",kind="container",required=true,render_strategy="shell_arg"}]
+owner="kerminal"
+tested_version="Docker 28"
+updated_at="2026-07-13"
+source={name="Docker logs reference",url="https://docs.docker.com/reference/cli/docker/container/logs/"}

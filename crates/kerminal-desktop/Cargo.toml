@@ -1,0 +1,56 @@
+# @author kongweiguang
+[package]
+name = "kerminal-desktop"
+default-run = "kerminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "kerminal"
+path = "src/main.rs"
+
+[[bin]]
+name = "kerminal-migrate"
+path = "src/bin/kerminal-migrate.rs"
+
+[features]
+acceptance-metrics = ["kerminal-ui/acceptance-metrics"]
+
+[dependencies]
+gpui_kit.workspace = true
+tokio-util.workspace = true
+gpui_pre.workspace = true
+dirs.workspace = true
+kerminal-application.workspace = true
+kerminal-domain.workspace = true
+kerminal-infrastructure.workspace = true
+kerminal-mcp.workspace = true
+kerminal-ui.workspace = true
+kerminal-terminal.workspace = true
+tokio.workspace = true
+single_application.workspace = true
+sha2.workspace = true
+sys_locale.workspace = true
+tracing.workspace = true
+tracing_appender.workspace = true
+tracing_subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rfd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[build-dependencies]
+embed-resource = "=3.0.12"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_UI_Shell"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
+

@@ -1,7 +1,0 @@
-id = "deploy-status"
-title = "部署状态"
-command = "systemctl status {{ service }} --no-pager"
-description = "兼容现有 v1 用户片段。"
-scope = "ssh"
-tags = ["service", "daily"]
-sort_order = 20

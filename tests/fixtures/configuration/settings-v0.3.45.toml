@@ -1,0 +1,114 @@
+# @author kongweiguang
+# Frozen representative settings.toml input from the v0.3.45 contract.
+schema_version = 1
+themeMode = "dark"
+interfaceDensity = "compact"
+
+[appearance]
+interfaceLanguage = "zhCn"
+backgroundEnabled = true
+backgroundFit = "contain"
+backgroundImagePath = "C:/Users/tester/Pictures/terminal.png"
+backgroundOpacity = 64
+windowOpacity = 82 # retain this user-owned inline comment
+
+[terminal]
+autoReconnect = false
+colorScheme = "tokyoNight"
+lightColorScheme = "github"
+darkColorScheme = "solarized"
+fontFamily = "Cascadia Code"
+fontSize = 16
+fontWeight = "medium"
+macOptionIsMeta = true
+lineHeight = 1.4
+cursorStyle = "bar"
+cursorBlink = false
+rightClickBehavior = "paste"
+selectionCopy = true
+showCommandBlockRail = false
+showTabNumbers = true
+confirmCloseTab = false
+rendererType = "gpu" # legacy WebView choice stays readable and untouched
+scrollback = 12000
+
+[terminal.inlineSuggestion]
+enabled = true
+acceptKey = "rightArrow"
+presentation = "inlineAndMenu"
+menuShortcut = "ctrlSpace"
+tabOpensMenu = false
+partialAccept = true
+remoteRefresh = "safe"
+remoteProbeEnabled = true
+auditRetentionDays = 30
+feedbackRetentionDays = 365
+
+[terminal.inlineSuggestion.providers]
+history = true
+remotePath = false
+remoteCommand = true
+git = true
+spec = false
+
+[terminal.keywordHighlights]
+enabled = true
+
+[[terminal.keywordHighlights.rules]]
+id = "java-errors"
+enabled = true
+pattern = "error|exception"
+matchMode = "regex"
+caseSensitive = false
+note = "Java 错误"
+style = "red"
+
+[desktopNotifications]
+enabled = true
+backgroundOnly = false
+importantOnly = true
+minDurationMs = 8000
+throttleMs = 25000
+
+[externalLaunch]
+enabled = true
+acceptVendorArgs = false
+autoOpenSftp = true
+disabledTools = ["putty"]
+
+[agentLauncher]
+selectedAgentKey = "builtin:claude"
+customAgents = []
+
+[sftp]
+globalTransfers = 6
+hostTransfers = 3
+pipelineDepth = 16
+packetBytes = 131072
+timeoutSeconds = 240
+
+[toolRail]
+order = ["context", "agentLauncher", "sftp", "snippets", "tmux", "ports", "system", "logs"]
+hidden = ["system"]
+bottom = ["logs"]
+
+[toolRail.panelPlacements]
+context = "attached"
+agentLauncher = "attached"
+sftp = "left"
+snippets = "attached"
+tmux = "attached"
+ports = "attached"
+system = "bottom"
+logs = "attached"
+
+[[keybindings]]
+action = "terminal.newTab"
+label = "新建终端"
+description = "打开一个本地终端"
+binding = "Ctrl+Shift+T"
+windowsBinding = "Ctrl+Shift+T"
+macBinding = "Cmd+Shift+T"
+scope = "workspace"
+editable = true
+vendorMetadata = "keep-me"

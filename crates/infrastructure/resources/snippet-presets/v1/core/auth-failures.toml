@@ -1,0 +1,25 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version=1
+id="snippet.builtin.core.auth_failures"
+catalog_version="1.0.0"
+pack="core"
+category="security"
+sort_order=100
+title="认证失败记录"
+description="从常见认证日志中筛选最近的失败记录"
+template="grep -Ei 'failed|failure|invalid' /var/log/auth.log /var/log/secure 2>/dev/null | tail -n 50"
+command_spec="grep"
+scope="ssh"
+platforms=["linux"]
+shells=["bash","zsh"]
+capabilities=["grep","tail"]
+tags=["security","auth","logs"]
+risk="inspect"
+duration="instant"
+default_action="insert"
+owner="kerminal"
+tested_version="GNU grep 3.12"
+updated_at="2026-07-13"
+source={name="GNU grep manual",url="https://www.gnu.org/software/grep/manual/grep.html"}

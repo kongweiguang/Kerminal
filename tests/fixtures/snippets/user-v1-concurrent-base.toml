@@ -1,5 +1,0 @@
-id = "concurrent-edit"
-title = "并发编辑基线"
-command = "journalctl -n 100 --no-pager"
-scope = "ssh"
-revision = 7

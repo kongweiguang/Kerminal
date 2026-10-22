@@ -1,0 +1,26 @@
+# @author kongweiguang
+# 双架构 app 与 DMG 沿用 Tauri 旧版 product name 和 bundle identifier。
+product-name = "Kerminal"
+identifier = "io.github.kongweiguang.kerminal"
+out-dir = "../target/package-output"
+publisher = "github"
+license-file = "../LICENSE"
+icons = ["../resources/icons/icon.icns"]
+formats = ["app", "dmg"]
+resources = [
+  { src = "../LICENSE", target = "licenses/LICENSE" },
+  { src = "../THIRD_PARTY_NOTICES.md", target = "licenses/THIRD_PARTY_NOTICES.md" },
+  { src = "../licenses/THIRD_PARTY_DEPENDENCIES.html", target = "licenses/THIRD_PARTY_DEPENDENCIES.html" },
+  { src = "../licenses/GPUI_KIT_LUCIDE_LICENSE.txt", target = "licenses/GPUI_KIT_LUCIDE_LICENSE.txt" },
+  { src = "kerminal-migrate.ps1", target = "migration/kerminal-migrate.ps1" },
+  { src = "kerminal-migrate.sh", target = "migration/kerminal-migrate.sh" },
+]
+
+[[binaries]]
+# 显式固定旧快捷方式和更新器所依赖的主程序名，目标目录由 xtask 按平台注入。
+path = "kerminal"
+main = true
+# 只注册旧版实际使用的 Kerminal 自有 scheme；ssh:// 与 sftp:// 是解析器兼容输入，不抢占系统关联。
+[[deep-link-protocols]]
+schemes = ["kerminal"]
+role = "viewer"

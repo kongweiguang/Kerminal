@@ -1,0 +1,31 @@
+[package]
+name = "single-application"
+version = "0.1.1"
+edition = "2024"
+authors = ["mengyou1024 <mengyou1024@126.com>"]
+description = "A lightweight single-instance application guard for Rust, using local sockets to enforce only one primary process while letting secondary processes send messages to it."
+license = "MIT"
+repository = "https://github.com/mengyou1024/single-application"
+homepage = "https://github.com/mengyou1024/single-application"
+documentation = "https://docs.rs/single-application"
+readme = "README.md"
+keywords = ["single-instance", "single-instance-app", "single-instance-lock"]
+categories = ["concurrency", "os", "development-tools"]
+exclude = ["/target", "/.git", "/.gitignore"]
+
+
+[dependencies]
+interprocess = { version = "2.4.4" }
+serde = { version = "1.0.229" }
+serde_json = "1.0.151"
+tracing = "0.1.44"
+tokio = { version = "1.53.1", optional = true }
+
+
+[dev-dependencies]
+tracing-subscriber = "0.3.23"
+
+
+[features]
+default = []
+tokio = ["dep:tokio", "interprocess/tokio", "tokio/net"]

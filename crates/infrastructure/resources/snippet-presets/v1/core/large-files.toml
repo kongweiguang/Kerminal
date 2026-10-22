@@ -1,0 +1,26 @@
+# @author kongweiguang
+# 兼容 Kerminal v0.3.45 (17c5d4be) 冻结的内置片段目录。
+
+schema_version=1
+id="snippet.builtin.core.large_files"
+catalog_version="1.0.0"
+pack="core"
+category="files"
+sort_order=110
+title="查找大文件"
+description="在指定挂载内列出最大的 20 个普通文件"
+template="find {{ path }} -xdev -type f -size +100M -printf '%s %p\n' | sort -nr | head -n 20"
+command_spec="find"
+scope="ssh"
+platforms=["linux"]
+shells=["bash","zsh"]
+capabilities=["find","sort","head"]
+tags=["files","disk"]
+risk="inspect"
+duration="high_io"
+default_action="insert"
+variables=[{name="path",label="搜索路径",description="限制在该挂载点内搜索",kind="path",required=true,render_strategy="shell_arg"}]
+owner="kerminal"
+tested_version="GNU findutils 4.9"
+updated_at="2026-07-13"
+source={name="GNU find manual",url="https://www.gnu.org/software/findutils/manual/html_mono/find.html"}

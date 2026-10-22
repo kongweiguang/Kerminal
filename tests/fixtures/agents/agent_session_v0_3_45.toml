@@ -1,0 +1,34 @@
+# v0.3.45 persistence contract fixture from 17c5d4be46172ca508f92546bfae5fe5ef477f11.
+# All identifiers and paths are synthetic; this fixture contains no user data.
+schema_version = 1
+agent_session_id = "ags-fixture"
+agent_id = "codex"
+title = "Baseline compatibility fixture"
+created_at = "1720000000"
+updated_at = "1720000001"
+status = "active"
+workspace_root = "C:/synthetic/.kerminal"
+session_root = "C:/synthetic/.kerminal/agents/sessions/ags-fixture"
+
+[launch]
+command_label = "codex"
+shell = "codex"
+args = ["resume", "--last"]
+cwd = "C:/synthetic/workspace"
+
+[scope]
+kind = "tab"
+tab_id = "tab-fixture"
+
+[target]
+binding_id = "binding-fixture"
+binding_generation = 7
+pane_id = "pane-fixture"
+tab_id = "tab-fixture"
+target_terminal_session_id = "terminal-fixture"
+target_ref = "local:fixture"
+target_kind = "local"
+cwd = "C:/synthetic/workspace"
+shell = "pwsh"
+live_status = "ready"
+last_seen_at = "1720000001"
