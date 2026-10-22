@@ -733,7 +733,9 @@ impl CommandsService {
             .await
     }
 
-    /// 先分析风险与完整目标集合，再校验所有 session 映射后逐个写入并保留部分失败结果。
+    /// 直接调用以单一取消令牌执行广播，并复用统一的逐目标编排与回执构造。
+    ///
+    /// @author kongweiguang
     pub async fn broadcast(
         &self,
         command: String,
@@ -741,6 +743,21 @@ impl CommandsService {
         bindings: Vec<BroadcastSessionBinding>,
         confirmed: bool,
         cancellation: CancellationToken,
+    ) -> AppResult<BroadcastExecutionResult> {
+        self.broadcast_inner(command, targets, bindings, confirmed, &[cancellation])
+            .await
+    }
+
+    /// 借用取消源集合复用单令牌和多令牌入口，逐目标直接检查以避免外层 select 的调度竞态。
+    ///
+    /// @author kongweiguang
+    async fn broadcast_inner(
+        &self,
+        command: String,
+        targets: Vec<BroadcastTarget>,
+        bindings: Vec<BroadcastSessionBinding>,
+        confirmed: bool,
+        cancellations: &[CancellationToken],
     ) -> AppResult<BroadcastExecutionResult> {
         if targets.is_empty() || targets.len() > 64 || bindings.len() != targets.len() {
             return Err(AppError::invalid("广播目标数量无效"));
@@ -758,7 +775,8 @@ impl CommandsService {
         let bytes = analysis.data.as_bytes().to_vec();
         let mut deliveries = Vec::with_capacity(resolved.len());
         for (pane_id, session_id) in resolved {
-            if cancellation.is_cancelled() {
+            let cancelled = cancellations.iter().any(CancellationToken::is_cancelled);
+            if cancelled {
                 deliveries.push(BroadcastDeliveryResult {
                     pane_id,
                     session_id,
@@ -822,7 +840,9 @@ impl CommandsService {
         })
     }
 
-    /// 将用户取消与应用关闭统一收敛到广播用例，保留已送达结果并停止后续目标。
+    /// 将用户取消与应用关闭统一收敛，并在每个目标边界复核原始信号以排除调度竞态。
+    ///
+    /// @author kongweiguang
     pub async fn broadcast_with_cancellation(
         &self,
         command: String,
@@ -836,13 +856,17 @@ impl CommandsService {
         if user_cancellation.is_cancelled() || application_cancellation.is_cancelled() {
             cancellation.cancel();
         }
-        let operation_cancellation = cancellation.clone();
-        let mut operation = Box::pin(self.broadcast(
+        let cancellation_sources = [
+            cancellation.clone(),
+            user_cancellation.clone(),
+            application_cancellation.clone(),
+        ];
+        let mut operation = Box::pin(self.broadcast_inner(
             command,
             targets,
             bindings,
             confirmed,
-            operation_cancellation,
+            &cancellation_sources,
         ));
         tokio::select! {
             result = &mut operation => return result,
