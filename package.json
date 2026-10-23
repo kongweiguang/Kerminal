@@ -120,12 +120,12 @@
     "knip": "^6.26.0",
     "typescript": "~5.8.3",
     "typescript-eslint": "^8.63.0",
-    "vite": "^7.0.4",
+    "vite": "7.3.7",
     "vitest": "^4.1.9"
   },
   "pnpm": {
     "overrides": {
-      "dompurify": "3.4.13",
+      "dompurify": "3.4.17",
       "nanoid": "3.3.18",
       "postcss": "8.5.23",
       "source-map-js": "1.2.2"
