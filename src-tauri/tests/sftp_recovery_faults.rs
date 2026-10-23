@@ -453,44 +453,9 @@ async fn retry_keeps_the_first_renamed_target_and_final_hash() {
     );
 }
 
-/// 服务器不支持原子覆盖时，overwrite 失败必须保留既有正式文件和可恢复 partial。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn overwrite_conflict_preserves_original_and_partial() {
-    let server_root = tempdir().expect("create fault server root");
-    let client_root = tempdir().expect("create client fixture root");
-    let source = client_root.path().join("replacement.bin");
-    write_pattern(&source, 256 * 1024).await;
-    fs::write(server_root.path().join("artifact.bin"), b"original-content")
-        .await
-        .expect("seed original final");
-    let server = start_fault_server(server_root.path().to_path_buf(), FaultMode::Normal).await;
-    let (_home, state) = test_state();
-    let host_id = create_loopback_host(&state, "overwrite-conflict", server.addr.port());
-    trust_loopback_host(&state, &host_id).await;
-    let task = state
-        .sftp()
-        .enqueue_transfer(
-            state.paths(),
-            upload_request(&host_id, &source, "/artifact.bin"),
-        )
-        .expect("enqueue overwrite probe");
-    let failed = wait_for_terminal(&state, &task.id, Duration::from_secs(5)).await;
-    assert_eq!(failed.status, SftpTransferStatus::Failed);
-    assert!(failed
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("服务器不支持原子覆盖")));
-    assert_eq!(
-        fs::read(server_root.path().join("artifact.bin"))
-            .await
-            .expect("read original final"),
-        b"original-content"
-    );
-    assert_eq!(
-        sha256_file(&source).await,
-        sha256_file(&server_root.path().join("artifact.bin.kerminal-part")).await
-    );
-}
+/// 覆盖提交的 fallback、回滚、未知回执和取消边界集成测试。
+#[path = "sftp_recovery_faults/remote_commit.rs"]
+mod remote_commit;
 
 /// 一个 bulk channel 被取消时，另一个独立 SSH/SFTP 连接仍应把同主机文件提交完整。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

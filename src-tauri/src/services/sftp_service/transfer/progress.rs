@@ -4,6 +4,8 @@
 use super::*;
 use crate::services::sftp_service::{transfer_io, transfer_registry};
 
+const COMMIT_UNKNOWN_ERROR: &str = "提交结果未确认，请核对目标文件";
+
 impl TransferProgress {
     /// 同步调用复用进度 API，但不注册队列摘要或窗口事件。
     pub(in crate::services::sftp_service) fn detached() -> Self {
@@ -15,6 +17,8 @@ impl TransferProgress {
             recovery: transfer_io::new_recovery_checkpoints(),
             idle_timeout_pending: Arc::new(AtomicBool::new(false)),
             commit_outcome_uncertain: Arc::new(AtomicBool::new(false)),
+            commit_rollback_confirmed: Arc::new(AtomicBool::new(false)),
+            commit_recovery_detail: Arc::new(Mutex::new(None)),
             last_activity_at_ms: Arc::new(AtomicU64::new(unix_timestamp_millis())),
             diagnostic_operation: Arc::new(Mutex::new("queued")),
             event_emitter: None,
@@ -38,6 +42,8 @@ impl TransferProgress {
             recovery,
             idle_timeout_pending: Arc::new(AtomicBool::new(false)),
             commit_outcome_uncertain: Arc::new(AtomicBool::new(false)),
+            commit_rollback_confirmed: Arc::new(AtomicBool::new(false)),
+            commit_recovery_detail: Arc::new(Mutex::new(None)),
             last_activity_at_ms: Arc::new(AtomicU64::new(unix_timestamp_millis())),
             diagnostic_operation: Arc::new(Mutex::new("queued")),
             event_emitter,
@@ -79,6 +85,8 @@ impl TransferProgress {
             recovery: self.recovery.clone(),
             idle_timeout_pending: self.idle_timeout_pending.clone(),
             commit_outcome_uncertain: self.commit_outcome_uncertain.clone(),
+            commit_rollback_confirmed: self.commit_rollback_confirmed.clone(),
+            commit_recovery_detail: self.commit_recovery_detail.clone(),
             last_activity_at_ms: self.last_activity_at_ms.clone(),
             diagnostic_operation: self.diagnostic_operation.clone(),
             event_emitter: None,
@@ -206,18 +214,54 @@ impl TransferProgress {
         self.commit_outcome_uncertain.load(Ordering::SeqCst)
     }
 
-    /// 对正在提交的取消给定两秒确认预算，超时后由统一终态转换保守失败并释放槽。
+    /// 事务 helper 可能在 future 被丢弃后仍需保留路径，用共享字段向最终任务状态回传。
+    pub(in crate::services::sftp_service) fn set_commit_recovery_detail(
+        &self,
+        detail: impl Into<String>,
+    ) {
+        let detail = detail.into();
+        if detail.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut current) = self.commit_recovery_detail.lock() {
+            *current = Some(detail);
+        }
+    }
+
+    /// 提交已确认或回滚已确认后清除临时路径，避免终态展示已失效的恢复指引。
+    pub(in crate::services::sftp_service) fn clear_commit_recovery_detail(&self) {
+        if let Ok(mut current) = self.commit_recovery_detail.lock() {
+            *current = None;
+        }
+    }
+
+    /// 事务无法唯一确认或取消确认窗口超时时置位，阻止自动重传覆盖未知目标状态。
     pub(in crate::services::sftp_service) fn note_commit_outcome_uncertain(&self) {
         self.commit_outcome_uncertain.store(true, Ordering::SeqCst);
     }
 
-    /// 未知提交结果禁止自动重传，用户需先核对正式文件是否已经出现。
-    pub(in crate::services::sftp_service) fn fail_commit_outcome_uncertain(&self) {
+    /// 只有后端收到完整回滚确认后才能开放单文件上传/下载的人工重试。
+    pub(in crate::services::sftp_service) fn note_commit_rollback_confirmed(&self) {
+        self.commit_rollback_confirmed.store(true, Ordering::SeqCst);
+    }
+
+    /// 未知提交结果禁止自动重传，并保留 helper 错误及预登记路径供用户核对/恢复。
+    pub(in crate::services::sftp_service) fn fail_commit_outcome_uncertain(
+        &self,
+        error: impl Into<String>,
+    ) {
+        let error = error.into();
+        let recovery_detail = self
+            .commit_recovery_detail
+            .lock()
+            .ok()
+            .and_then(|detail| detail.clone());
+        let error = commit_unknown_error_message(&error, recovery_detail.as_deref());
         self.update_summary(true, |summary| {
             summary.status = SftpTransferStatus::Failed;
             summary.failure_kind =
                 Some(crate::models::sftp::SftpTransferFailureKind::CommitUnknown);
-            summary.error = Some("提交结果未确认，请核对目标文件".to_owned());
+            summary.error = Some(error);
             summary.phase = Some("failed".to_owned());
             summary.retryable = false;
             summary.resumable = false;
@@ -365,13 +409,20 @@ impl TransferProgress {
             ));
             return;
         }
+        let rollback_confirmed = self.commit_rollback_confirmed.load(Ordering::SeqCst);
+        let commit_outcome_uncertain = self.commit_outcome_uncertain();
         self.update_summary(true, |summary| {
             summary.status = SftpTransferStatus::Failed;
             summary.error = Some(error.into());
             summary.failure_kind = Some(crate::models::sftp::SftpTransferFailureKind::Other);
             summary.phase = Some("failed".to_owned());
             summary.speed_bytes_per_second = 0;
-            summary.retryable = false;
+            summary.retryable = is_retryable_after_commit_rollback(
+                rollback_confirmed,
+                commit_outcome_uncertain,
+                summary.operation,
+                summary.kind,
+            );
             summary.updated_at = unix_timestamp();
         });
     }
@@ -458,5 +509,133 @@ impl TransferProgress {
                 task.summary.phase = Some("waiting".to_owned());
             }
         });
+    }
+}
+
+/// 普通错误不能开放重试；只接受已确认回滚、确定结果和单文件上传/下载。
+fn is_retryable_after_commit_rollback(
+    rollback_confirmed: bool,
+    commit_outcome_uncertain: bool,
+    operation: crate::models::sftp::SftpTransferOperation,
+    kind: crate::models::sftp::SftpTransferKind,
+) -> bool {
+    rollback_confirmed
+        && !commit_outcome_uncertain
+        && matches!(
+            operation,
+            crate::models::sftp::SftpTransferOperation::Upload
+                | crate::models::sftp::SftpTransferOperation::Download
+        )
+        && kind == crate::models::sftp::SftpTransferKind::File
+}
+
+/// Helper 或超时错误继续显示，预登记的恢复路径只在错误尚未包含时追加。
+fn commit_unknown_error_message(error: &str, recovery_detail: Option<&str>) -> String {
+    let error = error.trim();
+    let mut message = if error.is_empty() {
+        COMMIT_UNKNOWN_ERROR.to_owned()
+    } else {
+        error.to_owned()
+    };
+    if let Some(detail) = recovery_detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty() && !message.contains(detail))
+    {
+        message.push_str("；恢复信息：");
+        message.push_str(detail);
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        commit_unknown_error_message, is_retryable_after_commit_rollback, TransferProgress,
+        COMMIT_UNKNOWN_ERROR,
+    };
+    use crate::models::sftp::{SftpTransferKind, SftpTransferOperation};
+    use std::sync::atomic::Ordering;
+
+    /// Child I/O handles share recovery metadata and rollback proof with the task publishing its terminal state.
+    #[test]
+    fn detached_child_keeps_commit_recovery_detail_shared() {
+        let parent = TransferProgress::detached();
+        let child = parent.detached_child();
+
+        child.set_commit_recovery_detail("backup=/target.bak");
+        child.note_commit_rollback_confirmed();
+
+        let detail = parent
+            .commit_recovery_detail
+            .lock()
+            .expect("commit detail lock")
+            .clone();
+        assert_eq!(detail.as_deref(), Some("backup=/target.bak"));
+        assert!(parent.commit_rollback_confirmed.load(Ordering::SeqCst));
+    }
+
+    /// Future 超时丢弃时没有 helper 返回值，预登记的恢复路径仍必须进入最终摘要。
+    #[test]
+    fn unknown_commit_keeps_registered_recovery_detail() {
+        assert_eq!(
+            commit_unknown_error_message(
+                COMMIT_UNKNOWN_ERROR,
+                Some("backup=/target.bak; partial=/target.part")
+            ),
+            "提交结果未确认，请核对目标文件；恢复信息：backup=/target.bak; partial=/target.part",
+        );
+    }
+
+    /// Helper 已在错误中说明恢复路径时避免重复拼接同一信息。
+    #[test]
+    fn unknown_commit_does_not_duplicate_error_detail() {
+        assert_eq!(
+            commit_unknown_error_message(
+                "提交结果不明：backup=/target.bak",
+                Some("backup=/target.bak")
+            ),
+            "提交结果不明：backup=/target.bak",
+        );
+    }
+
+    /// 只有已确认的单文件传输回滚开放人工重试，未知结果和普通错误仍封锁。
+    #[test]
+    fn only_confirmed_single_file_rollback_is_retryable() {
+        assert!(is_retryable_after_commit_rollback(
+            true,
+            false,
+            SftpTransferOperation::Upload,
+            SftpTransferKind::File,
+        ));
+        assert!(is_retryable_after_commit_rollback(
+            true,
+            false,
+            SftpTransferOperation::Download,
+            SftpTransferKind::File,
+        ));
+        assert!(!is_retryable_after_commit_rollback(
+            false,
+            false,
+            SftpTransferOperation::Upload,
+            SftpTransferKind::File,
+        ));
+        assert!(!is_retryable_after_commit_rollback(
+            true,
+            true,
+            SftpTransferOperation::Upload,
+            SftpTransferKind::File,
+        ));
+        assert!(!is_retryable_after_commit_rollback(
+            true,
+            false,
+            SftpTransferOperation::Upload,
+            SftpTransferKind::Directory,
+        ));
+        assert!(!is_retryable_after_commit_rollback(
+            true,
+            false,
+            SftpTransferOperation::RemoteCopy,
+            SftpTransferKind::File,
+        ));
     }
 }

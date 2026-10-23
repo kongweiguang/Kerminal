@@ -159,7 +159,11 @@ export function canClearFinishedTransfers(transfers: SftpTransferSummary[]) {
 }
 
 /**
- * 计算传输进度百分比；未知总大小的运行任务保留可见进度。
+ * 仅成功终态才表示远端提交完成并允许显示 100%；传输字节到齐仍可能卡在校验或提交，
+ * 因此活动、失败和取消任务最多显示 99%，把数据进度与文件落盘结果区分开。
+ * 未知总大小的运行任务仍保留可见进度。
+ *
+ * @author kongweiguang
  */
 export function transferProgressPercent(transfer: SftpTransferSummary) {
   if (transfer.status === "succeeded") {
@@ -173,7 +177,7 @@ export function transferProgressPercent(transfer: SftpTransferSummary) {
     return transfer.status === "running" ? 8 : 0;
   }
   return Math.min(
-    100,
+    99,
     Math.max(0, (transfer.bytesTransferred / totalBytes) * 100),
   );
 }
@@ -189,9 +193,7 @@ export function transferTitle(transfer: SftpTransferSummary) {
   );
 }
 
-/**
- * 获取传输任务百分比文本。
- */
+/** 百分比文本复用进度模型，确保只有远端提交成功后才显示 100%。 */
 export function transferPercentLabel(transfer: SftpTransferSummary) {
   if (transfer.status === "succeeded") {
     return "100%";
@@ -533,13 +535,14 @@ export function isTransferWaiting(
 }
 
 /**
- * 将结构化无进度及提交不明失败投影为稳定文案，避免前端解析后端网络错误文本。
+ * 将结构化无进度及提交不明失败投影为稳定文案；提交结果不明时先核对远端状态再决定，
+ * 避免提示用户盲目重试并覆盖可能已经提交的文件。
  *
  * @author kongweiguang
  */
 export function transferFailureMessage(transfer: SftpTransferSummary) {
   if (transfer.failureKind === "commitUnknown") {
-    return "提交结果未确认，请核对目标文件";
+    return "提交结果未确认。请刷新目录核对目标文件后，再决定是否重新传输。";
   }
   if (transfer.failureKind !== "idleTimeout") {
     return transfer.error ?? null;

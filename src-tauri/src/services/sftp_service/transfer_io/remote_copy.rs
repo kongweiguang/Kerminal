@@ -193,6 +193,13 @@ pub(in crate::services::sftp_service) async fn copy_remote_file_between_sessions
         &target.final_path,
         &target.partial_path,
         source_size,
+        RemoteCommitContext {
+            progress,
+            checkpoints: &checkpoints,
+            key: &checkpoint_key,
+            expected_sha256: sha256_hex_digest(&hasher),
+            allow_overwrite: conflict_policy == SftpTransferConflictPolicy::Overwrite,
+        },
     )
     .await?;
     progress.clear_network_wait();

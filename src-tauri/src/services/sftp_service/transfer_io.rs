@@ -447,6 +447,8 @@ mod recovery_tests {
                     prefix_length: 4,
                 },
                 committed: false,
+                backup_path: None,
+                expected_sha256: None,
             },
         );
         let mut changed_source = Sha256::new();

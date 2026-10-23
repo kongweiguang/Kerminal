@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 import type { HostContainersToolContentProps } from "./HostContainersToolContent";
 import type { Machine, MachineGroup } from "../workspace/contracts/index";
 
@@ -43,6 +45,7 @@ export interface MachineSidebarProps {
   onOpenContainerTerminal?: (machineId: string) => void;
   onOpenRdpConnection?: (machineId: string) => void;
   onOpenSettings?: () => void;
+  onOpenUpdates?: () => void;
   onOpenSftp?: (machineId: string) => void;
   onOpenSshTerminal?: (machineId: string) => void;
   onOpenSftpTransferWorkbench?: (machineId: string) => void;

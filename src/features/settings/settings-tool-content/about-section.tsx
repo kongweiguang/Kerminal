@@ -1,6 +1,6 @@
 // @author kongweiguang
 
-import { useRef, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import {
   Download,
   ExternalLink,
@@ -17,13 +17,6 @@ import packageJson from "../../../../package.json";
 import { UserFacingNotice } from "../../../components/ui/user-facing-notice";
 import { cn } from "../../../lib/cn";
 import {
-  currentDesktopNotificationVisibility,
-  sendDesktopNotification,
-} from "../../../lib/desktopNotificationApi";
-import {
-  checkForAppUpdate,
-  installPendingAppUpdate,
-  relaunchApp,
   type AppUpdateCheckResult,
   type AppUpdateInstallResult,
   type AppUpdateProgress,
@@ -34,6 +27,7 @@ import {
 } from "../../../lib/userFacingMessage";
 import type { DesktopNotificationSettings } from "../settingsModel";
 import { desktopRuntime } from "../../../lib/desktopRuntimeApi";
+import { useAppUpdateStore, type UpdateCheckState } from "../appUpdateStore";
 
 const githubRepositoryUrl = "https://github.com/kongweiguang/Kerminal";
 const appVersion = `v${packageJson.version}`;
@@ -49,37 +43,25 @@ const aboutButtonClassName =
 const aboutPrimaryButtonClassName =
   "kerminal-focus-ring kerminal-pressable inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-control)] border border-sky-400/25 bg-[var(--surface-selected)] px-2.5 text-xs font-medium text-sky-700 transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-60 dark:text-sky-100";
 
-type UpdateCheckState =
-  | "idle"
-  | "checking"
-  | "available"
-  | "up-to-date"
-  | "unavailable"
-  | "installing"
-  | "ready-to-restart"
-  | "restarting"
-  | "error";
-
 interface AboutSettingsSectionProps {
   desktopNotifications: DesktopNotificationSettings;
 }
 
-/** 关于页沿用 GitHub 仓库的规范名称，让展示地址与实际打开地址保持一致。 */
+/** 关于页订阅主窗口已查到的更新，导航或重新打开时无需再次检查才能安装。 */
 export function AboutSettingsSection({
   desktopNotifications,
 }: AboutSettingsSectionProps) {
-  const [checkState, setCheckState] = useState<UpdateCheckState>("idle");
-  const [error, setError] = useState<UserFacingMessage | null>(null);
-  const [installResult, setInstallResult] =
-    useState<AppUpdateInstallResult | null>(null);
+  const {
+    checkState,
+    error,
+    installResult,
+    progress,
+    updateResult,
+    checkForUpdate,
+    installUpdate,
+    restartApp,
+  } = useAppUpdateStore();
   const [linkError, setLinkError] = useState<UserFacingMessage | null>(null);
-  const [progress, setProgress] = useState<AppUpdateProgress | null>(null);
-  const [updateResult, setUpdateResult] = useState<AppUpdateCheckResult | null>(
-    null,
-  );
-  const updateNotificationSentAtByKey = useRef<
-    Record<string, number | undefined>
-  >({});
   const checking = checkState === "checking";
   const installing = checkState === "installing";
   const restarting = checkState === "restarting";
@@ -87,75 +69,7 @@ export function AboutSettingsSection({
     checkState === "available" && updateResult?.kind === "available";
   const canRestart = checkState === "ready-to-restart";
 
-  const handleCheck = async () => {
-    setCheckState("checking");
-    setError(null);
-    setInstallResult(null);
-    setProgress(null);
-    setUpdateResult(null);
-    try {
-      const result = await checkForAppUpdate();
-      setUpdateResult(result);
-      setCheckState(result.kind);
-      if (result.kind === "available") {
-        void sendDesktopNotification({
-          event: {
-            currentVersion: result.currentVersion,
-            kind: "updater.available",
-            version: result.version,
-          },
-          lastSentAtByKey: updateNotificationSentAtByKey.current,
-          settings: desktopNotifications,
-          visibility: currentDesktopNotificationVisibility(),
-        });
-      }
-    } catch (nextError) {
-      setError(
-        buildUserFacingError(nextError, {
-          recoveryAction: "请检查网络连接后重试。",
-          title: "检查更新失败",
-        }),
-      );
-      setCheckState("error");
-    }
-  };
-
-  const handleInstall = async () => {
-    setCheckState("installing");
-    setError(null);
-    setInstallResult(null);
-    setProgress(null);
-    try {
-      const result = await installPendingAppUpdate(setProgress);
-      setInstallResult(result);
-      setCheckState("ready-to-restart");
-    } catch (nextError) {
-      setError(
-        buildUserFacingError(nextError, {
-          recoveryAction: "请稍后重新安装。",
-          title: "安装更新失败",
-        }),
-      );
-      setCheckState("error");
-    }
-  };
-
-  const handleRestart = async () => {
-    setCheckState("restarting");
-    setError(null);
-    try {
-      await relaunchApp();
-    } catch (nextError) {
-      setError(
-        buildUserFacingError(nextError, {
-          recoveryAction: "请手动重新启动 Kerminal。",
-          title: "自动重启失败",
-        }),
-      );
-      setCheckState("ready-to-restart");
-    }
-  };
-
+  /** 外链失败独立于更新事务，避免打开仓库时覆盖安装进度或重试入口。 */
   const handleOpenGitHub = async () => {
     setLinkError(null);
     try {
@@ -219,8 +133,8 @@ export function AboutSettingsSection({
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
             <button
               className={aboutButtonClassName}
-              disabled={checking || installing || restarting}
-              onClick={() => void handleCheck()}
+              disabled={checking || installing || restarting || canRestart}
+              onClick={() => void checkForUpdate(desktopNotifications)}
               type="button"
             >
               <RefreshCw
@@ -232,7 +146,7 @@ export function AboutSettingsSection({
               <button
                 className={aboutPrimaryButtonClassName}
                 disabled={installing}
-                onClick={() => void handleInstall()}
+                onClick={() => void installUpdate()}
                 type="button"
               >
                 <Download className="h-3.5 w-3.5" />
@@ -243,7 +157,7 @@ export function AboutSettingsSection({
               <button
                 className={aboutPrimaryButtonClassName}
                 disabled={restarting}
-                onClick={() => void handleRestart()}
+                onClick={() => void restartApp()}
                 type="button"
               >
                 <Rocket className="h-3.5 w-3.5" />

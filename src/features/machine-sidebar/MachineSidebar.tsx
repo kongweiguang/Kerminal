@@ -1,8 +1,9 @@
+// @author kongweiguang
+
 import {
   ChevronsDownUp,
   ChevronsUpDown,
   Plus,
-  Settings,
 } from "lucide-react";
 import {
   useCallback,
@@ -16,7 +17,6 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { Button } from "../../components/ui/button";
-import { cn } from "../../lib/cn";
 import type { Machine } from "../workspace/contracts/index";
 import {
   POINTER_DRAG_THRESHOLD_PX,
@@ -32,6 +32,7 @@ import { MachineSidebarContainersView } from "./MachineSidebarContainersView";
 import { MachineSidebarContextMenuPortal } from "./MachineSidebarContextMenuPortal";
 import { MachineSidebarHostList } from "./MachineSidebarHostList";
 import { MachineSidebarHeader } from "./MachineSidebarHeader";
+import { MachineSidebarSettingsButtons } from "./MachineSidebarSettingsButtons";
 import {
   CollapsedHostPopover,
   CollapsedMachineSidebar,
@@ -45,8 +46,6 @@ export type { ConnectionOpenOptions } from "./MachineSidebar.shared";
 
 const sidebarFooterClassName =
   "kerminal-sidebar-footer flex items-center justify-between border-t border-[var(--border-subtle)]";
-const sidebarSettingsSelectedClassName =
-  "bg-[var(--surface-selected)] text-sky-700 dark:text-sky-100";
 
 function stringSetsEqual(left: Set<string>, right: Set<string>) {
   if (left.size !== right.size) {
@@ -62,6 +61,7 @@ function stringSetsEqual(left: Set<string>, right: Set<string>) {
   return true;
 }
 
+/** 更新入口沿用设置导航回调，让展开和折叠侧栏进入同一份全局更新状态。 */
 export function MachineSidebar({
   activeView = "hosts",
   collapsed = false,
@@ -100,6 +100,7 @@ export function MachineSidebar({
   onOpenContainerTerminal,
   onOpenRdpConnection,
   onOpenSettings,
+  onOpenUpdates,
   onOpenSftp,
   onOpenSshTerminal,
   onOpenSftpTransferWorkbench,
@@ -679,6 +680,7 @@ export function MachineSidebar({
         dragPreviewElement={dragPreviewElement}
         onAddConnection={onAddConnection}
         onOpenSettings={onOpenSettings}
+        onOpenUpdates={onOpenUpdates}
         onOpenTransferWorkbench={onOpenTransferWorkbench}
         openContextMenu={openContextMenu}
         openMachineIdSet={openMachineIdSet}
@@ -747,20 +749,13 @@ export function MachineSidebar({
       )}
 
       <div className={sidebarFooterClassName}>
-        <Button
-          aria-label="打开设置"
-          aria-pressed={settingsSelected}
-          className={cn(
-            "h-8 w-8 rounded-lg",
-            settingsSelected && sidebarSettingsSelectedClassName,
-          )}
-          onClick={onOpenSettings}
-          size="icon"
-          title="设置"
-          variant="ghost"
-        >
-          <Settings className="h-4 w-4" />
-        </Button>
+        <div className="flex items-center gap-1">
+          <MachineSidebarSettingsButtons
+            onOpenSettings={onOpenSettings}
+            onOpenUpdates={onOpenUpdates}
+            settingsSelected={settingsSelected}
+          />
+        </div>
         {groups.length > 0 ? (
           <Button
             aria-label="添加连接"

@@ -44,6 +44,8 @@ interface SftpTransferQueueRowProps {
  *
  * 长路径、字节明细仍按需展开，避免正常队列因错误说明而持续增高；但网络失联不能藏在
  * 详情里，否则用户无法判断刷新图标是否会安全地从断点继续。
+ * 提交结果不明时主行保持简短核对提示；只把与提示不同的原始错误放在详情中，方便查找
+ * 备份或 partial 路径，同时避免重复错误和长路径撑开窄队列。
  */
 export function SftpTransferQueueRow({
   onCancel,
@@ -79,6 +81,11 @@ export function SftpTransferQueueRow({
     transfer.failureKind === "commitUnknown";
   const failureMessage = transferFailureMessage(transfer) ||
     (transfer.status === "failed" ? "传输失败，未收到详细错误信息。" : null);
+  const rawFailureDetail = transfer.error?.trim();
+  const technicalFailureDetail =
+    rawFailureDetail && rawFailureDetail !== failureMessage
+      ? rawFailureDetail
+      : null;
   const isWaiting = isTransferWaiting(transfer);
   const normalizedPhase = transfer.phase?.toLowerCase();
   const hasExplicitLifecyclePhase = [
@@ -327,6 +334,14 @@ export function SftpTransferQueueRow({
           {failureMessage && (!isInlineFailure || hasSuccessor) ? (
             <div className="break-words text-rose-600 dark:text-rose-300">
               {failureMessage}
+            </div>
+          ) : null}
+          {technicalFailureDetail ? (
+            <div className="min-w-0 break-words text-rose-600 dark:text-rose-300 [overflow-wrap:anywhere]">
+              <span className="font-semibold">错误详情：</span>{" "}
+              <code className="whitespace-pre-wrap break-words font-mono [overflow-wrap:anywhere]">
+                {technicalFailureDetail}
+              </code>
             </div>
           ) : null}
           {hasSuccessor ? (

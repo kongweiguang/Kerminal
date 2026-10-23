@@ -21,9 +21,11 @@ use super::checkpoint::*;
 mod local;
 mod recovery;
 mod remote;
+mod remote_commit;
 pub(in crate::services::sftp_service) use local::*;
 pub(in crate::services::sftp_service) use recovery::*;
 pub(in crate::services::sftp_service) use remote::*;
+pub(in crate::services::sftp_service) use remote_commit::*;
 
 use crate::{
     error::{AppError, AppResult},
@@ -329,6 +331,8 @@ mod tests {
             confirmed_offset: 0,
             source: source.clone(),
             committed: false,
+            backup_path: None,
+            expected_sha256: None,
         };
         assert!(safe_first_write_retry_checkpoint(
             &record,
@@ -440,6 +444,8 @@ mod tests {
                 confirmed_offset: contents.len() as u64,
                 source: source.clone(),
                 committed: false,
+                backup_path: None,
+                expected_sha256: None,
             },
         );
 
@@ -487,6 +493,8 @@ mod tests {
                 confirmed_offset: 4,
                 source: source.clone(),
                 committed: false,
+                backup_path: None,
+                expected_sha256: None,
             },
         );
 
@@ -557,6 +565,8 @@ mod tests {
                 confirmed_offset: 4,
                 source: source.clone(),
                 committed: false,
+                backup_path: None,
+                expected_sha256: None,
             },
         );
         let changed_source = RecoverySourceFingerprint {

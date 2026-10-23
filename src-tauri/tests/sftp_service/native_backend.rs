@@ -4,7 +4,7 @@ use super::support::{
     create_password_remote_host, create_password_remote_host_without_credentials,
     loopback::{
         start_loopback_sftp_only_server, start_loopback_sftp_server,
-        start_loopback_sftp_server_with_symlinks,
+        start_loopback_sftp_server_with_symlinks, start_loopback_sftp_server_without_overwrite,
     },
     test_state,
 };

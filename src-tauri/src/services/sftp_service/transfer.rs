@@ -287,6 +287,8 @@ pub(super) struct TransferProgress {
     recovery: RecoveryCheckpointHolder,
     idle_timeout_pending: Arc<AtomicBool>,
     commit_outcome_uncertain: Arc<AtomicBool>,
+    commit_rollback_confirmed: Arc<AtomicBool>,
+    commit_recovery_detail: Arc<Mutex<Option<String>>>,
     last_activity_at_ms: Arc<AtomicU64>,
     diagnostic_operation: Arc<Mutex<&'static str>>,
     event_emitter: Option<TransferEventEmitter>,
@@ -306,7 +308,7 @@ impl fmt::Debug for TransferProgress {
     }
 }
 
-/// 用单个定时器监督后台网络工作；只有连续无进度时才中断 future 并保留可恢复 partial。
+/// 用单个定时器监督后台网络工作；取消提交时保留回执等待窗口，只有超时才视为结果不明。
 pub(super) async fn run_with_idle_watchdog<T>(
     progress: &TransferProgress,
     idle_timeout_seconds: u64,
@@ -322,29 +324,96 @@ pub(super) async fn run_with_idle_watchdog<T>(
             result = &mut future => return result,
             _ = progress.cancel_notified() => {
                 progress.log_stall_diagnostic("cancelRequested");
-                if progress.with_summary(|s| s.phase.as_deref() == Some("committing")).unwrap_or(false) {
-                    return match tokio::time::timeout(Duration::from_secs(2), &mut future).await {
-                        Ok(Ok(value)) => Ok(value),
-                        Ok(Err(_)) | Err(_) => {
-                            progress.note_commit_outcome_uncertain();
-                            Err(AppError::Sftp("提交结果未确认，请核对目标文件".to_owned()))
-                        }
-                    };
+                if commit_is_in_progress(progress) {
+                    return wait_for_commit_after_interruption(progress, &mut future).await;
                 }
                 return Err(AppError::Sftp("传输已取消".to_owned()));
             }
             _ = ticker.tick() => {
                 if progress.is_cancelled() {
+                    progress.log_stall_diagnostic("cancelRequested");
+                    if commit_is_in_progress(progress) {
+                        return wait_for_commit_after_interruption(progress, &mut future).await;
+                    }
                     return Err(AppError::Sftp("传输已取消".to_owned()));
                 }
                 progress.mark_waiting_if_stalled(unix_timestamp_millis());
                 if progress.idle_timeout_elapsed(idle_timeout_seconds, unix_timestamp_millis()) {
                     progress.log_stall_diagnostic("idleTimeout");
+                    if commit_is_in_progress(progress) {
+                        return wait_for_commit_after_interruption(progress, &mut future).await;
+                    }
                     progress.note_idle_timeout(idle_timeout_seconds);
                     return Err(AppError::Sftp(idle_timeout_message(idle_timeout_seconds)));
                 }
             }
         }
+    }
+}
+
+/// 三种中断分支共用提交确认宽限期，避免 committing future 被直接丢弃而漏掉 unknown 标记。
+async fn wait_for_commit_after_interruption<T, F>(
+    progress: &TransferProgress,
+    future: &mut F,
+) -> AppResult<T>
+where
+    F: std::future::Future<Output = AppResult<T>> + Unpin,
+{
+    commit_result_after_cancel(
+        progress,
+        tokio::time::timeout(Duration::from_secs(2), future).await,
+    )
+}
+
+/// 仅提交阶段需要等待回执；其余阶段可立即取消并保留安全 partial。
+fn commit_is_in_progress(progress: &TransferProgress) -> bool {
+    progress
+        .with_summary(|summary| summary.phase.as_deref() == Some("committing"))
+        .unwrap_or(false)
+}
+
+/// 已收到的提交错误是确定结果；只有等待窗口耗尽、future 仍未返回时才标记回执不明。
+fn commit_result_after_cancel<T>(
+    progress: &TransferProgress,
+    completion: Result<AppResult<T>, tokio::time::error::Elapsed>,
+) -> AppResult<T> {
+    match completion {
+        Ok(result) => result,
+        Err(_) => {
+            progress.note_commit_outcome_uncertain();
+            Err(AppError::Sftp("提交结果未确认，请核对目标文件".to_owned()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod commit_cancel_tests {
+    use super::{commit_result_after_cancel, TransferProgress};
+    use crate::error::{AppError, AppResult};
+    use std::{future::pending, time::Duration};
+
+    /// 确定的服务器提交拒绝必须保留原错误语义，避免误设 CommitUnknown 并封锁人工重试。
+    #[tokio::test]
+    async fn known_commit_error_after_cancel_is_not_unknown() {
+        let progress = TransferProgress::detached();
+        let error = AppError::Sftp("服务器明确拒绝提交".to_owned());
+
+        let result: AppResult<()> = commit_result_after_cancel(&progress, Ok(Err(error)));
+
+        assert!(matches!(result, Err(AppError::Sftp(message)) if message == "服务器明确拒绝提交"));
+        assert!(!progress.commit_outcome_uncertain());
+    }
+
+    /// future 在取消宽限期内没有返回时仍须保守保护，避免重试覆盖未知提交结果。
+    #[tokio::test]
+    async fn pending_commit_after_cancel_is_unknown() {
+        let progress = TransferProgress::detached();
+        let timed_out = tokio::time::timeout(Duration::ZERO, pending::<AppResult<()>>()).await;
+
+        let result = commit_result_after_cancel(&progress, timed_out);
+
+        assert!(result.is_err());
+        assert!(progress.commit_outcome_uncertain());
     }
 }
 

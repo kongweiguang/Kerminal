@@ -37,8 +37,14 @@ pub(in crate::services::sftp_service) struct RecoveryCheckpointRecord {
     pub(in crate::services::sftp_service) confirmed_offset: u64,
     /// 源文件身份。
     pub(in crate::services::sftp_service) source: RecoverySourceFingerprint,
-    /// 是否已经完成原子提交；提交后不会再次写入同一记录。
+    /// 是否已经确认正式提交；提交后不会再次写入同一记录。
     pub(in crate::services::sftp_service) committed: bool,
+    /// 非原子覆盖事务中暂存原目标的同目录路径；供 future 被取消后继续恢复。
+    #[serde(default)]
+    pub(in crate::services::sftp_service) backup_path: Option<String>,
+    /// 上传内容的完整摘要；未知提交结果只在正式目标与它完全一致时收敛成功。
+    #[serde(default)]
+    pub(in crate::services::sftp_service) expected_sha256: Option<String>,
 }
 
 /// 任务级恢复记录集合；backend 可把它放进 `TransferTask`，自动恢复和人工 retry 共享。
@@ -130,6 +136,27 @@ impl TransferRecoveryState {
         self.records.insert(key, record);
     }
 
+    /// 在首个远端 rename 前登记事务三条路径/内容身份，监督器丢弃 future 后仍可安全恢复。
+    pub(in crate::services::sftp_service) fn remember_commit_attempt(
+        &mut self,
+        key: &str,
+        backup_path: Option<String>,
+        expected_sha256: String,
+    ) {
+        if let Some(record) = self.records.get_mut(key) {
+            record.backup_path = backup_path;
+            record.expected_sha256 = Some(expected_sha256);
+        }
+    }
+
+    /// 确认回滚或提交收敛后移除事务 journal，避免后继重试误处理已结束的备份。
+    pub(in crate::services::sftp_service) fn clear_commit_backup(&mut self, key: &str) {
+        if let Some(record) = self.records.get_mut(key) {
+            record.backup_path = None;
+            record.expected_sha256 = None;
+        }
+    }
+
     /// 批量 ACK 后同时推进偏移和整个已确认前缀摘要，避免只验证前 64 KiB。
     pub(in crate::services::sftp_service) fn record_confirmed_batch_with_prefix(
         &mut self,
@@ -199,6 +226,8 @@ mod tests {
                     prefix_length: 0,
                 },
                 committed: false,
+                backup_path: None,
+                expected_sha256: None,
             },
         );
         assert!(state.has_safe_recovery_checkpoint());

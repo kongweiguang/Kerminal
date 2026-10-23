@@ -27,6 +27,12 @@ pub(in crate::services::sftp_service) async fn prepare_remote_target_with_checkp
             if record.committed {
                 return Ok(None);
             }
+            if let Some(backup) = &record.backup_path {
+                return Err(AppError::Sftp(format!(
+                    "覆盖事务尚未确认，禁止继续写入；请核对目标: {}\npartial: {}\nbackup: {backup}",
+                    record.actual_target, record.partial_path
+                )));
+            }
             if remote_final_matches_checkpoint(sftp, &record).await? {
                 checkpoints
                     .lock()
@@ -118,7 +124,7 @@ pub(in crate::services::sftp_service) async fn prepare_remote_target_with_checkp
 }
 
 /// 只有同任务 checkpoint 能提供可信偏移和临时路径；孤儿文件保留并隔离到新路径上传。
-/// 全新文件用排他创建避免检查与 OPEN 之间覆盖其它任务，恢复仍须裁掉未确认尾部。
+/// 长文件名预先改用短 UUID 避免追加后缀超过服务器常见的 255 字节限制；排他创建保护并发任务。
 #[allow(clippy::too_many_arguments)]
 async fn prepare_selected_remote_reliable_write_target(
     sftp: &SftpSession,
@@ -135,6 +141,20 @@ async fn prepare_selected_remote_reliable_write_target(
         .as_ref()
         .map(|record| record.partial_path.clone())
         .unwrap_or_else(|| reliable_remote_partial_path(final_path));
+    if existing_checkpoint.is_none()
+        && partial_path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.len() > 255)
+    {
+        partial_path = join_remote_path(
+            &remote_parent_path(final_path),
+            &format!(
+                ".{}{RELIABLE_PARTIAL_SUFFIX}",
+                uuid::Uuid::new_v4().simple()
+            ),
+        );
+    }
     let mut partial_bytes = remote_partial_bytes(sftp, &partial_path).await?;
     if source.is_some() && existing_checkpoint.is_none() && partial_bytes.is_some() {
         partial_path = join_remote_path(
@@ -154,6 +174,8 @@ async fn prepare_selected_remote_reliable_write_target(
             confirmed_offset: 0,
             source: source.cloned().expect("source is present"),
             committed: false,
+            backup_path: None,
+            expected_sha256: None,
         })
     });
     let resume_offset = match (source, partial_bytes, checkpoint.as_ref()) {
@@ -379,6 +401,8 @@ async fn open_remote_reliable_partial_target(
         confirmed_offset: offset,
         source: source.clone(),
         committed: false,
+        backup_path: None,
+        expected_sha256: None,
     });
     if let (Some(checkpoint), Some(checkpoints)) = (&checkpoint, checkpoints) {
         checkpoints
@@ -392,44 +416,4 @@ async fn open_remote_reliable_partial_target(
         offset,
         file,
     })
-}
-
-/// 大小确认后才改正式路径；服务器不能原子替换已存在目标时保留原文件和 partial。
-pub(in crate::services::sftp_service) async fn commit_remote_reliable_write_target(
-    sftp: &SftpSession,
-    final_path: &str,
-    partial_path: &str,
-    expected_bytes: u64,
-) -> AppResult<()> {
-    let actual_bytes = sftp
-        .metadata(partial_path.to_owned())
-        .await
-        .map_err(|error| remote_write_error("核对上传临时文件大小（STAT）", error))?
-        .size
-        .unwrap_or(0);
-    match confirm_reliable_write_size(expected_bytes, actual_bytes) {
-        ReliableSizeConfirmation::Verified => {}
-        ReliableSizeConfirmation::Mismatch { expected, actual } => {
-            return Err(AppError::Sftp(format!(
-                "可靠上传 size 确认失败: expected {expected} bytes, got {actual} bytes"
-            )));
-        }
-    }
-
-    // 直接请求服务器执行 rename；支持同路径原子替换的实现可完成 overwrite。
-    // 服务器拒绝已有目标时保持两侧文件原样，绝不先删除正式文件。
-    match sftp
-        .rename(partial_path.to_owned(), final_path.to_owned())
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(error) if remote_create_conflict_confirmed(sftp, final_path, &error, false).await => {
-            // 不能 remove(final) 再 rename：网络中断发生在 remove 之后会丢失用户原文件。
-            // 当前依赖没有公开 posix-rename 扩展入口，因此遇到已存在目标安全拒绝，保留 partial。
-            Err(AppError::Sftp(
-                "服务器不支持原子覆盖；原文件未改，partial 保留".to_owned(),
-            ))
-        }
-        Err(error) => Err(remote_write_error("提交上传文件（RENAME）", error)),
-    }
 }

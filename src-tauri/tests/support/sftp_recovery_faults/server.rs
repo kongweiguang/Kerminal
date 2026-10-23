@@ -54,6 +54,12 @@ pub(crate) enum FaultMode {
     StallOnceWrite = 6,
     /// 每个新连接的第一次写请求都阻塞，用于验证自动恢复第二次失败。
     StallEveryConnection = 7,
+    /// 触发 overwrite fallback 后拒绝 partial 到正式目标的提交 rename。
+    RejectPartialCommit = 8,
+    /// 同时拒绝 fallback 提交与 backup 回滚，制造可恢复的未知状态。
+    RejectCommitAndRollback = 9,
+    /// 在既有目标已备份后挂起 partial 提交，供取消宽限期验证未知结果保护。
+    StallCommitAfterBackup = 10,
 }
 
 impl FaultMode {
@@ -67,6 +73,9 @@ impl FaultMode {
             5 => Self::OutOfOrderAck,
             6 => Self::StallOnceWrite,
             7 => Self::StallEveryConnection,
+            8 => Self::RejectPartialCommit,
+            9 => Self::RejectCommitAndRollback,
+            10 => Self::StallCommitAfterBackup,
             _ => Self::Normal,
         }
     }
@@ -79,6 +88,7 @@ pub(crate) struct FaultSftpServer {
     mode: Arc<AtomicU8>,
     write_requests: Arc<AtomicUsize>,
     read_requests: Arc<AtomicUsize>,
+    commit_stalls: Arc<AtomicUsize>,
     shutdown: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -98,6 +108,11 @@ impl FaultSftpServer {
     pub(crate) fn read_requests(&self) -> usize {
         self.read_requests.load(Ordering::SeqCst)
     }
+
+    /// 返回已进入悬停提交 rename 的请求数，避免取消测试只停在 backup 与 partial rename 的间隙。
+    pub(crate) fn commit_stalls(&self) -> usize {
+        self.commit_stalls.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for FaultSftpServer {
@@ -114,6 +129,7 @@ struct FaultSshServer {
     mode: Arc<AtomicU8>,
     write_requests: Arc<AtomicUsize>,
     read_requests: Arc<AtomicUsize>,
+    commit_stalls: Arc<AtomicUsize>,
     stall_once_consumed: Arc<AtomicU8>,
     shutdown: watch::Receiver<bool>,
 }
@@ -123,6 +139,7 @@ struct FaultSshSession {
     mode: Arc<AtomicU8>,
     write_requests: Arc<AtomicUsize>,
     read_requests: Arc<AtomicUsize>,
+    commit_stalls: Arc<AtomicUsize>,
     stall_once_consumed: Arc<AtomicU8>,
     shutdown: watch::Receiver<bool>,
     channels: HashMap<ChannelId, Channel<Msg>>,
@@ -138,6 +155,7 @@ impl russh::server::Server for FaultSshServer {
             mode: Arc::clone(&self.mode),
             write_requests: Arc::clone(&self.write_requests),
             read_requests: Arc::clone(&self.read_requests),
+            commit_stalls: Arc::clone(&self.commit_stalls),
             stall_once_consumed: Arc::clone(&self.stall_once_consumed),
             shutdown: self.shutdown.clone(),
             channels: HashMap::new(),
@@ -192,11 +210,13 @@ impl russh::server::Handler for FaultSshSession {
                 mode: Arc::clone(&self.mode),
                 write_requests: Arc::clone(&self.write_requests),
                 read_requests: Arc::clone(&self.read_requests),
+                commit_stalls: Arc::clone(&self.commit_stalls),
                 stall_once_consumed: Arc::clone(&self.stall_once_consumed),
                 shutdown: self.shutdown.clone(),
                 next_handle: 0,
                 handles: HashMap::new(),
                 stalled_connection: false,
+                rejected_partial_commit_target: None,
             },
         )
         .await;
@@ -209,11 +229,13 @@ struct FaultSftpFs {
     mode: Arc<AtomicU8>,
     write_requests: Arc<AtomicUsize>,
     read_requests: Arc<AtomicUsize>,
+    commit_stalls: Arc<AtomicUsize>,
     stall_once_consumed: Arc<AtomicU8>,
     shutdown: watch::Receiver<bool>,
     next_handle: u64,
     handles: HashMap<String, FaultHandle>,
     stalled_connection: bool,
+    rejected_partial_commit_target: Option<String>,
 }
 
 enum FaultHandle {
@@ -459,7 +481,8 @@ impl russh_sftp::server::Handler for FaultSftpFs {
         Ok(Self::ok(id))
     }
 
-    /// 模拟拒绝替换既有目标的 SFTP v3 服务器；保留原 final 供安全覆盖失败断言。
+    /// Reject overwrite like SFTP v3 servers without POSIX rename and inject deterministic commit
+    /// refusals or a missing commit ACK so recovery state is exercised over the real protocol.
     async fn rename(
         &mut self,
         id: u32,
@@ -468,8 +491,32 @@ impl russh_sftp::server::Handler for FaultSftpFs {
     ) -> Result<Status, Self::Error> {
         let old_path = self.resolve_path(&oldpath)?;
         let new_path = self.resolve_path(&newpath)?;
-        if fs::metadata(&new_path).await.is_ok() {
+        if fs::symlink_metadata(&new_path).await.is_ok() {
             return Err(StatusCode::Failure);
+        }
+
+        let mode = FaultMode::from_raw(self.mode.load(Ordering::SeqCst));
+        let is_partial = oldpath.ends_with(".kerminal-part");
+        if matches!(
+            mode,
+            FaultMode::RejectPartialCommit | FaultMode::RejectCommitAndRollback
+        ) && is_partial
+            && self.rejected_partial_commit_target.is_none()
+        {
+            self.rejected_partial_commit_target = Some(newpath);
+            return Err(StatusCode::Failure);
+        }
+        if mode == FaultMode::RejectCommitAndRollback
+            && self.rejected_partial_commit_target.as_deref() == Some(newpath.as_str())
+            && !is_partial
+        {
+            return Err(StatusCode::Failure);
+        }
+        if mode == FaultMode::StallCommitAfterBackup && is_partial {
+            // The destination was proven absent above; the fixture starts with an old final so
+            // reaching this partial rename proves the backup move already completed.
+            self.commit_stalls.fetch_add(1, Ordering::SeqCst);
+            self.stall_until_shutdown().await?;
         }
         fs::rename(old_path, new_path)
             .await
@@ -506,6 +553,7 @@ pub(crate) async fn start_fault_server(root: PathBuf, mode: FaultMode) -> FaultS
     let mode = Arc::new(AtomicU8::new(mode as u8));
     let write_requests = Arc::new(AtomicUsize::new(0));
     let read_requests = Arc::new(AtomicUsize::new(0));
+    let commit_stalls = Arc::new(AtomicUsize::new(0));
     let stall_once_consumed = Arc::new(AtomicU8::new(0));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = FaultSshServer {
@@ -513,6 +561,7 @@ pub(crate) async fn start_fault_server(root: PathBuf, mode: FaultMode) -> FaultS
         mode: Arc::clone(&mode),
         write_requests: Arc::clone(&write_requests),
         read_requests: Arc::clone(&read_requests),
+        commit_stalls: Arc::clone(&commit_stalls),
         stall_once_consumed: Arc::clone(&stall_once_consumed),
         shutdown: shutdown_rx,
     };
@@ -526,6 +575,7 @@ pub(crate) async fn start_fault_server(root: PathBuf, mode: FaultMode) -> FaultS
         mode,
         write_requests,
         read_requests,
+        commit_stalls,
         shutdown: shutdown_tx,
         task,
     }

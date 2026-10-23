@@ -96,12 +96,12 @@ pub(in crate::services::sftp_service) async fn remote_final_matches_checkpoint(
     {
         return Ok(false);
     }
-    let metadata = match sftp.metadata(record.actual_target.clone()).await {
+    let metadata = match sftp.symlink_metadata(record.actual_target.clone()).await {
         Ok(metadata) => metadata,
         Err(error) if is_no_such_file_error(&error) => return Ok(false),
         Err(error) => return Err(native_sftp_error(error)),
     };
-    if metadata.size != Some(record.source.size) {
+    if !metadata.file_type().is_file() || metadata.size != Some(record.source.size) {
         return Ok(false);
     }
     let mut file = sftp

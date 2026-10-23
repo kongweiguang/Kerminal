@@ -5,6 +5,10 @@ import type userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { beforeEach, vi } from "vitest";
 import { SettingsToolContent } from "../../../../src/features/settings/SettingsToolContent";
+import {
+  appUpdateInitialState,
+  useAppUpdateStore,
+} from "../../../../src/features/settings/appUpdateStore";
 import { defaultAppSettings } from "../../../../src/features/settings/settingsModel";
 import type { AppSettings } from "../../../../src/features/settings/settingsModel";
 import type {
@@ -191,6 +195,7 @@ export function renderControlledSettings({
   return render(<ControlledSettings />);
 }
 
+/** 设置内容与更新 store 都是模块级状态，统一恢复可避免前一用例泄漏到下一用例。 */
 function resetSettingsToolContentMocks() {
   agentLauncherApiMock.getExternalAgentWorkspaceStatus.mockReset();
   agentLauncherApiMock.getExternalAgentWorkspaceStatus.mockResolvedValue({
@@ -348,6 +353,7 @@ function resetSettingsToolContentMocks() {
   updaterApiMock.installPendingAppUpdate.mockResolvedValue(undefined);
   updaterApiMock.relaunchApp.mockReset();
   updaterApiMock.relaunchApp.mockResolvedValue(undefined);
+  useAppUpdateStore.setState(appUpdateInitialState);
 }
 
 beforeEach(() => {

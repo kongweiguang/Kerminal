@@ -1,13 +1,11 @@
 //! @author kongweiguang
 
 use std::{
-    future::Future,
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
-    time::Duration,
 };
 
-use tokio::{fs, sync::Notify, time::sleep};
+use tokio::{fs, sync::Notify};
 
 use crate::models::sftp::SftpTransferConflictPolicy;
 
@@ -37,7 +35,7 @@ impl SftpService {
         Ok(true)
     }
 
-    /// 持有目标写入锁贯穿同 ID 自动恢复；每轮网络 future 由监督器拥有并在取消时丢弃。
+    /// 持有目标写入锁贯穿同 ID 自动恢复；目录 checkpoint 逐项登记，不能据当前已提交项推断遍历完成。
     #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_transfer_task(
         &self,
@@ -97,9 +95,17 @@ impl SftpService {
             match result {
                 Ok(()) if progress.is_cancelled() && !progress.all_committed() => progress.cancel(),
                 Ok(()) => progress.succeed(),
-                Err(_) if progress.all_committed() => progress.succeed(),
-                Err(_) if progress.commit_outcome_uncertain() => {
-                    progress.fail_commit_outcome_uncertain()
+                Err(error) if progress.commit_outcome_uncertain() => {
+                    progress.fail_commit_outcome_uncertain(error.to_string())
+                }
+                Err(_)
+                    if committed_transfer_error_is_complete(
+                        request.kind,
+                        progress.all_committed(),
+                        progress.commit_outcome_uncertain(),
+                    ) =>
+                {
+                    progress.succeed()
                 }
                 Err(_) if progress.is_cancelled() => progress.cancel(),
                 Err(_) if progress.failed_with_idle_timeout() => {}
@@ -195,8 +201,8 @@ impl SftpService {
             match result {
                 Ok(()) if progress.is_cancelled() => progress.cancel(),
                 Ok(()) => progress.succeed(),
-                Err(_) if progress.commit_outcome_uncertain() => {
-                    progress.fail_commit_outcome_uncertain()
+                Err(error) if progress.commit_outcome_uncertain() => {
+                    progress.fail_commit_outcome_uncertain(error.to_string())
                 }
                 Err(_) if progress.is_cancelled() => progress.cancel(),
                 Err(_) if progress.failed_with_idle_timeout() => {}
@@ -301,8 +307,8 @@ impl SftpService {
             match result {
                 Ok(()) if progress.is_cancelled() => progress.cancel(),
                 Ok(()) => progress.succeed(),
-                Err(_) if progress.commit_outcome_uncertain() => {
-                    progress.fail_commit_outcome_uncertain()
+                Err(error) if progress.commit_outcome_uncertain() => {
+                    progress.fail_commit_outcome_uncertain(error.to_string())
                 }
                 Err(_) if progress.is_cancelled() => progress.cancel(),
                 Err(_) if progress.failed_with_idle_timeout() => {}
@@ -404,8 +410,8 @@ impl SftpService {
             match result {
                 Ok(()) if progress.is_cancelled() => progress.cancel(),
                 Ok(()) => progress.succeed(),
-                Err(_) if progress.commit_outcome_uncertain() => {
-                    progress.fail_commit_outcome_uncertain()
+                Err(error) if progress.commit_outcome_uncertain() => {
+                    progress.fail_commit_outcome_uncertain(error.to_string())
                 }
                 Err(_) if progress.is_cancelled() => progress.cancel(),
                 Err(_) if progress.failed_with_idle_timeout() => {}
@@ -502,8 +508,8 @@ impl SftpService {
             match result {
                 Ok(()) if progress.is_cancelled() => progress.cancel(),
                 Ok(()) => progress.succeed(),
-                Err(_) if progress.commit_outcome_uncertain() => {
-                    progress.fail_commit_outcome_uncertain()
+                Err(error) if progress.commit_outcome_uncertain() => {
+                    progress.fail_commit_outcome_uncertain(error.to_string())
                 }
                 Err(_) if progress.is_cancelled() => progress.cancel(),
                 Err(_) if progress.failed_with_idle_timeout() => {}
@@ -513,6 +519,7 @@ impl SftpService {
     }
 }
 
+/// 跨主机槽位不足或目录复制会包含自身时改走中转，避免并发等待或递归复制。
 pub(super) fn should_stage_remote_copy(
     request: &SftpRemoteCopyRequest,
     settings: SftpRuntimeSettings,
@@ -522,87 +529,6 @@ pub(super) fn should_stage_remote_copy(
     }
     request.kind == SftpTransferKind::Directory
         && is_remote_descendant_path(&request.source_remote_path, &request.target_remote_path)
-}
-
-/// 执行一段受 watchdog 保护的 SFTP 工作，并对首次无进度故障做一次同 ID 重连恢复。
-///
-/// `operation` 每次调用都会重新创建底层连接 future；旧 future 在 watchdog 返回时已被
-/// 丢弃，因此恢复不会继续复用已经不再产生确认的 SFTP stream。排队和恢复等待期间仍监听
-/// 取消，最终失败只由这里写入，避免首次 idle 事件污染 UI 的终态通知。
-async fn run_managed_transfer_with_recovery<F, Fut>(
-    progress: &TransferProgress,
-    settings: SftpRuntimeSettings,
-    limiter: Arc<TransferLimiter>,
-    host_id: String,
-    allow_recovery: bool,
-    mut operation: F,
-) -> AppResult<()>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = AppResult<()>>,
-{
-    let mut recovery_attempt = 0_u8;
-    loop {
-        let permit = limiter
-            .acquire(host_id.clone(), settings, progress.clone())
-            .await?;
-        progress.mark_running();
-        progress.mark_phase("connecting", None);
-        let result =
-            run_with_idle_watchdog(progress, settings.idle_timeout_seconds, operation()).await;
-        // watchdog 已丢弃旧 I/O；等待恢复前先释放槽，让其他排队任务获得执行机会。
-        drop(permit);
-        if result.is_ok() {
-            return result;
-        }
-
-        let idle_timeout = progress.take_idle_timeout_pending();
-        if idle_timeout
-            && allow_recovery
-            && progress.has_safe_recovery_checkpoint()
-            && recovery_attempt == 0
-            && !progress.is_cancelled()
-        {
-            recovery_attempt = 1;
-            progress.begin_recovery(recovery_attempt);
-            if progress.is_cancelled() {
-                return Err(AppError::Sftp("传输已取消".to_owned()));
-            }
-            tokio::select! {
-                _ = sleep(Duration::from_secs(2)) => {}
-                _ = progress.cancel_notified() => {
-                    return Err(AppError::Sftp("传输已取消".to_owned()));
-                }
-            }
-            if progress.is_cancelled() {
-                return Err(AppError::Sftp("传输已取消".to_owned()));
-            }
-            progress.reset_after_recovery();
-            continue;
-        }
-
-        if idle_timeout {
-            progress.fail_idle_timeout(settings.idle_timeout_seconds);
-        }
-        return result;
-    }
-}
-
-/// 无检查点的复合操作不允许自动重放，只把 watchdog 原因写为稳定终态。
-async fn run_transfer_with_recovery<F, Fut>(
-    progress: &TransferProgress,
-    idle_timeout_seconds: u64,
-    mut operation: F,
-) -> AppResult<()>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = AppResult<()>>,
-{
-    let result = run_with_idle_watchdog(progress, idle_timeout_seconds, operation()).await;
-    if progress.take_idle_timeout_pending() {
-        progress.fail_idle_timeout(idle_timeout_seconds);
-    }
-    result
 }
 
 /// 跨主机流式复制必须同时拿齐槽位；无安全双端检查点时闲置失败不重放副作用。
@@ -754,3 +680,9 @@ struct StagedRemoteCopyTask {
 
 mod types;
 pub(super) use types::*;
+
+mod recovery;
+use recovery::{
+    committed_transfer_error_is_complete, run_managed_transfer_with_recovery,
+    run_transfer_with_recovery,
+};

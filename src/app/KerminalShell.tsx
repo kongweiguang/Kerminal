@@ -15,6 +15,7 @@ import {
   updateRemoteHost,
 } from "../lib/remoteHostApi";
 import { useDocumentTheme } from "../lib/useDocumentTheme";
+import { useAppUpdateCheck } from "./useAppUpdateCheck";
 import { useTauriWindowFrameState } from "../lib/useTauriWindowFrameState";
 import { resolveWindowChromeModel } from "../lib/windowChromeModel";
 import {
@@ -43,7 +44,7 @@ import { useKerminalShellTerminalDrop } from "./useKerminalShellTerminalDrop";
 import { useKerminalShellToolPanels } from "./useKerminalShellToolPanels";
 import { archiveAgentSessionsForClosedTabs } from "./agentSessionTabCloseCleanup";
 
-/** 主窗口只持有一次全局 rail 编辑状态，让展开态与紧凑态共享同一保存事务。 */
+/** 主窗口统一承载 rail 编辑与后台更新检查，使设置页挂载次数不影响全局运行状态。 */
 export function KerminalShell() {
   const activeTabId = useWorkspaceStore((state) => state.activeTabId);
   const activeTool = useWorkspaceStore((state) => state.activeTool);
@@ -118,6 +119,7 @@ export function KerminalShell() {
   const profiles = useWorkspaceStore((state) => state.profiles);
   const activeProfileId = useWorkspaceStore((state) => state.activeProfileId);
   const settings = useWorkspaceStore((state) => state.settings);
+  useAppUpdateCheck(settings.desktopNotifications);
   const setSettings = useWorkspaceStore((state) => state.setSettings);
   const [toolRailCustomizationOpen, setToolRailCustomizationOpen] =
     useState(false);
@@ -495,6 +497,7 @@ export function KerminalShell() {
         onOpenHostContainers: openHostContainersSidebar, onOpenLocalTerminal: openLocalTerminal,
         onOpenRdpConnection: openSavedRdpMachine, onOpenSerialTerminal: openSerialTerminal,
         onOpenSettings: openSettingsTool, onOpenSftp: openSftpForMachine,
+        onOpenUpdates: () => openSettingsTool("settings-about"),
         onOpenSftpTransferWorkbench: openSftpTransferWorkbench,
         onOpenSshTerminal: openSshTerminal, onOpenTelnetTerminal: openTelnetTerminal,
         onOpenTransferWorkbench: openSftpTransferWorkbench,

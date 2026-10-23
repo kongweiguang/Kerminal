@@ -133,6 +133,7 @@ impl russh::server::Handler for LoopbackSftpJumpSession {
 #[derive(Clone)]
 struct LoopbackSshServer {
     allow_shell: bool,
+    rename_policy: LoopbackSftpRenamePolicy,
     auth_successes: Arc<AtomicUsize>,
     root: PathBuf,
     symlinks: Arc<HashMap<String, String>>,
@@ -140,6 +141,7 @@ struct LoopbackSshServer {
 
 struct LoopbackSshSession {
     allow_shell: bool,
+    rename_policy: LoopbackSftpRenamePolicy,
     auth_successes: Arc<AtomicUsize>,
     root: PathBuf,
     symlinks: Arc<HashMap<String, String>>,
@@ -150,9 +152,12 @@ struct LoopbackSshSession {
 impl russh::server::Server for LoopbackSshServer {
     type Handler = LoopbackSshSession;
 
+    /// Carry the immutable fixture policy into each SSH connection so a test can exercise one
+    /// consistent server capability without sharing per-channel file handles.
     fn new_client(&mut self, _peer_addr: Option<SocketAddr>) -> Self::Handler {
         LoopbackSshSession {
             allow_shell: self.allow_shell,
+            rename_policy: self.rename_policy,
             auth_successes: Arc::clone(&self.auth_successes),
             root: self.root.clone(),
             symlinks: self.symlinks.clone(),
@@ -274,6 +279,7 @@ impl russh::server::Handler for LoopbackSshSession {
         Ok(())
     }
 
+    /// Attach the configured rename policy to the real SFTP dispatcher used by this session.
     async fn subsystem_request(
         &mut self,
         channel_id: ChannelId,
@@ -294,7 +300,11 @@ impl russh::server::Handler for LoopbackSshSession {
         session.channel_success(channel_id)?;
         russh_sftp::server::run(
             channel.into_stream(),
-            LoopbackSftpFs::with_symlinks(self.root.clone(), self.symlinks.clone()),
+            LoopbackSftpFs::with_policy(
+                self.root.clone(),
+                self.symlinks.clone(),
+                self.rename_policy,
+            ),
         )
         .await;
         Ok(())
@@ -353,9 +363,18 @@ fn parse_shell_single_quoted_string(value: &str) -> Option<String> {
 struct LoopbackSftpFs {
     root: PathBuf,
     symlinks: Arc<HashMap<String, String>>,
+    rename_policy: LoopbackSftpRenamePolicy,
     next_handle: u64,
     handles: HashMap<String, LoopbackSftpHandle>,
     rejected_first_writes: HashSet<String>,
+}
+
+/// Keep the no-overwrite case deterministic across Windows and Unix host filesystem semantics.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LoopbackSftpRenamePolicy {
+    #[default]
+    ReplaceExisting,
+    RejectExisting,
 }
 
 enum LoopbackSftpHandle {
@@ -370,14 +389,26 @@ enum LoopbackSftpHandle {
 }
 
 impl LoopbackSftpFs {
+    /// Retain existing replace-friendly behavior for fixtures that are not about commit fallback.
     fn new(root: PathBuf) -> Self {
-        Self::with_symlinks(root, Arc::new(HashMap::new()))
+        Self::with_policy(
+            root,
+            Arc::new(HashMap::new()),
+            LoopbackSftpRenamePolicy::ReplaceExisting,
+        )
     }
 
-    fn with_symlinks(root: PathBuf, symlinks: Arc<HashMap<String, String>>) -> Self {
+    /// Keep the rename policy on the filesystem handler so all SFTP sessions in one fixture see
+    /// the same deterministic server behavior while per-connection handles remain isolated.
+    fn with_policy(
+        root: PathBuf,
+        symlinks: Arc<HashMap<String, String>>,
+        rename_policy: LoopbackSftpRenamePolicy,
+    ) -> Self {
         Self {
             root,
             symlinks,
+            rename_policy,
             next_handle: 0,
             handles: HashMap::new(),
             rejected_first_writes: HashSet::new(),
@@ -409,13 +440,28 @@ impl LoopbackSftpFs {
         Ok(local_path)
     }
 
+    /// Reproduce servers that omit Unix mode bits or return permission bits without a type tag.
     async fn attrs_for_path(&self, id: u32, path: String) -> Result<Attrs, StatusCode> {
         let local_path = self.resolve_path(&path)?;
         let metadata = fs::metadata(local_path).await.map_err(Self::io_status)?;
         Ok(Attrs {
             id,
-            attrs: FileAttributes::from(&metadata),
+            attrs: Self::file_attributes_for_path(&path, &metadata),
         })
+    }
+
+    /// SFTP v3 attributes may legally omit permissions; marker-specific fields keep the fixture
+    /// deterministic while retaining real sizes and host metadata for all other paths.
+    fn file_attributes_for_path(remote_path: &str, metadata: &std::fs::Metadata) -> FileAttributes {
+        let mut attrs = FileAttributes::from(metadata);
+        let name = remote_path.rsplit('/').next().unwrap_or(remote_path);
+        if name.contains("omit-mode") {
+            attrs.permissions = None;
+        } else if name.contains("mode-only") && !name.ends_with(".kerminal-part") {
+            // A mode without S_IFREG/S_IFDIR/S_IFLNK proves permissions, not the entry type.
+            attrs.permissions = Some(0o644);
+        }
+        attrs
     }
 
     async fn symlink_attrs_for_path(&self, id: u32, path: String) -> Result<Attrs, StatusCode> {
@@ -545,16 +591,18 @@ impl russh_sftp::server::Handler for LoopbackSftpFs {
         self.symlink_attrs_for_path(id, path).await
     }
 
+    /// Keep FSTAT and LSTAT/STAT on the same attribute profile so a missing type bit cannot be
+    /// hidden by the upload's handle-based size verification.
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
         let Some(open_handle) = self.handles.get_mut(&handle) else {
             return Err(StatusCode::NoSuchFile);
         };
         match open_handle {
-            LoopbackSftpHandle::File { file, .. } => {
+            LoopbackSftpHandle::File { file, path } => {
                 let metadata = file.metadata().await.map_err(Self::io_status)?;
                 Ok(Attrs {
                     id,
-                    attrs: FileAttributes::from(&metadata),
+                    attrs: Self::file_attributes_for_path(path, &metadata),
                 })
             }
             LoopbackSftpHandle::Directory { .. } => Err(StatusCode::Failure),
@@ -656,12 +704,23 @@ impl russh_sftp::server::Handler for LoopbackSftpFs {
         self.attrs_for_path(id, path).await
     }
 
+    /// Inject deterministic existing-target and commit/rollback refusals before filesystem
+    /// mutation, while default fixtures continue to use the host filesystem's rename behavior.
     async fn rename(
         &mut self,
         id: u32,
         oldpath: String,
         newpath: String,
     ) -> Result<Status, Self::Error> {
+        if self.rename_policy != LoopbackSftpRenamePolicy::ReplaceExisting {
+            let target = self.resolve_physical_path(&newpath)?;
+            let target_exists = fs::symlink_metadata(&target).await.is_ok()
+                || self.virtual_symlink_target(&newpath).is_some();
+            if target_exists {
+                return Err(StatusCode::Failure);
+            }
+        }
+
         let old_path = self.resolve_path(&oldpath)?;
         let new_path = self.resolve_path(&newpath)?;
         fs::rename(old_path, new_path)

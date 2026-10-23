@@ -298,7 +298,7 @@ function sftpRecoverySmokeHtml(entryPath) {
 }
 
 /**
- * 返回浏览器端 React harness，所有动作走真实 DOM/React 事件而非静态 HTML。
+ * 返回真实队列组件的 React harness；同时区分字节到齐、提交失败与成功，防止满格误报完成。
  */
 function sftpRecoverySmokeEntry() {
   return `
@@ -310,13 +310,15 @@ import { SftpTransferQueueRow } from "/src/features/sftp/SftpTransferQueueRow";
 
 const longName = "release-artifact-with-a-deliberately-long-name-for-narrow-panels-2026-09-22.tar.zst";
 
-/** 用独立任务覆盖恢复、取消、提交不明与长名布局，防止状态互相遮蔽。 */
+/** 分别覆盖字节到齐后的提交、拒绝与未知结果，避免成功状态掩盖真实失败。 */
 function fixtureTransfers() {
   return [
     transfer({ id: "waiting", phase: "waiting", status: "running", bytesTransferred: 32768 }),
     transfer({ id: "recovering", phase: "recovering", status: "running", recoveryAttempt: 1, bytesTransferred: 196608 }),
     transfer({ id: "canceling", phase: "canceling", status: "running", cancelRequested: true, bytesTransferred: 65536 }),
     transfer({ id: "idle-failed", failureKind: "idleTimeout", idleTimeoutSeconds: 180, retryable: true, resumable: true, status: "failed", bytesTransferred: 524288 }),
+    transfer({ id: "committing", phase: "committing", cancelable: false, status: "running", bytesTransferred: 1048576 }),
+    transfer({ id: "commit-failed", retryable: true, resumable: true, status: "failed", error: "替换目标文件失败，原文件已恢复，可继续传输。", bytesTransferred: 1048576 }),
     transfer({ id: "commit-unknown", failureKind: "commitUnknown", retryable: false, status: "failed", bytesTransferred: 1048576 }),
     transfer({ id: "canceled", status: "canceled", cancelRequested: true, bytesTransferred: 131072 }),
     transfer({ id: "succeeded", status: "succeeded", bytesTransferred: 1048576, totalBytes: 1048576 }),
@@ -396,7 +398,7 @@ function SmokeApp() {
   );
 }
 
-/** 同时检查可视宽度、主题、主状态和危险动作缺席，避免截图看似正常但语义不闭环。 */
+/** 同时检查布局、主题及提交语义；100% 与取消入口必须服从后端终态和提交门禁。 */
 function validateQueue(themeMode, resolvedTheme) {
   const failures = [];
   const shell = document.querySelector("#sftp-recovery-smoke-shell");
@@ -425,9 +427,11 @@ function validateQueue(themeMode, resolvedTheme) {
     recovering: ["正在恢复连接", "1/1"],
     canceling: ["正在取消"],
     "idle-failed": ["失败", "网络连续 3 分钟无响应"],
-    "commit-unknown": ["失败", "提交结果未确认，请核对目标文件"],
+    committing: ["提交文件", "99%"],
+    "commit-failed": ["失败", "99%", "原文件已恢复"],
+    "commit-unknown": ["失败", "99%", "请刷新目录核对目标文件后"],
     canceled: ["已取消"],
-    succeeded: ["完成"],
+    succeeded: ["完成", "100%"],
   };
   for (const [id, labels] of Object.entries(expected)) {
     const text = document.querySelector('[data-sftp-transfer-state="' + id + '"]')?.textContent || "";
@@ -441,6 +445,8 @@ function validateQueue(themeMode, resolvedTheme) {
   const commitRow = document.querySelector('[data-sftp-transfer-state="commit-unknown"]');
   if (!commitRow?.querySelector('[role="alert"]')) failures.push("commit-unknown:missing-alert");
   if (commitRow?.querySelector('button[aria-label^="继续传输"], button[aria-label^="重新传输"]')) failures.push("commit-unknown:unsafe-retry-action");
+  const committingRow = document.querySelector('[data-sftp-transfer-state="committing"]');
+  if (committingRow?.querySelector('button[aria-label^="取消传输"]')) failures.push("committing:unsafe-cancel-action");
   return { dataTheme: document.documentElement.dataset.theme, failures, queueWidth: queue?.getBoundingClientRect().width ?? 0, themeMode, resolvedTheme, rows: document.querySelectorAll("[data-sftp-transfer-state]").length };
 }
 

@@ -106,6 +106,9 @@ fn prepare_codex_writes_managed_files_without_clobbering_user_content() {
     assert!(config_reference.contains("one idempotent successor"));
     assert!(config_reference.contains("automatically reconnects once"));
     assert!(config_reference.contains("failureKind = \"commitUnknown\""));
+    assert!(config_reference.contains("same-directory backup, replacement, and rollback"));
+    assert!(config_reference.contains("compatibility path is not atomic"));
+    assert!(config_reference.contains("Existing unrelated partial files are preserved"));
     assert!(config_reference.contains("transportMode` automatically"));
     assert!(config_reference.contains("[sftp].idleTimeoutSeconds"));
     assert!(config_reference.contains("60-second MCP client call guard"));

@@ -169,6 +169,8 @@ async fn prepare_selected_local_reliable_write_target(
             confirmed_offset: 0,
             source: source.cloned().expect("source is present"),
             committed: false,
+            backup_path: None,
+            expected_sha256: None,
         })
     });
     let resume_offset = match (source, partial_bytes, checkpoint.as_ref()) {
@@ -307,6 +309,8 @@ async fn open_local_reliable_partial_target(
         confirmed_offset: offset,
         source: source.clone(),
         committed: false,
+        backup_path: None,
+        expected_sha256: None,
     });
     if let (Some(checkpoint), Some(checkpoints)) = (&checkpoint, checkpoints) {
         checkpoints

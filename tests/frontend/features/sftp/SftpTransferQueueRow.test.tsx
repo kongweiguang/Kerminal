@@ -141,6 +141,52 @@ describe("SftpTransferQueueRow", () => {
     expect(status).toHaveTextContent("正在恢复连接（1/1）");
   });
 
+  /** 提交阶段不提供取消动作，字节到齐也不能把活动任务伪装成完成。 */
+  it("keeps committing uploads below 100 percent and hides unsupported cancel", () => {
+    render(
+      <SftpTransferQueueRow
+        onCancel={vi.fn()}
+        transfer={createSftpTransferSummary({
+          bytesTransferred: 1024,
+          cancelable: false,
+          direction: "upload",
+          phase: "committing",
+          status: "running",
+          totalBytes: 1024,
+        })}
+      />,
+    );
+
+    expect(screen.getByLabelText("提交文件")).toBeVisible();
+    expect(screen.getByText("99%")).toBeVisible();
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "99");
+    expect(screen.queryByRole("button", { name: /取消传输/ })).not.toBeInTheDocument();
+  });
+
+  /** 已传完字节但远端提交失败时，错误必须和未完成进度同时可见。 */
+  it("shows a failed full-byte upload as incomplete", () => {
+    const message = "SFTP 文件操作失败：服务器不支持原子覆盖；原文件未改，partial 保留";
+    render(
+      <SftpTransferQueueRow
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+        transfer={createSftpTransferSummary({
+          bytesTransferred: 1024,
+          direction: "upload",
+          error: message,
+          failureKind: "other",
+          retryable: false,
+          status: "failed",
+          totalBytes: 1024,
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent(message);
+    expect(screen.getByText("99%")).toBeVisible();
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "99");
+  });
+
   it("closes the old retry action when a successor task exists", async () => {
     const transfer = createSftpTransferSummary({
       failureKind: "idleTimeout",
@@ -166,20 +212,37 @@ describe("SftpTransferQueueRow", () => {
   });
 
   /** 提交结果不明时把核对提示放在主行，并阻止 UI 诱导重复上传。 */
-  it("shows uncertain commit without a retry action", () => {
+  /** 未知提交保持主行简洁，只在详情中暴露可用于恢复的备份和 partial 路径。 */
+  it("shows uncertain commit details without a retry action", async () => {
+    const user = userEvent.setup();
+    const technicalError =
+      "提交回执丢失；backup=/srv/releases/.service.tar.gz.backup-20261023-132455-7d9f04a7; partial=/srv/releases/.service.tar.gz.part-7d9f04a7";
     render(<SftpTransferQueueRow
       onCancel={vi.fn()}
       onRetry={vi.fn()}
       transfer={createSftpTransferSummary({
+        bytesTransferred: 1024,
+        error: technicalError,
         failureKind: "commitUnknown",
         retryable: false,
         status: "failed",
+        totalBytes: 1024,
       })}
     />);
 
     expect(screen.getByRole("alert")).toHaveTextContent(
-      "提交结果未确认，请核对目标文件",
+      "提交结果未确认。请刷新目录核对目标文件后，再决定是否重新传输。",
     );
+    expect(screen.queryByText(technicalError)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /继续传输|重新传输/ }))
+      .not.toBeInTheDocument();
+    expect(screen.getByText("99%")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: /查看传输详情/ }));
+    expect(screen.getByText("错误详情：")).toBeVisible();
+    const detail = screen.getByText(technicalError);
+    expect(detail).toBeVisible();
+    expect(detail.className).toContain("overflow-wrap:anywhere");
     expect(screen.queryByRole("button", { name: /继续传输|重新传输/ }))
       .not.toBeInTheDocument();
   });

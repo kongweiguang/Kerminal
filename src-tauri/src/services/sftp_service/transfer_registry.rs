@@ -121,7 +121,7 @@ impl SftpService {
         self.cancel_transfer_with_events(request, Some(TransferEventEmitter::new(window)))
     }
 
-    /// 先在 registry 锁内固化取消意图，再用可记忆通知唤醒网络监督器。
+    /// 先固化取消意图再唤醒监督器；提交阶段保留 phase，确保取消仍会等待提交/回滚回执。
     fn cancel_transfer_with_events(
         &self,
         request: SftpTransferCancelRequest,
@@ -164,7 +164,9 @@ impl SftpService {
                 SftpTransferOperation::Upload | SftpTransferOperation::Download
             ) && task.summary.kind == SftpTransferKind::File;
         } else {
-            task.summary.phase = Some("canceling".to_owned());
+            if task.summary.phase.as_deref() != Some("committing") {
+                task.summary.phase = Some("canceling".to_owned());
+            }
             task.summary.speed_bytes_per_second = 0;
         }
         let summary = task.summary.clone();

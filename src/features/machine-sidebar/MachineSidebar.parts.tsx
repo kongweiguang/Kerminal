@@ -13,7 +13,6 @@ import {
   Plus,
   Search,
   Server,
-  Settings,
   Terminal,
   Trash2,
 } from "lucide-react";
@@ -30,6 +29,7 @@ import type {
 import { MACHINE_ASSET_MENU_DOMAIN } from "./machineSidebarMenuModel";
 import { buildVisibleMachineGroups } from "./machineSidebarVisibilityModel";
 import { MachineSidebarMachineRow } from "./MachineSidebarMachineRow";
+import { MachineSidebarSettingsButtons } from "./MachineSidebarSettingsButtons";
 import {
   ContextMenuItem,
   PinnedGroupBadge,
@@ -60,8 +60,6 @@ const collapsedSidebarButtonIdleClassName =
   "text-zinc-500 hover:bg-[var(--surface-hover)] hover:text-zinc-950 dark:text-zinc-300 dark:hover:text-zinc-50";
 const collapsedSidebarFooterClassName =
   "kerminal-sidebar-collapsed-stack flex flex-col items-center border-t border-[var(--border-subtle)]";
-const sidebarSettingsSelectedClassName =
-  "bg-[var(--surface-selected)] text-sky-700 dark:text-sky-100";
 
 type CollapsedHostPopoverProps = {
   allGroupsCollapsed: boolean;
@@ -285,6 +283,7 @@ type CollapsedMachineSidebarProps = {
   dragPreviewElement: ReactNode;
   onAddConnection?: (options?: ConnectionOpenOptions) => void;
   onOpenSettings?: () => void;
+  onOpenUpdates?: () => void;
   onOpenTransferWorkbench?: () => void;
   openContextMenu: (
     event: ReactMouseEvent<HTMLElement>,
@@ -295,6 +294,7 @@ type CollapsedMachineSidebarProps = {
   toggleCollapsedHostPopover: (event: ReactMouseEvent<HTMLButtonElement>) => void;
 };
 
+/** 紧凑侧栏复用更新按钮，保持折叠前后相同的更新进度和安装入口。 */
 export function CollapsedMachineSidebar({
   collapsedHostButtonRef,
   collapsedHostPopoverElement,
@@ -303,6 +303,7 @@ export function CollapsedMachineSidebar({
   dragPreviewElement,
   onAddConnection,
   onOpenSettings,
+  onOpenUpdates,
   onOpenTransferWorkbench,
   openContextMenu,
   openMachineIdSet,
@@ -353,19 +354,12 @@ export function CollapsedMachineSidebar({
         </Button>
       </div>
       <div className={collapsedSidebarFooterClassName}>
-        <Button
-          aria-label="打开设置"
-          aria-pressed={settingsSelected}
-          className={cn(
-            settingsSelected && sidebarSettingsSelectedClassName,
-          )}
-          onClick={onOpenSettings}
-          size="icon"
-          title="打开设置"
-          variant="ghost"
-        >
-          <Settings className="h-4 w-4" />
-        </Button>
+        <MachineSidebarSettingsButtons
+          compact
+          onOpenSettings={onOpenSettings}
+          onOpenUpdates={onOpenUpdates}
+          settingsSelected={settingsSelected}
+        />
         <Button
           aria-label="添加连接"
           className="kerminal-pressable hover:bg-[var(--surface-hover)]"

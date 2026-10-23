@@ -195,6 +195,13 @@ pub(in crate::services::sftp_service) async fn upload_file(
         &remote_target.final_path,
         &remote_target.partial_path,
         metadata.len(),
+        RemoteCommitContext {
+            progress,
+            checkpoints: &checkpoints,
+            key: &checkpoint_key,
+            expected_sha256: sha256_hex_digest(&hasher),
+            allow_overwrite: conflict_policy == SftpTransferConflictPolicy::Overwrite,
+        },
     )
     .await?;
     progress.clear_network_wait();

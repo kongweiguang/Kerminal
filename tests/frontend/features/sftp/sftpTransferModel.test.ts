@@ -205,7 +205,8 @@ describe("sftpTransferModel", () => {
     expect(replaced.map((item) => item.id)).toEqual(["running", "queued"]);
   });
 
-  it("calculates percent boundaries for unknown, overrun, and completed totals", () => {
+  /** 字节计数可以到齐，但只有成功终态能表示远端提交完成。 */
+  it("reserves 100 percent for committed transfers", () => {
     expect(
       transferProgressPercent(
         transfer({ bytesTransferred: 50, status: "running", totalBytes: 0 }),
@@ -213,7 +214,28 @@ describe("sftpTransferModel", () => {
     ).toBe(8);
     expect(
       transferProgressPercent(transfer({ bytesTransferred: 150, totalBytes: 100 })),
-    ).toBe(100);
+    ).toBe(99);
+    const committingUpload = transfer({
+      bytesTransferred: 100,
+      direction: "upload",
+      phase: "committing",
+      status: "running",
+      totalBytes: 100,
+    });
+    expect(transferProgressPercent(committingUpload)).toBe(99);
+    expect(transferPercentLabel(committingUpload)).toBe("99%");
+    expect(transferStatusLabel(committingUpload.status, committingUpload.phase)).toBe(
+      "提交文件",
+    );
+    const failedCommit = transfer({
+      bytesTransferred: 100,
+      direction: "upload",
+      phase: "committing",
+      status: "failed",
+      totalBytes: 100,
+    });
+    expect(transferProgressPercent(failedCommit)).toBe(99);
+    expect(transferPercentLabel(failedCommit)).toBe("99%");
     expect(
       transferProgressPercent(
         transfer({ bytesTransferred: 0, status: "succeeded", totalBytes: 0 }),

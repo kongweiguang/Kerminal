@@ -141,6 +141,10 @@ async fn native_upload_does_not_require_fsetstat_for_new_partial() {
     }
 }
 
+/// 无 replace rename 与缺省属性下的实际 SFTP 上传兼容测试。
+#[path = "protocol/commit_compat.rs"]
+mod commit_compat;
+
 /// 同样的服务端状态必须带上失败操作，不能要求用户从 0% 猜测 STAT 还是 OPEN 被拒绝。
 #[tokio::test]
 async fn native_upload_permission_error_identifies_remote_operation() {
@@ -275,8 +279,7 @@ async fn sftp_only_host_browses_files_and_rejects_command_before_transport() {
 }
 
 #[tokio::test]
-/// 协议冒烟使用全新目标；无同任务 checkpoint 的孤儿 partial 必须由可靠传输层拒绝，
-/// 不能在基础上传测试里继续伪装成可续传数据。
+/// 协议冒烟只验证全新目标的首次上传，不预置孤儿 partial 来暗示它可被信任为断点数据。
 async fn native_sftp_service_uses_real_ssh_sftp_protocol() {
     let server_root = tempdir().expect("server root");
     fs::write(
