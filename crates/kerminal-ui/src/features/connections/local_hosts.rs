@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, Focusable, SharedString, Subscription, Window,
+    AppContext as _, Context, Entity, Focusable, ScrollHandle, SharedString, Subscription, Window,
     component::{
         input::{InputEvent, InputState, TextareaState},
         searchable_list::SearchableListItem,
@@ -218,6 +218,7 @@ pub(super) struct LocalHostEditor {
     pub(super) profile_id: String,
     pub(super) mode: LocalHostEditorMode,
     pub(super) section: LocalHostEditorSection,
+    pub(super) scroll_handle: ScrollHandle,
     pub(super) revision: Option<ConfigRevision>,
     pub(super) name: Entity<InputState>,
     pub(super) group_select: Entity<SelectState<Vec<LocalHostGroupOption>>>,
@@ -245,6 +246,11 @@ struct LocalHostInputBaseline {
     args: String,
     env: String,
     group_id: Option<String>,
+}
+
+/// 仅保留被协议切换中断的默认目标意图；显式应用仍以发起时快照保护后续输入。
+pub(super) struct LocalHostDefaultRequest {
+    explicit_override: Option<LocalHostInputBaseline>,
 }
 
 /// 默认本地目标的可编辑字段；不包含名称或分组，避免系统探测改写用户身份信息。
@@ -427,6 +433,7 @@ pub(super) struct LocalHostState {
     shell_discovery_generation: u64,
     shell_discovery_cancellation: Option<CancellationToken>,
     default_target_generation: u64,
+    pub(super) default_target_request: Option<LocalHostDefaultRequest>,
 }
 
 impl Default for LocalHostState {
@@ -461,6 +468,7 @@ impl Default for LocalHostState {
             shell_discovery_generation: 0,
             shell_discovery_cancellation: None,
             default_target_generation: 0,
+            default_target_request: None,
         }
     }
 }
@@ -536,15 +544,20 @@ impl LocalHostState {
 }
 
 impl ConnectionsPanel {
-    /// 只切换本地编辑器的显示分区；同一份 Entity 草稿继续承载输入和焦点恢复。
+    /// 分区切换保留草稿并交接可见字段焦点，避免隐藏输入使 Esc 与 Tab 失去表单路径。
     /// @author kongweiguang
     pub(super) fn select_local_host_section(
         &mut self,
         section: LocalHostEditorSection,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(editor) = self.local_hosts.editor.as_mut() {
+        if let Some(editor) = self.local_hosts.editor.as_mut()
+            && editor.section != section
+        {
+            editor.scroll_handle.set_offset(Default::default());
             editor.section = section;
+            self.focus_editor_primary_input(window, cx);
             cx.notify();
         }
     }
@@ -704,7 +717,7 @@ impl ConnectionsPanel {
         true
     }
 
-    /// 自动填充与显式切换共用同一 ProfileService 调用；第二次意图取消第一次并递增代次。
+    /// 自动填充与显式切换共用同一请求；保留意图供协议返回重试，代次阻止旧回执重放。
     /// @author kongweiguang
     fn resolve_default_local_target(
         &mut self,
@@ -730,6 +743,9 @@ impl ConnectionsPanel {
         else {
             return;
         };
+        self.local_hosts.default_target_request = Some(LocalHostDefaultRequest {
+            explicit_override: explicit_override.clone(),
+        });
         self.local_hosts.default_target_generation =
             self.local_hosts.default_target_generation.wrapping_add(1);
         let default_generation = self.local_hosts.default_target_generation;
@@ -748,6 +764,7 @@ impl ConnectionsPanel {
                 {
                     return;
                 }
+                panel.local_hosts.default_target_request = None;
                 match result {
                     Ok(target) => match local_target_to_profile_fields(target) {
                         Ok((shell, args, cwd, env)) => {
@@ -816,7 +833,7 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 使已关闭或替换表单的发现与默认 Profile 请求失效，并及时取消正在执行的扫描。
+    /// 关闭或替换表单会同时丢弃默认目标意图，避免以后打开另一表单时重放旧请求。
     /// @author kongweiguang
     pub(super) fn cancel_local_host_background_requests(&mut self) {
         self.local_hosts.shell_discovery_generation =
@@ -827,6 +844,15 @@ impl ConnectionsPanel {
         self.local_hosts.shell_loading = false;
         self.local_hosts.default_target_generation =
             self.local_hosts.default_target_generation.wrapping_add(1);
+        self.local_hosts.default_target_request = None;
+    }
+
+    /// 仅恢复切协议留下的在途意图；已完成、失败或被关闭的请求不会反复覆盖初值。
+    /// @author kongweiguang
+    pub(super) fn resume_local_host_default_target(&mut self, cx: &mut Context<Self>) {
+        if let Some(request) = self.local_hosts.default_target_request.take() {
+            self.resolve_default_local_target(request.explicit_override, cx);
+        }
     }
 
     /// 新扫描取代旧扫描并保留跨线程可观察的取消令牌。
@@ -1234,8 +1260,7 @@ impl ConnectionsPanel {
         }
         if self.local_hosts.editor.is_some() && self.local_host_is_dirty(cx) {
             self.local_hosts.pending_action = Some(LocalHostPendingAction::Select(profile_id));
-            self.pending_editor_discard = true;
-            window.focus(&self.discard_focus, cx);
+            self.begin_editor_discard_confirmation(window, cx);
             self.status = Some(
                 crate::locale::text(
                     "本地主机尚未保存；确认放弃后再切换。",
@@ -1617,8 +1642,7 @@ impl ConnectionsPanel {
         }
         if self.local_host_is_dirty(cx) {
             self.local_hosts.pending_action = Some(LocalHostPendingAction::Delete(profile_id));
-            self.pending_editor_discard = true;
-            window.focus(&self.discard_focus, cx);
+            self.begin_editor_discard_confirmation(window, cx);
             self.status = Some(
                 crate::locale::text(
                     "请先处理本地编辑草稿，再确认删除。",
@@ -2034,8 +2058,7 @@ impl ConnectionsPanel {
         }
         if self.local_host_is_dirty(cx) {
             self.local_hosts.pending_action = Some(action);
-            self.pending_editor_discard = true;
-            window.focus(&self.discard_focus, cx);
+            self.begin_editor_discard_confirmation(window, cx);
             self.status = Some(crate::locale::text(
                 "本地主机有未保存修改；确认放弃后继续刚才的操作。",
                 "The local host has unsaved changes. Confirm discard to continue the requested action.",
@@ -2414,6 +2437,7 @@ impl ConnectionsPanel {
             profile_id,
             mode,
             section: LocalHostEditorSection::Properties,
+            scroll_handle: ScrollHandle::new(),
             revision,
             name,
             group_select,

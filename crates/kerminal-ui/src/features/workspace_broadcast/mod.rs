@@ -7,6 +7,7 @@ mod toolbar;
 pub(crate) use toolbar::{
     WorkspaceBroadcastBar, WorkspaceBroadcastBarEvent, WorkspaceBroadcastBarProjection,
     WorkspaceBroadcastDeliveryProjection, WorkspaceBroadcastSnippetProjection,
+    WorkspaceBroadcastTargetProjection,
 };
 
 /// pane header 只呈现当前 Tab 的群发目标状态，不持有任何 PTY 或业务 binding。

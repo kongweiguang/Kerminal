@@ -3,7 +3,7 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    ClickEvent, Context, IntoElement, Window,
+    ClickEvent, Context, Focusable as _, IntoElement, Window,
     component::{
         Disableable, IconName,
         button::{Button, ButtonVariants},
@@ -26,7 +26,7 @@ use gpui_kit::base::{FocusTrapElement as _, Selectable};
 
 use super::{
     form::{HostEditor, HostEditorField, HostEditorSection, JumpInputs, clear_input},
-    form_layout::{EditorField, compact_editor},
+    form_layout::{EditorField, EditorFieldScope, compact_editor},
     local_hosts::{LocalHostEditorMode, LocalHostEditorSection},
     panel::{ConnectionsEditorKind, ConnectionsPanel, HostFilePickerTarget},
 };
@@ -117,8 +117,7 @@ fn render_remote_host_editor(
         panel.recovery.mode == kerminal_domain::preferences::ConfigurationMode::ReadOnlyRecovery;
     let saving = panel.saving;
     let reloading = panel.conflicted_host_editor_reload_in_progress();
-    let disabled =
-        readonly || saving || reloading || panel.probe_running || panel.save_outcome_unknown;
+    let disabled = panel.host_editor_fields_disabled();
     let is_new = editor.original.is_none();
     let protocol = editor.protocol;
     let active_section = editor.section;
@@ -150,6 +149,7 @@ fn render_remote_host_editor(
         ));
     let mut page = div()
         .id("connections-remote-editor-page")
+        .debug_selector(|| "connections-editor-viewport".into())
         .flex_1()
         .min_h(px(0.))
         .min_w(px(0.))
@@ -293,6 +293,7 @@ fn render_remote_host_editor(
             },
             Some(editor),
             saving || reloading,
+            disabled,
             theme,
             short,
             cx,
@@ -348,6 +349,10 @@ fn render_local_host_editor(
     let Some(editor) = panel.local_hosts.editor.as_ref() else {
         return render_local_host_editor_load(panel, theme, compact, short, cx);
     };
+    let field_scope = EditorFieldScope::new(
+        editor.scroll_handle.clone(),
+        format!("local-{:?}-{:?}", editor.name.entity_id(), editor.section),
+    );
     let readonly =
         panel.recovery.mode == kerminal_domain::preferences::ConfigurationMode::ReadOnlyRecovery;
     let saving = panel.local_hosts.saving;
@@ -364,7 +369,9 @@ fn render_local_host_editor(
         .flex_1()
         .min_h(px(0.))
         .min_w(px(0.))
-        .overflow_y_scrollbar()
+        .track_scroll(&editor.scroll_handle)
+        .overflow_y_scroll()
+        .vertical_scrollbar(&editor.scroll_handle)
         .p_5()
         .flex()
         .flex_col()
@@ -396,12 +403,14 @@ fn render_local_host_editor(
         page = page.child(render_local_host_unknown_recovery(
             panel,
             &editor.profile_id,
+            &field_scope,
             theme,
             cx,
         ));
     }
     let mut properties = div()
         .id("connections-local-editor-properties")
+        .track_focus(&panel.editor_fields_focus)
         .w_full()
         .flex_shrink_0()
         .flex()
@@ -413,6 +422,7 @@ fn render_local_host_editor(
                 crate::locale::text("名称", "Name"),
                 Input::new(&editor.name).disabled(disabled).w_full(),
                 theme,
+                &field_scope,
             ))
             .child(group_field(
                 Select::new(&editor.group_select)
@@ -422,12 +432,14 @@ fn render_local_host_editor(
                     .accessibility_label(crate::locale::text("主机分组", "Host group")),
                 theme,
                 disabled,
+                &field_scope,
                 cx,
             ))
             .child(field(
                 crate::locale::text("Shell", "Shell"),
                 local_shell_picker(panel, disabled, cx),
                 theme,
+                &field_scope,
             ))
             .child(path_field(
                 crate::locale::text("可执行文件", "Executable"),
@@ -435,6 +447,7 @@ fn render_local_host_editor(
                 HostFilePickerTarget::LocalShell,
                 disabled,
                 theme,
+                &field_scope,
                 cx,
             ))
             .child(path_field(
@@ -443,6 +456,7 @@ fn render_local_host_editor(
                 HostFilePickerTarget::LocalWorkingDirectory,
                 disabled,
                 theme,
+                &field_scope,
                 cx,
             ));
         if let Some(error) = panel.local_hosts.shell_error.as_ref() {
@@ -457,6 +471,7 @@ fn render_local_host_editor(
                     .disabled(disabled)
                     .w_full(),
                 theme,
+                &field_scope,
             ))
             .child(multiline_field(
                 crate::locale::text("环境变量", "Environment"),
@@ -465,6 +480,7 @@ fn render_local_host_editor(
                     .disabled(disabled)
                     .w_full(),
                 theme,
+                &field_scope,
             ))
             .child(authentication_note(
                 crate::locale::text(
@@ -556,6 +572,7 @@ fn render_local_host_editor(
             title,
             None,
             saving || reloading,
+            disabled,
             theme,
             short,
             cx,
@@ -593,11 +610,12 @@ fn render_local_host_editor(
 }
 
 /// 未知保存只允许读取目标当前版本；只有稳定 ID 匹配的读回可显式接纳或据此重新比较。
-/// 缺失或读取失败时保留原写入所有权，不提供直接重放入口。
+/// 缺失或读取失败时保留原写入所有权，不提供直接重放入口；恢复动作按按钮单独绑定正文焦点行。
 /// @author kongweiguang
 fn render_local_host_unknown_recovery(
     panel: &ConnectionsPanel,
     profile_id: &str,
+    scope: &EditorFieldScope,
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> gpui_kit::AnyElement {
@@ -659,18 +677,44 @@ fn render_local_host_unknown_recovery(
     if readback.is_some() {
         actions = actions
             .child(
-                Button::new("connections-local-use-save-readback")
-                    .compact()
-                    .label(crate::locale::text("采用当前版本", "Use current version"))
-                    .disabled(in_flight)
-                    .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
-                        panel.use_local_host_readback(window, cx);
-                    })),
+                scope.wrap(
+                    "unknown-use-readback",
+                    Button::new("connections-local-use-save-readback")
+                        .compact()
+                        .label(crate::locale::text("采用当前版本", "Use current version"))
+                        .disabled(in_flight)
+                        .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                            panel.use_local_host_readback(window, cx);
+                        })),
+                ),
             )
             .child(
-                Button::new("connections-local-keep-save-draft")
+                scope.wrap(
+                    "unknown-keep-save-draft",
+                    Button::new("connections-local-keep-save-draft")
+                        .compact()
+                        .label(crate::locale::text("保留草稿并继续", "Keep draft and continue"))
+                        .disabled(
+                            in_flight
+                                || panel.recovery.mode
+                                    == kerminal_domain::preferences::ConfigurationMode::ReadOnlyRecovery,
+                        )
+                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                            panel.continue_local_host_with_draft(cx);
+                        })),
+                ),
+            );
+        recovery = recovery.child(actions);
+    } else if missing {
+        actions = actions.child(
+            scope.wrap(
+                "unknown-keep-missing-save-draft",
+                Button::new("connections-local-keep-missing-save-draft")
                     .compact()
-                    .label(crate::locale::text("保留草稿并继续", "Keep draft and continue"))
+                    .label(crate::locale::text(
+                        "保留草稿，重新比较保存",
+                        "Keep draft for a fresh save",
+                    ))
                     .disabled(
                         in_flight
                             || panel.recovery.mode
@@ -679,39 +723,25 @@ fn render_local_host_unknown_recovery(
                     .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
                         panel.continue_local_host_with_draft(cx);
                     })),
-            );
-        recovery = recovery.child(actions);
-    } else if missing {
-        actions = actions.child(
-            Button::new("connections-local-keep-missing-save-draft")
-                .compact()
-                .label(crate::locale::text(
-                    "保留草稿，重新比较保存",
-                    "Keep draft for a fresh save",
-                ))
-                .disabled(
-                    in_flight
-                        || panel.recovery.mode
-                            == kerminal_domain::preferences::ConfigurationMode::ReadOnlyRecovery,
-                )
-                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                    panel.continue_local_host_with_draft(cx);
-                })),
+            ),
         );
         recovery = recovery.child(actions);
     } else {
         actions = actions.child(
-            Button::new("connections-local-review-save-result")
-                .compact()
-                .label(if in_flight {
-                    crate::locale::text("正在核对…", "Checking…")
-                } else {
-                    crate::locale::text("刷新并核对", "Refresh and verify")
-                })
-                .disabled(in_flight)
-                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                    panel.review_local_host_unknown(cx);
-                })),
+            scope.wrap(
+                "unknown-review-save-result",
+                Button::new("connections-local-review-save-result")
+                    .compact()
+                    .label(if in_flight {
+                        crate::locale::text("正在核对…", "Checking…")
+                    } else {
+                        crate::locale::text("刷新并核对", "Refresh and verify")
+                    })
+                    .disabled(in_flight)
+                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                        panel.review_local_host_unknown(cx);
+                    })),
+            ),
         );
         recovery = recovery.child(actions);
     }
@@ -817,7 +847,7 @@ fn render_local_host_editor_load(
         .overflow_hidden()
         .bg(theme.background)
         .text_color(theme.foreground)
-        .child(editor_header(title, None, false, theme, short, cx))
+        .child(editor_header(title, None, false, true, theme, short, cx))
         .child(
             div()
                 .w_full()
@@ -868,9 +898,9 @@ fn local_host_editor_navigation(
                             menu = menu.item(
                                 PopupMenuItem::new(local_section_label(section))
                                     .checked(section == selected)
-                                    .on_click(move |_, _, app| {
+                                    .on_click(move |_, window, app| {
                                         panel_entity.update(app, |panel, cx| {
-                                            panel.select_local_host_section(section, cx)
+                                            panel.select_local_host_section(section, window, cx)
                                         });
                                     }),
                             );
@@ -911,8 +941,8 @@ fn local_host_editor_navigation(
                         .bg(theme.selected)
                         .text_color(theme.selected_foreground)
                 })
-                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                    panel.select_local_host_section(section, cx)
+                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                    panel.select_local_host_section(section, window, cx)
                 }))
         }))
         .into_any_element()
@@ -931,6 +961,7 @@ fn group_field(
     select: impl IntoElement,
     theme: ThemeTokens,
     disabled: bool,
+    scope: &EditorFieldScope,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
     field(
@@ -953,6 +984,7 @@ fn group_field(
                     })),
             ),
         theme,
+        scope,
     )
 }
 
@@ -963,6 +995,7 @@ fn path_field(
     target: HostFilePickerTarget,
     disabled: bool,
     theme: ThemeTokens,
+    scope: &EditorFieldScope,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
     field(
@@ -985,6 +1018,7 @@ fn path_field(
                     })),
             ),
         theme,
+        scope,
     )
 }
 
@@ -1078,16 +1112,20 @@ fn multiline_field(
     label: impl Into<gpui_kit::SharedString>,
     input: impl IntoElement,
     theme: ThemeTokens,
+    scope: &EditorFieldScope,
 ) -> impl IntoElement {
-    EditorField::new(label, input, theme, true)
+    let label = label.into();
+    EditorField::new(label.clone(), input, theme, true)
+        .reveal_in(scope.scroll(), scope.identity(label.as_ref()))
 }
 
-/// 同一标题栏供远程、本地及加载中状态复用，关闭永远回到面板统一 dirty/write gate。
+/// 标题栏收藏服从字段门禁；关闭保留独立出口，由面板统一裁决 dirty/write gate。
 /// @author kongweiguang
 fn editor_header(
     title: impl Into<gpui_kit::SharedString>,
     editor: Option<&HostEditor>,
     saving: bool,
+    fields_disabled: bool,
     theme: ThemeTokens,
     short: bool,
     cx: &mut Context<ConnectionsPanel>,
@@ -1129,7 +1167,7 @@ fn editor_header(
                 } else {
                     crate::locale::text("收藏", "Add to favorites")
                 })
-                .disabled(saving)
+                .disabled(fields_disabled)
                 .selected(editor.favorite)
                 .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| panel.toggle_favorite(cx))),
         )
@@ -1277,6 +1315,7 @@ fn render_editor_section(
     };
     div()
         .id("connections-editor-selected-section")
+        .track_focus(&panel.editor_fields_focus)
         .w_full()
         .flex_shrink_0()
         .flex()
@@ -1333,9 +1372,9 @@ fn render_editor_navigation(
                             menu = menu.item(
                                 PopupMenuItem::new(protocol_section_label(protocol, section))
                                     .checked(section == selected)
-                                    .on_click(move |_, _, app| {
+                                    .on_click(move |_, window, app| {
                                         panel_entity.update(app, |panel, cx| {
-                                            panel.select_editor_section(section, cx);
+                                            panel.select_editor_section(section, window, cx);
                                         });
                                     }),
                             );
@@ -1378,8 +1417,8 @@ fn render_editor_navigation(
             } else {
                 button.ghost()
             };
-            button.on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                panel.select_editor_section(section, cx);
+            button.on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                panel.select_editor_section(section, window, cx);
             }))
         }))
         .into_any_element()
@@ -1419,6 +1458,7 @@ fn render_properties(
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "properties");
     let mut fields = div()
         .w_full()
         .flex()
@@ -1429,6 +1469,7 @@ fn render_properties(
                 crate::locale::text("名称", "Name"),
                 Input::new(&editor.inputs.name).disabled(disabled).w_full(),
                 theme,
+                &field_scope,
             ),
             editor,
             HostEditorField::Name,
@@ -1443,6 +1484,7 @@ fn render_properties(
                     .accessibility_label(crate::locale::text("主机分组", "Host group")),
                 theme,
                 disabled,
+                &field_scope,
                 cx,
             ),
             editor,
@@ -1476,6 +1518,7 @@ fn render_properties(
             crate::locale::text("标签", "Tags"),
             Input::new(&editor.inputs.tags).disabled(disabled).w_full(),
             theme,
+            &field_scope,
         ),
         editor,
         HostEditorField::Tags,
@@ -1493,6 +1536,7 @@ fn render_properties(
                     .disabled(disabled)
                     .w_full(),
                 theme,
+                &field_scope,
             ),
             editor,
             HostEditorField::Note,
@@ -2080,6 +2124,7 @@ fn choice_button(
 /// 地址与端口共用一个字段组，避免端口再次占用完整标签列；串口设备由独立串口分类编辑。
 /// @author kongweiguang
 fn render_endpoint(editor: &HostEditor, disabled: bool, theme: ThemeTokens) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "endpoint");
     let mut fields = div().w_full().flex().flex_col().gap_2().min_w(px(0.));
     if editor.protocol != RemoteProtocol::Serial {
         fields = fields.child(field(
@@ -2130,19 +2175,17 @@ fn render_endpoint(editor: &HostEditor, disabled: bool, theme: ThemeTokens) -> i
                         )),
                 ),
             theme,
+            &field_scope,
         ));
         if editor.protocol != RemoteProtocol::Telnet {
             fields = fields.child(with_validation_issue(
                 input_field(
-                    if editor.protocol == RemoteProtocol::Rdp {
-                        crate::locale::text("用户名（可选）", "Username (optional)")
-                    } else {
-                        crate::locale::text("用户名", "Username")
-                    },
+                    crate::locale::text("用户名", "Username"),
                     Input::new(&editor.inputs.username)
                         .disabled(disabled)
                         .w_full(),
                     theme,
+                    &field_scope,
                 ),
                 editor,
                 HostEditorField::Username,
@@ -2163,6 +2206,7 @@ fn render_ssh_auth(
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "authentication");
     let mode = editor.authentication_mode;
     let panel_entity = cx.entity().clone();
     let options = [
@@ -2199,9 +2243,9 @@ fn render_ssh_auth(
                 menu = menu.item(
                     PopupMenuItem::new(label)
                         .checked(candidate == mode)
-                        .on_click(move |_, _, app| {
+                        .on_click(move |_, window, app| {
                             panel_entity.update(app, |panel, cx| {
-                                panel.set_authentication_mode(candidate, cx)
+                                panel.set_authentication_mode(candidate, window, cx)
                             });
                         }),
                 );
@@ -2212,6 +2256,7 @@ fn render_ssh_auth(
         crate::locale::text("认证", "Authentication"),
         mode_picker,
         theme,
+        &field_scope,
     ));
     match mode {
         HostAuthenticationMode::Agent => {}
@@ -2222,8 +2267,11 @@ fn render_ssh_auth(
                     .disabled(disabled)
                     .w_full(),
                 theme,
+                &field_scope,
             ));
             section = section.child(credential_status(
+                &field_scope,
+                "target-password-clear",
                 has_credential,
                 editor.clear_target_credential,
                 disabled,
@@ -2248,6 +2296,7 @@ fn render_ssh_auth(
                 HostFilePickerTarget::PrivateKey,
                 disabled,
                 theme,
+                &field_scope,
                 cx,
             ));
             section = section.child(with_validation_issue(
@@ -2258,6 +2307,7 @@ fn render_ssh_auth(
                         .disabled(disabled)
                         .w_full(),
                     theme,
+                    &field_scope,
                 ),
                 editor,
                 HostEditorField::PrivateKey,
@@ -2271,6 +2321,8 @@ fn render_ssh_auth(
                 theme,
             ));
             section = section.child(credential_status(
+                &field_scope,
+                "target-private-key-clear",
                 editor.has_target_private_key(),
                 editor.clear_private_key,
                 disabled,
@@ -2295,8 +2347,11 @@ fn render_ssh_auth(
                     .disabled(disabled)
                     .w_full(),
                 theme,
+                &field_scope,
             ));
             section = section.child(credential_status(
+                &field_scope,
+                "target-passphrase-clear",
                 has_passphrase,
                 editor.clear_passphrase,
                 disabled,
@@ -2316,7 +2371,7 @@ fn render_ssh_auth(
     section.into_any_element()
 }
 
-/// RDP 凭据沿用认证区的平面分隔；平台差异提示保留为正文，避免嵌套提示卡。
+/// RDP 标签保持短小；可选、留空保留和客户端差异放在输入旁说明，避免窄列多行标签。
 /// @author kongweiguang
 fn render_rdp_auth(
     editor: &HostEditor,
@@ -2325,15 +2380,16 @@ fn render_rdp_auth(
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "rdp-authentication");
     let credential_note = if cfg!(target_os = "windows") {
         crate::locale::text(
-            "密码只进入加密 vault。用户名可留空，由系统客户端提示输入。",
-            "The password is stored only in the encrypted vault. Leave username empty to let the system client prompt.",
+            "用户名可留空，由系统客户端提示输入。密码只进入加密 vault；未选择清除时，留空保留已保存密码。未保存密码时由客户端提示。",
+            "Username is optional; the system client can prompt. Passwords are stored only in the encrypted vault. Leave password empty to keep a saved password unless removal is selected. The client can prompt when none is saved.",
         )
     } else {
         crate::locale::text(
-            "密码只进入加密 vault。此平台由外部 RDP 客户端处理认证，保存的密码不会自动填入客户端。",
-            "The password is stored only in the encrypted vault. The external RDP client handles authentication on this platform; saved passwords are not entered automatically.",
+            "用户名可留空。密码只进入加密 vault；未选择清除时，留空保留已保存密码。此平台由外部 RDP 客户端处理认证，保存的密码不会自动填入客户端。",
+            "Username is optional. Passwords are stored only in the encrypted vault. Leave password empty to keep a saved password unless removal is selected. The external RDP client handles authentication on this platform; saved passwords are not entered automatically.",
         )
     };
     div()
@@ -2349,16 +2405,16 @@ fn render_rdp_auth(
             theme,
         ))
         .child(input_field(
-            crate::locale::text(
-                "新密码（留空交给客户端提示）",
-                "New password (leave empty for a client prompt)",
-            ),
+            crate::locale::text("密码", "Password"),
             Input::new(&editor.inputs.secret)
                 .disabled(disabled)
                 .w_full(),
             theme,
+            &field_scope,
         ))
         .child(credential_status(
+            &field_scope,
+            "rdp-password-clear",
             has_credential,
             editor.clear_rdp_password,
             disabled,
@@ -2384,9 +2440,10 @@ fn render_ssh_terminal(
     disabled: bool,
     theme: ThemeTokens,
 ) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "terminal");
     div().w_full().flex().flex_col().gap_3()
-        .child(input_field("TERM", Input::new(&editor.inputs.term).disabled(disabled).w_full(), theme))
-        .child(input_field(crate::locale::text("默认目录（可选）", "Initial directory (optional)"), Input::new(&editor.inputs.working_directory).disabled(disabled).w_full(), theme))
+        .child(input_field("TERM", Input::new(&editor.inputs.term).disabled(disabled).w_full(), theme, &field_scope))
+        .child(input_field(crate::locale::text("默认目录（可选）", "Initial directory (optional)"), Input::new(&editor.inputs.working_directory).disabled(disabled).w_full(), theme, &field_scope))
         .child(note_card(crate::locale::text("仅用于新终端；恢复或显式指定的目录优先。", "Applies to new terminals only; restored or explicitly selected directories take precedence."), theme))
 }
 
@@ -2398,6 +2455,7 @@ fn render_network_options(
     disabled: bool,
     theme: ThemeTokens,
 ) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "network");
     div()
         .w_full()
         .flex()
@@ -2410,6 +2468,7 @@ fn render_network_options(
                 .disabled(disabled)
                 .w_full(),
             theme,
+            &field_scope,
         ))
         .child(network_option_input_field(
             crate::locale::text("心跳间隔", "Keepalive interval"),
@@ -2418,6 +2477,7 @@ fn render_network_options(
                 .disabled(disabled)
                 .w_full(),
             theme,
+            &field_scope,
         ))
 }
 
@@ -2429,7 +2489,7 @@ enum HostOptionToggle {
     RdpFullscreen,
 }
 
-/// 开关与普通输入共享草稿和探测失效机制，不即时写配置，也不影响在途会话。
+/// 条件字段开关同步交接焦点，避免关闭传输或全屏时按键留在隐藏输入；普通选项保留焦点。
 ///
 /// @author kongweiguang
 fn host_option_toggle(
@@ -2438,9 +2498,10 @@ fn host_option_toggle(
     selected: bool,
     disabled: bool,
     option: HostOptionToggle,
+    scope: &EditorFieldScope,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
-    Button::new(id)
+    let row = Button::new(id)
         .compact()
         .w_full()
         .label(format!("{} {label}", if selected { "✓" } else { "○" }))
@@ -2450,7 +2511,7 @@ fn host_option_toggle(
         ))
         .selected(selected)
         .disabled(disabled)
-        .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
+        .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
             if let Some(editor) = panel.editor.as_mut() {
                 match option {
                     HostOptionToggle::SftpEnabled => editor.sftp_enabled = !editor.sftp_enabled,
@@ -2465,9 +2526,21 @@ fn host_option_toggle(
                     }
                 }
             }
+            if matches!(
+                option,
+                HostOptionToggle::SftpEnabled | HostOptionToggle::RdpFullscreen
+            ) {
+                panel.focus_editor_primary_input(window, cx);
+            }
             panel.reset_connection_probe();
             cx.notify();
-        }))
+        }));
+    let row = scope.wrap(id, row);
+    if matches!(option, HostOptionToggle::PreserveMtime) {
+        row.debug_selector("connections-editor-preserve-mtime-row")
+    } else {
+        row
+    }
 }
 
 /// 主机传输选项只改变后续任务；禁用 SFTP 不影响 SSH 终端或强杀在途传输。
@@ -2479,13 +2552,14 @@ fn render_transfer_options(
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "transfer");
     div().w_full().flex().flex_col().gap_3()
-        .child(host_option_toggle("host-sftp-enabled", crate::locale::text("启用 SFTP", "Enable SFTP"), editor.sftp_enabled, disabled, HostOptionToggle::SftpEnabled, cx))
-        .child(path_field(crate::locale::text("本地起始目录", "Local start directory"), Input::new(&editor.inputs.sftp_local_directory).disabled(disabled || !editor.sftp_enabled).w_full(), HostFilePickerTarget::SftpLocalDirectory, disabled || !editor.sftp_enabled, theme, cx))
-        .child(input_field(crate::locale::text("远端起始目录", "Remote start directory"), Input::new(&editor.inputs.sftp_remote_directory).disabled(disabled || !editor.sftp_enabled).w_full(), theme))
-        .child(network_option_input_field(crate::locale::text("并发数", "Concurrency"), crate::locale::text("1–8，留空继承全局", "1–8; leave empty to inherit the global setting"), Input::new(&editor.inputs.sftp_concurrency).disabled(disabled || !editor.sftp_enabled).w_full(), theme))
-        .child(host_option_toggle("host-sftp-mtime", crate::locale::text("保留修改时间", "Preserve modification time"), editor.preserve_mtime, disabled || !editor.sftp_enabled, HostOptionToggle::PreserveMtime, cx))
-        .child(host_option_toggle("host-sftp-follow", crate::locale::text("跟随源端符号链接", "Follow source symbolic links"), editor.follow_source_symlinks, disabled || !editor.sftp_enabled, HostOptionToggle::FollowSourceSymlinks, cx))
+        .child(host_option_toggle("host-sftp-enabled", crate::locale::text("启用 SFTP", "Enable SFTP"), editor.sftp_enabled, disabled, HostOptionToggle::SftpEnabled, &field_scope, cx))
+        .child(path_field(crate::locale::text("本地起始目录", "Local start directory"), Input::new(&editor.inputs.sftp_local_directory).disabled(disabled || !editor.sftp_enabled).w_full(), HostFilePickerTarget::SftpLocalDirectory, disabled || !editor.sftp_enabled, theme, &field_scope, cx))
+        .child(input_field(crate::locale::text("远端起始目录", "Remote start directory"), Input::new(&editor.inputs.sftp_remote_directory).disabled(disabled || !editor.sftp_enabled).w_full(), theme, &field_scope))
+        .child(network_option_input_field(crate::locale::text("并发数", "Concurrency"), crate::locale::text("1–8，留空继承全局", "1–8; leave empty to inherit the global setting"), Input::new(&editor.inputs.sftp_concurrency).disabled(disabled || !editor.sftp_enabled).w_full(), theme, &field_scope))
+        .child(host_option_toggle("host-sftp-mtime", crate::locale::text("保留修改时间", "Preserve modification time"), editor.preserve_mtime, disabled || !editor.sftp_enabled, HostOptionToggle::PreserveMtime, &field_scope, cx))
+        .child(host_option_toggle("host-sftp-follow", crate::locale::text("跟随源端符号链接", "Follow source symbolic links"), editor.follow_source_symlinks, disabled || !editor.sftp_enabled, HostOptionToggle::FollowSourceSymlinks, &field_scope, cx))
         .child(note_card(crate::locale::text("仅源端解引用并检查范围和环路；目标写入及删除始终不跟随链接。并发仍受全局上限约束。", "Only source links are dereferenced with scope and cycle checks; destination writes/deletes never follow links. The global concurrency cap still applies."), theme))
 }
 
@@ -2498,6 +2572,7 @@ fn render_rdp_display(
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "display");
     div()
         .w_full()
         .flex()
@@ -2509,6 +2584,7 @@ fn render_rdp_display(
             editor.rdp_fullscreen,
             disabled,
             HostOptionToggle::RdpFullscreen,
+            &field_scope,
             cx,
         ))
         .child(network_option_input_field(
@@ -2518,6 +2594,7 @@ fn render_rdp_display(
                 .disabled(disabled || editor.rdp_fullscreen)
                 .w_full(),
             theme,
+            &field_scope,
         ))
         .child(network_option_input_field(
             crate::locale::text("窗口高度", "Window height"),
@@ -2526,6 +2603,7 @@ fn render_rdp_display(
                 .disabled(disabled || editor.rdp_fullscreen)
                 .w_full(),
             theme,
+            &field_scope,
         ))
         .child(note_card(
             crate::locale::text(
@@ -2536,7 +2614,8 @@ fn render_rdp_display(
         ))
 }
 
-/// 显示可选串口设备和受限线制；枚举不可用时保留手动设备路径与清晰状态反馈。
+/// 显示可选串口设备和受限线制；候选按钮逐项绑定焦点行，避免换行设备簇被整体测量。
+/// 枚举不可用时仍保留手动设备路径与清晰状态反馈。
 /// @author kongweiguang
 fn render_serial(
     panel: &ConnectionsPanel,
@@ -2545,6 +2624,7 @@ fn render_serial(
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "serial");
     let selected_device = editor.inputs.host.read(cx).value().trim().to_owned();
     let mut devices = div().w_full().flex().flex_wrap().gap_2();
     for port in &panel.serial_ports {
@@ -2561,14 +2641,17 @@ fn render_serial(
             format!("{} · {}", port.name, details)
         };
         devices = devices.child(
-            Button::new(format!("connections-serial-port-{}", port.name))
-                .compact()
-                .selected(selected_device == port.name)
-                .label(label)
-                .disabled(disabled)
-                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-                    panel.select_serial_port(name.clone(), window, cx);
-                })),
+            field_scope.wrap(
+                format!("serial-device:{}", port.name),
+                Button::new(format!("connections-serial-port-{}", port.name))
+                    .compact()
+                    .selected(selected_device == port.name)
+                    .label(label)
+                    .disabled(disabled)
+                    .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                        panel.select_serial_port(name.clone(), window, cx);
+                    })),
+            ),
         );
     }
     let state = serial_port_list_state(
@@ -2624,21 +2707,24 @@ fn render_serial(
                     theme,
                 ))
                 .child(
-                    Button::new("connections-serial-refresh")
-                        .compact()
-                        .label(if panel.serial_ports_loading {
-                            crate::locale::text("刷新中…", "Refreshing…")
-                        } else {
-                            crate::locale::text("刷新设备", "Refresh devices")
-                        })
-                        .disabled(
-                            disabled
-                                || panel.serial_ports_loading
-                                || panel.serial_port_service.is_none(),
-                        )
-                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.refresh_serial_ports(cx);
-                        })),
+                    field_scope.wrap(
+                        "serial-refresh",
+                        Button::new("connections-serial-refresh")
+                            .compact()
+                            .label(if panel.serial_ports_loading {
+                                crate::locale::text("刷新中…", "Refreshing…")
+                            } else {
+                                crate::locale::text("刷新设备", "Refresh devices")
+                            })
+                            .disabled(
+                                disabled
+                                    || panel.serial_ports_loading
+                                    || panel.serial_port_service.is_none(),
+                            )
+                            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                panel.refresh_serial_ports(cx);
+                            })),
+                    ),
                 ),
         )
         .child(note_card(state_text, theme))
@@ -2650,6 +2736,7 @@ fn render_serial(
                 crate::locale::text("设备路径", "Device path"),
                 Input::new(&editor.inputs.host).disabled(disabled).w_full(),
                 theme,
+                &field_scope,
             ),
             editor,
             HostEditorField::Host,
@@ -2662,6 +2749,7 @@ fn render_serial(
                     .disabled(disabled)
                     .w_full(),
                 theme,
+                &field_scope,
             ),
             editor,
             HostEditorField::SerialBaud,
@@ -2689,6 +2777,7 @@ fn render_serial(
                                         "Data bits",
                                     )),
                                 theme,
+                                &field_scope,
                             )),
                         )
                         .child(
@@ -2703,6 +2792,7 @@ fn render_serial(
                                         "Stop bits",
                                     )),
                                 theme,
+                                &field_scope,
                             )),
                         ),
                 )
@@ -2719,6 +2809,7 @@ fn render_serial(
                                     .disabled(disabled)
                                     .accessibility_label(crate::locale::text("校验方式", "Parity")),
                                 theme,
+                                &field_scope,
                             )),
                         )
                         .child(
@@ -2733,6 +2824,7 @@ fn render_serial(
                                         "Flow control",
                                     )),
                                 theme,
+                                &field_scope,
                             )),
                         ),
                 ),
@@ -2783,7 +2875,7 @@ fn serial_port_list_state(
 #[path = "../../../tests/unit/connections_serial.rs"]
 mod connections_serial_tests;
 
-/// 代理密码使用掩码字段并走 CAS/vault；关闭代理移除整条路由，空输入保留原引用。
+/// 代理开关卸载字段时交接表单焦点；密码仍走 CAS/vault，空输入保留原引用。
 /// @author kongweiguang
 fn render_proxy_route(
     editor: &HostEditor,
@@ -2791,22 +2883,27 @@ fn render_proxy_route(
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "proxy");
     let has_proxy_password = editor.has_proxy_password(cx);
     let mut section = div().w_full().flex().flex_col().gap_2().child(
-        Button::new("connections-proxy-toggle")
-            .compact()
-            .label(if editor.proxy_enabled {
-                crate::locale::text("✓ 使用代理", "✓ Proxy enabled")
-            } else {
-                crate::locale::text("使用代理", "Enable proxy")
-            })
-            .disabled(disabled)
-            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                if let Some(editor) = panel.editor.as_mut() {
-                    editor.proxy_enabled = !editor.proxy_enabled;
-                    cx.notify();
-                }
-            })),
+        field_scope.wrap(
+            "proxy-toggle",
+            Button::new("connections-proxy-toggle")
+                .compact()
+                .label(if editor.proxy_enabled {
+                    crate::locale::text("✓ 使用代理", "✓ Proxy enabled")
+                } else {
+                    crate::locale::text("使用代理", "Enable proxy")
+                })
+                .disabled(disabled)
+                .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                    if let Some(editor) = panel.editor.as_mut() {
+                        editor.proxy_enabled = !editor.proxy_enabled;
+                        panel.focus_editor_primary_input(window, cx);
+                        cx.notify();
+                    }
+                })),
+        ),
     );
     if editor.proxy_enabled {
         section = section
@@ -2814,6 +2911,7 @@ fn render_proxy_route(
                 crate::locale::text("代理类型", "Proxy type"),
                 proxy_protocol_picker(editor.proxy_protocol, disabled, theme, cx),
                 theme,
+                &field_scope,
             ))
             .child(input_field(
                 crate::locale::text("代理地址", "Proxy address"),
@@ -2821,6 +2919,7 @@ fn render_proxy_route(
                     .disabled(disabled)
                     .w_full(),
                 theme,
+                &field_scope,
             ))
             .child(
                 div()
@@ -2832,6 +2931,7 @@ fn render_proxy_route(
                             .disabled(disabled)
                             .w_full(),
                         theme,
+                        &field_scope,
                     ))
                     .child(input_field(
                         crate::locale::text("代理用户名", "Proxy username"),
@@ -2839,6 +2939,7 @@ fn render_proxy_route(
                             .disabled(disabled)
                             .w_full(),
                         theme,
+                        &field_scope,
                     )),
             )
             .child(input_field(
@@ -2847,8 +2948,11 @@ fn render_proxy_route(
                     .disabled(disabled)
                     .w_full(),
                 theme,
+                &field_scope,
             ))
             .child(credential_status(
+                &field_scope,
+                "proxy-password-clear",
                 has_proxy_password,
                 editor.clear_proxy_password,
                 disabled,
@@ -2882,6 +2986,7 @@ fn render_jump_hosts(
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
+    let field_scope = host_editor_scope(editor, "jump-hosts");
     let mut section = div()
         .w_full()
         .flex()
@@ -2907,13 +3012,16 @@ fn render_jump_hosts(
                     .child(crate::locale::text("跳板链", "Jump host chain")),
             )
             .child(
-                Button::new("connections-add-jump")
-                    .compact()
-                    .label(crate::locale::text("添加跳板", "Add jump host"))
-                    .disabled(disabled || editor.jumps.len() >= 8)
-                    .on_click(
-                        cx.listener(|panel, _: &ClickEvent, window, cx| panel.add_jump(window, cx)),
-                    ),
+                field_scope.wrap(
+                    "jump-add",
+                    Button::new("connections-add-jump")
+                        .compact()
+                        .label(crate::locale::text("添加跳板", "Add jump host"))
+                        .disabled(disabled || editor.jumps.len() >= 8)
+                        .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                            panel.add_jump(window, cx)
+                        })),
+                ),
             ),
     );
     if editor.jumps.is_empty() {
@@ -2926,7 +3034,7 @@ fn render_jump_hosts(
         ));
     }
     for (index, jump) in editor.jumps.iter().enumerate() {
-        section = section.child(render_jump(index, jump, disabled, theme, cx));
+        section = section.child(render_jump(editor, index, jump, disabled, theme, cx));
     }
     section
 }
@@ -2963,14 +3071,24 @@ fn proxy_protocol_picker(
     )
 }
 
-/// 跳板细节独立列出，避免主机认证字段与 jump-N 凭据槽位混淆。
+/// 跳板凭据独立占用槽位；切换认证先交接到保留的地址字段，避免秘密输入卸载后丢失按键。
+/// @author kongweiguang
 fn render_jump(
+    editor: &HostEditor,
     index: usize,
     jump: &JumpInputs,
     disabled: bool,
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
+    let field_scope = EditorFieldScope::new(
+        editor.scroll_handle.clone(),
+        format!(
+            "jump-{:?}-{:?}",
+            editor.inputs.name.entity_id(),
+            jump.host.entity_id()
+        ),
+    );
     let original = jump.original_authentication_ref();
     let mut card = div()
         .w_full()
@@ -2996,13 +3114,16 @@ fn render_jump(
                         )),
                 )
                 .child(
-                    Button::new(format!("connections-remove-jump-{index}"))
-                        .compact()
-                        .label(crate::locale::text("移除", "Remove"))
-                        .disabled(disabled)
-                        .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-                            panel.remove_jump(index, window, cx)
-                        })),
+                    field_scope.wrap(
+                        "remove",
+                        Button::new(format!("connections-remove-jump-{index}"))
+                            .compact()
+                            .label(crate::locale::text("移除", "Remove"))
+                            .disabled(disabled)
+                            .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                                panel.remove_jump(index, window, cx)
+                            })),
+                    ),
                 ),
         )
         .child(
@@ -3013,21 +3134,25 @@ fn render_jump(
                     crate::locale::text("名称", "Name"),
                     Input::new(&jump.name).disabled(disabled).w_full(),
                     theme,
+                    &field_scope,
                 )))
                 .child(div().flex_1().child(input_field(
                     crate::locale::text("地址", "Address"),
                     Input::new(&jump.host).disabled(disabled).w_full(),
                     theme,
+                    &field_scope,
                 )))
                 .child(div().w(px(96.)).child(input_field(
                     crate::locale::text("端口", "Port"),
                     Input::new(&jump.port).disabled(disabled).w_full(),
                     theme,
+                    &field_scope,
                 )))
                 .child(div().flex_1().child(input_field(
                     crate::locale::text("用户名", "Username"),
                     Input::new(&jump.username).disabled(disabled).w_full(),
                     theme,
+                    &field_scope,
                 ))),
         );
     let mode = jump.authentication_mode;
@@ -3046,29 +3171,36 @@ fn render_jump(
         ),
     ];
     card = card.child(
-        div()
-            .flex()
-            .gap_1()
-            .p_1()
-            .rounded_sm()
-            .bg(theme.sidebar)
-            .children(options.iter().cloned().map(|(mode, label)| {
-                choice_button(
-                    format!("connections-jump-{index}-auth-{mode:?}"),
-                    label,
-                    jump.authentication_mode == mode,
-                    disabled,
-                    theme,
-                )
-                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                    if let Some(editor) = panel.editor.as_mut()
-                        && let Some(jump) = editor.jumps.get_mut(index)
-                    {
-                        jump.authentication_mode = mode;
-                        cx.notify();
-                    }
-                }))
-            })),
+        field_scope.wrap(
+            "authentication-mode",
+            div()
+                .flex()
+                .gap_1()
+                .p_1()
+                .rounded_sm()
+                .bg(theme.sidebar)
+                .children(options.iter().cloned().map(|(mode, label)| {
+                    choice_button(
+                        format!("connections-jump-{index}-auth-{mode:?}"),
+                        label,
+                        jump.authentication_mode == mode,
+                        disabled,
+                        theme,
+                    )
+                    .on_click(cx.listener(
+                        move |panel, _: &ClickEvent, window, cx| {
+                            if let Some(editor) = panel.editor.as_mut()
+                                && let Some(jump) = editor.jumps.get_mut(index)
+                                && jump.authentication_mode != mode
+                            {
+                                jump.authentication_mode = mode;
+                                window.focus(&jump.host.read(cx).focus_handle(cx), cx);
+                                cx.notify();
+                            }
+                        },
+                    ))
+                })),
+        ),
     );
     match mode {
         HostAuthenticationMode::Agent => {
@@ -3085,30 +3217,34 @@ fn render_jump(
                 crate::locale::text("新跳板密码", "New jump host password"),
                 Input::new(&jump.secret).disabled(disabled).w_full(),
                 theme,
+                &field_scope,
             ));
             if jump.has_password() {
                 card = card.child(
-                    Button::new(format!("connections-jump-{index}-clear-password"))
-                        .compact()
-                        .label(if jump.clear_credential {
-                            crate::locale::text("保留原密码", "Keep existing password")
-                        } else {
-                            crate::locale::text("清除已保存密码", "Clear saved password")
-                        })
-                        .disabled(disabled)
-                        .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-                            if let Some(jump) = panel
-                                .editor
-                                .as_mut()
-                                .and_then(|editor| editor.jumps.get_mut(index))
-                            {
-                                jump.clear_credential = !jump.clear_credential;
-                                if jump.clear_credential {
-                                    clear_input(&jump.secret, window, cx);
+                    field_scope.wrap(
+                        "clear-password",
+                        Button::new(format!("connections-jump-{index}-clear-password"))
+                            .compact()
+                            .label(if jump.clear_credential {
+                                crate::locale::text("保留原密码", "Keep existing password")
+                            } else {
+                                crate::locale::text("清除已保存密码", "Clear saved password")
+                            })
+                            .disabled(disabled)
+                            .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                                if let Some(jump) = panel
+                                    .editor
+                                    .as_mut()
+                                    .and_then(|editor| editor.jumps.get_mut(index))
+                                {
+                                    jump.clear_credential = !jump.clear_credential;
+                                    if jump.clear_credential {
+                                        clear_input(&jump.secret, window, cx);
+                                    }
+                                    cx.notify();
                                 }
-                                cx.notify();
-                            }
-                        })),
+                            })),
+                    ),
                 );
             }
         }
@@ -3118,11 +3254,13 @@ fn render_jump(
                     crate::locale::text("跳板私钥路径", "Jump host private key path"),
                     Input::new(&jump.key_path).disabled(disabled).w_full(),
                     theme,
+                    &field_scope,
                 ))
                 .child(input_field(
                     crate::locale::text("新私钥口令", "New key passphrase"),
                     Input::new(&jump.passphrase).disabled(disabled).w_full(),
                     theme,
+                    &field_scope,
                 ));
             if matches!(
                 original,
@@ -3134,27 +3272,36 @@ fn render_jump(
                 )
             ) {
                 card = card.child(
-                    Button::new(format!("connections-jump-{index}-clear-passphrase"))
-                        .compact()
-                        .label(if jump.clear_passphrase {
-                            crate::locale::text("保留原私钥口令", "Keep existing key passphrase")
-                        } else {
-                            crate::locale::text("清除已保存私钥口令", "Clear saved key passphrase")
-                        })
-                        .disabled(disabled)
-                        .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-                            if let Some(jump) = panel
-                                .editor
-                                .as_mut()
-                                .and_then(|editor| editor.jumps.get_mut(index))
-                            {
-                                jump.clear_passphrase = !jump.clear_passphrase;
-                                if jump.clear_passphrase {
-                                    clear_input(&jump.passphrase, window, cx);
+                    field_scope.wrap(
+                        "clear-passphrase",
+                        Button::new(format!("connections-jump-{index}-clear-passphrase"))
+                            .compact()
+                            .label(if jump.clear_passphrase {
+                                crate::locale::text(
+                                    "保留原私钥口令",
+                                    "Keep existing key passphrase",
+                                )
+                            } else {
+                                crate::locale::text(
+                                    "清除已保存私钥口令",
+                                    "Clear saved key passphrase",
+                                )
+                            })
+                            .disabled(disabled)
+                            .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                                if let Some(jump) = panel
+                                    .editor
+                                    .as_mut()
+                                    .and_then(|editor| editor.jumps.get_mut(index))
+                                {
+                                    jump.clear_passphrase = !jump.clear_passphrase;
+                                    if jump.clear_passphrase {
+                                        clear_input(&jump.passphrase, window, cx);
+                                    }
+                                    cx.notify();
                                 }
-                                cx.notify();
-                            }
-                        })),
+                            })),
+                    ),
                 );
             }
         }
@@ -3176,7 +3323,10 @@ fn with_validation_issue(
         .flex()
         .flex_col()
         .gap_1()
-        .child(content);
+        .child(content)
+        .when(field == HostEditorField::Username, |row| {
+            row.debug_selector(|| "connections-editor-username-row".into())
+        });
     if let Some(issue) = editor
         .validation_issue
         .as_ref()
@@ -3201,8 +3351,24 @@ fn field(
     label: impl Into<gpui_kit::SharedString>,
     input: impl IntoElement,
     theme: ThemeTokens,
+    scope: &EditorFieldScope,
 ) -> impl IntoElement {
-    EditorField::new(label, input, theme, false)
+    let label = label.into();
+    EditorField::new(label.clone(), input, theme, false)
+        .reveal_in(scope.scroll(), scope.identity(label.as_ref()))
+}
+
+/// 同一编辑器内再按分区隔离字段 key，协议或分类重绘不会借用别行的焦点实体。
+/// @author kongweiguang
+fn host_editor_scope(editor: &HostEditor, section: &str) -> EditorFieldScope {
+    EditorFieldScope::new(
+        editor.scroll_handle.clone(),
+        format!(
+            "host-{:?}-{:?}-{section}",
+            editor.inputs.name.entity_id(),
+            editor.protocol
+        ),
+    )
 }
 
 /// 认证说明保留就近可读性，但不增加另一层卡片背景或内边距。
@@ -3224,10 +3390,11 @@ fn input_field(
     label: impl Into<gpui_kit::SharedString>,
     input: Input,
     theme: ThemeTokens,
+    scope: &EditorFieldScope,
 ) -> impl IntoElement {
     let input = gpui_kit::Styled::h(input, rems(2.25));
     let input = gpui_kit::Styled::text_sm(input);
-    field(label, input, theme)
+    field(label, input, theme, scope)
 }
 
 /// 网络超时与心跳的主标签独立可读，范围/单位降为说明，数字控件不再铺满整行。
@@ -3238,6 +3405,7 @@ fn network_option_input_field(
     hint: impl Into<gpui_kit::SharedString>,
     input: Input,
     theme: ThemeTokens,
+    scope: &EditorFieldScope,
 ) -> impl IntoElement {
     let (_, control_max_width) = network_field_widths_px();
     field(
@@ -3255,6 +3423,7 @@ fn network_option_input_field(
             )
             .child(authentication_note(hint, theme)),
         theme,
+        scope,
     )
 }
 
@@ -3282,8 +3451,12 @@ fn note_card(message: impl Into<gpui_kit::SharedString>, theme: ThemeTokens) -> 
         .child(message.into())
 }
 
-/// 同时表达已保存凭据状态和清除意图，不读取 vault；点击回调遵守 Kit 的 App 级事件契约。
+/// 同时表达凭据状态且单独绑定清除按钮的焦点行；独立身份避免同页多个秘密槽共用 reveal 状态。
+/// 点击回调遵守 Kit 的 App 级事件契约，不读取 vault。
+/// @author kongweiguang
 fn credential_status(
+    scope: &EditorFieldScope,
+    identity: &str,
     exists: bool,
     clearing: bool,
     disabled: bool,
@@ -3304,18 +3477,24 @@ fn credential_status(
             }));
     if exists {
         status = status.child(
-            Button::new(format!("connections-clear-{label}"))
-                .compact()
-                .label(if clearing {
-                    crate::locale::text(format!("保留原{label}"), format!("Keep existing {label}"))
-                } else {
-                    crate::locale::text(
-                        format!("清除已保存{label}"),
-                        format!("Clear saved {label}"),
-                    )
-                })
-                .disabled(disabled)
-                .on_click(on_click),
+            scope.wrap(
+                identity,
+                Button::new(format!("connections-clear-{label}"))
+                    .compact()
+                    .label(if clearing {
+                        crate::locale::text(
+                            format!("保留原{label}"),
+                            format!("Keep existing {label}"),
+                        )
+                    } else {
+                        crate::locale::text(
+                            format!("清除已保存{label}"),
+                            format!("Clear saved {label}"),
+                        )
+                    })
+                    .disabled(disabled)
+                    .on_click(on_click),
+            ),
         );
     }
     status

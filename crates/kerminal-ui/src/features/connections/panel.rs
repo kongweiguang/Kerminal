@@ -1013,6 +1013,8 @@ pub struct ConnectionsPanel {
     group_editor_return: Option<GroupEditorReturn>,
     pub(super) pending_editor_discard: bool,
     pub(super) discard_focus: FocusHandle,
+    pub(super) editor_fields_focus: FocusHandle,
+    editor_discard_return_focus: Option<FocusHandle>,
     /// 仅 Files 选择器发起的 SFTP 新建流程可在明确保存回执后回投工作台。
     sftp_host_creation_flow_id: Option<String>,
     pub(super) save_outcome_unknown: bool,
@@ -1080,6 +1082,7 @@ impl ConnectionsPanel {
         let group_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(group_name_placeholder));
         let discard_focus = cx.focus_handle().tab_stop(false);
+        let editor_fields_focus = cx.focus_handle().tab_stop(false);
         let external_username_input = create_input(
             window,
             cx,
@@ -1127,6 +1130,8 @@ impl ConnectionsPanel {
             group_editor_return: None,
             pending_editor_discard: false,
             discard_focus,
+            editor_fields_focus,
+            editor_discard_return_focus: None,
             sftp_host_creation_flow_id: None,
             save_outcome_unknown: false,
             pending_host_save_recovery: None,
@@ -1410,18 +1415,81 @@ impl ConnectionsPanel {
         self.pending_host_file_picker = None;
     }
 
-    /// Root 展示编辑弹层后把输入焦点交给连接目标地址；串口协议复用该输入作为设备路径。
+    /// 仅聚焦当前分区实际可编辑的字段；无可输入项时留在分区容器，避免焦点落入隐藏表单。
     /// @author kongweiguang
     pub fn focus_editor_primary_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_editor_kind == Some(ConnectionsEditorKind::Local) || self.editor.is_none() {
-            if let Some(editor) = self.local_hosts.editor.as_ref() {
-                let focus = editor.name.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
-            }
-        } else if let Some(editor) = self.editor.as_ref() {
-            let focus = editor.inputs.host.read(cx).focus_handle(cx);
-            window.focus(&focus, cx);
+        let local =
+            self.active_editor_kind == Some(ConnectionsEditorKind::Local) || self.editor.is_none();
+        let disabled = if local {
+            self.recovery.mode == ConfigurationMode::ReadOnlyRecovery
+                || self.local_hosts.saving
+                || self.local_hosts.save_outcome_unknown
+                || self.conflicted_host_editor_reload_in_progress()
+        } else {
+            self.host_editor_fields_disabled()
+        };
+        if disabled {
+            window.focus(&self.editor_fields_focus, cx);
+            return;
         }
+        let focus = if local {
+            self.local_hosts
+                .editor
+                .as_ref()
+                .map(|editor| match editor.section {
+                    super::local_hosts::LocalHostEditorSection::Properties => {
+                        editor.name.read(cx).focus_handle(cx)
+                    }
+                    super::local_hosts::LocalHostEditorSection::Terminal => {
+                        editor.args.read(cx).focus_handle(cx)
+                    }
+                })
+        } else if let Some(editor) = self.editor.as_ref() {
+            let input = match editor.section {
+                HostEditorSection::Properties | HostEditorSection::Authentication
+                    if editor.protocol == RemoteProtocol::Serial =>
+                {
+                    Some(&editor.inputs.name)
+                }
+                HostEditorSection::Properties | HostEditorSection::Authentication => {
+                    Some(&editor.inputs.host)
+                }
+                HostEditorSection::Proxy if editor.proxy_enabled => Some(&editor.inputs.proxy_host),
+                HostEditorSection::Terminal if editor.protocol == RemoteProtocol::Serial => {
+                    Some(&editor.inputs.serial_baud)
+                }
+                HostEditorSection::Terminal => Some(&editor.inputs.term),
+                HostEditorSection::Network => Some(&editor.inputs.connect_timeout),
+                HostEditorSection::Transfer if editor.sftp_enabled => {
+                    Some(&editor.inputs.sftp_local_directory)
+                }
+                HostEditorSection::Display if !editor.rdp_fullscreen => {
+                    Some(&editor.inputs.rdp_width)
+                }
+                HostEditorSection::JumpHosts => editor.jumps.first().map(|jump| &jump.host),
+                _ => None,
+            };
+            input.map(|input| input.read(cx).focus_handle(cx))
+        } else {
+            None
+        };
+        window.focus(focus.as_ref().unwrap_or(&self.editor_fields_focus), cx);
+    }
+
+    /// 确认层夺取焦点前保留当前分区内的实际控件，连续关闭请求不能把确认层当成返回目标。
+    /// @author kongweiguang
+    pub(super) fn begin_editor_discard_confirmation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.pending_editor_discard {
+            self.editor_discard_return_focus = window
+                .focused(cx)
+                .filter(|focus| self.editor_fields_focus.contains(focus, window));
+        }
+        self.pending_editor_discard = true;
+        window.focus(&self.discard_focus, cx);
     }
 
     /// Root 的 Escape/遮罩关闭请求复用面板自己的脏草稿保护，不直接丢弃表单。
@@ -1795,8 +1863,7 @@ impl ConnectionsPanel {
                 );
             }
             self.pending_conflict_reload_after_discard = Some(target);
-            self.pending_editor_discard = true;
-            window.focus(&self.discard_focus, cx);
+            self.begin_editor_discard_confirmation(window, cx);
             self.status = Some(crate::locale::text(
                 "确认后将按原 ID 重新读取当前配置并放弃表单修改；取消可保留草稿。",
                 "Confirming reloads the current configuration by its original ID and discards these edits. Cancel keeps the draft.",
@@ -3269,8 +3336,7 @@ impl ConnectionsPanel {
             .is_some_and(|editor| editor.is_dirty(cx));
         let local_dirty = self.local_host_is_dirty(cx);
         if unified_editor_requires_discard(remote_dirty, local_dirty, self.save_outcome_unknown) {
-            self.pending_editor_discard = true;
-            window.focus(&self.discard_focus, cx);
+            self.begin_editor_discard_confirmation(window, cx);
             cx.notify();
             return;
         }
@@ -3281,6 +3347,7 @@ impl ConnectionsPanel {
     /// @author kongweiguang
     pub(super) fn confirm_discard_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending_editor_discard {
+            self.editor_discard_return_focus = None;
             if let Some(target) = self.pending_conflict_reload_after_discard.take() {
                 self.pending_editor_discard = false;
                 match target {
@@ -3308,7 +3375,7 @@ impl ConnectionsPanel {
         }
     }
 
-    /// 关闭确认期间保留草稿并撤销待执行重读，用户可安全返回表单继续编辑。
+    /// 继续编辑恢复仍挂载在当前分区的原焦点；目标失效时使用当前分区字段而非隐藏名称。
     /// @author kongweiguang
     pub(super) fn keep_editor_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cancelled_reload = self.pending_conflict_reload_after_discard.is_some()
@@ -3334,19 +3401,12 @@ impl ConnectionsPanel {
             );
             self.local_hosts.status = self.status.clone();
         }
-        let focus = match self.active_editor_kind {
-            Some(ConnectionsEditorKind::Local) => self
-                .local_hosts
-                .editor
-                .as_ref()
-                .map(|editor| editor.name.read(cx).focus_handle(cx)),
-            Some(ConnectionsEditorKind::Remote) | None => self
-                .editor
-                .as_ref()
-                .map(|editor| editor.inputs.name.read(cx).focus_handle(cx)),
-        };
-        if let Some(focus) = focus {
+        if let Some(focus) = self.editor_discard_return_focus.take().filter(|focus| {
+            !self.host_editor_fields_disabled() && self.editor_fields_focus.contains(focus, window)
+        }) {
             window.focus(&focus, cx);
+        } else {
+            self.focus_editor_primary_input(window, cx);
         }
         cx.notify();
     }
@@ -3374,6 +3434,7 @@ impl ConnectionsPanel {
         self.editor = None;
         self.clear_local_host_editor_for_unified_close(window, cx);
         self.pending_editor_discard = false;
+        self.editor_discard_return_focus = None;
         self.editor_group_revision = None;
         self.pending_new_host_id = None;
         self.external_conflict = false;
@@ -4795,7 +4856,7 @@ impl ConnectionsPanel {
             && submitted_name == current_name
     }
 
-    /// 协议切换只更新仍为默认值的新建端口和字段提示；编辑值与隐藏的设备路径保持原样。
+    /// 协议草稿替换输入实体后立即交接焦点，避免按键仍派发给已卸载字段；重复选择保留焦点。
     /// @author kongweiguang
     pub(super) fn set_protocol(
         &mut self,
@@ -4829,6 +4890,7 @@ impl ConnectionsPanel {
         if changed {
             self.invalidate_host_file_picker();
             self.status = None;
+            self.focus_editor_primary_input(window, cx);
             cx.notify();
         }
         if !changed
@@ -4850,7 +4912,7 @@ impl ConnectionsPanel {
         }
     }
 
-    /// 切换到本地主机保留远程草稿与显式分组归属；已有本地草稿继续编辑，不会覆盖输入。
+    /// 跨编辑器类型时恢复目标草稿的可见焦点与滚动起点，避免隐藏输入截断 Esc 冒泡。
     ///
     /// @author kongweiguang
     pub(super) fn activate_local_host_editor(
@@ -4864,7 +4926,15 @@ impl ConnectionsPanel {
         self.invalidate_host_file_picker();
         self.reset_connection_probe();
         if self.local_hosts.editor.is_some() {
+            let returning_to_local = self.active_editor_kind != Some(ConnectionsEditorKind::Local);
             self.active_editor_kind = Some(ConnectionsEditorKind::Local);
+            if returning_to_local {
+                if let Some(editor) = self.local_hosts.editor.as_ref() {
+                    editor.scroll_handle.set_offset(Default::default());
+                }
+                self.resume_local_host_default_target(cx);
+                self.focus_editor_primary_input(window, cx);
+            }
             if self.local_hosts.shell_candidates.is_empty() && !self.local_hosts.shell_loading {
                 self.discover_local_shells(cx);
             }
@@ -4875,10 +4945,11 @@ impl ConnectionsPanel {
                 .as_ref()
                 .and_then(|editor| editor.selected_group.clone());
             self.begin_create_local_host(selected_group, window, cx);
+            self.focus_editor_primary_input(window, cx);
         }
     }
 
-    /// 远程协议切换保留 HostEditor 草稿，Local 表单作为并行草稿继续挂在同一 Root modal。
+    /// 切出 Local 保留默认目标意图，并将焦点交给远程可见字段；重复协议点击不打断浏览。
     /// @author kongweiguang
     pub(super) fn activate_remote_protocol(
         &mut self,
@@ -4889,34 +4960,51 @@ impl ConnectionsPanel {
         if self.refuse_conflict_reload_mutation(cx) {
             return;
         }
+        let returning_to_remote = self.active_editor_kind != Some(ConnectionsEditorKind::Remote);
+        let pending_local_defaults = self.local_hosts.default_target_request.take();
         self.cancel_local_host_background_requests();
         self.invalidate_host_file_picker();
         if self.editor.is_none() {
             self.create_host(window, cx);
         }
+        self.local_hosts.default_target_request = pending_local_defaults;
         self.active_editor_kind = Some(ConnectionsEditorKind::Remote);
         self.set_protocol(protocol, window, cx);
+        if returning_to_remote {
+            if let Some(editor) = self.editor.as_ref() {
+                editor.scroll_handle.set_offset(Default::default());
+            }
+            self.focus_editor_primary_input(window, cx);
+        }
         cx.notify();
     }
 
-    /// 高级分区导航只改变当前视图，不进入主机草稿或触发持久化。
+    /// 分区真实切换后同步滚动与可见焦点，保证 Esc、Tab 继续从当前表单派发；重复选择不变。
     /// @author kongweiguang
     pub(super) fn select_editor_section(
         &mut self,
         section: HostEditorSection,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(editor) = self.editor.as_mut() {
-            editor.section = HostEditorSection::normalize(editor.protocol, section);
+            let section = HostEditorSection::normalize(editor.protocol, section);
+            if editor.section == section {
+                return;
+            }
+            editor.scroll_handle.set_offset(Default::default());
+            editor.section = section;
+            self.focus_editor_primary_input(window, cx);
             cx.notify();
         }
     }
 
-    /// 将认证选择限制到面板当前目标协议允许的枚举值。
+    /// 认证字段卸载前交接到新模式的输入；Agent 没有秘密字段时保留表单按键路径。
     /// @author kongweiguang
     pub(super) fn set_authentication_mode(
         &mut self,
         mode: HostAuthenticationMode,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(editor) = self.editor.as_mut() {
@@ -4924,7 +5012,18 @@ impl ConnectionsPanel {
             {
                 return;
             }
+            if editor.authentication_mode == mode {
+                return;
+            }
             editor.authentication_mode = mode;
+            let focus = match mode {
+                HostAuthenticationMode::Password => editor.inputs.secret.read(cx).focus_handle(cx),
+                HostAuthenticationMode::PrivateKey => {
+                    editor.inputs.key_path.read(cx).focus_handle(cx)
+                }
+                HostAuthenticationMode::Agent => self.editor_fields_focus.clone(),
+            };
+            window.focus(&focus, cx);
             cx.notify();
         }
         self.reset_connection_probe();
@@ -4962,7 +5061,7 @@ impl ConnectionsPanel {
         self.reset_connection_probe();
     }
 
-    /// 删除指定跳板并释放该表单内的秘密输入，减少凭据作用域与路由索引错配；先核对索引再移除。
+    /// 删除跳板后释放秘密并聚焦相邻路由，避免保留已卸载字段焦点或跳回列表首项。
     /// @author kongweiguang
     pub(super) fn remove_jump(
         &mut self,
@@ -4975,14 +5074,34 @@ impl ConnectionsPanel {
         {
             let jump = editor.jumps.remove(index);
             jump.clear_secrets(window, cx);
+            let focus = editor
+                .jumps
+                .get(index)
+                .or_else(|| editor.jumps.last())
+                .map(|jump| jump.host.read(cx).focus_handle(cx))
+                .unwrap_or_else(|| self.editor_fields_focus.clone());
+            window.focus(&focus, cx);
             cx.notify();
         }
         self.reset_connection_probe();
     }
 
-    /// 切换收藏标记仅更新主机草稿，收藏标签由 schema adapter 映射到兼容字段。
+    /// 所有远程字段共享同一门禁，标题栏收藏不能绕过只读、测试或结果待核对状态。
+    /// @author kongweiguang
+    pub(super) fn host_editor_fields_disabled(&self) -> bool {
+        self.recovery.mode == ConfigurationMode::ReadOnlyRecovery
+            || self.saving
+            || self.conflicted_host_editor_reload_in_progress()
+            || self.probe_running
+            || self.save_outcome_unknown
+    }
+
+    /// 收藏遵循与其它字段相同的门禁；取消测试释放门禁后仍可修改草稿。
     /// @author kongweiguang
     pub(super) fn toggle_favorite(&mut self, cx: &mut Context<Self>) {
+        if self.host_editor_fields_disabled() {
+            return;
+        }
         if let Some(editor) = self.editor.as_mut() {
             editor.favorite = !editor.favorite;
             cx.notify();
@@ -5395,3 +5514,7 @@ mod connections_guardrails_tests;
 #[cfg(test)]
 #[path = "../../../tests/unit/connections_panel.rs"]
 mod connections_panel_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/connections_editor_dirty.rs"]
+mod connections_editor_dirty_tests;

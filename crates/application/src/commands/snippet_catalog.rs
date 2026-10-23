@@ -478,7 +478,10 @@ impl FingerprintHasher {
 }
 
 /// 目录投影回转为执行定义时显式复制运行字段，展示统计和来源元数据不会进入命令模板。
-fn definition_from_catalog_item(item: &SnippetCatalogItem) -> SnippetDefinition {
+/// 让目录发送与详情页共享同一领域定义映射，避免两条模板渲染路径对变量和来源各自解释。
+///
+/// @author kongweiguang
+pub(super) fn definition_from_catalog_item(item: &SnippetCatalogItem) -> SnippetDefinition {
     SnippetDefinition {
         id: item.id.clone(),
         title: item.title.clone(),

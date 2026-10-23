@@ -81,7 +81,7 @@ impl CommandsView {
             .into_any_element();
         let section_tabs = self.render_snippet_sections(theme, cx);
         let fill_blocked = self.snippet_terminal_fill_blocked();
-        let fill_feedback = if self.compact_layout && fill_blocked {
+        let fill_feedback = if fill_blocked {
             Some(
                 self.render_snippet_fill_feedback(theme, cx)
                     .into_any_element(),
@@ -115,22 +115,6 @@ impl CommandsView {
             .into_iter()
             .map(|item| self.render_snippet_row(item, rows_stale, theme, cx))
             .collect::<Vec<_>>();
-        // 运行弹层打开或仍阻止导航时固定保留同一执行状态；终态结果由用户显式收起。
-        let run_state_visible = self.snippet_run_state().recovery_visible();
-        let run_recovery = if !self.snippet_editor_open && run_state_visible {
-            Some(
-                div()
-                    .id("snippet-run-recovery-slot")
-                    .w_full()
-                    .max_h(px(248.))
-                    .flex_shrink_0()
-                    .overflow_y_scroll()
-                    .child(self.render_snippet_run_panel(theme, cx))
-                    .into_any_element(),
-            )
-        } else {
-            None
-        };
         let empty_state_visible = should_show_snippet_empty_state(
             self.snippet_page_items.len(),
             loading,
@@ -275,7 +259,6 @@ impl CommandsView {
                     )
                 },
             )
-            .when_some(run_recovery, |view, panel| view.child(panel))
             .child(
                 div()
                     .id("snippet-catalog-list")
@@ -1215,7 +1198,7 @@ fn snippet_filter_description(
     }
 }
 
-/// 紧凑行只保留范围与限制提示；来源及完整平台和 shell 声明放在悬浮提示及详情中供核对。
+/// 紧凑行只标注定义范围；平台与 shell 声明仅供参考，不把元数据伪装成直接发送的限制。
 ///
 /// @author kongweiguang
 fn row_metadata(
@@ -1232,17 +1215,6 @@ fn row_metadata(
         SnippetScope::Any => ("通用", "Any"),
         SnippetScope::Local => ("本地", "Local"),
         SnippetScope::Ssh => ("SSH", "SSH"),
-    };
-    let has_applicability_conditions = !platforms.is_empty() || !shells.is_empty();
-    let zh = if has_applicability_conditions {
-        format!("{scope_zh} · 有条件")
-    } else {
-        scope_zh.to_owned()
-    };
-    let en = if has_applicability_conditions {
-        format!("{scope_en} · Limited")
-    } else {
-        scope_en.to_owned()
     };
     let platforms_zh = if platforms.is_empty() {
         "不限".to_owned()
@@ -1265,7 +1237,7 @@ fn row_metadata(
         shells.join(", ")
     };
     (
-        crate::locale::text(zh, en),
+        crate::locale::text(scope_zh, scope_en),
         crate::locale::text(
             format!(
                 "来源：{source_zh} · 范围：{scope_zh} · 平台：{platforms_zh} · Shell：{shells_zh}"

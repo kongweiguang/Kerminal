@@ -11,9 +11,7 @@ use kerminal_domain::commands::{
     SnippetDefinition, SnippetPreferenceKey, SnippetRisk, SnippetScope,
 };
 
-use super::{
-    CommandsSection, CommandsView, SnippetDraftValues, command_message, snippet_applicability,
-};
+use super::{CommandsSection, CommandsView, SnippetDraftValues, command_message};
 
 /// 保存解析前的片段表单值，用来识别新建入口的真实空白基线。
 ///
@@ -247,8 +245,6 @@ impl CommandsView {
                     }
                     SnippetConfigurationRefreshAction::ReloadExact { key, reopen_editor } => {
                         self.configuration_conflict = None;
-                        // 外部 revision 已变化，旧定义的异步结论不能在精确重读期间短暂复用。
-                        snippet_applicability::clear(self);
                         // 同来源精确重读；false 保留关闭态，也不改变已打开 modal 的可见状态。
                         self.load_snippet_key(key, reopen_editor, false, window, cx);
                     }

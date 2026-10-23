@@ -308,6 +308,15 @@ pub struct UiCommandLineRequest {
     pub command: String,
 }
 
+/// 从可见片段入口直接提交模板文本；其多行编码允许沿用普通终端 Paste 语义。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiSnippetCommandLineRequest {
+    pub binding: UiSessionBinding,
+    pub command: String,
+}
+
 /// UI 更新原因；终端字节仍在有界输出路径中完整消费。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionChangeKind {
@@ -595,6 +604,21 @@ pub trait SessionService: Send + Sync {
         &self,
         request: UiCommandLineRequest,
     ) -> AppResult<TerminalCommandContext>;
+
+    /// 直接发送已由用户点击选择的片段；保留精确 UI owner/generation CAS，不要求 prompt 或 shell marker。
+    ///
+    /// 该窄能力沿用 Paste+Enter 的单次 writer 事务，并允许普通粘贴模式下的多行片段；旧命令入口仍执行其安全门禁。
+    /// 未覆盖此能力的 adapter 不得假装片段已发送。
+    ///
+    /// @author kongweiguang
+    async fn submit_ui_snippet_command_line(
+        &self,
+        _request: UiSnippetCommandLineRequest,
+    ) -> AppResult<TerminalCommandContext> {
+        Err(AppError::unsupported(
+            "当前会话服务不支持直接发送 UI 命令片段",
+        ))
+    }
 
     /// 为可见 UI 的单次提交附带输入投影；正文只有经绑定、版本与完整 writer ACK 后才能关联 OSC C。
     ///

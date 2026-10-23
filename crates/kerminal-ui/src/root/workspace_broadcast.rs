@@ -6,7 +6,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use gpui_kit::{AnyElement, AppContext as _, Context, Entity, IntoElement, Subscription, Window};
 use kerminal_application::{
-    commands::{BroadcastDeliveryResult, BroadcastSessionBinding},
+    commands::{
+        BroadcastDeliveryResult, BroadcastSessionBinding, SnippetRenderResult,
+        direct_snippet_catalog_command,
+    },
     sessions::UiSessionBinding,
     workspace::{WorkspaceSessionSnapshot, WorkspaceSessionTab},
 };
@@ -31,6 +34,7 @@ use crate::{
             PaneBroadcastProjection, WorkspaceBroadcastBar, WorkspaceBroadcastBarEvent,
             WorkspaceBroadcastBarProjection, WorkspaceBroadcastDeliveryProjection,
             WorkspaceBroadcastSnippetProjection, WorkspaceBroadcastTargetMode,
+            WorkspaceBroadcastTargetProjection,
         },
         workspace_panes::WorkspacePaneEvent,
     },
@@ -65,13 +69,13 @@ struct WorkspaceBroadcastTabState {
     snippets_open: bool,
     snippets: Vec<SnippetChoice>,
     snippet_generation: u64,
-    required_placeholders: Vec<String>,
 }
 
 #[derive(Clone)]
 struct SnippetChoice {
     key: SnippetPreferenceKey,
     title: String,
+    command: SnippetRenderResult,
 }
 
 #[derive(Clone)]
@@ -83,6 +87,7 @@ struct FrozenBroadcastRequest {
     ui_bindings: Vec<UiSessionBinding>,
     api_bindings: Vec<BroadcastSessionBinding>,
     analysis: BroadcastAnalysis,
+    snippet: Option<SnippetRenderResult>,
 }
 
 struct BroadcastPlan {
@@ -129,7 +134,6 @@ impl WorkspaceBroadcastTabState {
             snippets_open: false,
             snippets: Vec::new(),
             snippet_generation: 0,
-            required_placeholders: Vec::new(),
         }
     }
 }
@@ -417,14 +421,14 @@ impl RootView {
         if !state.bar_visible {
             return None;
         }
-        let projection = self.bar_projection(tab_id, &layout);
+        let projection = self.bar_projection(tab_id, &layout, cx);
         self.workspace_broadcast.bar.update(cx, |bar, cx| {
             bar.set_projection(projection, window, cx);
         });
         Some(self.workspace_broadcast.bar.clone().into_any_element())
     }
 
-    /// 隐藏工具栏会停止同步输入；pane 页头的显式入口可重新展开。
+    /// 页头与菜单共用目标集合；工具栏随多分屏自动显示，页头入口只负责聚焦命令输入。
     ///
     /// @author kongweiguang
     pub(super) fn handle_workspace_broadcast_header_event(
@@ -482,28 +486,61 @@ impl RootView {
         }
     }
 
-    /// 为当前 Tab 投影简短状态和逐目标回执，避免结果内容无限撑高画布。
+    /// 菜单与页头共用精确绑定下的选中集合，标题只供阅读，不参与目标路由。
+    ///
+    /// @author kongweiguang
     fn bar_projection(
         &self,
         tab_id: &TabId,
         layout: &TerminalLayoutNode,
+        cx: &Context<Self>,
     ) -> WorkspaceBroadcastBarProjection {
         let Some(state) = self.workspace_broadcast.tabs.get(tab_id) else {
             return WorkspaceBroadcastBarProjection::default();
         };
-        let selected_count = self
-            .selected_workspace_pane_ids(tab_id, layout, None)
+        let selected = self.selected_workspace_pane_ids(tab_id, layout, None);
+        let focused = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.snapshot().focused_pane_id.as_ref());
+        let targets = layout
+            .pane_ids()
             .into_iter()
-            .filter(|pane_id| {
-                self.workspace_broadcast_input_binding(tab_id, pane_id)
-                    .is_some()
+            .map(|pane_id| {
+                let enabled = self
+                    .workspace_broadcast_input_binding(tab_id, &pane_id)
+                    .is_some();
+                let pane = self.workspace_runtime.pane(&pane_id);
+                let protocol = pane
+                    .and_then(|pane| pane.target.as_ref())
+                    .map_or("", |target| match target {
+                        SessionTarget::Local(_) => "LOCAL",
+                        SessionTarget::Ssh(_) => "SSH",
+                        SessionTarget::Telnet(_) => "TELNET",
+                        SessionTarget::Serial(_) => "SERIAL",
+                        SessionTarget::Container(_) => "CONTAINER",
+                    });
+                WorkspaceBroadcastTargetProjection {
+                    title: self.workspace_pane_title(&pane_id, cx).to_string(),
+                    detail: pane
+                        .and_then(|pane| pane.current_working_directory.as_deref())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    protocol: protocol.to_owned(),
+                    selected: enabled && selected.contains(&pane_id),
+                    enabled,
+                    current: focused == Some(&pane_id),
+                    pane_id,
+                }
             })
-            .count();
+            .collect::<Vec<_>>();
+        let selected_count = targets.iter().filter(|target| target.selected).count();
         WorkspaceBroadcastBarProjection {
             tab_id: Some(tab_id.clone()),
             pane_count: layout.pane_ids().len(),
             selected_count,
             mode: state.mode,
+            targets,
             draft: state.draft.clone(),
             sync_enabled: state.sync_enabled,
             command_pending: self
@@ -582,7 +619,9 @@ impl RootView {
         )
     }
 
-    /// 进入自选时冻结当下目标；改选后先停止旧同步路由，避免后续输入扩散到不同集合。
+    /// 菜单与页头改选都只冻结当下可输入目标，候选 pane 不会在就绪后悄悄加入自选。
+    ///
+    /// @author kongweiguang
     fn toggle_workspace_broadcast_target(
         &mut self,
         tab_id: &TabId,
@@ -597,7 +636,14 @@ impl RootView {
         if !layout.contains_pane(pane_id) {
             return;
         }
-        let selected = self.selected_workspace_pane_ids(tab_id, &layout, Some(&focused));
+        let selected = self
+            .selected_workspace_pane_ids(tab_id, &layout, Some(&focused))
+            .into_iter()
+            .filter(|pane_id| {
+                self.workspace_broadcast_input_binding(tab_id, pane_id)
+                    .is_some()
+            })
+            .collect::<BTreeSet<_>>();
         let input_enabled = self
             .workspace_broadcast_input_binding(tab_id, pane_id)
             .is_some();
@@ -607,7 +653,7 @@ impl RootView {
             .entry(tab_id.clone())
             .or_insert_with(WorkspaceBroadcastTabState::default);
         if state.mode != WorkspaceBroadcastTargetMode::Custom {
-            state.custom_panes = selected.into_iter().collect();
+            state.custom_panes = selected;
             state.mode = WorkspaceBroadcastTargetMode::Custom;
         }
         if state.custom_panes.contains(pane_id) {
@@ -750,7 +796,7 @@ impl RootView {
                 let (layout, _) = self.workspace_broadcast_view_layout(snapshot, tab_id, cx)?;
                 let state = self.workspace_broadcast.tabs.get(tab_id)?;
                 (state.bar_visible && layout.pane_ids().len() >= 2)
-                    .then(|| self.bar_projection(tab_id, &layout))
+                    .then(|| self.bar_projection(tab_id, &layout, cx))
             })
             .unwrap_or_default();
         self.workspace_broadcast.bar.update(cx, |bar, cx| {
@@ -768,6 +814,7 @@ impl RootView {
         let tab_id = match &event {
             WorkspaceBroadcastBarEvent::DraftChanged { tab_id, .. }
             | WorkspaceBroadcastBarEvent::SetMode { tab_id, .. }
+            | WorkspaceBroadcastBarEvent::ToggleTarget { tab_id, .. }
             | WorkspaceBroadcastBarEvent::ToggleSync { tab_id }
             | WorkspaceBroadcastBarEvent::SendCommand { tab_id }
             | WorkspaceBroadcastBarEvent::ConfirmSend { tab_id }
@@ -777,8 +824,7 @@ impl RootView {
             | WorkspaceBroadcastBarEvent::ToggleResults { tab_id }
             | WorkspaceBroadcastBarEvent::OpenSnippets { tab_id }
             | WorkspaceBroadcastBarEvent::CloseSnippets { tab_id }
-            | WorkspaceBroadcastBarEvent::ChooseSnippet { tab_id, .. }
-            | WorkspaceBroadcastBarEvent::Close { tab_id } => tab_id.clone(),
+            | WorkspaceBroadcastBarEvent::ChooseSnippet { tab_id, .. } => tab_id.clone(),
         };
         if self.workspace_broadcast.last_active_tab_id.as_ref() != Some(&tab_id) {
             return;
@@ -795,6 +841,9 @@ impl RootView {
             }
             WorkspaceBroadcastBarEvent::SetMode { mode, .. } => {
                 self.set_workspace_broadcast_mode(&tab_id, mode, cx);
+            }
+            WorkspaceBroadcastBarEvent::ToggleTarget { pane_id, .. } => {
+                self.toggle_workspace_broadcast_target(&tab_id, &pane_id, cx);
             }
             WorkspaceBroadcastBarEvent::ToggleSync { .. } => {
                 self.toggle_workspace_broadcast_sync(&tab_id, cx);
@@ -865,45 +914,16 @@ impl RootView {
                 }
             }
             WorkspaceBroadcastBarEvent::ChooseSnippet { snippet_id, .. } => {
-                self.choose_workspace_broadcast_snippet(&tab_id, &snippet_id, window, cx);
-            }
-            WorkspaceBroadcastBarEvent::Close { .. } => {
-                if let Some(state) = self.workspace_broadcast.tabs.get_mut(&tab_id) {
-                    state.bar_visible = false;
-                    state.sync_enabled = false;
-                    invalidate_snippet_picker(state);
-                    state.confirmation = None;
-                }
-                self.stop_workspace_broadcast_for_lifecycle("群发栏已隐藏，后续发送已停止。");
-                if self
-                    .workspace_controller
-                    .as_ref()
-                    .is_some_and(|controller| {
-                        controller.snapshot().active_tab_id.as_ref() == Some(&tab_id)
-                    })
-                    && let Some((layout, focused)) =
-                        self.workspace_controller.as_ref().and_then(|controller| {
-                            self.workspace_broadcast_view_layout(controller.snapshot(), &tab_id, cx)
-                        })
-                {
-                    let pane_id =
-                        std::iter::once(focused)
-                            .chain(layout.pane_ids())
-                            .find(|pane_id| {
-                                self.workspace_broadcast_input_binding(&tab_id, pane_id)
-                                    .is_some()
-                            });
-                    if let Some(pane_id) = pane_id {
-                        self.focus_workspace_pane(tab_id.clone(), pane_id, window, cx);
-                    }
-                }
+                self.choose_workspace_broadcast_snippet(&tab_id, &snippet_id, cx);
             }
         }
         self.sync_bar_projection_for_current_tab(window, cx);
         cx.notify();
     }
 
-    /// 首次进入自选模式时，将当前可输入目标设为起始集合。
+    /// 切入自选保留当前已勾选的可输入集合；未就绪候选不视为用户已经选中。
+    ///
+    /// @author kongweiguang
     fn set_workspace_broadcast_mode(
         &mut self,
         tab_id: &TabId,
@@ -923,14 +943,21 @@ impl RootView {
         }) else {
             return;
         };
-        let current = self.selected_workspace_pane_ids(tab_id, &layout, Some(&focused));
+        let current = self
+            .selected_workspace_pane_ids(tab_id, &layout, Some(&focused))
+            .into_iter()
+            .filter(|pane_id| {
+                self.workspace_broadcast_input_binding(tab_id, pane_id)
+                    .is_some()
+            })
+            .collect::<BTreeSet<_>>();
         let state = self
             .workspace_broadcast
             .tabs
             .entry(tab_id.clone())
             .or_insert_with(WorkspaceBroadcastTabState::default);
         if mode == WorkspaceBroadcastTargetMode::Custom {
-            state.custom_panes = current.into_iter().collect();
+            state.custom_panes = current;
         }
         state.mode = mode;
         state.confirmation = None;
@@ -953,7 +980,7 @@ impl RootView {
             && let Some(state) = self.workspace_broadcast.tabs.get(&tab_id)
             && state.bar_visible
         {
-            let projection = self.bar_projection(&tab_id, &layout);
+            let projection = self.bar_projection(&tab_id, &layout, cx);
             self.workspace_broadcast.bar.update(cx, |bar, cx| {
                 bar.set_projection(projection, window, cx);
             });
@@ -1041,6 +1068,7 @@ impl RootView {
             ui_bindings,
             api_bindings,
             analysis,
+            snippet: None,
         })
     }
 
@@ -1085,6 +1113,7 @@ impl RootView {
                         state.snippets = items
                             .into_iter()
                             .map(|item| SnippetChoice {
+                                command: direct_snippet_catalog_command(&item, &BTreeMap::new()),
                                 key: SnippetPreferenceKey {
                                     origin: item.origin,
                                     snippet_id: item.id,
@@ -1106,16 +1135,20 @@ impl RootView {
         .detach();
     }
 
-    /// 复用 application renderer 按每个冻结目标的可信 Shell 方言渲染；只在所有结果一致且非敏感时填草稿。
+    /// 点击即发送当前展示的片段快照；关闭弹层只影响目录，不撤销已明确发起的发送。
+    /// 目标仍固定为点击时的完整 binding，命令不覆盖输入草稿，也不依赖平台探测或 Shell marker。
     ///
     /// @author kongweiguang
     fn choose_workspace_broadcast_snippet(
         &mut self,
         tab_id: &TabId,
         choice_id: &str,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.workspace_broadcast.active_command.is_some() {
+            self.report_workspace_broadcast_busy(tab_id);
+            return;
+        }
         let Some(choice) = self.workspace_broadcast.tabs.get(tab_id).and_then(|state| {
             state
                 .snippets
@@ -1125,135 +1158,46 @@ impl RootView {
         }) else {
             return;
         };
-        let Some(commands) = self.services.commands.clone() else {
-            return;
-        };
         let Some((layout, _)) = self.workspace_controller.as_ref().and_then(|controller| {
             self.workspace_broadcast_view_layout(controller.snapshot(), tab_id, cx)
         }) else {
             return;
         };
         let bindings = self.selected_workspace_bindings(tab_id, &layout);
-        if bindings.is_empty() {
+        let draft_snapshot = self
+            .workspace_broadcast
+            .tabs
+            .get(tab_id)
+            .map(|state| state.draft.clone())
+            .unwrap_or_default();
+        let Some(mut request) = self.freeze_workspace_broadcast_request(
+            tab_id,
+            choice.command.command.clone(),
+            draft_snapshot,
+            bindings,
+            cx,
+        ) else {
             if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                state.status = Some("请先选择仍可输入的终端分屏。".to_owned());
+                state.status = Some("请选择仍可输入的分屏后发送片段。".to_owned());
             }
             return;
-        }
-        let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) else {
-            return;
         };
-        let expected_draft = state.draft.clone();
-        state.snippet_generation = state.snippet_generation.wrapping_add(1).max(1);
-        let generation = state.snippet_generation;
-        state.status = Some("正在按所选终端检查片段适用性…".to_owned());
-        let executor = self.services.executor.clone();
-        let key = choice.key;
-        let callback_tab = tab_id.clone();
-        let worker_bindings = bindings.clone();
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(move |_cancellation| async move {
-                    let Some(snapshot) =
-                        commands.get_snippet_execution_snapshot(key.clone()).await?
-                    else {
-                        return Err(kerminal_application::AppError::not_found(
-                            "命令片段已不存在",
-                        ));
-                    };
-                    let mut rendered_command: Option<String> = None;
-                    for binding in &worker_bindings {
-                        let applicability = commands
-                            .snippet_applicability(key.clone(), Some(binding.clone()))
-                            .await?
-                            .ok_or_else(|| {
-                                kerminal_application::AppError::not_found("命令片段已不存在")
-                            })?;
-                        use kerminal_domain::commands::SnippetApplicabilityStatus;
-                        if matches!(
-                            applicability.assessment.status,
-                            SnippetApplicabilityStatus::Incompatible
-                                | SnippetApplicabilityStatus::Unknown
-                        ) {
-                            return Err(kerminal_application::AppError::conflict(
-                                "所选终端的 Shell 或平台与片段不兼容或无法确认",
-                            ));
-                        }
-                        let rendered = commands
-                            .render_snippet_for_binding(
-                                &snapshot.definition,
-                                binding,
-                                &BTreeMap::new(),
-                            )
-                            .await?;
-                        if rendered.sensitive {
-                            return Err(kerminal_application::AppError::unsupported(
-                                "敏感片段请在命令片段面板中使用，群发不会把它写入命令历史",
-                            ));
-                        }
-                        match rendered_command.as_ref() {
-                            Some(previous) if previous != &rendered.command => {
-                                return Err(kerminal_application::AppError::conflict(
-                                    "此片段在不同终端会渲染为不同命令，请改为单独选择目标",
-                                ));
-                            }
-                            None => rendered_command = Some(rendered.command),
-                            _ => {}
-                        }
-                    }
-                    rendered_command.ok_or_else(|| {
-                        kerminal_application::AppError::invalid("片段没有可渲染的终端目标")
-                    })
-                })
-                .await;
-            let _ = this.update(cx, |root, cx| {
-                if root.workspace_broadcast.last_active_tab_id.as_ref() != Some(&callback_tab) {
-                    return;
-                }
-                let current_bindings = root
-                    .workspace_controller
-                    .as_ref()
-                    .and_then(|controller| {
-                        root.workspace_broadcast_view_layout(
-                            controller.snapshot(),
-                            &callback_tab,
-                            cx,
-                        )
-                    })
-                    .map(|(layout, _)| root.selected_workspace_bindings(&callback_tab, &layout));
-                let Some(state) = root.workspace_broadcast.tabs.get_mut(&callback_tab) else {
-                    return;
-                };
-                if !is_current_snippet_request(state, generation) {
-                    return;
-                }
-                if current_bindings.as_ref() != Some(&bindings) {
-                    state.status = Some("片段目标已变化，请重新选择片段。".to_owned());
-                } else if state.draft != expected_draft {
-                    state.status = Some("草稿已更新；片段渲染结果未覆盖你的新内容。".to_owned());
-                } else {
-                    match result {
-                        Ok(command) => {
-                            state.draft = command;
-                            state.required_placeholders.clear();
-                            state.confirmation = None;
-                            state.snippets_open = false;
-                            state.status = Some("片段已渲染并填入草稿；尚未发送。".to_owned());
-                        }
-                        Err(error) => {
-                            let message = error.public_message();
-                            state.status = Some(if message.contains("缺少必填变量") {
-                                "片段需要填写变量；请先到命令片段面板填写后再使用。".to_owned()
-                            } else {
-                                message.to_owned()
-                            });
-                        }
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        request.snippet = Some(choice.command);
+        if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
+            invalidate_snippet_picker(state);
+            state.confirmation = None;
+            state.last_result = None;
+            state.results_open = false;
+        }
+        self.execute_workspace_broadcast_plan(
+            BroadcastPlan {
+                full: request.clone(),
+                execute: request,
+                prior_deliveries: Vec::new(),
+            },
+            true,
+            cx,
+        );
     }
 
     /// 发送时冻结命令和目标集合；只有 CommandsService 的风险门禁要求时才二次确认。
@@ -1421,7 +1365,7 @@ impl RootView {
         .detach();
     }
 
-    /// 复用 CommandsService 逐目标发送，并保留原绑定直至全部回执完成合并。
+    /// 共享逐目标回执与取消流程；片段直接提交完整 binding，普通草稿保留既有确认策略。
     ///
     /// @author kongweiguang
     fn execute_workspace_broadcast_plan(
@@ -1468,16 +1412,28 @@ impl RootView {
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run_cancellable(cancellation, move |application_cancellation| async move {
-                    commands
-                        .broadcast_with_cancellation(
-                            execute_request.command,
-                            execute_request.targets,
-                            execute_request.api_bindings,
-                            confirmed,
-                            user_cancellation,
-                            application_cancellation,
-                        )
-                        .await
+                    if let Some(snippet) = execute_request.snippet {
+                        commands
+                            .broadcast_snippet_with_cancellation(
+                                snippet,
+                                execute_request.targets,
+                                execute_request.ui_bindings,
+                                user_cancellation,
+                                application_cancellation,
+                            )
+                            .await
+                    } else {
+                        commands
+                            .broadcast_with_cancellation(
+                                execute_request.command,
+                                execute_request.targets,
+                                execute_request.api_bindings,
+                                confirmed,
+                                user_cancellation,
+                                application_cancellation,
+                            )
+                            .await
+                    }
                 })
                 .await;
             let _ = this.update(cx, |root, cx| {
@@ -1536,13 +1492,12 @@ impl RootView {
                             "已发送 {sent}/{}；结果未知/失败 {attempted_failed}，未发送 {not_sent}。",
                             result.request.targets.len()
                         ));
-                        if should_clear_workspace_broadcast_draft(
+                        if callback_plan.full.snippet.is_none() && should_clear_workspace_broadcast_draft(
                             all_sent,
                             &state.draft,
                             &callback_plan.full.draft_snapshot,
                         ) {
                             state.draft.clear();
-                            state.required_placeholders.clear();
                         }
                         state.confirmation = None;
                         state.last_result = Some(result);
@@ -2063,7 +2018,7 @@ fn reconcile_workspace_broadcast_tab_state(
     state.previous_view_pane_count = pane_count;
 }
 
-/// 关闭片段弹层时递增代次，使已启动的目录查询或模板渲染回执失效。
+/// 关闭片段弹层只撤销目录查询回执；已点击发起的发送由独立冻结请求继续收敛。
 ///
 /// @author kongweiguang
 fn invalidate_snippet_picker(state: &mut WorkspaceBroadcastTabState) {

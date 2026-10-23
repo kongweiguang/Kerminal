@@ -21,8 +21,10 @@ use kerminal_application::{
         CreateSessionRequest, PlainTextSnapshot, PlainTextSnapshotRequest, RenderSnapshot,
         RenderSnapshotRequest, ScrollRequest, SessionDeadline, SessionFilter,
         SessionRuntimeMetadata, SessionService, SessionSubscription, ShellCommandOutcome,
-        ShellCommandRequest, TerminalInputEvent, TerminalPalette, TerminalSearchRequest,
-        TerminalSearchResult, TerminalSelection, UiCommandLineRequest, UiSessionBinding,
+        ShellCommandRequest, TerminalCommandAvailability, TerminalCommandContext,
+        TerminalCommandUnavailableReason, TerminalInputEvent, TerminalPalette,
+        TerminalSearchRequest, TerminalSearchResult, TerminalSelection, UiCommandLineRequest,
+        UiSessionBinding, UiSnippetCommandLineRequest,
     },
 };
 use kerminal_domain::{
@@ -51,7 +53,7 @@ fn unused_port<T>() -> AppResult<T> {
 }
 
 /// 历史 port 只需接受成功目标的记录；广播结果仍由真实 CommandsService 产生。
-struct BroadcastHistory;
+struct BroadcastHistory(Arc<Mutex<usize>>);
 
 #[async_trait]
 impl CommandHistoryRepository for BroadcastHistory {
@@ -76,6 +78,10 @@ impl CommandHistoryRepository for BroadcastHistory {
     ///
     /// @author kongweiguang
     async fn append(&self, draft: CommandHistoryDraft) -> AppResult<CommandHistoryEntry> {
+        *self
+            .0
+            .lock()
+            .expect("broadcast history counter should not be poisoned") += 1;
         Ok(CommandHistoryEntry {
             id: "broadcast-test-history".to_owned(),
             command: draft.command,
@@ -307,6 +313,8 @@ pub(crate) struct BroadcastSessions {
     actions: Mutex<VecDeque<WriteAction>>,
     writes: Mutex<Vec<SessionId>>,
     list_calls: Mutex<usize>,
+    snippet_submissions: Mutex<Vec<UiSnippetCommandLineRequest>>,
+    history_writes: Arc<Mutex<usize>>,
 }
 
 impl BroadcastSessions {
@@ -322,6 +330,8 @@ impl BroadcastSessions {
             actions: Mutex::new(actions.into_iter().collect()),
             writes: Mutex::new(Vec::new()),
             list_calls: Mutex::new(0),
+            snippet_submissions: Mutex::new(Vec::new()),
+            history_writes: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -343,6 +353,26 @@ impl BroadcastSessions {
             .list_calls
             .lock()
             .expect("broadcast fixture mutex should not be poisoned")
+    }
+
+    /// 读取精确 snippet request，确认服务使用 UI direct writer 而不是旧 raw-write 分支。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn snippet_submissions(&self) -> Vec<UiSnippetCommandLineRequest> {
+        self.snippet_submissions
+            .lock()
+            .expect("snippet submission mutex should not be poisoned")
+            .clone()
+    }
+
+    /// 历史仓储实际收到的追加数，用于证明敏感片段不进入存储端口。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn history_writes(&self) -> usize {
+        *self
+            .history_writes
+            .lock()
+            .expect("broadcast history counter should not be poisoned")
     }
 }
 
@@ -430,6 +460,50 @@ impl SessionService for BroadcastSessions {
         _request: UiCommandLineRequest,
     ) -> AppResult<kerminal_application::sessions::TerminalCommandContext> {
         unused_port()
+    }
+
+    /// 直接片段测试记录一次 writer 入口并返回 unknown-shell/未就绪上下文，验证不依赖 shell marker。
+    ///
+    /// @author kongweiguang
+    async fn submit_ui_snippet_command_line(
+        &self,
+        request: UiSnippetCommandLineRequest,
+    ) -> AppResult<TerminalCommandContext> {
+        self.writes
+            .lock()
+            .expect("broadcast write mutex should not be poisoned")
+            .push(request.binding.session_id.clone());
+        self.snippet_submissions
+            .lock()
+            .expect("snippet submission mutex should not be poisoned")
+            .push(request.clone());
+        let action = self
+            .actions
+            .lock()
+            .expect("broadcast action mutex should not be poisoned")
+            .pop_front()
+            .unwrap_or(WriteAction::OutcomeUnknown);
+        match action {
+            WriteAction::Succeed | WriteAction::CancelThenSucceed(_) => {
+                Ok(TerminalCommandContext {
+                    session_id: request.binding.session_id,
+                    owner: request.binding.owner,
+                    session_generation: request.binding.session_generation,
+                    prompt_epoch: 0,
+                    input_generation: 0,
+                    shell_dialect: kerminal_domain::connections::RemoteShellDialect::Unknown,
+                    prompt_ready: false,
+                    prompt_line_empty: false,
+                    alternate_screen: false,
+                    availability: TerminalCommandAvailability::Unavailable(
+                        TerminalCommandUnavailableReason::PromptNotReady,
+                    ),
+                })
+            }
+            WriteAction::OutcomeUnknown => Err(AppError::outcome_unknown(
+                "snippet terminal write outcome is unknown",
+            )),
+        }
     }
 
     /// 广播不调整终端网格。
@@ -590,7 +664,7 @@ impl SessionService for BroadcastSessions {
 /// @author kongweiguang
 pub(crate) fn commands_service(sessions: Arc<BroadcastSessions>) -> CommandsService {
     CommandsService::new(
-        Arc::new(BroadcastHistory),
+        Arc::new(BroadcastHistory(Arc::clone(&sessions.history_writes))),
         Arc::new(UnusedSnippets),
         Arc::new(UnusedWorkflows),
         Arc::new(UnusedSuggestions),

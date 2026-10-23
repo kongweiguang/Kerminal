@@ -19,9 +19,9 @@ use kerminal_application::sessions::{
     SessionTransportControl, SessionTransportFactory, SessionTransportOpenError,
     ShellCommandOutcome, ShellCommandRequest, ShellCommandUnknownReason,
     TerminalCommandAvailability, TerminalCommandUnavailableReason, TerminalSearchRequest,
-    UiCommandLineRequest, UiInputProjection, UiSessionBinding, UiTerminalInputRequest,
-    UiTerminalSearchCommitGate, UiTerminalSearchRequest, UiTerminalSearchResult,
-    UiTerminalSearchViewport,
+    UiCommandLineRequest, UiInputProjection, UiSessionBinding, UiSnippetCommandLineRequest,
+    UiTerminalInputRequest, UiTerminalSearchCommitGate, UiTerminalSearchRequest,
+    UiTerminalSearchResult, UiTerminalSearchViewport,
 };
 use kerminal_domain::connections::RemoteShellDialect;
 use kerminal_domain::identity::{AgentSessionId, PaneId, SessionId, TabId};
@@ -636,6 +636,77 @@ async fn ui_command_line_submission_uses_exact_binding_without_shell_readiness()
         .await
         .expect("writer acknowledged command bytes")
         .expect("read combined paste and Enter bytes");
+    assert_eq!(written, expected);
+
+    manager.close_all().await.expect("close test session");
+}
+
+/// 片段专用事务保留 generation CAS，却允许 Unknown shell 与普通 paste 模式的多行正文直接写入。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn ui_snippet_submission_writes_multiline_with_unknown_shell_without_prompt_gate() {
+    let (manager, factory, session_id) = create_ui_session(RemoteShellDialect::Unknown).await;
+    let mut output = factory
+        .output
+        .lock()
+        .await
+        .take()
+        .expect("test output stream");
+    let before = manager
+        .terminal_command_context(session_id.clone())
+        .await
+        .expect("initial terminal context");
+    assert_eq!(before.shell_dialect, RemoteShellDialect::Unknown);
+    assert!(!before.prompt_ready);
+    let binding = UiSessionBinding {
+        session_id: session_id.clone(),
+        owner: before.owner.clone(),
+        session_generation: before.session_generation,
+    };
+
+    let ordinary_multiline = manager
+        .submit_ui_command_line(UiCommandLineRequest {
+            binding: binding.clone(),
+            command: "echo first\necho second".to_owned(),
+        })
+        .await
+        .expect_err("ordinary command-line submissions retain their safety gate");
+    assert_eq!(
+        ordinary_multiline.public_code(),
+        kerminal_application::PublicErrorCode::Unsupported
+    );
+
+    let stale = manager
+        .submit_ui_snippet_command_line(UiSnippetCommandLineRequest {
+            binding: UiSessionBinding {
+                session_id: binding.session_id.clone(),
+                owner: binding.owner.clone(),
+                session_generation: binding.session_generation.wrapping_add(1),
+            },
+            command: "must-not-be-written".to_owned(),
+        })
+        .await
+        .expect_err("stale snippet views remain fenced by the writer generation");
+    assert_eq!(
+        stale.public_code(),
+        kerminal_application::PublicErrorCode::Conflict
+    );
+
+    manager
+        .submit_ui_snippet_command_line(UiSnippetCommandLineRequest {
+            binding,
+            command: "echo first\necho second".to_owned(),
+        })
+        .await
+        .expect("direct snippet sends do not require a known shell or ready prompt");
+
+    let expected = b"echo first\recho second\r";
+    let mut written = vec![0; expected.len()];
+    tokio::time::timeout(Duration::from_secs(2), output.read_exact(&mut written))
+        .await
+        .expect("writer acknowledged all snippet bytes")
+        .expect("read paste and Enter bytes");
     assert_eq!(written, expected);
 
     manager.close_all().await.expect("close test session");

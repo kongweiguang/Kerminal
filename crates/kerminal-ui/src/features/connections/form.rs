@@ -167,7 +167,7 @@ impl HostEditorSection {
 
 /// 字段错误只绑定当前编辑器输入，不修改 HostDraft 的领域校验或持久化契约。
 /// @author kongweiguang
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum HostEditorField {
     Name,
     Group,
@@ -283,11 +283,25 @@ impl HostEditorValidationIssue {
 /// 表单基线只保存非秘密字段；一次性凭据输入只以“是否非空”参与脏状态判断。
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HostEditorBaseline {
+    common: HostEditorCommonBaseline,
+    protocol: HostProtocolBaseline,
+}
+
+/// 名称、标签、分组和收藏跨协议共用，必须始终与打开编辑器时的同一基线比较。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostEditorCommonBaseline {
+    name: String,
+    tags: String,
+    selected_group: Option<String>,
+    favorite: bool,
+}
+
+/// 隐藏协议只缓存其独有字段的脏态，共用字段恢复原值不能被历史标记阻断关闭。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostProtocolBaseline {
     protocol: RemoteProtocol,
     authentication_mode: HostAuthenticationMode,
     private_key_file_source: bool,
-    selected_group: Option<String>,
-    favorite: bool,
     proxy_enabled: bool,
     proxy_protocol: ProxyProtocol,
     sftp_enabled: bool,
@@ -303,7 +317,7 @@ struct HostEditorBaseline {
     jumps: Vec<JumpEditorBaseline>,
 }
 
-/// 将当前页变化与缓存协议的离开时脏态统一归约，防止切换回干净协议掩盖另一页未保存输入。
+/// 仅聚合协议独有字段的脏态；共用字段由编辑器按当前值统一判断，不能缓存历史变化。
 /// @author kongweiguang
 fn has_unsaved_protocol_draft(
     current_protocol_dirty: bool,
@@ -369,7 +383,7 @@ pub(super) struct HostEditorInputs {
 struct HostProtocolDraft {
     inputs: HostEditorInputs,
     baseline: HostEditorBaseline,
-    dirty_when_hidden: bool,
+    protocol_dirty_when_hidden: bool,
     authentication_mode: HostAuthenticationMode,
     private_key_file_source: bool,
     proxy_enabled: bool,
@@ -391,13 +405,13 @@ struct HostProtocolDraft {
 }
 
 impl HostProtocolDraft {
-    /// 只克隆实体句柄并保存本协议基线/离开时脏态，恢复输入法状态且不丢隐藏协议的未保存提示。
+    /// 只缓存协议独有字段的离开时脏态，共用输入会在其它协议继续变化，不能在此冻结判断。
     /// @author kongweiguang
     fn capture(editor: &HostEditor, cx: &gpui_kit::App) -> Self {
         Self {
             inputs: editor.inputs.clone(),
             baseline: editor.baseline.clone(),
-            dirty_when_hidden: editor.current_protocol_is_dirty(cx),
+            protocol_dirty_when_hidden: editor.current_protocol_is_dirty(cx),
             authentication_mode: editor.authentication_mode,
             private_key_file_source: editor.private_key_file_source,
             proxy_enabled: editor.proxy_enabled,
@@ -903,24 +917,30 @@ impl HostEditor {
             serial_flow_select,
             original: host,
             baseline: HostEditorBaseline {
-                protocol,
-                authentication_mode,
-                private_key_file_source: false,
-                selected_group: None,
-                favorite: false,
-                proxy_enabled: false,
-                proxy_protocol: ProxyProtocol::Socks5,
-                sftp_enabled: true,
-                preserve_mtime: true,
-                follow_source_symlinks: false,
-                rdp_fullscreen: true,
-                serial_data_bits,
-                serial_stop_bits,
-                serial_parity,
-                serial_flow_control,
-                inputs: Vec::new(),
-                note: String::new(),
-                jumps: Vec::new(),
+                common: HostEditorCommonBaseline {
+                    name: String::new(),
+                    tags: String::new(),
+                    selected_group: None,
+                    favorite: false,
+                },
+                protocol: HostProtocolBaseline {
+                    protocol,
+                    authentication_mode,
+                    private_key_file_source: false,
+                    proxy_enabled: false,
+                    proxy_protocol: ProxyProtocol::Socks5,
+                    sftp_enabled: true,
+                    preserve_mtime: true,
+                    follow_source_symlinks: false,
+                    rdp_fullscreen: true,
+                    serial_data_bits,
+                    serial_stop_bits,
+                    serial_parity,
+                    serial_flow_control,
+                    inputs: Vec::new(),
+                    note: String::new(),
+                    jumps: Vec::new(),
+                },
             },
             protocol_drafts: Vec::new(),
             _probe_subscriptions: Vec::new(),
@@ -1186,21 +1206,22 @@ impl HostEditor {
         self.validation_issue = None;
     }
 
-    /// 比较当前字段和协议基线，并聚合已切出的其它协议脏草稿，避免关闭时静默丢稿。
+    /// 共用字段实时比较最初基线，协议独有字段聚合各自脏态；改回原值即可直接关闭。
     /// @author kongweiguang
     pub(super) fn is_dirty(&self, cx: &gpui_kit::App) -> bool {
-        has_unsaved_protocol_draft(
-            self.current_protocol_is_dirty(cx),
-            self.protocol_drafts
-                .iter()
-                .map(|(_, draft)| draft.dirty_when_hidden),
-        )
+        self.common_snapshot(cx) != self.baseline.common
+            || has_unsaved_protocol_draft(
+                self.current_protocol_is_dirty(cx),
+                self.protocol_drafts
+                    .iter()
+                    .map(|(_, draft)| draft.protocol_dirty_when_hidden),
+            )
     }
 
-    /// 当前协议离开视图前独立比较字段和秘密操作，缓存时不递归计入其它协议草稿。
+    /// 隐藏期间只有共用字段能继续变化，因此离开时仅冻结本协议独有字段和秘密操作的差异。
     /// @author kongweiguang
     fn current_protocol_is_dirty(&self, cx: &gpui_kit::App) -> bool {
-        self.snapshot(cx) != self.baseline
+        self.protocol_snapshot(cx) != self.baseline.protocol
             || !input_is_empty(&self.inputs.secret, cx)
             || !self.inputs.private_key.read(cx).value().is_empty()
             || !input_is_empty(&self.inputs.passphrase, cx)
@@ -1222,11 +1243,18 @@ impl HostEditor {
     /// @author kongweiguang
     fn snapshot(&self, cx: &gpui_kit::App) -> HostEditorBaseline {
         HostEditorBaseline {
+            common: self.common_snapshot(cx),
+            protocol: self.protocol_snapshot(cx),
+        }
+    }
+
+    /// 仅读取本协议独有配置，隐藏草稿的比较不受共用名称、分组或收藏变化影响。
+    /// @author kongweiguang
+    fn protocol_snapshot(&self, cx: &gpui_kit::App) -> HostProtocolBaseline {
+        HostProtocolBaseline {
             protocol: self.protocol,
             authentication_mode: self.authentication_mode,
             private_key_file_source: self.private_key_file_source,
-            selected_group: self.selected_group.clone(),
-            favorite: self.favorite,
             proxy_enabled: self.proxy_enabled,
             proxy_protocol: self.proxy_protocol,
             sftp_enabled: self.sftp_enabled,
@@ -1247,11 +1275,9 @@ impl HostEditor {
                 &self.inputs.sftp_concurrency,
                 &self.inputs.rdp_width,
                 &self.inputs.rdp_height,
-                &self.inputs.name,
                 &self.inputs.host,
                 &self.inputs.port,
                 &self.inputs.username,
-                &self.inputs.tags,
                 &self.inputs.key_path,
                 &self.inputs.serial_baud,
                 &self.inputs.proxy_host,
@@ -1279,6 +1305,17 @@ impl HostEditor {
                     .collect(),
                 })
                 .collect(),
+        }
+    }
+
+    /// 共用元数据只读取当前实体，不把协议切换时的用户值误当作新的未修改初值。
+    /// @author kongweiguang
+    fn common_snapshot(&self, cx: &gpui_kit::App) -> HostEditorCommonBaseline {
+        HostEditorCommonBaseline {
+            name: read_input(&self.inputs.name, cx),
+            tags: read_input(&self.inputs.tags, cx),
+            selected_group: self.selected_group.clone(),
+            favorite: self.favorite,
         }
     }
 
@@ -1701,7 +1738,7 @@ impl HostEditor {
         }
     }
 
-    /// 新建态切换时缓存本协议基线与脏态，首次进入新协议则以其默认值建立独立基线。
+    /// 新协议仅为独有默认值建基线，共用字段沿用打开时基线，切换不能使用户编辑变成初值。
     /// 编辑态锁定持久协议，避免误改 schema 语义。
     /// @author kongweiguang
     pub(super) fn switch_new_protocol(
@@ -1749,10 +1786,13 @@ impl HostEditor {
         };
         self.protocol = protocol;
         if !restored_existing_draft {
+            let common_baseline = self.baseline.common.clone();
             self.baseline = self.snapshot(cx);
+            self.baseline.common = common_baseline;
         }
         self.section = HostEditorSection::normalize(protocol, self.section);
         self.validation_issue = None;
+        self.scroll_handle.set_offset(Default::default());
         self.subscribe_probe_invalidations(window, cx);
         true
     }
@@ -1952,6 +1992,8 @@ pub(super) fn initial_host_editor_protocol(
 }
 
 /// 复制认证模式与公开 key path，但剥离所有 vault 引用，要求用户为副本重新录入秘密。
+/// 缺少凭据时只阻止密码认证进入草稿用例，不覆盖已经保存的 Vault 引用。
+/// @author kongweiguang
 fn authentication_without_credentials(
     authentication: Option<SshAuthentication>,
 ) -> Option<SshAuthentication> {

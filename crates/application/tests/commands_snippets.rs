@@ -4,8 +4,12 @@
 
 use std::collections::BTreeMap;
 
-use kerminal_application::commands::{SnippetRenderDialect, render_snippet_definition};
+use kerminal_application::commands::{
+    SnippetRenderDialect, direct_snippet_catalog_command, direct_snippet_command,
+    render_snippet_definition,
+};
 use kerminal_domain::commands::{
+    SnippetCatalogItem, SnippetCatalogOrigin, SnippetContextBinding, SnippetContextBindingKind,
     SnippetDefaultAction, SnippetDefinition, SnippetRisk, SnippetScope, SnippetVariable,
     SnippetVariableKind, SnippetVariableRenderStrategy,
 };
@@ -82,6 +86,81 @@ fn shell_argument_path_rejects_line_and_nul_controls() {
 #[test]
 fn unknown_shell_dialect_is_rejected() {
     assert!(SnippetRenderDialect::from_trusted_shell(RemoteShellDialect::Unknown).is_err());
+}
+
+/// 直接发送保留缺失占位符，并跳过 scope、context、变量类型和 regex 检查。
+///
+/// @author kongweiguang
+#[test]
+fn direct_render_sends_unknown_shell_and_unvalidated_values() {
+    let mut definition = snippet(SnippetVariableRenderStrategy::ValidatedRaw);
+    definition.scope = SnippetScope::Local;
+    definition.context_bindings = vec![SnippetContextBinding {
+        kind: SnippetContextBindingKind::Host,
+        target_id: Some("different-host".to_owned()),
+    }];
+    definition.variables[0].kind = SnippetVariableKind::Port;
+    definition.variables[0].validation = Some("[invalid regex".to_owned());
+    definition.command.push_str(" {{missing}}\n");
+    let values = BTreeMap::from([("path".to_owned(), "not-a-port; run anyway".to_owned())]);
+
+    let rendered = direct_snippet_command(&definition, &values);
+
+    assert_eq!(
+        rendered.command,
+        "echo not-a-port; run anyway {{missing}}\n"
+    );
+    assert!(!rendered.sensitive);
+}
+
+/// 目录项平台与 shell 声明只用于展示；目录敏感标记仍阻止历史记录。
+///
+/// @author kongweiguang
+#[test]
+fn direct_catalog_render_ignores_platform_shell_metadata_and_preserves_sensitive() {
+    let definition = snippet(SnippetVariableRenderStrategy::ShellArg);
+    let item = SnippetCatalogItem {
+        id: definition.id.clone(),
+        origin: SnippetCatalogOrigin::Builtin,
+        title: definition.title.clone(),
+        description: String::new(),
+        template: "echo {{path}}".to_owned(),
+        category: String::new(),
+        pack: String::new(),
+        tags: Vec::new(),
+        scope: SnippetScope::Ssh,
+        platforms: vec!["windows".to_owned()],
+        shells: vec!["powershell".to_owned()],
+        capabilities: Vec::new(),
+        risk: SnippetRisk::Inspect,
+        sensitive: true,
+        duration: String::new(),
+        default_action: SnippetDefaultAction::Run,
+        variables: definition.variables,
+        context_bindings: vec![SnippetContextBinding {
+            kind: SnippetContextBindingKind::HostGroup,
+            target_id: Some("unmatched-group".to_owned()),
+        }],
+        derived_from: None,
+        catalog_version: None,
+        command_spec: None,
+        owner: None,
+        tested_version: None,
+        source_name: None,
+        source_url: None,
+        deprecated: false,
+        favorite: false,
+        use_count: 0,
+        last_used_at_unix_ms: None,
+        sort_order: 0,
+        updated_at: String::new(),
+    };
+    let values = BTreeMap::from([("path".to_owned(), "unquoted value".to_owned())]);
+
+    let rendered = direct_snippet_catalog_command(&item, &values);
+
+    assert_eq!(rendered.command, "echo unquoted value");
+    assert!(rendered.sensitive);
 }
 
 /// 构造带一个路径参数的最小合法片段，固定测试目标只需改变渲染策略。

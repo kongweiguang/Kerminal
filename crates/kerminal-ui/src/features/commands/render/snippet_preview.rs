@@ -17,12 +17,11 @@ use kerminal_domain::commands::{SnippetDefaultAction, SnippetPreferenceKey};
 
 use crate::theme::ThemeTokens;
 
-use super::super::super::{
-    CommandsView, snippet_browser::SnippetInlinePreview, snippet_run::SnippetRunPhase,
-};
+use super::super::super::{CommandsView, snippet_browser::SnippetInlinePreview};
 
 impl CommandsView {
-    /// 仅复用当前 key、revision 与目标的安全 plan；无 plan 时展示模板，删除沿用编辑器脏稿门禁及 revision CAS。
+    /// 预览从表单实体读取模板，与发送共享同一未保存正文，避免编辑器关闭后展示旧定义。
+    /// 宽工作台仍保留独立的草稿填入入口；展开预览本身不执行片段。
     ///
     /// @author kongweiguang
     pub(super) fn render_snippet_inline_preview(
@@ -118,70 +117,29 @@ impl CommandsView {
                     );
                 }
 
-                let selected = self.selected_snippet.as_ref()?;
-                let planned_preview = self.ui_session_binding.as_ref().and_then(|binding| {
-                    self.snippet_run_state().inline_preview(
-                        key,
-                        selected.revision.as_ref(),
-                        binding,
-                    )
-                });
-                let command_is_resolved = planned_preview.is_some_and(|info| !info.sensitive);
-                let command = planned_preview
-                    .filter(|info| !info.sensitive)
-                    .map(|info| info.command_preview.clone())
-                    .unwrap_or_else(|| selected.definition.command.clone());
-                let command_label = if command_is_resolved {
-                    crate::locale::text("命令预览", "Command preview")
-                } else {
-                    crate::locale::text("命令模板", "Command template")
-                };
-                let copy_label = if command_is_resolved {
-                    crate::locale::text("复制展开命令", "Copy rendered command")
-                } else {
-                    crate::locale::text("复制片段模板", "Copy snippet template")
-                };
+                let command = self
+                    .snippet_command
+                    .update(cx, |input, _| input.text().to_string());
+                let command_label = crate::locale::text("命令模板", "Command template");
+                let copy_label = crate::locale::text("复制片段模板", "Copy snippet template");
                 let variables = self.render_snippet_runtime_variables(theme, cx);
-                let applicability = self.render_selected_snippet_applicability(theme, cx);
-                let phase = self.snippet_run_state().phase();
-                let reopens_run = matches!(
-                    phase,
-                    SnippetRunPhase::AwaitingConfirmation | SnippetRunPhase::OutcomeUnknown
-                );
-                let run_busy = self.snippet_run_state().is_busy();
-                let run_can_start = self.snippet_run_state().can_start();
                 let fill_primary = self.snippet_default_action == SnippetDefaultAction::Insert;
                 let run_primary = self.snippet_default_action == SnippetDefaultAction::Run;
-                let selected_incompatible = self.selected_snippet_is_incompatible();
                 let fill_blocked = self.snippet_terminal_fill_blocked();
                 let has_target = self.ui_session_binding.is_some() && self.session_id.is_some();
                 let can_edit = !self.snippet_saving
                     && !self.confirm_snippet_delete
                     && self.pending_snippet_transition.is_none()
-                    && !self.snippet_run_state().blocks_editing();
-                let can_fill = has_target
-                    && !self.snippet_saving
+                    && !self.snippet_terminal_fill_in_flight();
+                let can_fill = !self.snippet_saving
                     && self.pending_snippet_transition.is_none()
+                    && !self.snippet_terminal_fill_in_flight();
+                let can_send = has_target
+                    && self.snippet_execution.is_some()
                     && !fill_blocked
-                    && !self.snippet_run_state().blocks_navigation();
-                let can_run = if reopens_run {
-                    true
-                } else {
-                    run_can_start
-                        && !run_busy
-                        && !fill_blocked
-                        && has_target
-                        && self.snippet_execution.is_some()
-                        && !self.snippet_is_new
-                        && !self.snippet_saving
-                        && self.pending_snippet_transition.is_none()
-                        && !selected_incompatible
-                };
-                let run_label = if reopens_run {
-                    crate::locale::text("查看运行状态", "Review run")
-                } else {
-                    crate::locale::text("运行", "Run")
-                };
+                    && !self.snippet_saving
+                    && !self.confirm_snippet_delete
+                    && self.pending_snippet_transition.is_none();
                 let variable_body = (!variables.is_empty()).then(|| {
                     div()
                         .id("snippet-preview-runtime-variables")
@@ -236,16 +194,6 @@ impl CommandsView {
                                         .child(command),
                                 ),
                         )
-                        .when_some(applicability, |panel, applicability| {
-                            panel.child(
-                                div()
-                                    .id("snippet-preview-applicability")
-                                    .w_full()
-                                    .max_h(px(92.))
-                                    .overflow_y_scroll()
-                                    .child(applicability),
-                            )
-                        })
                         .when_some(variable_body, |panel, variables| panel.child(variables))
                         .child(
                             div()
@@ -372,31 +320,33 @@ impl CommandsView {
                                             )
                                     },
                                 )
+                                .when(!self.compact_layout, |actions| {
+                                    actions.child(
+                                        Button::new(format!(
+                                            "snippet-preview-fill-{}-{}",
+                                            preview_origin(key),
+                                            key.snippet_id
+                                        ))
+                                        .compact()
+                                        .h(px(32.))
+                                        .when(fill_primary, Button::primary)
+                                        .when(!fill_primary, Button::secondary)
+                                        .label(crate::locale::text("填入草稿", "Fill draft"))
+                                        .tooltip(crate::locale::text(
+                                            "把展开后的命令填入工作台草稿",
+                                            "Put the rendered command in the workbench draft",
+                                        ))
+                                        .disabled(!can_fill)
+                                        .on_click(
+                                            cx.listener(|view, _: &ClickEvent, window, cx| {
+                                                view.fill_snippet(window, cx);
+                                            }),
+                                        ),
+                                    )
+                                })
                                 .child(
                                     Button::new(format!(
-                                        "snippet-preview-fill-{}-{}",
-                                        preview_origin(key),
-                                        key.snippet_id
-                                    ))
-                                    .compact()
-                                    .h(px(32.))
-                                    .when(fill_primary, Button::primary)
-                                    .when(!fill_primary, Button::secondary)
-                                    .label(crate::locale::text("填入", "Fill"))
-                                    .tooltip(crate::locale::text(
-                                        "填入当前目标终端的命令行，不会执行",
-                                        "Insert into the bound terminal without running",
-                                    ))
-                                    .disabled(!can_fill)
-                                    .on_click(cx.listener(
-                                        |view, _: &ClickEvent, window, cx| {
-                                            view.fill_snippet(window, cx);
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    Button::new(format!(
-                                        "snippet-preview-run-{}-{}",
+                                        "snippet-preview-send-{}-{}",
                                         preview_origin(key),
                                         key.snippet_id
                                     ))
@@ -404,15 +354,15 @@ impl CommandsView {
                                     .h(px(32.))
                                     .when(run_primary, Button::primary)
                                     .when(!run_primary, Button::secondary)
-                                    .label(run_label)
+                                    .label(crate::locale::text("发送", "Send"))
                                     .tooltip(crate::locale::text(
-                                        "提交并执行片段命令",
-                                        "Submit and run snippet command",
+                                        "发送到当前终端",
+                                        "Send to the current terminal",
                                     ))
-                                    .disabled(!can_run)
+                                    .disabled(!can_send)
                                     .on_click(cx.listener(
                                         |view, _: &ClickEvent, window, cx| {
-                                            view.prepare_snippet_run(window, cx);
+                                            view.send_snippet_terminal(window, cx);
                                         },
                                     )),
                                 ),

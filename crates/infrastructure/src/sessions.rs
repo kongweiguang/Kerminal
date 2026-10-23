@@ -25,10 +25,10 @@ use kerminal_application::sessions::{
     ShellCommandUnknownReason, TerminalCommandAvailability, TerminalCommandContext,
     TerminalCommandContextVersion, TerminalCommandUnavailableReason, TerminalResizeCapability,
     TerminalWriteAdmission, TerminalWriteReceipt, UiCommandLineRequest, UiInputProjection,
-    UiSessionBinding, UiTerminalCommandSubmissionReceipt, UiTerminalCommandSubmissionRequest,
-    UiTerminalInputRequest, UiTerminalSearchRequest, UiTerminalSearchResult,
-    UiTerminalSearchViewport, classify_command_block_text, io_transport_error,
-    is_plain_command_enter,
+    UiSessionBinding, UiSnippetCommandLineRequest, UiTerminalCommandSubmissionReceipt,
+    UiTerminalCommandSubmissionRequest, UiTerminalInputRequest, UiTerminalSearchRequest,
+    UiTerminalSearchResult, UiTerminalSearchViewport, classify_command_block_text,
+    io_transport_error, is_plain_command_enter,
 };
 use kerminal_domain::connections::RemoteShellDialect;
 use kerminal_domain::identity::SessionId;
@@ -2479,6 +2479,7 @@ impl SessionService for SessionManager {
                 payload: UiInputPayload::Event(request.event),
                 command_submission: None,
                 require_valid_context: true,
+                allow_unbracketed_multiline: false,
             },
         )
         .await
@@ -2503,6 +2504,32 @@ impl SessionService for SessionManager {
                 payload: UiInputPayload::CommandLine(request.command),
                 command_submission: None,
                 require_valid_context: false,
+                allow_unbracketed_multiline: false,
+            },
+        )
+        .await
+    }
+
+    /// 对用户点击的片段复用同一 writer gate 与 Paste+Enter 编码，只放宽片段多行的 bracketed-paste 限制。
+    ///
+    /// 目标仍必须是当前 Running UI owner 和 generation；不会读取 prompt、OSC marker 或 shell 方言。
+    ///
+    /// @author kongweiguang
+    async fn submit_ui_snippet_command_line(
+        &self,
+        request: UiSnippetCommandLineRequest,
+    ) -> AppResult<TerminalCommandContext> {
+        let session = self.session(&request.binding.session_id).await?;
+        write_ui_input_inner(
+            session,
+            UiInputWriteRequest {
+                binding: request.binding,
+                expected_context: None,
+                projection: UiInputProjection::Invalidates,
+                payload: UiInputPayload::CommandLine(request.command),
+                command_submission: None,
+                require_valid_context: false,
+                allow_unbracketed_multiline: true,
             },
         )
         .await
@@ -2526,6 +2553,7 @@ impl SessionService for SessionManager {
                 payload: UiInputPayload::Event(request.input.event),
                 command_submission: Some(command),
                 require_valid_context: false,
+                allow_unbracketed_multiline: false,
             },
         )
         .await
@@ -2549,6 +2577,7 @@ impl SessionService for SessionManager {
                 payload: UiInputPayload::Event(request.input.event),
                 command_submission: Some(command),
                 require_valid_context: false,
+                allow_unbracketed_multiline: false,
             },
         )
         .await
@@ -5096,7 +5125,10 @@ async fn write_ui_input_inner_with_receipt(
     let encoded = match &request.payload {
         UiInputPayload::Event(event) => encode_input(event, modes),
         UiInputPayload::CommandLine(command) => {
-            if (command.contains('\n') || command.contains('\r')) && !modes.bracketed_paste {
+            if (command.contains('\n') || command.contains('\r'))
+                && !modes.bracketed_paste
+                && !request.allow_unbracketed_multiline
+            {
                 return Err(AppError::unsupported("目标终端未启用多行安全粘贴模式"));
             }
             let mut bytes = encode_input(&TerminalInputEvent::Paste(command.clone()), modes)
@@ -5245,6 +5277,8 @@ struct UiInputWriteRequest {
     payload: UiInputPayload,
     command_submission: Option<CommandBlockText>,
     require_valid_context: bool,
+    /// 仅片段显式发送使用普通 Paste 的多行语义，不扩大通用命令提交能力。
+    allow_unbracketed_multiline: bool,
 }
 
 /// 保持普通键盘事件与命令行粘贴 Enter 的编码边界明确，防止 UI 传入已编码字节绕过终端模式。

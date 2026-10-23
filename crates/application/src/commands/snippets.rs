@@ -1,4 +1,4 @@
-//! 命令片段变量解析与 shell 安全转义。
+//! 片段正文准备：直接变量替换与保留的受管 shell 转义入口。
 //!
 //! @author kongweiguang
 
@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use kerminal_domain::{
     commands::{
-        SnippetContextBindingKind, SnippetDefinition, SnippetScope, SnippetVariable,
-        SnippetVariableKind, SnippetVariableRenderStrategy,
+        SnippetCatalogItem, SnippetContextBindingKind, SnippetDefinition, SnippetScope,
+        SnippetVariable, SnippetVariableKind, SnippetVariableRenderStrategy,
     },
     connections::RemoteShellDialect,
     identity::SessionId,
@@ -46,6 +46,70 @@ impl SnippetRenderDialect {
 pub struct SnippetRenderResult {
     pub command: String,
     pub sensitive: bool,
+}
+
+/// 直接发送按定义名替换的变量；未知或未提供的占位符保留原文，避免把不完整模板改写成别的命令。
+///
+/// 此路径刻意不推断目标平台、shell、scope 或变量类型，也不做 shell quoting；调用方负责把结果送入用户选定的终端。
+///
+/// @author kongweiguang
+pub fn direct_snippet_command(
+    definition: &SnippetDefinition,
+    values: &BTreeMap<String, String>,
+) -> SnippetRenderResult {
+    let mut command = String::with_capacity(definition.command.len());
+    let mut remaining = definition.command.as_str();
+    let mut sensitive = false;
+
+    while let Some(open) = remaining.find("{{") {
+        command.push_str(&remaining[..open]);
+        let after_open = &remaining[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            command.push_str(&remaining[open..]);
+            remaining = "";
+            break;
+        };
+
+        let placeholder_end = open + 2 + close + 2;
+        let placeholder = &remaining[open..placeholder_end];
+        let name = &after_open[..close];
+        let variable = definition
+            .variables
+            .iter()
+            .find(|variable| variable.name == name);
+        let replacement = variable.and_then(|variable| {
+            values
+                .get(&variable.name)
+                .or(variable.default_value.as_ref())
+                .map(|value| {
+                    sensitive |= variable.sensitive || variable.kind == SnippetVariableKind::Secret;
+                    value.as_str()
+                })
+        });
+
+        if let Some(replacement) = replacement {
+            command.push_str(replacement);
+        } else {
+            command.push_str(placeholder);
+        }
+        remaining = &remaining[placeholder_end..];
+    }
+    command.push_str(remaining);
+
+    SnippetRenderResult { command, sensitive }
+}
+
+/// 从目录行复用同一直接替换逻辑；平台和 shell 元数据仅供展示，不参与是否可发送的判断。
+///
+/// @author kongweiguang
+pub fn direct_snippet_catalog_command(
+    item: &SnippetCatalogItem,
+    values: &BTreeMap<String, String>,
+) -> SnippetRenderResult {
+    let definition = super::snippet_catalog::definition_from_catalog_item(item);
+    let mut rendered = direct_snippet_command(&definition, values);
+    rendered.sensitive |= item.sensitive;
+    rendered
 }
 
 impl CommandsService {

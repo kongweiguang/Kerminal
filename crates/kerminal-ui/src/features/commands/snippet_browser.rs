@@ -2,8 +2,6 @@
 //!
 //! @author kongweiguang
 
-use std::collections::BTreeMap;
-
 use gpui_kit::{ClipboardItem, Context, IntoElement, Window};
 use kerminal_application::{
     AppError, PublicErrorCode,
@@ -663,7 +661,7 @@ impl CommandsView {
         cx.notify();
     }
 
-    /// 同一可信 plan 有非敏感展开命令时复制其展示快照；否则沿精确版本读回模板。
+    /// 复制操作保留模板语义，不为剪贴板生成或缓存一次运行预览。
     ///
     /// @author kongweiguang
     pub(super) fn copy_snippet_inline_preview(
@@ -671,35 +669,10 @@ impl CommandsView {
         key: SnippetPreferenceKey,
         cx: &mut Context<Self>,
     ) {
-        let planned_command = self.selected_snippet.as_ref().and_then(|selected| {
-            let origin = if selected.revision.is_some() {
-                SnippetCatalogOrigin::User
-            } else {
-                SnippetCatalogOrigin::Builtin
-            };
-            if selected.definition.id != key.snippet_id || origin != key.origin {
-                return None;
-            }
-            let binding = self.ui_session_binding.as_ref()?;
-            self.snippet_run_state()
-                .inline_preview(&key, selected.revision.as_ref(), binding)
-                .filter(|info| !info.sensitive)
-                .map(|info| info.command_preview.clone())
-        });
-        let Some(command) = planned_command else {
-            self.copy_snippet(key, cx);
-            return;
-        };
-
-        cx.write_to_clipboard(ClipboardItem::new_string(command));
-        self.status = Some(command_message(
-            "运行预览命令已交给系统剪贴板",
-            "The prepared run preview was sent to the system clipboard",
-        ));
-        cx.notify();
+        self.copy_snippet(key, cx);
     }
 
-    /// 复制变量预览只使用当前详情的完整来源 key 和捕获的 UI binding；命令不进入历史。
+    /// 复制只展开当前表单中的命令与变量；剪贴板是明确用户动作，不依赖终端平台或 shell 查询。
     ///
     /// @author kongweiguang
     pub(super) fn copy_snippet_preview(
@@ -707,169 +680,44 @@ impl CommandsView {
         key: SnippetPreferenceKey,
         cx: &mut Context<Self>,
     ) {
-        let Some(selected) = self.selected_snippet.as_ref() else {
+        let selected_matches = self.selected_snippet.as_ref().is_some_and(|selected| {
+            !self.snippet_is_new
+                && selected.definition.id == key.snippet_id
+                && selected.revision.is_some() == (key.origin == SnippetCatalogOrigin::User)
+        });
+        if !selected_matches {
             self.status = Some(command_message(
-                "请先打开片段详情，再复制变量预览",
-                "Open a snippet detail before copying a variable preview",
+                "片段详情已变化，未复制命令",
+                "The selected snippet changed; no command was copied",
             ));
             cx.notify();
             return;
+        }
+        let Some(rendered) = super::snippet_fill::render_selected_snippet_direct(self, cx) else {
+            self.status = Some(command_message("请先选择片段", "Select a snippet first"));
+            cx.notify();
+            return;
         };
-        let selected_origin = if selected.revision.is_some() {
-            SnippetCatalogOrigin::User
+        if rendered.command.trim().is_empty() {
+            self.status = Some(command_message(
+                "命令片段内容为空",
+                "Snippet command is empty",
+            ));
+            cx.notify();
+            return;
+        }
+        let status = if rendered.sensitive {
+            command_message(
+                "敏感命令已复制；不会写入命令历史",
+                "Sensitive command copied; it will not be recorded in command history",
+            )
         } else {
-            SnippetCatalogOrigin::Builtin
+            command_message("命令已复制", "Command copied")
         };
-        if self.snippet_is_new
-            || selected.definition.id != key.snippet_id
-            || selected_origin != key.origin
-        {
-            self.status = Some(command_message(
-                "片段详情已变化，未复制变量预览",
-                "The selected snippet changed; no variable preview was copied",
-            ));
-            cx.notify();
-            return;
-        }
-        let Some(binding) = self.ui_session_binding.clone() else {
-            self.status = Some(command_message(
-                "变量预览需要仍有效的可见终端目标",
-                "A current visible terminal binding is required for a variable preview",
-            ));
-            cx.notify();
-            return;
-        };
-        let draft = match self.collect_snippet_draft_values(cx) {
-            Ok(draft) => draft,
-            Err(message) => {
-                self.status = Some(message);
-                cx.notify();
-                return;
-            }
-        };
-        if self.snippet_variables.len() != draft.variables.len() {
-            self.status = Some(command_message(
-                "片段变量列表已变化，未复制预览",
-                "The snippet variable list changed; no preview was copied",
-            ));
-            cx.notify();
-            return;
-        }
-        let expected_draft = draft.clone();
-        let mut definition: SnippetDefinition = selected.definition.clone();
-        definition.title = draft.title;
-        definition.command = draft.command;
-        definition.description = draft.description;
-        definition.tags = draft.tags;
-        definition.sort_order = draft.sort_order;
-        definition.scope = draft.scope;
-        definition.category = draft.category;
-        definition.risk = draft.risk;
-        definition.default_action = draft.default_action;
-        definition.variables = draft.variables.clone();
-        definition.context_bindings = draft.context_bindings;
-        let values = self
-            .snippet_variables
-            .iter()
-            .zip(draft.variables.iter())
-            .map(|(field, variable)| {
-                (
-                    variable.name.clone(),
-                    field.input.update(cx, |input, _| input.value().to_string()),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let expected_values = values.clone();
-        let (generation, cancellation) = self.begin_snippet_copy();
-        let commands = self.commands.clone();
-        let executor = self.executor.clone();
-        let captured_key = key.clone();
-        let render_binding = binding.clone();
-        self.status = Some(command_message(
-            "正在按当前 shell 方言渲染变量预览…",
-            "Rendering the variable preview for the current shell dialect…",
-        ));
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run_cancellable(cancellation.clone(), move |operation_cancel| async move {
-                    let rendered = commands
-                        .render_snippet_for_binding(&definition, &render_binding, &values)
-                        .await?;
-                    if operation_cancel.is_cancelled() {
-                        return Err(AppError::cancelled(command_error_context(
-                            "片段预览复制已取消",
-                            "Snippet preview copy was cancelled",
-                        )));
-                    }
-                    Ok(rendered)
-                })
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                if view.snippet_copy_generation != generation || cancellation.is_cancelled() {
-                    return;
-                }
-                let binding_is_current = view.ui_session_binding.as_ref() == Some(&binding);
-                let key_is_current = view.selected_snippet.as_ref().is_some_and(|selected| {
-                    selected.definition.id == captured_key.snippet_id
-                        && selected.revision.is_some()
-                            == (captured_key.origin == SnippetCatalogOrigin::User)
-                });
-                let draft_is_current = view
-                    .collect_snippet_draft_values(cx)
-                    .is_ok_and(|current_draft| {
-                        if current_draft != expected_draft
-                            || view.snippet_variables.len() != current_draft.variables.len()
-                        {
-                            return false;
-                        }
-                        let current_values = view
-                            .snippet_variables
-                            .iter()
-                            .zip(current_draft.variables.iter())
-                            .map(|(field, variable)| {
-                                (
-                                    variable.name.clone(),
-                                    field.input.update(cx, |input, _| input.value().to_string()),
-                                )
-                            })
-                            .collect::<BTreeMap<_, _>>();
-                        current_values == expected_values
-                    });
-                if !binding_is_current || !key_is_current || !draft_is_current {
-                    view.snippet_copy_cancellation = None;
-                    view.status = Some(command_message(
-                        "片段、变量或终端目标已变化，未复制过期预览",
-                        "The snippet, variables, or terminal target changed; no stale preview was copied",
-                    ));
-                    cx.notify();
-                    return;
-                }
-                view.snippet_copy_cancellation = None;
-                match result {
-                    Ok(rendered) => {
-                        let status = if rendered.sensitive {
-                            command_message(
-                                "敏感片段预览已交给系统剪贴板；不会写入命令历史",
-                                "Sensitive snippet preview was sent to the system clipboard; it is not recorded in command history",
-                            )
-                        } else {
-                            command_message(
-                                "片段变量预览已交给系统剪贴板",
-                                "Snippet variable preview was sent to the system clipboard",
-                            )
-                        };
-                        cx.write_to_clipboard(ClipboardItem::new_string(rendered.command));
-                        view.status = Some(status);
-                    }
-                    Err(error) => view.status = Some(error.public_message().to_owned()),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        cx.write_to_clipboard(ClipboardItem::new_string(rendered.command));
+        self.status = Some(status);
         cx.notify();
     }
-
     /// 将当前只读内置定义另存为新的用户定义；创建 CAS 与精确读回避免覆盖或盲目重试。
     ///
     /// @author kongweiguang
@@ -881,7 +729,6 @@ impl CommandsView {
         if self.snippet_saving
             || self.confirm_snippet_delete
             || self.pending_snippet_transition.is_some()
-            || self.snippet_run.blocks_editing()
         {
             self.status = Some(command_message(
                 "请先完成当前片段操作，再保存到我的",
@@ -1273,15 +1120,6 @@ impl CommandsView {
             SnippetPreviewToggleAction::LoadExact => {}
         }
 
-        if self.snippet_run.blocks_navigation() && !selected_key_matches {
-            self.status = Some(command_message(
-                "请先完成或核对当前片段运行，再切换片段",
-                "Finish or review the current snippet run before switching snippets",
-            ));
-            cx.notify();
-            return;
-        }
-
         if self.snippet_draft_is_dirty(cx) {
             self.pending_snippet_transition = Some(super::EditorTransition::PreviewKey(key));
             self.set_snippet_editor_open(true, cx);
@@ -1311,14 +1149,6 @@ impl CommandsView {
             &self.snippet_inline_preview,
             SnippetInlinePreview::Failed { key: failed, .. } if failed == &key
         ) {
-            return;
-        }
-        if self.snippet_run.blocks_navigation() && !self.selected_snippet_matches_key(&key) {
-            self.status = Some(command_message(
-                "请先完成或核对当前片段运行，再切换片段",
-                "Finish or review the current snippet run before switching snippets",
-            ));
-            cx.notify();
             return;
         }
         if self.snippet_draft_is_dirty(cx) {

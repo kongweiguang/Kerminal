@@ -4492,6 +4492,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "tokio",
  "tokio-util",
  "tracing",
  "unicode-segmentation",

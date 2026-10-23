@@ -1,24 +1,26 @@
-//! 分屏命令栏只编辑按 Tab 保存的草稿并发出动作意图，真实发送由 Root 和 CommandsService 校验。
+//! 分屏命令栏维护按 Tab 投影的草稿与动作意图，终端写入统一由工作台动作链执行。
 //!
 //! @author kongweiguang
 
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, EntityInputHandler, EventEmitter, Focusable as _,
-    IntoElement, Render, ScrollStrategy, StyleRefinement, Subscription, UniformListScrollHandle,
-    Window,
+    IntoElement, MouseButton, Render, ScrollStrategy, StyleRefinement, Subscription,
+    UniformListScrollHandle, Window,
     assets::IconName,
     base::Selectable as _,
     component::{
         Disableable,
         button::{Button, ButtonVariants as _},
+        checkbox::Checkbox,
         input::{Input, InputEvent, InputState},
         popover::Popover,
+        switch::Switch,
     },
     div,
     prelude::*,
     px, uniform_list,
 };
-use kerminal_domain::identity::TabId;
+use kerminal_domain::identity::{PaneId, TabId};
 
 use super::WorkspaceBroadcastTargetMode;
 use crate::theme::ThemeTokens;
@@ -31,6 +33,7 @@ pub(crate) struct WorkspaceBroadcastBarProjection {
     pub tab_id: Option<TabId>,
     pub pane_count: usize,
     pub selected_count: usize,
+    pub targets: Vec<WorkspaceBroadcastTargetProjection>,
     pub mode: WorkspaceBroadcastTargetMode,
     pub draft: String,
     pub sync_enabled: bool,
@@ -46,7 +49,21 @@ pub(crate) struct WorkspaceBroadcastBarProjection {
     pub status: Option<String>,
 }
 
-/// 仅展示可插入的安全模板字段，片段选中动作不会启动终端写入。
+/// Root 投影当前 Tab 的 pane 展示和可选状态；组件不从 pane 自行读取运行态。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceBroadcastTargetProjection {
+    pub pane_id: PaneId,
+    pub title: String,
+    pub detail: String,
+    pub protocol: String,
+    pub selected: bool,
+    pub enabled: bool,
+    pub current: bool,
+}
+
+/// 片段选择只发出稳定意图，由 Root 统一完成发送与结果回写，避免组件绕过广播生命周期。
 ///
 /// @author kongweiguang
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +93,10 @@ pub(crate) enum WorkspaceBroadcastBarEvent {
     SetMode {
         tab_id: TabId,
         mode: WorkspaceBroadcastTargetMode,
+    },
+    ToggleTarget {
+        tab_id: TabId,
+        pane_id: PaneId,
     },
     ToggleSync {
         tab_id: TabId,
@@ -108,9 +129,79 @@ pub(crate) enum WorkspaceBroadcastBarEvent {
         tab_id: TabId,
         snippet_id: String,
     },
-    Close {
-        tab_id: TabId,
-    },
+}
+
+/// 模式行使用固定次序；人数按可发送或当前有效目标计算，避免把布局总数误报成发送数。
+///
+/// @author kongweiguang
+fn target_mode_option_labels(
+    projection: &WorkspaceBroadcastBarProjection,
+) -> [(WorkspaceBroadcastTargetMode, String); 3] {
+    let current_title = projection
+        .targets
+        .iter()
+        .find(|target| target.current)
+        .map(|target| target.title.as_str())
+        .filter(|title| !title.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| crate::locale::text("无当前分屏", "No current pane").to_string());
+    let all_count = projection
+        .targets
+        .iter()
+        .filter(|target| target.enabled)
+        .count();
+    [
+        (
+            WorkspaceBroadcastTargetMode::Current,
+            crate::locale::text(
+                format!("当前分屏 · {current_title}"),
+                format!("Current pane · {current_title}"),
+            )
+            .to_string(),
+        ),
+        (
+            WorkspaceBroadcastTargetMode::All,
+            crate::locale::text(
+                format!("全部分屏 · {all_count} 个目标"),
+                format!("All panes · {all_count} targets"),
+            )
+            .to_string(),
+        ),
+        (
+            WorkspaceBroadcastTargetMode::Custom,
+            crate::locale::text(
+                format!("自定义 · {} 个已选", projection.selected_count),
+                format!("Custom · {} selected", projection.selected_count),
+            )
+            .to_string(),
+        ),
+    ]
+}
+
+/// 触发区保持短且稳定，当前 pane 的完整标题放在弹层选项中以免挤压命令输入。
+///
+/// @author kongweiguang
+fn target_mode_trigger_label(projection: &WorkspaceBroadcastBarProjection) -> String {
+    let count = match projection.mode {
+        WorkspaceBroadcastTargetMode::All => projection
+            .targets
+            .iter()
+            .filter(|target| target.enabled)
+            .count(),
+        WorkspaceBroadcastTargetMode::Current | WorkspaceBroadcastTargetMode::Custom => {
+            projection.selected_count
+        }
+    };
+    let mode = match projection.mode {
+        WorkspaceBroadcastTargetMode::All => {
+            crate::locale::text("全部分屏", "All panes").to_string()
+        }
+        WorkspaceBroadcastTargetMode::Current => {
+            crate::locale::text("当前分屏", "Current pane").to_string()
+        }
+        WorkspaceBroadcastTargetMode::Custom => crate::locale::text("自定义", "Custom").to_string(),
+    };
+    format!("{mode} · {count}")
 }
 
 /// 输入实体可以跨 workspace render 重用；projection 的 Tab id 门禁阻止旧 UI 回调污染新草稿。
@@ -252,22 +343,36 @@ impl WorkspaceBroadcastBar {
         })
     }
 
-    /// 三种目标模式收在同一紧凑触发区，避免窄窗口重复标签挤压命令输入。
-    fn render_target_mode(&self, tab_id: &TabId, count: usize, cx: &mut Context<Self>) -> Popover {
-        let label = match self.projection.mode {
-            WorkspaceBroadcastTargetMode::All => crate::locale::text("全部", "All"),
-            WorkspaceBroadcastTargetMode::Current => crate::locale::text("当前", "Current"),
-            WorkspaceBroadcastTargetMode::Custom => crate::locale::text("自选", "Custom"),
-        };
+    /// 三种目标模式与 pane 勾选放入同一弹层，切换模式后保留弹层便于连续微调目标。
+    ///
+    /// @author kongweiguang
+    fn render_target_mode(
+        &self,
+        tab_id: &TabId,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Popover {
         let weak = cx.weak_entity();
         let event_tab = tab_id.clone();
         let active_mode = self.projection.mode;
+        let labels = target_mode_option_labels(&self.projection);
+        let targets = std::rc::Rc::new(self.projection.targets.clone());
+        let trigger_label = target_mode_trigger_label(&self.projection);
+        let viewport_width = window.bounds().size.width.to_f64();
+        let viewport_height = window.bounds().size.height.to_f64();
+        let width = px((viewport_width - 24.).clamp(0., 360.) as f32);
+        let max_height = px((viewport_height - 32.).clamp(160., 560.) as f32);
+        let list_height = px(((targets.len().max(1) as f32 * 48.)
+            .min(max_height.to_f64() as f32 - 116.))
+        .max(44.));
+        let theme = ThemeTokens::current(window, cx);
         Popover::new("workspace-broadcast-mode-picker")
             .trigger(
                 Button::new("workspace-broadcast-mode")
+                    .debug_selector(|| "workspace-broadcast-mode-trigger".to_owned())
                     .compact()
                     .ghost()
-                    .label(format!("{label} · {count}")),
+                    .label(trigger_label),
             )
             .trigger_style(StyleRefinement::default().flex_none())
             .open(self.target_mode_open)
@@ -276,51 +381,147 @@ impl WorkspaceBroadcastBar {
                 cx.notify();
             }))
             .content(move |_, _, _| {
-                let rows = [
-                    (
-                        WorkspaceBroadcastTargetMode::All,
-                        crate::locale::text("全部分屏", "All panes"),
-                    ),
-                    (
-                        WorkspaceBroadcastTargetMode::Current,
-                        crate::locale::text("当前分屏", "Current pane"),
-                    ),
-                    (
-                        WorkspaceBroadcastTargetMode::Custom,
-                        crate::locale::text("自定义目标", "Custom targets"),
-                    ),
-                ]
-                .into_iter()
-                .map(|(mode, label)| {
-                    let weak = weak.clone();
-                    let tab_id = event_tab.clone();
-                    Button::new(format!("workspace-broadcast-mode-{mode:?}"))
-                        .compact()
-                        .ghost()
-                        .w_full()
-                        .justify_start()
-                        .selected(active_mode == mode)
-                        .label(label)
-                        .on_click(move |_, _, app| {
-                            if let Some(bar) = weak.upgrade() {
-                                bar.update(app, |bar, cx| {
-                                    bar.target_mode_open = false;
-                                    cx.emit(WorkspaceBroadcastBarEvent::SetMode {
-                                        tab_id: tab_id.clone(),
-                                        mode,
+                let mode_rows = labels
+                    .iter()
+                    .cloned()
+                    .map(|(mode, label)| {
+                        let weak = weak.clone();
+                        let tab_id = event_tab.clone();
+                        Button::new(format!("workspace-broadcast-mode-{mode:?}"))
+                            .debug_selector(move || {
+                                format!("workspace-broadcast-mode-option-{mode:?}")
+                            })
+                            .compact()
+                            .ghost()
+                            .w_full()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .justify_start()
+                            .selected(active_mode == mode)
+                            .tooltip(label.clone())
+                            .label(label)
+                            .on_click(move |_, _, app| {
+                                if let Some(bar) = weak.upgrade() {
+                                    bar.update(app, |_, cx| {
+                                        cx.emit(WorkspaceBroadcastBarEvent::SetMode {
+                                            tab_id: tab_id.clone(),
+                                            mode,
+                                        });
+                                        cx.notify();
                                     });
-                                    cx.notify();
+                                }
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let target_rows = targets
+                    .iter()
+                    .map(|target| {
+                        let weak = weak.clone();
+                        let tab_id = event_tab.clone();
+                        let pane_id = target.pane_id.clone();
+                        let title = target.title.clone();
+                        let target_selector =
+                            format!("workspace-broadcast-target-{}", target.pane_id.as_str());
+                        let mut detail = target.detail.trim().to_string();
+                        if !target.protocol.trim().is_empty() {
+                            if detail.is_empty() {
+                                detail = target.protocol.clone();
+                            } else {
+                                detail.push_str(" · ");
+                                detail.push_str(target.protocol.trim());
+                            }
+                        }
+                        Checkbox::new(format!(
+                            "workspace-broadcast-target-{}",
+                            target.pane_id.as_str()
+                        ))
+                        .debug_selector(move || target_selector.clone())
+                        .w_full()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .min_h(px(44.))
+                        .px_2()
+                        .py_1()
+                        .checked(target.selected)
+                        .disabled(!target.enabled)
+                        .accessibility_label(crate::locale::text(
+                            format!("选择群发目标：{title}"),
+                            format!("Select broadcast target: {title}"),
+                        ))
+                        .tooltip(title.clone())
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_change(move |_, _, app| {
+                            if let Some(bar) = weak.upgrade() {
+                                bar.update(app, |_, cx| {
+                                    cx.emit(WorkspaceBroadcastBarEvent::ToggleTarget {
+                                        tab_id: tab_id.clone(),
+                                        pane_id: pane_id.clone(),
+                                    });
                                 });
                             }
                         })
-                })
-                .collect::<Vec<_>>();
-                div().w(px(180.)).flex().flex_col().gap_1().children(rows)
+                        .child(div().w_full().min_w(px(0.)).truncate().child(title))
+                        .when(!detail.is_empty(), |checkbox| {
+                            checkbox.child(
+                                div()
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(theme.text_xs)
+                                    .text_color(theme.muted)
+                                    .child(detail),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut panel = div()
+                    .w(width)
+                    .max_w(width)
+                    .max_h(max_height)
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_1()
+                    .overflow_hidden()
+                    .children(mode_rows)
+                    .child(div().my_1().h(px(1.)).w_full().bg(theme.border));
+                if target_rows.is_empty() {
+                    panel = panel.child(
+                        div()
+                            .min_h(px(44.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .text_size(theme.text_xs)
+                            .text_color(theme.muted)
+                            .child(crate::locale::text(
+                                "当前没有可选分屏",
+                                "No panes to select",
+                            )),
+                    );
+                } else {
+                    panel = panel.child(
+                        div()
+                            .id("workspace-broadcast-target-list")
+                            .w_full()
+                            .h(list_height)
+                            .min_h(px(0.))
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .children(target_rows),
+                    );
+                }
+                panel
             })
     }
 
     /// 片段目录独立滚动并虚拟化，不裁剪候选，也不把目录展开高度计入终端画布。
-    /// 搜索实体随工具栏保留；选择只提交稳定片段身份，渲染和目标校验仍由 Root 处理。
+    /// 搜索实体随工具栏保留；选择只提交稳定片段身份，发送与结果回写由 Root 统一处理。
+    ///
+    /// @author kongweiguang
     fn render_snippet_picker(&self, tab_id: &TabId, cx: &mut Context<Self>) -> Popover {
         let query = self.snippet_query.trim().to_lowercase();
         let snippets = std::rc::Rc::new(
@@ -375,12 +576,15 @@ impl WorkspaceBroadcastBar {
                             range
                                 .map(|index| {
                                     let snippet = rows[index].clone();
+                                    let selector =
+                                        format!("workspace-broadcast-snippet-row-{}", snippet.id);
                                     let weak = list_weak.clone();
                                     let tab_id = row_tab.clone();
                                     Button::new(format!(
                                         "workspace-broadcast-snippet-{}",
                                         snippet.id
                                     ))
+                                    .debug_selector(move || selector.clone())
                                     .ghost()
                                     .compact()
                                     .w_full()
@@ -475,7 +679,7 @@ impl WorkspaceBroadcastBar {
 }
 
 impl Render for WorkspaceBroadcastBar {
-    /// 常用操作保持紧凑，窄窗口允许换行；片段目录独立弹出，画布尺寸由真实布局测量。
+    /// 状态与可取消操作固定占位，异步发送状态变化不应挤动工具栏并反复重测终端网格。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -499,14 +703,14 @@ impl Render for WorkspaceBroadcastBar {
             .border_b_1()
             .border_color(theme.border);
 
-        let close_tab_id = tab_id.clone();
-        row = row.child(self.render_target_mode(&tab_id, projection.selected_count, cx));
+        row = row.child(self.render_target_mode(&tab_id, window, cx));
         let composition_draft = self.draft.clone();
         row = row.child(
             div()
                 .w_0()
                 .flex_1()
                 .min_w(px(120.))
+                .debug_selector(|| "workspace-broadcast-draft-input-slot".to_owned())
                 .capture_action(move |_: &gpui_kit::component::input::Escape, window, cx| {
                     crate::features::input_composition::cancel_input_composition(
                         &composition_draft,
@@ -540,21 +744,26 @@ impl Render for WorkspaceBroadcastBar {
 
         let sync_tab = tab_id.clone();
         row = row.child(
-            Button::new("workspace-broadcast-sync")
-                .compact()
-                .ghost()
-                .selected(projection.sync_enabled)
-                .label(crate::locale::text("同步按键", "Sync input"))
-                .disabled(projection.selected_count < 2 || projection.execution_busy)
-                .tooltip(crate::locale::text(
-                    "同步按键默认关闭",
-                    "Synchronized input starts off",
-                ))
-                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                    cx.emit(WorkspaceBroadcastBarEvent::ToggleSync {
-                        tab_id: sync_tab.clone(),
-                    });
-                })),
+            div()
+                .debug_selector(|| "workspace-broadcast-sync-toggle".to_owned())
+                .flex_none()
+                .child(
+                    Switch::new("workspace-broadcast-sync")
+                        .checked(projection.sync_enabled)
+                        .label(crate::locale::text("同步按键", "Sync input"))
+                        .disabled(projection.selected_count < 2 || projection.execution_busy)
+                        .flex_none()
+                        .accessibility_label(crate::locale::text("同步按键", "Synchronized input"))
+                        .tooltip(crate::locale::text(
+                            "同步按键默认关闭",
+                            "Synchronized input starts off",
+                        ))
+                        .on_change(cx.listener(move |_, _: &bool, _, cx| {
+                            cx.emit(WorkspaceBroadcastBarEvent::ToggleSync {
+                                tab_id: sync_tab.clone(),
+                            });
+                        })),
+                ),
         );
 
         if projection.confirmation_required {
@@ -575,11 +784,28 @@ impl Render for WorkspaceBroadcastBar {
             );
         }
 
-        let send_tab = tab_id.clone();
-        row = row.child(
+        // 发送与取消共享同一槽位，避免忙闲切换挤压输入，也不为未显示的操作留下空白按钮位。
+        let send_button = if projection.command_pending && projection.can_cancel {
+            let cancel_tab = tab_id.clone();
+            Button::new("workspace-broadcast-cancel")
+                .debug_selector(|| "workspace-broadcast-cancel-button".to_owned())
+                .compact()
+                .ghost()
+                .w_full()
+                .h_full()
+                .label(crate::locale::text("取消", "Cancel"))
+                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                    cx.emit(WorkspaceBroadcastBarEvent::CancelCommand {
+                        tab_id: cancel_tab.clone(),
+                    });
+                }))
+        } else {
+            let send_tab = tab_id.clone();
             Button::new("workspace-broadcast-send")
                 .compact()
                 .primary()
+                .w_full()
+                .h_full()
                 .label(crate::locale::text("发送", "Send"))
                 .accessibility_label(crate::locale::text(
                     "发送到所选分屏",
@@ -600,23 +826,15 @@ impl Render for WorkspaceBroadcastBar {
                             tab_id: send_tab.clone(),
                         });
                     }
-                })),
+                }))
+        };
+        row = row.child(
+            div()
+                .w(px(72.))
+                .h(px(32.))
+                .flex_shrink_0()
+                .child(send_button),
         );
-
-        if projection.command_pending && projection.can_cancel {
-            let cancel_tab = tab_id.clone();
-            row = row.child(
-                Button::new("workspace-broadcast-cancel")
-                    .compact()
-                    .ghost()
-                    .label(crate::locale::text("取消", "Cancel"))
-                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                        cx.emit(WorkspaceBroadcastBarEvent::CancelCommand {
-                            tab_id: cancel_tab.clone(),
-                        });
-                    })),
-            );
-        }
         if projection.can_retry_safe {
             let retry_tab = tab_id.clone();
             row = row.child(
@@ -633,46 +851,34 @@ impl Render for WorkspaceBroadcastBar {
             );
         }
 
-        if !projection.result_details.is_empty() {
+        let mut status_slot = div()
+            .id("workspace-broadcast-status-slot")
+            .w(px(28.))
+            .h(px(28.))
+            .flex_shrink_0();
+        if let Some(status) = projection.status {
             let results_tab = tab_id.clone();
-            row = row.child(
-                Button::new("workspace-broadcast-results")
+            let has_results = !projection.result_details.is_empty();
+            status_slot = status_slot.child(
+                Button::new("workspace-broadcast-status")
                     .compact()
                     .ghost()
+                    .w_full()
+                    .h_full()
+                    .icon(IconName::Info)
                     .selected(projection.results_open)
-                    .label(crate::locale::text("结果", "Results"))
+                    .accessibility_label(status.clone())
+                    .tooltip(status)
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                        cx.emit(WorkspaceBroadcastBarEvent::ToggleResults {
-                            tab_id: results_tab.clone(),
-                        });
+                        if has_results {
+                            cx.emit(WorkspaceBroadcastBarEvent::ToggleResults {
+                                tab_id: results_tab.clone(),
+                            });
+                        }
                     })),
             );
         }
-
-        if let Some(status) = projection.status {
-            row = row.child(
-                div()
-                    .text_size(theme.text_xs)
-                    .text_color(theme.muted)
-                    .max_w(px(220.))
-                    .overflow_hidden()
-                    .child(status),
-            );
-        }
-        row = row.child(
-            Button::new("workspace-broadcast-close")
-                .compact()
-                .ghost()
-                .flex_shrink_0()
-                .icon(IconName::Close)
-                .accessibility_label(crate::locale::text("隐藏群发栏", "Hide broadcast bar"))
-                .tooltip(crate::locale::text("隐藏群发栏", "Hide broadcast bar"))
-                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                    cx.emit(WorkspaceBroadcastBarEvent::Close {
-                        tab_id: close_tab_id.clone(),
-                    });
-                })),
-        );
+        row = row.child(status_slot);
         let details = if projection.results_open {
             let rows = projection
                 .result_details
@@ -715,3 +921,7 @@ impl Render for WorkspaceBroadcastBar {
             .into_any_element()
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/workspace_broadcast_toolbar.rs"]
+mod toolbar_tests;

@@ -37,4 +37,5 @@ unicode_width.workspace = true
 [dev-dependencies]
 # Headless tests exercise the selected GPUI backend without resolving Kit's optional fast backend.
 gpui_pre = { workspace = true, features = ["test-support"] }
+tokio.workspace = true
 

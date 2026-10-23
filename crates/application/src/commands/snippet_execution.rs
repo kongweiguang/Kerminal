@@ -1,4 +1,4 @@
-//! 命令片段执行用例：精确绑定目录版本、可见终端和一次性确认。
+//! 片段提交与受管执行：直接发送固定 UI binding，原目录计划与完成跟踪独立保留。
 //!
 //! @author kongweiguang
 
@@ -16,7 +16,7 @@ use kerminal_domain::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     AppError, AppResult, PublicErrorCode,
@@ -25,13 +25,13 @@ use crate::{
     },
     commands::{
         CommandsService, SnippetCatalogRevision, SnippetExecutionCatalogSnapshot,
-        SnippetRenderDialect,
+        SnippetRenderDialect, SnippetRenderResult,
     },
     sessions::{
         SessionFilter, SessionService, ShellCommandOutcome, ShellCommandRequest,
         TerminalCommandAvailability, TerminalCommandContext, TerminalCommandContextVersion,
         TerminalCommandUnavailableReason, TerminalInputEvent, UiInputProjection, UiSessionBinding,
-        UiTerminalInputRequest,
+        UiSnippetCommandLineRequest, UiTerminalInputRequest,
     },
 };
 
@@ -219,6 +219,85 @@ impl SnippetExecutionService {
     /// 组合根传入共享应用服务，避免片段执行另建目录、终端或用量存储实例。
     pub fn new(commands: Arc<CommandsService>, sessions: Arc<dyn SessionService>) -> Self {
         Self { commands, sessions }
+    }
+
+    /// 直接发送用户当前点击的定义，不读取 catalog、平台、scope、shell 或 prompt 状态。
+    ///
+    /// 会话 owner 与 Running 前态用于拒绝陈旧目标；最终 owner/generation 仍由 session writer 在 Paste+Enter 的同一事务中 CAS。
+    /// writer 错误不重放；取消只在开始写入前生效，避免中断一个回执未知的终端写入。
+    ///
+    /// @author kongweiguang
+    pub async fn send_direct(
+        &self,
+        rendered: SnippetRenderResult,
+        binding: UiSessionBinding,
+        record_history: bool,
+        cancellation: CancellationToken,
+    ) -> AppResult<SnippetRunHistory> {
+        let SnippetRenderResult { command, sensitive } = rendered;
+        let command = Zeroizing::new(command);
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("命令片段发送已取消"));
+        }
+        if !matches!(&binding.owner, SessionOwner::Ui { .. }) {
+            return Err(AppError::conflict("命令片段目标不属于可见终端"));
+        }
+        let session = self
+            .sessions
+            .list(SessionFilter::default())
+            .await?
+            .into_iter()
+            .find(|session| session.session_id == binding.session_id)
+            .ok_or_else(|| AppError::not_found("指定终端会话不存在"))?;
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("命令片段发送已取消"));
+        }
+        if session.lifecycle != SessionLifecycle::Running || session.owner != binding.owner {
+            return Err(AppError::conflict("命令片段目标会话已变化或已关闭"));
+        }
+
+        if command.trim().is_empty() {
+            return Err(AppError::invalid("命令片段内容为空"));
+        }
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("命令片段发送已取消"));
+        }
+        self.sessions
+            .submit_ui_snippet_command_line(UiSnippetCommandLineRequest {
+                binding,
+                command: command.to_string(),
+            })
+            .await?;
+
+        let history = if !record_history {
+            SnippetRunHistory::NotRequested
+        } else if sensitive {
+            SnippetRunHistory::SkippedSensitive
+        } else {
+            match self
+                .commands
+                .record_history(CommandHistoryRecordRequest {
+                    command: command.to_string(),
+                    source: CommandHistorySource::Snippet,
+                    target: history_target(&session.target),
+                    record: Some(true),
+                    session_id: Some(session.session_id.clone()),
+                    pane_id: owner_pane(&session.owner),
+                    tab_id: owner_tab(&session.owner),
+                    profile_id: None,
+                    remote_host_id: target_host(&session.target),
+                    cwd: target_cwd(&session.target),
+                    shell: local_shell(&session.target),
+                })
+                .await
+            {
+                Ok(result) => SnippetRunHistory::Evaluated(Arc::new(result)),
+                Err(error) => SnippetRunHistory::Failed {
+                    error_code: error.public_code(),
+                },
+            }
+        };
+        Ok(history)
     }
 
     /// 将当前精确目录项、UI binding、generation 与可信 shell 方言冻结成一次运行计划。

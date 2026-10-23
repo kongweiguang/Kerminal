@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, SharedString, Subscription, Window,
@@ -53,14 +53,10 @@ mod logs;
 mod render;
 #[path = "commands/send_state.rs"]
 mod send_state;
-#[path = "commands/snippet_applicability.rs"]
-mod snippet_applicability;
 #[path = "commands/snippet_browser.rs"]
 mod snippet_browser;
 #[path = "commands/snippet_fill.rs"]
 mod snippet_fill;
-#[path = "commands/snippet_run.rs"]
-mod snippet_run;
 #[path = "commands/snippet_transfer_ui.rs"]
 mod snippet_transfer_ui;
 #[path = "commands/workflow_editor.rs"]
@@ -202,61 +198,6 @@ pub(super) struct SnippetDraftValues {
     pub context_bindings: Vec<SnippetContextBinding>,
 }
 
-/// 片段 Fill 回执必须仍属于点击时的目标、定义、编辑器和草稿快照。
-///
-/// @author kongweiguang
-#[derive(Clone, PartialEq, Eq)]
-struct SnippetFillGuard {
-    request_generation: u64,
-    session_view_generation: u64,
-    session_id: Option<SessionId>,
-    binding: Option<UiSessionBinding>,
-    section: CommandsSection,
-    snippet_generation: u64,
-    editor_generation: u64,
-    editor_open: bool,
-    selected_sensitive: bool,
-    command_draft: String,
-    definition_draft: SnippetDraftValues,
-    variable_values: BTreeMap<String, String>,
-}
-
-impl Drop for SnippetFillGuard {
-    /// 异步 UI 核对也会持有 Secret 变量副本；释放时与应用执行计划一样清除展开值。
-    fn drop(&mut self) {
-        self.command_draft.zeroize();
-        self.definition_draft.command.zeroize();
-        for value in self.variable_values.values_mut() {
-            value.zeroize();
-        }
-    }
-}
-
-impl SnippetFillGuard {
-    /// 目标或编辑器身份改变时丢弃回执，避免迟到操作接管新的工作区状态。
-    ///
-    /// @author kongweiguang
-    fn same_request_context(&self, current: &Self) -> bool {
-        self.request_generation == current.request_generation
-            && self.session_view_generation == current.session_view_generation
-            && self.session_id == current.session_id
-            && self.binding == current.binding
-            && self.section == current.section
-            && self.snippet_generation == current.snippet_generation
-            && self.editor_generation == current.editor_generation
-    }
-
-    /// 用户在等待期间编辑命令、变量定义或变量值时保留新输入，不让旧预览覆盖它。
-    ///
-    /// @author kongweiguang
-    fn drafts_unchanged(&self, current: &Self) -> bool {
-        self.command_draft == current.command_draft
-            && self.selected_sensitive == current.selected_sensitive
-            && self.definition_draft == current.definition_draft
-            && self.variable_values == current.variable_values
-    }
-}
-
 /// 编辑器切换请求暂存为 typed intent，保存/丢弃确认完成前不改选中定义。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum EditorTransition {
@@ -382,12 +323,9 @@ pub struct CommandsView {
     /// 只保留最近一次显式复制请求，避免较慢的旧结果覆盖用户后续剪贴板选择。
     pub(super) snippet_copy_generation: u64,
     pub(super) snippet_copy_cancellation: Option<CancellationToken>,
-    /// 只追踪当前选中定义与可信 binding 的适用性结果，避免列表渲染触发逐项 IO。
-    snippet_applicability: snippet_applicability::SelectedSnippetApplicability,
     /// 片段创建结果未知时保留原 ID 与正文，后续只能精确读回，不能生成新 ID 重试。
     pending_builtin_copy: Option<snippet_browser::PendingBuiltinSnippetCopy>,
     snippet_import_review: Option<snippet_transfer_ui::SnippetImportReview>,
-    snippet_run: snippet_run::SnippetRunUiState,
     pub(super) snippet_transfer_busy: bool,
     pub(super) snippet_transfer_generation: u64,
     pub(super) snippet_transfer_cancellation: Option<CancellationToken>,
@@ -573,10 +511,8 @@ impl CommandsView {
             snippet_inline_preview: snippet_browser::SnippetInlinePreview::Collapsed,
             snippet_copy_generation: 0,
             snippet_copy_cancellation: None,
-            snippet_applicability: snippet_applicability::SelectedSnippetApplicability::default(),
             pending_builtin_copy: None,
             snippet_import_review: None,
-            snippet_run: snippet_run::SnippetRunUiState::default(),
             snippet_transfer_busy: false,
             snippet_transfer_generation: 0,
             snippet_transfer_cancellation: None,
@@ -873,22 +809,10 @@ impl CommandsView {
         if self.section == section {
             return;
         }
-        if (self.snippet_editor_open && section != CommandsSection::Snippets)
-            || (self.section == CommandsSection::Snippets
-                && section != CommandsSection::Snippets
-                && self.snippet_run.blocks_navigation())
-        {
+        if self.snippet_editor_open && section != CommandsSection::Snippets {
             self.status = Some(command_message(
-                if self.snippet_editor_open {
-                    "请先关闭片段编辑器，再切换工作区"
-                } else {
-                    "请先完成或核对片段运行，再切换工作区"
-                },
-                if self.snippet_editor_open {
-                    "Close the snippet editor before switching workspaces"
-                } else {
-                    "Finish or review the snippet run before switching workspaces"
-                },
+                "请先关闭片段编辑器，再切换工作区",
+                "Close the snippet editor before switching workspaces",
             ));
             cx.notify();
             return;
@@ -998,7 +922,6 @@ impl CommandsView {
         if self.session_id == session_id {
             return;
         }
-        self.cancel_snippet_run(cx);
         snippet_browser::cancel_snippet_copy(self);
         self.clear_suggestions();
         let run_is_in_flight = self.workflow_running;
@@ -1034,7 +957,6 @@ impl CommandsView {
         }
         self.session_id = session_id;
         self.ui_session_binding = None;
-        snippet_applicability::refresh_selected(self, cx);
         self.target_presentation = None;
         self.session_info = None;
         self.history.clear();
@@ -1090,11 +1012,9 @@ impl CommandsView {
             cancellation.cancel();
         }
         self.target_presentation = None;
-        self.cancel_snippet_run(cx);
         snippet_browser::cancel_snippet_copy(self);
         self.clear_suggestions();
         self.ui_session_binding = binding;
-        snippet_applicability::refresh_selected(self, cx);
         if self.workflow_running {
             if let Some(control) = self.workflow_control.as_ref() {
                 control.cancel();
@@ -1633,60 +1553,13 @@ impl CommandsView {
         self.suggestions.clear();
     }
 
-    /// 捕获 Fill 请求仍需匹配的目标、定义、弹层和输入值，供异步回执拒绝过期结果。
-    ///
-    /// @author kongweiguang
-    fn snippet_fill_guard(
-        &mut self,
-        request_generation: u64,
-        definition_draft: SnippetDraftValues,
-        cx: &mut Context<Self>,
-    ) -> SnippetFillGuard {
-        SnippetFillGuard {
-            request_generation,
-            session_view_generation: self.session_view_generation,
-            session_id: self.session_id.clone(),
-            binding: self.ui_session_binding.clone(),
-            section: self.section,
-            snippet_generation: self.snippet_generation,
-            editor_generation: self.snippet_editor_generation,
-            editor_open: self.snippet_editor_open,
-            selected_sensitive: self.selected_snippet_sensitive
-                || self.snippet_variables.iter().any(|field| {
-                    field.variable.sensitive || field.variable.kind == SnippetVariableKind::Secret
-                }),
-            command_draft: self
-                .command_input
-                .update(cx, |input, _| input.value().to_string()),
-            definition_draft,
-            variable_values: self
-                .snippet_variables
-                .iter()
-                .map(|field| {
-                    (
-                        field.name.update(cx, |input, _| input.value().to_string()),
-                        field.input.update(cx, |input, _| input.value().to_string()),
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    /// 右栏写入精确绑定终端且不回车；宽工作台保留命令编辑草稿，敏感内容关闭历史记录。
-    /// 成功仅隐藏同一弹层并切到历史，保留定义/变量草稿和既有运行保护。
+    /// 显式草稿填入与右栏发送复用同一渲染快照；不会运行片段或检查平台适配性。
+    /// 填入后把焦点交给命令草稿，终端写入只由单独的发送按钮触发。
     ///
     /// @author kongweiguang
     pub(super) fn fill_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.compact_layout {
-            self.fill_snippet_terminal(window, cx);
-            return;
-        }
-        if self.snippet_run.blocks_navigation() {
-            self.status = Some(command_message(
-                "请先完成或核对片段运行，再填入命令草稿",
-                "Finish or review the snippet run before filling a command draft",
-            ));
-            cx.notify();
+            self.send_snippet_terminal(window, cx);
             return;
         }
         if self.snippet_saving
@@ -1700,168 +1573,58 @@ impl CommandsView {
             cx.notify();
             return;
         }
-        let Some(snippet) = self.selected_snippet.clone() else {
-            self.status = Some(command_message(
-                "请先选择一个用户片段",
-                "Select a user snippet first",
-            ));
+        let Some(mut rendered) = snippet_fill::render_selected_snippet_direct(self, cx) else {
+            self.status = Some(command_message("请先选择片段", "Select a snippet first"));
             cx.notify();
             return;
         };
-        let Some(session_id) = self.session_id.clone() else {
-            self.status = Some(command_message(
-                "命令片段需要明确的活动终端会话",
-                "A snippet needs an explicit active terminal session",
-            ));
-            cx.notify();
-            return;
-        };
-        let definition = snippet.definition.clone();
-        let user_definition = snippet.revision.is_some();
-        let snippet_id = definition.id.clone();
-        let definition_draft = match self.collect_snippet_draft_values(cx) {
-            Ok(draft) => draft,
-            Err(message) => {
-                self.status = Some(message);
-                cx.notify();
-                return;
+        if rendered.command.trim().is_empty() {
+            if rendered.sensitive {
+                rendered.command.zeroize();
             }
-        };
-        if !configuration_watch::snippet_definition_draft_matches_saved(
-            &definition,
-            &definition_draft,
-        ) {
             self.status = Some(command_message(
-                "请先保存片段定义，再填入命令草稿；运行变量会保留",
-                "Save the snippet definition before filling; runtime variable values are preserved",
+                "命令片段内容为空",
+                "Snippet command is empty",
             ));
             cx.notify();
             return;
         }
-        self.snippet_fill_generation = self.snippet_fill_generation.wrapping_add(1).max(1);
-        let request_guard =
-            self.snippet_fill_guard(self.snippet_fill_generation, definition_draft, cx);
-        let selected_sensitive = request_guard.selected_sensitive;
-        let values = request_guard.variable_values.clone();
-        let service = self.commands.clone();
-        let executor = self.executor.clone();
-        let callback_guard = request_guard;
-        cx.spawn_in(window, async move |this, cx| {
-            let result = executor
-                .run(move |cancellation| async move {
-                    let rendered = if user_definition {
-                        service
-                            .render_snippet_for_session(snippet_id, session_id, values)
-                            .await?
-                    } else {
-                        service
-                            .render_definition_for_session(definition, session_id, values)
-                            .await?
-                    };
-                    if cancellation.is_cancelled() {
-                        return Err(AppError::cancelled(command_error_context(
-                            "命令片段渲染已取消",
-                            "Snippet rendering was cancelled",
-                        )));
-                    }
-                    let mut rendered = rendered;
-                    rendered.sensitive |= selected_sensitive;
-                    Ok(rendered)
-                })
-                .await;
-            let _ = cx.update(|window, app| {
-                let _ = this.update(app, |view, cx| {
-                    if view.snippet_fill_generation != callback_guard.request_generation {
-                        return;
-                    }
-                    let mut current_guard = view.snippet_fill_guard(
-                        callback_guard.request_generation,
-                        callback_guard.definition_draft.clone(),
-                        cx,
-                    );
-                    if !callback_guard.same_request_context(&current_guard) {
-                        return;
-                    }
-                    current_guard.definition_draft =
-                        match view.collect_snippet_draft_values(cx) {
-                            Ok(draft) => draft,
-                            Err(_) => {
-                                view.status = Some(command_message(
-                                    "填入期间片段定义已变化，已保留当前编辑；请检查后重新填入",
-                                    "The snippet definition changed while filling; your edits were preserved. Review and fill again",
-                                ));
-                                cx.notify();
-                                return;
-                            }
-                        };
-                    if !callback_guard.drafts_unchanged(&current_guard) {
-                        view.status = Some(command_message(
-                            "填入期间命令或变量草稿已修改，已保留当前输入，请重新填入",
-                            "The command or variable draft changed while filling; it was preserved. Fill again to use the new values",
-                        ));
-                        cx.notify();
-                        return;
-                    }
-                    if view.snippet_run.blocks_navigation()
-                        || view.snippet_saving
-                        || view.confirm_snippet_delete
-                        || view.pending_snippet_transition.is_some()
-                    {
-                        return;
-                    }
-                    match result {
-                        Ok(rendered) => {
-                            if callback_guard.editor_open {
-                                view.close_snippet_editor_for_fill(cx);
-                                if view.snippet_editor_open {
-                                    return;
-                                }
-                            }
-                            view.clear_suggestions();
-                            view.command_input.update(cx, |input, cx| {
-                                input.set_value(rendered.command, window, cx)
-                            });
-                            if rendered.sensitive {
-                                view.record_command = false;
-                                view.status = Some(command_message(
-                                    "敏感片段已填入命令框，本次发送不会写入历史",
-                                    "Sensitive snippet copied to the command field; this send will not be recorded",
-                                ));
-                            } else {
-                                view.record_command = true;
-                                view.status = Some(command_message(
-                                    "片段已填入命令框，请检查后提交",
-                                    "Snippet copied to the command field; review it before sending",
-                                ));
-                            }
-                            view.select_section(CommandsSection::History, cx);
-                            if !callback_guard.editor_open {
-                                let focus_at_schedule = window.focused(cx);
-                                let commands_view = cx.entity();
-                                window.on_next_frame(move |window, app| {
-                                    if window.has_active_prompt()
-                                        || window.focused(app) != focus_at_schedule
-                                    {
-                                        return;
-                                    }
-                                    commands_view.update(app, |view, cx| {
-                                        view.focus_command_draft(window, cx);
-                                    });
-                                });
-                            }
-                            cx.notify();
-                        }
-                        Err(error) => {
-                            view.status = Some(error.public_message().to_owned());
-                            cx.notify();
-                        }
-                    }
+
+        self.clear_suggestions();
+        self.command_input.update(cx, |input, cx| {
+            input.set_value(rendered.command, window, cx)
+        });
+        self.record_command = !rendered.sensitive;
+        self.status = Some(command_message(
+            if rendered.sensitive {
+                "敏感片段已填入命令草稿，不会写入历史"
+            } else {
+                "已填入命令草稿"
+            },
+            if rendered.sensitive {
+                "Sensitive snippet added to the command draft; it will not be recorded"
+            } else {
+                "Snippet added to the command draft"
+            },
+        ));
+        if self.snippet_editor_open {
+            self.close_snippet_editor_for_fill(cx);
+        }
+        self.select_section(CommandsSection::History, cx);
+        if !self.snippet_editor_open {
+            let focus_at_schedule = window.focused(cx);
+            let commands_view = cx.entity();
+            window.on_next_frame(move |window, app| {
+                if window.has_active_prompt() || window.focused(app) != focus_at_schedule {
+                    return;
+                }
+                commands_view.update(app, |view, cx| {
+                    view.focus_command_draft(window, cx);
                 });
             });
-        })
-        .detach();
+        }
+        cx.notify();
     }
-
     /// 兼容旧调用方的 ID 入口；来源必须重新精确查询，不能从当前分页猜测。
     ///
     /// @author kongweiguang
@@ -2254,7 +2017,6 @@ impl CommandsView {
     fn install_new_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.snippet_generation = self.snippet_generation.wrapping_add(1).max(1);
         self.snippet_inline_preview = snippet_browser::SnippetInlinePreview::Collapsed;
-        snippet_applicability::clear(self);
         self.selected_snippet = None;
         self.snippet_advanced_open = false;
         self.configuration_conflict = None;
@@ -2551,7 +2313,6 @@ impl CommandsView {
                 view.confirm_snippet_delete = false;
                 match result {
                     Ok(true) => {
-                        snippet_applicability::clear(view);
                         view.snippet_inline_preview =
                             snippet_browser::SnippetInlinePreview::Collapsed;
                         view.selected_snippet = None;
@@ -3284,7 +3045,6 @@ impl CommandsView {
             .iter()
             .any(|variable| variable.sensitive || variable.kind == SnippetVariableKind::Secret);
         self.selected_snippet = Some(saved);
-        snippet_applicability::refresh_selected(self, cx);
         self.snippet_is_new = false;
         self.configuration_conflict = None;
         self.status = None;
@@ -3543,7 +3303,7 @@ pub(super) fn command_error_context(zh_cn: &'static str, en_us: &'static str) ->
     }
 }
 
-/// 原样保留派生身份；来源名称和链接只是展示信息，混入会导致填入的精确版本校验误拒绝。
+/// 原样保留派生身份；来源名称和链接仅用于展示，不能改变目录项的稳定来源标识。
 ///
 /// @author kongweiguang
 fn snippet_definition_from_catalog(item: SnippetCatalogItem) -> SnippetDefinition {
@@ -3910,7 +3670,6 @@ impl Drop for CommandsView {
         cancel_owned_suggestion_request(&mut self.suggestion_cancellation);
         snippet_browser::cancel_snippet_page_request(&mut self.snippet_page_cancellation);
         snippet_browser::cancel_snippet_copy(self);
-        snippet_applicability::clear(self);
         if let Some(cancellation) = self.snippet_transfer_cancellation.take() {
             cancellation.cancel();
         }

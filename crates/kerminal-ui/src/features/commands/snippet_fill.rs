@@ -1,4 +1,4 @@
-//! 右栏片段填入只投递一次 Paste；异步准备与最终写入之间再次核对 UI 草稿。
+//! 右栏片段发送只投递一次 Paste+Enter；目标仍由点击时捕获的 UI binding 固定。
 //!
 //! @author kongweiguang
 
@@ -9,21 +9,31 @@ use gpui_kit::{
     prelude::*,
 };
 use kerminal_application::{
-    PublicErrorCode, commands::SnippetRunPreparation, sessions::UiSessionBinding,
+    PublicErrorCode,
+    commands::{SnippetRenderResult, SnippetRunHistory, direct_snippet_command},
+    sessions::UiSessionBinding,
 };
+use kerminal_domain::commands::{SnippetDefinition, SnippetVariableKind};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroize;
 
-use super::{
-    CommandsView, SnippetCatalogOrigin, SnippetPreferenceKey, SnippetTerminalFillCompleted,
-    configuration_watch,
-};
+use super::{CommandsView, SnippetTerminalFillCompleted, command_message};
 use crate::theme::ThemeTokens;
 
-/// 未知回执保留原终端身份，只有明确核对才能再次填入，避免重复粘贴。
+/// 未知回执保留发送时的原终端身份，只有明确核对后才允许再次发送。
 #[derive(Default)]
 pub(super) struct TerminalFillState {
-    cancellation: Option<CancellationToken>,
-    unknown_target: Option<UiSessionBinding>,
+    pub(super) cancellation: Option<CancellationToken>,
+    pub(super) unknown_target: Option<UiSessionBinding>,
+}
+
+impl TerminalFillState {
+    /// 活跃发送和未知结果都必须阻止重放；人工检查仅清除未知目标状态。
+    ///
+    /// @author kongweiguang
+    pub(super) fn blocks_new_send(&self) -> bool {
+        self.cancellation.is_some() || self.unknown_target.is_some()
+    }
 }
 
 /// 延迟聚焦只接受仍对应当前 Fill 请求、右栏视图及编辑弹层代次和完整 UI 绑定的成功票据。
@@ -44,14 +54,87 @@ pub(super) fn snippet_fill_completion_matches_current(
 
 impl gpui_kit::EventEmitter<SnippetTerminalFillCompleted> for CommandsView {}
 
+/// 从当前表单实体生成一次性渲染快照；选中定义只提供身份与默认元数据，不覆盖未保存正文。
+/// 运行时输入在离开此 helper 前清零，敏感标志同时继承目录项和当前变量定义。
+///
+/// @author kongweiguang
+pub(super) fn render_selected_snippet_direct(
+    view: &mut CommandsView,
+    cx: &mut Context<CommandsView>,
+) -> Option<SnippetRenderResult> {
+    let mut definition = view
+        .selected_snippet
+        .as_ref()
+        .map(|snippet| snippet.definition.clone())
+        .or_else(|| {
+            view.snippet_is_new.then(|| SnippetDefinition {
+                id: String::new(),
+                title: String::new(),
+                command: String::new(),
+                description: None,
+                tags: Vec::new(),
+                sort_order: 0,
+                scope: view.snippet_scope,
+                category: None,
+                risk: view.snippet_risk,
+                default_action: view.snippet_default_action,
+                variables: Vec::new(),
+                context_bindings: Vec::new(),
+                derived_from: None,
+            })
+        })?;
+    let command = view
+        .snippet_command
+        .update(cx, |input, _| input.text().to_string());
+    definition.command.zeroize();
+    definition.command = command;
+    definition.variables = view
+        .snippet_variables
+        .iter()
+        .map(|field| {
+            let mut variable = field.variable.clone();
+            variable.name = field.name.update(cx, |input, _| input.value().to_string());
+            variable
+        })
+        .collect();
+    let mut values = view
+        .snippet_variables
+        .iter()
+        .map(|field| {
+            (
+                field.name.update(cx, |input, _| input.value().to_string()),
+                field.input.update(cx, |input, _| input.value().to_string()),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut rendered = direct_snippet_command(&definition, &values);
+    definition.command.zeroize();
+    values.values_mut().for_each(String::zeroize);
+    rendered.sensitive |= view.selected_snippet_sensitive
+        || view.snippet_variables.iter().any(|field| {
+            field.variable.sensitive || field.variable.kind == SnippetVariableKind::Secret
+        });
+    Some(rendered)
+}
+
 impl CommandsView {
-    /// 填入与运行互斥；未知结果必须由用户检查原终端后解除门禁。
+    /// 未知写入结果必须由用户检查原终端后解除门禁，防止重复发送。
+    ///
+    /// @author kongweiguang
     pub(super) fn snippet_terminal_fill_blocked(&self) -> bool {
-        self.snippet_terminal_fill.cancellation.is_some()
-            || self.snippet_terminal_fill.unknown_target.is_some()
+        self.snippet_terminal_fill.blocks_new_send()
     }
 
-    /// 切目标或销毁视图只请求协作取消，已有 writer 仍等待实际回执，不能推断未写入。
+    /// 表单只在 writer 等待期间冻结，未知回执仍允许查看和修改片段内容。
+    ///
+    /// @author kongweiguang
+    pub(super) fn snippet_terminal_fill_in_flight(&self) -> bool {
+        self.snippet_terminal_fill.cancellation.is_some()
+    }
+
+    /// 在 writer 启动前取消本次请求；writer 启动后仍等待确定回执，不用取消信号推断未发送。
+    ///
+    /// @author kongweiguang
     pub(super) fn cancel_terminal_fill(&mut self) {
         if let Some(cancellation) = self.snippet_terminal_fill.cancellation.as_ref() {
             cancellation.cancel();
@@ -75,148 +158,128 @@ impl CommandsView {
         )
     }
 
-    /// UI 先冻结已展示定义和变量，准备成功后核对原草稿，最终输入仍由应用层原子检查绑定和 context。
-    pub(super) fn fill_snippet_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 显式发送时只做必要的目标身份和并发门禁；不探测平台、shell 或 prompt，也不改变终端焦点。
+    /// Unknown 保留在原目标上，用户核对前不允许重放；变量副本与敏感命令交由零化边界清理。
+    ///
+    /// @author kongweiguang
+    pub(super) fn send_snippet_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.snippet_terminal_fill_blocked()
-            || self.snippet_run.blocks_navigation()
             || self.snippet_saving
             || self.confirm_snippet_delete
             || self.pending_snippet_transition.is_some()
         {
-            self.status = Some("请先完成或核对当前片段操作".to_owned());
+            self.status = Some(command_message(
+                "请先完成或核对当前片段操作",
+                "Finish or review the current snippet action first",
+            ));
             cx.notify();
             return;
         }
-        let (Some(snippet), Some(binding), Some(service)) = (
-            self.selected_snippet.clone(),
+        let (Some(binding), Some(service)) = (
             self.ui_session_binding.clone(),
             self.snippet_execution.clone(),
         ) else {
-            self.status = Some("请先选择片段并绑定可用终端".to_owned());
+            self.status = Some(command_message(
+                "请选择片段并绑定终端",
+                "Select a snippet and bind a terminal",
+            ));
             cx.notify();
             return;
         };
-        let draft = match self.collect_snippet_draft_values(cx) {
-            Ok(draft)
-                if configuration_watch::snippet_definition_draft_matches_saved(
-                    &snippet.definition,
-                    &draft,
-                ) =>
-            {
-                draft
-            }
-            _ => {
-                self.status = Some("请先保存片段定义；运行变量会保留".to_owned());
-                cx.notify();
-                return;
-            }
+        if self.session_id.as_ref() != Some(&binding.session_id) {
+            self.status = Some(command_message(
+                "终端绑定已变化，请重新选择目标",
+                "The terminal binding changed; select the target again",
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(rendered) = render_selected_snippet_direct(self, cx) else {
+            self.status = Some(command_message("请先选择片段", "Select a snippet first"));
+            cx.notify();
+            return;
         };
+        if rendered.command.trim().is_empty() {
+            let mut rendered = rendered;
+            if rendered.sensitive {
+                rendered.command.zeroize();
+            }
+            self.status = Some(command_message(
+                "命令片段内容为空",
+                "Snippet command is empty",
+            ));
+            cx.notify();
+            return;
+        }
         self.snippet_fill_generation = self.snippet_fill_generation.wrapping_add(1).max(1);
-        let guard = self.snippet_fill_guard(self.snippet_fill_generation, draft, cx);
-        let request = SnippetRunPreparation {
-            key: SnippetPreferenceKey {
-                origin: if snippet.revision.is_some() {
-                    SnippetCatalogOrigin::User
-                } else {
-                    SnippetCatalogOrigin::Builtin
-                },
-                snippet_id: snippet.definition.id.clone(),
-            },
-            binding: binding.clone(),
-            variables: guard.variable_values.clone(),
-            record_history: false,
-        };
+        let request_generation = self.snippet_fill_generation;
+        let session_view_generation = self.session_view_generation;
+        let snippet_generation = self.snippet_generation;
+        let editor_generation = self.snippet_editor_generation;
+        let record_history = self.record_command && !rendered.sensitive;
         let cancellation = CancellationToken::new();
         self.snippet_terminal_fill.cancellation = Some(cancellation.clone());
-        self.status = Some("正在核对片段与终端…".to_owned());
-        let expected_focus = window.focused(cx);
-        let snippet_editor_generation = self
-            .snippet_editor_open
-            .then_some(self.snippet_editor_generation);
+        self.status = Some(command_message("正在发送…", "Sending…"));
         let executor = self.executor.clone();
-        let prepare_service = service.clone();
+        let send_binding = binding.clone();
+        let send_cancellation = cancellation.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = executor
-                .run(move |_| async move {
-                    prepare_service
-                        .prepare_fill(request, snippet.definition, snippet.revision)
-                        .await
-                })
+                .run_cancellable(
+                    send_cancellation,
+                    move |operation_cancellation| async move {
+                        service
+                            .send_direct(
+                                rendered,
+                                send_binding,
+                                record_history,
+                                operation_cancellation,
+                            )
+                            .await
+                    },
+                )
                 .await;
-            let proceed = cx
-                .update(|_, app| {
-                    this.update(app, |view, cx| {
-                        let current_draft = view.collect_snippet_draft_values(cx);
-                        let current = current_draft.ok().map(|draft| {
-                            view.snippet_fill_guard(guard.request_generation, draft, cx)
-                        });
-                        if cancellation.is_cancelled()
-                            || current.as_ref().is_none_or(|current| {
-                                !guard.same_request_context(current)
-                                    || !guard.drafts_unchanged(current)
-                            })
-                        {
-                            view.snippet_terminal_fill.cancellation = None;
-                            view.status =
-                                Some("填入已取消或草稿、目标已变化；当前输入已保留".to_owned());
-                            cx.notify();
-                            return false;
-                        }
-                        true
-                    })
-                    .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if !proceed {
-                return;
-            }
-            let result = match result {
-                Ok(plan) => {
-                    executor
-                        .run(move |_| async move { service.fill(plan, cancellation).await })
-                        .await
-                }
-                Err(error) => Err(error),
-            };
             let _ = cx.update(|_, app| {
                 let _ = this.update(app, |view, cx| {
                     view.snippet_terminal_fill.cancellation = None;
-                    let context_matches = view.snippet_fill_generation == guard.request_generation
-                        && view.session_view_generation == guard.session_view_generation
-                        && view.ui_session_binding == guard.binding;
-                    // 已开始写入时取消不能撤回 Paste；目标切换后仍须交代原终端的成功回执。
-                    if !context_matches
-                        && !result.as_ref().is_err_and(|error| {
-                            error.public_code() == PublicErrorCode::OutcomeUnknown
-                        })
-                    {
-                        if result.is_ok() {
-                            view.status = Some(format!(
-                                "已填入原终端 {}（代次 {}），尚未执行；请检查原终端输入。",
-                                binding.session_id, binding.session_generation
-                            ));
-                        }
-                        cx.notify();
-                        return;
-                    }
+                    let context_matches = view.snippet_fill_generation == request_generation
+                        && view.session_view_generation == session_view_generation
+                        && view.snippet_generation == snippet_generation
+                        && view.snippet_editor_generation == editor_generation
+                        && view.ui_session_binding.as_ref() == Some(&binding);
                     match result {
+                        Ok(SnippetRunHistory::Failed { .. }) => {
+                            if context_matches {
+                                view.status = Some(command_message(
+                                    "已发送到终端，历史记录失败",
+                                    "Sent to terminal; history could not be saved",
+                                ));
+                            }
+                        }
                         Ok(_) => {
-                            view.status =
-                                Some("已填入终端，尚未执行；可继续编辑后按回车".to_owned());
-                            cx.emit(SnippetTerminalFillCompleted {
-                                binding: binding.clone(),
-                                snippet_fill_generation: guard.request_generation,
-                                session_view_generation: guard.session_view_generation,
-                                expected_focus,
-                                snippet_editor_generation,
-                            });
+                            if context_matches {
+                                view.status =
+                                    Some(command_message("已发送到终端", "Sent to terminal"));
+                            }
                         }
                         Err(error) if error.public_code() == PublicErrorCode::OutcomeUnknown => {
                             view.snippet_terminal_fill.unknown_target = Some(binding.clone());
-                            view.status =
-                                Some("填入结果未知，请检查原终端后核对；不会自动重放".to_owned());
+                            view.status = Some(command_message(
+                                "发送结果未知，请检查原终端",
+                                "Send result is unknown; check the original terminal",
+                            ));
                         }
-                        Err(error) => view.status = Some(error.to_string()),
+                        Err(error) if error.public_code() == PublicErrorCode::Cancelled => {
+                            if !context_matches {
+                                cx.notify();
+                                return;
+                            }
+                            view.status = Some(command_message("发送已取消", "Send cancelled"));
+                        }
+                        Err(error) if context_matches => {
+                            view.status = Some(error.public_message().to_owned())
+                        }
+                        Err(_) => {}
                     }
                     cx.notify();
                 });
@@ -226,7 +289,9 @@ impl CommandsView {
         cx.notify();
     }
 
-    /// 取消等待 writer 回执；未知状态的核对按钮只解除门禁，不把未知记录改报成功。
+    /// 取消尚未开始的发送；未知状态的核对按钮只解除重发门禁。
+    ///
+    /// @author kongweiguang
     pub(super) fn render_snippet_fill_feedback(
         &self,
         theme: ThemeTokens,
@@ -243,9 +308,9 @@ impl CommandsView {
                 Button::new("snippet-fill-cancel")
                     .ghost()
                     .label(if cancellation.is_cancelled() {
-                        "正在等待填入回执…"
+                        crate::locale::text("等待中…", "Waiting…")
                     } else {
-                        "取消填入"
+                        crate::locale::text("取消发送", "Cancel send")
                     })
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.cancel_terminal_fill();
@@ -253,19 +318,23 @@ impl CommandsView {
                     })),
             );
         }
-        if let Some(target) = self.snippet_terminal_fill.unknown_target.as_ref() {
+        if self.snippet_terminal_fill.unknown_target.is_some() {
             content = content
-                .child(format!(
-                    "请核对原终端 {}（代次 {}）的输入，避免重复填入。",
-                    target.session_id, target.session_generation
+                .child(crate::locale::text(
+                    "发送结果未知，请检查原终端",
+                    "Send result is unknown; check the original terminal",
                 ))
                 .child(
                     Button::new("snippet-fill-reviewed")
                         .ghost()
-                        .label("已核对原终端")
+                        .label(crate::locale::text(
+                            "已检查原终端，允许再次发送",
+                            "I checked the original terminal; allow another send",
+                        ))
                         .on_click(cx.listener(|view, _, _, cx| {
                             view.snippet_terminal_fill.unknown_target = None;
-                            view.status = Some("已记录核对；需要时可再次填入".to_owned());
+                            view.status =
+                                Some(command_message("已核对原终端", "Original terminal checked"));
                             cx.notify();
                         })),
                 );

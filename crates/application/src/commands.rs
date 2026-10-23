@@ -26,7 +26,7 @@ use crate::{
     AppError, AppResult, PublicErrorCode,
     configuration_changes::{ConfigurationChangeService, ConfigurationChangeSubscription},
     preferences::PreferencesService,
-    sessions::{SessionFilter, SessionService},
+    sessions::{SessionFilter, SessionService, UiSessionBinding, UiSnippetCommandLineRequest},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -74,7 +74,10 @@ pub use snippet_transfer_file::{
     SnippetTransferFileConfirmation, SnippetTransferFilePort, SnippetTransferFileService,
     SnippetTransferFileWriteReceipt,
 };
-pub use snippets::{SnippetRenderDialect, SnippetRenderResult, render_snippet_definition};
+pub use snippets::{
+    SnippetRenderDialect, SnippetRenderResult, direct_snippet_catalog_command,
+    direct_snippet_command, render_snippet_definition,
+};
 pub use submission::{
     TerminalInputSubmissionReceipt, UiTerminalInputSubmissionResult, UiTerminalSubmissionRequest,
 };
@@ -325,6 +328,35 @@ pub struct BroadcastDeliveryResult {
 pub struct BroadcastExecutionResult {
     pub analysis: BroadcastAnalysis,
     pub deliveries: Vec<BroadcastDeliveryResult>,
+}
+
+/// 同一逐目标执行循环服务普通广播和片段发送；片段用完整 UI binding 做 generation CAS。
+enum BroadcastBindings {
+    Stable(Vec<BroadcastSessionBinding>),
+    Ui(Vec<UiSessionBinding>),
+}
+
+/// 保持广播入口的来源、敏感性和目标写法成组传递，避免调用参数与历史策略错位。
+#[derive(Clone, Copy)]
+struct BroadcastMode {
+    history_source: CommandHistorySource,
+    sensitive: bool,
+}
+
+/// 写入前解析出的稳定接收方；带 UI binding 的片段路径由 session writer 原子核对 owner/generation。
+struct ResolvedBroadcastTarget {
+    pane_id: PaneId,
+    session_id: SessionId,
+    ui_binding: Option<UiSessionBinding>,
+}
+
+/// 逐目标交付所需的不可变快照；共享循环统一处理取消、写入回执和历史策略。
+struct BroadcastDeliveryPlan<'a> {
+    analysis: BroadcastAnalysis,
+    targets: Vec<ResolvedBroadcastTarget>,
+    sessions: &'a [SessionInfo],
+    cancellations: &'a [CancellationToken],
+    mode: BroadcastMode,
 }
 
 /// 命令用例聚合稳定 repository ports 与唯一 SessionService。
@@ -744,42 +776,80 @@ impl CommandsService {
         confirmed: bool,
         cancellation: CancellationToken,
     ) -> AppResult<BroadcastExecutionResult> {
-        self.broadcast_inner(command, targets, bindings, confirmed, &[cancellation])
-            .await
+        self.broadcast_inner(
+            command,
+            targets,
+            BroadcastBindings::Stable(bindings),
+            confirmed,
+            &[cancellation],
+            BroadcastMode {
+                history_source: CommandHistorySource::Broadcast,
+                sensitive: false,
+            },
+        )
+        .await
     }
 
-    /// 借用取消源集合复用单令牌和多令牌入口，逐目标直接检查以避免外层 select 的调度竞态。
+    /// 借用取消源集合复用单令牌和多令牌入口；UI 片段先用 trim 结果拒绝空白，再恢复原展开正文，普通广播保留既有 trim 语义。
     ///
     /// @author kongweiguang
     async fn broadcast_inner(
         &self,
         command: String,
         targets: Vec<BroadcastTarget>,
-        bindings: Vec<BroadcastSessionBinding>,
+        bindings: BroadcastBindings,
         confirmed: bool,
         cancellations: &[CancellationToken],
+        mode: BroadcastMode,
     ) -> AppResult<BroadcastExecutionResult> {
-        if targets.is_empty() || targets.len() > 64 || bindings.len() != targets.len() {
+        let binding_count = match &bindings {
+            BroadcastBindings::Stable(bindings) => bindings.len(),
+            BroadcastBindings::Ui(bindings) => bindings.len(),
+        };
+        if targets.is_empty() || targets.len() > 64 || binding_count != targets.len() {
             return Err(AppError::invalid("广播目标数量无效"));
         }
-        let analysis = BroadcastAnalysis::analyze(&command, targets);
+        let mut analysis = BroadcastAnalysis::analyze(&command, targets);
         if !analysis.is_sendable() {
             return Err(AppError::invalid("广播命令或目标为空"));
         }
         if analysis.requires_confirmation && !confirmed {
             return Err(AppError::conflict("广播需要用户确认"));
         }
-        validate_broadcast_bindings(&analysis, &bindings)?;
+        if matches!(&bindings, BroadcastBindings::Ui(_)) {
+            analysis.command = command;
+            analysis.data = format!("{}\r", analysis.command);
+        }
+        validate_broadcast_binding_shape(&analysis, &bindings)?;
         let sessions = self.sessions.list(SessionFilter::default()).await?;
-        let resolved = resolve_broadcast_sessions(&analysis, &bindings, &sessions)?;
-        let bytes = analysis.data.as_bytes().to_vec();
-        let mut deliveries = Vec::with_capacity(resolved.len());
-        for (pane_id, session_id) in resolved {
-            let cancelled = cancellations.iter().any(CancellationToken::is_cancelled);
+        let resolved = resolve_broadcast_targets(&analysis, &bindings, &sessions)?;
+        self.deliver_broadcast_targets(BroadcastDeliveryPlan {
+            analysis,
+            targets: resolved,
+            sessions: &sessions,
+            cancellations,
+            mode,
+        })
+        .await
+    }
+
+    /// 逐目标一次写入，并共享普通广播和片段发送的取消、敏感历史与部分失败语义。
+    ///
+    /// @author kongweiguang
+    async fn deliver_broadcast_targets(
+        &self,
+        plan: BroadcastDeliveryPlan<'_>,
+    ) -> AppResult<BroadcastExecutionResult> {
+        let mut deliveries = Vec::with_capacity(plan.targets.len());
+        for target in plan.targets {
+            let cancelled = plan
+                .cancellations
+                .iter()
+                .any(CancellationToken::is_cancelled);
             if cancelled {
                 deliveries.push(BroadcastDeliveryResult {
-                    pane_id,
-                    session_id,
+                    pane_id: target.pane_id,
+                    session_id: target.session_id,
                     attempted: false,
                     sent: false,
                     cancelled: true,
@@ -790,41 +860,66 @@ impl CommandsService {
                 });
                 continue;
             }
-            let session = sessions
+            let session = plan
+                .sessions
                 .iter()
-                .find(|session| session.session_id == session_id)
+                .find(|session| session.session_id == target.session_id)
                 .ok_or_else(|| AppError::not_found("广播终端会话不存在"))?;
-            let result = self.sessions.write(session_id.clone(), bytes.clone()).await;
+            let result = match &target.ui_binding {
+                Some(binding) => self
+                    .sessions
+                    .submit_ui_snippet_command_line(UiSnippetCommandLineRequest {
+                        binding: binding.clone(),
+                        command: plan.analysis.command.clone(),
+                    })
+                    .await
+                    .map(|_| ()),
+                None => {
+                    self.sessions
+                        .write(
+                            target.session_id.clone(),
+                            plan.analysis.data.as_bytes().to_vec(),
+                        )
+                        .await
+                }
+            };
             let (sent, error_code) = match result {
                 Ok(()) => (true, None),
                 Err(error) => (false, Some(error.public_code())),
             };
-            let (history_recorded, history_skip_reason, history_error_code) = if sent {
-                match self
-                    .record_history(CommandHistoryRecordRequest {
-                        command: analysis.command.clone(),
-                        source: CommandHistorySource::Broadcast,
-                        target: execution::history_target(&session.target),
-                        record: Some(true),
-                        session_id: Some(session.session_id.clone()),
-                        pane_id: execution::owner_pane(&session.owner),
-                        tab_id: execution::owner_tab(&session.owner),
-                        profile_id: None,
-                        remote_host_id: execution::target_host(&session.target),
-                        cwd: execution::target_cwd(&session.target),
-                        shell: execution::local_shell(&session.target),
-                    })
-                    .await
-                {
-                    Ok(result) => (Some(result.recorded), result.skip_reason, None),
-                    Err(error) => (None, None, Some(error.public_code())),
-                }
-            } else {
-                (None, None, None)
-            };
+            let (history_recorded, history_skip_reason, history_error_code) =
+                if sent && plan.mode.sensitive {
+                    (
+                        Some(false),
+                        Some("敏感片段不会写入命令历史".to_owned()),
+                        None,
+                    )
+                } else if sent {
+                    match self
+                        .record_history(CommandHistoryRecordRequest {
+                            command: plan.analysis.command.clone(),
+                            source: plan.mode.history_source,
+                            target: execution::history_target(&session.target),
+                            record: Some(true),
+                            session_id: Some(session.session_id.clone()),
+                            pane_id: execution::owner_pane(&session.owner),
+                            tab_id: execution::owner_tab(&session.owner),
+                            profile_id: None,
+                            remote_host_id: execution::target_host(&session.target),
+                            cwd: execution::target_cwd(&session.target),
+                            shell: execution::local_shell(&session.target),
+                        })
+                        .await
+                    {
+                        Ok(result) => (Some(result.recorded), result.skip_reason, None),
+                        Err(error) => (None, None, Some(error.public_code())),
+                    }
+                } else {
+                    (None, None, None)
+                };
             deliveries.push(BroadcastDeliveryResult {
-                pane_id,
-                session_id,
+                pane_id: target.pane_id,
+                session_id: target.session_id,
                 attempted: true,
                 sent,
                 cancelled: false,
@@ -835,7 +930,7 @@ impl CommandsService {
             });
         }
         Ok(BroadcastExecutionResult {
-            analysis,
+            analysis: plan.analysis,
             deliveries,
         })
     }
@@ -864,9 +959,53 @@ impl CommandsService {
         let mut operation = Box::pin(self.broadcast_inner(
             command,
             targets,
-            bindings,
+            BroadcastBindings::Stable(bindings),
             confirmed,
             &cancellation_sources,
+            BroadcastMode {
+                history_source: CommandHistorySource::Broadcast,
+                sensitive: false,
+            },
+        ));
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = user_cancellation.cancelled() => {},
+            _ = application_cancellation.cancelled() => {},
+        }
+        cancellation.cancel();
+        operation.await
+    }
+
+    /// 片段按钮本身是用户的发送动作，因此不再弹第二次风险确认；敏感正文不会进入历史。
+    ///
+    /// @author kongweiguang
+    pub async fn broadcast_snippet_with_cancellation(
+        &self,
+        snippet: SnippetRenderResult,
+        targets: Vec<BroadcastTarget>,
+        bindings: Vec<UiSessionBinding>,
+        user_cancellation: CancellationToken,
+        application_cancellation: CancellationToken,
+    ) -> AppResult<BroadcastExecutionResult> {
+        let cancellation = CancellationToken::new();
+        if user_cancellation.is_cancelled() || application_cancellation.is_cancelled() {
+            cancellation.cancel();
+        }
+        let cancellation_sources = [
+            cancellation.clone(),
+            user_cancellation.clone(),
+            application_cancellation.clone(),
+        ];
+        let mut operation = Box::pin(self.broadcast_inner(
+            snippet.command,
+            targets,
+            BroadcastBindings::Ui(bindings),
+            true,
+            &cancellation_sources,
+            BroadcastMode {
+                history_source: CommandHistorySource::Snippet,
+                sensitive: snippet.sensitive,
+            },
         ));
         tokio::select! {
             result = &mut operation => return result,
@@ -926,6 +1065,52 @@ fn validate_broadcast_bindings(
     Ok(())
 }
 
+/// 在读取 session 快照前拒绝缺失、重复、非 UI 或未选中的片段目标绑定。
+///
+/// @author kongweiguang
+fn validate_broadcast_binding_shape(
+    analysis: &BroadcastAnalysis,
+    bindings: &BroadcastBindings,
+) -> AppResult<()> {
+    match bindings {
+        BroadcastBindings::Stable(bindings) => validate_broadcast_bindings(analysis, bindings),
+        BroadcastBindings::Ui(bindings) => {
+            if bindings
+                .iter()
+                .any(|binding| !matches!(&binding.owner, SessionOwner::Ui { .. }))
+            {
+                return Err(AppError::invalid("片段广播只能绑定可见 UI 分屏"));
+            }
+            for target in &analysis.targets {
+                let count = bindings
+                    .iter()
+                    .filter(|binding| {
+                        matches!(
+                            &binding.owner,
+                            SessionOwner::Ui { pane_id, .. } if pane_id == &target.pane_id
+                        )
+                    })
+                    .count();
+                if count != 1 {
+                    return Err(AppError::invalid("片段广播分屏绑定缺失或重复"));
+                }
+            }
+            if bindings.iter().any(|binding| {
+                let SessionOwner::Ui { pane_id, .. } = &binding.owner else {
+                    return true;
+                };
+                !analysis
+                    .targets
+                    .iter()
+                    .any(|target| target.pane_id == *pane_id)
+            }) {
+                return Err(AppError::invalid("片段广播包含未选择的分屏"));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// 在任何写入前确认显式 session 仍运行且仍归属相同 pane，失效目标不自动换 Tab。
 fn resolve_broadcast_sessions(
     analysis: &BroadcastAnalysis,
@@ -957,6 +1142,60 @@ fn resolve_broadcast_sessions(
             Ok((binding.pane_id.clone(), binding.session_id.clone()))
         })
         .collect()
+}
+
+/// 解析稳定广播或完整 UI binding；片段 generation 最终仍由唯一 session writer 原子复核。
+///
+/// @author kongweiguang
+fn resolve_broadcast_targets(
+    analysis: &BroadcastAnalysis,
+    bindings: &BroadcastBindings,
+    sessions: &[SessionInfo],
+) -> AppResult<Vec<ResolvedBroadcastTarget>> {
+    match bindings {
+        BroadcastBindings::Stable(bindings) => {
+            resolve_broadcast_sessions(analysis, bindings, sessions).map(|targets| {
+                targets
+                    .into_iter()
+                    .map(|(pane_id, session_id)| ResolvedBroadcastTarget {
+                        pane_id,
+                        session_id,
+                        ui_binding: None,
+                    })
+                    .collect()
+            })
+        }
+        BroadcastBindings::Ui(bindings) => analysis
+            .targets
+            .iter()
+            .map(|target| {
+                let binding = bindings
+                    .iter()
+                    .find(|binding| {
+                        matches!(
+                            &binding.owner,
+                            SessionOwner::Ui { pane_id, .. } if pane_id == &target.pane_id
+                        )
+                    })
+                    .ok_or_else(|| AppError::not_found("片段广播分屏绑定已失效"))?;
+                let session = sessions
+                    .iter()
+                    .find(|session| session.session_id == binding.session_id)
+                    .ok_or_else(|| AppError::not_found("片段广播终端会话不存在"))?;
+                if session.owner != binding.owner
+                    || session.lifecycle != SessionLifecycle::Running
+                    || !target_matches_session(target.target, &session.target)
+                {
+                    return Err(AppError::conflict("片段广播终端目标已经变化"));
+                }
+                Ok(ResolvedBroadcastTarget {
+                    pane_id: target.pane_id.clone(),
+                    session_id: binding.session_id.clone(),
+                    ui_binding: Some(binding.clone()),
+                })
+            })
+            .collect(),
+    }
 }
 
 /// 对照协议类别而不把本地与远端 host ID 丢失后误认为同一运行目标。

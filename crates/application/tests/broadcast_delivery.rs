@@ -7,7 +7,13 @@ mod support;
 
 use std::sync::Arc;
 
-use kerminal_application::{PublicErrorCode, commands::BroadcastExecutionResult};
+use kerminal_application::{
+    PublicErrorCode,
+    commands::{
+        BroadcastExecutionResult, SnippetExecutionService, SnippetRenderResult, SnippetRunHistory,
+    },
+    sessions::UiSessionBinding,
+};
 use kerminal_domain::{
     commands::CommandHistoryTarget,
     identity::{PaneId, SessionId, TabId},
@@ -181,6 +187,143 @@ async fn invalid_broadcast_binding_is_rejected_without_session_writes() {
     assert!(result.is_err());
     assert!(sessions.writes().is_empty());
     assert_eq!(sessions.list_calls(), 0);
+}
+
+/// 片段经群发仍须把首尾空白和换行原样交给 UI writer；trim 仅用于拒绝空白正文，敏感正文不进历史。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn sensitive_snippet_uses_direct_ui_writer_without_history_or_shell_gate() {
+    let session_id = SessionId::new();
+    let tab_id = TabId::new();
+    let pane_id = PaneId::new();
+    let sessions = Arc::new(BroadcastSessions::new(
+        vec![ui_session(
+            session_id.clone(),
+            tab_id.clone(),
+            pane_id.clone(),
+        )],
+        [WriteAction::Succeed],
+    ));
+    let (target, _) = target_and_binding(
+        session_id.clone(),
+        pane_id.clone(),
+        CommandHistoryTarget::Local,
+        "local unknown shell",
+    );
+    let binding = UiSessionBinding {
+        session_id: session_id.clone(),
+        owner: kerminal_domain::sessions::SessionOwner::Ui { tab_id, pane_id },
+        session_generation: 7,
+    };
+    let snippet_command = "\n  echo secret \t\r\n ".to_owned();
+
+    let result = commands_service(Arc::clone(&sessions))
+        .broadcast_snippet_with_cancellation(
+            SnippetRenderResult {
+                command: snippet_command.clone(),
+                sensitive: true,
+            },
+            vec![target.clone()],
+            vec![binding.clone()],
+            CancellationToken::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the explicit click is the send action; shell readiness is not required");
+
+    assert_eq!(sessions.writes(), vec![session_id.clone()]);
+    assert_eq!(
+        sessions.snippet_submissions(),
+        vec![
+            kerminal_application::sessions::UiSnippetCommandLineRequest {
+                binding: binding.clone(),
+                command: snippet_command,
+            }
+        ]
+    );
+    assert_eq!(sessions.history_writes(), 0);
+    assert!(result.deliveries[0].sent);
+    assert_eq!(result.deliveries[0].history_recorded, Some(false));
+    assert_eq!(
+        result.deliveries[0].history_skip_reason.as_deref(),
+        Some("敏感片段不会写入命令历史")
+    );
+
+    let rejected = commands_service(Arc::clone(&sessions))
+        .broadcast_snippet_with_cancellation(
+            SnippetRenderResult {
+                command: " \r\n\t ".to_owned(),
+                sensitive: true,
+            },
+            vec![target],
+            vec![binding],
+            CancellationToken::new(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("whitespace-only snippets remain unsendable");
+
+    assert_eq!(rejected.public_code(), PublicErrorCode::Invalid);
+    assert_eq!(sessions.writes(), vec![session_id]);
+    assert_eq!(sessions.snippet_submissions().len(), 1);
+}
+
+/// 右栏直发同样只提交一次固定目标；没有目录或 prompt 能力也能发送，未知回执不重试。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn sidebar_snippet_direct_send_uses_one_writer_and_preserves_unknown_result() {
+    for (action, expected_unknown) in [
+        (WriteAction::Succeed, false),
+        (WriteAction::OutcomeUnknown, true),
+    ] {
+        let session_id = SessionId::new();
+        let tab_id = TabId::new();
+        let pane_id = PaneId::new();
+        let sessions = Arc::new(BroadcastSessions::new(
+            vec![ui_session(
+                session_id.clone(),
+                tab_id.clone(),
+                pane_id.clone(),
+            )],
+            [action],
+        ));
+        let commands = Arc::new(commands_service(sessions.clone()));
+        let service = SnippetExecutionService::new(commands, sessions.clone());
+        let result = service
+            .send_direct(
+                SnippetRenderResult {
+                    command: "echo one\necho two".to_owned(),
+                    sensitive: true,
+                },
+                UiSessionBinding {
+                    session_id: session_id.clone(),
+                    owner: kerminal_domain::sessions::SessionOwner::Ui { tab_id, pane_id },
+                    session_generation: 7,
+                },
+                true,
+                CancellationToken::new(),
+            )
+            .await;
+
+        if expected_unknown {
+            assert_eq!(
+                result
+                    .expect_err("unknown write stays unknown")
+                    .public_code(),
+                PublicErrorCode::OutcomeUnknown
+            );
+        } else {
+            assert_eq!(
+                result.expect("unknown shell does not block a direct send"),
+                SnippetRunHistory::SkippedSensitive
+            );
+        }
+        assert_eq!(sessions.writes(), vec![session_id]);
+        assert_eq!(sessions.snippet_submissions().len(), 1);
+        assert_eq!(sessions.history_writes(), 0);
+    }
 }
 
 /// 结果条数必须与完整目标集合相同，避免错误或取消后丢失未尝试目标。
