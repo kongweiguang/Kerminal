@@ -3,10 +3,8 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { defaultAppSettings } from "../../../../src/features/settings/settingsModel";
 import { describe, expect, it } from "vitest";
-import {
-  mocks,
-  terminalAppearanceWithInlineSuggestion,
-} from "../../support/terminal/XtermPane.testSupport.tsx";
+import { mocks } from "../../support/terminal/XtermPane.testSupport.tsx";
+import { terminalAppearanceWithInlineSuggestion } from "../../support/terminal/XtermPane.testUtilities";
 import { XtermPane } from "../../../../src/features/terminal/XtermPane";
 
 describe("XtermPane remote suggestions", () => {

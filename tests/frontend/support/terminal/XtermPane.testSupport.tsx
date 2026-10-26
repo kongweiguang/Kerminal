@@ -1,10 +1,6 @@
 // @author kongweiguang
 
 import { afterEach, beforeEach, vi } from "vitest";
-import {
-  mockElementBox,
-  terminalAppearanceWithInlineSuggestion,
-} from "./XtermPane.testUtilities";
 import { terminalSuggestionProbeScheduler } from "../../../../src/features/terminal/terminalSuggestionProbeScheduler";
 import type { TerminalOutputEvent } from "../../../../src/lib/terminalApi";
 const mocks = vi.hoisted(() => {
@@ -734,8 +730,6 @@ afterEach(() => {
 
 export {
   installClipboardMock,
-  mockElementBox,
   mocks,
   setTerminalBufferLines,
-  terminalAppearanceWithInlineSuggestion,
 };

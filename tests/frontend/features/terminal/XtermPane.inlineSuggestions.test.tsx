@@ -3,10 +3,8 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import { defaultAppSettings } from "../../../../src/features/settings/settingsModel";
 import { Profiler, type ProfilerOnRenderCallback } from "react";
 import { describe, expect, it, vi } from "vitest";
-import {
-  mockElementBox,
-  mocks,
-} from "../../support/terminal/XtermPane.testSupport.tsx";
+import { mocks } from "../../support/terminal/XtermPane.testSupport.tsx";
+import { mockElementBox } from "../../support/terminal/XtermPane.testUtilities";
 import { XtermPane } from "../../../../src/features/terminal/XtermPane";
 
 describe("XtermPane inline suggestions", () => {
