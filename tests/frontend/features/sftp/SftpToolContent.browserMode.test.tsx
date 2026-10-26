@@ -1,5 +1,7 @@
+// @author kongweiguang
+
 import { fireEvent, render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
@@ -8,55 +10,70 @@ import {
 } from "../../support/sftp/SftpToolContent.testSupport.tsx";
 import { SftpToolContent } from "../../../../src/features/sftp/SftpToolContent";
 
-describe("SftpToolContent browser modes", () => {
-  it("switches between list, tree, and workspace modes without removing the list default", async () => {
-    const user = userEvent.setup();
+/** 通过用户可见菜单切换视图，避免耦合工具栏的内部按钮结构。 */
+async function chooseMode(
+  user: UserEvent,
+  name: "列表模式" | "树形模式" | "工作区模式",
+) {
+  await user.click(screen.getByRole("button", { name: "切换文件视图" }));
+  await user.click(screen.getByRole("menuitemradio", { name }));
+}
 
+describe("SftpToolContent browser modes", () => {
+  it("switches between list, tree, and workspace through the view menu", async () => {
+    const user = userEvent.setup();
     render(<SftpToolContent selectedMachine={sshMachine} />);
 
-    expect(
-      await screen.findByTestId("sftp-remote-entry-list"),
-    ).toBeInTheDocument();
-    expect(screen.getByTestId("sftp-browser-mode-list")).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-    expect(screen.queryByText("远程目录")).not.toBeInTheDocument();
+    await screen.findByTestId("sftp-remote-entry-list");
+    await chooseMode(user, "树形模式");
+    expect(screen.queryByTestId("sftp-remote-entry-list")).not.toBeInTheDocument();
+    expect(screen.getByRole("tree", { name: "SFTP 目录树" })).toBeInTheDocument();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "切换文件视图" })).toHaveFocus();
 
-    await user.click(screen.getByTestId("sftp-browser-mode-tree"));
+    await chooseMode(user, "工作区模式");
+    expect(screen.queryByRole("tree")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "在中间打开选中文件" })).toBeDisabled();
 
-    expect(
-      screen.queryByTestId("sftp-remote-entry-list"),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("tree", { name: "SFTP 目录树" }),
-    ).toBeInTheDocument();
-    expect(screen.getByText("目录树")).toBeInTheDocument();
-    expect(screen.getByTestId("sftp-browser-mode-tree")).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    await chooseMode(user, "列表模式");
+    expect(await screen.findByTestId("sftp-remote-entry-list")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "切换文件视图" }));
+    expect(screen.getByRole("menuitemradio", { name: "列表模式" })).toBeChecked();
+  });
 
-    await user.click(screen.getByTestId("sftp-browser-mode-workspace"));
+  it("supports keyboard selection and dismisses without changing modes or stealing outside focus", async () => {
+    const user = userEvent.setup();
+    render(<SftpToolContent selectedMachine={sshMachine} />);
+    await screen.findByTestId("sftp-remote-entry-list");
+    const trigger = screen.getByRole("button", { name: "切换文件视图" });
+    trigger.focus();
+    await user.keyboard("{ArrowDown}");
+    expect(screen.getByRole("menuitemradio", { name: "列表模式" })).toHaveFocus();
+    await user.keyboard("{ArrowDown}{Enter}");
+    expect(screen.getByRole("tree", { name: "SFTP 目录树" })).toBeInTheDocument();
+    expect(trigger).toHaveFocus();
 
-    expect(screen.getByText("文件工作区")).toBeInTheDocument();
-    expect(screen.getByText("当前根目录")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "右栏只负责导航和文件操作；文件正文会打开到中间工作区 tab。",
-      ),
-    ).toBeInTheDocument();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("menuitemradio", { name: "树形模式" })).toBeChecked();
+    expect(screen.getByRole("menuitemradio", { name: "树形模式" })).toHaveFocus();
+    await user.keyboard("{End}");
+    expect(screen.getByRole("menuitemradio", { name: "工作区模式" })).toHaveFocus();
+    await user.keyboard("{Home}{ArrowUp}");
+    expect(screen.getByRole("menuitemradio", { name: "工作区模式" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(screen.getByRole("tree", { name: "SFTP 目录树" })).toBeInTheDocument();
 
-    await user.click(screen.getByTestId("sftp-browser-mode-list"));
-
-    expect(
-      await screen.findByTestId("sftp-remote-entry-list"),
-    ).toBeInTheDocument();
-    expect(screen.getByTestId("sftp-browser-mode-list")).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-    expect(screen.queryByText("远程目录")).not.toBeInTheDocument();
+    await user.click(trigger);
+    const path = screen.getByRole("textbox", { name: "当前远程路径" });
+    await user.click(path);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(path).toHaveFocus();
+    await user.click(trigger);
+    await user.tab();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(screen.getByRole("tree", { name: "SFTP 目录树" })).toBeInTheDocument();
   });
 
   it("preserves expanded tree directories when switching browser modes", async () => {
@@ -65,7 +82,7 @@ describe("SftpToolContent browser modes", () => {
     render(<SftpToolContent selectedMachine={sshMachine} />);
 
     await screen.findByTestId("sftp-remote-entry-list");
-    await user.click(screen.getByTestId("sftp-browser-mode-tree"));
+    await chooseMode(user, "树形模式");
 
     const varNode = await screen.findByRole("treeitem", { name: "var" });
     await user.click(varNode);
@@ -74,9 +91,9 @@ describe("SftpToolContent browser modes", () => {
     );
     expect(await screen.findByRole("treeitem", { name: "log" })).toBeInTheDocument();
 
-    await user.click(screen.getByTestId("sftp-browser-mode-list"));
+    await chooseMode(user, "列表模式");
     await screen.findByTestId("sftp-remote-entry-list");
-    await user.click(screen.getByTestId("sftp-browser-mode-tree"));
+    await chooseMode(user, "树形模式");
 
     expect(
       await screen.findByRole("treeitem", { name: "var" }),
@@ -90,7 +107,7 @@ describe("SftpToolContent browser modes", () => {
     render(<SftpToolContent selectedMachine={sshMachine} />);
 
     await screen.findByTestId("sftp-remote-entry-list");
-    await user.click(screen.getByTestId("sftp-browser-mode-tree"));
+    await chooseMode(user, "树形模式");
 
     expect(
       await screen.findByRole("treeitem", { name: ".env" }),
@@ -118,7 +135,7 @@ describe("SftpToolContent browser modes", () => {
     render(<SftpToolContent selectedMachine={sshMachine} />);
 
     await screen.findByTestId("sftp-remote-entry-list");
-    await user.click(screen.getByTestId("sftp-browser-mode-tree"));
+    await chooseMode(user, "树形模式");
 
     const varNode = await screen.findByRole("treeitem", { name: "var" });
     fireEvent.contextMenu(varNode, { clientX: 32, clientY: 48 });

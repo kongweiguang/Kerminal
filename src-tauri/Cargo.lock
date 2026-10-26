@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "kerminal"
-version = "0.3.47"
+version = "0.3.48"
 dependencies = [
  "async-trait",
  "axum",

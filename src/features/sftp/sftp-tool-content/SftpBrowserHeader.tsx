@@ -5,11 +5,13 @@
 import {
   ArrowLeft,
   ArrowRight,
+  Check,
   ChevronUp,
   CornerDownRight,
   Download,
   Eye,
   EyeOff,
+  Ellipsis,
   FolderPlus,
   FolderTree,
   List,
@@ -19,7 +21,17 @@ import {
   Terminal,
   Upload,
 } from "lucide-react";
-import type { Dispatch, ReactNode, RefObject, SetStateAction } from "react";
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type Dispatch,
+  type KeyboardEvent,
+  type ReactNode,
+  type RefObject,
+  type SetStateAction,
+} from "react";
 import { Button } from "../../../components/ui/button";
 import { cn } from "../../../lib/cn";
 import { SftpBookmarkControl } from "../sftp-bookmark/SftpBookmarkControl";
@@ -33,7 +45,7 @@ import type {
 } from "./types";
 
 const dividerClassName =
-  "mx-1 hidden h-5 w-px bg-[var(--border-subtle)] min-[420px]:block";
+  "mx-1 hidden h-5 w-px bg-[var(--border-subtle)] @[360px]:block";
 
 interface SftpBrowserHeaderProps {
   actions: {
@@ -84,7 +96,7 @@ interface SftpBrowserHeaderProps {
   };
 }
 
-/** SFTP 浏览器的路径、跟随状态和目录操作 presenter。 */
+/** 路径与操作保持独立行；视图菜单和可截断计数让窄侧栏不再增加工具栏高度。 */
 export function SftpBrowserHeader({
   actions,
   chrome,
@@ -92,10 +104,16 @@ export function SftpBrowserHeader({
   navigation,
   summary,
 }: SftpBrowserHeaderProps) {
+  const summaryLabel = navigation.loading
+    ? "刷新中"
+    : `${summary.visibleEntryCount} / ${summary.entryCount} 项${
+        summary.selectedCount > 0 ? ` / 已选 ${summary.selectedCount}` : ""
+      }`;
+
   return (
     <header
       className={cn(
-        "kerminal-material-nav relative z-30 shrink-0 border-b",
+        "kerminal-material-nav @container relative z-30 shrink-0 border-b",
         chrome.headerPaddingClass,
       )}
     >
@@ -159,11 +177,11 @@ export function SftpBrowserHeader({
 
       <div
         className={cn(
-          "flex flex-wrap items-center justify-between gap-2",
+          "flex min-w-0 items-center justify-between gap-0.5 @[360px]:gap-2",
           chrome.compact ? "mt-2" : "mt-3",
         )}
       >
-        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-0.5 @[360px]:gap-1.5">
           <ToolbarButton
             ariaLabel="返回上级目录"
             disabled={!navigation.listing?.parentPath || navigation.loading}
@@ -226,17 +244,14 @@ export function SftpBrowserHeader({
           />
           <TransferAction actions={actions} />
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <div className="max-w-40 truncate font-mono text-xs text-zinc-500 dark:text-zinc-400">
-            {navigation.loading
-              ? "刷新中"
-              : `${summary.visibleEntryCount} / ${summary.entryCount} 项${
-                  summary.selectedCount > 0
-                    ? ` / 已选 ${summary.selectedCount}`
-                    : ""
-                }`}
+        <div className="flex min-w-0 flex-1 items-center justify-end gap-0.5 @[360px]:gap-2">
+          <div
+            className="min-w-0 max-w-40 truncate font-mono text-xs text-zinc-500 dark:text-zinc-400"
+            title={summaryLabel}
+          >
+            {summaryLabel}
           </div>
-          <SftpBrowserModeToggle
+          <SftpBrowserModeMenu
             mode={summary.browserMode}
             onModeChange={summary.setBrowserMode}
           />
@@ -341,42 +356,137 @@ function TransferAction({ actions }: Pick<SftpBrowserHeaderProps, "actions">) {
   );
 }
 
-function SftpBrowserModeToggle({
+/** 复用现有视图状态；菜单就地锚定，随面板缩放，退出时不抢走外部控件焦点。 */
+function SftpBrowserModeMenu({
   mode,
   onModeChange,
 }: {
   mode: SftpBrowserMode;
   onModeChange: Dispatch<SetStateAction<SftpBrowserMode>>;
 }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuId = useId();
   const items = [
     { icon: <List className="h-3.5 w-3.5" />, id: "list", label: "列表模式" },
     { icon: <FolderTree className="h-3.5 w-3.5" />, id: "tree", label: "树形模式" },
-    { icon: <PanelRight className="h-3.5 w-3.5" />, id: "workspace", label: "工作区模式" },
+    {
+      icon: <PanelRight className="h-3.5 w-3.5" />,
+      id: "workspace",
+      label: "工作区模式",
+    },
   ] satisfies Array<{ icon: ReactNode; id: SftpBrowserMode; label: string }>;
+
+  useEffect(() => {
+    if (!open) return;
+    rootRef.current?.querySelector<HTMLElement>('[aria-checked="true"]')?.focus();
+    const closeOutside = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        !rootRef.current?.contains(event.target)
+      ) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    return () => document.removeEventListener("pointerdown", closeOutside);
+  }, [open]);
+
+  const closeMenu = () => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  };
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (open) event.stopPropagation();
+    if (event.key === "Escape" && open) {
+      event.preventDefault();
+      closeMenu();
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!open) {
+      setOpen(true);
+      return;
+    }
+    const buttons = Array.from(
+      rootRef.current?.querySelectorAll<HTMLElement>('[role="menuitemradio"]') ?? [],
+    );
+    const index = buttons.indexOf(document.activeElement as HTMLElement);
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? buttons.length - 1
+          : (index + (event.key === "ArrowUp" ? -1 : 1) + buttons.length) %
+            buttons.length;
+    buttons[next]?.focus();
+  };
+
   return (
     <div
-      aria-label="SFTP 浏览模式"
-      className="kerminal-muted-surface flex shrink-0 items-center gap-0.5 rounded-lg border p-0.5"
-      role="group"
+      className="relative shrink-0"
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+      }}
+      onKeyDown={handleKeyDown}
+      ref={rootRef}
     >
-      {items.map((item) => (
-        <button
-          aria-label={item.label}
-          aria-pressed={mode === item.id}
-          className={cn(
-            "kerminal-focus-ring flex h-7 w-7 items-center justify-center rounded-md text-zinc-500 transition hover:bg-[var(--surface-hover)] hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-50",
-            mode === item.id &&
-              "bg-[var(--surface-selected)] text-sky-700 dark:text-sky-100",
-          )}
-          data-testid={`sftp-browser-mode-${item.id}`}
-          key={item.id}
-          onClick={() => onModeChange(item.id)}
-          title={item.label}
-          type="button"
+      <button
+        aria-controls={open ? menuId : undefined}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-label="切换文件视图"
+        className={cn(
+          "kerminal-focus-ring kerminal-pressable flex h-8 w-8 items-center justify-center rounded-md border transition",
+          open
+            ? "border-sky-400/45 bg-[var(--surface-selected)] text-sky-700 dark:text-sky-100"
+            : "kerminal-muted-surface text-zinc-600 hover:bg-[var(--surface-hover)] hover:text-zinc-950 dark:text-zinc-300 dark:hover:text-zinc-50",
+        )}
+        onClick={() => setOpen((current) => !current)}
+        ref={triggerRef}
+        title={`切换文件视图（当前：${items.find((item) => item.id === mode)?.label}）`}
+        type="button"
+      >
+        <Ellipsis aria-hidden="true" className="h-4 w-4" />
+      </button>
+      {open ? (
+        <div
+          aria-label="文件视图"
+          className="kerminal-floating-surface kerminal-layer-popover absolute right-0 top-[calc(100%+0.375rem)] w-40 rounded-[var(--radius-card)] border p-1"
+          id={menuId}
+          role="menu"
         >
-          {item.icon}
-        </button>
-      ))}
+          {items.map((item) => (
+            <button
+              aria-checked={mode === item.id}
+              className={cn(
+                "kerminal-focus-ring flex h-8 w-full items-center gap-2 rounded-[var(--radius-control)] px-2 text-left text-[13px] transition hover:bg-[var(--surface-hover)]",
+                mode === item.id
+                  ? "bg-[var(--surface-selected)] text-sky-700 dark:text-sky-100"
+                  : "text-zinc-700 dark:text-zinc-200",
+              )}
+              key={item.id}
+              onClick={() => {
+                onModeChange(item.id);
+                closeMenu();
+              }}
+              role="menuitemradio"
+              tabIndex={-1}
+              type="button"
+            >
+              {item.icon}
+              <span className="flex-1">{item.label}</span>
+              {mode === item.id ? (
+                <Check aria-hidden="true" className="h-3.5 w-3.5" />
+              ) : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
