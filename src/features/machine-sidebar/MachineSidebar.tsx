@@ -23,12 +23,10 @@ import {
   SIDEBAR_GROUP_DROP_TARGET_ATTRIBUTE,
   type MachineDragPreview,
   type MachineSidebarProps,
-  type MachineSidebarViewMode,
   type PointerMachineDrag,
   type SidebarContextMenu,
   type SidebarContextMenuPayload,
 } from "./MachineSidebar.shared";
-import { MachineSidebarContainersView } from "./MachineSidebarContainersView";
 import { MachineSidebarContextMenuPortal } from "./MachineSidebarContextMenuPortal";
 import { MachineSidebarHostList } from "./MachineSidebarHostList";
 import { MachineSidebarHeader } from "./MachineSidebarHeader";
@@ -61,41 +59,29 @@ function stringSetsEqual(left: Set<string>, right: Set<string>) {
   return true;
 }
 
-/** 更新入口沿用设置导航回调，让展开和折叠侧栏进入同一份全局更新状态。 */
+/** 主机树是唯一左栏视图；状态和快捷入口仍委托既有 workspace 与菜单回调。 */
 export function MachineSidebar({
-  activeView = "hosts",
   collapsed = false,
   collapsedGroupIds: controlledCollapsedGroupIds,
-  containerHostId,
-  containerInitialContainerId,
   groups,
   openMachineIds = [],
   rdpOpeningMachineIds = [],
-  onActiveViewChange,
   onAddConnection,
   onAddGroup,
   onAddMachine,
-  onContainerHostChange,
   onCollapsedGroupIdsChange,
   onDeleteGroup,
   onDeleteMachine,
   onDuplicateMachine,
-  onEnterContainer,
   onEditGroup,
   onEditMachine,
   onExternalMachineDrag,
   onExternalMachineDragEnd,
   onExternalMachineDrop,
-  onFetchContainerStats,
-  onInspectContainer,
-  onLifecycleContainer,
-  onListDockerContainers,
   onMoveMachine,
   onSearchChange,
   onOpenContainerDetails,
   onOpenHostContainers,
-  onOpenContainerLogs,
-  onOpenWorkspaceFileTab,
   onOpenLocalTerminal,
   onOpenContainerTerminal,
   onOpenRdpConnection,
@@ -108,7 +94,6 @@ export function MachineSidebar({
   onOpenTelnetTerminal,
   onOpenSerialTerminal,
   onPinGroup,
-  onPinContainer,
   onSelectMachine,
   search,
   selectedMachineId,
@@ -125,7 +110,6 @@ export function MachineSidebar({
   );
   const [draggingMachineId, setDraggingMachineId] = useState<string | null>(null);
   const [collapsedHostPopoverOpen, setCollapsedHostPopoverOpen] = useState(false);
-  const [containerRefreshRequestId, setContainerRefreshRequestId] = useState(0);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const collapsedHostButtonRef = useRef<HTMLButtonElement>(null);
   const collapsedHostPopoverRef = useRef<HTMLDivElement>(null);
@@ -363,18 +347,6 @@ export function MachineSidebar({
     });
   };
 
-  const switchSidebarView = (view: MachineSidebarViewMode) => {
-    if (view === "containers") {
-      const selectedMachine = groups
-        .flatMap((group) => group.machines)
-        .find((machine) => machine.id === selectedMachineId);
-      if (selectedMachine?.kind === "ssh") {
-        onContainerHostChange?.(selectedMachine.id);
-      }
-    }
-    onActiveViewChange?.(view);
-  };
-
   const openMachineSession = (machine: Machine) => {
     if (
       machine.kind === "rdp" &&
@@ -420,22 +392,14 @@ export function MachineSidebar({
     onSelectMachine(machine.id);
   };
 
+  /** 主机菜单把目标交给 Shell 统一解析，避免侧栏维护容器目标状态。 */
   const openHostContainersInSidebar = (machineId: string) => {
     onSelectMachine(machineId);
-    onContainerHostChange?.(machineId);
-    onActiveViewChange?.("containers");
     onOpenHostContainers?.(machineId);
   };
 
+  /** 固定容器详情导航由 Shell 结合其宿主机与运行时完成。 */
   const openContainerDetailsInSidebar = (machineId: string) => {
-    const machine = groups
-      .flatMap((group) => group.machines)
-      .find((candidate) => candidate.id === machineId);
-    if (machine?.kind === "dockerContainer" && machine.parentMachineId) {
-      onSelectMachine(machine.parentMachineId);
-      onContainerHostChange?.(machine.parentMachineId);
-      onActiveViewChange?.("containers");
-    }
     onOpenContainerDetails?.(machineId);
   };
 
@@ -697,56 +661,34 @@ export function MachineSidebar({
       onContextMenu={(event) => openContextMenu(event, { type: "root" })}
     >
       <MachineSidebarHeader
-        activeView={activeView}
         allGroupsCollapsed={allGroupsCollapsed}
         groupCount={groups.length}
         groupToggleLabel={groupToggleLabel}
         onOpenTransferWorkbench={onOpenTransferWorkbench}
-        onRefreshContainers={() => setContainerRefreshRequestId((requestId) => requestId + 1)}
         onSearchChange={onSearchChange}
         onToggleAllGroups={toggleAllGroups}
-        onViewChange={switchSidebarView}
         search={search}
       />
 
-      {activeView === "containers" ? (
-        <MachineSidebarContainersView
-          groups={groups}
-          hostId={containerHostId}
-          initialContainerId={containerInitialContainerId}
-          onEnterContainer={onEnterContainer}
-          onFetchContainerStats={onFetchContainerStats}
-          onHostChange={onContainerHostChange}
-          onInspectContainer={onInspectContainer}
-          onLifecycleContainer={onLifecycleContainer}
-          onListDockerContainers={onListDockerContainers}
-          onOpenContainerLogs={onOpenContainerLogs}
-          onOpenWorkspaceFileTab={onOpenWorkspaceFileTab}
-          onPinContainer={onPinContainer}
-          refreshRequestId={containerRefreshRequestId}
-          selectedMachineId={selectedMachineId}
-        />
-      ) : (
-        <MachineSidebarHostList
-          collapsedGroupIds={collapsedGroupIds}
-          dragOverGroupId={dragOverGroupId}
-          draggingMachineId={draggingMachineId}
-          groups={groups}
-          hasSearch={hasSearch}
-          onAddConnection={onAddConnection}
-          onMachineClick={handleMachineClick}
-          onMoveMachine={onMoveMachine}
-          onOpenContextMenu={openContextMenu}
-          onOpenMachineSession={openMachineSession}
-          onSelectMachine={onSelectMachine}
-          onStartPointerDrag={startPointerMachineDrag}
-          onToggleGroup={toggleGroup}
-          openMachineIdSet={openMachineIdSet}
-          rdpOpeningMachineIdSet={rdpOpeningMachineIdSet}
-          selectedMachineId={selectedMachineId}
-          visibleGroups={visibleGroups}
-        />
-      )}
+      <MachineSidebarHostList
+        collapsedGroupIds={collapsedGroupIds}
+        dragOverGroupId={dragOverGroupId}
+        draggingMachineId={draggingMachineId}
+        groups={groups}
+        hasSearch={hasSearch}
+        onAddConnection={onAddConnection}
+        onMachineClick={handleMachineClick}
+        onMoveMachine={onMoveMachine}
+        onOpenContextMenu={openContextMenu}
+        onOpenMachineSession={openMachineSession}
+        onSelectMachine={onSelectMachine}
+        onStartPointerDrag={startPointerMachineDrag}
+        onToggleGroup={toggleGroup}
+        openMachineIdSet={openMachineIdSet}
+        rdpOpeningMachineIdSet={rdpOpeningMachineIdSet}
+        selectedMachineId={selectedMachineId}
+        visibleGroups={visibleGroups}
+      />
 
       <div className={sidebarFooterClassName}>
         <div className="flex items-center gap-1">

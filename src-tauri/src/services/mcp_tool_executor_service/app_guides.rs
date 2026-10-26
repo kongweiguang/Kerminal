@@ -314,7 +314,7 @@ pub(super) fn execute_kerminal_app_guide(tools: &[ToolDefinition]) -> ToolExecut
                 },
                 {
                     "surface": "rightToolPanel",
-                    "userSees": "Agent Launcher, System, Files/SFTP, Ports, tmux, Snippets, Logs, and Settings.",
+                    "userSees": "Agent Launcher, Containers, System, Files/SFTP, Ports, tmux, Snippets, Logs, and Settings. The Containers tool is in the right rail and follows the focused terminal host; a container terminal resolves to its SSH host, while selecting a host in the left sidebar alone does not change the tool target.",
                     "aiCanDo": [
                         "Use runtime tools matching the right-panel domain.",
                         "Use file-first config for snippets, workflows, settings, hosts, and profiles.",

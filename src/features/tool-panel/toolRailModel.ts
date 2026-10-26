@@ -2,6 +2,7 @@
 
 import {
   Bot,
+  Box,
   Cpu,
   FileText,
   FolderOpen,
@@ -26,6 +27,7 @@ const toolRailToolIds = [
   "ports",
   "system",
   "logs",
+  "containers",
 ] as const satisfies readonly ToolId[];
 
 export type ToolRailToolId = (typeof toolRailToolIds)[number];
@@ -130,6 +132,12 @@ export const toolRailDefinitions: readonly ToolRailDefinition[] = [
     Icon: History,
     id: "logs",
     title: "命令历史",
+  },
+  {
+    description: "当前 SSH 主机的 Docker、Podman 和 Compose 容器",
+    Icon: Box,
+    id: "containers",
+    title: "容器",
   },
 ];
 

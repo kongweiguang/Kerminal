@@ -1,11 +1,12 @@
 // @author kongweiguang
 
 import { useState, type ReactNode } from "react";
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TerminalPane, TerminalTab } from "../../../../src/features/workspace/types";
 import { TerminalWorkspace } from "../../../../src/features/terminal/TerminalWorkspace";
+import { terminalInputSync } from "../../../../src/features/terminal/terminalInputSync";
 import {
   baseTerminalPane,
   batchPanes,
@@ -30,6 +31,30 @@ vi.mock("../../../../src/components/ui/resizable", () => ({
   ResizablePanel: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   ResizablePanelGroup: ({ children }: { children: ReactNode }) => <div>{children}</div>,
 }));
+
+const syncDisposers: Array<() => void> = [];
+
+/** 工具栏测试只替代连接资格；输入模型及真实 xterm 分别由集成用例覆盖。 */
+function connectBroadcastTargets(failReceiver = false) {
+  for (const pane of batchPanes) {
+    syncDisposers.push(terminalInputSync.register(pane.id, {
+      readBinding: () => ({ sessionId: `sync-${pane.id}`, connectionGeneration: 1, tabId: "tab-batch" }),
+      prepareMirroredInput: (input) => {
+        if (failReceiver && pane.id === "pane-batch-ssh") throw new Error("encoding failed");
+        return input.data;
+      },
+      observeMirroredInput: () => {},
+      onWriteError: () => {},
+    }));
+  }
+}
+
+afterEach(() => {
+  act(() => {
+    terminalInputSync.configure(null, []);
+    for (const dispose of syncDisposers.splice(0)) dispose();
+  });
+});
 
 describe("TerminalWorkspace broadcast command", () => {
   it("updates the broadcast command draft", async () => {
@@ -240,6 +265,34 @@ describe("TerminalWorkspace broadcast command", () => {
     });
   });
 
+  it("keeps an empty custom selection instead of sending to every pane", async () => {
+    const user = userEvent.setup();
+    const onBroadcastCommand = vi.fn();
+    render(
+      <TerminalWorkspace
+        {...workspaceProps({
+          activeTabId: "tab-batch",
+          broadcastDraft: "hostname",
+          focusedPaneId: "pane-batch-local",
+          onBroadcastCommand,
+          panes: batchPanes,
+          tabs: batchTabs,
+        })}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "发送目标：全部分屏 · 2" }));
+    const menu = screen.getByRole("menu", { name: "发送目标选择" });
+    await user.click(within(menu).getByRole("button", { name: /自定义/ }));
+    for (const checkbox of within(menu).getAllByRole("checkbox")) {
+      await user.click(checkbox);
+    }
+    expect(screen.getByRole("button", { name: "发送目标：自定义 · 0" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "没有可发送目标" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "同步终端输入" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "同步终端输入" }).parentElement).toHaveAttribute("title", "请至少选择两个终端分屏");
+    expect(onBroadcastCommand).not.toHaveBeenCalled();
+  });
+
   it("hides broadcast controls after switching from a split tab to a single pane tab", async () => {
     const user = userEvent.setup();
     const onBroadcastCommand = vi.fn().mockResolvedValue({
@@ -408,5 +461,48 @@ describe("TerminalWorkspace broadcast command", () => {
 
     expect(screen.getByRole("button", { name: "没有可发送目标" })).toBeDisabled();
     expect(onBroadcastCommand).not.toHaveBeenCalled();
+  });
+  it("keeps pointer focus, supports keyboard activation and stops rather than expanding a focused target", async () => {
+    const user = userEvent.setup();
+    connectBroadcastTargets();
+    const props = workspaceProps({ activeTabId: "tab-batch", focusedPaneId: "pane-batch-local", panes: batchPanes, tabs: batchTabs });
+    const { rerender } = render(<TerminalWorkspace {...props} />);
+    const toggle = screen.getByRole("switch", { name: "同步终端输入" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    await user.click(screen.getByLabelText("批量命令"));
+    await user.click(toggle);
+    expect(screen.getByLabelText("批量命令")).toHaveFocus();
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    rerender(<TerminalWorkspace {...props} focusedPaneId="pane-batch-ssh" />);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    await user.tab();
+    expect(toggle).toHaveFocus();
+    await user.keyboard(" ");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(toggle).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    await user.click(screen.getByRole("button", { name: "发送目标：全部分屏 · 2" }));
+    await user.click(within(screen.getByRole("menu", { name: "发送目标选择" })).getByRole("button", { name: /当前分屏/ }));
+    expect(toggle).toBeDisabled();
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(toggle.parentElement).toHaveAttribute("title", "请至少选择两个终端分屏");
+    expect(screen.getByRole("status")).toHaveTextContent("目标已变更，同步已关闭。");
+  });
+
+  it("shows send and synchronization failures together instead of masking either error", async () => {
+    const user = userEvent.setup();
+    connectBroadcastTargets(true);
+    render(<TerminalWorkspace {...workspaceProps({
+      activeTabId: "tab-batch", focusedPaneId: "pane-batch-local", panes: batchPanes, tabs: batchTabs,
+      broadcastDraft: "hostname", onBroadcastCommand: vi.fn().mockRejectedValue(new Error("send failure")),
+    })} />);
+    await user.click(screen.getByRole("button", { name: "发送到 2 个目标" }));
+    await user.click(screen.getByRole("switch", { name: "同步终端输入" }));
+    await act(async () => { await terminalInputSync.writeUserInput("pane-batch-local", { data: "x" }); });
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("send failure");
+    expect(alert).toHaveTextContent("同步已关闭：部分输入可能未送达，请检查各分屏后重新开启。");
+    expect(screen.getByRole("switch", { name: "同步终端输入" })).toHaveAttribute("aria-checked", "false");
   });
 });

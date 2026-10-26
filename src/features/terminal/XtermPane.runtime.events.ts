@@ -33,6 +33,10 @@ import type { RemoteTargetRef } from "../../lib/targetModel";
 import type { TerminalAppearance } from "../settings/contracts/index";
 import { updateTerminalPaneRuntimeContext } from "./terminalSessionRegistry";
 import { syncTerminalImeAnchor } from "./terminalImeAnchor";
+import { getTerminalPaneSessionRecord } from "./terminalSessionRegistry";
+import { terminalChromeRuntimeStore } from "./terminalChromeRuntimeStore";
+import { terminalInputSync } from "./terminalInputSync";
+import { getTerminalInputOrigin, withTerminalInputOrigin } from "./terminalInputOrigin";
 
 type CommandBlockRuntime = ReturnType<
   typeof createXtermPaneCommandBlockRuntime
@@ -79,10 +83,12 @@ interface RuntimeEventsParams {
   readShellIntegrationState: () => TerminalShellIntegrationState;
   writeShellIntegrationState: (state: TerminalShellIntegrationState) => void;
   onArtifactCommandBlock?: (id: string, command: string) => void;
+  onInputWriteError: () => void;
   onArtifactInvalidate?: (reason: "clear" | "restart") => void;
 }
 
 export interface XtermPaneRuntimeEvents {
+  commitUserInput: (data: string) => void;
   dispose: () => void;
 }
 
@@ -124,6 +130,7 @@ export function registerXtermPaneRuntimeEvents(
     writeShellIntegrationState,
     onArtifactCommandBlock,
     onArtifactInvalidate,
+    onInputWriteError,
   } = params;
 
   const reduceShellIntegration = (
@@ -134,22 +141,13 @@ export function registerXtermPaneRuntimeEvents(
     );
   };
 
-  const inputDisposable = terminal.onData((data) => {
-    activityRuntimeRef.current?.markUserInput();
-    terminalRuntimeLifecycleControllerRef.current?.markUserInteraction();
-    if (terminalInlineSshAuthPrompt.handleInput(data)) {
-      return;
-    }
+  let disposed = false;
+  let keyToken: { key: string } | undefined;
+
+  /** 统一观察已接受输入；镜像只更新自身模型，不接受本端候选或再次传播。 */
+  const observeCommittedInput = (data: string, source: "user" | "broadcast") => {
     const sessionId = sessionIdRef.current;
-    if (!sessionId) {
-      return;
-    }
-    if (
-      isRightArrowInput(data) &&
-      ghostSuggestions.acceptGhostSuggestion(sessionId)
-    ) {
-      return;
-    }
+    if (!sessionId || disposed) return;
     const printableInput = Array.from(data)
       .filter((character) => {
         const codePoint = character.codePointAt(0);
@@ -231,7 +229,7 @@ export function registerXtermPaneRuntimeEvents(
             containerHostId ?? telnetHostId ?? serialHostId ?? sshHostId,
           sessionId,
           shell,
-          source: "user",
+          source,
           target: containerHostId
             ? "dockerContainer"
             : telnetHostId
@@ -241,13 +239,79 @@ export function registerXtermPaneRuntimeEvents(
                 : sshHostId
                   ? "ssh"
                   : "local",
-        });
+        }).catch(() => {});
       }
     }
-    void writeTerminal(sessionId, data);
     if (collected.commands.length === 0) {
       commandBlockRuntime.scheduleCommandBlockViewSync();
-      ghostSuggestions.scheduleGhostSuggestion();
+      if (source === "broadcast" || !ghostSuggestions.isCommittingSuggestion()) {
+        ghostSuggestions.scheduleGhostSuggestion();
+      }
+    }
+  };
+
+  /** 手动输入先通过认证与会话门禁，再同步观察模型并进入逐 pane 写入队列。 */
+  const commitUserInput = (data: string) => {
+    if (disposed) return;
+    activityRuntimeRef.current?.markUserInput();
+    terminalRuntimeLifecycleControllerRef.current?.markUserInteraction();
+    if (terminalInlineSshAuthPrompt.handleInput(data) || !sessionIdRef.current) return;
+    const origin = getTerminalInputOrigin(terminal);
+    if (origin?.kind !== "paste" && isRightArrowInput(data) &&
+      ghostSuggestions.acceptGhostSuggestion(sessionIdRef.current)) return;
+    observeCommittedInput(data, "user");
+    void terminalInputSync.writeUserInput(paneId, {
+      data,
+      ...(origin?.kind === "paste" ? { pasteText: origin.text } : {}),
+    }).catch(onInputWriteError);
+  };
+
+  const unregisterInputSync = terminalInputSync.register(paneId, {
+    // 每次读取当前绑定，不能把创建 runtime 时的 tab 或连接代次固定下来。
+    readBinding: () => {
+      const record = getTerminalPaneSessionRecord(paneId);
+      return !disposed && !terminalInlineSshAuthPrompt.isActive() &&
+        record && record.sessionId === sessionIdRef.current &&
+        terminalChromeRuntimeStore.getSnapshot(paneId).connectionState === "connected"
+        ? record : null;
+    },
+    prepareMirroredInput: (input) => input.pasteText === undefined ? input.data :
+      terminal.modes.bracketedPasteMode && terminal.options.ignoreBracketedPasteMode !== true
+        ? `\x1b[200~${input.pasteText}\x1b[201~` : input.pasteText,
+    observeMirroredInput: (data) => observeCommittedInput(data, "broadcast"),
+    onWriteError: onInputWriteError,
+  });
+
+  // public onKey 在 onData 前发布完整编码；微任务仅清除本次未消费 token。
+  const keyDisposable = terminal.onKey(({ key }) => {
+    const token = { key };
+    keyToken = token;
+    queueMicrotask(() => { if (keyToken === token) keyToken = undefined; });
+  });
+  const inputDisposable = terminal.onData((data) => {
+    const token = keyToken;
+    keyToken = undefined;
+    const origin = getTerminalInputOrigin(terminal);
+    const manual = origin?.kind !== "programmatic" && (
+      origin?.kind === "paste" || token?.key === data ||
+      (data.length > 0 && !/[\u001b\u0080-\u009f]/.test(data))
+    );
+    if (manual) {
+      commitUserInput(data);
+      return;
+    }
+    // 协议回包与定向输入保持来源本地，不让 ESC 回包误接受任何候选。
+    if (disposed || terminalInlineSshAuthPrompt.handleInput(data)) return;
+    const sessionId = sessionIdRef.current;
+    if (!sessionId) return;
+    if (origin?.kind === "programmatic") {
+      // 定向输入也排在已接受的本地输入之后，且永不加入镜像传播。
+      terminalInputSync.stopForPane(paneId);
+      observeCommittedInput(data, "user");
+      void terminalInputSync.writeUserInput(paneId, { data }).catch(onInputWriteError);
+    } else {
+      observeCommittedInput(data, "user");
+      void writeTerminal(sessionId, data).catch(onInputWriteError);
     }
   });
 
@@ -267,14 +331,7 @@ export function registerXtermPaneRuntimeEvents(
     }
     event.preventDefault();
     event.stopPropagation();
-    if (sessionId) {
-      terminalRuntimeLifecycleControllerRef.current?.markUserInteraction();
-      reduceShellIntegration({
-        data: compatibilityOverride.data,
-        type: "input",
-      });
-      void writeTerminal(sessionId, compatibilityOverride.data);
-    }
+    commitUserInput(compatibilityOverride.data);
     return false;
   });
 
@@ -391,26 +448,36 @@ export function registerXtermPaneRuntimeEvents(
         suppressPasteResetTimer = null;
       }, 500);
     }
-    const sessionId = sessionIdRef.current;
-    if (sessionId) {
-      reduceShellIntegration({ data: runtimeOverride.data, type: "input" });
-      void writeTerminal(sessionId, runtimeOverride.data);
-    }
+    commitUserInput(runtimeOverride.data);
   };
+  /** 原生粘贴只处理一次，保留快捷键抑制，并用瞬时来源范围标记人工正文。 */
   const handleRuntimePaste = (event: ClipboardEvent) => {
-    if (!suppressNextPasteEvent) {
+    if (suppressNextPasteEvent) {
+      clearRuntimePasteSuppression();
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
       return;
     }
-    clearRuntimePasteSuppression();
+    if (!event.clipboardData) return;
+    const text = event.clipboardData.getData("text/plain").replace(/\r?\n/g, "\r");
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
+    if (!text) return;
+    withTerminalInputOrigin(terminal, { kind: "paste", text }, () => terminal.paste(text));
   };
   container.addEventListener("keydown", handleRuntimeKeydown, true);
   container.addEventListener("paste", handleRuntimePaste, true);
 
   return {
+    commitUserInput,
     dispose: () => {
+      disposed = true;
+      keyToken = undefined;
+      unregisterInputSync();
+      keyDisposable.dispose();
+      terminal.attachCustomKeyEventHandler(() => true);
       inputDisposable.dispose();
       selectionDisposable.dispose();
       searchResultDisposable.dispose();

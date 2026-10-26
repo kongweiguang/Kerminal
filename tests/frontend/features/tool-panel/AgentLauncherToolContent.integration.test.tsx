@@ -548,7 +548,7 @@ describe("AgentLauncherToolContent", () => {
     );
   });
 
-  it("creates a fresh dropdown Custom session from the edited definition", async () => {
+  it("continues the persisted Custom session from its launch snapshot", async () => {
     const user = userEvent.setup();
     const launcherKey = "custom:11111111-1111-4111-8111-111111111111";
     apiMocks.listAgentSessions.mockResolvedValue({
@@ -591,25 +591,19 @@ describe("AgentLauncherToolContent", () => {
     await user.click(
       await screen.findByRole("button", { name: "使用 New PI 进入" }),
     );
-    await user.click(await screen.findByRole("button", { name: "新会话" }));
 
     await waitFor(() => {
-      expect(apiMocks.createAgentSession).toHaveBeenCalledWith({
-        agentId: "custom",
-        launcherKey,
-        scope: { kind: "tab", tabId: "tab-main" },
-        title: "New PI",
-      });
+      expect(apiMocks.createAgentSession).not.toHaveBeenCalled();
       expect(apiMocks.prepareExternalAgentWorkspace).toHaveBeenCalledWith({
         agentId: "custom",
-        agentSessionId: "ags-custom",
-        customCommand: "pi --new",
-        resumeProviderSession: false,
+        agentSessionId: "ags-old-pi",
+        customCommand: "pi --old",
+        resumeProviderSession: true,
       });
     });
   });
 
-  it("creates a same-Agent session from a deleted Custom definition snapshot", async () => {
+  it("continues a deleted Custom definition from its historical command snapshot", async () => {
     const user = userEvent.setup();
     apiMocks.listAgentSessions.mockResolvedValue({
       diagnostics: [],
@@ -634,22 +628,18 @@ describe("AgentLauncherToolContent", () => {
     });
 
     renderAgentLauncher();
+    await user.click(await screen.findByRole("button", { name: /全部/u }));
     await user.click(
-      await screen.findByRole("button", { name: "同 Agent 新会话" }),
+      await screen.findByRole("button", { name: "继续对话 Deleted PI" }),
     );
 
     await waitFor(() => {
-      expect(apiMocks.createAgentSession).toHaveBeenCalledWith({
-        agentId: "custom",
-        launcherKey: "custom:22222222-2222-4222-8222-222222222222",
-        scope: { kind: "tab", tabId: "tab-main" },
-        title: "Deleted PI",
-      });
+      expect(apiMocks.createAgentSession).not.toHaveBeenCalled();
       expect(apiMocks.prepareExternalAgentWorkspace).toHaveBeenCalledWith({
         agentId: "custom",
-        agentSessionId: "ags-custom",
+        agentSessionId: "ags-deleted-pi",
         customCommand: "pi --deleted",
-        resumeProviderSession: false,
+        resumeProviderSession: true,
       });
     });
   });

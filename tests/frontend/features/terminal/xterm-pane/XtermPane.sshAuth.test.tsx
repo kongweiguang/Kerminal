@@ -1,3 +1,4 @@
+// @author kongweiguang
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { defaultAppSettings } from "../../../../../src/features/settings/settingsModel";
@@ -91,6 +92,7 @@ describe("XtermPane sessions and command blocks", () => {
       expect.any(String),
       expect.stringContaining("terminal-secret"),
     );
+    expect(mocks.api.recordCommandHistory).not.toHaveBeenCalled();
     expect(screen.getByText("已连接")).not.toBeVisible();
     expect(
       mocks.terminalInstances[0].write.mock.calls.some(([data]) =>

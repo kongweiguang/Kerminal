@@ -1,6 +1,6 @@
 // @author kongweiguang
 import { useCallback, useMemo, useRef, useState } from "react";
-import type { MachineSidebarViewMode } from "../features/machine-sidebar/MachineSidebar.shared";
+import type { HostContainerRevealRequest } from "../features/tool-panel/toolPanelContextModel";
 import { resolveThemeMode } from "../features/settings/settingsModel";
 import type {
   ToolRailPanelPlacement,
@@ -87,9 +87,6 @@ export function KerminalShell() {
   const openSftpTransferTab = useWorkspaceStore(
     (state) => state.openSftpTransferTab,
   );
-  const openWorkspaceFileTab = useWorkspaceStore(
-    (state) => state.openWorkspaceFileTab,
-  );
   const removeSidebarMachine = useWorkspaceStore(
     (state) => state.removeSidebarMachine,
   );
@@ -127,15 +124,18 @@ export function KerminalShell() {
   const [shellNoticeVisible, setShellNoticeVisible] = useState(false);
   const [workspaceSessionPersistenceNotice, setWorkspaceSessionPersistenceNotice] =
     useState<string | null>(null);
-  const [machineSidebarView, setMachineSidebarView] =
-    useState<MachineSidebarViewMode>("hosts");
-  const [hostContainersHostId, setHostContainersHostId] = useState<
-    string | null
-  >(null);
-  const [
-    hostContainersInitialContainerId,
-    setHostContainersInitialContainerId,
-  ] = useState<string>();
+  const [containerRevealRequest, setContainerRevealRequest] =
+    useState<HostContainerRevealRequest>();
+  /** 每次显式定位保留独立序号，相同快捷项再次打开也能从列表返回其详情。 */
+  const revealHostContainers = useCallback(
+    (request: HostContainerRevealRequest) => {
+      setContainerRevealRequest((previous) => ({
+        ...request,
+        requestId: (previous?.requestId ?? 0) + 1,
+      }));
+    },
+    [],
+  );
   const workspaceFrameRef = useRef<HTMLDivElement>(null);
   const {
     handleSettingsChange,
@@ -287,12 +287,10 @@ export function KerminalShell() {
     enterHostContainer,
     openContainerDetails,
     openHostContainerLogs,
-    openHostContainersSidebar,
+    openHostContainersPanel,
     openSftpForMachine,
     openSftpTransferWorkbench,
-    selectHostContainersHost,
   } = useKerminalShellNavigation({
-    activeTool,
     machineGroups,
     openDockerContainerTerminal,
     openSftpTransferTab,
@@ -300,9 +298,7 @@ export function KerminalShell() {
     selectMachine,
     closeTool,
     openTool,
-    setHostContainersHostId,
-    setHostContainersInitialContainerId,
-    setMachineSidebarView,
+    onRevealHostContainers: revealHostContainers,
   });
   const {
     closeConnectionDialog,
@@ -476,33 +472,28 @@ export function KerminalShell() {
         style: { gridColumn: "5 / 6", gridRow: "3 / 4" },
       }}
       machineSidebarProps={effectiveLeftPanelCollapsed ? null : {
-        activeView: machineSidebarView, collapsed: false, collapsedGroupIds: collapsedMachineGroupIds,
-        containerHostId: hostContainersHostId, containerInitialContainerId: hostContainersInitialContainerId,
-        groups: machineGroups, onActiveViewChange: setMachineSidebarView,
+        collapsed: false, collapsedGroupIds: collapsedMachineGroupIds,
+        groups: machineGroups,
         onAddConnection: openConnectionDialog, onAddGroup: openRemoteGroupDialog,
         onAddMachine: (groupId) => openConnectionDialog({ groupId, mode: "ssh" }),
         onCollapsedGroupIdsChange: handleCollapsedMachineGroupIdsChange,
-        onContainerHostChange: selectHostContainersHost, onDeleteGroup: requestDeleteGroup,
+        onDeleteGroup: requestDeleteGroup,
         onDeleteMachine: requestDeleteMachine,
         onDuplicateMachine: (machineId) => void handleDuplicateMachine(machineId),
         onEditGroup: openRemoteGroupDialog, onEditMachine: (hostId) => openConnectionDialog({ hostId }),
-        onEnterContainer: enterHostContainer, onExternalMachineDrag: handleExternalMachineDrag,
+        onExternalMachineDrag: handleExternalMachineDrag,
         onExternalMachineDragEnd: handleExternalMachineDragEnd,
         onExternalMachineDrop: handleExternalMachineDrop,
-        onFetchContainerStats: fetchContainerStats, onInspectContainer: inspectContainer,
-        onLifecycleContainer: runHostContainerLifecycleAction, onListDockerContainers: loadDockerContainers,
         onMoveMachine: (machineId, groupId) => void handleMoveMachineToGroup(machineId, groupId),
         onOpenContainerDetails: openContainerDetails,
-        onOpenContainerLogs: openHostContainerLogs, onOpenContainerTerminal: openContainerTerminal,
-        onOpenHostContainers: openHostContainersSidebar, onOpenLocalTerminal: openLocalTerminal,
+        onOpenContainerTerminal: openContainerTerminal,
+        onOpenHostContainers: openHostContainersPanel, onOpenLocalTerminal: openLocalTerminal,
         onOpenRdpConnection: openSavedRdpMachine, onOpenSerialTerminal: openSerialTerminal,
         onOpenSettings: openSettingsTool, onOpenSftp: openSftpForMachine,
         onOpenUpdates: () => openSettingsTool("settings-about"),
         onOpenSftpTransferWorkbench: openSftpTransferWorkbench,
         onOpenSshTerminal: openSshTerminal, onOpenTelnetTerminal: openTelnetTerminal,
         onOpenTransferWorkbench: openSftpTransferWorkbench,
-        onOpenWorkspaceFileTab: openWorkspaceFileTab,
-        onPinContainer: pinHostContainer,
         onPinGroup: (groupId, pinned) => void handlePinMachineGroup(groupId, pinned),
         onSearchChange: setMachineSearch, onSelectMachine: selectMachine,
         rdpOpeningMachineIds, search: machineSearch, selectedMachineId,
@@ -567,6 +558,16 @@ export function KerminalShell() {
         onConfirm: confirmTerminalTabs, tabCount: pendingTerminalTabCount,
       }}
       toolPanelProps={{
+        containerRevealRequest,
+        containerActions: {
+          onEnterContainer: enterHostContainer,
+          onFetchContainerStats: fetchContainerStats,
+          onInspectContainer: inspectContainer,
+          onLifecycleContainer: runHostContainerLifecycleAction,
+          onListDockerContainers: loadDockerContainers,
+          onOpenContainerLogs: openHostContainerLogs,
+          onPinContainer: pinHostContainer,
+        },
         activeTool, defaultRemoteGroupId, defaultRemoteHostId, machineGroups,
         onActiveToolChange: activateTool, onCreateTerminal: addTerminalTab,
         onFocusTab: selectTab, onOpenSettingsSection: openSettingsTool,

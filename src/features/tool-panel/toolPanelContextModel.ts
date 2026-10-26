@@ -7,6 +7,7 @@ import {
   sshTarget,
   targetStableId,
   telnetTarget,
+  type ContainerRuntime,
   type RemoteTargetRef,
 } from "../../lib/targetModel";
 import type {
@@ -37,11 +38,21 @@ type ToolPanelBindingSource =
   | "none";
 
 export interface ToolPanelContextInput {
+  machineGroups?: readonly { machines: readonly Machine[] }[];
   activeMachine?: Machine;
   activeTab?: TerminalTab;
   focusedPane?: TerminalPane;
   selectedMachine?: Machine;
   workspaceRevision?: WorkspaceContextRevision;
+}
+
+/** 显式导航只在指定 Tab 和宿主机消费，避免切 Tab 后沿用另一台主机的详情定位。 */
+export interface HostContainerRevealRequest {
+  tabId: string;
+  hostId: string;
+  containerId?: string;
+  runtime?: ContainerRuntime;
+  requestId?: number;
 }
 
 /**
@@ -131,12 +142,14 @@ export function resolveToolPanelBinding(
 
   // 系统监控描述当前工作区运行目标；没有 Tab 时不能继续刷新侧栏残留主机。
   const subject =
-    toolId === "system" &&
-    !context.focusedPane &&
-    !context.activeTab &&
-    !context.activeMachine
-      ? { source: "none" as const }
-      : activeTargetSubject(context);
+    toolId === "containers"
+      ? containerHostSubject(context)
+      : toolId === "system" &&
+          !context.focusedPane &&
+          !context.activeTab &&
+          !context.activeMachine
+        ? { source: "none" as const }
+        : activeTargetSubject(context);
   const resourceKey =
     scope === "host"
       ? hostResourceKey(subject.machine, subject.target)
@@ -160,6 +173,32 @@ interface ActiveTargetSubject {
   machine?: Machine;
   source: ToolPanelBindingSource;
   target?: RemoteTargetRef;
+}
+
+/** 容器工具始终操作当前目标的 SSH 宿主；缺失引用或不支持的协议不能借用侧栏选择。 */
+function containerHostSubject(context: ToolPanelContextInput): ActiveTargetSubject {
+  if (!context.focusedPane && !context.activeTab && !context.activeMachine) {
+    return { source: "none" };
+  }
+  const subject = activeTargetSubject(context);
+  const target = subject.target;
+  const hostId =
+    target?.kind === "ssh" || target?.kind === "dockerContainer"
+      ? target.hostId
+      : undefined;
+  if (!hostId || subject.machine?.kind === "sftp") {
+    return { source: subject.source };
+  }
+  const host =
+    subject.machine?.kind === "ssh" && subject.machine.id === hostId
+      ? subject.machine
+      : context.machineGroups
+          ?.flatMap((group) => group.machines)
+          .find((machine) => machine.id === hostId && machine.kind === "ssh");
+  return {
+    source: subject.source,
+    ...(host ? { machine: host, target: sshTarget(host.id) } : {}),
+  };
 }
 
 function activeTargetSubject(

@@ -1,10 +1,10 @@
+// @author kongweiguang
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import {
   AgentWorkflowHistoryList,
   AgentWorkflowSendPreviewPanel,
-  AgentWorkflowSessionCommands,
   AgentWorkflowStatusBadge,
 } from "../../../../../src/features/agent-workflow/ui";
 
@@ -102,21 +102,4 @@ describe("Agent Workflow production UI", () => {
     expect(screen.queryByLabelText("待发送正文")).not.toBeInTheDocument();
   });
 
-  it("继续和同 Agent 新会话只上抛当前 session id", async () => {
-    const user = userEvent.setup();
-    const onContinue = vi.fn();
-    const onNewSession = vi.fn();
-    render(
-      <AgentWorkflowSessionCommands
-        onContinue={onContinue}
-        onNewSession={onNewSession}
-        sessionId="session-42"
-      />,
-    );
-
-    await user.click(screen.getByRole("button", { name: "继续对话" }));
-    await user.click(screen.getByRole("button", { name: "同 Agent 新会话" }));
-    expect(onContinue).toHaveBeenCalledWith("session-42");
-    expect(onNewSession).toHaveBeenCalledWith("session-42");
-  });
 });

@@ -2,6 +2,8 @@
 //!
 //! @author kongweiguang
 
+#[path = "mcp_tool_executor_service/app_guide.rs"]
+mod app_guide;
 #[path = "mcp_tool_executor_service/fixtures.rs"]
 mod fixtures;
 #[path = "mcp_tool_executor_service/guides.rs"]

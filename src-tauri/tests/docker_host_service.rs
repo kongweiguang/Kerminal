@@ -53,6 +53,71 @@ fn parses_docker_ps_json_lines_into_container_targets() {
     assert!(containers[0].capabilities.terminal);
 }
 
+/// Keep Docker's multiple-record JSONL form working alongside Podman's whole-array JSON.
+#[test]
+fn parses_multiple_docker_ps_json_lines() {
+    let output = concat!(
+        r#"{"ID":"abcdef1234567890","Image":"repo/api:latest","Names":"api","Status":"Up 2 minutes","State":"running"}"#,
+        "\n",
+        r#"{"ID":"fedcba0987654321","Image":"redis:7","Names":"redis","Status":"Up 1 minute","State":"running"}"#,
+    );
+
+    let containers =
+        parse_container_list_output("host-1", ContainerRuntime::Docker, output).expect("parse");
+
+    assert_eq!(containers.len(), 2);
+    assert_eq!(containers[0].name, "api");
+    assert_eq!(containers[1].name, "redis");
+}
+
+/// Cover the observed Podman 3.4 array shape, including structured and absent port mappings.
+#[test]
+fn parses_podman_pretty_json_array_names_and_ports() {
+    let output = r#"[
+      {
+        "Id": "pod1234567890abcdef",
+        "Image": "localhost/api:latest",
+        "Names": ["/api", "api-alias"],
+        "Status": "Up 2 minutes",
+        "State": "running",
+        "Ports": null
+      },
+      {
+        "Id": "podfedcba0987654321",
+        "Image": "localhost/web:latest",
+        "Names": ["/web"],
+        "Status": "Up 2 minutes",
+        "State": "running",
+        "Ports": [
+          {"host_ip": "0.0.0.0", "host_port": 8080, "container_port": 80, "protocol": "tcp"},
+          {"host_ip": "::", "host_port": "8443", "container_port": "443", "protocol": "tcp"}
+        ]
+      },
+      {
+        "Id": "podempty0987654321",
+        "Image": "localhost/worker:latest",
+        "Names": ["/worker"],
+        "Status": "Up 2 minutes",
+        "State": "running",
+        "Ports": []
+      }
+    ]"#;
+
+    let containers =
+        parse_container_list_output("host-1", ContainerRuntime::Podman, output).expect("parse");
+
+    assert_eq!(containers.len(), 3);
+    assert_eq!(containers[0].name, "api");
+    assert!(containers[0].ports.is_empty());
+    assert_eq!(containers[1].name, "web");
+    assert_eq!(
+        containers[1].ports,
+        vec!["0.0.0.0:8080->80/tcp", "[::]:8443->443/tcp"]
+    );
+    assert_eq!(containers[2].name, "worker");
+    assert!(containers[2].ports.is_empty());
+}
+
 #[test]
 fn parses_docker_compose_labels_into_typed_metadata() {
     let output = r#"{"ID":"abcdef1234567890","Image":"repo/api:latest","Names":"api","Status":"Up 2 minutes","State":"running","Labels":"com.docker.compose.project=stack,com.docker.compose.service=api,com.docker.compose.project.working_dir=/srv/stack,com.docker.compose.project.config_files=compose.yaml,compose.override.yaml,com.docker.compose.container-number=1,com.docker.compose.oneoff=True"}"#;

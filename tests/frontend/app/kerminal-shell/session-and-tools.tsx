@@ -465,7 +465,8 @@ export function registerSessionAndToolTests() {
     expect(mocks.dockerApi.listDockerContainers).not.toHaveBeenCalled();
   });
 
-  it("opens SSH host container management in the left sidebar from the context menu", async () => {
+  /** 主机菜单应在对应 SSH Tab 打开右栏容器工具，而不再切换左栏视图。 */
+  it("opens SSH host containers in the right tool panel from the context menu", async () => {
     const user = userEvent.setup();
     const hostId = "db980b17-2ed0-44e5-b72a-6ecadf788439";
     const runtime = "docker" as const;
@@ -497,34 +498,25 @@ export function registerSessionAndToolTests() {
     await user.click(screen.getByRole("menuitem", { name: "容器" }));
 
     const sidebar = screen.getByRole("complementary", { name: "主机侧边栏" });
-    expect(
-      await within(sidebar).findByRole("button", { name: "容器" }),
-    ).toHaveAttribute("aria-pressed", "true");
-    expect(
-      within(sidebar).getByRole("button", { name: "容器" }),
-    ).toHaveAttribute("aria-pressed", "true");
-    const hostSearch = within(sidebar).getByRole("combobox", {
-      name: "搜索容器主机",
-    });
-    expect(hostSearch).toHaveValue("172.16.41.60");
-    expect(
-      within(sidebar).queryByRole("listbox", { name: "容器主机列表" }),
-    ).not.toBeInTheDocument();
+    expect(within(sidebar).queryByRole("button", { name: "容器" })).not.toBeInTheDocument();
 
-    await user.click(hostSearch);
+    await waitFor(() => {
+      const state = useWorkspaceStore.getState();
+      expect(state.terminalTabs.some((tab) => tab.machineId === hostId)).toBe(true);
+      expect(state.activeTabId).toBe(
+        state.terminalTabs.find((tab) => tab.machineId === hostId)?.id,
+      );
+      expect(state.openToolsByTabId[state.activeTabId]).toContain("containers");
+    });
+
+    const selectedContainerTool = await screen.findByRole("button", {
+      name: "收起 容器",
+    });
+    expect(selectedContainerTool).toHaveAttribute("aria-pressed", "true");
+    const containerPanel = await screen.findByTestId("host-containers-tool-content");
+    expect(containerPanel).toHaveTextContent("Docker");
     expect(
-      within(sidebar).getByRole("option", { name: /172\.16\.41\.60/ }),
-    ).toHaveAttribute("aria-selected", "true");
-    expect(sidebar).toHaveTextContent("172.16.41.60");
-    expect(
-      await within(sidebar).findByTestId(
-        "host-containers-tool-content",
-        {},
-        { timeout: 5000 },
-      ),
-    ).toHaveTextContent("Docker");
-    expect(
-      await within(sidebar).findByRole(
+      await within(containerPanel).findByRole(
         "button",
         { name: "进入容器 api" },
         { timeout: 5000 },

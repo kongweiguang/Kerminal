@@ -22,7 +22,8 @@ import {
 } from "../features/terminal/TerminalWorkspace";
 import type { TerminalSplitDropIndicator } from "../features/terminal/TerminalSplitDropOverlay";
 import type { ConnectionState } from "../features/terminal/XtermPane.helpers";
-import { ToolPanel } from "../features/tool-panel/ToolPanel";
+import { ToolPanel, type ContainerToolActions } from "../features/tool-panel/ToolPanel";
+import type { HostContainerRevealRequest } from "../features/tool-panel/toolPanelContextModel";
 import type {
   MachineGroup,
   MachineStatus,
@@ -80,6 +81,8 @@ type MachineSidebarStoreBridgeProps = Omit<
 >;
 
 interface ToolPanelStoreBridgeProps {
+  containerActions?: ContainerToolActions;
+  containerRevealRequest?: HostContainerRevealRequest;
   activeTool: ToolId | null;
   activeTools?: readonly ToolId[];
   defaultRemoteGroupId?: string;
@@ -106,6 +109,7 @@ interface ToolPanelStoreBridgeProps {
   resolvedTheme: ResolvedTheme;
   settings: AppSettings;
   showRail?: boolean;
+  visible?: boolean;
   snippetConfigRevision?: number;
   terminalAppearance: TerminalAppearance;
   workflowConfigRevision?: number;
@@ -376,6 +380,7 @@ export function MachineSidebarStoreBridge(
   return <MachineSidebar {...props} openMachineIds={openMachineIds} />;
 }
 
+/** 目标快照和主机目录在同一宿主解析，容器 pane 无需注册为左栏快捷项也能找到宿主机。 */
 export function ToolPanelStoreBridge({
   machineGroups,
   ...props
@@ -409,6 +414,7 @@ export function ToolPanelStoreBridge({
   return (
     <ToolPanel
       {...props}
+      machineGroups={machineGroups}
       activeMachine={workspaceContext.activeMachine}
       activeTab={workspaceContext.activeTab}
       focusedPane={workspaceContext.focusedPane}

@@ -29,6 +29,8 @@ export type AgentSelectorTone = "ready" | "warning" | "muted";
 export interface AgentSelectorOption {
   agentId: ExternalAgentId;
   commandLabel?: string;
+  /** 完整配置命令仅用于提示，列表仍用短命令避免撑宽。 */
+  launchCommand?: string;
   disabled?: boolean;
   disabledReason?: string;
   key: string;

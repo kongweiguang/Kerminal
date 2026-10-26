@@ -1,20 +1,15 @@
 // @author kongweiguang
 
 import type {
-  AgentSessionRecord,
   AgentSessionScope,
   ExternalAgentId,
-  ExternalAgentWorkspaceStatus,
 } from "../../../lib/agentLauncherApi";
-import { agentSessionRecordId } from "../../../lib/agentLauncherApi";
-import type { AgentWorkflowSessionSnapshot } from "../../agent-workflow";
 import { redactSensitiveTechnicalDetail } from "../../../lib/userFacingMessage";
 import {
   BUILTIN_CLAUDE_AGENT_KEY,
   BUILTIN_CODEX_AGENT_KEY,
   BUILTIN_PI_AGENT_KEY,
   customAgentLauncherKey,
-  type AgentLauncherSettings,
   type CustomAgentDefinition,
 } from "../../settings/contracts/index";
 import {
@@ -24,106 +19,23 @@ import {
 } from "../../workspace/contracts/index";
 import {
   customAgentExecutableName,
-  resolveAgentLauncherDescriptor,
   type AgentLauncherDescriptor,
 } from "./agentLauncherSettingsModel";
 import type { AgentActionViewModel } from "./agentLauncherModel";
 import type { AgentSelectorOption } from "./AgentSelector";
-import {
-  persistedAgentSessionSelection,
-  type AgentSessionSelection,
-} from "./agentSessionRestoreModel";
+import type { AgentSessionSelection } from "./agentSessionRestoreModel";
 import {
   buildAgentSessionTarget,
   formatCurrentAgentTargetLabel,
   formatTargetChipLabel,
 } from "./agentSessionTargetModel";
-import {
-  agentSessionScopeFromId,
-  agentSessionScopeId,
-} from "./agentTabSessionModel";
+import { agentSessionScopeFromId } from "./agentTabSessionModel";
 
 export type AgentLaunchSnapshot = Omit<AgentLauncherDescriptor, "launcherKey"> & {
   launcherKey?: string;
 };
 
-interface HistoricalAgentRuntimeSession {
-  agentId: ExternalAgentId;
-  customCommand?: string;
-  launcherKey?: string;
-  title: string;
-}
-
-interface ResolveHistoricalAgentLaunchOptions {
-  activeScope: AgentSessionScope;
-  agentSessionId: string;
-  launcherSettings: AgentLauncherSettings;
-  persistedSessions: readonly AgentSessionRecord[];
-  runtimeSessions: Readonly<Record<string, HistoricalAgentRuntimeSession>>;
-  workflowSessions: readonly AgentWorkflowSessionSnapshot[];
-}
-
-export interface HistoricalAgentLaunchResolution {
-  agentId: ExternalAgentId;
-  launcher: AgentLaunchSnapshot | null;
-  sourceScope: AgentSessionScope;
-}
-
-/**
- * “同 Agent 新会话”优先读取运行态或持久化历史快照；只有内置 Agent 缺少旧快照时
- * 才退回当前定义，避免 Custom 编辑或删除后悄悄换成另一条命令。
- */
-export function resolveHistoricalAgentLaunch({
-  activeScope,
-  agentSessionId,
-  launcherSettings,
-  persistedSessions,
-  runtimeSessions,
-  workflowSessions,
-}: ResolveHistoricalAgentLaunchOptions): HistoricalAgentLaunchResolution | null {
-  const workflowSession = workflowSessions.find(
-    (session) => session.agentSessionId === agentSessionId,
-  );
-  const agentId = workflowSession?.agentId;
-  if (!agentId) {
-    return null;
-  }
-  const sourceScope =
-    workflowSession.scope ??
-    (workflowSession.target?.liveStatus === "unbound"
-      ? { kind: "global" as const }
-      : workflowSession.target?.tabId
-        ? { kind: "tab" as const, tabId: workflowSession.target.tabId }
-        : activeScope);
-  const sourceScopeId = agentSessionScopeId(sourceScope);
-  const runtimeSession = runtimeSessions[agentSessionId];
-  const persistedRecord = persistedSessions.find((candidate) => {
-    try {
-      return agentSessionRecordId(candidate) === agentSessionId;
-    } catch {
-      return false;
-    }
-  });
-  const persistedSelection = persistedRecord
-    ? persistedAgentSessionSelection(persistedRecord, sourceScopeId)
-    : null;
-  const launcher: AgentLaunchSnapshot | null = runtimeSession
-    ? {
-        agentId: runtimeSession.agentId,
-        customCommand: runtimeSession.customCommand,
-        launcherKey: runtimeSession.launcherKey,
-        title: runtimeSession.title,
-      }
-    : persistedSelection
-      ? launcherSnapshotFromSelection(agentId, persistedSelection)
-      : resolveAgentLauncherDescriptor(
-          launcherSettings,
-          builtinAgentLauncherKey(agentId) ?? "",
-        );
-  return { agentId, launcher, sourceScope };
-}
-
-/** 将内置可用性和有序 Custom 定义投影为专用选择器条目。 */
+/** 列表保留短命令，悬停提供脱敏的完整配置命令，避免长参数挤压窄栏。 */
 export function buildAgentSelectorOptions(
   agentActions: readonly AgentActionViewModel[],
   customAgents: readonly CustomAgentDefinition[],
@@ -134,6 +46,7 @@ export function buildAgentSelectorOptions(
       .map((agent) => ({
         agentId: agent.agentId,
         commandLabel: agent.cliCommand,
+        launchCommand: redactSensitiveTechnicalDetail(agent.cliCommand),
         disabled: agent.disabled,
         disabledReason: agent.disabledReason,
         key: builtinAgentLauncherKey(agent.agentId) ?? BUILTIN_CODEX_AGENT_KEY,
@@ -146,6 +59,7 @@ export function buildAgentSelectorOptions(
     ...customAgents.map((agent) => ({
       agentId: "custom" as const,
       commandLabel: customAgentExecutableName(agent.command),
+      launchCommand: redactSensitiveTechnicalDetail(agent.command),
       disabled: false,
       key: customAgentLauncherKey(agent.id),
       name: agent.name,
@@ -153,26 +67,6 @@ export function buildAgentSelectorOptions(
       tone: "ready" as const,
     })),
   ];
-}
-
-/** 技术详情仅覆盖探测到的内置 provider，并统一经过敏感内容脱敏。 */
-export function buildAgentTechnicalDetail(
-  status: ExternalAgentWorkspaceStatus | null,
-  agentActions: readonly AgentActionViewModel[],
-): string {
-  return redactSensitiveTechnicalDetail(
-    [
-      `MCP: ${status?.mcpServerRunning ? "running" : "stopped"}`,
-      `Endpoint: ${status?.mcpEndpoint || "unavailable"}`,
-      ...agentActions.flatMap((agent) => [
-        "",
-        `${agent.title}: ${agent.availabilityLabel}`,
-        `  command: ${agent.cliCommand}`,
-        `  config: ${agent.configPath}`,
-        `  status: ${agent.statusDetail}`,
-      ]),
-    ].join("\n"),
-  );
 }
 
 /** 将当前 scope 一次投影成标题、兼容 target 和显式权限范围，避免三处条件漂移。 */

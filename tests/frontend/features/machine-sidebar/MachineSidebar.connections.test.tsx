@@ -1,4 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+// @author kongweiguang
+
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MachineSidebar } from "../../../../src/features/machine-sidebar/MachineSidebar";
@@ -358,7 +360,7 @@ describe("MachineSidebar", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("replaces empty search chrome with a single add-connection action", async () => {
+  it("keeps the search toolbar while connections are empty", async () => {
     const user = userEvent.setup();
     const onAddConnection = vi.fn();
 
@@ -373,7 +375,7 @@ describe("MachineSidebar", () => {
       />,
     );
 
-    expect(screen.queryByLabelText("搜索主机")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("搜索主机")).toBeDisabled();
     expect(screen.getByText("暂无连接")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "添加连接" }));

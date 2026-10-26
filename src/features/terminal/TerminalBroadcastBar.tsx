@@ -3,6 +3,7 @@
 import { Send } from "lucide-react";
 import type { CSSProperties, KeyboardEvent } from "react";
 import { Button } from "../../components/ui/button";
+import { Switch } from "../../components/ui/switch";
 import { cn } from "../../lib/cn";
 import {
   canBroadcastCommand,
@@ -13,12 +14,15 @@ import type {
   BroadcastTargetMode,
   BroadcastTargetOption,
 } from "./terminalBroadcastTargets";
+import type { TerminalInputSyncSnapshot } from "./terminalInputSync";
 
 interface TerminalBroadcastBarProps {
   analysis: BroadcastCommandAnalysis;
   draft: string;
   error: string | null;
   focusedPaneId: string;
+  inputSync: TerminalInputSyncSnapshot;
+  onToggleInputSync: () => void;
   onDraftChange: (draft: string) => void;
   onRequestBroadcast: () => void;
   onTargetModeChange: (mode: BroadcastTargetMode) => void;
@@ -32,12 +36,14 @@ interface TerminalBroadcastBarProps {
   toolbarPaddingClass: string;
 }
 
-/** 广播栏与终端正文共享双侧 inset，确保左右面板并开时目标和输入仍可操作。 */
+/** 广播栏共享终端双侧 inset；同步复用标准开关并在鼠标操作时保留终端焦点。 */
 export function TerminalBroadcastBar({
   analysis,
   draft,
   error,
   focusedPaneId,
+  inputSync,
+  onToggleInputSync,
   onDraftChange,
   onRequestBroadcast,
   onTargetModeChange,
@@ -54,6 +60,11 @@ export function TerminalBroadcastBar({
     analysis.targetCount > 0
       ? `发送到 ${analysis.targetCount} 个目标`
       : "没有可发送目标";
+  const syncError = inputSync.notice?.level === "error" ? inputSync.notice.message : null;
+  const feedbackError = Boolean(error || syncError);
+  const feedbackStatus = inputSync.notice?.level === "status" ? inputSync.notice.message : status;
+  const syncTitle = inputSync.disabledReason ??
+    "同步所选分屏的输入（含粘贴、终端快捷键）；请确认各端命令行状态一致。";
 
   const handleInputKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (event.key !== "Enter") {
@@ -96,6 +107,19 @@ export function TerminalBroadcastBar({
         <span className="hidden shrink-0 rounded-lg bg-[var(--surface-hover)] px-2 py-1 text-xs text-zinc-500 dark:text-zinc-400 xl:inline">
           {analysis.targetCount} 个目标
         </span>
+        <span
+          className="inline-flex h-9 shrink-0 items-center gap-2 text-xs text-[var(--text-secondary)]"
+          title={syncTitle}
+        >
+          <span>同步</span>
+          <Switch
+            aria-label="同步终端输入"
+            checked={inputSync.enabled}
+            disabled={inputSync.disabledReason !== null}
+            onCheckedChange={onToggleInputSync}
+            onMouseDown={(event) => { if (event.button === 0) event.preventDefault(); }}
+          />
+        </span>
         <Button
           aria-label={sending ? "发送中" : sendLabel}
           disabled={!canBroadcastCommand(analysis) || sending}
@@ -108,18 +132,21 @@ export function TerminalBroadcastBar({
         </Button>
       </div>
 
-      {status || error ? (
+      {feedbackStatus || feedbackError ? (
         <div
           className={cn(
             "border-b border-[var(--border-subtle)] px-3 py-2 text-sm transition-[margin-left,margin-right] duration-200 ease-out",
-            error
+            feedbackError
               ? "bg-rose-500/10 text-rose-700 dark:text-rose-100"
               : "bg-emerald-500/10 text-emerald-700 dark:text-emerald-100",
           )}
-          role={error ? "alert" : "status"}
+          role={feedbackError ? "alert" : "status"}
           style={style}
         >
-          {error ?? status}
+          {feedbackError ? <>
+            {error ? <span>{error}</span> : null}
+            {syncError ? <span className={error ? "ml-2" : undefined}>{syncError}</span> : null}
+          </> : feedbackStatus}
         </div>
       ) : null}
     </>

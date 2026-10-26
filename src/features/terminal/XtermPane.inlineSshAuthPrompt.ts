@@ -1,3 +1,4 @@
+// @author kongweiguang
 import type { Terminal as XtermTerminal } from "@xterm/xterm";
 import type { SshAuthPromptRequest } from "../../lib/sshAuthApi";
 
@@ -66,6 +67,8 @@ export function createTerminalInlineSshAuthPrompt({
   return {
     finish,
     handleInput,
+    // 只暴露认证门禁，不暴露临时凭据或通过试探输入改变认证状态。
+    isActive: (): boolean => activePrompt !== null,
     promptForSecret,
   };
 }

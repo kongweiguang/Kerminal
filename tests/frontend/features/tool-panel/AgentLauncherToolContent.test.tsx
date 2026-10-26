@@ -248,8 +248,11 @@ describe("AgentLauncherToolContent", () => {
       "可用",
     );
     expect(screen.getByTestId("agent-current-target")).toHaveTextContent(
-      "新建对话当前目标 · 当前 Tab · 1 个终端 · tab-main",
+      "当前目标 · 当前 Tab · 1 个终端 · tab-main",
     );
+    expect(
+      screen.queryByRole("heading", { name: "新建对话" }),
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("textbox", { name: "Custom agent command" }),
     ).not.toBeInTheDocument();
@@ -262,15 +265,9 @@ describe("AgentLauncherToolContent", () => {
       );
     }
 
-    expect(
-      screen.queryByRole("region", { name: "Agent 技术详情" }),
-    ).not.toBeInTheDocument();
-    await user.click(
-      screen.getByRole("button", { name: "查看 Agent 技术详情" }),
-    );
-    expect(
-      screen.getByRole("region", { name: "Agent 技术详情" }),
-    ).toHaveTextContent("config.toml");
+    const commandHint = screen.getByLabelText("启动命令");
+    expect(commandHint).toHaveAttribute("title", "启动命令：codex");
+    expect(commandHint.tagName).not.toBe("BUTTON");
   });
 
   it("keeps the selector usable while workspace status is loading", () => {
@@ -479,7 +476,7 @@ describe("AgentLauncherToolContent", () => {
     renderAgentLauncher();
 
     await user.click(
-      await screen.findByRole("button", { name: "继续对话" }),
+      await screen.findByRole("button", { name: "继续对话 Codex" }),
     );
 
     await waitFor(() => {
@@ -495,7 +492,7 @@ describe("AgentLauncherToolContent", () => {
     );
   });
 
-  it("restores a persisted full-permission session from the default entry action", async () => {
+  it("default entry action directly continues a persisted full-permission session", async () => {
     const user = userEvent.setup();
     apiMocks.listAgentSessions.mockResolvedValue({
       diagnostics: [],
@@ -528,10 +525,6 @@ describe("AgentLauncherToolContent", () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "继续上次" })).toBeInTheDocument();
-    });
-    await user.click(screen.getByRole("button", { name: "继续上次" }));
-    await waitFor(() => {
       expect(apiMocks.createAgentSession).not.toHaveBeenCalled();
       expect(apiMocks.prepareExternalAgentWorkspace).toHaveBeenCalledWith({
         agentId: "codex",
@@ -541,7 +534,7 @@ describe("AgentLauncherToolContent", () => {
     });
   });
 
-  it("creates a workflow follow-up session in the current tab scope", async () => {
+  it("continues a workflow session from the current target", async () => {
     const user = userEvent.setup();
     apiMocks.listAgentSessions.mockResolvedValue({
       diagnostics: [],
@@ -567,15 +560,15 @@ describe("AgentLauncherToolContent", () => {
     renderAgentLauncher();
     await user.click(await screen.findByRole("button", { name: /全部/u }));
     await user.click(
-      await screen.findByRole("button", { name: "同 Agent 新会话" }),
+      await screen.findByRole("button", { name: "继续对话 Global Codex" }),
     );
 
     await waitFor(() => {
-      expect(apiMocks.createAgentSession).toHaveBeenCalledWith({
+      expect(apiMocks.createAgentSession).not.toHaveBeenCalled();
+      expect(apiMocks.prepareExternalAgentWorkspace).toHaveBeenCalledWith({
         agentId: "codex",
-        launcherKey: "builtin:codex",
-        scope: { kind: "tab", tabId: "tab-main" },
-        title: "Codex · 当前 Tab · 1 个终端 · tab-main",
+        agentSessionId: "ags-global-source",
+        resumeProviderSession: true,
       });
     });
   });
@@ -636,7 +629,7 @@ describe("AgentLauncherToolContent", () => {
     );
 
     expect(await screen.findByTestId("agent-current-target")).toHaveTextContent(
-      "新建对话当前目标 · 当前 Tab · 1 个终端",
+      "当前目标 · 当前 Tab · 1 个终端",
     );
     await launchAgent(user, "Codex");
 
@@ -744,16 +737,6 @@ describe("AgentLauncherToolContent", () => {
     renderAgentLauncher();
 
     await launchAgent(user, "Codex");
-
-    expect(
-      await screen.findByRole("button", { name: "继续上次" }),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "新会话" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "取消" })).toBeInTheDocument();
-    expect(apiMocks.createAgentSession).not.toHaveBeenCalled();
-    expect(apiMocks.prepareExternalAgentWorkspace).not.toHaveBeenCalled();
-
-    await user.click(screen.getByRole("button", { name: "继续上次" }));
 
     await waitFor(() => {
       expect(apiMocks.createAgentSession).not.toHaveBeenCalled();

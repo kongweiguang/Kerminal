@@ -7,12 +7,10 @@ import {
   recordTerminalSuggestionFeedback,
 } from "../../lib/terminalSuggestionApi";
 import type { CommandHistoryTarget } from "../../lib/commandHistoryApi";
-import { writeTerminal } from "../../lib/terminalApi";
 import type { AppSettings } from "../settings/contracts/index";
 import type { TerminalPane } from "../workspace/contracts/index";
 import { requestSnippetPanelOpen } from "../snippets/contracts/index";
 import {
-  applyTerminalInputData,
   terminalSuggestionEligibility,
   updateTerminalInputBufferKind,
   type TerminalInputModelState,
@@ -83,11 +81,11 @@ function resolveSuggestionTarget({
 export function createXtermPaneGhostSuggestions({
   assistEnabled,
   canScheduleSuggestion = () => true,
+  commitUserInput,
   container,
   currentCwdRef,
   cwd,
   ghostSuggestionRef,
-  inputBufferRef,
   inputModelRef,
   inputCompatibilityMode,
   isDisposed,
@@ -105,11 +103,11 @@ export function createXtermPaneGhostSuggestions({
 }: {
   assistEnabled: boolean;
   canScheduleSuggestion?: () => boolean;
+  commitUserInput: (data: string) => void;
   container: HTMLDivElement;
   currentCwdRef: MutableRefObject<string | undefined>;
   cwd?: string;
   ghostSuggestionRef: MutableRefObject<TerminalGhostSuggestion | null>;
-  inputBufferRef: MutableRefObject<string>;
   inputModelRef: MutableRefObject<TerminalInputModelState>;
   inputCompatibilityMode: "agentTui" | "shell";
   isDisposed: () => boolean;
@@ -486,7 +484,21 @@ export function createXtermPaneGhostSuggestions({
     }).catch(() => undefined);
   };
 
-  const acceptGhostSuggestion = (sessionId: string) => {
+  let committingSuggestion = false;
+
+  /** 接受控制器已推进候选；同步提交期间不让输入观察器重新清空剩余候选。 */
+  const commitAcceptedInput = (data: string): void => {
+    const previous = committingSuggestion;
+    committingSuggestion = true;
+    try {
+      commitUserInput(data);
+    } finally {
+      committingSuggestion = previous;
+    }
+  };
+
+  /** 接受候选统一提交实际插入字节，由输入事件边界更新模型并分发。 */
+  const acceptGhostSuggestion = (_sessionId: string) => {
     if (terminalAppearanceRef.current.inlineSuggestion.acceptKey !== "rightArrow") {
       return false;
     }
@@ -494,21 +506,16 @@ export function createXtermPaneGhostSuggestions({
     if (!acceptance) {
       return false;
     }
-    void writeTerminal(sessionId, acceptance.insertedText);
-    const accepted = applyTerminalInputData(
-      inputModelRef.current,
-      acceptance.insertedText,
-    );
-    inputModelRef.current = accepted.state;
-    inputBufferRef.current = accepted.state.command;
+    commitAcceptedInput(acceptance.insertedText);
     clearGhostSuggestion();
     scheduleCommandBlockViewSync();
     return true;
   };
 
+  /** 键盘接受候选不重复写 PTY，也不自行推进输入模型。 */
   const handleKeyEvent = (
     event: TerminalSuggestionKeyEvent,
-    sessionId: string,
+    _sessionId: string,
   ) => {
     if (
       event.altKey &&
@@ -520,21 +527,16 @@ export function createXtermPaneGhostSuggestions({
     if (!result.handled || !result.acceptance) {
       return false;
     }
-    void writeTerminal(sessionId, result.acceptance.insertedText);
-    const accepted = applyTerminalInputData(
-      inputModelRef.current,
-      result.acceptance.insertedText,
-    );
-    inputModelRef.current = accepted.state;
-    inputBufferRef.current = accepted.state.command;
+    commitAcceptedInput(result.acceptance.insertedText);
     hideGhostSuggestion();
     scheduleCommandBlockViewSync();
     return true;
   };
 
+  /** 菜单接受沿用同一人工输入入口，保留候选选择与菜单生命周期。 */
   const handleMenuIntent = (
     intent: TerminalSuggestionMenuIntent,
-    sessionId: string,
+    _sessionId: string,
   ) => {
     if (intent.type === "open") {
       return openSuggestionMenu();
@@ -566,13 +568,7 @@ export function createXtermPaneGhostSuggestions({
     if (!acceptance) {
       return false;
     }
-    void writeTerminal(sessionId, acceptance.insertedText);
-    const accepted = applyTerminalInputData(
-      inputModelRef.current,
-      acceptance.insertedText,
-    );
-    inputModelRef.current = accepted.state;
-    inputBufferRef.current = accepted.state.command;
+    commitAcceptedInput(acceptance.insertedText);
     hideSuggestionMenu();
     hideGhostSuggestion();
     scheduleCommandBlockViewSync();
@@ -609,6 +605,7 @@ export function createXtermPaneGhostSuggestions({
 
   return {
     acceptGhostSuggestion,
+    isCommittingSuggestion: () => committingSuggestion,
     clearGhostSuggestion,
     dispose: () => {
       clearSuggestionTimer();

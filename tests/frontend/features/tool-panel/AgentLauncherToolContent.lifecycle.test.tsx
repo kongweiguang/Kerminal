@@ -277,7 +277,6 @@ describe("AgentLauncherToolContent", () => {
     renderAgentLauncher();
 
     await launchAgent(user, "Claude");
-    await user.click(await screen.findByRole("button", { name: "继续上次" }));
 
     await waitFor(() => {
       expect(apiMocks.createAgentSession).not.toHaveBeenCalled();
@@ -297,7 +296,7 @@ describe("AgentLauncherToolContent", () => {
     );
   });
 
-  it("creates a fresh provider session when the restore choice selects new session", async () => {
+  it("continues a persisted session directly from the selected Agent action", async () => {
     const user = userEvent.setup();
     apiMocks.listAgentSessions.mockResolvedValue({
       diagnostics: [],
@@ -325,24 +324,18 @@ describe("AgentLauncherToolContent", () => {
     renderAgentLauncher();
 
     await launchAgent(user, "Codex");
-    await user.click(await screen.findByRole("button", { name: "新会话" }));
 
     await waitFor(() => {
-      expect(apiMocks.createAgentSession).toHaveBeenCalledWith({
-        agentId: "codex",
-        launcherKey: "builtin:codex",
-        scope: { kind: "tab", tabId: "tab-main" },
-        title: "Codex · 当前 Tab · 1 个终端 · tab-main",
-      });
+      expect(apiMocks.createAgentSession).not.toHaveBeenCalled();
       expect(apiMocks.prepareExternalAgentWorkspace).toHaveBeenCalledWith({
         agentId: "codex",
-        agentSessionId: "ags-codex",
-        resumeProviderSession: false,
+        agentSessionId: "ags-restored-codex",
+        resumeProviderSession: true,
       });
     });
     expect(await screen.findByTestId("agent-xterm")).toHaveAttribute(
       "data-cwd",
-      "C:/Users/me/.kerminal/agents/sessions/ags-codex",
+      "C:/Users/me/.kerminal/agents/sessions/ags-restored-codex",
     );
   });
 
@@ -384,12 +377,6 @@ describe("AgentLauncherToolContent", () => {
 
     await launchAgent(user, "Codex");
 
-    expect(await screen.findByTestId("agent-restore-target-chip")).toHaveTextContent(
-      "已失效",
-    );
-
-    await user.click(screen.getByRole("button", { name: "继续上次" }));
-
     await waitFor(() => {
       expect(apiMocks.prepareExternalAgentWorkspace).toHaveBeenCalledWith({
         agentId: "codex",
@@ -400,7 +387,7 @@ describe("AgentLauncherToolContent", () => {
     expect(screen.queryByTestId("agent-target-chip")).not.toBeInTheDocument();
   });
 
-  it("offers to continue or replace the active session after returning", async () => {
+  it("continues the active session directly after returning to the launcher", async () => {
     const user = userEvent.setup();
 
     renderAgentLauncher();
@@ -430,35 +417,19 @@ describe("AgentLauncherToolContent", () => {
 
     await launchAgent(user, "Codex");
 
-    expect(
-      await screen.findByRole("button", { name: "继续上次" }),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "新会话" })).toBeInTheDocument();
     expect(screen.getByTestId("agent-xterm")).toHaveAttribute(
       "data-focused",
-      "false",
+      "true",
     );
 
-    await user.click(screen.getByRole("button", { name: "继续上次" }));
-
     expect(apiMocks.prepareExternalAgentWorkspace).toHaveBeenCalledTimes(1);
-    await waitFor(() => {
-      expect(screen.getByTestId("agent-xterm")).toHaveAttribute(
-        "data-focused",
-        "true",
-      );
-    });
 
     await user.click(
       screen.getByRole("button", { name: "Back to agent launcher" }),
     );
     await launchAgent(user, "Codex");
-    await user.click(await screen.findByRole("button", { name: "新会话" }));
-
-    await waitFor(() => {
-      expect(apiMocks.createAgentSession).toHaveBeenCalledTimes(2);
-      expect(apiMocks.prepareExternalAgentWorkspace).toHaveBeenCalledTimes(2);
-    });
+    expect(apiMocks.createAgentSession).toHaveBeenCalledTimes(1);
+    expect(apiMocks.prepareExternalAgentWorkspace).toHaveBeenCalledTimes(1);
   });
 
   it("keeps Codex and Claude in independent right-panel terminal sessions", async () => {
@@ -531,9 +502,6 @@ describe("AgentLauncherToolContent", () => {
       screen.getByRole("button", { name: "Back to agent launcher" }),
     );
     await launchAgent(user, "Codex");
-    await user.click(
-      await screen.findByRole("button", { name: "继续上次" }),
-    );
 
     expect(apiMocks.prepareExternalAgentWorkspace).toHaveBeenCalledTimes(2);
     await waitFor(() => {

@@ -25,6 +25,7 @@ import { resolveWorkspaceTabCloseDecision } from "../workspace/contracts/index";
 import { TerminalBroadcastBar } from "./TerminalBroadcastBar";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { terminalChromeRuntimeStore } from "./terminalChromeRuntimeStore";
+import { terminalInputSync } from "./terminalInputSync";
 import {
   resolveTerminalTabPresentation,
   type TerminalTabPresentation,
@@ -203,6 +204,18 @@ export function TerminalWorkspace({
     focusedPaneId,
     panesById,
   });
+  const inputSync = useSyncExternalStore(
+    terminalInputSync.subscribe,
+    terminalInputSync.getSnapshot,
+    terminalInputSync.getSnapshot,
+  );
+  const inputSyncTabId = activeTab && isTerminalSessionTab(activeTab) ? activeTab.id : null;
+  useLayoutEffect(() => {
+    terminalInputSync.configure(inputSyncTabId, selectedTargetPaneIds);
+    terminalInputSync.refresh();
+  }, [inputSyncTabId, selectedTargetPaneIds, paneChromeSnapshots]);
+  // 只有 owner 卸载才清空范围；布局更新的 cleanup 不能关闭未变化的成员集合。
+  useLayoutEffect(() => () => terminalInputSync.configure(null, []), []);
   const broadcastAnalysis = useMemo(
     () => analyzeBroadcastCommand(broadcastDraft, broadcastTargets),
     [broadcastDraft, broadcastTargets],
@@ -717,6 +730,8 @@ export function TerminalWorkspace({
           draft={broadcastDraft}
           error={broadcastError}
           focusedPaneId={focusedPaneId}
+          inputSync={inputSync}
+          onToggleInputSync={() => terminalInputSync.setEnabled(!inputSync.enabled)}
           onDraftChange={handleDraftChange}
           onRequestBroadcast={requestBroadcast}
           onTargetModeChange={handleBroadcastTargetModeChange}

@@ -15,6 +15,7 @@ import {
 } from "../../../../src/features/tool-panel/toolRailModel";
 
 describe("toolRailModel", () => {
+  /** 归一化目录新增工具时，全部隐藏偏好也必须保留可见入口。 */
   it("补齐缺失顺序、去重并保留至少一个可见工具", () => {
     const settings = normalizeToolRailSettings({
       hidden: [...defaultToolRailSettings.order],
@@ -22,9 +23,9 @@ describe("toolRailModel", () => {
     });
 
     expect(settings.order[0]).toBe("logs");
-    expect(settings.order).toHaveLength(8);
+    expect(settings.order).toHaveLength(9);
     expect(settings.hidden).not.toContain("logs");
-    expect(settings.hidden).toHaveLength(7);
+    expect(settings.hidden).toHaveLength(8);
     expect(settings.bottom).toEqual(["logs"]);
     expect(settings.panelPlacements.logs).toBe("attached");
   });
@@ -104,6 +105,7 @@ describe("toolRailModel", () => {
     ).toEqual(["logs"]);
   });
 
+  /** 旧全局位置迁移要扩展到新增工具，显式逐工具配置仍有更高优先级。 */
   it("把早期单一打开位置迁移为逐工具映射且优先采用新格式", () => {
     const migrated = normalizeToolRailSettings({ panelPlacement: "center" });
     const explicit = normalizeToolRailSettings({
@@ -112,12 +114,13 @@ describe("toolRailModel", () => {
     });
 
     expect(Object.values(migrated.panelPlacements)).toEqual(
-      Array.from({ length: 8 }, () => "center"),
+      Array.from({ length: 9 }, () => "center"),
     );
     expect(explicit.panelPlacements.context).toBe("attached");
     expect(explicit.panelPlacements.system).toBe("attached");
   });
 
+  /** 未知顺序保留在原顺序后，目录新增项只追加到末尾。 */
   it("将新工具追加到用户顺序末尾，并过滤非法 id", () => {
     const settings = normalizeToolRailSettings({
       order: ["system", "not-a-tool" as ToolRailToolId],
@@ -132,6 +135,7 @@ describe("toolRailModel", () => {
       "tmux",
       "ports",
       "logs",
+      "containers",
     ]);
   });
 
@@ -154,6 +158,7 @@ describe("toolRailModel", () => {
     ).toEqual(["logs"]);
   });
 
+  /** 主区与底部区共用顺序规则，新入口追加到主区末尾。 */
   it("按成员关系把任意工具放入底部且保持各分区顺序", () => {
     const sections = resolveToolRailSections(tools, {
       ...defaultToolRailSettings,
@@ -177,6 +182,7 @@ describe("toolRailModel", () => {
       "snippets",
       "tmux",
       "ports",
+      "containers",
     ]);
     expect(sections.bottom.map((tool) => tool.id)).toEqual(["system", "logs"]);
   });

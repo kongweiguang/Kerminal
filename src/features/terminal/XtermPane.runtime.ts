@@ -35,7 +35,7 @@ import { KITTY_KEYBOARD_PROTOCOL_ENABLE, shouldEnableKittyKeyboardProtocol } fro
 import { createTerminalShellIntegrationState, reduceTerminalShellIntegrationState } from "./terminalShellIntegrationModel";
 import { registerTerminalRuntimeDiagnosticsPane } from "./terminalRuntimeDiagnosticsStore";
 import { createXtermPaneActivityRuntime } from "./XtermPane.activityRuntime";
-import { registerXtermPaneRuntimeEvents } from "./XtermPane.runtime.events";
+import { registerXtermPaneRuntimeEvents, type XtermPaneRuntimeEvents } from "./XtermPane.runtime.events";
 import { createXtermPaneArtifactRuntime } from "./XtermPane.artifacts";
 import { createTerminalSurfaceEventController } from "./terminalSurfaceEventController";
 import {
@@ -196,11 +196,12 @@ export function installXtermPaneRuntime(params: InstallXtermPaneRuntimeParams) {
   const ghostSuggestions = createXtermPaneGhostSuggestions({
     assistEnabled,
     canScheduleSuggestion: canScheduleSuggestionProbe,
+    // 候选只提交实际插入文本，输入模型与同步分发由事件边界统一处理。
+    commitUserInput: (data) => runtimeEvents.commitUserInput(data),
     container,
     currentCwdRef,
     cwd,
     ghostSuggestionRef,
-    inputBufferRef,
     inputModelRef,
     inputCompatibilityMode,
     isDisposed: () => disposed,
@@ -386,7 +387,7 @@ export function installXtermPaneRuntime(params: InstallXtermPaneRuntimeParams) {
       ? rendererTelemetry
       : undefined,
   });
-  const runtimeEvents = registerXtermPaneRuntimeEvents({
+  const runtimeEvents: XtermPaneRuntimeEvents = registerXtermPaneRuntimeEvents({
     activityRuntimeRef,
     assistEnabled,
     commandBlockRuntime,
@@ -419,6 +420,7 @@ export function installXtermPaneRuntime(params: InstallXtermPaneRuntimeParams) {
     },
     onArtifactCommandBlock: (id, command) => artifactRuntime.queueCommandBlock(id, command),
     onArtifactInvalidate: (reason) => artifactRuntime.invalidate(reason),
+    onInputWriteError: () => setTerminalNotice("终端输入发送失败，请检查连接。"),
   });
   const commandBlockClearHandlersDisposable = registerCommandBlockClearHandlers(
     terminal,

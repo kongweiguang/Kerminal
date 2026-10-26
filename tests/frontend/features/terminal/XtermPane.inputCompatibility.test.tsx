@@ -1,3 +1,4 @@
+// @author kongweiguang
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { defaultAppSettings } from "../../../../src/features/settings/settingsModel";
@@ -5,6 +6,18 @@ import { mocks } from "../../support/terminal/XtermPane.testSupport.tsx";
 import { XtermPane } from "../../../../src/features/terminal/XtermPane";
 
 describe("XtermPane input compatibility", () => {
+  it("reports a local input rejection without retrying the accepted bytes", async () => {
+    render(
+      <XtermPane focused paneId="pane-shell" resolvedTheme="dark"
+        terminalAppearance={defaultAppSettings.terminal} title="PowerShell" />,
+    );
+    await screen.findByText("已连接");
+    mocks.api.writeTerminal.mockRejectedValueOnce(new Error("PTY closed"));
+    act(() => { mocks.terminalInstances[0].triggerKeyData("echo accepted\r"); });
+    expect(await screen.findByText("终端输入发送失败，请检查连接。")).toBeInTheDocument();
+    expect(mocks.api.writeTerminal.mock.calls).toEqual([["session-1", "echo accepted\r"]]);
+  });
+
   it("maps Agent TUI Shift+Enter to LF without xterm default CR", async () => {
     render(
       <XtermPane

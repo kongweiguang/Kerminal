@@ -271,7 +271,6 @@ describe("AgentLauncherToolContent preferred target persistence", () => {
       screen.getByRole("button", { name: "Back to agent launcher" }),
     );
     await launchAgent(user, "Codex");
-    await user.click(await screen.findByRole("button", { name: "继续上次" }));
 
     await waitFor(() => {
       expect(apiMocks.rebindAgentSessionTarget).toHaveBeenCalledWith(

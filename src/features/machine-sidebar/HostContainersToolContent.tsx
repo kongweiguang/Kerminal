@@ -5,11 +5,6 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FileCode2, Pin, Play, RefreshCw, Terminal } from "lucide-react";
-import { Button } from "../../components/ui/button";
-import { PromptDialog } from "../../components/ui/prompt-dialog";
-import { UserFacingNotice } from "../../components/ui/user-facing-notice";
-import { cn } from "../../lib/cn";
 import {
   fetchDockerContainerStats,
   inspectDockerContainer,
@@ -25,19 +20,12 @@ import {
   type UserFacingMessage,
 } from "../../lib/userFacingMessage";
 import { buildComposeProjectViews } from "./host-containers/composeProjectModel";
-import {
-  ComposeProjectInspector,
-  type ComposeProjectInspectorTab,
-} from "./host-containers/ComposeProjectInspector";
-import { HostContainerInspector } from "./host-containers/HostContainerInspector";
-import { HostContainerList } from "./host-containers/HostContainerList";
+import type { ComposeProjectInspectorTab } from "./host-containers/ComposeProjectInspector";
 import {
   buildHostContainerDialogViewModel,
   canEnterHostContainer,
   canRunHostContainerLifecycleAction,
-  hostContainerStatusLabel,
   hostContainerLifecycleDialogCopy,
-  resolveHostContainerSelection,
   type HostContainerGroupMode,
   type HostContainerInspectorTab,
   type HostContainerMetadata,
@@ -45,7 +33,6 @@ import {
 } from "./host-containers/hostContainerDialogModel";
 import {
   HostContainersStateMessage as StateMessage,
-  HostContainersToolbar,
   composeYamlRootPath,
   containerLifecycleActionText as lifecycleActionText,
 } from "./host-containers/hostContainersPresenter";
@@ -54,11 +41,18 @@ import {
   runDefaultLifecycleAction,
   type HostContainersToolContentProps,
 } from "./host-containers/hostContainersToolAdapter";
+import { HostContainersToolView } from "./host-containers/HostContainersToolView";
 
 export type { HostContainersToolContentProps } from "./host-containers/hostContainersToolAdapter";
 
+const emptyContainerList: DockerContainerSummary[] = [];
+
+/** Keeps reads and actions scoped to the active SSH host/runtime while retaining the list view between detail visits. */
 export function HostContainersToolContent({
+  active = true,
   initialContainerId,
+  initialRequestId,
+  initialRuntime,
   onEnterContainer,
   onFetchContainerStats = fetchDockerContainerStats,
   onInspectContainer = inspectDockerContainer,
@@ -67,35 +61,45 @@ export function HostContainersToolContent({
   onOpenContainerLogs,
   onOpenWorkspaceFileTab,
   onPinContainer,
-  presentation = "default",
   refreshRequestId,
   selectedMachine,
 }: HostContainersToolContentProps) {
   const host = selectedMachine?.kind === "ssh" ? selectedMachine : undefined;
-  const [runtime, setRuntime] = useState<ContainerRuntime>("docker");
+  const hostId = host?.id;
+  const [runtime, setRuntime] = useState<ContainerRuntime>(
+    () => initialRuntime ?? "docker",
+  );
   const [includeStopped, setIncludeStopped] = useState(true);
   const [groupMode, setGroupMode] = useState<HostContainerGroupMode>("compose");
   const [query, setQuery] = useState("");
   const [containers, setContainers] = useState<DockerContainerSummary[]>([]);
+  const [resultTargetKey, setResultTargetKey] = useState<string | null>(null);
   const [selection, setSelection] = useState<HostContainerSelection>(
     initialContainerId
       ? { kind: "container", containerId: initialContainerId }
       : null,
   );
+  const [detailView, setDetailView] = useState<"list" | "container" | "project">(
+    () => (initialContainerId ? "container" : "list"),
+  );
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<UserFacingMessage | null>(null);
   const [actionError, setActionError] =
     useState<UserFacingMessage | null>(null);
+  const [missingPinnedContainerId, setMissingPinnedContainerId] =
+    useState<string | null>(null);
   const [pinningContainerId, setPinningContainerId] = useState<string | null>(
     null,
   );
   const [activeLifecycleAction, setActiveLifecycleAction] = useState<{
     action: DockerContainerLifecycleAction;
     containerId: string;
+    targetKey: string;
   } | null>(null);
   const [pendingLifecycleAction, setPendingLifecycleAction] = useState<{
     action: DockerContainerLifecycleAction;
     container: HostContainerMetadata;
+    targetKey: string;
   } | null>(null);
   const [lifecycleConfirmValue, setLifecycleConfirmValue] = useState("");
   const [inspectorTab, setInspectorTab] =
@@ -111,7 +115,23 @@ export function HostContainersToolContent({
     useState<DockerContainerStatsResult | null>(null);
   const requestSequenceRef = useRef(0);
   const inspectorSequenceRef = useRef(0);
+  const lifecycleOperationsRef = useRef(new Map<string, string>());
+  const pinOperationsRef = useRef(new Set<string>());
+  const currentTargetKey = host ? `${host.id}:${runtime}` : null;
+  const currentTargetKeyRef = useRef(currentTargetKey);
+  const activeRef = useRef(active);
+  const initialRequestKeyRef = useRef<string | null>(null);
+  const pendingInitialRuntimeRef = useRef<{
+    containerId: string;
+    hostId: string;
+    runtime: ContainerRuntime;
+  } | null>(null);
+  currentTargetKeyRef.current = currentTargetKey;
+  activeRef.current = active;
 
+  const resultMatchesTarget = resultTargetKey === currentTargetKey;
+  const currentContainers = resultMatchesTarget ? containers : emptyContainerList;
+  const currentLoadError = resultMatchesTarget ? loadError : null;
   const selectedContainerId =
     selection?.kind === "container" ? selection.containerId : undefined;
   const selectedProjectId =
@@ -119,19 +139,23 @@ export function HostContainersToolContent({
   const viewModel = useMemo(
     () =>
       buildHostContainerDialogViewModel(
-        containers,
+        currentContainers,
         { groupMode, query },
         selectedContainerId,
       ),
-    [containers, groupMode, query, selectedContainerId],
+    [currentContainers, groupMode, query, selectedContainerId],
   );
   const composeViewModel = useMemo(
+    () => buildComposeProjectViews(currentContainers),
+    [currentContainers],
+  );
+  const composeListViewModel = useMemo(
     () => buildComposeProjectViews(viewModel.containers),
     [viewModel.containers],
   );
   const selectedContainer =
     selection?.kind === "container"
-      ? viewModel.containers.find(
+      ? currentContainers.find(
           (container) => container.id === selection.containerId,
         )
       : undefined;
@@ -143,22 +167,41 @@ export function HostContainersToolContent({
           (project) => project.id === selection.projectId,
         )
       : undefined;
-  const sidebar = presentation === "sidebar";
+  /** Inspector data is tied to a selected container so switching rows never flashes the previous row's details. */
+  useEffect(() => {
+    inspectorSequenceRef.current += 1;
+    setInspectorLoading(false);
+    setInspectorError(null);
+    setInspectSummary(null);
+    setStatsResult(null);
+  }, [selectedContainerId]);
 
+  /** A list response is accepted only while its request sequence and host/runtime target are still current. */
   const loadContainers = useCallback(async () => {
-    if (!host) {
-      setContainers([]);
-      setSelection(null);
-      setLoadError(null);
-      setLoading(false);
+    if (
+      !activeRef.current ||
+      !host ||
+      currentTargetKeyRef.current !== currentTargetKey
+    ) {
       return;
     }
 
+    const pendingInitialRuntime = pendingInitialRuntimeRef.current;
+    if (
+      pendingInitialRuntime?.hostId === host.id &&
+      pendingInitialRuntime.runtime !== runtime
+    ) {
+      return;
+    }
+    pendingInitialRuntimeRef.current = null;
+
     const requestId = requestSequenceRef.current + 1;
     requestSequenceRef.current = requestId;
+    const requestTargetKey = `${host.id}:${runtime}`;
     setLoading(true);
     setLoadError(null);
     setActionError(null);
+    setMissingPinnedContainerId(null);
 
     try {
       const nextContainers = await onListDockerContainers({
@@ -166,23 +209,23 @@ export function HostContainersToolContent({
         includeStopped,
         runtime,
       });
-      if (requestSequenceRef.current !== requestId) {
+      if (
+        requestSequenceRef.current !== requestId ||
+        currentTargetKeyRef.current !== requestTargetKey
+      ) {
         return;
       }
       setContainers(nextContainers);
-      setSelection((current) =>
-        resolveHostContainerSelection(
-          nextContainers,
-          groupMode,
-          current,
-          initialContainerId,
-        ),
-      );
+      setResultTargetKey(requestTargetKey);
     } catch (loadError: unknown) {
-      if (requestSequenceRef.current !== requestId) {
+      if (
+        requestSequenceRef.current !== requestId ||
+        currentTargetKeyRef.current !== requestTargetKey
+      ) {
         return;
       }
       setContainers([]);
+      setResultTargetKey(requestTargetKey);
       setSelection(null);
       setLoadError(
         buildUserFacingError(loadError, {
@@ -197,36 +240,80 @@ export function HostContainersToolContent({
       }
     }
   }, [
-    groupMode,
+    currentTargetKey,
     host,
     includeStopped,
-    initialContainerId,
     onListDockerContainers,
     runtime,
   ]);
 
+  /** Invalidate old reads on target changes, preserving a one-shot pinned-container reveal that caused the runtime switch. */
   useEffect(() => {
-    setQuery("");
+    requestSequenceRef.current += 1;
+    inspectorSequenceRef.current += 1;
+    const pendingInitialRuntime = pendingInitialRuntimeRef.current;
+    const initialContainerToPreserve =
+      pendingInitialRuntime &&
+      pendingInitialRuntime.hostId === hostId &&
+      pendingInitialRuntime.runtime === runtime
+        ? pendingInitialRuntime.containerId
+        : undefined;
+    pendingInitialRuntimeRef.current = null;
+    setQuery((current) => (hostId ? current : ""));
+    setContainers([]);
+    setResultTargetKey(null);
+    setLoading(false);
     setSelection(
-      initialContainerId
-        ? { kind: "container", containerId: initialContainerId }
+      initialContainerToPreserve
+        ? { kind: "container", containerId: initialContainerToPreserve }
         : null,
     );
+    setDetailView(initialContainerToPreserve ? "container" : "list");
     setActionError(null);
+    setMissingPinnedContainerId(null);
     setActiveLifecycleAction(null);
     setPendingLifecycleAction(null);
     setLifecycleConfirmValue("");
+    setPinningContainerId(null);
     setInspectorTab("details");
     setProjectInspectorTab("overview");
+    setInspectorLoading(false);
     setInspectorError(null);
     setInspectSummary(null);
     setStatsResult(null);
-  }, [host?.id, initialContainerId, runtime]);
+  }, [hostId, runtime]);
 
+  /** Each explicit reveal has a unique request key so reopening the same pinned item reselects its detail view. */
+  useEffect(() => {
+    if (!initialContainerId || !hostId) {
+      pendingInitialRuntimeRef.current = null;
+      return;
+    }
+    const requestKey = `${hostId}:${initialRequestId ?? "legacy"}:${initialContainerId}:${initialRuntime ?? ""}`;
+    if (initialRequestKeyRef.current === requestKey) {
+      return;
+    }
+    initialRequestKeyRef.current = requestKey;
+    setMissingPinnedContainerId(null);
+    if (initialRuntime && initialRuntime !== runtime) {
+      pendingInitialRuntimeRef.current = {
+        containerId: initialContainerId,
+        hostId,
+        runtime: initialRuntime,
+      };
+      setRuntime(initialRuntime);
+    }
+    setSelection({ kind: "container", containerId: initialContainerId });
+    setDetailView("container");
+    setInspectorTab("details");
+  }, [hostId, initialContainerId, initialRequestId, initialRuntime, runtime]);
+
+  /** Hidden tools start no new reads; active reads still finish under the host/runtime sequence guard. */
   useEffect(() => {
     void loadContainers();
-  }, [loadContainers, refreshRequestId]);
+  }, [active, loadContainers, refreshRequestId]);
 
+  /** Compose project selection stays valid only while its project remains in the active host's full result set. */
   useEffect(() => {
     if (selection?.kind !== "project") {
       return;
@@ -237,35 +324,71 @@ export function HostContainersToolContent({
         (project) => project.id === selection.projectId,
       )
     ) {
-      setSelection(
-        resolveHostContainerSelection(
-          viewModel.containers,
-          groupMode,
-          null,
-          initialContainerId,
-        ),
-      );
+      setSelection(null);
+      setDetailView("list");
     }
   }, [
     composeViewModel.projects,
     groupMode,
-    initialContainerId,
     selection,
     viewModel.containers,
   ]);
 
+  /** A target-matched refresh is the only point at which a missing selection closes its detail view. */
+  useEffect(() => {
+    if (!resultMatchesTarget) {
+      return;
+    }
+    if (
+      initialContainerId &&
+      currentContainers.some((container) => container.id === initialContainerId)
+    ) {
+      setMissingPinnedContainerId(null);
+    }
+    if (
+      selection?.kind === "container" &&
+      !currentContainers.some((container) => container.id === selection.containerId)
+    ) {
+      if (selection.containerId === initialContainerId) {
+        setMissingPinnedContainerId(initialContainerId);
+      }
+      setSelection(null);
+      setDetailView("list");
+    } else if (
+      selection?.kind === "project" &&
+      !composeViewModel.projects.some((project) => project.id === selection.projectId)
+    ) {
+      setSelection(null);
+      setDetailView("list");
+    }
+  }, [
+    composeViewModel.projects,
+    currentContainers,
+    resultMatchesTarget,
+    selection,
+    initialContainerId,
+  ]);
+
+  /** Detail selection stays in the shared list model so its scroll position survives the view switch. */
   const selectContainer = useCallback((containerId: string) => {
+    setMissingPinnedContainerId(null);
     setSelection({ kind: "container", containerId });
+    setDetailView("container");
   }, []);
 
+  /** Compose selection opens its existing project inspector instead of a second detail implementation. */
   const selectProject = useCallback((projectId: string) => {
+    setMissingPinnedContainerId(null);
     setSelection({ kind: "project", projectId });
+    setDetailView("project");
     setProjectInspectorTab("overview");
   }, []);
 
+  /** YAML inspection reuses the central SSH workspace tab and preserves its read-only contract. */
   const openProjectYaml = useCallback(
     (projectId: string) => {
       setSelection({ kind: "project", projectId });
+      setDetailView("project");
       setProjectInspectorTab("yaml");
 
       const project = composeViewModel.projects.find(
@@ -287,17 +410,15 @@ export function HostContainersToolContent({
     [composeViewModel.projects, host, onOpenWorkspaceFileTab],
   );
 
-  const refreshProject = useCallback(
-    (projectId: string) => {
-      setSelection({ kind: "project", projectId });
-      void loadContainers();
-    },
-    [loadContainers],
-  );
-
+  /** Entry is allowed only for a running container that still belongs to the visible host/runtime. */
   const enterContainer = useCallback(
     (container: HostContainerMetadata | undefined = selectedContainer) => {
-      if (!container || !canEnterHostContainer(container)) {
+      if (
+        !container ||
+        !activeRef.current ||
+        currentTargetKeyRef.current !== `${container.hostId}:${container.runtime}` ||
+        !canEnterHostContainer(container)
+      ) {
         return;
       }
       onEnterContainer?.(container);
@@ -305,14 +426,27 @@ export function HostContainersToolContent({
     [onEnterContainer, selectedContainer],
   );
 
+  /** Deduplicate pin writes per host/container and keep stale failures out of the newly selected host. */
   const pinContainer = useCallback(
     async (container: HostContainerMetadata) => {
+      const targetKey = `${container.hostId}:${container.runtime}`;
+      const operationKey = `${targetKey}:${container.id}`;
+      if (!activeRef.current || currentTargetKeyRef.current !== targetKey) {
+        return;
+      }
+      if (pinOperationsRef.current.has(operationKey)) {
+        return;
+      }
+      pinOperationsRef.current.add(operationKey);
       selectContainer(container.id);
       setPinningContainerId(container.id);
       setActionError(null);
       try {
         await onPinContainer?.(container);
       } catch (pinError: unknown) {
+        if (currentTargetKeyRef.current !== targetKey) {
+          return;
+        }
         setActionError(
           buildUserFacingError(pinError, {
             detail: `${container.name} 仍可从当前列表打开。`,
@@ -321,25 +455,42 @@ export function HostContainersToolContent({
           }),
         );
       } finally {
-        setPinningContainerId(null);
+        pinOperationsRef.current.delete(operationKey);
+        if (currentTargetKeyRef.current === targetKey) {
+          setPinningContainerId((current) =>
+            current === container.id ? null : current,
+          );
+        }
       }
     },
     [onPinContainer, selectContainer],
   );
 
+  /** Serialize lifecycle writes per host/runtime and scope their completion feedback to the submitted target. */
   const runLifecycleAction = useCallback(
     async (
       action: DockerContainerLifecycleAction,
       container: HostContainerMetadata,
       options?: { force?: boolean },
     ) => {
+      const targetKey = `${container.hostId}:${container.runtime}`;
+      if (!activeRef.current || currentTargetKeyRef.current !== targetKey) {
+        return;
+      }
+      if (lifecycleOperationsRef.current.has(targetKey)) {
+        return;
+      }
+      lifecycleOperationsRef.current.set(targetKey, container.id);
       selectContainer(container.id);
-      setActiveLifecycleAction({ action, containerId: container.id });
+      setActiveLifecycleAction({ action, containerId: container.id, targetKey });
       setActionError(null);
       try {
         await onLifecycleContainer(action, container, options);
         await loadContainers();
       } catch (lifecycleError: unknown) {
+        if (currentTargetKeyRef.current !== targetKey) {
+          return;
+        }
         setActionError(
           buildUserFacingError(lifecycleError, {
             detail: `${container.name} 未完成${lifecycleActionText(action)}操作。`,
@@ -348,14 +499,27 @@ export function HostContainersToolContent({
           }),
         );
       } finally {
-        setActiveLifecycleAction(null);
+        if (lifecycleOperationsRef.current.get(targetKey) === container.id) {
+          lifecycleOperationsRef.current.delete(targetKey);
+        }
+        if (currentTargetKeyRef.current === targetKey) {
+          setActiveLifecycleAction(null);
+        }
       }
     },
     [loadContainers, onLifecycleContainer, selectContainer],
   );
 
+  /** Refuse another lifecycle submission for this target while its prior write is pending. */
   const requestLifecycleAction = useCallback(
     (action: DockerContainerLifecycleAction, container: HostContainerMetadata) => {
+      const targetKey = `${container.hostId}:${container.runtime}`;
+      if (currentTargetKeyRef.current !== targetKey) {
+        return;
+      }
+      if (lifecycleOperationsRef.current.has(targetKey)) {
+        return;
+      }
       selectContainer(container.id);
       setActionError(null);
       if (!canRunHostContainerLifecycleAction(container, action)) {
@@ -366,13 +530,21 @@ export function HostContainersToolContent({
         return;
       }
       setLifecycleConfirmValue("");
-      setPendingLifecycleAction({ action, container });
+      setPendingLifecycleAction({ action, container, targetKey });
     },
     [runLifecycleAction, selectContainer],
   );
 
+  /** Inspector reads use a separate sequence because list reads and detail tabs resolve independently. */
   const loadInspector = useCallback(
     async (tab: HostContainerInspectorTab, container: Pick<HostContainerMetadata, "id" | "hostId" | "runtime">) => {
+      const targetKey = `${container.hostId}:${container.runtime}`;
+      if (
+        !activeRef.current ||
+        currentTargetKeyRef.current !== targetKey
+      ) {
+        return;
+      }
       const requestId = inspectorSequenceRef.current + 1;
       inspectorSequenceRef.current = requestId;
       const request = { containerId: container.id, hostId: container.hostId, runtime: container.runtime };
@@ -381,17 +553,26 @@ export function HostContainersToolContent({
       try {
         if (tab === "details") {
           const summary = await onInspectContainer(request);
-          if (inspectorSequenceRef.current === requestId) {
+          if (
+            inspectorSequenceRef.current === requestId &&
+            currentTargetKeyRef.current === targetKey
+          ) {
             setInspectSummary(summary);
           }
           return;
         }
         const stats = await onFetchContainerStats(request);
-        if (inspectorSequenceRef.current === requestId) {
+        if (
+          inspectorSequenceRef.current === requestId &&
+          currentTargetKeyRef.current === targetKey
+        ) {
           setStatsResult(stats);
         }
       } catch (inspectorError: unknown) {
-        if (inspectorSequenceRef.current === requestId) {
+        if (
+          inspectorSequenceRef.current === requestId &&
+          currentTargetKeyRef.current === targetKey
+        ) {
           setInspectorError(
             buildUserFacingError(inspectorError, {
               detail: "当前详情或监控数据暂时不可用。",
@@ -409,10 +590,12 @@ export function HostContainersToolContent({
     [onFetchContainerStats, onInspectContainer],
   );
 
+  /** Selection/tab changes load through the effect; repeating the same menu action refreshes the unchanged view directly. */
   const openInspector = useCallback(
     (tab: HostContainerInspectorTab, container: HostContainerMetadata) => {
       selectContainer(container.id);
       setInspectorTab(tab);
+      setDetailView("container");
       if (selectedContainer?.id === container.id && inspectorTab === tab) {
         void loadInspector(tab, {
           id: container.id,
@@ -424,6 +607,7 @@ export function HostContainersToolContent({
     [inspectorTab, loadInspector, selectContainer, selectedContainer?.id],
   );
 
+  /** Keep detail selection synchronized before handing off to the existing logs flow. */
   const openContainerLogs = useCallback(
     (container: HostContainerMetadata) => {
       selectContainer(container.id);
@@ -432,18 +616,22 @@ export function HostContainersToolContent({
     [onOpenContainerLogs, selectContainer],
   );
 
+  /** Confirmation is bound to the dialog's captured target and is discarded after a host/runtime switch. */
   const confirmLifecycleAction = useCallback(async () => {
     if (!pendingLifecycleAction) {
       return;
     }
-    const { action, container } = pendingLifecycleAction;
+    const { action, container, targetKey } = pendingLifecycleAction;
     setPendingLifecycleAction(null);
     setLifecycleConfirmValue("");
+    if (currentTargetKeyRef.current !== targetKey) {
+      return;
+    }
     await runLifecycleAction(action, container, { force: false });
   }, [pendingLifecycleAction, runLifecycleAction]);
 
   useEffect(() => {
-    if (sidebar) {
+    if (!active || detailView !== "container") {
       return;
     }
     if (
@@ -462,7 +650,8 @@ export function HostContainersToolContent({
   }, [
     inspectorTab,
     loadInspector,
-    sidebar,
+    active,
+    detailView,
     selectedContainerHostId,
     selectedContainerId,
     selectedContainerRuntime,
@@ -492,286 +681,90 @@ export function HostContainersToolContent({
     : false;
   const selectedActionBusy =
     selectedContainer &&
-    activeLifecycleAction?.containerId === selectedContainer.id;
+    activeLifecycleAction?.containerId === selectedContainer.id &&
+    activeLifecycleAction.targetKey === currentTargetKey;
   if (!host) {
     return (
-      <div className="grid gap-3" data-testid="host-containers-tool-empty">
-        <StateMessage>选择 SSH 主机后查看 Docker、Podman 和 Compose。</StateMessage>
+      <div className="grid h-full min-h-0 content-start gap-3 p-3" data-testid="host-containers-tool-empty">
+        <StateMessage>容器仅支持 SSH 主机上的 Docker 和 Podman。</StateMessage>
       </div>
     );
   }
 
   return (
-    <>
-      <div
-        className="grid min-w-0 max-w-full gap-3"
-        data-testid="host-containers-tool-content"
-      >
-        <HostContainersToolbar
-          groupMode={groupMode}
-          host={host}
-          includeStopped={includeStopped}
-          loading={loading}
-          onGroupModeChange={setGroupMode}
-          onIncludeStoppedChange={setIncludeStopped}
-          onQueryChange={setQuery}
-          onRefresh={() => void loadContainers()}
-          onRuntimeChange={setRuntime}
-          query={query}
-          runtime={runtime}
-          sidebar={sidebar}
-          summary={containerSummary}
-        />
-
-        <section
-          className={cn(
-            "grid min-w-0 gap-3 overflow-hidden border border-[var(--border-subtle)] bg-[var(--surface-solid)]/78 shadow-sm shadow-black/5 dark:shadow-black/20",
-            sidebar ? "min-h-[18rem] rounded-[var(--radius-control)] p-2" : "min-h-[20rem] rounded-[var(--radius-card)] p-3",
-          )}
-        >
-          <div
-            className={cn(
-              "grid min-h-0 gap-3 overflow-hidden",
-              sidebar ? "grid-rows-[minmax(0,1fr)]" : "grid-rows-[minmax(0,1fr)_44px]",
-            )}
-          >
-            {loadError ? (
-              <div className="flex min-h-32 items-center">
-                <UserFacingNotice
-                  className="w-full"
-                  compact
-                  message={loadError}
-                />
-              </div>
-            ) : loading && viewModel.totalCount === 0 ? (
-              <StateMessage>正在读取容器...</StateMessage>
-            ) : viewModel.emptySearch ? (
-              <StateMessage>没有匹配的容器。</StateMessage>
-            ) : viewModel.totalCount === 0 ? (
-              <StateMessage>当前主机没有可显示的容器。</StateMessage>
-            ) : (
-              <HostContainerList
-                groupMode={groupMode}
-                groups={viewModel.groups}
-                onEnterContainer={enterContainer}
-                onInspectAction={openInspector}
-                onLifecycleAction={requestLifecycleAction}
-                onOpenLogs={openContainerLogs}
-                onOpenProjectYaml={openProjectYaml}
-                onPinContainer={(container) => void pinContainer(container)}
-                onSelectContainer={selectContainer}
-                onSelectProject={selectProject}
-                pinningContainerId={pinningContainerId}
-                presentation={presentation}
-                projects={composeViewModel.projects}
-                selectedContainerId={selectedContainer?.id}
-                selectedProjectId={selectedProjectId}
-                standaloneContainers={composeViewModel.standaloneContainers}
-              />
-            )}
-            {sidebar ? null : (
-              <div className="grid h-11 min-h-11 grid-cols-[minmax(0,1fr)_5.5rem] items-center gap-3 border-t border-[var(--border-subtle)] pt-3">
-                <div
-                  className="min-w-0 truncate text-xs text-zinc-500 dark:text-zinc-400"
-                  data-testid="host-container-selection-summary"
-                >
-                  {selectedProject ? (
-                    <>
-                      <span className="font-medium text-zinc-800 dark:text-zinc-200">
-                        {selectedProject.project}
-                      </span>
-                      <span className="mx-2">/</span>
-                      <span>
-                        {selectedProject.runningCount}/{selectedProject.totalCount} 运行
-                      </span>
-                    </>
-                  ) : selectedContainer ? (
-                    <>
-                      <span className="font-medium text-zinc-800 dark:text-zinc-200">
-                        {selectedContainer.name}
-                      </span>
-                      <span className="mx-2">/</span>
-                      <span>{hostContainerStatusLabel(selectedContainer.status)}</span>
-                    </>
-                  ) : (
-                    "未选择容器"
-                  )}
-                </div>
-                <div className="grid shrink-0 grid-cols-2 justify-end gap-2">
-                  {selectedProject ? (
-                    <>
-                      <Button
-                        aria-label="打开所选 Compose YAML"
-                        className="h-8 w-8 rounded-lg"
-                        onClick={() => openProjectYaml(selectedProject.id)}
-                        size="icon"
-                        title="查看 Compose YAML"
-                        type="button"
-                        variant={
-                          projectInspectorTab === "yaml" ? "primary" : "secondary"
-                        }
-                      >
-                        <FileCode2 className="h-3.5 w-3.5" />
-                      </Button>
-                      <Button
-                        aria-label="刷新所选 Compose 应用"
-                        className="h-8 w-8 rounded-lg"
-                        onClick={() => refreshProject(selectedProject.id)}
-                        size="icon"
-                        title="刷新 Compose 元数据"
-                        type="button"
-                        variant="secondary"
-                      >
-                        <RefreshCw className="h-3.5 w-3.5" />
-                      </Button>
-                    </>
-                  ) : (
-                    <>
-                      <Button
-                        aria-label={
-                          selectedContainer
-                            ? "固定所选容器到侧栏"
-                            : "固定容器到侧栏"
-                        }
-                        className="h-8 w-8 rounded-lg"
-                        disabled={
-                          !selectedContainer ||
-                          pinningContainerId === selectedContainer.id
-                        }
-                        onClick={() =>
-                          selectedContainer && void pinContainer(selectedContainer)
-                        }
-                        size="icon"
-                        title="固定到侧栏"
-                        type="button"
-                        variant="secondary"
-                      >
-                        <Pin className="h-3.5 w-3.5" />
-                      </Button>
-                      {selectedCanEnter ? (
-                        <Button
-                          aria-label="进入所选容器"
-                          className="h-8 w-8 rounded-lg"
-                          disabled={!selectedContainer}
-                          onClick={() => enterContainer()}
-                          size="icon"
-                          title="进入容器终端"
-                          type="button"
-                          variant="primary"
-                        >
-                          <Terminal className="h-3.5 w-3.5" />
-                        </Button>
-                      ) : (
-                        <Button
-                          aria-label="启动所选容器"
-                          className="h-8 w-8 rounded-lg"
-                          disabled={
-                            !selectedContainer ||
-                            !selectedCanStart ||
-                            Boolean(selectedActionBusy)
-                          }
-                          onClick={() =>
-                            selectedContainer &&
-                            requestLifecycleAction("start", selectedContainer)
-                          }
-                          size="icon"
-                          title={
-                            selectedCanStart
-                              ? "启动容器"
-                              : "容器未运行或正在重启"
-                          }
-                          type="button"
-                          variant="primary"
-                        >
-                          {selectedActionBusy ? (
-                            <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            <Play className="h-3.5 w-3.5" />
-                          )}
-                        </Button>
-                      )}
-                    </>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        </section>
-
-        {sidebar ? null : (
-          <section className="grid min-h-[22rem] min-w-0 gap-3 overflow-hidden">
-            {!selectedProject && inspectorError ? (
-              <UserFacingNotice compact message={inspectorError} />
-            ) : null}
-            {selectedProject ? (
-              <ComposeProjectInspector
-                hostId={host.id}
-                onEnterContainer={enterContainer}
-                onOpenContainerLogs={openContainerLogs}
-                onOpenWorkspaceFileTab={onOpenWorkspaceFileTab}
-                onRefresh={() => void loadContainers()}
-                onSelectContainer={(container) => {
-                  selectContainer(container.id);
-                  setInspectorTab("details");
-                }}
-                onTabChange={setProjectInspectorTab}
-                project={selectedProject}
-                tab={projectInspectorTab}
-              />
-            ) : (
-              <HostContainerInspector
-                container={selectedContainer}
-                error={null}
-                inspectSummary={inspectSummary}
-                loading={inspectorLoading}
-                onRefresh={() => {
-                  if (selectedContainer) {
-                    void loadInspector(inspectorTab, selectedContainer);
-                  }
-                }}
-                onTabChange={setInspectorTab}
-                statsResult={statsResult}
-                tab={inspectorTab}
-              />
-            )}
-          </section>
-        )}
-
-        {actionError ? (
-          <UserFacingNotice compact message={actionError} />
-        ) : null}
-      </div>
-
-      {pendingLifecycleAction && lifecycleDialogCopy ? (
-        <PromptDialog
-          busy={Boolean(activeLifecycleAction)}
-          confirmLabel={lifecycleDialogCopy.confirmLabel}
-          confirmVariant={lifecycleDialogCopy.variant}
-          description={lifecycleDialogCopy.description}
-          helperText={lifecycleDialogCopy.helperText}
-          inputLabel={lifecycleDialogCopy.inputLabel}
-          onClose={() => {
-            setPendingLifecycleAction(null);
-            setLifecycleConfirmValue("");
-          }}
-          onConfirm={() => {
-            void confirmLifecycleAction();
-          }}
-          onValueChange={setLifecycleConfirmValue}
-          open
-          placeholder={lifecycleDialogCopy.placeholder}
-          title={lifecycleDialogCopy.title}
-          validate={
-            pendingLifecycleAction.action === "remove"
-              ? (value) =>
-                  value === pendingLifecycleAction.container.name
-                    ? null
-                    : "请输入完整容器名确认删除"
-              : undefined
+    <HostContainersToolView
+      actions={{
+        onBackToList: () => setDetailView("list"),
+        onCloseLifecycleDialog: () => {
+          setPendingLifecycleAction(null);
+          setLifecycleConfirmValue("");
+        },
+        onConfirmLifecycleAction: () => {
+          void confirmLifecycleAction();
+        },
+        onEnterContainer: enterContainer,
+        onGroupModeChange: setGroupMode,
+        onIncludeStoppedChange: setIncludeStopped,
+        onInspectAction: openInspector,
+        onLifecycleAction: requestLifecycleAction,
+        onLifecycleConfirmValueChange: setLifecycleConfirmValue,
+        onInspectorTabChange: setInspectorTab,
+        onOpenContainerLogs: openContainerLogs,
+        onOpenProjectYaml: openProjectYaml,
+        onOpenWorkspaceFileTab,
+        onPinContainer: (container) => void pinContainer(container),
+        onProjectInspectorTabChange: setProjectInspectorTab,
+        onProjectSelectContainer: (container) => {
+          selectContainer(container.id);
+          setInspectorTab("details");
+          setDetailView("container");
+        },
+        onQueryChange: setQuery,
+        onRefreshContainers: () => void loadContainers(),
+        onRefreshInspector: () => {
+          if (selectedContainer) {
+            void loadInspector(inspectorTab, selectedContainer);
           }
-          value={lifecycleConfirmValue}
-        />
-      ) : null}
-    </>
+        },
+        onRuntimeChange: setRuntime,
+        onSelectContainer: selectContainer,
+        onSelectProject: selectProject,
+      }}
+      state={{
+        actionError,
+        activeLifecycleAction,
+        composeListViewModel,
+        containerSummary,
+        currentContainerCount: currentContainers.length,
+        currentLoadError,
+        detailView,
+        groupMode,
+        host,
+        includeStopped,
+        inspectorError,
+        inspectorLoading,
+        inspectorTab,
+        inspectSummary,
+        lifecycleConfirmValue,
+        lifecycleDialogCopy,
+        loading,
+        missingPinnedContainer: Boolean(missingPinnedContainerId),
+        pendingLifecycleAction,
+        pinningContainerId,
+        projectInspectorTab,
+        query,
+        resultMatchesTarget,
+        runtime,
+        selectedActionBusy: Boolean(selectedActionBusy),
+        selectedCanEnter,
+        selectedCanStart,
+        selectedContainer,
+        selectedContainerId,
+        selectedProject,
+        selectedProjectId,
+        statsResult,
+        viewModel,
+      }}
+    />
   );
 }

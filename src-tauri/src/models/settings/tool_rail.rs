@@ -24,6 +24,8 @@ pub enum ToolRailToolId {
     System,
     /// 当前终端命令历史面板。
     Logs,
+    /// 当前 SSH 主机的 Docker、Podman 与 Compose 容器。
+    Containers,
 }
 
 /// 工具内容相对工作区的展示方式。
@@ -145,6 +147,7 @@ fn default_tool_rail_order() -> Vec<ToolRailToolId> {
         ToolRailToolId::Ports,
         ToolRailToolId::System,
         ToolRailToolId::Logs,
+        ToolRailToolId::Containers,
     ]
 }
 

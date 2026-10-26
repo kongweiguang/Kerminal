@@ -1,9 +1,6 @@
 // @author kongweiguang
 
-import type { HostContainersToolContentProps } from "./HostContainersToolContent";
 import type { Machine, MachineGroup } from "../workspace/contracts/index";
-
-export type MachineSidebarViewMode = "hosts" | "containers";
 
 export type ConnectionOpenOptions = {
   groupId?: string;
@@ -11,18 +8,14 @@ export type ConnectionOpenOptions = {
 };
 
 export interface MachineSidebarProps {
-  activeView?: MachineSidebarViewMode;
   collapsed?: boolean;
   collapsedGroupIds?: readonly string[];
-  containerHostId?: string | null;
-  containerInitialContainerId?: string;
   groups: MachineGroup[];
   openMachineIds?: readonly string[];
   rdpOpeningMachineIds?: readonly string[];
   selectedMachineId: string;
   search: string;
   settingsSelected?: boolean;
-  onActiveViewChange?: (view: MachineSidebarViewMode) => void;
   onSearchChange: (query: string) => void;
   onAddConnection?: (options?: ConnectionOpenOptions) => void;
   onAddGroup?: () => void;
@@ -54,15 +47,6 @@ export interface MachineSidebarProps {
   onOpenSerialTerminal?: (machineId: string) => void;
   onPinGroup?: (groupId: string, pinned?: boolean) => void;
   onSelectMachine: (machineId: string) => void;
-  onContainerHostChange?: (hostId: string) => void;
-  onEnterContainer?: HostContainersToolContentProps["onEnterContainer"];
-  onFetchContainerStats?: HostContainersToolContentProps["onFetchContainerStats"];
-  onInspectContainer?: HostContainersToolContentProps["onInspectContainer"];
-  onLifecycleContainer?: HostContainersToolContentProps["onLifecycleContainer"];
-  onListDockerContainers?: HostContainersToolContentProps["onListDockerContainers"];
-  onOpenContainerLogs?: HostContainersToolContentProps["onOpenContainerLogs"];
-  onOpenWorkspaceFileTab?: HostContainersToolContentProps["onOpenWorkspaceFileTab"];
-  onPinContainer?: HostContainersToolContentProps["onPinContainer"];
 }
 
 export type SidebarContextMenu =

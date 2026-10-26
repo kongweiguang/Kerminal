@@ -1,3 +1,4 @@
+// @author kongweiguang
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { defaultAppSettings } from "../../../../src/features/settings/settingsModel";
 import { Profiler, type ProfilerOnRenderCallback } from "react";
@@ -64,7 +65,7 @@ describe("XtermPane inline suggestions", () => {
 
     mocks.api.writeTerminal.mockClear();
     act(() => {
-      terminal.onDataCallback?.("\u001b[C");
+      terminal.triggerKeyData("\u001b[C");
     });
 
     expect(mocks.api.writeTerminal).toHaveBeenCalledTimes(1);
@@ -91,6 +92,34 @@ describe("XtermPane inline suggestions", () => {
         screen.queryByLabelText("终端命令灰色提示"),
       ).not.toBeInTheDocument();
     });
+  });
+
+  it("can finish a candidate after accepting its first segment without losing the remainder", async () => {
+    mocks.api.listTerminalSuggestions.mockResolvedValue([{
+      acceptBoundaries: [10], description: "分段历史候选", displayText: "git status --short",
+      id: "partial-history", provider: "history", replacementRange: { start: 0, end: 3 },
+      replacementText: "git status --short", score: 0.9, sensitivity: "normal",
+      sourceId: "partial-history", suffix: " status --short",
+    }]);
+    render(<XtermPane focused paneId="pane-local" resolvedTheme="dark"
+      terminalAppearance={{ ...defaultAppSettings.terminal, inlineSuggestion: {
+        ...defaultAppSettings.terminal.inlineSuggestion, partialAccept: true,
+      } }} title="本地 PowerShell" />);
+    await screen.findByText("已连接");
+    const terminal = mocks.terminalInstances[0];
+    terminal.buffer.active.cursorX = 3;
+    act(() => { for (const key of "git") terminal.triggerKeyData(key); });
+    await screen.findByLabelText("终端命令灰色提示");
+    mocks.api.writeTerminal.mockClear();
+    act(() => {
+      terminal.triggerCustomKeyEvent({ altKey: true, key: "ArrowRight", code: "ArrowRight", keyCode: 39 });
+      terminal.triggerCustomKeyEvent({ key: "ArrowRight", code: "ArrowRight", keyCode: 39 });
+      terminal.triggerKeyData("\r");
+    });
+    await waitFor(() => expect(mocks.api.writeTerminal.mock.calls).toEqual([
+      ["session-1", " status"], ["session-1", " --short"], ["session-1", "\r"],
+    ]));
+    expect(mocks.api.recordCommandHistory).toHaveBeenCalledWith(expect.objectContaining({ command: "git status --short" }));
   });
 
   it("positions ghost suggestions from the xterm screen grid even on short rows", async () => {

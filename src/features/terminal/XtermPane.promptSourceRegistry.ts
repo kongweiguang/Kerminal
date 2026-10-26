@@ -1,9 +1,13 @@
+/**
+ * @author kongweiguang
+ */
 import { useEffect, useRef, type MutableRefObject } from "react";
 import type { Terminal } from "@xterm/xterm";
-import { writeTerminal } from "../../lib/terminalApi";
 import type { TerminalCommandBlock } from "./terminalCommandBlocks";
 import { terminalCommandBlockPlainText } from "./terminalCommandBlocks";
 import { getTerminalPaneSessionRecord } from "./terminalSessionRegistry";
+import { withTerminalInputOrigin } from "./terminalInputOrigin";
+import { terminalInputSync } from "./terminalInputSync";
 import type { XtermPaneInputRequest } from "./XtermPane.types";
 
 /** 终端正文按需读取结果；调用方不得把该对象同步到全局状态或持久化。 */
@@ -89,9 +93,17 @@ export function useXtermPanePromptBridge({
     const terminal = terminalRef.current;
     const sessionId = sessionIdRef.current;
     if (!terminal || !sessionId) return;
+    // 定向输入先关闭所属同步组，避免粘贴引发的延迟输入被传播。
+    terminalInputSync.stopForPane(paneId);
     lastInputRequestIdRef.current = inputRequest.id;
-    if (inputRequest.text) terminal.paste(inputRequest.text);
-    if (inputRequest.submit) void writeTerminal(sessionId, "\r");
+    if (inputRequest.text) {
+      withTerminalInputOrigin(terminal, { kind: "programmatic" }, () => {
+        terminal.paste(inputRequest.text);
+      });
+    }
+    if (inputRequest.submit) {
+      void terminalInputSync.writeUserInput(paneId, { data: "\r" }).catch(() => undefined);
+    }
     terminal.focus();
-  }, [connectionState, inputRequest, sessionIdRef, terminalRef]);
+  }, [connectionState, inputRequest, paneId, sessionIdRef, terminalRef]);
 }

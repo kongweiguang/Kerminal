@@ -10,7 +10,6 @@ import {
 } from "lucide-react";
 import {
   AgentWorkflowHistoryList,
-  AgentWorkflowSessionCommands,
   AgentWorkflowStatusBadge,
   type AgentWorkflowHistoryMetadata,
   type AgentWorkflowSessionSnapshot,
@@ -36,13 +35,12 @@ interface AgentConversationListProps {
   historyMetadata: readonly AgentWorkflowHistoryMetadata[];
   onContinue: (sessionId: string) => void;
   onDelete: (sessionId: string) => Promise<boolean>;
-  onNewSession: (sessionId: string) => void;
   onRename: (sessionId: string, title: string) => Promise<boolean>;
   renamingSessionId: string | null;
   sessions: readonly AgentConversationSessionSnapshot[];
 }
 
-/** Agent 对话列表只负责范围、标题编辑和展示；scope 优先于 legacy target 决定当前列表。 */
+/** 卡片主按钮直接继续原会话；编辑和删除作为独立兄弟控件，避免嵌套按钮与误恢复。 */
 export function AgentConversationList({
   actionDisabled,
   currentTarget,
@@ -51,7 +49,6 @@ export function AgentConversationList({
   historyMetadata,
   onContinue,
   onDelete,
-  onNewSession,
   onRename,
   renamingSessionId,
   sessions,
@@ -89,14 +86,17 @@ export function AgentConversationList({
     [activeSessions, currentSessions, scope],
   );
 
+  /** 编辑草稿只属于当前记录，不触发会话恢复。 */
   const beginEditing = (session: AgentWorkflowSessionSnapshot) => {
     setEditingSessionId(session.agentSessionId);
     setDraftTitle(session.title);
   };
+  /** 放弃草稿不修改持久化标题。 */
   const cancelEditing = () => {
     setEditingSessionId(null);
     setDraftTitle("");
   };
+  /** 等待持久化成功再退出编辑，失败时保留用户输入。 */
   const submitTitle = async (sessionId: string) => {
     const title = draftTitle.trim();
     if (!title) {
@@ -146,17 +146,27 @@ export function AgentConversationList({
                 const deleting = deletingSessionId === session.agentSessionId;
                 return (
                   <article
-                    className="min-w-0 px-3 py-3"
+                    className="group relative isolate min-w-0 px-3 py-3 transition-colors hover:bg-[var(--surface-hover)] focus-within:bg-[var(--surface-hover)]"
                     key={session.agentSessionId}
                   >
-                    <div className="flex min-w-0 items-start gap-2">
+                    {!editing ? (
+                      <button
+                        aria-label={`继续对话 ${session.title}`}
+                        className="kerminal-focus-ring absolute inset-0 z-0 rounded-lg disabled:cursor-wait"
+                        disabled={actionDisabled || renaming || deleting}
+                        onClick={() => onContinue(session.agentSessionId)}
+                        title="继续这段对话"
+                        type="button"
+                      />
+                    ) : null}
+                    <div className="pointer-events-none relative flex min-w-0 items-start gap-2">
                       <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-[var(--surface-muted)] text-zinc-500 dark:text-zinc-400">
                         <MessageSquare aria-hidden className="h-3.5 w-3.5" />
                       </span>
                       <div className="min-w-0 flex-1">
                         {editing ? (
                           <form
-                            className="flex min-w-0 items-center gap-1"
+                            className="pointer-events-auto flex min-w-0 items-center gap-1"
                             onSubmit={(event) => {
                               event.preventDefault();
                               void submitTitle(session.agentSessionId);
@@ -199,7 +209,7 @@ export function AgentConversationList({
                             </h3>
                             <button
                               aria-label={`重命名 ${session.title}`}
-                              className="kerminal-focus-ring grid h-7 w-7 shrink-0 place-items-center rounded-md text-zinc-400 hover:bg-[var(--surface-hover)] hover:text-zinc-700 dark:hover:text-zinc-200"
+                              className="pointer-events-auto kerminal-focus-ring grid h-7 w-7 shrink-0 place-items-center rounded-md text-zinc-400 hover:bg-[var(--surface-hover)] hover:text-zinc-700 dark:hover:text-zinc-200"
                               disabled={actionDisabled}
                               onClick={() => beginEditing(session)}
                               title="重命名"
@@ -209,7 +219,7 @@ export function AgentConversationList({
                             </button>
                             <button
                               aria-label={`删除 ${session.title}`}
-                              className="kerminal-focus-ring grid h-7 w-7 shrink-0 place-items-center rounded-md text-zinc-400 hover:bg-red-500/10 hover:text-red-600 disabled:opacity-50 dark:hover:text-red-300"
+                              className="pointer-events-auto kerminal-focus-ring grid h-7 w-7 shrink-0 place-items-center rounded-md text-zinc-400 hover:bg-red-500/10 hover:text-red-600 disabled:opacity-50 dark:hover:text-red-300"
                               disabled={actionDisabled || deleting}
                               onClick={() => setDeleteCandidate(session)}
                               title="删除记录"
@@ -239,14 +249,6 @@ export function AgentConversationList({
                         </div>
                       </div>
                       <AgentWorkflowStatusBadge status={session.runtimeStatus} />
-                    </div>
-                    <div className="mt-2 pl-9">
-                      <AgentWorkflowSessionCommands
-                        disabled={actionDisabled || renaming || deleting}
-                        onContinue={onContinue}
-                        onNewSession={onNewSession}
-                        sessionId={session.agentSessionId}
-                      />
                     </div>
                   </article>
                 );

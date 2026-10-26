@@ -258,7 +258,7 @@ describe("XtermPane remote suggestions", () => {
     mocks.api.writeTerminal.mockClear();
     mocks.api.recordTerminalSuggestionFeedback.mockClear();
     act(() => {
-      terminal.onDataCallback?.("\u001b[C");
+      terminal.triggerKeyData("\u001b[C");
     });
 
     expect(mocks.api.writeTerminal).toHaveBeenCalledWith("session-1", "\u001b[C");
@@ -366,7 +366,7 @@ describe("XtermPane remote suggestions", () => {
 
     mocks.api.writeTerminal.mockClear();
     act(() => {
-      terminal.onDataCallback?.("\u001b[C");
+      terminal.triggerKeyData("\u001b[C");
     });
 
     expect(mocks.api.writeTerminal).toHaveBeenCalledWith(

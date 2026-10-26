@@ -188,6 +188,9 @@ describe("hostContainerDialogModel", () => {
     expect(hostContainerLifecycleDisabledReason(running, "remove")).toBe(
       "先停止容器再删除",
     );
+    expect(hostContainerLifecycleDialogCopy("stop", running).helperText).toBe(
+      "停止后可重新启动容器。",
+    );
     expect(hostContainerLifecycleDialogCopy("remove", stopped)).toMatchObject({
       confirmLabel: "删除容器",
       inputLabel: "容器名",

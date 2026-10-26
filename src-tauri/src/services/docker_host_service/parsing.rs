@@ -1,3 +1,4 @@
+// @author kongweiguang
 use super::*;
 use std::collections::BTreeMap;
 
@@ -25,12 +26,33 @@ const COMPOSE_LABEL_KEYS: &[&str] = &[
     PODMAN_COMPOSE_CONFIG_FILES_LABEL,
 ];
 
+/// Prefer whole-document JSON when available while retaining Docker's line-oriented output contract.
 pub fn parse_container_list_output(
     host_id: &str,
     runtime: ContainerRuntime,
     output: &str,
 ) -> AppResult<Vec<DockerContainerSummary>> {
-    output
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        match &value {
+            Value::Array(items) => {
+                return items
+                    .iter()
+                    .map(|item| parse_container_value(host_id, runtime, item))
+                    .collect();
+            }
+            Value::Object(_) => {
+                return Ok(vec![parse_container_value(host_id, runtime, &value)?]);
+            }
+            _ => {}
+        }
+    }
+
+    trimmed
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -38,6 +60,7 @@ pub fn parse_container_list_output(
         .collect()
 }
 
+/// Preserve the line-based error context used when Docker emits JSONL.
 pub(super) fn parse_container_line(
     host_id: &str,
     runtime: ContainerRuntime,
@@ -46,29 +69,28 @@ pub(super) fn parse_container_line(
     let value: Value = serde_json::from_str(line).map_err(|error| {
         AppError::Docker(format!("无法解析容器列表 JSON: {error}; line={line}"))
     })?;
-    let id = field_string(&value, "ID")
-        .or_else(|| field_string(&value, "Id"))
+    parse_container_value(host_id, runtime, &value)
+}
+
+/// Decode one row without imposing a serialization format on Docker or Podman callers.
+fn parse_container_value(
+    host_id: &str,
+    runtime: ContainerRuntime,
+    value: &Value,
+) -> AppResult<DockerContainerSummary> {
+    let id = field_string(value, "ID")
+        .or_else(|| field_string(value, "Id"))
         .ok_or_else(|| AppError::Docker("容器列表缺少 ID 字段".to_owned()))?;
-    let name = field_string(&value, "Names")
-        .or_else(|| field_string(&value, "Name"))
-        .map(|value| first_csv_value(&value))
+    let name = container_name_field(value, "Names")
+        .or_else(|| container_name_field(value, "Name"))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| short_container_id(&id));
-    let image = field_string(&value, "Image").unwrap_or_default();
-    let status_text = field_string(&value, "Status").unwrap_or_default();
-    let state = field_string(&value, "State").unwrap_or_default();
+    let image = field_string(value, "Image").unwrap_or_default();
+    let status_text = field_string(value, "Status").unwrap_or_default();
+    let state = field_string(value, "State").unwrap_or_default();
     let status = DockerContainerStatus::from_cli_fields(&state, &status_text);
-    let ports = field_string(&value, "Ports")
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    let raw_labels = container_labels_from_list_value(&value);
+    let ports = container_ports(value.get("Ports"));
+    let raw_labels = container_labels_from_list_value(value);
     let labels = compose_labels_from_map(&raw_labels);
     let compose = parse_compose_metadata(&labels);
     let target = RemoteTargetRef::DockerContainer {
@@ -95,6 +117,73 @@ pub(super) fn parse_container_line(
         capabilities: TargetCapabilities::docker_container(),
         compose,
         labels,
+    })
+}
+
+/// Podman returns names as an array while Docker returns a comma-separated string.
+fn container_name_field(value: &Value, key: &str) -> Option<String> {
+    let name = match value.get(key)? {
+        Value::String(name) => Some(name.as_str()),
+        Value::Array(names) => names.iter().find_map(Value::as_str),
+        _ => None,
+    }?;
+    let name = first_csv_value(name.trim());
+    (!name.is_empty()).then_some(name)
+}
+
+/// Normalize both Docker's display string and Podman's structured port mappings for the existing UI contract.
+fn container_ports(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(ports)) => ports
+            .split(',')
+            .map(str::trim)
+            .filter(|port| !port.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        Some(Value::Array(ports)) => ports.iter().filter_map(port_mapping_text).collect(),
+        Some(port @ Value::Object(_)) => port_mapping_text(port).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Skip incomplete mappings so a missing optional port field cannot break container discovery.
+fn port_mapping_text(value: &Value) -> Option<String> {
+    if let Value::String(port) = value {
+        let port = port.trim();
+        return (!port.is_empty()).then(|| port.to_owned());
+    }
+    let Value::Object(_) = value else {
+        return None;
+    };
+
+    let container_port =
+        object_string(value, &["ContainerPort", "container_port", "containerPort"])?;
+    let protocol = object_string(value, &["Protocol", "protocol"]).unwrap_or_else(|| "tcp".into());
+    let container = format!("{container_port}/{protocol}");
+    let host_port =
+        object_string(value, &["HostPort", "host_port", "hostPort"]).filter(|port| port != "0");
+    let Some(host_port) = host_port else {
+        return Some(container);
+    };
+    let host_ip = object_string(value, &["HostIP", "HostIp", "host_ip", "hostIp"])
+        .filter(|ip| !ip.is_empty());
+    let host = match host_ip {
+        Some(ip) if ip.contains(':') && !ip.starts_with('[') => format!("[{ip}]:{host_port}"),
+        Some(ip) => format!("{ip}:{host_port}"),
+        None => host_port,
+    };
+    Some(format!("{host}->{container}"))
+}
+
+/// Accept numeric and textual fields because Podman CLI versions serialize ports differently.
+fn object_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| match value.get(*key)? {
+        Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        }
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
     })
 }
 

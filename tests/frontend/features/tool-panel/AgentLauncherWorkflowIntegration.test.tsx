@@ -16,7 +16,6 @@ const baseProps = {
   actionError: null,
   actionState: null,
   agentOptions: [codexSelectorOption],
-  agentTechnicalDetail: "",
   currentAgentTargetLabel: "未绑定",
   customAgentError: null,
   customAgentMutationPending: false,
@@ -27,17 +26,13 @@ const baseProps = {
   pendingSendRequest: null,
   selectedAgentKey: "builtin:codex",
   onAgentSelect: vi.fn(),
-  onCancelRestore: vi.fn(),
-  onContinueRestore: vi.fn(),
   onCustomAgentDelete: vi.fn().mockResolvedValue(true),
   onCustomAgentSave: vi.fn().mockResolvedValue(true),
   onLaunchSelected: vi.fn(),
-  onNewSession: vi.fn(),
   onRetry: vi.fn(),
   onWorkflowRename: vi.fn().mockResolvedValue(true),
   onWorkflowDelete: vi.fn().mockResolvedValue(true),
   renamingSessionId: null,
-  restoreChoice: null,
   statusAvailable: true,
   visible: true,
 };
@@ -48,7 +43,6 @@ describe("AgentLauncher workflow integration", () => {
       <AgentLauncherView
         {...baseProps}
         onWorkflowContinue={vi.fn()}
-        onWorkflowNewSession={vi.fn()}
         pendingSendRequest={{
           expiresAt: Date.now() + 60_000,
           id: 1,
@@ -80,7 +74,6 @@ describe("AgentLauncher workflow integration", () => {
       <AgentLauncherView
         {...baseProps}
         onWorkflowContinue={vi.fn()}
-        onWorkflowNewSession={vi.fn()}
         workflowSnapshot={{
           disposed: false,
           historyMetadata: [],
@@ -93,7 +86,7 @@ describe("AgentLauncher workflow integration", () => {
       />,
     );
 
-    expect(screen.getByRole("heading", { name: "新建对话" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "新建对话" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("agent-launcher-pending-send")).not.toBeInTheDocument();
   });
 
@@ -104,7 +97,6 @@ describe("AgentLauncher workflow integration", () => {
         {...baseProps}
         onCustomAgentSave={onCustomAgentSave}
         onWorkflowContinue={vi.fn()}
-        onWorkflowNewSession={vi.fn()}
         workflowSnapshot={{
           disposed: false,
           historyMetadata: [],
@@ -147,7 +139,6 @@ describe("AgentLauncher workflow integration", () => {
       <AgentLauncherView
         {...baseProps}
         onWorkflowContinue={vi.fn()}
-        onWorkflowNewSession={vi.fn()}
         workflowSnapshot={{
           disposed: false,
           historyMetadata: [],
@@ -173,23 +164,12 @@ describe("AgentLauncher workflow integration", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("旧 PI 会话缺少 launcherKey 时仍按内置 key 展示恢复中状态", () => {
+  it("启动期间禁用选择器与进入，避免并行切换或重复启动", () => {
     const { container } = render(
       <AgentLauncherView
         {...baseProps}
-        actionState="builtin:pi"
+        actionState="builtin:codex"
         onWorkflowContinue={vi.fn()}
-        onWorkflowNewSession={vi.fn()}
-        restoreChoice={{
-          agentId: "pi",
-          permissionMode: "default",
-          session: {
-            agentSessionId: "ags-legacy-pi",
-            scope: { kind: "tab", tabId: "tab-local" },
-            tabId: "tab-local",
-            title: "PI Agent",
-          },
-        }}
         workflowSnapshot={{
           disposed: false,
           historyMetadata: [],
@@ -202,21 +182,19 @@ describe("AgentLauncher workflow integration", () => {
       />,
     );
 
-    expect(
-      screen.queryByRole("button", { name: "继续上次" }),
-    ).not.toBeInTheDocument();
     expect(container.querySelector(".animate-spin")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "使用 Codex 进入" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "选择 Agent" })).toHaveAttribute("aria-disabled", "true");
   });
 
-  it("展示统一状态并只以上抛 session id 的方式执行继续和同 Agent 新会话", () => {
+  it("展示统一状态并在操作中禁用继续入口", () => {
     const onWorkflowContinue = vi.fn();
-    const onWorkflowNewSession = vi.fn();
 
     render(
       <AgentLauncherView
         {...baseProps}
+        actionState="busy"
         onWorkflowContinue={onWorkflowContinue}
-        onWorkflowNewSession={onWorkflowNewSession}
         workflowSnapshot={{
           disposed: false,
           historyMetadata: [],
@@ -239,10 +217,46 @@ describe("AgentLauncher workflow integration", () => {
     );
 
     expect(screen.getByLabelText("Agent 状态：等待人工")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "继续对话" }));
-    fireEvent.click(screen.getByRole("button", { name: "同 Agent 新会话" }));
-    expect(onWorkflowContinue).toHaveBeenCalledWith("ags-1");
-    expect(onWorkflowNewSession).toHaveBeenCalledWith("ags-1");
+    const continueButton = screen.getByRole("button", { name: "继续对话 Codex" });
+    expect(continueButton).toBeDisabled();
+    fireEvent.click(continueButton);
+    expect(onWorkflowContinue).not.toHaveBeenCalled();
+    expect(screen.queryByText("同 Agent 新会话")).not.toBeInTheDocument();
+  });
+
+  it("编辑和删除会话时不会误触继续按钮", () => {
+    const onWorkflowContinue = vi.fn();
+    render(
+      <AgentLauncherView
+        {...baseProps}
+        onWorkflowContinue={onWorkflowContinue}
+        workflowSnapshot={{
+          disposed: false,
+          historyMetadata: [],
+          loading: false,
+          queueMetadata: [],
+          revision: 1,
+          sessions: [
+            {
+              agentId: "codex",
+              agentSessionId: "ags-1",
+              repositoryStatus: "active",
+              runtimeStatus: "waitingForUser",
+              statusSource: "terminalSignal",
+              title: "Codex 会话",
+            },
+          ],
+          stale: false,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "重命名 Codex 会话" }));
+    expect(onWorkflowContinue).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "取消修改标题" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除 Codex 会话" }));
+    expect(onWorkflowContinue).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "删除会话记录？" })).toBeInTheDocument();
   });
 
   it("Pi 历史会话的身份标签与自定义标题独立显示", () => {
@@ -250,7 +264,6 @@ describe("AgentLauncher workflow integration", () => {
       <AgentLauncherView
         {...baseProps}
         onWorkflowContinue={vi.fn()}
-        onWorkflowNewSession={vi.fn()}
         workflowSnapshot={{
           disposed: false,
           historyMetadata: [],
@@ -283,7 +296,6 @@ describe("AgentLauncher workflow integration", () => {
       <AgentLauncherView
         {...baseProps}
         onWorkflowContinue={vi.fn()}
-        onWorkflowNewSession={vi.fn()}
         workflowSnapshot={{
           disposed: false,
           historyMetadata: [
@@ -319,7 +331,6 @@ describe("AgentLauncher workflow integration", () => {
         {...baseProps}
         currentAgentTarget={{ targetRef: "ssh:prod" }}
         onWorkflowContinue={vi.fn()}
-        onWorkflowNewSession={vi.fn()}
         onWorkflowRename={onWorkflowRename}
         workflowSnapshot={{
           disposed: false,
@@ -375,7 +386,6 @@ describe("AgentLauncher workflow integration", () => {
         {...baseProps}
         onWorkflowContinue={vi.fn()}
         onWorkflowDelete={onWorkflowDelete}
-        onWorkflowNewSession={vi.fn()}
         workflowSnapshot={{
           disposed: false,
           historyMetadata: [],

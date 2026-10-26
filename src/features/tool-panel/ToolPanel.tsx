@@ -14,6 +14,7 @@ import {
 import type { SettingsSectionId } from "../settings/view/index";
 import type {
   Machine,
+  MachineGroup,
   TerminalPane,
   TerminalTab,
   ToolId,
@@ -35,13 +36,32 @@ import {
   claimAgentSendRequestAutoOpen,
   useAgentSendRequestSnapshot,
 } from "../agent-workflow/state/index";
-import { resolveToolPanelBinding } from "./toolPanelContextModel";
+import {
+  resolveToolPanelBinding,
+  type HostContainerRevealRequest,
+} from "./toolPanelContextModel";
 import { ToolRail } from "./ToolRail";
+import type { HostContainersToolContentProps } from "../machine-sidebar";
+
+/** Shell 继续拥有业务操作，内容宿主只传递当前容器的动作，避免再造一套服务适配。 */
+export type ContainerToolActions = Pick<
+  HostContainersToolContentProps,
+  | "onEnterContainer"
+  | "onFetchContainerStats"
+  | "onInspectContainer"
+  | "onLifecycleContainer"
+  | "onListDockerContainers"
+  | "onOpenContainerLogs"
+  | "onPinContainer"
+>;
 
 interface ToolPanelProps {
   activeTool: ToolId | null;
   activeTools?: readonly ToolId[];
   activeMachine?: Machine;
+  machineGroups?: MachineGroup[];
+  containerActions?: ContainerToolActions;
+  containerRevealRequest?: HostContainerRevealRequest;
   activeTab?: TerminalTab;
   defaultRemoteGroupId?: string;
   defaultRemoteHostId?: string;
@@ -53,6 +73,7 @@ interface ToolPanelProps {
   tools: ToolSummary[];
   settings?: AppSettings;
   showRail?: boolean;
+  visible?: boolean;
   snippetConfigRevision?: number;
   sftpRevealRequest?: WorkspaceFileRevealRequest | null;
   resolvedTheme?: ResolvedTheme;
@@ -103,6 +124,9 @@ const AgentLauncherToolContent = lazy(async () => ({
 const TmuxToolContent = lazy(async () => ({
   default: (await import("./TmuxToolContent")).TmuxToolContent,
 }));
+const HostContainersToolContent = lazy(async () => ({
+  default: (await import("../machine-sidebar")).HostContainersToolContent,
+}));
 const ContextInspectorToolContent = lazy(async () => ({
   default: (await import("./context-inspector")).ContextInspectorToolContent,
 }));
@@ -120,6 +144,9 @@ export function ToolPanel({
   activeTool,
   activeTools = activeTool ? [activeTool] : [],
   activeMachine,
+  machineGroups,
+  containerActions,
+  containerRevealRequest,
   activeTab,
   focusedPane,
   selectedMachine,
@@ -135,6 +162,7 @@ export function ToolPanel({
   resolvedTheme = "dark",
   settings,
   showRail = true,
+  visible = true,
   snippetConfigRevision,
   sftpRevealRequest,
   terminalPanes,
@@ -230,6 +258,7 @@ export function ToolPanel({
             const toolId = tool.id;
             const selected = toolId === contentTool;
             const binding = resolveToolPanelBinding(toolId, {
+              machineGroups,
               activeMachine,
               activeTab,
               focusedPane,
@@ -237,9 +266,17 @@ export function ToolPanel({
               workspaceRevision: workspaceContext?.revision,
             });
             const fullHeightTool =
-              toolId === "agentLauncher" || toolId === "sftp";
+              toolId === "agentLauncher" ||
+              toolId === "sftp" ||
+              toolId === "containers";
             const contentOwnsHeader =
               toolId === "system" || toolId === "ports" || toolId === "tmux";
+            const containerReveal =
+              containerRevealRequest &&
+              containerRevealRequest.tabId === binding.activeTab?.id &&
+              containerRevealRequest.hostId === binding.machine?.id
+                ? containerRevealRequest
+                : undefined;
             return (
               <div
                 aria-hidden={!selected}
@@ -268,6 +305,21 @@ export function ToolPanel({
                   <Suspense
                     fallback={<ToolContentLoadingFallback title={tool.title} />}
                   >
+                    {toolId === "containers" ? (
+                      <HostContainersToolContent
+                        {...containerActions}
+                        active={selected && drawerOpen && visible}
+                        initialContainerId={containerReveal?.containerId}
+                        initialRuntime={containerReveal?.runtime ?? (
+                          activeMachine?.kind === "dockerContainer"
+                            ? activeMachine.runtime
+                            : undefined
+                        )}
+                        initialRequestId={containerReveal?.requestId}
+                        onOpenWorkspaceFileTab={onOpenWorkspaceFileTab}
+                        selectedMachine={binding.machine}
+                      />
+                    ) : null}
                     {toolId === "agentLauncher" ? (
                       <AgentLauncherToolContent
                         activeTab={binding.activeTab}

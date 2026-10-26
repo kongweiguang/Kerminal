@@ -179,6 +179,9 @@ export function KerminalShellLayout({
             {...toolPanelProps}
             activeTool={toolId}
             activeTools={activeTools}
+            visible={activeTools.includes(toolId) && (
+              !compactShell || activeTool === toolId
+            )}
             showRail={false}
           />
         )}

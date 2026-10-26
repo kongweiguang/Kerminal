@@ -27,7 +27,7 @@ import type { XtermPaneActivityRuntime } from "./XtermPane.activityRuntime";
 import type { XtermPaneArtifactRuntime } from "./XtermPane.artifacts";
 import type { createXtermPaneCommandBlockRuntime } from "./XtermPane.commandBlockRuntime";
 import type { createXtermPaneGhostSuggestions } from "./XtermPane.ghostSuggestions";
-import { errorMessage } from "./XtermPane.helpers";
+import { errorMessage, type ConnectionState } from "./XtermPane.helpers";
 import { createInitialRemoteOutputGate } from "./terminalInitialRemoteOutputGate";
 import type { createTerminalInlineSshAuthPrompt } from "./XtermPane.inlineSshAuthPrompt";
 import { cancelSshHostKeyPromptsForOwner } from "../ssh-host-key/state/index";
@@ -38,6 +38,7 @@ import {
 } from "./XtermPane.runtime.helpers";
 import type { InstallXtermPaneRuntimeParams } from "./XtermPane.runtime.types";
 import { createXtermPaneTerminalSession } from "./XtermPane.sessionFactory";
+import { terminalInputSync } from "./terminalInputSync";
 
 type SessionConfig = Pick<
   InstallXtermPaneRuntimeParams,
@@ -147,7 +148,7 @@ export function createXtermPaneSessionRuntime({
   resetInputState,
   resetShellIntegration,
   sessionIdRef,
-  setConnectionState,
+  setConnectionState: setReactConnectionState,
   setLogNotice,
   setLogState,
   setShellIntegrationTrusted,
@@ -165,6 +166,13 @@ export function createXtermPaneSessionRuntime({
   let sessionRun = 0;
   // 活动 session 清空后仍保留最后绑定 id，pane 被关闭时才能注销 disconnected binding。
   let lastBoundSessionId: string | null = null;
+
+  /** 先更新同步输入门禁，再通知 React；读失败保留 binding 时也立即停止整组。 */
+  const setConnectionState = (state: ConnectionState): void => {
+    activityRuntime.setConnectionState(state);
+    setReactConnectionState(state);
+    terminalInputSync.refresh();
+  };
   const sshFailureTracker = createSshTerminalFailureTracker();
   const isSshTerminalTarget = () =>
     Boolean(
@@ -187,6 +195,7 @@ export function createXtermPaneSessionRuntime({
     }
     paneResizeController.clearSession(sessionId);
     unregisterTerminalPaneSession(paneId, sessionId, { preserveBinding: true });
+    terminalInputSync.refresh();
     resetShellIntegration();
     commandBlockRuntime.resetProtocolState();
     setLogState({ active: false, bytesWritten: 0 });
@@ -531,6 +540,7 @@ export function createXtermPaneSessionRuntime({
         paneResizeController.clearSession(boundSessionId);
         unregisterTerminalPaneSession(paneId, boundSessionId);
       }
+      terminalInputSync.refresh();
       if (sessionId) {
         void closeTerminal(sessionId);
       }

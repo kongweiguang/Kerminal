@@ -227,6 +227,7 @@ export function hostContainerLifecycleDisabledReason(
   }
 }
 
+/** Lifecycle guidance stays independent of the confirmation surface so dialogs remain reusable across sidebar and tool panel entry points. */
 export function hostContainerLifecycleDialogCopy(
   action: HostContainerLifecycleAction,
   container: DockerContainerSummary,
@@ -236,7 +237,7 @@ export function hostContainerLifecycleDialogCopy(
       return {
         confirmLabel: "停止容器",
         description: `停止 ${container.name} 会中断其中正在运行的进程。`,
-        helperText: "停止后可从当前弹框重新启动。",
+        helperText: "停止后可重新启动容器。",
         title: "停止容器",
         variant: "danger" as const,
       };

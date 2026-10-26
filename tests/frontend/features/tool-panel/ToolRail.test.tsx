@@ -10,6 +10,7 @@ import {
 } from "../../../../src/features/tool-panel/toolRailModel";
 
 describe("ToolRail", () => {
+  /** 主区顺序和固定底部分区共同决定 DOM 次序，新入口仍可发现。 */
   it("在两个入口使用相同顺序并响应右击编辑", () => {
     const onOpenCustomizer = vi.fn();
     const onActiveToolChange = vi.fn();
@@ -52,6 +53,7 @@ describe("ToolRail", () => {
       "打开 文件",
       "打开 片段",
       "打开 tmux",
+      "打开 容器",
       "打开 端口",
     ]);
     expect(

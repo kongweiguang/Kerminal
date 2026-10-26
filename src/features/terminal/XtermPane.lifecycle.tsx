@@ -465,10 +465,6 @@ export function XtermPane({
   }, [focused, paneId]);
 
   useEffect(() => {
-    activityRuntimeRef.current?.setConnectionState(connectionState);
-  }, [connectionState]);
-
-  useEffect(() => {
     visibleRef.current = visible;
     activityRuntimeRef.current?.setVisible(visible);
     terminalRuntimeLifecycleControllerRef.current?.markVisible(visible);
@@ -611,7 +607,9 @@ export function XtermPane({
         requestAgentSend({ paneId, source: "context", tabId });
         setCommandBlockNotice("已将终端上下文交给 Agent，等待发送预览");
       } else if (action === "paste") {
-        void pasteIntoTerminal(terminal, sessionId);
+        void pasteIntoTerminal(paneId, terminal, sessionId).catch(() => {
+          setTerminalNotice("粘贴失败，请检查剪贴板权限或终端连接。");
+        });
       } else if (action === "selectAll") {
         terminal?.selectAll?.();
       } else if (action === "clear") {
@@ -676,7 +674,9 @@ export function XtermPane({
       return;
     }
     if (rightClickBehavior === "paste" && !openMenuWithModifier) {
-      void pasteIntoTerminal(terminal, sessionId);
+      void pasteIntoTerminal(paneId, terminal, sessionId).catch(() => {
+        setTerminalNotice("粘贴失败，请检查剪贴板权限或终端连接。");
+      });
       terminal?.focus();
       return;
     }

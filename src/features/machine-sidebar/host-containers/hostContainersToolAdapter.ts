@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 import {
   removeDockerContainer,
   restartDockerContainer,
@@ -13,9 +15,13 @@ import {
 } from "../../../lib/dockerApi";
 import type { Machine } from "../../workspace/contracts/index";
 import type { OpenWorkspaceFileTabOptions } from "../../workspace/state/index";
+import type { ContainerRuntime } from "../../../lib/targetModel";
 
 export interface HostContainersToolContentProps {
+  active?: boolean;
   initialContainerId?: string;
+  initialRequestId?: number;
+  initialRuntime?: ContainerRuntime;
   onEnterContainer?: (container: DockerContainerSummary) => void;
   onFetchContainerStats?: (request: DockerContainerStatsRequest) => Promise<DockerContainerStatsResult>;
   onInspectContainer?: (request: DockerContainerInfoRequest) => Promise<DockerContainerInspectSummary>;
@@ -28,7 +34,6 @@ export interface HostContainersToolContentProps {
   onOpenContainerLogs?: (container: DockerContainerSummary) => void;
   onOpenWorkspaceFileTab?: (options: OpenWorkspaceFileTabOptions) => void;
   onPinContainer?: (container: DockerContainerSummary) => void | Promise<void>;
-  presentation?: "default" | "sidebar";
   refreshRequestId?: number;
   selectedMachine?: Machine;
 }

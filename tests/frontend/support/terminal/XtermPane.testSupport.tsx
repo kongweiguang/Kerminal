@@ -86,6 +86,8 @@ const mocks = vi.hoisted(() => {
       addon.activate?.(this);
     });
     onDataCallback: ((data: string) => void) | undefined;
+    onKeyCallback: ((event: { key: string; domEvent: KeyboardEvent }) => void) | undefined;
+    modes = { bracketedPasteMode: false };
     onScrollCallback: ((viewportY: number) => void) | undefined;
     onSelectionChangeCallback: (() => void) | undefined;
     onWriteParsedCallback: (() => void) | undefined;
@@ -119,7 +121,7 @@ const mocks = vi.hoisted(() => {
     selectAll = vi.fn();
     write = vi.fn((_data: string) => undefined);
     constructor(options: Record<string, unknown>) {
-      this.options = options;
+      this.options = { ignoreBracketedPasteMode: false, ...options };
       const csiHandlers = new Map<
         string,
         (params: Array<number | number[]>) => boolean
@@ -199,9 +201,23 @@ const mocks = vi.hoisted(() => {
     attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean) {
       this.customKeyEventHandler = handler;
     }
+    /** 按真实 xterm 的同步 onKey→onData 次序发送完整编码，避免把协议回包当键盘。 */
+    triggerKeyData(key: string) {
+      this.onKeyCallback?.({ key, domEvent: new KeyboardEvent("keydown") });
+      this.onDataCallback?.(key);
+    }
+    /** 公共事件订阅保留注册身份，旧 disposer 不影响后注册回调。 */
+    onKey(callback: (event: { key: string; domEvent: KeyboardEvent }) => void) {
+      this.onKeyCallback = callback;
+      return { dispose: vi.fn(() => {
+        if (this.onKeyCallback === callback) this.onKeyCallback = undefined;
+      }) };
+    }
     onData(callback: (data: string) => void) {
       this.onDataCallback = callback;
-      return { dispose: vi.fn() };
+      return { dispose: vi.fn(() => {
+        if (this.onDataCallback === callback) this.onDataCallback = undefined;
+      }) };
     }
     onSelectionChange(callback: () => void) {
       this.onSelectionChangeCallback = callback;

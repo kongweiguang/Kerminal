@@ -82,21 +82,6 @@ export function useTerminalBroadcastTargets({
     });
   }, [broadcastTargetOptions]);
 
-  useEffect(() => {
-    if (
-      broadcastTargetMode !== "custom" ||
-      broadcastTargetOptions.length === 0 ||
-      selectedTargetPaneIds.length > 0
-    ) {
-      return;
-    }
-    setBroadcastTargetMode("all");
-  }, [
-    broadcastTargetMode,
-    broadcastTargetOptions.length,
-    selectedTargetPaneIds.length,
-  ]);
-
   const handleBroadcastTargetModeChange = useCallback(
     (mode: BroadcastTargetMode) => {
       setBroadcastTargetMode(mode);

@@ -5,10 +5,7 @@
 import type { ISearchOptions } from "@xterm/addon-search";
 import type { Terminal as XtermTerminal } from "@xterm/xterm";
 import type { TerminalCreateRequest } from "../../lib/terminalApi";
-import {
-  readTerminalClipboardText,
-  writeTerminal,
-} from "../../lib/terminalApi";
+import { readTerminalClipboardText } from "../../lib/terminalApi";
 import type {
   CommandSuggestionCandidate,
   CommandSuggestionProvider,
@@ -25,6 +22,9 @@ import {
   type TerminalInputModelState,
 } from "./terminalInputModel";
 import { parseTerminalShellIntegrationCwd } from "./terminalShellIntegrationModel";
+import { terminalChromeRuntimeStore } from "./terminalChromeRuntimeStore";
+import { getTerminalPaneSessionRecord } from "./terminalSessionRegistry";
+import { withTerminalInputOrigin } from "./terminalInputOrigin";
 
 export type ConnectionState =
   | "connecting"
@@ -741,21 +741,24 @@ export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** 剪贴板读取后重验当前连接，避免异步粘贴落入旧会话；空正文不触发输入。 */
 export async function pasteIntoTerminal(
+  paneId: string,
   terminal: XtermTerminal | null,
   sessionId: string | null,
-) {
-  const text = await readTerminalClipboardText();
-  if (!text) {
+): Promise<void> {
+  const clipboardText = await readTerminalClipboardText();
+  if (
+    !terminal ||
+    !sessionId ||
+    getTerminalPaneSessionRecord(paneId)?.sessionId !== sessionId ||
+    terminalChromeRuntimeStore.getSnapshot(paneId).connectionState !== "connected"
+  ) {
     return;
   }
-
-  if (typeof terminal?.paste === "function") {
+  const text = clipboardText.replace(/\r?\n/g, "\r");
+  if (!text) return;
+  withTerminalInputOrigin(terminal, { kind: "paste", text }, () => {
     terminal.paste(text);
-    return;
-  }
-
-  if (sessionId) {
-    await writeTerminal(sessionId, text);
-  }
+  });
 }

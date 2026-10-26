@@ -21,6 +21,7 @@ use kerminal_lib::{
 };
 use tempfile::tempdir;
 
+/// 配置往返必须保存完整的工具目录和逐工具位置。
 #[test]
 fn settings_toml_roundtrip_keeps_runtime_model() {
     let temp = tempdir().expect("temp dir");
@@ -66,6 +67,7 @@ fn settings_toml_roundtrip_keeps_runtime_model() {
     assert!(source.contains("matchMode = \"regex\""));
     assert!(source.contains("[toolRail]"));
     assert!(source.contains("agentLauncher"));
+    assert!(source.contains("containers"));
     assert!(source.contains("bottom = [\"context\"]"));
     assert!(source.contains("[toolRail.panelPlacements]"));
     assert!(source.contains("context = \"left\""));
@@ -94,6 +96,7 @@ fn settings_toml_defaults_missing_terminal_renderer_type_to_cpu() {
     assert_eq!(loaded.tool_rail, AppSettings::default().tool_rail);
 }
 
+/// 旧版全隐藏列表归一化时要补齐新工具，并恢复原排序第一项。
 #[test]
 fn settings_toml_normalizes_duplicate_and_all_hidden_tool_rail_entries() {
     let temp = tempdir().expect("temp dir");
@@ -104,7 +107,7 @@ fn settings_toml_normalizes_duplicate_and_all_hidden_tool_rail_entries() {
             "schema_version = 1\n",
             "[toolRail]\n",
             "order = [\"logs\", \"logs\"]\n",
-            "hidden = [\"logs\", \"context\", \"agentLauncher\", \"sftp\", \"snippets\", \"tmux\", \"ports\", \"system\"]\n",
+            "hidden = [\"logs\", \"context\", \"agentLauncher\", \"sftp\", \"snippets\", \"tmux\", \"ports\", \"system\", \"containers\"]\n",
             "bottom = [\"context\", \"logs\", \"context\"]\n",
         ),
     )
@@ -114,13 +117,14 @@ fn settings_toml_normalizes_duplicate_and_all_hidden_tool_rail_entries() {
 
     assert_eq!(loaded.tool_rail.order[0], ToolRailToolId::Logs);
     assert!(!loaded.tool_rail.hidden.contains(&ToolRailToolId::Logs));
-    assert_eq!(loaded.tool_rail.order.len(), 8);
+    assert_eq!(loaded.tool_rail.order.len(), 9);
     assert_eq!(
         loaded.tool_rail.bottom,
         vec![ToolRailToolId::Logs, ToolRailToolId::Context]
     );
 }
 
+/// 没有逐工具位置配置的旧文件为新增容器面板补上 attached 默认值。
 #[test]
 fn settings_toml_defaults_legacy_tool_rail_section_to_logs_bottom_and_attached_panel() {
     let temp = tempdir().expect("temp dir");
@@ -145,9 +149,16 @@ fn settings_toml_defaults_legacy_tool_rail_section_to_logs_bottom_and_attached_p
         loaded.tool_rail.panel_placements.get(&ToolRailToolId::Logs),
         Some(&ToolRailPanelPlacement::Attached)
     );
+    assert_eq!(
+        loaded
+            .tool_rail
+            .panel_placements
+            .get(&ToolRailToolId::Containers),
+        Some(&ToolRailPanelPlacement::Attached)
+    );
 }
 
-/// 旧版全局展示位置要扩展到全部工具，并在下一次写回时只保留逐工具格式。
+/// 旧版全局展示位置要扩展到全部工具（含新增项），并在下一次写回时只保留逐工具格式。
 #[test]
 fn settings_toml_migrates_legacy_global_tool_panel_placement() {
     let temp = tempdir().expect("temp dir");
@@ -165,7 +176,7 @@ fn settings_toml_migrates_legacy_global_tool_panel_placement() {
     let loaded = store
         .read_settings()
         .expect("migrate global tool panel placement");
-    assert_eq!(loaded.tool_rail.panel_placements.len(), 8);
+    assert_eq!(loaded.tool_rail.panel_placements.len(), 9);
     assert!(loaded
         .tool_rail
         .panel_placements

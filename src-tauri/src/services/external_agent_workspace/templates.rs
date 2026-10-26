@@ -218,7 +218,7 @@ name = "PI Agent"
 command = "pi"
 
 [toolRail]
-order = ["context", "agentLauncher", "sftp", "snippets", "tmux", "ports", "system", "logs"]
+order = ["context", "agentLauncher", "sftp", "snippets", "tmux", "ports", "system", "logs", "containers"]
 hidden = []
 bottom = ["logs"]
 
@@ -231,6 +231,7 @@ tmux = "attached"
 ports = "attached"
 system = "attached"
 logs = "attached"
+containers = "attached"
 
 [terminal.keywordHighlights]
 enabled = true
@@ -256,7 +257,7 @@ Known settings groups:
 - `[[keybindings]]`: keyboard shortcuts.
 - `[sftp]`: transfer concurrency, timeout, packet size, pipeline depth.
 - `[agentLauncher]`: global Agent selector state. `selectedAgentKey` is `builtin:codex`, `builtin:claude`, or `custom:<uuid>` pointing to one current definition. `customAgents` preserves addition order and accepts at most 32 entries; every UUID is unique, names are unique ignoring case and at most 64 characters, and trimmed commands are non-empty and at most 4096 characters. Custom commands are stored as plaintext in `settings.toml`; never put API keys, passwords, tokens, or other secrets in them. Editing or deleting a definition does not rewrite or delete existing Agent session snapshots.
-- `[toolRail]`: right tool rail layout. `order` is the complete tool order, `hidden` removes ordinary entries, and `bottom` assigns arbitrary tools to the bottom-fixed rail section. `[toolRail.panelPlacements]` independently maps each tool id to `"attached"` (a resizable right panel), `"left"` (a resizable panel between the host sidebar and terminal), `"bottom"` (a resizable panel below the terminal workspace), or `"center"` (an initially centered, draggable non-modal workspace window). One tool can remain open in each different placement at the same time; opening another tool in the same placement replaces that placement only. Omitted tools default to `"attached"`. The legacy single `panelPlacement` field is accepted only for migration and is rewritten as the per-tool table, so new edits must not add it. At least one tool remains visible after normalization. Supported ids are `context`, `agentLauncher`, `sftp`, `snippets`, `tmux`, `ports`, `system`, and `logs`.
+- `[toolRail]`: right tool rail layout. `order` is the complete tool order, `hidden` removes ordinary entries, and `bottom` assigns arbitrary tools to the bottom-fixed rail section. `[toolRail.panelPlacements]` independently maps each tool id to `"attached"` (a resizable right panel), `"left"` (a resizable panel between the host sidebar and terminal), `"bottom"` (a resizable panel below the terminal workspace), or `"center"` (an initially centered, draggable non-modal workspace window). One tool can remain open in each different placement at the same time; opening another tool in the same placement replaces that placement only. Omitted tools default to `"attached"`. The legacy single `panelPlacement` field is accepted only for migration and is rewritten as the per-tool table, so new edits must not add it. At least one tool remains visible after normalization. Supported ids are `context`, `agentLauncher`, `sftp`, `snippets`, `tmux`, `ports`, `system`, `logs`, and `containers`.
 
 Do not invent settings fields. If a field is not already present and is not documented here, inspect the current Kerminal settings model or ask the user.
 

@@ -45,6 +45,80 @@ const tabA: TerminalTab = {
 };
 
 describe("toolPanelContextModel", () => {
+  it("容器工具从当前容器 pane 解析宿主机，而不借用侧栏选择", () => {
+    const binding = resolveToolPanelBinding("containers", {
+      activeMachine: { ...hostA, id: "podman:host-a:api", kind: "dockerContainer", parentMachineId: hostA.id },
+      activeTab: tabA,
+      focusedPane: { ...paneA, mode: "container", target: { kind: "dockerContainer", hostId: hostA.id, containerId: "api", runtime: "podman" } },
+      machineGroups: [{ machines: [hostA, hostB] }],
+      selectedMachine: hostB,
+    });
+    expect(binding.machine).toBe(hostA);
+    expect(binding.resourceKey).toBe("host:host-a");
+    expect(binding.target).toEqual({ kind: "ssh", hostId: hostA.id });
+  });
+
+  it("容器宿主机不存在时关闭绑定，不回退其它主机", () => {
+    const binding = resolveToolPanelBinding("containers", {
+      activeMachine: { ...hostA, kind: "dockerContainer" },
+      focusedPane: { ...paneA, mode: "container", target: { kind: "dockerContainer", hostId: "deleted-host", containerId: "api" } },
+      selectedMachine: hostB,
+      machineGroups: [{ machines: [hostB] }],
+    });
+    expect(binding.machine).toBeUndefined();
+    expect(binding.target).toBeUndefined();
+    expect(binding.resourceKey).toContain("unbound");
+  });
+
+  it("无活动目标或当前为本地、SFTP-only 时不发出容器主机绑定", () => {
+    expect(resolveToolPanelBinding("containers", { selectedMachine: hostA }).machine).toBeUndefined();
+    for (const machine of [{ ...hostA, kind: "local" as const }, { ...hostA, kind: "sftp" as const, target: { kind: "ssh" as const, hostId: hostA.id } }]) {
+      expect(resolveToolPanelBinding("containers", { activeMachine: machine, selectedMachine: hostB }).machine).toBeUndefined();
+    }
+  });
+
+  it("分屏切换使用新的聚焦 pane，忽略侧栏选择", () => {
+    const first = resolveToolPanelBinding("containers", {
+      activeMachine: hostA,
+      activeTab: tabA,
+      focusedPane: paneA,
+      selectedMachine: hostB,
+    });
+    const second = resolveToolPanelBinding("containers", {
+      activeMachine: hostB,
+      activeTab: tabA,
+      focusedPane: {
+        ...paneA,
+        id: "pane-b",
+        machineId: hostB.id,
+        remoteHostId: hostB.id,
+      },
+      selectedMachine: hostA,
+    });
+    expect(first.machine).toBe(hostA);
+    expect(second.machine).toBe(hostB);
+    expect(second.bindingKey).not.toBe(first.bindingKey);
+  });
+
+  it("SSH 文件标签通过自身目标解析容器宿主机", () => {
+    const binding = resolveToolPanelBinding("containers", {
+      activeTab: {
+        access: "readonly",
+        id: "compose-file",
+        kind: "workspaceFile",
+        machineId: hostA.id,
+        path: "/srv/compose.yaml",
+        source: "composeYaml",
+        target: { hostId: hostA.id, kind: "ssh" },
+        title: "compose.yaml",
+      },
+      machineGroups: [{ machines: [hostA, hostB] }],
+      selectedMachine: hostB,
+    });
+    expect(binding.machine).toBe(hostA);
+    expect(binding.source).toBe("activeTab");
+  });
+
   it("为全部右栏能力声明唯一所有者层级", () => {
     expect(toolPanelBindingScopes).toEqual({
       agentLauncher: "tab",

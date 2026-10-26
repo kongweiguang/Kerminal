@@ -34,19 +34,20 @@ function renderDialog(
 }
 
 describe("ToolRailCustomizationDialog", () => {
+  /** 编辑器须读取归一化后的完整工具目录，避免 UI 数量与设置类型脱节。 */
   it("通过开关和上下按钮编辑草稿，保存后才提交", async () => {
     const user = userEvent.setup();
     const onSave = vi.fn().mockResolvedValue(undefined);
     const onClose = vi.fn();
     renderDialog({ onClose, onSave });
 
-    expect(screen.getAllByRole("combobox")).toHaveLength(8);
+    expect(screen.getAllByRole("combobox")).toHaveLength(9);
 
     await user.click(screen.getByRole("switch", { name: "隐藏 当前上下文" }));
     await user.click(screen.getByRole("button", { name: "上移 Agent Launcher" }));
 
     expect(onSave).not.toHaveBeenCalled();
-    expect(screen.getByText("已显示 7 / 8 个工具")).toBeInTheDocument();
+    expect(screen.getByText("已显示 8 / 9 个工具")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "保存" }));
 

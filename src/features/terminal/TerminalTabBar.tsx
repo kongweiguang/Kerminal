@@ -102,7 +102,7 @@ interface TerminalTabBarProps {
   workspaceFileDirtyState: WorkspaceFileDirtyState;
 }
 
-/** 终端标签栏的纯展示与命令转发层，避免工作区组件继续膨胀。 */
+/** 终端标签栏只负责展示与命令转发；顶层间距由 DropGap 提供，避免重复留白。 */
 export function TerminalTabBar({
   activeTabId,
   collapsedGroupIds,
@@ -369,7 +369,7 @@ export function TerminalTabBar({
             <div className="flex min-w-0 flex-1 items-center self-stretch">
               <div
                 aria-label="终端标签栏"
-                className="scrollbar-none flex min-w-0 max-w-full flex-[0_1_auto] items-center gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain"
+                className="scrollbar-none flex min-w-0 max-w-full flex-[0_1_auto] items-center overflow-x-auto overflow-y-hidden overscroll-x-contain"
                 onWheel={onWheel}
                 onKeyDown={handleTabListKeyDown}
                 ref={tabListRef}

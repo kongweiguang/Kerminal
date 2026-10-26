@@ -1,3 +1,4 @@
+// @author kongweiguang
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { defaultAppSettings } from "../../../../src/features/settings/settingsModel";
 import type { TerminalOutputEvent } from "../../../../src/lib/terminalApi";
@@ -423,6 +424,46 @@ describe("XtermPane context menu search and logging", () => {
       expect.any(Function),
     );
     expect(await screen.findByText("已连接")).toBeInTheDocument();
+  });
+
+  it("discards clipboard text resolved after the pane disconnects", async () => {
+    const user = userEvent.setup();
+    let resolveClipboard!: (text: string) => void;
+    mocks.api.readTerminalClipboardText.mockReturnValue(new Promise<string>((resolve) => {
+      resolveClipboard = resolve;
+    }));
+    render(
+      <XtermPane focused paneId="pane-local" resolvedTheme="dark"
+        terminalAppearance={defaultAppSettings.terminal} title="本地 PowerShell" />,
+    );
+    await screen.findByText("已连接");
+    const surface = screen.getByLabelText("本地 PowerShell xterm 终端");
+    fireEvent.contextMenu(surface);
+    await user.click(screen.getByRole("menuitem", { name: /粘贴/ }));
+    fireEvent.contextMenu(surface);
+    await user.click(screen.getByRole("menuitem", { name: "断开连接" }));
+    await screen.findByText("已断开");
+    await act(async () => { resolveClipboard("must not reach old session"); });
+    expect(mocks.terminalInstances[0].paste).not.toHaveBeenCalled();
+    expect(mocks.api.writeTerminal).not.toHaveBeenCalled();
+  });
+
+  it.each(["menu", "paste"] as const)("reports clipboard rejection for %s paste", async (behavior) => {
+    const user = userEvent.setup();
+    mocks.api.readTerminalClipboardText.mockRejectedValue(new Error("clipboard denied"));
+    render(
+      <XtermPane focused paneId="pane-local" resolvedTheme="dark"
+        terminalAppearance={{ ...defaultAppSettings.terminal, rightClickBehavior: behavior }}
+        title="本地 PowerShell" />,
+    );
+    await screen.findByText("已连接");
+    fireEvent.contextMenu(screen.getByLabelText("本地 PowerShell xterm 终端"));
+    if (behavior === "menu") {
+      await user.click(screen.getByRole("menuitem", { name: /粘贴/ }));
+    }
+    expect(await screen.findByText("粘贴失败，请检查剪贴板权限或终端连接。")).toBeInTheDocument();
+    expect(mocks.terminalInstances[0].paste).not.toHaveBeenCalled();
+    expect(mocks.api.writeTerminal).not.toHaveBeenCalled();
   });
 
   it("disables copy in the context menu when there is no selection", async () => {
