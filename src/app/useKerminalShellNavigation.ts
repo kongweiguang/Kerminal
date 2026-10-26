@@ -14,8 +14,6 @@ import type { ContainerRuntime } from "../lib/targetModel";
 import type { DockerContainerSummary } from "../lib/dockerApi";
 import { shellQuote } from "./KerminalShell.contextWorkspaceShellHelpers";
 
-export type { HostContainerRevealRequest } from "../features/tool-panel/toolPanelContextModel";
-
 interface UseKerminalShellNavigationOptions {
   machineGroups: MachineGroup[];
   openDockerContainerTerminal: WorkspaceState["openDockerContainerTerminal"];

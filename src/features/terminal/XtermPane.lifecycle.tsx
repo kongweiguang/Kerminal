@@ -659,6 +659,7 @@ export function XtermPane({
       scheduleCommandBlockViewsSync,
       openSearch,
       setCommandBlockNotice,
+      setTerminalNotice,
     ],
   );
 
@@ -699,7 +700,7 @@ export function XtermPane({
     };
     setContextMenu(menuState);
     terminal?.focus();
-  }, [enableAgentSendActions, paneId]);
+  }, [enableAgentSendActions, paneId, setTerminalNotice]);
 
   const executeCommandBlockAction = useCallback(
     (blockId: string, action: TerminalCommandBlockAction) => {

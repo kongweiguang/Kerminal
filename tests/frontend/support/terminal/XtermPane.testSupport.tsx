@@ -1,7 +1,10 @@
 // @author kongweiguang
 
 import { afterEach, beforeEach, vi } from "vitest";
-import { defaultAppSettings } from "../../../../src/features/settings/settingsModel";
+import {
+  mockElementBox,
+  terminalAppearanceWithInlineSuggestion,
+} from "./XtermPane.testUtilities";
 import { terminalSuggestionProbeScheduler } from "../../../../src/features/terminal/terminalSuggestionProbeScheduler";
 import type { TerminalOutputEvent } from "../../../../src/lib/terminalApi";
 const mocks = vi.hoisted(() => {
@@ -496,82 +499,6 @@ function setTerminalBufferLines(
   });
 }
 
-function mockElementBox(
-  element: HTMLElement,
-  metrics: {
-    clientHeight?: number;
-    clientWidth?: number;
-    height?: number;
-    offsetLeft?: number;
-    offsetTop?: number;
-    rectLeft?: number;
-    rectTop?: number;
-    width?: number;
-  },
-) {
-  if (typeof metrics.clientHeight === "number") {
-    Object.defineProperty(element, "clientHeight", {
-      configurable: true,
-      value: metrics.clientHeight,
-    });
-  }
-  if (typeof metrics.clientWidth === "number") {
-    Object.defineProperty(element, "clientWidth", {
-      configurable: true,
-      value: metrics.clientWidth,
-    });
-  }
-  if (typeof metrics.offsetLeft === "number") {
-    Object.defineProperty(element, "offsetLeft", {
-      configurable: true,
-      value: metrics.offsetLeft,
-    });
-  }
-  if (typeof metrics.offsetTop === "number") {
-    Object.defineProperty(element, "offsetTop", {
-      configurable: true,
-      value: metrics.offsetTop,
-    });
-  }
-
-  const width = metrics.width ?? 0;
-  const height = metrics.height ?? 0;
-  const left = metrics.rectLeft ?? 0;
-  const top = metrics.rectTop ?? 0;
-  Object.defineProperty(element, "getBoundingClientRect", {
-    configurable: true,
-    value: () =>
-      ({
-        bottom: top + height,
-        height,
-        left,
-        right: left + width,
-        top,
-        width,
-        x: left,
-        y: top,
-        toJSON: () => ({}),
-      }) as DOMRect,
-  });
-}
-
-function terminalAppearanceWithInlineSuggestion(
-  inlineSuggestion: Partial<
-    typeof defaultAppSettings.terminal.inlineSuggestion
-  >,
-) {
-  return {
-    ...defaultAppSettings.terminal,
-    inlineSuggestion: {
-      ...defaultAppSettings.terminal.inlineSuggestion,
-      ...inlineSuggestion,
-      providers: {
-        ...defaultAppSettings.terminal.inlineSuggestion.providers,
-        ...(inlineSuggestion.providers ?? {}),
-      },
-    },
-  };
-}
 
 beforeEach(() => {
   terminalSuggestionProbeScheduler.reset();

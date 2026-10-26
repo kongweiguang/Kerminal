@@ -1,8 +1,5 @@
 // @author kongweiguang
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Terminal as XtermTerminal } from "@xterm/xterm";
-import type { Mock } from "vitest";
-import type { TerminalInputModelState } from "../../../../src/features/terminal/terminalInputModel";
 import { installShellIntegrationOscHandlers } from "../../../../src/features/terminal/XtermPane.shellIntegration";
 import {
   createTerminalOutputWriter,
@@ -12,13 +9,18 @@ import { runTerminalPaneVisibleRecovery } from "../../../../src/features/termina
 import { createTerminalShellIntegrationState } from "../../../../src/features/terminal/terminalShellIntegrationModel";
 import { syncTerminalImeAnchor } from "../../../../src/features/terminal/terminalImeAnchor";
 import { createTerminalKeywordHighlightController } from "../../../../src/features/terminal/terminalKeywordHighlightController";
-import * as terminalApi from "../../../../src/lib/terminalApi";
-import { registerXtermPaneRuntimeEvents } from "../../../../src/features/terminal/XtermPane.runtime.events";
 import { terminalInputSync } from "../../../../src/features/terminal/terminalInputSync";
-import { terminalChromeRuntimeStore } from "../../../../src/features/terminal/terminalChromeRuntimeStore";
-import { registerTerminalPaneSession, unregisterTerminalPaneSession } from "../../../../src/features/terminal/terminalSessionRegistry";
-import { createTerminalInputModelState } from "../../../../src/features/terminal/terminalInputModel";
 import { getTerminalInputOrigin, withTerminalInputOrigin } from "../../../../src/features/terminal/terminalInputOrigin";
+import {
+  createRealXtermHarness,
+  realKey,
+  realPaste,
+  settleInputQueues,
+  stubElementRect,
+  waitForNextParsedWrite,
+  waitForWriterIdle,
+  withRealInputPair,
+} from "../../support/terminal/realXtermCompatibility.testSupport";
 
 describe("real xterm compatibility", () => {
   afterEach(() => {
@@ -535,233 +537,6 @@ describe("real xterm compatibility", () => {
   });
 });
 
-function waitForNextParsedWrite(
-  terminal: Awaited<ReturnType<typeof createRealXtermHarness>>["terminal"],
-) {
-  return new Promise<void>((resolve) => {
-    const subscription: { disposable?: { dispose: () => void } } = {};
-    subscription.disposable = terminal.onWriteParsed(() => {
-      subscription.disposable?.dispose();
-      resolve();
-    });
-  });
-}
-
-async function waitForWriterIdle(
-  writer: ReturnType<typeof createTerminalOutputWriter>,
-) {
-  for (let index = 0; index < 100; index += 1) {
-    if (!writer.stats().inFlight && writer.pendingLength() === 0) {
-      return;
-    }
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  throw new Error("terminal writer did not become idle");
-}
-
-/**
- * 使用项目锁定的真实 xterm 包而非 mock；proposed API 只由显式测试开启，确保其它
- * 兼容用例仍覆盖默认安全门禁，关键词装饰用例则验证生产所需能力确实可注册。
- */
-async function createRealXtermHarness(options?: {
-  allowProposedApi?: boolean;
-  runtimePaneId?: string;
-  rows?: number;
-  scrollback?: number;
-  theme?: { background: string; foreground: string };
-}) {
-  installBrowserApiStubs();
-
-  const { Terminal: XtermTerminal } = await import("@xterm/xterm");
-  const container = document.createElement("div");
-  document.body.appendChild(container);
-  const terminal = new XtermTerminal({
-    ...(options?.allowProposedApi ? { allowProposedApi: true } : {}),
-    cols: 80,
-    rows: options?.rows ?? 24,
-    scrollback: options?.scrollback ?? 1000,
-    theme: options?.theme,
-  });
-  const data: string[] = [];
-  terminal.onData((entry) => data.push(entry));
-  terminal.open(container);
-  const runtime = options?.runtimePaneId
-    ? installRealInputRuntime(terminal, container, options.runtimePaneId)
-    : undefined;
-
-  return {
-    container,
-    runtime,
-    data,
-    dispose() {
-      runtime?.dispose();
-      terminal.dispose();
-      container.remove();
-    },
-    terminal,
-    write(entry: string) {
-      return new Promise<void>((resolve) => terminal.write(entry, resolve));
-    },
-  };
-}
-
-function stubElementRect(
-  element: HTMLElement,
-  rect: Pick<DOMRect, "height" | "left" | "top" | "width">,
-) {
-  element.style.paddingLeft = "0px";
-  element.style.paddingTop = "0px";
-  element.getBoundingClientRect = () =>
-    ({
-      bottom: rect.top + rect.height,
-      height: rect.height,
-      left: rect.left,
-      right: rect.left + rect.width,
-      top: rect.top,
-      width: rect.width,
-      x: rect.left,
-      y: rect.top,
-      toJSON: () => ({}),
-    }) as DOMRect;
-}
-
-function installBrowserApiStubs() {
-  Object.defineProperty(window, "matchMedia", {
-    configurable: true,
-    value: () => ({
-      addEventListener: vi.fn(),
-      addListener: vi.fn(),
-      dispatchEvent: vi.fn(() => false),
-      matches: false,
-      media: "",
-      onchange: null,
-      removeEventListener: vi.fn(),
-      removeListener: vi.fn(),
-    }),
-  });
-  Object.defineProperty(window, "ResizeObserver", {
-    configurable: true,
-    value: class ResizeObserver {
-      disconnect() {}
-      observe() {}
-      unobserve() {}
-    },
-  });
-  Object.defineProperty(globalThis, "ResizeObserver", {
-    configurable: true,
-    value: window.ResizeObserver,
-  });
-
-  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
-    createCanvasContextStub() as unknown as CanvasRenderingContext2D,
-  );
-  vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(320);
-  vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(16);
-}
-
-function createCanvasContextStub() {
-  return {
-    beginPath: vi.fn(),
-    clearRect: vi.fn(),
-    clip: vi.fn(),
-    closePath: vi.fn(),
-    createLinearGradient: vi.fn(() => ({ addColorStop: vi.fn() })),
-    drawImage: vi.fn(),
-    fillRect: vi.fn(),
-    fillText: vi.fn(),
-    getImageData: vi.fn(() => ({ data: new Uint8ClampedArray(4) })),
-    measureText: vi.fn(() => ({ width: 10 })),
-    putImageData: vi.fn(),
-    rect: vi.fn(),
-    restore: vi.fn(),
-    save: vi.fn(),
-    scale: vi.fn(),
-    setTransform: vi.fn(),
-    strokeRect: vi.fn(),
-    strokeText: vi.fn(),
-    translate: vi.fn(),
-  };
-}
-
-/** @author kongweiguang Real xterm owns event production; only business services are inert. */
-function installRealInputRuntime(
-  terminal: XtermTerminal,
-  container: HTMLElement,
-  paneId: string,
-) {
-  type Params = Parameters<typeof registerXtermPaneRuntimeEvents>[0];
-  const inputModelRef = { current: createTerminalInputModelState() };
-  const sessionIdRef = { current: `${paneId}-session` as string | null };
-  const registerCommandBlock = vi.fn();
-  const auth = { active: false };
-  let shellState = createTerminalShellIntegrationState();
-  const removeChrome = terminalChromeRuntimeStore.register(paneId, { connectionState: "connected" });
-  registerTerminalPaneSession(paneId, sessionIdRef.current!, { tabId: "real-input-tab" });
-  const events = registerXtermPaneRuntimeEvents({
-    terminal, container, paneId, compositionTarget: terminal.textarea!,
-    sessionIdRef, inputModelRef, inputBufferRef: { current: "" },
-    currentCwdRef: { current: undefined }, assistEnabled: false,
-    inputCompatibilityMode: "shell",
-    activityRuntimeRef: { current: null },
-    terminalRuntimeLifecycleControllerRef: { current: null },
-    ghostSuggestionRef: { current: null },
-    shellIntegrationCommandBlockProtocolRef: { current: false },
-    terminalAppearanceRef: { current: { selectionCopy: false } as Params["terminalAppearanceRef"]["current"] },
-    terminalInlineSshAuthPrompt: {
-      handleInput: () => auth.active,
-      isActive: () => auth.active,
-    } as unknown as Params["terminalInlineSshAuthPrompt"],
-    commandBlockRuntime: {
-      registerCommandBlock,
-      hasOpenCommandBlock: () => false,
-      setInteractiveTuiActive: vi.fn(),
-      scheduleCommandBlockViewSync: vi.fn(),
-      clearCommandBlockViewSyncFrame: vi.fn(),
-      syncCommandBlockRuntimeContext: vi.fn(),
-      closeCurrentCommandBlock: vi.fn(),
-    } as unknown as Params["commandBlockRuntime"],
-    ghostSuggestions: {
-      acceptGhostSuggestion: () => false,
-      isCommittingSuggestion: () => false,
-      handleRuntimeKeyEvent: () => false,
-      clearGhostSuggestion: vi.fn(), scheduleGhostSuggestion: vi.fn(),
-      refreshGhostSuggestionLayout: vi.fn(), setLifecycle: vi.fn(),
-    } as unknown as Params["ghostSuggestions"],
-    searchAddon: { onDidChangeResults: () => ({ dispose() {} }) } as unknown as Params["searchAddon"],
-    setSearchResults: vi.fn(), syncCommandBlockViews: vi.fn(),
-    readShellIntegrationState: () => shellState,
-    writeShellIntegrationState: (state) => { shellState = state; },
-    onInputWriteError: vi.fn(),
-  });
-  return {
-    auth, inputModelRef, registerCommandBlock, sessionIdRef,
-    dispose() {
-      events.dispose();
-      unregisterTerminalPaneSession(paneId);
-      removeChrome();
-    },
-  };
-}
-
-/** @author kongweiguang Drain controller FIFOs without assuming PTY packet boundaries. */
-async function settleInputQueues() {
-  for (let index = 0; index < 40; index += 1) await Promise.resolve();
-}
-
-/** @author kongweiguang Send browser keyboard events through xterm's public textarea. */
-function realKey(terminal: XtermTerminal, key: string, keyCode: number, extra: KeyboardEventInit = {}) {
-  terminal.textarea!.dispatchEvent(new KeyboardEvent("keydown", {
-    bubbles: true, cancelable: true, key, keyCode, which: keyCode, ...extra,
-  }));
-}
-
-/** @author kongweiguang Clipboard data is supplied by the browser, never an onData echo. */
-function realPaste(terminal: XtermTerminal, text: string) {
-  const event = new Event("paste", { bubbles: true, cancelable: true });
-  Object.defineProperty(event, "clipboardData", { value: { getData: () => text } });
-  terminal.textarea!.dispatchEvent(event);
-  expect(event.defaultPrevented).toBe(true);
-}
 
 describe("real xterm composition input boundaries", () => {
   it("commits delayed, consecutive, cancelled and emoji compositions once with interleaved queries", async () => {
@@ -793,7 +568,7 @@ describe("real xterm composition input boundaries", () => {
       await a.write("\x1b[6n\x1b[c");
       await settleInputQueues();
       expect(bytes("real-b")).toBe("中😀文\n\t");
-      expect(bytes("real-a").replace(/\x1b\[[0-9;?]*[cR]/g, "")).toBe("中😀文\n\t");
+      expect(bytes("real-a").replace(new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[cR]`, "g"), "")).toBe("中😀文\n\t");
       expect(bytes("real-a")).toContain("\x1b[1;1R");
       expect(b.runtime!.registerCommandBlock.mock.calls).toEqual([["中😀文"]]);
       expect(a.runtime!.registerCommandBlock.mock.calls).toEqual([["中😀文"]]);
@@ -876,7 +651,7 @@ describe("real xterm production input synchronization", () => {
       expect(bytes("real-a")).toContain("\x1b]11;rgb:");
       expect(bytes("real-a")).toContain("\x1b[I");
       expect(bytes("real-a")).toContain("\x1b[O");
-      expect(bytes("real-a")).toMatch(/\x1b\[<0;\d+;\d+M/);
+      expect(bytes("real-a")).toMatch(new RegExp(`${String.fromCharCode(27)}\\[<0;\\d+;\\d+M`));
       expect(b.runtime!.registerCommandBlock).not.toHaveBeenCalled();
       expect(terminalInputSync.getSnapshot().enabled).toBe(true);
     });
@@ -946,43 +721,3 @@ describe("real xterm production input synchronization", () => {
   });
 });
 
-/** @author kongweiguang Public resources retained by a real terminal test. */
-interface RealInputHarness {
-  terminal: XtermTerminal;
-  container: HTMLElement;
-  data: string[];
-  write(data: string): Promise<void>;
-  dispose(): void;
-  runtime?: {
-    auth: { active: boolean };
-    inputModelRef: { current: TerminalInputModelState };
-    sessionIdRef: { current: string | null };
-    registerCommandBlock: Mock;
-    dispose(): void;
-  };
-}
-
-/** @author kongweiguang Isolate registry, chrome, singleton scope and PTY boundary per pair. */
-async function withRealInputPair(action: (
-  a: RealInputHarness,
-  b: RealInputHarness,
-  bytes: (paneId: string) => string,
-) => Promise<void>) {
-  const writes = vi.spyOn(terminalApi, "writeTerminal").mockResolvedValue(undefined);
-  const a = await createRealXtermHarness({ runtimePaneId: "real-a" });
-  const b = await createRealXtermHarness({ runtimePaneId: "real-b" });
-  try {
-    terminalInputSync.configure("real-input-tab", ["real-a", "real-b"]);
-    terminalInputSync.setEnabled(true);
-    expect(terminalInputSync.getSnapshot().enabled).toBe(true);
-    await action(a, b, (paneId) => writes.mock.calls
-      .filter(([sessionId]) => sessionId === `${paneId}-session`)
-      .map(([, data]) => data).join(""));
-  } finally {
-    terminalInputSync.configure(null, []);
-    a.dispose(); b.dispose();
-    vi.useRealTimers();
-    writes.mockRestore();
-    vi.restoreAllMocks();
-  }
-}

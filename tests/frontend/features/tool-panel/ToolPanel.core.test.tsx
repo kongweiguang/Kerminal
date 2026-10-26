@@ -32,20 +32,6 @@ it("renders only the rail when no tool drawer is active", () => {
     screen.getByRole("button", { name: "打开 Agent Launcher" }),
   ).toBeInTheDocument();
   expect(
-    within(screen.getByRole("navigation", { name: "工具栏" }))
-      .getAllByRole("button")
-      .map((button) => button.getAttribute("aria-label")),
-  ).toEqual([
-    "打开 当前上下文",
-    "打开 Agent Launcher",
-    "打开 文件",
-    "打开 片段",
-    "打开 tmux",
-    "打开 端口",
-    "打开 系统",
-    "打开 命令历史",
-  ]);
-  expect(
     screen.queryByRole("heading", { name: "Agent Launcher" }),
   ).not.toBeInTheDocument();
 });

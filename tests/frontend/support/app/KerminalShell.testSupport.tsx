@@ -73,6 +73,11 @@ const mocks = vi.hoisted(() => {
       };
     }
 
+    /** Shell 测试不发送按键，仅实现运行时所需的 xterm 公共订阅生命周期。 */
+    onKey() {
+      return { dispose: vi.fn() };
+    }
+
     onData() {
       return { dispose: vi.fn() };
     }

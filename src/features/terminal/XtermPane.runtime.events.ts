@@ -294,7 +294,7 @@ export function registerXtermPaneRuntimeEvents(
     const origin = getTerminalInputOrigin(terminal);
     const manual = origin?.kind !== "programmatic" && (
       origin?.kind === "paste" || token?.key === data ||
-      (data.length > 0 && !/[\u001b\u0080-\u009f]/.test(data))
+      (data.length > 0 && !data.includes("\x1b") && !/[\u0080-\u009f]/.test(data))
     );
     if (manual) {
       commitUserInput(data);

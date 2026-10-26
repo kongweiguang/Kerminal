@@ -261,6 +261,7 @@ jobs:
             - 完善 Agent 会话入口、终端目标保持和 MCP 应用导航说明。
             - 优化文件浏览器窄侧栏布局，将列表、树形和工作区视图切换收纳到菜单。
             - 完善终端粘贴、补全、重连与 SSH 认证输入处理。
+            - 更新 crypto-bigint 安全补丁，修复常量时间运算中的时序差异问题。
           releaseDraft: true
           releaseName: "Kerminal ${{ env.RELEASE_TAG }}"
           tagName: ${{ env.RELEASE_TAG }}
