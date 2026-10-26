@@ -1925,6 +1925,7 @@ async fn prepare_workspace_session(
                         target,
                         owner,
                         size,
+                        initial_palette: Some(presentation.palette),
                     },
                     cancellation.clone(),
                 )

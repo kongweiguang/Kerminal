@@ -287,12 +287,12 @@ fn unix_formal_root_check_preserves_windows_looking_directory_names() {
 }
 
 /// 环境变量显式覆盖优先级最高，方便开发和安装测试隔离真实用户数据。
+///
+/// @author kongweiguang
 #[test]
 fn explicit_root_is_used_without_normalizing_it() {
     let result = resolve_from_inputs(
         Some(OsString::from("sandbox/config")),
-        false,
-        Path::new("workspace"),
         Some(PathBuf::from("home")),
     );
 
@@ -303,43 +303,46 @@ fn explicit_root_is_used_without_normalizing_it() {
 }
 
 /// 显式空路径很可能是部署配置错误，应阻止启动而不是静默回落到 home。
+///
+/// @author kongweiguang
 #[test]
 fn empty_override_is_rejected() {
-    let result = resolve_from_inputs(
-        Some(OsString::new()),
-        true,
-        Path::new("workspace"),
-        Some(PathBuf::from("home")),
-    );
+    let result = resolve_from_inputs(Some(OsString::new()), Some(PathBuf::from("home")));
 
     assert!(matches!(result, Err(ConfigRootError::EmptyOverride)));
 }
 
-/// 无覆盖的开发启动始终写入工作区 target，避免误触碰 ~/.kerminal。
+/// GPUI 两种构建模式均选择独立目录，且该目录不能误触发旧版正式根的迁移门禁。
+///
+/// @author kongweiguang
 #[test]
-fn development_uses_workspace_target() {
-    let result = resolve_from_inputs(None, true, Path::new("workspace"), None);
+fn default_uses_separate_gpui_home() {
+    let result = resolve_from_inputs(None, Some(PathBuf::from("home")));
 
     assert_eq!(
-        result.expect("development path does not need a home directory"),
-        PathBuf::from("workspace/target/kerminal-dev-config"),
+        result.expect("default needs an available home directory"),
+        PathBuf::from("home/.kerminal-gpui"),
     );
+    let fixture = tempfile::tempdir().expect("隔离用户 home");
+    let root = resolve_from_inputs(None, Some(fixture.path().to_path_buf())).unwrap();
+    assert!(!points_to_formal_default_from_inputs(
+        &root,
+        Some(fixture.path().to_path_buf()),
+        None,
+    ));
 }
 
-/// 安装运行使用用户 home 中的兼容根目录，并在 home 不可用时明确失败。
+/// home 不可用时拒绝默认启动，但显式隔离根仍可用，避免静默写入其它账户目录。
+///
+/// @author kongweiguang
 #[test]
-fn release_uses_home_and_requires_it() {
-    let path = resolve_from_inputs(
-        None,
-        false,
-        Path::new("workspace"),
-        Some(PathBuf::from("home")),
-    );
-    let missing_home = resolve_from_inputs(None, false, Path::new("workspace"), None);
+fn missing_home_requires_explicit_root() {
+    let path = resolve_from_inputs(Some(OsString::from("sandbox/config")), None);
+    let missing_home = resolve_from_inputs(None, None);
 
     assert_eq!(
-        path.expect("release has a home"),
-        PathBuf::from("home/.kerminal")
+        path.expect("explicit root does not need a home"),
+        PathBuf::from("sandbox/config")
     );
     assert!(matches!(
         missing_home,

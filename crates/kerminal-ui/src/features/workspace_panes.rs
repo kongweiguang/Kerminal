@@ -16,7 +16,7 @@ use gpui_kit::{
     assets::IconName,
     component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
     component::{
-        Disableable as _,
+        Disableable as _, Sizable as _,
         button::{Button, ButtonVariants as _},
         checkbox::Checkbox,
         tooltip::Tooltip,
@@ -1024,7 +1024,7 @@ fn split_button(
     })
 }
 
-/// 重启按钮占据与分屏按钮一致的固定槽位；忙碌或 binding 缺失时不发出过期操作。
+/// 重启会影响当前 shell，保留明确文字以区别数据刷新；忙碌或 binding 缺失时不发出过期操作。
 ///
 /// @author kongweiguang
 fn pane_refresh_button(
@@ -1038,9 +1038,9 @@ fn pane_refresh_button(
     let mut button = Button::new(format!("pane-refresh-{}", pane_id.as_str()))
         .compact()
         .ghost()
-        .icon(IconName::RefreshCw)
-        .w(px(22.))
-        .h(px(22.))
+        .small()
+        .label(crate::locale::text("重启", "Restart"))
+        .flex_shrink_0()
         .accessibility_label(label.clone())
         .tooltip(label)
         .tab_stop(true)

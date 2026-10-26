@@ -51,11 +51,9 @@ const WORKBENCH_MIN_HEIGHT: f32 = 240.0;
 const LEFT_TOOL_PANEL_WIDTH: f32 = 320.0;
 const TOOL_RAIL_WIDTH: f32 = 44.0;
 const TOOL_RAIL_BUTTON_SIZE: f32 = 32.0;
-const AGENT_DOCK_EMPTY_WIDTH: f32 = 320.0;
-const AGENT_DOCK_RUNNING_WIDTH: f32 = 420.0;
-const SFTP_DOCK_DEFAULT_WIDTH: f32 = 320.0;
-const ATTACHED_DOCK_MIN_WIDTH: f32 = 260.0;
-const ATTACHED_DOCK_MAX_WIDTH: f32 = 680.0;
+const ATTACHED_DOCK_DEFAULT_WIDTH: f32 = 360.0;
+const ATTACHED_DOCK_MIN_WIDTH: f32 = 130.0;
+const ATTACHED_DOCK_MAX_WIDTH: f32 = 1_360.0;
 pub(super) const RESIZABLE_EDGE_GUTTER: f32 = 4.0;
 const WORKBENCH_PANEL_GUTTER: f32 = 4.0;
 
@@ -196,13 +194,16 @@ pub(super) struct WorkbenchToolPanels {
     pub(super) renderers: WorkbenchToolPanelRenderers,
 }
 
-/// 保存活动右侧工具与每个 ToolId 的自定义宽度；宽度记忆不随入口排序或面板重挂载漂移。
+/// 保存当前 Attached 工具与右栏共享宽度；内容身份由各工具的 retained Entity 负责。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ToolRailPanelState {
     open_order: Vec<ToolRailToolId>,
+    active_tab_id: Option<TabId>,
+    tab_open_orders: BTreeMap<Option<TabId>, Vec<ToolRailToolId>>,
+    tab_right_dock_collapsed: BTreeMap<Option<TabId>, bool>,
     attached_tool: Option<ToolRailToolId>,
     attached_default_width: Option<gpui_kit::Pixels>,
-    attached_widths: BTreeMap<ToolRailToolId, gpui_kit::Pixels>,
+    shared_attached_width: Option<gpui_kit::Pixels>,
 }
 
 impl Default for ToolRailPanelState {
@@ -212,14 +213,69 @@ impl Default for ToolRailPanelState {
     fn default() -> Self {
         Self {
             open_order: Vec::new(),
+            active_tab_id: None,
+            tab_open_orders: BTreeMap::new(),
+            tab_right_dock_collapsed: BTreeMap::new(),
             attached_tool: None,
             attached_default_width: None,
-            attached_widths: BTreeMap::new(),
+            shared_attached_width: None,
         }
     }
 }
 
 impl ToolRailPanelState {
+    /// 切换 active tab 时保存旧工具顺序并恢复新 tab 的顺序；清掉已关闭 tab 的缓存。
+    ///
+    /// @author kongweiguang
+    pub(super) fn activate_tab(
+        &mut self,
+        tab_id: Option<TabId>,
+        live_tab_ids: &[TabId],
+        right_dock_collapsed: bool,
+    ) -> Option<bool> {
+        if self.active_tab_id == tab_id {
+            self.tab_open_orders.retain(|cached_tab_id, _| {
+                cached_tab_id
+                    .as_ref()
+                    .is_none_or(|cached_tab_id| live_tab_ids.contains(cached_tab_id))
+            });
+            self.tab_right_dock_collapsed.retain(|cached_tab_id, _| {
+                cached_tab_id
+                    .as_ref()
+                    .is_none_or(|cached_tab_id| live_tab_ids.contains(cached_tab_id))
+            });
+            return None;
+        }
+
+        self.tab_right_dock_collapsed
+            .insert(self.active_tab_id.clone(), right_dock_collapsed);
+        if !self.open_order.is_empty() {
+            self.tab_open_orders.insert(
+                self.active_tab_id.clone(),
+                std::mem::take(&mut self.open_order),
+            );
+        } else {
+            self.tab_open_orders.remove(&self.active_tab_id);
+        }
+        self.active_tab_id = tab_id.clone();
+        self.open_order = self.tab_open_orders.remove(&tab_id).unwrap_or_default();
+        let restored_collapsed = self
+            .tab_right_dock_collapsed
+            .remove(&tab_id)
+            .unwrap_or(false);
+        self.tab_open_orders.retain(|cached_tab_id, _| {
+            cached_tab_id
+                .as_ref()
+                .is_none_or(|cached_tab_id| live_tab_ids.contains(cached_tab_id))
+        });
+        self.tab_right_dock_collapsed.retain(|cached_tab_id, _| {
+            cached_tab_id
+                .as_ref()
+                .is_none_or(|cached_tab_id| live_tab_ids.contains(cached_tab_id))
+        });
+        Some(restored_collapsed)
+    }
+
     /// 切换指定工具；历史 Context 只保留配置可读性，不再创建面板状态。
     /// 同方向最近打开者替换旧宿主，不同方向保持并行。
     ///
@@ -313,7 +369,7 @@ impl ToolRailPanelState {
         ToolRailLayout { entries, panels }
     }
 
-    /// 按稳定 ToolId 保存自定义宽度；等于当前默认值时移除覆盖，允许动态 Agent 默认宽度生效。
+    /// 记录所有右栏工具共用的宽度；回到统一默认值时移除覆盖，保持切换时几何稳定。
     ///
     /// @author kongweiguang
     pub(super) fn remember_attached_width(
@@ -329,28 +385,41 @@ impl ToolRailPanelState {
             return;
         }
 
+        if tool == ToolRailToolId::Context {
+            return;
+        }
         if (width - default.as_f32()).abs() <= 0.5 {
-            self.attached_widths.remove(&tool);
+            self.shared_attached_width = None;
         } else {
-            self.attached_widths.insert(tool, measured);
+            self.shared_attached_width = Some(measured);
         }
     }
 
-    /// 已确认配置只恢复稀疏覆盖，不将 Agent 动态默认宽度伪装成用户拖动。
+    /// 旧配置若包含不同工具宽度，沿用当前宿主值或最大值作为共享尺寸，并忽略已退役 Context 键。
     ///
     /// @author kongweiguang
     pub(super) fn restore_attached_widths(&mut self, widths: &BTreeMap<ToolRailToolId, u16>) {
-        self.attached_widths = widths
-            .iter()
-            .map(|(tool, width)| (*tool, px(f32::from(*width) + RESIZABLE_EDGE_GUTTER)))
-            .collect();
+        self.shared_attached_width = self
+            .attached_tool
+            .filter(|tool| *tool != ToolRailToolId::Context)
+            .and_then(|tool| widths.get(&tool).copied())
+            .or_else(|| {
+                widths
+                    .iter()
+                    .filter(|(tool, _)| **tool != ToolRailToolId::Context)
+                    .map(|(_, width)| *width)
+                    .max()
+            })
+            .map(|width| px(f32::from(width) + RESIZABLE_EDGE_GUTTER));
     }
 
-    /// 返回指定工具的用户宽度；没有覆盖时由当前内容状态决定默认值。
+    /// 返回所有右栏工具共用的用户宽度；没有覆盖时由统一默认值决定。
     ///
     /// @author kongweiguang
     pub(super) fn attached_width(&self, tool: ToolRailToolId) -> Option<gpui_kit::Pixels> {
-        self.attached_widths.get(&tool).copied()
+        (tool != ToolRailToolId::Context)
+            .then_some(self.shared_attached_width)
+            .flatten()
     }
 
     /// 返回最后一次由 Root 正式同步的右侧工具，用于设置重排前捕获仍在屏幕上的旧面板。
@@ -378,8 +447,8 @@ impl ToolRailPanelState {
         true
     }
 
-    /// 同步内容状态的默认基准，并只为没有用户宽度覆盖的真实变化请求一次尺寸回填。
-    /// Kit 在已挂载时会保留首选宽度，单改 initial_size 不会使空 Agent 进入运行宽度。
+    /// 同步共享尺寸基准；已有用户覆盖时不被生命周期或目标变化覆盖。
+    /// 即使 Kit 保留挂载尺寸，默认基准变化也只请求一次明确回填。
     ///
     /// @author kongweiguang
     pub(super) fn update_attached_default_width(
@@ -392,14 +461,13 @@ impl ToolRailPanelState {
         }
 
         let restore_default = self.attached_default_width != Some(default_width)
-            && !self.attached_widths.contains_key(&tool);
+            && self.shared_attached_width.is_none();
         self.attached_default_width = Some(default_width);
         let width_is_now_default = self
-            .attached_widths
-            .get(&tool)
+            .shared_attached_width
             .is_some_and(|width| (width.as_f32() - default_width.as_f32()).abs() <= 0.5);
         if width_is_now_default {
-            self.attached_widths.remove(&tool);
+            self.shared_attached_width = None;
         }
         restore_default
     }
@@ -739,21 +807,14 @@ pub(super) fn compact_tool_panel_open_target(
         .then_some(requested_tool)
 }
 
-/// 将内容宽度规则统一转换为包含右侧拖动槽的面板初始宽度。
-/// 运行中 Agent 只适度增宽，不在常见 1280px 窗口挤占主终端；用户拖动值仍由原记忆逻辑优先。
+/// 右栏工具切换不改变工作区几何，因此 Agent、文件和运维共用相同默认尺寸。
 ///
 /// @author kongweiguang
 pub(super) fn attached_dock_default_width(
-    tool: ToolRailToolId,
-    show_agent_terminal: bool,
+    _tool: ToolRailToolId,
+    _show_agent_terminal: bool,
 ) -> gpui_kit::Pixels {
-    let content_width = match tool {
-        ToolRailToolId::Sftp | ToolRailToolId::Containers => SFTP_DOCK_DEFAULT_WIDTH,
-        ToolRailToolId::AgentLauncher if show_agent_terminal => AGENT_DOCK_RUNNING_WIDTH,
-        ToolRailToolId::AgentLauncher => AGENT_DOCK_EMPTY_WIDTH,
-        _ => AGENT_DOCK_EMPTY_WIDTH,
-    };
-    px(content_width + RESIZABLE_EDGE_GUTTER)
+    px(ATTACHED_DOCK_DEFAULT_WIDTH + RESIZABLE_EDGE_GUTTER)
 }
 
 /// 文件与容器工具固定右侧；其余工具沿用配置，兼容停靠值只在投影时忽略而不改写磁盘。
@@ -802,7 +863,7 @@ fn panel_slot_mut(
 /// 设置弹层限制为可扫读的双栏宽高；密集分类继续内部滚动，固定操作栏与窄窗视口夹紧规则不变。
 /// 两侧分隔槽平时透明，悬停光效只由 Kit 的拖动状态驱动；收起右栏仍补齐与左侧相同的留白。
 /// 运维表单接收扣除边框的宿主高度，正文滚动不能挤出固定操作栏。
-/// 主机弹层统一按 rem 缩放并夹紧视口，正文接收完整剩余高度后独立滚动。
+/// 主机弹层统一按 rem 缩放并夹紧视口；主机树插槽允许收缩，使内部滚动区能接收剩余高度。
 ///
 /// @author kongweiguang
 pub(super) fn render_workbench(
@@ -1039,6 +1100,7 @@ pub(super) fn render_workbench(
                     div()
                         .id("workbench-host-navigation-slot")
                         .flex_1()
+                        .min_h(px(0.))
                         .child(navigation)
                 },
             ));

@@ -1,4 +1,4 @@
-//! 用户数据目录解析。开发运行默认写入仓库 target，正式运行使用 `~/.kerminal`。
+//! 用户数据目录解析。GPUI 测试期默认使用 `~/.kerminal-gpui`，与旧版正式数据隔离。
 //!
 //! @author kongweiguang
 
@@ -17,16 +17,13 @@ const CONFIG_ROOT_ENV: &str = "KERMINAL_CONFIG_ROOT";
 pub struct ConfigRoot(PathBuf);
 
 impl ConfigRoot {
-    /// 开发构建未显式指定时固定使用仓库 target 下的隔离目录，避免误写用户数据。
+    /// GPUI 两种构建模式共用独立目录，允许旧版继续运行；显式覆盖用于其它隔离验收。
+    ///
+    /// @author kongweiguang
     pub fn resolve() -> Result<Self, ConfigRootError> {
         let override_path = env::var_os(CONFIG_ROOT_ENV);
         let home = current_home_dir();
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .ok_or(ConfigRootError::WorkspacePathUnavailable)?
-            .to_path_buf();
-        let path = resolve_from_inputs(override_path, cfg!(debug_assertions), &workspace, home)?;
+        let path = resolve_from_inputs(override_path, home)?;
         Ok(Self(path))
     }
 
@@ -43,14 +40,11 @@ impl ConfigRoot {
     }
 }
 
-/// 根据启动环境确定目录；开发默认隔离，正式默认使用用户 home 下的稳定路径。
-/// 正式根规则与迁移离线检查共用，避免显式 --root 指向同一目录时绕过旧实例门禁。
+/// GPUI 默认根与旧版正式根分开；显式覆盖仍优先，旧版根身份另由迁移门禁检查。
 ///
 /// @author kongweiguang
 fn resolve_from_inputs(
     override_path: Option<OsString>,
-    is_development: bool,
-    workspace_root: &Path,
     home_dir: Option<PathBuf>,
 ) -> Result<PathBuf, ConfigRootError> {
     if let Some(path) = override_path {
@@ -60,11 +54,9 @@ fn resolve_from_inputs(
         return Ok(PathBuf::from(path));
     }
 
-    if is_development {
-        return Ok(workspace_root.join("target").join("kerminal-dev-config"));
-    }
-
-    formal_default_root(home_dir)
+    home_dir
+        .map(|home| home.join(".kerminal-gpui"))
+        .ok_or(ConfigRootError::HomeDirectoryUnavailable)
 }
 
 /// 保持既有 home/.kerminal 选择规则集中；此处只拼接路径，不查询文件系统。
@@ -251,18 +243,17 @@ fn current_home_dir() -> Option<PathBuf> {
 pub enum ConfigRootError {
     EmptyOverride,
     HomeDirectoryUnavailable,
-    WorkspacePathUnavailable,
 }
 
 impl fmt::Display for ConfigRootError {
+    /// 只展示可操作的原因，不在目录解析失败时回显用户路径。
+    ///
+    /// @author kongweiguang
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyOverride => formatter.write_str("KERMINAL_CONFIG_ROOT cannot be empty"),
             Self::HomeDirectoryUnavailable => {
                 formatter.write_str("user home directory is unavailable")
-            }
-            Self::WorkspacePathUnavailable => {
-                formatter.write_str("development workspace path is unavailable")
             }
         }
     }

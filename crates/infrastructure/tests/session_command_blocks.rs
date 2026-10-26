@@ -229,6 +229,7 @@ async fn create_session_with_owner(
             owner,
             size: kerminal_domain::sessions::TerminalSize::new(80, 24, 0, 0)
                 .expect("valid terminal size"),
+            initial_palette: None,
         })
         .await
         .expect("create test session");

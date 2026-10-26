@@ -795,6 +795,7 @@ async fn new_custom_cli_rejects_resume_without_spawning_and_archives() {
                     scope: AgentSessionScope::Global,
                     target: AgentTargetBinding::unbound(0),
                     launcher_key: None,
+                    initial_palette: None,
                 },
                 CancellationToken::new(),
             )
@@ -1211,6 +1212,7 @@ async fn windows_custom_cli_exit_marks_agent_stale_and_rejects_terminal_write() 
                     scope: AgentSessionScope::Global,
                     target: AgentTargetBinding::unbound(0),
                     launcher_key: None,
+                    initial_palette: None,
                 },
                 CancellationToken::new(),
             )

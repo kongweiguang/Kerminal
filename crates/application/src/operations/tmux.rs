@@ -576,6 +576,7 @@ impl TmuxService {
                         }),
                         owner,
                         size,
+                        initial_palette: None,
                     },
                     factory,
                     cancel,
@@ -605,6 +606,7 @@ impl TmuxService {
                         }),
                         owner,
                         size,
+                        initial_palette: None,
                     },
                     cancel,
                 )

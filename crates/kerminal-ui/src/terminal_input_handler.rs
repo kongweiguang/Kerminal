@@ -1,13 +1,33 @@
-//! 仅覆盖 macOS Option-as-Meta 的 IME 按键优先级，其余输入能力委托给 GPUI handler。
+//! 终端的局部按键与平台文本边界，其余输入能力委托给 GPUI handler。
 //!
 //! @author kongweiguang
 
 use std::ops::Range;
 
 use gpui_kit::{
-    App, Bounds, ClipboardItem, InputHandler, Pixels, Point, TextInputConfiguration,
-    UTF16Selection, Window,
+    App, Bounds, ClipboardItem, FocusHandle, InputHandler, KeyBinding, NoAction, Pixels, Point,
+    TextInputConfiguration, UTF16Selection, Window,
 };
+
+pub(crate) const TERMINAL_INPUT_CONTEXT: &str = "KerminalTerminalInput";
+
+/// 只覆盖真实聚焦画布的 Tab 导航，让中央和 Agent 终端都能先接收补全/TUI 按键。
+/// 搜索框、工具按钮不挂此 context，继续使用 Kit 的正常焦点顺序。
+///
+/// @author kongweiguang
+pub(crate) fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("tab", NoAction, Some(TERMINAL_INPUT_CONTEXT)),
+        KeyBinding::new("shift-tab", NoAction, Some(TERMINAL_INPUT_CONTEXT)),
+    ]);
+}
+
+/// 焦点在搜索或按钮上时移除覆盖，避免终端祖先吞掉子控件正常的 Tab 导航。
+///
+/// @author kongweiguang
+pub(crate) fn keyboard_context(focus: &FocusHandle, window: &Window) -> Option<&'static str> {
+    focus.is_focused(window).then_some(TERMINAL_INPUT_CONTEXT)
+}
 
 /// 判断当前按键是否应跳过 IME 优先路由，让终端把 Option 作为 Meta 处理。
 ///

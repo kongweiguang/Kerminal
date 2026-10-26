@@ -866,7 +866,11 @@ impl WorkspaceRuntime {
         Ok(true)
     }
 
-    /// 按真实 RPC 回执提交 pane 尺寸；失败保留旧快照/网格并允许相同尺寸再次尝试。
+    /// 按真实 RPC 回执提交 pane 尺寸；resize 后保留最后一帧供重绘过渡，直到新网格快照到达。
+    ///
+    /// 旧帧仅作视觉连续性的临时内容，快照代次仍失效且尺寸门禁拒绝旧回执，避免闪成恢复占位或误认旧网格。
+    ///
+    /// @author kongweiguang
     pub fn complete_resize(
         &mut self,
         pane_id: &PaneId,
@@ -886,7 +890,6 @@ impl WorkspaceRuntime {
             pane.size = size;
             pane.view_size = size;
             if view_grid_changed {
-                pane.snapshot = None;
                 pane.snapshot_gate.invalidate();
                 pane.snapshot_dirty = true;
             }

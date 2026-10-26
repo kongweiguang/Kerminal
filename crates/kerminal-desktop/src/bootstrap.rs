@@ -46,7 +46,8 @@ pub(crate) fn run_after_migration<T>(
     Ok(start(report))
 }
 
-/// 只有正式默认根允许一次性读取旧 Tauri 目录，显式 CLI 根和环境隔离根绝不查询该来源。
+/// GPUI 默认测试根不读取旧 Tauri 窗口资料，避免旧版仍在运行时共享其状态文件。
+/// 正式根的原有来源限制保留，显式 CLI 根和环境隔离根也不查询该来源。
 ///
 /// @author kongweiguang
 pub(crate) fn legacy_window_state_path(explicit_root: bool) -> Option<PathBuf> {
@@ -54,6 +55,9 @@ pub(crate) fn legacy_window_state_path(explicit_root: bool) -> Option<PathBuf> {
         cfg!(debug_assertions),
         explicit_root,
         std::env::var_os("KERMINAL_CONFIG_ROOT").is_some(),
+        ConfigRoot::resolve()
+            .ok()
+            .is_some_and(|root| ConfigRoot::points_to_formal_default(root.as_path())),
     ) {
         return None;
     }
@@ -64,15 +68,16 @@ pub(crate) fn legacy_window_state_path(explicit_root: bool) -> Option<PathBuf> {
     })
 }
 
-/// 将默认正式根的来源权限作为纯事实门禁，测试不需要读取或修改真实环境、用户目录。
+/// 来源权限同时检查目录身份和调用方式，使 release 的 GPUI 测试根也保持隔离。
 ///
 /// @author kongweiguang
 fn legacy_window_state_enabled(
     development: bool,
     explicit_root: bool,
     environment_override: bool,
+    formal_root: bool,
 ) -> bool {
-    !development && !explicit_root && !environment_override
+    formal_root && !development && !explicit_root && !environment_override
 }
 
 #[cfg(test)]

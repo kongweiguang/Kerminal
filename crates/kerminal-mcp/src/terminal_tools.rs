@@ -213,6 +213,7 @@ pub(crate) async fn create(
                 target: target.clone(),
                 owner: SessionOwner::Mcp,
                 size,
+                initial_palette: None,
             },
             cancellation,
         )

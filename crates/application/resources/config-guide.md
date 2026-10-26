@@ -27,11 +27,11 @@
 
 `themeMode` 和 `interfaceDensity` 是顶层外观选项；界面语言、背景开关、背景适配方式、背景图片路径与透明度统一放在 `[appearance]` 下。`[terminal]` 保存字体、光标、色盘与滚屏缓冲。设置中暂未识别的扩展键由原文仓储保留。
 
-`[workbenchLayout]` 保存稳定的工作台用户意图：`hostSidebarCollapsed` 默认 `false`，`hostSidebarWidth` 默认 `220` 且范围为 `168`–`360`；`dockPanelWidths` 默认空稀疏表，未列出的工具沿用各自动态默认宽度，显式宽度范围为 `260`–`680`；`bottomPanelHeight` 默认 `240` 且范围为 `180`–`4000`。
+`[workbenchLayout]` 保存稳定的工作台用户意图：`hostSidebarCollapsed` 默认 `false`，`hostSidebarWidth` 默认 `220` 且范围为 `168`–`360`；`dockPanelWidths` 默认空表，右侧 Attached 工具共用 `360` 逻辑像素内容宽度，显式宽度范围为 `130`–`1360`；`bottomPanelHeight` 默认 `240` 且范围为 `180`–`4000`。
 
-以上宽高均为逻辑像素内容尺寸，不包含 `4px` 调整槽。窄窗口响应式夹紧只用于当前布局投影，不写回持久设置；省略整个表或任一字段都使用当前默认值，不改变现有 `schema_version = 1`。
+以上宽高均为逻辑像素内容尺寸，不包含 `4px` 调整槽。窗口可用宽度不足时，运行时按中心区域最小宽度等布局预算临时夹紧；窄窗抽屉夹紧到实际剩余视口，这些夹紧值不写回设置。省略整个表或任一字段都使用当前默认值，不改变现有 `schema_version = 1`。
 
-`dockPanelWidths` 只接受现有 ToolId：`context`、`agentLauncher`、`sftp`、`containers`、`snippets`、`tmux`、`ports`、`system`、`logs`。`containers` 默认紧随 `sftp`，文件和容器面板固定显示在右侧抽屉；两者的存量停靠值仍保留在配置中，但运行时按固定位置投影。缺少单个工具宽度时使用其动态默认宽度，Containers 默认内容宽度为 320 逻辑像素；旧工具顺序缺少新增项时由现有设置归一化补齐，同时保留用户已有顺序。未知 ID 是严格解码/校验错误；不得静默丢弃，原文件保留并进入既有只读恢复。配置仍通过文件或应用设置界面维护，不新增 MCP CRUD。
+`dockPanelWidths` 只接受现有 ToolId：`context`、`agentLauncher`、`sftp`、`containers`、`snippets`、`tmux`、`ports`、`system`、`logs`。`containers` 默认紧随 `sftp`，文件和容器面板固定显示在右侧抽屉；两者的存量停靠值仍保留在配置中，但运行时按固定位置投影。此映射保留按 ToolId 的文件兼容形状，运行时不再为每个工具使用独立宽度：旧配置有多个不同宽度时，优先使用当前 Attached 工具对应的旧值；该项缺失时取非 `context` 项中的最大值；`context` 只保留为兼容键，不参与共享宽度选择。读取只建立共享运行时宽度，不自动改写旧配置；用户拖动 Attached Dock 后会把同一内容宽度写到各右侧工具键，拖回默认值则清除覆盖。Center 居中宿主使用自己的布局，不套用 Attached 共享宽度；紧凑工具抽屉复用共享宽度作为首选值并受剩余视口约束。旧工具顺序缺少新增项时由现有设置归一化补齐，同时保留用户已有顺序。未知 ID 是严格解码/校验错误；不得静默丢弃，原文件保留并进入既有只读恢复。配置仍通过文件或应用设置界面维护，不新增 MCP CRUD。
 
 `keybindings` 是快捷键行数组，每个 `action` 只能出现一次。`action` 使用应用已提供的动作标识；未知动作会保留在设置中但不会执行，不要用配置新增动作或 MCP 工具。`label` 和 `description` 是界面说明；`scope` 为 `global`、`terminal` 或 `workspace`；`editable` 控制设置页是否允许编辑该行。
 

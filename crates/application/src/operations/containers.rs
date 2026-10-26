@@ -397,6 +397,7 @@ impl ContainerRuntimeService {
                     target: session_target,
                     owner,
                     size,
+                    initial_palette: None,
                 },
                 cancellation,
             )

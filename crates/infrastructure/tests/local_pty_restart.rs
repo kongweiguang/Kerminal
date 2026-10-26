@@ -227,6 +227,7 @@ async fn local_pty_restart_reuses_identity_and_replaces_process() {
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::new(100, 30, 0, 0).expect("valid test grid"),
+            initial_palette: None,
         })
         .await
         .expect("spawn first local PTY generation");

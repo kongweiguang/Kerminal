@@ -248,7 +248,7 @@ impl WorkbenchLayoutSettings {
     pub(super) fn normalized(mut self) -> Self {
         self.host_sidebar_width = self.host_sidebar_width.clamp(168, 360);
         for width in self.dock_panel_widths.values_mut() {
-            *width = (*width).clamp(260, 680);
+            *width = (*width).clamp(130, 1_360);
         }
         self.bottom_panel_height = self.bottom_panel_height.clamp(180, 4_000);
         self

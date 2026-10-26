@@ -1281,7 +1281,7 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
         .into_any_element()
 }
 
-/// 工具只调用既有文件用例；冲突策略收进活动面板的传输菜单，危险色仅在二次删除确认时出现。
+/// 工具只调用既有文件用例；创建动作保留对象文字，冲突策略收进传输菜单，危险色仅在删除确认时出现。
 ///
 /// @author kongweiguang
 fn render_file_actions(
@@ -1404,7 +1404,8 @@ fn render_file_actions(
                 locale::text("新建文件夹", "New folder"),
                 false,
             )
-            .w(px(32.))
+            .label(locale::text("新建文件夹", "New folder"))
+            .w_auto()
             .h(px(32.))
             .on_click(cx.listener(move |pane, _: &ClickEvent, window, cx| {
                 pane.activate_side(side, cx);
@@ -1607,7 +1608,7 @@ fn render_file_actions(
 }
 
 /// 紧凑栏把常用动作和低频动作放在同一组的响应式布局中，窄栏仍可从菜单找到全部操作。
-/// 只有足够容纳整组操作时才直显点文件与新建目录，保留计数、三态视图和原有异步状态机。
+/// 只有足够容纳整组操作时才直显点文件与带文字的新建目录，保留计数、三态视图和原异步状态机。
 ///
 /// @author kongweiguang
 fn render_compact_file_actions(
@@ -1897,7 +1898,8 @@ fn render_compact_file_actions(
                     locale::text("在当前目录新建文件夹", "Create a folder in this directory"),
                     false,
                 )
-                .w(px(32.))
+                .label(locale::text("新建文件夹", "New folder"))
+                .w_auto()
                 .h(px(32.))
                 .on_click(cx.listener(move |pane, _: &ClickEvent, window, cx| {
                     pane.activate_side(side, cx);
@@ -2634,7 +2636,7 @@ fn format_file_modified_tooltip(entry: &FileEntry) -> String {
         .unwrap_or_else(|| locale::text("修改时间不可用", "Modified time unavailable").to_string())
 }
 
-/// 为空目录和未读取目录提供可区分状态，并把新建目录接回既有动作。
+/// 空目录的新建入口保留图标与对象文字，让首次使用者无需悬停即可理解；仍复用既有创建动作。
 ///
 /// @author kongweiguang
 pub(super) fn render_empty_directory(
@@ -2703,6 +2705,7 @@ pub(super) fn render_empty_directory(
             Button::new(format!("files-empty-create-{side}"))
                 .compact()
                 .ghost()
+                .icon(IconName::Plus)
                 .label(locale::text("新建文件夹", "New folder"))
                 .tooltip(locale::text(
                     "在当前目录新建文件夹",

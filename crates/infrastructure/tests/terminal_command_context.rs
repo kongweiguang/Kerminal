@@ -317,6 +317,7 @@ async fn create_ui_session(
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::new(80, 24, 0, 0).expect("valid terminal size"),
+            initial_palette: None,
         })
         .await
         .expect("create test session");
@@ -350,6 +351,7 @@ async fn create_agent_session(
                 agent_session_id: AgentSessionId::new(),
             },
             size: TerminalSize::new(80, 24, 0, 0).expect("valid terminal size"),
+            initial_palette: None,
         })
         .await
         .expect("create Agent-owned test session");
@@ -1804,6 +1806,7 @@ async fn ui_scroll_keeps_failed_session_history_available() {
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::new(80, 24, 0, 0).expect("valid terminal size"),
+            initial_palette: None,
         })
         .await
         .expect("create failing-reader session");
@@ -1871,6 +1874,7 @@ async fn ui_scroll_on_reconnected_exited_session_does_not_write_transport() {
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::new(80, 24, 0, 0).expect("valid terminal size"),
+            initial_palette: None,
         })
         .await
         .expect("create session with gated EOF");
@@ -1968,6 +1972,7 @@ async fn ui_scroll_rejects_session_while_close_is_in_progress() {
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::new(80, 24, 0, 0).expect("valid terminal size"),
+            initial_palette: None,
         })
         .await
         .expect("create close-gated session");

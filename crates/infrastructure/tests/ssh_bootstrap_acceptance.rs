@@ -388,6 +388,7 @@ async fn ssh_bash_pty_bootstrap_reports_redacted_prompt_state() {
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::default(),
+            initial_palette: None,
         };
         let create_operation = sessions.create_cancellable(request, cancellation.clone());
         tokio::pin!(create_operation);
@@ -1224,6 +1225,7 @@ async fn run_ssh_bash_resize_sequence(
             pane_id: old_pane_id,
         },
         size: resize_fixture_size(INITIAL_FIXTURE_COLUMNS),
+        initial_palette: None,
     };
     let old_cancel = CancellationToken::new();
     let old_create = sessions.create_cancellable(old_request, old_cancel.clone());
@@ -1314,6 +1316,7 @@ async fn run_ssh_bash_resize_sequence(
             pane_id: new_pane_id,
         },
         size: resize_fixture_size(SPLIT_FIXTURE_COLUMNS),
+        initial_palette: None,
     };
     let new_cancel = CancellationToken::new();
     let new_create = sessions.create_cancellable(new_request, new_cancel.clone());

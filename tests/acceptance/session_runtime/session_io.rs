@@ -128,7 +128,7 @@ async fn wait_for_text(
     }
 }
 
-/// 使用本次运行的 HOME、临时目录与配置根创建实际 portable-pty session。
+/// 使用本次运行的 HOME、临时目录与配置根创建实际 PTY；无界面验收沿用默认色盘。
 pub(super) async fn create_session(
     service: &Arc<dyn SessionService>,
     options: &Options,
@@ -145,6 +145,7 @@ pub(super) async fn create_session(
                 name: "session-acceptance".to_owned(),
             },
             size: TerminalSize::default(),
+            initial_palette: None,
         })
         .await
         .map_err(|error| format!("创建真实 local PTY session 失败：{error}"))

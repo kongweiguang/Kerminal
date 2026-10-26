@@ -1072,6 +1072,7 @@ async fn agent_scoped_resize_and_close_require_matching_scope_id_without_target_
                 agent_session_id: agent_id.clone(),
             },
             size: TerminalSize::default(),
+            initial_palette: None,
         })
         .await
         .expect("Agent CLI session is registered");
@@ -1112,6 +1113,7 @@ async fn agent_scoped_resize_and_close_require_matching_scope_id_without_target_
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::default(),
+            initial_palette: None,
         })
         .await
         .expect("explicit UI session is registered");

@@ -11,7 +11,7 @@ use kerminal_domain::{
     identity::{AgentSessionId, SessionId},
     sessions::SessionInfo,
 };
-use kerminal_terminal::snapshot::PlainTextSnapshot;
+use kerminal_terminal::snapshot::{PlainTextSnapshot, TerminalPalette};
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
@@ -78,6 +78,8 @@ pub struct CreateAgentSessionFromHistoryRequest {
     pub title: Option<String>,
     pub scope: AgentSessionScope,
     pub target: AgentTargetBinding,
+    /// 传给新 PTY 的首帧色盘，在 CLI 首次读取 OSC 颜色前生效。
+    pub initial_palette: Option<TerminalPalette>,
 }
 
 /// 以调用方读取到的标题作为前置值，避免并发改名覆盖其他窗口的新标题。
@@ -100,6 +102,8 @@ pub struct CreateAgentSessionRequest {
     pub target: AgentTargetBinding,
     /// 显式选择只影响本次新建；application 会按最新配置重新验证，缺失时不回退。
     pub launcher_key: Option<AgentLauncherKey>,
+    /// 传给新 PTY 的首帧色盘，在 CLI 首次读取 OSC 颜色前生效。
+    pub initial_palette: Option<TerminalPalette>,
 }
 
 /// 当前配置中可供新建界面选择的启动项，不包含命令内容或凭据。
@@ -451,6 +455,23 @@ pub trait AgentService: Send + Sync {
         agent_session_id: AgentSessionId,
         cancellation: CancellationToken,
     ) -> AppResult<AgentSessionView>;
+
+    /// 继续会话时先把 Root 当前色盘装入 PTY engine，避免恢复后的 CLI 启动时查询到旧默认色。
+    ///
+    /// @author kongweiguang
+    async fn resume_with_palette(
+        &self,
+        agent_session_id: AgentSessionId,
+        initial_palette: Option<TerminalPalette>,
+        cancellation: CancellationToken,
+    ) -> AppResult<AgentSessionView> {
+        if initial_palette.is_some() {
+            return Err(AppError::unsupported(
+                "Agent resume with an initial terminal palette is unavailable",
+            ));
+        }
+        self.resume(agent_session_id, cancellation).await
+    }
 
     /// 只核对已有恢复事务；缺省实现让外部 adapter 保持兼容且不会误调用继续启动。
     ///

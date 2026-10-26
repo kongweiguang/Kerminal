@@ -437,6 +437,7 @@ async fn create_failed_session(manager: &SessionManager) -> SessionInfo {
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::new(80, 24, 0, 0).expect("valid test terminal size"),
+            initial_palette: None,
         })
         .await
         .expect("initial transport opens");
@@ -475,6 +476,7 @@ async fn create_running_session(manager: &SessionManager) -> SessionInfo {
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::new(80, 24, 0, 0).expect("valid test terminal size"),
+            initial_palette: None,
         })
         .await
         .expect("initial running transport opens")

@@ -182,6 +182,7 @@ impl RootView {
     }
 
     /// 绑定 handler 与上下文并补读等待绑定的脏快照；blur 只清预编辑，不释放会话输入 owner。
+    /// 焦点进出都重绘按键 context，避免搜索控件继承上一次画布聚焦时的 Tab 覆盖。
     ///
     /// @author kongweiguang
     pub(super) fn install_pane_input_handler(
@@ -247,6 +248,10 @@ impl RootView {
         );
         let focus_out_subscription = cx.on_blur(&focus_handle, window, |root, window, cx| {
             root.cancel_unfocused_pane_compositions(window, cx);
+            cx.notify();
+        });
+        let focus_in_subscription = cx.on_focus(&focus_handle, window, |_, _, cx| {
+            cx.notify();
         });
         self.pane_input_handlers.insert(
             binding.session_id.clone(),
@@ -256,6 +261,7 @@ impl RootView {
                 _subscription: subscription,
                 _viewport_subscription: viewport_subscription,
                 _focus_out_subscription: focus_out_subscription,
+                _focus_in_subscription: focus_in_subscription,
             },
         );
         self.command_line_projection

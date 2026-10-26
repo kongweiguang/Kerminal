@@ -5,7 +5,7 @@
 use gpui_kit::{
     ClickEvent, Context, IntoElement, Window,
     component::{
-        Disableable,
+        Disableable, Sizable as _,
         button::{Button, ButtonVariants},
     },
     div,
@@ -15,6 +15,7 @@ use gpui_kit::{
 use kerminal_application::mcp_runtime::{McpRuntimeSnapshot, McpRuntimeState};
 
 use crate::theme::ThemeTokens;
+use crate::ui_button::icon_button;
 
 use super::{McpRuntimePanel, RuntimeOperation};
 
@@ -111,7 +112,10 @@ fn render_header(theme: ThemeTokens, snapshot: &McpRuntimeSnapshot) -> impl Into
         })
 }
 
-/// 根据状态显式禁用不可能的动作；停止超时会保留 owner 并把同一按钮变为重试。
+/// 仅将明确的刷新命令压缩为图标，启停及取消仍显示真实服务生命周期动作。
+/// 停止超时保留 owner 并把同一按钮变为重试，不能由图标化改变重试语义。
+///
+/// @author kongweiguang
 fn render_controls(
     panel: &mut McpRuntimePanel,
     theme: ThemeTokens,
@@ -168,14 +172,18 @@ fn render_controls(
             )
         })
         .child(
-            Button::new("mcp-runtime-refresh")
-                .compact()
-                .label(crate::locale::text("刷新", "Refresh"))
-                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| panel.refresh(cx))),
+            icon_button(
+                "mcp-runtime-refresh",
+                gpui_kit::assets::IconName::RefreshCw,
+                crate::locale::text("刷新 MCP 服务状态", "Refresh MCP server status"),
+            )
+            .with_size(gpui_kit::component::Size::Medium)
+            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| panel.refresh(cx))),
         )
         .child(
             Button::new("mcp-runtime-copy")
                 .compact()
+                .icon(gpui_kit::assets::IconName::Copy)
                 .label(crate::locale::text("复制客户端配置", "Copy client config"))
                 .disabled(!copy_available)
                 .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| panel.copy_client_config(cx))),

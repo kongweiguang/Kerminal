@@ -115,6 +115,7 @@ async fn create_ui_session() -> (
             }),
             owner: owner.clone(),
             size: TerminalSize::new(24, 4, 0, 0).expect("valid test terminal size"),
+            initial_palette: None,
         })
         .await
         .expect("create isolated UI session");

@@ -394,7 +394,7 @@ pub struct CommandsView {
     pub(super) ui_session_binding: Option<UiSessionBinding>,
     /// 与精确 binding 同代的目标展示名；焦点/目标更新后必须重新投影。
     pub(super) target_presentation: Option<CommandsTargetPresentation>,
-    pub(super) history_generation: u64,
+    history_read: history_query::HistoryReadState,
     pub(super) panel_generation: u64,
     pub(super) suggestion_generation: u64,
     pub(super) suggestion_cancellation: Option<CancellationToken>,
@@ -409,7 +409,7 @@ type PanelLoad = (
 );
 
 impl CommandsView {
-    /// 使用窗口上下文创建稳定输入实体；布局重绘不会丢失搜索、命令和定义草稿。
+    /// 稳定输入实体与历史读取槽由视图持有；重绘不重建草稿或在途查询。
     pub fn new(
         commands: Arc<CommandsService>,
         executor: ApplicationTaskExecutor,
@@ -567,7 +567,7 @@ impl CommandsView {
             session_view_generation: 0,
             ui_session_binding: None,
             target_presentation: None,
-            history_generation: 0,
+            history_read: history_query::HistoryReadState::default(),
             panel_generation: 0,
             suggestion_generation: 0,
             suggestion_cancellation: None,
@@ -915,7 +915,7 @@ impl CommandsView {
         self.open_workflow(id, window, cx);
     }
 
-    /// 切换活动终端时取消旧发送并失效其 token；迟到回执不得释放新目标的忙状态。
+    /// 切换终端时取消旧读取和发送；迟到回执不得覆盖新目标或释放其忙状态。
     ///
     /// @author kongweiguang
     pub fn set_session(&mut self, session_id: Option<SessionId>, cx: &mut Context<Self>) {
@@ -944,7 +944,7 @@ impl CommandsView {
         }
         self.send_operation.invalidate();
         self.session_view_generation = self.session_view_generation.wrapping_add(1).max(1);
-        self.history_generation = self.history_generation.wrapping_add(1).max(1);
+        self.history_read.cancel();
         if !run_is_in_flight {
             self.workflow_generation = self.workflow_generation.wrapping_add(1);
             if let Some(run) = self.workflow_run.as_mut()
@@ -1067,10 +1067,12 @@ impl CommandsView {
             .label_for_binding(self.ui_session_binding.as_ref())
     }
 
-    /// 在应用 runtime 并行读取当前会话、历史、文件化目录与可见分屏，不阻塞 GPUI 线程。
+    /// 整页重读先取代独立历史搜索，避免两条读取链互相覆盖；I/O 留在应用 runtime。
     ///
     /// @author kongweiguang
     pub(super) fn reload_panel(&mut self, cx: &mut Context<Self>) {
+        self.history_read.cancel();
+        let history_generation = self.history_read.generation();
         self.refresh_snippet_page(cx);
         self.panel_generation = self.panel_generation.wrapping_add(1).max(1);
         let generation = self.panel_generation;
@@ -1103,17 +1105,18 @@ impl CommandsView {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                view.finish_panel_load(generation, result, cx)
+                view.finish_panel_load(generation, history_generation, result, cx)
             });
         })
         .detach();
         cx.notify();
     }
 
-    /// 只接受当前 generation 的数据，旧 session 或旧搜索的迟到结果不会覆盖新面板。
+    /// 整页与历史读取分别核对版本；后发搜索不被先发整页回执覆盖，其余数据照常回投。
     fn finish_panel_load(
         &mut self,
         generation: u64,
+        history_generation: u64,
         result: Result<PanelLoad, AppError>,
         cx: &mut Context<Self>,
     ) {
@@ -1130,9 +1133,11 @@ impl CommandsView {
                         Err(error) => errors.push(error.public_message()),
                     }
                 }
-                match history {
-                    Ok(history) => self.history = history,
-                    Err(error) => errors.push(error.public_message()),
+                if self.history_read.generation() == history_generation {
+                    match history {
+                        Ok(history) => self.history = history,
+                        Err(error) => errors.push(error.public_message()),
+                    }
                 }
                 match workflows {
                     Ok(workflows) => self.workflows = workflows,
@@ -1153,12 +1158,21 @@ impl CommandsView {
         cx.notify();
     }
 
-    /// 用显式会话筛选重新读取历史；清理或删除后不会重新显示旧列表快照。
+    /// 用户提交与按钮忙态共用门禁；内部删除后的权威刷新仍可取代旧查询。
+    ///
+    /// @author kongweiguang
+    pub(super) fn search_history(&mut self, cx: &mut Context<Self>) {
+        if self.loading || self.history_read.is_loading() {
+            return;
+        }
+        self.reload_history(cx);
+    }
+
+    /// 强制刷新冻结会话与查询，取消旧读；失败同样释放忙态以保留重试入口。
     ///
     /// @author kongweiguang
     pub(super) fn reload_history(&mut self, cx: &mut Context<Self>) {
-        self.history_generation = self.history_generation.wrapping_add(1).max(1);
-        let generation = self.history_generation;
+        let (generation, cancellation) = self.history_read.begin();
         let service = self.commands.clone();
         let executor = self.executor.clone();
         let session_id = self.session_id.clone();
@@ -1167,7 +1181,7 @@ impl CommandsView {
             .update(cx, |input, _| input.value().to_string());
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |cancellation| async move {
+                .run_cancellable(cancellation, move |cancellation| async move {
                     let request = history_query::HistoryScope::session(session_id)
                         .list_request(query, None, 100);
                     let result = service.list_history(request).await?;
@@ -1181,7 +1195,7 @@ impl CommandsView {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                if view.history_generation != generation {
+                if !view.history_read.finish(generation) {
                     return;
                 }
                 match result {
@@ -1195,6 +1209,7 @@ impl CommandsView {
             });
         })
         .detach();
+        cx.notify();
     }
 
     /// 历史项点击只把原文恢复到草稿，不会自动提交或改变当前活动会话。
@@ -3667,6 +3682,7 @@ impl Drop for CommandsView {
     ///
     /// @author kongweiguang
     fn drop(&mut self) {
+        self.history_read.cancel();
         cancel_owned_suggestion_request(&mut self.suggestion_cancellation);
         snippet_browser::cancel_snippet_page_request(&mut self.snippet_page_cancellation);
         snippet_browser::cancel_snippet_copy(self);
@@ -3701,6 +3717,10 @@ mod tests;
 #[cfg(test)]
 #[path = "../../tests/unit/commands_target_presentation.rs"]
 mod target_presentation_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/commands_history_read.rs"]
+mod history_read_tests;
 
 #[cfg(test)]
 #[path = "../../tests/unit/commands_snippet_fill.rs"]

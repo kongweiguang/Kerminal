@@ -5,7 +5,7 @@
 use gpui_kit::{
     AnyElement, ClickEvent, Context, IntoElement,
     component::{
-        Disableable,
+        Disableable, Sizable as _,
         button::{Button, ButtonVariants},
         input::Input,
         menu::{DropdownMenu as _, PopupMenuItem},
@@ -20,7 +20,7 @@ use kerminal_domain::operations::{
     ComposeAction, ContainerAction, ContainerRuntime, ContainerStatus,
 };
 
-use crate::theme::ThemeTokens;
+use crate::{theme::ThemeTokens, ui_button::icon_button};
 
 use super::super::{
     ContainerPanelContext, ContainerPanelUnavailableReason, ContainerReadKind, OperationsView,
@@ -345,10 +345,12 @@ fn render_host(
                         view.request_container_files(file_target.clone(), &ticket, cx)
                     })),
             );
-            let menu = Button::new(format!("container-more-{short_id}"))
-                .compact()
-                .ghost()
-                .label(crate::locale::text("更多", "More"));
+            let menu = icon_button(
+                format!("container-more-{short_id}"),
+                gpui_kit::assets::IconName::Ellipsis,
+                crate::locale::text("更多容器操作", "More container actions"),
+            )
+            .with_size(gpui_kit::component::Size::Medium);
             let entity = cx.entity().clone();
             let menu_target = target.clone();
             let menu_ticket = row_ticket.clone();
@@ -696,7 +698,11 @@ fn render_container_info(
                 let details = details.clone();
                 body = body.child(super::container_inspect(&details, theme));
                 let copy = format!("{}\n{}\n{}", details.name, details.id, details.image);
-                body = body.child(copy_button(copy, "container-info-copy-overview"));
+                body = body.child(copy_button(
+                    copy,
+                    "container-info-copy-overview",
+                    crate::locale::text("复制容器概览", "Copy container overview"),
+                ));
             }
         }
         ContainerReadKind::Stats | ContainerReadKind::Logs => {
@@ -738,7 +744,11 @@ fn render_container_info(
                         }),
                 );
                 if !no_logs {
-                    body = body.child(copy_button(output, "container-info-copy-output"));
+                    body = body.child(copy_button(
+                        output,
+                        "container-info-copy-output",
+                        crate::locale::text("复制容器输出", "Copy container output"),
+                    ));
                 }
             }
         }
@@ -826,15 +836,20 @@ pub(super) fn wrap_container_identifier(value: &str) -> String {
         .join("\n")
 }
 
-/// 复制展示内容只操作当前快照，不要求额外读取或改变绑定目标。
+/// 复制按钮贴近已加载内容并标明其范围，避免图标隐藏具体复制对象。
 ///
 /// @author kongweiguang
-fn copy_button(value: String, id: &str) -> impl IntoElement {
-    Button::new(id.to_owned())
-        .compact()
-        .ghost()
-        .label(crate::locale::text("复制", "Copy"))
-        .on_click(move |_, _, cx| {
-            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(value.clone()));
-        })
+fn copy_button(
+    value: String,
+    id: &str,
+    accessible_label: gpui_kit::SharedString,
+) -> impl IntoElement {
+    icon_button(
+        id.to_owned(),
+        gpui_kit::assets::IconName::Copy,
+        accessible_label,
+    )
+    .on_click(move |_, _, cx| {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(value.clone()));
+    })
 }

@@ -9,6 +9,51 @@ use kerminal_domain::{
     },
     identity::{HostId, PaneId, SessionId},
 };
+use tokio_util::sync::CancellationToken;
+
+/// 读取槽把忙碌、协作取消和代次放在一起，旧回执不能解除新搜索的锁定。
+#[derive(Default)]
+pub(super) struct HistoryReadState {
+    generation: u64,
+    cancellation: Option<CancellationToken>,
+}
+
+impl HistoryReadState {
+    /// 整页加载捕获同一版本；后续独立搜索一旦开始，旧整页历史不得回写。
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 槽位存在即表示尚未收敛，鼠标与键盘共用此门禁。
+    pub(super) fn is_loading(&self) -> bool {
+        self.cancellation.is_some()
+    }
+
+    /// 内部权威刷新可取代旧读；删除后的刷新不能被旧搜索的忙碌状态吞掉。
+    pub(super) fn begin(&mut self) -> (u64, CancellationToken) {
+        self.cancel();
+        let cancellation = CancellationToken::new();
+        self.cancellation = Some(cancellation.clone());
+        (self.generation, cancellation)
+    }
+
+    /// 成功或失败都释放当前槽，过期任务既不能写结果也不能解锁下一次请求。
+    pub(super) fn finish(&mut self, generation: u64) -> bool {
+        if self.generation != generation || !self.is_loading() {
+            return false;
+        }
+        self.cancellation = None;
+        true
+    }
+
+    /// 切目标、整页重读和释放实体都作废旧票据，并通知原任务停止读取。
+    pub(super) fn cancel(&mut self) {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.cancel();
+        }
+    }
+}
 
 pub(super) const PAGE_SIZE: usize = 8;
 

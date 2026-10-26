@@ -158,6 +158,7 @@ async fn local_pty_close_terminates_descendant_process_group() {
         }),
         owner: SessionOwner::Mcp,
         size: TerminalSize::new(80, 24, 0, 0).expect("valid grid"),
+        initial_palette: None,
     }).await.expect("spawn shell with descendant");
     let child_pid = wait_for_descendant_pid(service.as_ref(), &info.session_id).await;
     service
@@ -212,6 +213,7 @@ async fn conpty_close_terminates_descendant_process_job() {
             }),
             owner: SessionOwner::Mcp,
             size: TerminalSize::new(100, 30, 0, 0).expect("valid grid"),
+            initial_palette: None,
         })
         .await
         .expect("spawn PowerShell with descendant");
@@ -248,6 +250,7 @@ async fn local_pty_create_write_read_resize_close() {
             target: SessionTarget::Local(local_shell()),
             owner: SessionOwner::Mcp,
             size: TerminalSize::new(80, 24, 0, 0).expect("valid grid"),
+            initial_palette: None,
         })
         .await
         .expect("spawn real local PTY");
@@ -343,6 +346,7 @@ async fn assert_pwsh_path_matches_expected(environment: BTreeMap<OsString, OsStr
             }),
             owner: SessionOwner::Mcp,
             size: TerminalSize::new(100, 30, 0, 0).expect("valid grid"),
+            initial_palette: None,
         })
         .await
         .unwrap_or_else(|error| {
@@ -814,6 +818,7 @@ async fn powershell_integration_runs_multiline_script_in_current_shell() {
             }),
             owner: SessionOwner::Mcp,
             size: TerminalSize::new(100, 30, 0, 0).expect("valid grid"),
+            initial_palette: None,
         })
         .await
         .unwrap_or_else(|error| {
@@ -983,6 +988,7 @@ async fn powershell_startup_with_command_mode_does_not_claim_integration() {
             }),
             owner: SessionOwner::Mcp,
             size: TerminalSize::new(80, 24, 0, 0).expect("valid grid"),
+            initial_palette: None,
         })
         .await
         .expect("start explicit one-shot command target");
@@ -1036,6 +1042,7 @@ async fn fish_integration_runs_multiline_script_in_current_shell() {
             }),
             owner: SessionOwner::Mcp,
             size: TerminalSize::new(100, 30, 0, 0).expect("valid grid"),
+            initial_palette: None,
         })
         .await
         .expect("start interactive Fish with hook");
@@ -1101,6 +1108,7 @@ async fn reconnect_preserves_session_watch_and_resets_terminal_generation() {
             target: SessionTarget::Local(local_shell()),
             owner: SessionOwner::Mcp,
             size: TerminalSize::new(80, 24, 0, 0).expect("valid grid"),
+            initial_palette: None,
         })
         .await
         .expect("spawn initial shell");
@@ -1890,6 +1898,7 @@ async fn session_manager_preserves_descendant_output_after_native_child_exit() {
             target: SessionTarget::Local(target),
             owner: SessionOwner::Mcp,
             size: TerminalSize::new(100, 30, 0, 0).expect("valid grid"),
+            initial_palette: None,
         })
         .await
         .expect("start controlled ConPTY root child");

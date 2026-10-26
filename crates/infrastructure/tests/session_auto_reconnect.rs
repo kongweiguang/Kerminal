@@ -128,6 +128,7 @@ fn create_request() -> CreateSessionRequest {
             pane_id: PaneId::new(),
         },
         size: TerminalSize::new(80, 24, 0, 0).expect("valid test terminal size"),
+        initial_palette: None,
     }
 }
 

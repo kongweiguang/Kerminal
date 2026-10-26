@@ -305,7 +305,7 @@ impl WorkspaceFileRuntime {
 }
 
 impl RootView {
-    /// 为每个文件视图绑定同一组 typed Root 桥接，source Entity 隔离各面板的迟到投影。
+    /// 为每个文件视图绑定同一组 typed Root 桥接；缓存中的右栏面板不能回投导航或开启根确认。
     /// 主机选择仅受理共享工作台的显式意图，复用保存连接的信任预检，不让文件视图自行建连接。
     /// 新建主机同样交给 Root 捕获来源身份，保存成功不依赖当时的后台活动传输标签。
     ///
@@ -318,7 +318,10 @@ impl RootView {
         let open_file = cx.subscribe_in(
             pane,
             window,
-            |root, _pane, event: &OpenFileRequested, window, cx| {
+            |root, source, event: &OpenFileRequested, window, cx| {
+                if root.is_cached_sftp_panel(source) {
+                    return;
+                }
                 root.open_file_endpoint(event.endpoint.clone(), window, cx);
             },
         );
@@ -326,13 +329,19 @@ impl RootView {
             pane,
             window,
             |root, source, event: &WorkspaceOverviewRequested, _, cx| {
+                if root.is_cached_sftp_panel(source) {
+                    return;
+                }
                 root.return_editor_workspace_projection(source.clone(), event.generation, cx);
             },
         );
         let activate_editor_file = cx.subscribe_in(
             pane,
             window,
-            |root, _pane, event: &ActivateEditorFileRequested, window, cx| {
+            |root, source, event: &ActivateEditorFileRequested, window, cx| {
+                if root.is_cached_sftp_panel(source) {
+                    return;
+                }
                 root.activate_open_editor_file(event.endpoint.clone(), window, cx);
             },
         );
@@ -366,6 +375,9 @@ impl RootView {
         let delete_confirmation_observer =
             cx.observe_in(pane, window, |root, source, window, cx| {
                 let active = source.read(cx).pending_delete_confirmation().is_some();
+                if active && root.is_cached_sftp_panel(&source) {
+                    return;
+                }
                 root.sync_file_delete_root_confirmation(source.clone(), active, window, cx);
             });
         FilesPaneSubscriptions {

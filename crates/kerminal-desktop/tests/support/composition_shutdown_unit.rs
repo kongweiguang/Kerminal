@@ -150,6 +150,7 @@ async fn session_close_unblocks_tracked_task_during_shared_shutdown_join() {
             }),
             owner: SessionOwner::Mcp,
             size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+            initial_palette: None,
         })
         .await
         .expect("fake session should be registered");

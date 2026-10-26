@@ -51,7 +51,10 @@ pub fn cargo(root: &Path, arguments: &[&str]) -> Result<(), Box<dyn Error>> {
     require_success("cargo", status)
 }
 
-/// 默认隔离配置不接触用户 home；并行原生验收可显式提供绝对 dev 根，避免复用另一候选的会话。
+/// 普通启动沿用桌面的用户配置根；smoke 默认隔离，并行验收仍可显式指定绝对 dev 根。
+/// 不设置覆盖时保留调用者的 KERMINAL_CONFIG_ROOT，让两种普通启动入口遵守相同规则。
+///
+/// @author kongweiguang
 pub fn run_desktop(root: &Path, smoke: bool) -> Result<(), Box<dyn Error>> {
     let config_root = match std::env::var_os("KERMINAL_DEV_CONFIG_ROOT") {
         Some(path) => {
@@ -59,21 +62,20 @@ pub fn run_desktop(root: &Path, smoke: bool) -> Result<(), Box<dyn Error>> {
             if !path.is_absolute() {
                 return Err("KERMINAL_DEV_CONFIG_ROOT must be an absolute isolated path".into());
             }
-            path
+            Some(path)
         }
-        None => root.join("target").join(if smoke {
-            "kerminal-native-smoke"
-        } else {
-            "kerminal-dev-config"
-        }),
+        None if smoke => Some(root.join("target").join("kerminal-native-smoke")),
+        None => None,
     };
-    fs::create_dir_all(&config_root)?;
 
     let mut command = Command::new("cargo");
     command
         .current_dir(root)
-        .args(["--locked", "run", "--package", "kerminal-desktop"])
-        .env("KERMINAL_CONFIG_ROOT", &config_root);
+        .args(["--locked", "run", "--package", "kerminal-desktop"]);
+    if let Some(config_root) = config_root {
+        fs::create_dir_all(&config_root)?;
+        command.env("KERMINAL_CONFIG_ROOT", config_root);
+    }
     let status = command.status()?;
     require_success("cargo run -p kerminal-desktop", status)
 }

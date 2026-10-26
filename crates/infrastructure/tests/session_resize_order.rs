@@ -170,6 +170,7 @@ async fn create_session(
                 pane_id: PaneId::new(),
             },
             size: initial_size,
+            initial_palette: None,
         })
         .await
         .expect("create isolated resize test session");

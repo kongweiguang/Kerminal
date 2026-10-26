@@ -2,6 +2,7 @@
 //!
 //! @author kongweiguang
 
+use gpui_kit::component::Sizable as _;
 use gpui_kit::{
     ClickEvent, Context, EventEmitter, IntoElement, Render, Window, component::button::Button, div,
     prelude::*, px,
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::theme::ThemeTokens;
+use crate::ui_button::icon_button;
 
 static NEXT_TERMINAL_SELECTION_GESTURE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -477,7 +479,10 @@ impl SelectionControls {
 }
 
 impl Render for SelectionControls {
-    /// 有可复制内容时才显示快捷操作，剪贴板权限与异步提取留给宿主应用。
+    /// 有可复制内容时才显示快捷操作；剪贴板和异步读取仍留给宿主视图。
+    /// Copy 紧邻字符数且明确命名所选终端文本，清除选择保留文字。
+    ///
+    /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ThemeTokens::current(window, cx);
         let selected_chars = self.selected_chars;
@@ -497,14 +502,19 @@ impl Render for SelectionControls {
                         format!("{count} characters selected"),
                     )))
                     .child(
-                        Button::new("terminal-selection-copy")
-                            .compact()
-                            .label(crate::locale::text("复制", "Copy"))
-                            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        icon_button(
+                            "terminal-selection-copy",
+                            gpui_kit::assets::IconName::Copy,
+                            crate::locale::text("复制所选终端文本", "Copy selected terminal text"),
+                        )
+                        .with_size(gpui_kit::component::Size::Medium)
+                        .on_click(cx.listener(
+                            move |_, _: &ClickEvent, _, cx| {
                                 if let Some(session_id) = copy_session.clone() {
                                     cx.emit(TerminalSelectionEvent::Copy { session_id });
                                 }
-                            })),
+                            },
+                        )),
                     )
                     .child(
                         Button::new("terminal-selection-clear")

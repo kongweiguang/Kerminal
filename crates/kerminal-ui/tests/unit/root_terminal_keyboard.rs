@@ -54,13 +54,27 @@ fn legacy_printable_keys_remain_available_to_platform_text() {
     );
 }
 
-/// 控制键和终端导航键仍须消费，防止平台再提交回车等文本造成双投。
+/// 控制键、Tab 补全与终端导航键仍须消费，防止焦点导航或平台文本造成双投。
 ///
 /// @author kongweiguang
 #[test]
 fn encoded_control_and_navigation_keys_remain_terminal_owned() {
     let modes = TerminalModes::default();
     for (event, expected) in [
+        (
+            key(TerminalKey::Tab, InputModifiers::default()),
+            b"\t".as_slice(),
+        ),
+        (
+            key(
+                TerminalKey::Tab,
+                InputModifiers {
+                    shift: true,
+                    ..InputModifiers::default()
+                },
+            ),
+            b"\x1b[Z".as_slice(),
+        ),
         (
             key(TerminalKey::Enter, InputModifiers::default()),
             b"\r".as_slice(),

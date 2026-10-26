@@ -28,6 +28,8 @@ mod session_queue;
 mod session_reconnect;
 mod snippet_editor;
 mod split_target_picker;
+mod tab_agent_panels;
+mod tab_tool_contents;
 #[cfg(feature = "acceptance-metrics")]
 mod terminal_acceptance;
 pub(crate) mod terminal_context_menu;
@@ -386,6 +388,7 @@ struct PaneInputRegistration {
     _subscription: gpui_kit::Subscription,
     _viewport_subscription: gpui_kit::Subscription,
     _focus_out_subscription: gpui_kit::Subscription,
+    _focus_in_subscription: gpui_kit::Subscription,
 }
 
 /// 只在同一 pane 仍活动且原焦点未被用户改变时恢复异步安装的终端焦点。
@@ -604,6 +607,9 @@ pub struct RootView {
     /// 每个一次性 exec pane 绑定原始容器目标，终态或确认关闭后才刷新该目标。
     container_exec_refresh_targets: HashMap<PaneId, ContainerExecRefreshTarget>,
     agents_panel: Option<Entity<crate::features::agents::AgentsPanel>>,
+    /// 标签仅拥有面板状态；PTY 和 Agent 目标不随普通切换重建或重绑。
+    agent_panel_tab_id: Option<TabId>,
+    retained_agent_panels: HashMap<Option<TabId>, tab_agent_panels::RetainedAgentPanel>,
     /// 仅在候选语义发生变化时通知 Agent panel，避免终端输出刷新造成候选面板重绘风暴。
     agent_target_candidate: CachedAgentTargetCandidate,
     /// Agent 面板固定在右栏；折叠只隐藏视图，不销毁会话或实体。
@@ -725,6 +731,9 @@ pub struct RootView {
         Entity<crate::features::operations::proxy_panel::ProxyApplicationPanel>,
     >,
     _tool_rail_proxy_panel_subscriptions: BTreeMap<ToolRailToolId, gpui_kit::Subscription>,
+    /// 右栏内容按稳定 TabId 换挂，抽屉宽度仍由共享状态持有。
+    tab_tool_contents_tab_id: Option<TabId>,
+    retained_tab_tool_contents: HashMap<Option<TabId>, tab_tool_contents::RetainedTabToolContents>,
     /// 手动终端重连按 pane incarnation 持有尝试和迟到回执门禁。
     session_reconnect: session_reconnect::SessionReconnectController,
     workspace_renders: HashMap<TabId, Entity<workspace_render::WorkspaceRender>>,
@@ -1914,6 +1923,7 @@ impl RootView {
     /// 为 ready pane 组合工具；split candidate 只绘制无输入探针，普通待恢复 pane 继续走原恢复测量。
     /// 搜索控件作为 Canvas 的绝对定位子层挂载，避免显隐或错误反馈改动 PTY 行列测量。
     /// 原位重启期间保留画面但不重新安装旧代次输入，直到新连接完成身份核对。
+    /// Tab 覆盖仅在画布真实聚焦时启用，使终端补全与搜索框的焦点导航各归其主。
     ///
     /// @author kongweiguang
     fn render_workspace_pane(
@@ -2072,6 +2082,10 @@ impl RootView {
             let key_up_input = input.clone();
             canvas_region = canvas_region
                 .track_focus(&focus)
+                .when_some(
+                    crate::terminal_input_handler::keyboard_context(&focus, window),
+                    |region, context| region.key_context(context),
+                )
                 .on_key_down(cx.listener(move |root, event, window, cx| {
                     root.handle_pane_key_down(key_down_input.clone(), event, window, cx);
                 }))
@@ -2764,58 +2778,9 @@ impl RootView {
             );
             cx.new(|cx| FileEditorWorkspace::new(service, executor, target_name_lookup, window, cx))
         });
-        let commands_view = services.commands.clone().map(|commands| {
-            let executor = services.executor.clone();
-            // 共用既有会话服务以保留精确目标绑定；视图不自行创建 runtime 或访问配置文件。
-            let snippet_execution = kerminal_application::commands::SnippetExecutionService::new(
-                commands.clone(),
-                services.sessions.clone(),
-            );
-            let configuration_validation = services.configuration_validation.clone();
-            let configuration_directory = services.configuration_directory.clone();
-            let snippet_transfer_files = services.snippet_transfer_files.clone();
-            cx.new(|cx| {
-                let view =
-                    crate::features::commands::CommandsView::new(commands, executor, window, cx)
-                        .with_snippet_execution_service(snippet_execution);
-                let view = match configuration_validation {
-                    Some(service) => view.with_configuration_validation(service),
-                    None => view,
-                };
-                let view = match configuration_directory {
-                    Some(service) => view.with_configuration_directory(service),
-                    None => view,
-                };
-                match snippet_transfer_files {
-                    Some(service) => view.with_snippet_transfer_files(service),
-                    None => view,
-                }
-            })
-        });
-        let snippet_editor_visibility_subscription = commands_view.as_ref().map(|commands| {
-            cx.subscribe_in(
-                commands,
-                window,
-                |root,
-                 _commands,
-                 event: &crate::features::commands::SnippetEditorVisibilityChanged,
-                 window,
-                 cx| {
-                    snippet_editor::sync_visibility(
-                        root,
-                        event.open,
-                        event.focus_command_draft,
-                        window,
-                        cx,
-                    );
-                },
-            )
-        });
-        let snippet_terminal_fill_subscription = commands_view.as_ref().map(|commands| {
-            cx.subscribe_in(commands, window, |root, commands, event, window, cx| {
-                snippet_editor::focus_terminal_after_fill(root, commands, event, window, cx);
-            })
-        });
+        let commands_view = Self::create_commands_view(&services, window, cx);
+        let (snippet_editor_visibility_subscription, snippet_terminal_fill_subscription) =
+            Self::subscribe_commands_view(commands_view.as_ref(), window, cx);
         let connections_panel = services
             .hosts
             .clone()
@@ -3113,72 +3078,9 @@ impl RootView {
                 root.sync_connection_editor_modal(editor_open, prompt_open, window, cx);
             })
         });
-        let agent_event_subscription = agents_panel.as_ref().map(|panel| {
-            cx.subscribe_in(
-                panel,
-                window,
-                |root, _panel, event, window, cx| match event {
-                    crate::features::agents::AgentPanelEvent::NewTerminalFocusStarted {
-                        request_generation,
-                    } => {
-                        root.pending_tool_rail_placement_focus = None;
-                        root.begin_agent_creation_focus_intent(*request_generation, window, cx);
-                    }
-                    crate::features::agents::AgentPanelEvent::NewTerminalFocusReady {
-                        request_generation,
-                        agent_session_id,
-                        terminal_session_id,
-                    } => {
-                        root.complete_agent_creation_focus_intent(
-                            *request_generation,
-                            agent_session_id.clone(),
-                            terminal_session_id.clone(),
-                            window,
-                            cx,
-                        );
-                    }
-                    crate::features::agents::AgentPanelEvent::NewTerminalFocusCancelled {
-                        request_generation,
-                    } => {
-                        root.cancel_agent_creation_focus_intent(*request_generation);
-                    }
-                    crate::features::agents::AgentPanelEvent::Selected {
-                        agent_session_id,
-                        terminal_session_id,
-                    } => {
-                        if root.host_shutdown_requested {
-                            return;
-                        }
-                        root.retain_agent_creation_focus_for_selection(
-                            agent_session_id.as_ref(),
-                            terminal_session_id.as_ref(),
-                        );
-                        root.select_agent_terminal(
-                            agent_session_id.clone(),
-                            terminal_session_id.clone(),
-                            window,
-                            cx,
-                        );
-                        if let Some(panel) = root.mcp_runtime_panel.as_ref() {
-                            panel.update(cx, |panel, cx| panel.refresh(cx));
-                        }
-                    }
-                    crate::features::agents::AgentPanelEvent::OpenCustomAgentManager => {
-                        root.open_custom_agent_manager(window, cx);
-                    }
-                    crate::features::agents::AgentPanelEvent::OpenAgentLauncherSettings => {
-                        if root.host_shutdown_requested {
-                            return;
-                        }
-                        root.open_preferences_modal(window, cx);
-                        root.preferences_panel.update(cx, |panel, cx| {
-                            panel.show_agent_launcher_settings(window, cx);
-                        });
-                    }
-                    crate::features::agents::AgentPanelEvent::TargetBindingChanged => {}
-                },
-            )
-        });
+        let agent_event_subscription = agents_panel
+            .as_ref()
+            .map(|panel| Self::subscribe_agent_panel(panel, window, cx));
         let files_pane_subscriptions = files_pane
             .as_ref()
             .map(|pane| Self::subscribe_files_pane_events(pane, window, cx));
@@ -3364,6 +3266,8 @@ impl RootView {
             initial_proxy_notice: None,
             container_exec_refresh_targets: HashMap::new(),
             agents_panel,
+            agent_panel_tab_id: None,
+            retained_agent_panels: HashMap::new(),
             agent_target_candidate: CachedAgentTargetCandidate(None),
             right_dock_collapsed: false,
             agent_terminal_tools,
@@ -3444,6 +3348,8 @@ impl RootView {
             _tool_rail_operations_subscriptions: BTreeMap::new(),
             tool_rail_proxy_panels: BTreeMap::new(),
             _tool_rail_proxy_panel_subscriptions: BTreeMap::new(),
+            tab_tool_contents_tab_id: None,
+            retained_tab_tool_contents: HashMap::new(),
             session_reconnect: session_reconnect::SessionReconnectController::default(),
             workspace_renders: HashMap::new(),
             workspace_render_subscriptions: HashMap::new(),
@@ -3537,11 +3443,17 @@ impl RootView {
     }
 
     /// 从 controller 的活动终端布局与 Ready runtime pane 生成 Agent 首选目标候选；不从焦点外的 Tab 推断目标。
-    /// 收尾后的资源记账不再触发 Agent 列表 reload，保留已有业务 owner 给宿主继续清理。
+    /// 收尾及标签实体尚未换挂时不刷新旧面板，避免新标签目标清除旧标签的选择和历史筛选。
     ///
     /// @author kongweiguang
     fn refresh_agent_target_candidate(&mut self, cx: &mut Context<Self>) {
-        if self.host_shutdown_requested {
+        if self.host_shutdown_requested
+            || self.agent_panel_tab_id
+                != self
+                    .workspace_controller
+                    .as_ref()
+                    .and_then(|controller| controller.snapshot().active_tab_id.clone())
+        {
             return;
         }
         let candidate = self.current_agent_target_candidate();
@@ -3719,10 +3631,15 @@ impl RootView {
         true
     }
 
-    /// 按最新配置串行重配会话，并只刷新仍可见搜索的视图，避免主题改变遗留旧 revision 坐标。
+    /// 启动参数先同步当前调色板，再串行重配已有会话，防止自动启动 CLI 首次查询到旧底色。
+    /// 仅刷新可见搜索，避免主题变化遗留旧 revision 坐标。
     ///
     /// @author kongweiguang
     fn queue_terminal_palette_update(&mut self, cx: &mut Context<Self>) {
+        let palette = self.current_terminal_palette();
+        if let Some(panel) = self.agents_panel.clone() {
+            panel.update(cx, |panel, cx| panel.set_terminal_palette(palette, cx));
+        }
         self.palette_update_generation = self.palette_update_generation.wrapping_add(1).max(1);
         self.pending_palette_update = Some((
             self.current_terminal_palette(),
@@ -5446,10 +5363,14 @@ impl RootView {
     /// 只把活动 Ready pane 已安装的完整 UI binding 暴露给命令面板，并附上同代展示名。
     ///
     /// 活动 pane 尚未 Ready、已断开或尚无通过 terminal context 校验的 input handler 时，清空目标；
-    /// 不从侧栏、历史连接或 Agent 首选目标推测替代 session。会话 ID 未变时仍刷新 binding 和名称。
+    /// 不从侧栏或 Agent 目标推测 session；标签换挂前不刷新旧草稿，同标签内继续跟踪 binding 和名称。
     ///
     /// @author kongweiguang
     fn refresh_commands_session(&mut self, cx: &mut Context<Self>) {
+        // Controller 先切换、Render 后换挂；过渡期间不得把新目标写进旧标签的草稿实体。
+        if !self.tab_tool_contents_are_current() {
+            return;
+        }
         let (binding, presentation) = self.current_commands_target(cx);
         let session_id = binding.as_ref().map(|binding| binding.session_id.clone());
         if let Some(commands) = self.commands_view.as_ref() {
@@ -5461,10 +5382,13 @@ impl RootView {
         }
     }
 
-    /// 工作区 tab 改名只重算名称投影，不重新载入 Commands session 或打断当前编辑状态。
+    /// 工作区 tab 改名只重算同标签实体的名称，切换过渡帧不污染尚未换挂的旧草稿。
     ///
     /// @author kongweiguang
     fn refresh_commands_target_presentation(&self, cx: &mut Context<Self>) {
+        if !self.tab_tool_contents_are_current() {
+            return;
+        }
         let (_, presentation) = self.current_commands_target(cx);
         if let Some(commands) = self.commands_view.as_ref() {
             commands.update(cx, |view, cx| {
@@ -5835,7 +5759,9 @@ fn merge_commands_target_labels(tab_title: &str, pane_title: &str) -> Option<Str
 
 impl Render for RootView {
     /// 实际派发宿主收尾后只绘制停止投影，避免普通子视图每帧重新提交任务；确认和保存准备阶段仍保留原交互。
-    /// Workspace 与 Agent 搜索分别挂在自身 Canvas 上，使浮层只覆盖终端内容且不参与布局测量。
+    /// Workspace 与 Agent 搜索分别挂在自身 Canvas 上；仅真实画布焦点覆盖 Kit Tab 导航。
+    /// Agent 面板按活动标签换挂已保活的实体，避免跨标签串用草稿和 CLI 选择。
+    /// 其它右栏工具也按标签换挂；停用隐藏运维视图，保留其筛选与选择状态。
     /// 群发栏占真实 flex 槽，候选与现有 pane 都从剩余高度测量 PTY，避免用显示前的旧网格启动。
     /// 容器只由固定右栏挂载；退出准备失败提示保留在工作台，不伪造服务已停止。
     ///
@@ -5844,6 +5770,8 @@ impl Render for RootView {
         if let Some(stopping) = self.render_host_shutdown(window, cx) {
             return stopping;
         }
+        self.reconcile_agent_panel_for_tab(window, cx);
+        self.reconcile_tab_tool_contents(window, cx);
         self.sync_pending_root_confirmation(window, cx);
         self.restore_workspace_files(window, cx);
         self.ensure_workspace_render_entities(window, cx);
@@ -6170,6 +6098,10 @@ impl Render for RootView {
                     let key_up_input = input.clone();
                     canvas_slot = canvas_slot
                         .track_focus(&focus)
+                        .when_some(
+                            crate::terminal_input_handler::keyboard_context(&focus, window),
+                            |slot, context| slot.key_context(context),
+                        )
                         .on_key_down(cx.listener(move |root, event, window, cx| {
                             root.handle_pane_key_down(key_down_input.clone(), event, window, cx);
                         }))

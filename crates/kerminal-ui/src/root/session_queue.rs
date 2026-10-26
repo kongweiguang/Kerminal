@@ -15,6 +15,9 @@ use super::command_line_projection::CommandLineInputTicket;
 use super::command_suggestions::TerminalSuggestionAcceptance;
 use kerminal_domain::commands::SuggestionQueryMode;
 
+const MAX_WHEEL_BATCH_EVENTS: usize = 256;
+const MAX_WHEEL_BATCH_BYTES: usize = 8 * 1024;
+
 /// 同会话保序、跨会话并行，并同时限制队列内存与活跃写入数。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SessionQueueLimits {
@@ -44,6 +47,7 @@ pub(super) enum SessionWork {
         origin: InputOrigin,
     },
     UiInput(Box<UiInputWork>),
+    WheelInputBatch(WheelInputBatch),
     Scroll {
         binding: UiSessionBinding,
         lines: i32,
@@ -77,6 +81,7 @@ pub(super) struct UiInputWork {
     pub acceptance: Option<SuggestionAcceptanceWrite>,
     pub command_line_ticket: Option<CommandLineInputTicket>,
     pub origin: InputOrigin,
+    pub(super) wheel_input: bool,
     /// Acceptance-metrics-only correlation; never crosses the application/session API.
     #[cfg(feature = "acceptance-metrics")]
     pub echo_probe_id: Option<String>,
@@ -95,10 +100,27 @@ impl UiInputWork {
             acceptance,
             command_line_ticket: None,
             origin: InputOrigin::Direct,
+            wheel_input: false,
             #[cfg(feature = "acceptance-metrics")]
             echo_probe_id: None,
         }
     }
+
+    /// 标记滚轮来源，使专属小批次保留同方向多次按键与各自鼠标坐标。
+    ///
+    /// @author kongweiguang
+    pub(super) fn new_wheel(request: UiTerminalInputRequest) -> Self {
+        let mut work = Self::new(request, None);
+        work.wheel_input = true;
+        work
+    }
+}
+
+/// 仅聚合同一 owner 下连续滚轮事件；保留每一步原始坐标、方向和修饰键。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct WheelInputBatch {
+    pub binding: UiSessionBinding,
+    pub events: Vec<TerminalInputEvent>,
 }
 
 /// 一项建议替换计划的单个 CAS 步骤；下一步只会在前一项成功 ACK 后入队。
@@ -175,6 +197,12 @@ impl QueueDropSummary {
                 if matches!(work.origin, InputOrigin::Broadcast(_)) {
                     self.broadcast_events = self.broadcast_events.saturating_add(1);
                 }
+            }
+            SessionWork::WheelInputBatch(batch) => {
+                self.input_events = self.input_events.saturating_add(batch.events.len());
+                self.input_bytes = self
+                    .input_bytes
+                    .saturating_add(batch.events.iter().map(input_size).sum::<usize>());
             }
             SessionWork::HistoryResize { .. } => {
                 self.history_resize_commands = self.history_resize_commands.saturating_add(1);
@@ -260,6 +288,65 @@ impl SessionCommandQueues {
         work: SessionWork,
     ) -> Result<(), SessionQueueError> {
         self.enqueue_with_origin(session_id, work)
+    }
+
+    /// 仅接收准入点规范化后的 Direct 滚轮输入；连续同类事件才合批，逐事件保留协议语义与字节预算。
+    ///
+    /// @author kongweiguang
+    pub fn enqueue_wheel_input(
+        &mut self,
+        session_id: SessionId,
+        work: UiInputWork,
+    ) -> Result<(), SessionQueueError> {
+        let request = work.request;
+        let event = request.event;
+        if !work.wheel_input
+            || work.origin != InputOrigin::Direct
+            || request.binding.session_id != session_id
+            || request.expected_context.is_some()
+            || request.projection != UiInputProjection::Invalidates
+            || work.acceptance.is_some()
+            || work.command_line_ticket.is_some()
+            || !is_wheel_input(&event)
+        {
+            return Err(SessionQueueError::SessionUnavailable);
+        }
+        let event_bytes = input_size(&event);
+        let lane = self
+            .lanes
+            .entry(session_id.clone())
+            .or_insert_with(SessionLane::new);
+        if let Some(SessionWork::WheelInputBatch(batch)) = lane.pending.back_mut()
+            && batch.binding == request.binding
+            && wheel_events_are_compatible(batch.events.last(), &event)
+            && batch.events.len() < MAX_WHEEL_BATCH_EVENTS
+            && batch_input_size(&batch.events).saturating_add(event_bytes) <= MAX_WHEEL_BATCH_BYTES
+        {
+            if self.queued_input_bytes.saturating_add(event_bytes) > self.limits.total_input_bytes {
+                return Err(SessionQueueError::QueueFull);
+            }
+            batch.events.push(event);
+            self.queued_input_bytes = self.queued_input_bytes.saturating_add(event_bytes);
+            return Ok(());
+        }
+        if lane.pending.len() >= self.limits.per_session_commands
+            || self.queued_commands >= self.limits.total_commands
+            || self.queued_input_bytes.saturating_add(event_bytes) > self.limits.total_input_bytes
+        {
+            if lane.pending.is_empty() && !lane.in_flight {
+                self.lanes.remove(&session_id);
+            }
+            return Err(SessionQueueError::QueueFull);
+        }
+        lane.pending
+            .push_back(SessionWork::WheelInputBatch(WheelInputBatch {
+                binding: request.binding,
+                events: vec![event],
+            }));
+        self.queued_commands = self.queued_commands.saturating_add(1);
+        self.queued_input_bytes = self.queued_input_bytes.saturating_add(event_bytes);
+        self.schedule_if_ready(&session_id);
+        Ok(())
     }
 
     /// 接受计划的后续 CAS 事件必须排在已等待的普通输入之前，同时仍受同一 FIFO 预算约束。
@@ -566,6 +653,7 @@ impl SessionCommandQueues {
                         SessionWork::UiInput(input) => {
                             matches!(input.origin, InputOrigin::Broadcast(_))
                         }
+                        SessionWork::WheelInputBatch(_) => false,
                         SessionWork::Scroll { .. }
                         | SessionWork::ScrollTo { .. }
                         | SessionWork::SelectionScroll { .. }
@@ -732,11 +820,66 @@ fn input_size(event: &TerminalInputEvent) -> usize {
     }
 }
 
+/// 滚轮 batch 只接收滚动报告和未修饰方向键，避免把真实键盘输入误标为重复步数。
+///
+/// @author kongweiguang
+fn is_wheel_input(event: &TerminalInputEvent) -> bool {
+    match event {
+        TerminalInputEvent::Mouse(mouse) => {
+            mouse.action == kerminal_terminal::input::TerminalMouseAction::Scroll
+                && matches!(
+                    mouse.button,
+                    kerminal_terminal::input::TerminalMouseButton::WheelUp
+                        | kerminal_terminal::input::TerminalMouseButton::WheelDown
+                        | kerminal_terminal::input::TerminalMouseButton::WheelLeft
+                        | kerminal_terminal::input::TerminalMouseButton::WheelRight
+                )
+        }
+        TerminalInputEvent::Key(event) => {
+            event.phase == kerminal_terminal::input::KeyPhase::Press
+                && event.modifiers == kerminal_terminal::input::InputModifiers::default()
+                && matches!(
+                    event.key,
+                    kerminal_terminal::input::TerminalKey::Up
+                        | kerminal_terminal::input::TerminalKey::Down
+                )
+        }
+        TerminalInputEvent::KeyWithText { .. }
+        | TerminalInputEvent::Text(_)
+        | TerminalInputEvent::Paste(_)
+        | TerminalInputEvent::Focus(_) => false,
+    }
+}
+
+/// 只有相同协议类别的相邻滚轮输入共享一个队列批次；具体坐标与方向仍按原顺序保留。
+///
+/// @author kongweiguang
+fn wheel_events_are_compatible(
+    previous: Option<&TerminalInputEvent>,
+    next: &TerminalInputEvent,
+) -> bool {
+    matches!(
+        (previous, next),
+        (
+            Some(TerminalInputEvent::Mouse(_)),
+            TerminalInputEvent::Mouse(_)
+        ) | (Some(TerminalInputEvent::Key(_)), TerminalInputEvent::Key(_))
+    )
+}
+
+/// 返回 batch 中完整协议输入的预算成本，不以压缩后的队列项数代替真实事件字节。
+///
+/// @author kongweiguang
+fn batch_input_size(events: &[TerminalInputEvent]) -> usize {
+    events.iter().map(input_size).sum()
+}
+
 /// 只对输入事件计字节，scroll 与 resize 由命令数量预算约束。
 fn work_input_size(work: &SessionWork) -> usize {
     match work {
         SessionWork::Input { event, .. } => input_size(event),
         SessionWork::UiInput(work) => input_size(&work.request.event),
+        SessionWork::WheelInputBatch(batch) => batch_input_size(&batch.events),
         SessionWork::Scroll { .. }
         | SessionWork::ScrollTo { .. }
         | SessionWork::SelectionScroll { .. }

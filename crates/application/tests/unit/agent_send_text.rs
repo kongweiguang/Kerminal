@@ -2877,6 +2877,7 @@ async fn create_from_history_keeps_custom_launch_but_allocates_fresh_session_sta
                 title: Some("new independent chat".to_owned()),
                 scope: AgentSessionScope::Global,
                 target: requested_target.clone(),
+                initial_palette: None,
             },
             CancellationToken::new(),
         )

@@ -5,7 +5,7 @@
 use gpui_kit::{
     ClickEvent, Context, EventEmitter, IntoElement, Render, Window,
     component::{
-        Disableable,
+        Disableable, Sizable as _,
         button::{Button, ButtonVariants as _},
     },
     div,
@@ -16,6 +16,7 @@ use kerminal_application::sessions::logging::{SessionLogFailureReason, SessionLo
 use kerminal_domain::identity::SessionId;
 
 use crate::theme::ThemeTokens;
+use crate::ui_button::icon_button;
 
 /// 日志控件只发布显式操作；start/stop/state 的异步执行由 Root 的日志 use case 负责。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,7 +113,9 @@ impl TerminalLogControls {
 }
 
 impl Render for TerminalLogControls {
-    /// 展示录制状态、字节数和截断原因；不显示具体路径或未经脱敏的终端正文。
+    /// 展示录制状态、字节数和截断原因；刷新按钮仍受 session 和在途操作门禁约束。
+    ///
+    /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ThemeTokens::current(window, cx);
         let (state_label, state_color) = match log_status_summary(&self.state) {
@@ -230,15 +233,20 @@ impl Render for TerminalLogControls {
                             })),
                     )
                     .child(
-                        Button::new("terminal-log-refresh")
-                            .compact()
-                            .label(crate::locale::text("刷新状态", "Refresh status"))
-                            .disabled(!has_session || self.pending)
-                            .on_click(cx.listener(|controls, _: &ClickEvent, _, cx| {
+                        icon_button(
+                            "terminal-log-refresh",
+                            gpui_kit::assets::IconName::RefreshCw,
+                            crate::locale::text("刷新终端日志状态", "Refresh terminal log status"),
+                        )
+                        .with_size(gpui_kit::component::Size::Medium)
+                        .disabled(!has_session || self.pending)
+                        .on_click(cx.listener(
+                            |controls, _: &ClickEvent, _, cx| {
                                 controls.emit_action(LogAction::Refresh, cx);
                                 controls.pending = true;
                                 cx.notify();
-                            })),
+                            },
+                        )),
                     ),
             )
     }

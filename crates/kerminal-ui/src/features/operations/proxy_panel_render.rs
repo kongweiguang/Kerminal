@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use crate::theme::ThemeTokens;
+use crate::{theme::ThemeTokens, ui_button::icon_button};
 use gpui_kit::{
     ClickEvent, Context, IntoElement, Render, Window,
     component::{
@@ -574,7 +574,9 @@ impl ProxyApplicationPanel {
             )
     }
 
-    /// 脚本操作仅将当前展示内容复制到系统剪贴板，用户自行决定是否执行或写入配置。
+    /// 复制入口紧邻对应脚本标题并标出类型，只写剪贴板且不暗示应用或保存配置。
+    ///
+    /// @author kongweiguang
     fn render_script_action(
         &self,
         id: &'static str,
@@ -601,15 +603,26 @@ impl ProxyApplicationPanel {
                             .child(crate::locale::text(title_zh, title_en)),
                     )
                     .child(
-                        Button::new(format!("proxy-copy-{id}-script"))
-                            .compact()
-                            .label(crate::locale::text("复制", "Copy"))
-                            .disabled(script.is_empty())
-                            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        icon_button(
+                            format!("proxy-copy-{id}-script"),
+                            gpui_kit::assets::IconName::Copy,
+                            crate::locale::text(
+                                format!("复制{title_zh}"),
+                                format!("Copy {title_en}"),
+                            ),
+                        )
+                        .tooltip(crate::locale::text(
+                            format!("复制{title_zh}"),
+                            format!("Copy {title_en}"),
+                        ))
+                        .disabled(script.is_empty())
+                        .on_click(cx.listener(
+                            move |_, _: &ClickEvent, _, cx| {
                                 cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
                                     script.clone(),
                                 ));
-                            })),
+                            },
+                        )),
                     ),
             )
             .child(

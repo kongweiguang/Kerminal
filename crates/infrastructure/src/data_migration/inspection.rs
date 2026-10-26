@@ -23,6 +23,8 @@ use super::{
     workspace,
 };
 
+mod legacy_transactions;
+
 const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STORAGE_LOCK_BYTES: u64 = 4 * 1024;
 const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
@@ -465,7 +467,9 @@ fn inspect_old_manifest(root: &Path, blockers: &mut Vec<DataMigrationBlocker>) -
     Ok(())
 }
 
-/// 已知旧 journal 即使内容有效也交给旧恢复流程人工处置，迁移不替代旧业务事务语义。
+/// 活动旧 journal 仍交给旧恢复流程；已完成的目录式事务仅在收据与 manifest 一致时放行。
+///
+/// @author kongweiguang
 fn inspect_old_storage_transactions(
     root: &Path,
     blockers: &mut Vec<DataMigrationBlocker>,
@@ -517,19 +521,7 @@ fn inspect_old_storage_transactions(
                 relative_path: ".storage-transactions".to_owned(),
             });
         } else {
-            for entry in fs::read_dir(&transactions).map_err(io_error("读取旧事务目录失败"))?
-            {
-                let entry = entry.map_err(io_error("读取旧事务目录失败"))?;
-                if !matches!(
-                    entry.file_name().to_str(),
-                    Some("profile-default.json" | "host-group.json")
-                ) {
-                    blockers.push(DataMigrationBlocker::PendingLegacyTransaction {
-                        relative_path: ".storage-transactions".to_owned(),
-                    });
-                    break;
-                }
-            }
+            legacy_transactions::inspect_archives(root, blockers)?;
         }
     }
     Ok(())
@@ -735,6 +727,9 @@ struct OldManifestChangeSet {
     id: String,
     status: String,
     started_at: String,
+    completed_at: Option<String>,
+    #[serde(default)]
+    touched_files: Vec<String>,
 }
 
 /// 与存储协调器当前 schema v1 对齐，只用于根目录枚举时识别其保留锁文件。

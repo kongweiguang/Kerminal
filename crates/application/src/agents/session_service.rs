@@ -42,7 +42,7 @@ use crate::{
     sessions::{
         AgentTerminalSubmissionRequest, CreateSessionRequest, MAX_AGENT_TERMINAL_SUBMISSION_BYTES,
         PlainTextSnapshot, PlainTextSnapshotRequest, SessionFilter, SessionService,
-        logging::redact_terminal_text,
+        TerminalPalette, logging::redact_terminal_text,
     },
 };
 
@@ -481,6 +481,7 @@ impl AgentSessionService {
         terminal: &mut Option<SessionInfo>,
     ) -> AppResult<AgentSessionView> {
         let CreatedAgentWorkspace { id, root } = workspace;
+        let initial_palette = request.initial_palette;
         if !Path::new(&root).is_absolute() {
             return Err(AppError::invalid(
                 "Agent session workspace must be an absolute path",
@@ -506,7 +507,7 @@ impl AgentSessionService {
             Some(request.target),
         )
         .map_err(domain_error)?;
-        self.start_created_session(session, endpoint, cancellation, terminal)
+        self.start_created_session(session, endpoint, cancellation, terminal, initial_palette)
             .await
     }
 
@@ -519,6 +520,7 @@ impl AgentSessionService {
         endpoint: &str,
         cancellation: &CancellationToken,
         terminal: &mut Option<SessionInfo>,
+        initial_palette: Option<TerminalPalette>,
     ) -> AppResult<AgentSessionView> {
         self.ensure_request_active(cancellation, "Agent creation was cancelled")?;
         ensure_session_target_binding_id(&mut session);
@@ -553,6 +555,7 @@ impl AgentSessionService {
                 endpoint,
                 None,
                 None,
+                initial_palette,
                 cancellation,
             )
             .await?;
@@ -744,6 +747,18 @@ impl AgentSessionService {
         id: AgentSessionId,
         cancellation: CancellationToken,
     ) -> AppResult<AgentSessionView> {
+        self.resume_with_palette(id, None, cancellation).await
+    }
+
+    /// 在显式恢复路径创建 PTY 前应用 Root 色盘，避免 CLI 首次 OSC 查询观察到默认色。
+    ///
+    /// @author kongweiguang
+    pub async fn resume_with_palette(
+        &self,
+        id: AgentSessionId,
+        initial_palette: Option<TerminalPalette>,
+        cancellation: CancellationToken,
+    ) -> AppResult<AgentSessionView> {
         self.ensure_mcp_runtime_started(&cancellation).await?;
         let _gate = self
             .acquire_operation(&cancellation, "Agent resume was cancelled")
@@ -871,6 +886,7 @@ impl AgentSessionService {
                 &endpoint,
                 Some(terminal_session_id.clone()),
                 Some(pending.create_admission.clone()),
+                initial_palette,
                 &cancellation,
             )
             .await
@@ -2670,6 +2686,7 @@ impl AgentSessionService {
         endpoint: &str,
         preallocated_session_id: Option<kerminal_domain::identity::SessionId>,
         resume_admission: Option<ResumeCreateAdmission>,
+        initial_palette: Option<TerminalPalette>,
         cancellation: &CancellationToken,
     ) -> AppResult<SessionInfo> {
         self.ensure_request_active(cancellation, "Agent CLI launch was cancelled")?;
@@ -2701,6 +2718,7 @@ impl AgentSessionService {
                 agent_session_id: session.agent_session_id.clone(),
             },
             size: TerminalSize::default(),
+            initial_palette,
         };
         self.await_cancellable(cancellation, |token| async move {
             // The executor token is fresh, so mirror any already-set caller/shutdown state before
@@ -2929,6 +2947,24 @@ impl AgentService for AgentSessionService {
         cancellation: CancellationToken,
     ) -> AppResult<AgentSessionView> {
         AgentSessionService::resume(self, agent_session_id, cancellation).await
+    }
+
+    /// 恢复 Agent 时把 Root 当前色盘传入新 PTY 的首帧初始化。
+    ///
+    /// @author kongweiguang
+    async fn resume_with_palette(
+        &self,
+        agent_session_id: AgentSessionId,
+        initial_palette: Option<TerminalPalette>,
+        cancellation: CancellationToken,
+    ) -> AppResult<AgentSessionView> {
+        AgentSessionService::resume_with_palette(
+            self,
+            agent_session_id,
+            initial_palette,
+            cancellation,
+        )
+        .await
     }
 
     /// 将只核对请求路由到专用用例，保证 UI 不会把核对误做成第二次 CLI 启动。

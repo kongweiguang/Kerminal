@@ -14,7 +14,7 @@ Kerminal 正在从 Tauri 前端重建为 Rust 原生 GPUI 桌面应用。当前�
 - `crates/kerminal-mcp`：面向 MCP host 的运行态工具。
 - `crates/kerminal-desktop`：桌面组合根和启动入口。
 
-正式数据根仍为 `~/.kerminal`。0.4 的业务代码只读写当前格式；旧数据转换集中在一次性迁移用例，不在正常读取路径保留旧版分支。完整字段、示例和校验要求以 [`config-guide.md`](crates/application/resources/config-guide.md) 为准。
+测试阶段 GPUI 默认数据根为 `~/.kerminal-gpui`，旧版继续使用 `~/.kerminal`；debug 和 release 的实例身份均按数据根隔离，可同时运行。0.4 的业务代码只读写当前格式；旧数据转换集中在一次性迁移用例，不在正常读取路径保留旧版分支。完整字段、示例和校验要求以 [`config-guide.md`](crates/application/resources/config-guide.md) 为准。
 
 ## 一次性数据迁移
 
@@ -42,9 +42,9 @@ cargo xtask ci
 cargo xtask source-fingerprint
 ```
 
-`cargo xtask run` 启动 GPUI 应用并使用 `target/kerminal-dev-config`；`cargo xtask smoke` 使用独立的 `target/kerminal-native-smoke`。这两个命令不会把开发运行指向用户的 `~/.kerminal`。构建或测试结果应以实际命令输出为准，本 README 不代表这些门禁已经通过。
+`cargo xtask run` 和 `cargo run -p kerminal-desktop` 默认使用 `~/.kerminal-gpui`；显式设置的 `KERMINAL_CONFIG_ROOT` 优先。`cargo xtask smoke` 仍默认使用独立的 `target/kerminal-native-smoke`，自动化测试保持隔离。构建或测试结果应以实际命令输出为准，本 README 不代表这些门禁已经通过。
 
-并行验收时可将 `KERMINAL_DEV_CONFIG_ROOT` 设为独立的绝对路径，再运行 `cargo xtask run` 或 `smoke`；需要隔离构建进程时同时设置 `CARGO_TARGET_DIR`。这两个目录都应放在任务专用的 `target/` 子目录，避免共用配置或占用运行中的二进制。
+并行验收时可将 `KERMINAL_DEV_CONFIG_ROOT` 设为独立的绝对路径，再运行 `cargo xtask run` 或 `smoke`；该变量在这两个入口中优先于 `KERMINAL_CONFIG_ROOT`。需要隔离构建进程时同时设置 `CARGO_TARGET_DIR`。验收目录应放在任务专用的 `target/` 子目录，避免共用配置或占用运行中的二进制。
 
 本地打包前，在仓库根目录将许可证报告工具安装到仓库自己的 `target/` 目录，然后显式选择 Rust target：
 
@@ -74,7 +74,7 @@ $env:KERMINAL_CONFIG_ROOT = Join-Path $PWD 'target/kerminal-local-config'
 cargo run -p kerminal-desktop
 ```
 
-发布构建默认使用当前用户 home 下的 `.kerminal`；不要在开发或测试中把 `KERMINAL_CONFIG_ROOT` 指向真实用户数据。自动化测试使用临时目录或 `target/` 下的隔离目录。
+GPUI 的开发与发布构建在测试阶段都使用当前用户 home 下的 `.kerminal-gpui`。从旧版导入主机时，只复制 `hosts/*.toml`（含分组）、`profiles/*.toml`、`known_hosts` 和配套的 `secrets/vault.toml`、`secrets/vault-key.toml`，在新目录完成迁移；密钥文件保留原访问权限，不把凭据改写为明文。旧版的会话、历史、Git 仓库及运行态不复制，两个目录后续独立保存，不自动同步。显式选择旧版 `.kerminal` 仍受旧实例迁移检查保护；不要在测试期间将其作为 GPUI 数据根。自动化测试使用临时目录或 `target/` 下的隔离目录。
 
 ## 原生窗口性能采集
 

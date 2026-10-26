@@ -386,7 +386,7 @@ fn overview_metric_grid_and_gpu_projection_keep_real_data_constraints() {
     );
 }
 
-/// 后台刷新已有快照时不显示首次加载横条，但失败回执仍需可见。
+/// 成功与后台采集都不挂载反馈子项，避免空 div 增加 gap；失败、取消仍保留反馈和旧快照。
 ///
 /// @author kongweiguang
 #[test]
@@ -395,13 +395,24 @@ fn server_refresh_keeps_snapshot_without_loading_feedback() {
     let initial = state.begin(1);
     assert!(should_render_server_feedback(&state));
     assert!(state.complete(&initial, Ok(42)));
+    assert!(!should_render_server_feedback(&state));
+
+    let refresh = state.begin(1);
+    assert!(!should_render_server_feedback(&state));
+
+    assert!(state.complete(&refresh, Ok(43)));
+    assert!(!should_render_server_feedback(&state));
+
+    let refresh = state.begin(1);
+    assert!(state.cancel(&refresh));
+    assert!(should_render_server_feedback(&state));
 
     let refresh = state.begin(1);
     assert!(!should_render_server_feedback(&state));
 
     assert!(state.complete(&refresh, Err("sample failed".to_owned())));
     assert!(should_render_server_feedback(&state));
-    assert_eq!(state.data(), Some(&42));
+    assert_eq!(state.data(), Some(&43));
     assert_eq!(state.error(), Some("sample failed"));
 }
 

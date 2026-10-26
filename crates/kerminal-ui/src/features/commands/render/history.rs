@@ -16,11 +16,13 @@ use gpui_kit::{
 use kerminal_application::commands::{CommandHistoryAvailability, CommandHistoryUnavailableReason};
 
 use crate::theme::ThemeTokens;
+use crate::ui_button::icon_button;
 
 use super::super::CommandsView;
 
 impl CommandsView {
-    /// 历史搜索显式限定当前会话；元信息使用统一可读字号并受内容列宽约束以便窄栏换行，点击记录仍只回填草稿。
+    /// 历史搜索显式限定当前会话；一眼可识别的搜索改用图标，其余清理仍标明范围并经过确认。
+    /// 搜索等待时保留原槽位并禁用重复提交；失败后仍可重试，点击记录只回填草稿。
     ///
     /// @author kongweiguang
     pub(super) fn render_history(
@@ -109,14 +111,19 @@ impl CommandsView {
                     .gap_2()
                     .child(Input::new(&self.history_query).w_full())
                     .child(
-                        Button::new("command-history-search")
-                            .compact()
-                            .primary()
-                            .label(crate::locale::text("搜索", "Search"))
-                            .disabled(!available)
-                            .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
-                                view.reload_history(cx);
-                            })),
+                        icon_button(
+                            "command-history-search",
+                            gpui_kit::assets::IconName::Search,
+                            crate::locale::text("搜索命令历史", "Search command history"),
+                        )
+                        .primary()
+                        .loading(self.loading || self.history_read.is_loading())
+                        .disabled(!available || self.loading || self.history_read.is_loading())
+                        .on_click(cx.listener(
+                            |view, _: &ClickEvent, _, cx| {
+                                view.search_history(cx);
+                            },
+                        )),
                     )
                     .child(
                         Button::new("command-history-clear")

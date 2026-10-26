@@ -5,12 +5,13 @@
 use super::super::OperationsView;
 use super::{localized_text, section_feedback, section_page, should_suppress_ready_empty_feedback};
 use crate::theme::ThemeTokens;
+use crate::ui_button::icon_button;
 use gpui_kit::{
     AnyElement, ClickEvent, Context, Entity, IntoElement, SharedString, Window,
     assets::IconName,
     base::Button as BaseButton,
     component::{
-        Disableable,
+        Disableable, Sizable as _,
         button::{Button, ButtonVariants},
         input::Input,
         tooltip::Tooltip,
@@ -69,8 +70,8 @@ fn forward_socks_kind(remote: bool) -> ForwardKind {
 }
 
 impl OperationsView {
-    /// 标题卡集中承载目标与操作；行详情使用稳定 ID 级渲染状态，展开一项不会改变转发业务状态。
-    /// 成功空列表展示引导，其余读取状态仍走共享反馈。
+    /// 标题卡集中承载目标与操作；仅把对象明确的刷新、编辑和复制收为图标。
+    /// 删除和启动保留文字以说明后果，行详情继续按稳定 ID 投影。
     ///
     /// @author kongweiguang
     pub(super) fn render_forwards(
@@ -160,7 +161,8 @@ impl OperationsView {
                                         .compact()
                                         .h(px(32.))
                                         .primary()
-                                        .label(crate::locale::text("＋ 添加", "+ Add"))
+                                        .icon(IconName::Plus)
+                                        .label(crate::locale::text("添加", "Add"))
                                         .disabled(
                                             self.busy
                                                 || self.forward_save_pending.is_some()
@@ -173,22 +175,20 @@ impl OperationsView {
                                         )),
                                 )
                                 .child(
-                                    Button::new("operations-forwards-refresh")
-                                        .compact()
-                                        .h(px(32.))
-                                        .ghost()
-                                        .label(crate::locale::text("↻", "↻"))
-                                        .accessibility_label(crate::locale::text(
-                                            "刷新隧道列表",
-                                            "Refresh tunnel list",
-                                        ))
-                                        .disabled(
-                                            self.forwards.phase()
-                                                == super::super::state::SectionPhase::Loading,
-                                        )
-                                        .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
-                                            view.load_forwards(cx)
-                                        })),
+                                    icon_button(
+                                        "operations-forwards-refresh",
+                                        IconName::RefreshCw,
+                                        crate::locale::text("刷新隧道列表", "Refresh tunnel list"),
+                                    )
+                                    .with_size(gpui_kit::component::Size::Medium)
+                                    .h(px(32.))
+                                    .disabled(
+                                        self.forwards.phase()
+                                            == super::super::state::SectionPhase::Loading,
+                                    )
+                                    .on_click(cx.listener(
+                                        |view, _: &ClickEvent, _, cx| view.load_forwards(cx),
+                                    )),
                                 ),
                         ),
                 ),
@@ -420,21 +420,23 @@ impl OperationsView {
                                         )),
                                 )
                                 .child(
-                                    Button::new(format!("forward-edit-{id}"))
-                                        .compact()
-                                        .h(px(32.))
-                                        .ghost()
-                                        .label(crate::locale::text("编辑", "Edit"))
-                                        .disabled(self.busy)
-                                        .on_click(cx.listener(
-                                            move |view, _: &ClickEvent, window, cx| {
-                                                view.prepare_forward_edit(
-                                                    edit_snapshot.clone(),
-                                                    window,
-                                                    cx,
-                                                )
-                                            },
-                                        )),
+                                    icon_button(
+                                        format!("forward-edit-{id}"),
+                                        IconName::Pencil,
+                                        crate::locale::text("编辑隧道", "Edit tunnel"),
+                                    )
+                                    .with_size(gpui_kit::component::Size::Medium)
+                                    .h(px(32.))
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(
+                                        move |view, _: &ClickEvent, window, cx| {
+                                            view.prepare_forward_edit(
+                                                edit_snapshot.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    )),
                                 )
                                 .child(
                                     Button::new(format!("forward-delete-{id}"))
@@ -618,10 +620,16 @@ impl OperationsView {
                         .items_center()
                         .gap_2()
                         .child(
-                            Button::new(format!("forward-copy-address-{id}"))
-                                .compact()
-                                .ghost()
-                                .label(crate::locale::text("复制地址", "Copy address"))
+                            icon_button(
+                                format!("forward-copy-address-{id}"),
+                                IconName::Copy,
+                                crate::locale::text("复制隧道地址", "Copy tunnel address"),
+                            )
+                                .tooltip(crate::locale::text(
+                                    "复制隧道地址",
+                                    "Copy tunnel address",
+                                ))
+                                .with_size(gpui_kit::component::Size::Medium)
                                 .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                                     cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
                                         copied_address.clone(),

@@ -204,8 +204,14 @@ impl AgentSessionService {
                 Some(request.target),
             )
             .map_err(domain_error)?;
-            self.start_created_session(session, &endpoint, &cancellation, &mut terminal)
-                .await
+            self.start_created_session(
+                session,
+                &endpoint,
+                &cancellation,
+                &mut terminal,
+                request.initial_palette,
+            )
+            .await
         }
         .await;
 

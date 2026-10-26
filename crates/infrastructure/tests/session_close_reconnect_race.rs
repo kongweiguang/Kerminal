@@ -166,6 +166,7 @@ async fn confirmed_close_treats_ssh_cancelled_exit_as_unknown_status() {
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+            initial_palette: None,
         })
         .await
         .expect("fake SSH session opens");
@@ -295,6 +296,7 @@ async fn closed_session_cannot_reconnect_while_recorder_finishes() {
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+            initial_palette: None,
         })
         .await
         .expect("fake terminal session opens");

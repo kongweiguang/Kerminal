@@ -501,7 +501,7 @@ impl SessionManager {
         }))
     }
 
-    /// 在 manager-owned task 中传递同一 open context，避免拆散 ID、permit 与取消/清理 owner。
+    /// 在 manager-owned task 中传递同一 open context，并把首帧 palette 一起送到 attach，避免拆散 ID、permit 与取消/清理 owner。
     ///
     /// @author kongweiguang
     async fn create_with_permit(
@@ -525,6 +525,7 @@ impl SessionManager {
                     target: request.target,
                     owner: request.owner,
                     size: request.size,
+                    initial_palette: request.initial_palette,
                 },
                 transport,
                 open_context,
@@ -828,7 +829,7 @@ impl SessionManager {
     }
 
     /// 在关闭门禁与容量 permit 已确认后接入 transport，并原子地把 context reservation 转成 live；
-    /// 若内部上下文缺少必需 owner，先清理已打开的 transport，再返回固定错误而不 panic。
+    /// engine 在 reader 启动前应用首帧 palette；若内部上下文缺少必需 owner，则先清理已打开的 transport。
     ///
     /// @author kongweiguang
     async fn attach_with_permit(
@@ -911,6 +912,10 @@ impl SessionManager {
                     .await);
             }
         };
+        let mut engine = engine;
+        if let Some(palette) = request.initial_palette {
+            engine.set_palette(palette);
+        }
         let resized = tokio::select! {
             _ = caller_cancellation.cancelled() => {
                 cancellation.cancel();

@@ -497,7 +497,10 @@ fn live_directory_tracks_only_accepted_session_snapshots_and_survives_resize() {
         .complete_resize(&pane_id, &session_id, resized, true)
         .unwrap();
     let pane = runtime.pane(&pane_id).unwrap();
-    assert!(pane.snapshot.is_none());
+    assert_eq!(
+        pane.snapshot.as_ref().map(|snapshot| snapshot.size),
+        Some(size)
+    );
     assert_eq!(
         pane.current_working_directory.as_deref(),
         Some("/home/验收 a")
@@ -534,7 +537,7 @@ fn live_directory_tracks_only_accepted_session_snapshots_and_survives_resize() {
     assert_eq!(pane.persisted, persisted);
 }
 
-/// Resize 失败保留确认网格并允许同尺寸重试；成功 ACK 后才使旧快照失效。
+/// Resize 失败保留确认网格并允许重试；成功 ACK 保留末帧直到新网格快照通过代次与尺寸校验。
 #[test]
 fn resize_size_changes_only_after_ack_and_failed_size_can_retry() {
     let pane_id = PaneId::new();
@@ -547,6 +550,15 @@ fn resize_size_changes_only_after_ack_and_failed_size_can_retry() {
     runtime
         .install_session(&pane_id, session_id.clone(), local_target(), confirmed)
         .unwrap();
+    assert!(
+        runtime
+            .accept_initial_snapshot(
+                &pane_id,
+                &session_id,
+                render_snapshot(session_id.clone(), confirmed, 3, 1),
+            )
+            .unwrap()
+    );
 
     assert!(runtime.resize_needs_enqueue(&pane_id, requested).unwrap());
     runtime.mark_resize_pending(&pane_id, requested).unwrap();
@@ -559,6 +571,10 @@ fn resize_size_changes_only_after_ack_and_failed_size_can_retry() {
     let pane = runtime.pane(&pane_id).unwrap();
     assert_eq!(pane.size, confirmed);
     assert_eq!(pane.pending_resize, None);
+    assert_eq!(
+        pane.snapshot.as_ref().map(|snapshot| snapshot.size),
+        Some(confirmed)
+    );
     assert!(runtime.resize_needs_enqueue(&pane_id, requested).unwrap());
 
     runtime.mark_resize_pending(&pane_id, requested).unwrap();
@@ -570,6 +586,32 @@ fn resize_size_changes_only_after_ack_and_failed_size_can_retry() {
     let pane = runtime.pane(&pane_id).unwrap();
     assert_eq!(pane.size, requested);
     assert_eq!(pane.pending_resize, None);
+    assert_eq!(
+        pane.snapshot.as_ref().map(|snapshot| snapshot.size),
+        Some(confirmed)
+    );
+
+    let (_, token, request) = runtime.begin_snapshot(&pane_id).unwrap().unwrap();
+    assert_eq!(request.since_revision, Some(1));
+    assert!(
+        runtime
+            .accept_snapshot(
+                &pane_id,
+                &session_id,
+                token,
+                render_snapshot(session_id.clone(), requested, 3, 2),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        runtime
+            .pane(&pane_id)
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.size),
+        Some(requested)
+    );
 }
 
 /// Exited 历史只更新 engine view 网格；不得推进 PTY 确认尺寸或持久化 pane。
@@ -843,7 +885,16 @@ fn engine_viewport_snapshot_survives_scroll_refresh_and_resize() {
             .complete_resize(&pane_id, &session_id, resized_size, true)
             .unwrap()
     );
-    assert!(runtime.pane(&pane_id).unwrap().snapshot.is_none());
+    assert_eq!(
+        runtime
+            .pane(&pane_id)
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.size),
+        Some(original_size),
+        "the previous frame remains available while the resized grid is read"
+    );
     assert!(
         runtime.snapshot_session_is_current(&pane_id, &session_id),
         "resize keeps the watcher bound to the same session"

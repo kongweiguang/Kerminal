@@ -204,7 +204,7 @@ pub(super) fn render_compact_tool_drawer(
         .into_any_element()
 }
 
-/// 抽屉借用现有 Dock 宽度且不超出真实剩余视口，非有限测量不进入绘制或用户布局偏好。
+/// 抽屉复用右栏共享宽度并夹紧到真实剩余视口，非有限测量不进入用户布局偏好。
 ///
 /// @author kongweiguang
 pub(super) fn tool_drawer_width(
@@ -215,9 +215,9 @@ pub(super) fn tool_drawer_width(
 ) -> f32 {
     let available = (viewport_width - left_inset - right_inset).max(0.0);
     let preferred = if preferred_width.is_finite() {
-        preferred_width.clamp(260.0, 680.0)
+        preferred_width.clamp(134.0, 1_364.0)
     } else {
-        320.0
+        364.0
     };
     if available.is_finite() {
         preferred.min(available)

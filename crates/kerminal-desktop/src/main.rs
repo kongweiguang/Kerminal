@@ -252,14 +252,10 @@ fn acquire_single_instance(
 
 /// Windows 隔离根先建立真实目录再规范化，避免大小写或 extended-path 别名争用不同实例。
 /// 首次启动也必须得到可解析的目录；准备或解析失败直接拒绝启动，不能退回有歧义的字符串身份。
-/// 正式 release 未覆盖数据根时仍使用既有固定产品身份。
+/// debug/release 都按数据根区分实例，避免 GPUI 测试版复用旧版正式身份而无法同时运行。
 ///
 /// @author kongweiguang
 fn single_instance_id(config_root: &Path) -> Result<String, io::Error> {
-    if !cfg!(debug_assertions) && std::env::var_os("KERMINAL_CONFIG_ROOT").is_none() {
-        return Ok(APPLICATION_ID.to_owned());
-    }
-
     let absolute_root = if config_root.is_absolute() {
         config_root.to_path_buf()
     } else {

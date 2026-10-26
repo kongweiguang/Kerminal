@@ -40,8 +40,10 @@ fn compact_drawer_keeps_side_width_and_fits_the_actual_viewport() {
     assert_eq!(tool_drawer_width(832., 52., 44., 324.), 324.);
     assert_eq!(tool_drawer_width(300., 52., 44., 324.), 204.);
     assert_eq!(tool_drawer_width(40., 52., 44., 324.), 0.);
-    assert_eq!(tool_drawer_width(1200., 52., 44., 1000.), 680.);
-    assert_eq!(tool_drawer_width(832., 52., 44., f32::NAN), 320.);
+    assert_eq!(tool_drawer_width(1200., 52., 44., 1000.), 1000.);
+    assert_eq!(tool_drawer_width(832., 52., 44., f32::NAN), 364.);
+    assert_eq!(tool_drawer_width(832., 52., 44., 40.), 134.);
+    assert_eq!(tool_drawer_width(2000., 52., 44., 2000.), 1364.);
 }
 
 /// 旧文件工具位置只影响兼容读回，实际永远右侧；重投影不改设置或另建业务实体。
@@ -120,7 +122,7 @@ fn file_tool_rail_label_is_transport_neutral() {
     assert!(matches!(label.as_str(), "文件" | "Files"));
 }
 
-/// 容器入口使用独立可访问身份、专属图标和与 Files 相同的 320px 默认内容宽度。
+/// 容器入口使用独立可访问身份、专属图标和与 Files 相同的 360px 默认内容宽度。
 ///
 /// @author kongweiguang
 #[test]
@@ -137,7 +139,7 @@ fn container_tool_rail_uses_container_identity_and_default_width() {
     assert!(matches!(label.as_str(), "容器" | "Containers"));
     assert_eq!(
         attached_dock_default_width(ToolRailToolId::Containers, false),
-        px(324.)
+        px(364.)
     );
 }
 
@@ -433,26 +435,26 @@ fn legacy_context_visibility_keeps_one_real_tool_discoverable() {
     assert_eq!(settings.hidden, hidden_before_projection);
 }
 
-/// SFTP 与 Agent 入口使用 320px，运行中 Agent 仅增到 420px，给常见窗口的主终端保留余量。
+/// 所有右侧工具共享一个默认宽度，Agent 运行态变化也不再改变工作区几何。
 ///
 /// @author kongweiguang
 #[test]
 fn attached_tool_defaults_keep_sftp_and_agent_width_rules() {
     assert_eq!(
         attached_dock_default_width(ToolRailToolId::Sftp, false),
-        px(324.)
+        px(364.)
     );
     assert_eq!(
         attached_dock_default_width(ToolRailToolId::AgentLauncher, false),
-        px(324.)
+        px(364.)
     );
     assert_eq!(
         attached_dock_default_width(ToolRailToolId::AgentLauncher, true),
-        px(424.)
+        px(364.)
     );
     assert_eq!(
         attached_dock_default_width(ToolRailToolId::Context, true),
-        px(324.)
+        px(364.)
     );
 }
 
@@ -468,11 +470,11 @@ fn rail_bottom_partition_minimum_preserves_one_click_target() {
     );
 }
 
-/// 自定义宽度按 ToolId 保存；排序变化不串用宽度，拖回当前默认值会清除旧覆盖。
+/// 自定义宽度在所有工具间共享；切换宿主不改变尺寸，拖回默认值会清除共享覆盖。
 ///
 /// @author kongweiguang
 #[test]
-fn attached_width_memory_is_stable_by_tool_and_default_resets_it() {
+fn attached_width_memory_is_shared_across_tools_and_default_resets_it() {
     let mut state = ToolRailPanelState::default();
     let sftp_default = attached_dock_default_width(ToolRailToolId::Sftp, false);
     let containers_default = attached_dock_default_width(ToolRailToolId::Containers, false);
@@ -486,25 +488,87 @@ fn attached_width_memory_is_stable_by_tool_and_default_resets_it() {
     let mut settings = ToolRailSettings::default();
     settings.order.reverse();
     state.project(&settings);
-    assert_eq!(state.attached_width(ToolRailToolId::Sftp), Some(px(548.)));
-    assert_eq!(
-        state.attached_width(ToolRailToolId::Containers),
-        Some(px(604.))
-    );
-    assert_eq!(
-        state.attached_width(ToolRailToolId::AgentLauncher),
-        Some(px(392.))
-    );
+    for tool in [
+        ToolRailToolId::Sftp,
+        ToolRailToolId::Containers,
+        ToolRailToolId::AgentLauncher,
+    ] {
+        assert_eq!(state.attached_width(tool), Some(px(548.)));
+    }
 
     state.remember_attached_width(ToolRailToolId::Sftp, sftp_default, sftp_default);
     assert_eq!(state.attached_width(ToolRailToolId::Sftp), None);
+    assert_eq!(state.attached_width(ToolRailToolId::Containers), None);
+    assert_eq!(state.attached_width(ToolRailToolId::AgentLauncher), None);
+}
+
+/// 每个 workspace tab 独立记住打开工具；切换时恢复原顺序并清理已关闭标签缓存。
+///
+/// @author kongweiguang
+#[test]
+fn tool_open_order_is_cached_per_tab_and_pruned_when_tabs_close() {
+    let first_tab = TabId::parse("tab-first").expect("valid tab ID");
+    let second_tab = TabId::parse("tab-second").expect("valid tab ID");
+    let live_tabs = [first_tab.clone(), second_tab.clone()];
+    let mut settings = ToolRailSettings::default();
+    settings
+        .panel_placements
+        .insert(ToolRailToolId::Logs, ToolRailPanelPlacement::Bottom);
+    let mut state = ToolRailPanelState::default();
+
     assert_eq!(
-        state.attached_width(ToolRailToolId::Containers),
-        Some(px(604.))
+        state.activate_tab(Some(first_tab.clone()), &live_tabs, false),
+        Some(false)
+    );
+    state.toggle(&settings, ToolRailToolId::Sftp);
+    state.toggle(&settings, ToolRailToolId::Logs);
+    let first_panels = state.project(&settings).panels;
+    assert_eq!(first_panels.attached, Some(ToolRailToolId::Sftp));
+    assert_eq!(first_panels.bottom, Some(ToolRailToolId::Logs));
+
+    assert_eq!(
+        state.activate_tab(Some(second_tab.clone()), &live_tabs, true),
+        Some(false)
     );
     assert_eq!(
-        state.attached_width(ToolRailToolId::AgentLauncher),
-        Some(px(392.))
+        state.project(&settings).panels,
+        ToolRailPanelSlots::default()
+    );
+    state.toggle(&settings, ToolRailToolId::Containers);
+    assert_eq!(
+        state.project(&settings).panels.attached,
+        Some(ToolRailToolId::Containers)
+    );
+
+    assert_eq!(
+        state.activate_tab(Some(first_tab.clone()), &live_tabs, false),
+        Some(true)
+    );
+    let first_panels = state.project(&settings).panels;
+    assert_eq!(first_panels.attached, Some(ToolRailToolId::Sftp));
+    assert_eq!(first_panels.bottom, Some(ToolRailToolId::Logs));
+    assert_eq!(
+        state.activate_tab(Some(second_tab.clone()), &live_tabs, true),
+        Some(false)
+    );
+    assert_eq!(
+        state.project(&settings).panels.attached,
+        Some(ToolRailToolId::Containers)
+    );
+
+    assert_eq!(
+        state.activate_tab(Some(first_tab.clone()), &[first_tab], false),
+        Some(true)
+    );
+    assert!(
+        !state
+            .tab_open_orders
+            .contains_key(&Some(second_tab.clone()))
+    );
+    assert!(
+        !state
+            .tab_right_dock_collapsed
+            .contains_key(&Some(second_tab))
     );
 }
 
@@ -541,9 +605,13 @@ fn attached_width_memory_accepts_only_current_user_resize() {
         state.attached_width(ToolRailToolId::AgentLauncher),
         Some(agent_width)
     );
+    assert_eq!(
+        state.attached_width(ToolRailToolId::Sftp),
+        Some(agent_width)
+    );
 }
 
-/// Agent 默认宽度随终端内容变化时刷新基准，并清除恰好成为新默认值的旧覆盖。
+/// Agent 生命周期变化不再改变共享右栏尺寸，用户覆盖与默认值仍按同一基准记忆。
 ///
 /// @author kongweiguang
 #[test]
@@ -556,7 +624,7 @@ fn agent_default_width_updates_without_erasing_custom_widths() {
     state.remember_attached_width(ToolRailToolId::AgentLauncher, px(392.), empty_default);
     assert!(!state.update_attached_default_width(ToolRailToolId::AgentLauncher, running_default));
     assert_eq!(state.attached_tool, Some(ToolRailToolId::AgentLauncher));
-    assert_eq!(state.attached_default_width, Some(running_default));
+    assert_eq!(state.attached_default_width, Some(empty_default));
     assert_eq!(
         state.attached_width(ToolRailToolId::AgentLauncher),
         Some(px(392.))
@@ -571,7 +639,7 @@ fn agent_default_width_updates_without_erasing_custom_widths() {
     assert_eq!(state.attached_width(ToolRailToolId::AgentLauncher), None);
 }
 
-/// 仅内容造成的默认变化需请求一次回填；重复绘制、其它工具和用户尺寸不会被强制调整。
+/// 工具默认宽度统一；运行态变化不会再触发尺寸回填，明确拖动仍更新共享尺寸。
 ///
 /// @author kongweiguang
 #[test]
@@ -582,7 +650,7 @@ fn agent_content_width_transition_requests_one_default_restore() {
     let running = attached_dock_default_width(tool, true);
     state.set_attached_tool(Some(tool), Some(empty));
 
-    assert!(state.update_attached_default_width(tool, running));
+    assert!(!state.update_attached_default_width(tool, running));
     assert!(!state.update_attached_default_width(tool, running));
     assert!(!state.update_attached_default_width(ToolRailToolId::Sftp, empty));
     assert_eq!(state.attached_default_width, Some(running));
@@ -603,8 +671,16 @@ fn persisted_layout_dimensions_exclude_only_horizontal_gutters() {
         Some(220)
     );
     assert_eq!(
-        workbench_content_dimension(px(424.), 4.0, 260, 680),
+        workbench_content_dimension(px(424.), 4.0, 130, 1_360),
         Some(420)
+    );
+    assert_eq!(
+        workbench_content_dimension(px(134.), 4.0, 130, 1_360),
+        Some(130)
+    );
+    assert_eq!(
+        workbench_content_dimension(px(1_364.), 4.0, 130, 1_360),
+        Some(1_360)
     );
     assert_eq!(
         workbench_content_dimension(px(240.), 0.0, 180, 4_000),
@@ -704,9 +780,9 @@ fn persisted_dock_widths_restore_sparse_overrides_with_one_gutter() {
     assert_eq!(state.attached_width(ToolRailToolId::Sftp), Some(px(504.)));
     assert_eq!(
         state.attached_width(ToolRailToolId::AgentLauncher),
-        Some(px(392.))
+        Some(px(504.))
     );
-    assert_eq!(state.attached_width(ToolRailToolId::Logs), None);
+    assert_eq!(state.attached_width(ToolRailToolId::Logs), Some(px(504.)));
     state.restore_attached_widths(&BTreeMap::new());
     assert_eq!(state.attached_width(ToolRailToolId::Sftp), None);
 }

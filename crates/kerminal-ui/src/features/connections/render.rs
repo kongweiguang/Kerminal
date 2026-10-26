@@ -6,7 +6,7 @@ use chrono::{DateTime, Datelike, SecondsFormat, Utc};
 use gpui_kit::{
     ClickEvent, Context, Focusable, IntoElement, Render, Window,
     component::{
-        Disableable, FocusTrapElement as _,
+        Disableable, FocusTrapElement as _, Sizable as _,
         button::{Button, ButtonVariants},
         input::Input,
     },
@@ -22,6 +22,7 @@ use kerminal_domain::{
 };
 
 use crate::theme::ThemeTokens;
+use crate::ui_button::icon_button;
 
 use super::{
     external::{render_external_password_prompt, render_external_username_prompt},
@@ -158,7 +159,7 @@ impl Render for ConnectionsPanel {
     }
 }
 
-/// 将本地主机作为普通连接详情呈现，并保留“设为默认”；动作绑定 Profile ID，不触碰 Tab 或当前终端绑定。
+/// 将本地主机作为普通连接详情呈现；紧凑编辑图标节省操作栏宽度，连接、默认项和配置复制仍保留明确文字与原目标绑定。
 /// 环境变量只展示名称以免把令牌值暴露在连接目录中；写入仍受共享配置门禁保护。
 ///
 /// @author kongweiguang
@@ -243,15 +244,20 @@ fn render_local_host_details(
                     panel.request_connect_local_host(connect_profile_id.clone(), cx)
                 })),
         )
-        .child(
-            Button::new("connections-local-host-edit")
-                .compact()
-                .label(crate::locale::text("编辑", "Edit"))
-                .disabled(!can_write)
-                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-                    panel.begin_edit_local_host(edit_profile_id.clone(), window, cx)
-                })),
-        );
+        .child({
+            let label = crate::locale::text("编辑本地主机", "Edit local host");
+            icon_button(
+                "connections-local-host-edit",
+                gpui_kit::assets::IconName::Pencil,
+                label.clone(),
+            )
+            .with_size(gpui_kit::component::Size::Medium)
+            .tooltip(label)
+            .disabled(!can_write)
+            .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                panel.begin_edit_local_host(edit_profile_id.clone(), window, cx)
+            }))
+        });
     let actions = actions.child(
         Button::new("connections-local-host-set-default")
             .compact()
@@ -270,7 +276,7 @@ fn render_local_host_details(
             .child(
                 Button::new("connections-local-host-duplicate")
                     .compact()
-                    .label(crate::locale::text("复制", "Duplicate"))
+                    .label(crate::locale::text("复制配置…", "Duplicate config…"))
                     .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
                         panel.begin_duplicate_local_host(duplicate_profile_id.clone(), window, cx)
                     })),
@@ -650,7 +656,7 @@ fn render_group_rename_editor(
         )
 }
 
-/// 选中主机展示协议能力与显式连接按钮，详情不创建终端或覆盖当前工作区。
+/// 选中主机展示协议能力与显式连接按钮；编辑图标只打开当前主机草稿，连接操作仍由用户明确选择。
 fn render_host_details(
     panel: &mut ConnectionsPanel,
     host: &ManagedHost,
@@ -694,15 +700,22 @@ fn render_host_details(
                                 .child(endpoint_label(host)),
                         ),
                 )
-                .child(
-                    Button::new("connections-edit-host")
-                        .compact()
-                        .label(crate::locale::text("编辑", "Edit"))
-                        .disabled(!can_write)
-                        .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                .child({
+                    let label = crate::locale::text("编辑连接", "Edit connection");
+                    icon_button(
+                        "connections-edit-host",
+                        gpui_kit::assets::IconName::Pencil,
+                        label.clone(),
+                    )
+                    .with_size(gpui_kit::component::Size::Medium)
+                    .tooltip(label)
+                    .disabled(!can_write)
+                    .on_click(cx.listener(
+                        move |panel, _: &ClickEvent, window, cx| {
                             panel.edit_host(&host_id, window, cx)
-                        })),
-                ),
+                        },
+                    ))
+                }),
         )
         .child(render_capability_card(host, capabilities, theme));
 
@@ -762,7 +775,7 @@ fn render_host_details(
             .child(
                 Button::new("connections-duplicate-host")
                     .compact()
-                    .label(crate::locale::text("复制", "Duplicate"))
+                    .label(crate::locale::text("复制配置…", "Duplicate config…"))
                     .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
                         panel.duplicate_saved_host(&duplicate_host_id, window, cx)
                     })),

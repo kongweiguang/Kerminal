@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use kerminal_application::sessions::{
     CreateSessionRequest, PlainTextSnapshotRequest, RenderSnapshotRequest, SelectionViewport,
     SessionChangeKind, SessionService, SessionTransport, SessionTransportControl,
-    SessionTransportFactory, SessionTransportOpenError, UiSessionBinding,
+    SessionTransportFactory, SessionTransportOpenError, TerminalPalette, UiSessionBinding,
 };
 use kerminal_application::{AppError, AppResult, PublicErrorCode};
 use kerminal_domain::identity::{PaneId, SessionId, TabId};
@@ -26,7 +26,7 @@ use kerminal_domain::sessions::{
 };
 use kerminal_infrastructure::sessions::{SessionManager, SessionRuntimeConfig};
 use kerminal_terminal::snapshot::{
-    RenderSnapshot, TerminalPoint, TerminalSelection, TerminalSelectionKind,
+    RenderSnapshot, TerminalPoint, TerminalRgb, TerminalSelection, TerminalSelectionKind,
 };
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::sync::Mutex;
@@ -209,6 +209,7 @@ async fn create_ended_history_session(
             }),
             owner,
             size: TerminalSize::new(80, 6, 800, 120).expect("valid initial grid"),
+            initial_palette: None,
         })
         .await
         .expect("create fixed ended-history session");
@@ -239,6 +240,7 @@ async fn create_live_selection_session(
             }),
             owner,
             size: TerminalSize::new(80, 6, 800, 120).expect("valid initial grid"),
+            initial_palette: None,
         })
         .await
         .expect("create live selection test session");
@@ -336,6 +338,59 @@ async fn wait_for_exited(manager: &SessionManager, session_id: &SessionId) -> Se
     })
     .await
     .expect("reader publishes a confirmed exited lifecycle")
+}
+
+/// 普通与预留 ID 两种创建入口的首次快照都应读到请求色盘，避免首个 OSC 查询抢在异步主题同步之前。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn create_paths_apply_initial_palette_before_first_snapshot() {
+    let palette = TerminalPalette::with_defaults(
+        TerminalRgb::new(0x12, 0x34, 0x56),
+        TerminalRgb::new(0x65, 0x43, 0x21),
+        TerminalRgb::new(0x23, 0x45, 0x67),
+    );
+    for reserved_session_id in [None, Some(SessionId::new())] {
+        let factory = Arc::new(LiveSelectionFactory {
+            output_peer: Arc::new(Mutex::new(None)),
+        });
+        let manager = Arc::new(SessionManager::new(
+            factory,
+            tokio::runtime::Handle::current(),
+            SessionRuntimeConfig::default(),
+        ));
+        let request = CreateSessionRequest {
+            target: SessionTarget::Local(LocalSessionTarget {
+                program: OsString::from("initial-palette-test-shell"),
+                args: Vec::new(),
+                working_directory: None,
+                environment: BTreeMap::new(),
+            }),
+            owner: SessionOwner::Mcp,
+            size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+            initial_palette: Some(palette),
+        };
+        let session = match reserved_session_id {
+            Some(session_id) => {
+                manager
+                    .create_with_session_id(request, session_id, CancellationToken::new())
+                    .await
+            }
+            None => manager.create(request).await,
+        }
+        .expect("create session with its initial palette");
+
+        let snapshot = manager
+            .render_snapshot(session.session_id.clone(), RenderSnapshotRequest::default())
+            .await
+            .expect("read first render snapshot");
+        assert_eq!(snapshot.palette, palette);
+
+        manager
+            .close(session.session_id)
+            .await
+            .expect("close test session");
+    }
 }
 
 /// Ended UI history can reflow and publish a resize without calling the dead transport.

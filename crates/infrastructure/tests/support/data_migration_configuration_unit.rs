@@ -23,6 +23,8 @@ const REVISION_7_GUIDE: &str =
     include_str!("../../../../tests/fixtures/configuration/config-guide-v7.md");
 const REVISION_8_GUIDE: &str =
     include_str!("../../../../tests/fixtures/configuration/config-guide-v8.md");
+const REVISION_9_GUIDE: &str =
+    include_str!("../../../../tests/fixtures/configuration/config-guide-v9.md");
 const HOST_V2_SERIAL: &str =
     include_str!("../../../../tests/fixtures/configuration/host-schema-v2-serial-migration.toml");
 const HOST_V3_SERIAL: &str =
@@ -1122,6 +1124,43 @@ fn frozen_revision_eight_guides_are_planned_for_current_upgrade() {
 
             let edits = plan_configuration_migration(root.path()).expect("冻结旧指南可规划");
             let planned = edit(&edits, "kerminal-config.md").expect("revision 8 有升级计划");
+            assert_eq!(planned.before.as_deref(), Some(original.as_bytes()));
+            assert_eq!(planned.after, configuration::managed_config_guide());
+            assert_eq!(
+                fs::read(root.path().join("kerminal-config.md")).expect("规划保留旧正文"),
+                original.as_bytes()
+            );
+        }
+    }
+}
+
+/// 只有冻结的 revision 9 正文可升级到当前指南，换行格式与可信生成标记不改变其身份。
+///
+/// @author kongweiguang
+#[test]
+fn frozen_revision_nine_guides_are_planned_for_current_upgrade() {
+    const { assert!(CONFIG_GUIDE_REVISION > 9) };
+    let digest = configuration::config_guide_digest(REVISION_9_GUIDE);
+    assert_eq!(digest, super::CONFIG_GUIDE_REVISION_9_SHA256);
+
+    for body in [
+        REVISION_9_GUIDE.to_owned(),
+        REVISION_9_GUIDE.replace('\n', "\r\n"),
+    ] {
+        for marked in [false, true] {
+            let original = if marked {
+                format!(
+                    "{}9 sha256={digest} -->\n{body}",
+                    configuration::CONFIG_GUIDE_MARKER_PREFIX
+                )
+            } else {
+                body.clone()
+            };
+            let root = tempdir().expect("创建隔离 revision 9 指南根");
+            write_fixture(root.path(), "kerminal-config.md", &original);
+
+            let edits = plan_configuration_migration(root.path()).expect("冻结旧指南可规划");
+            let planned = edit(&edits, "kerminal-config.md").expect("revision 9 有升级计划");
             assert_eq!(planned.before.as_deref(), Some(original.as_bytes()));
             assert_eq!(planned.after, configuration::managed_config_guide());
             assert_eq!(

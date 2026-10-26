@@ -9,7 +9,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Window,
     base::Selectable as _,
     component::{
-        Disableable as _,
+        Disableable as _, IconName,
         button::{Button, ButtonVariants as _},
         input::{Editor, Input},
         menu::ContextMenuExt as _,
@@ -23,6 +23,7 @@ use kerminal_domain::files::FileEndpoint;
 use kerminal_domain::files::editor::{EditorPhase, SaveResolution};
 
 use crate::theme::ThemeTokens;
+use crate::ui_button::icon_button;
 
 use super::context_menu::{editor_context_menu, editor_tab_context_menu};
 use super::search_model::EditorSearchOption;
@@ -196,7 +197,7 @@ fn endpoint_source_identity(endpoint: &FileEndpoint, target_names: &FileTargetNa
 }
 
 impl Render for FileEditorWorkspace {
-    /// 外壳用 workspace 材料，正文保持不透明 panel；内部文件标签菜单绑定 endpoint+读取代次，避免迟到动作触及重开标签。
+    /// 外壳保持不透明正文；标签关闭使用通用图标但仍绑定 endpoint 与读取代次，沿用未保存保护。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -290,17 +291,19 @@ impl Render for FileEditorWorkspace {
                             .child(display_title),
                     )
                     .child(
-                        Button::new(format!("file-editor-close-{index}"))
-                            .compact()
-                            .w(px(24.))
-                            .h(px(24.))
-                            .flex_shrink_0()
-                            .label("×")
-                            .accessibility_label(close_label.clone())
-                            .tooltip(close_label)
-                            .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                        icon_button(
+                            format!("file-editor-close-{index}"),
+                            IconName::Close,
+                            close_label.clone(),
+                        )
+                        .tooltip(close_label)
+                        .on_click(cx.listener(
+                            move |workspace, _: &ClickEvent, _, cx| {
+                                // 关闭是独立动作；取消未保存确认时不应顺带激活被关闭标签。
+                                cx.stop_propagation();
                                 workspace.request_close(close_endpoint.clone(), cx);
-                            })),
+                            },
+                        )),
                     )
             })
             .collect::<Vec<_>>();
@@ -688,7 +691,7 @@ impl FileEditorWorkspace {
             )
     }
 
-    /// 查找条压缩匹配计数并让固定操作换行，避免窄分屏裁掉导航、选项或无障碍状态。
+    /// 查找条允许窄栏换行，通用导航图标与终端搜索一致；替换及搜索选项保留能区分语义的文字。
     fn render_search_bar(
         &mut self,
         theme: ThemeTokens,
@@ -818,42 +821,45 @@ impl FileEditorWorkspace {
                     .gap_1()
                     .child(Input::new(self.find_input()).flex_1().min_w(px(96.)))
                     .child(
-                        Button::new("file-editor-previous-match")
-                            .compact()
-                            .flex_shrink_0()
-                            .label("↑")
-                            .accessibility_label(crate::locale::text(
-                                "上一个匹配",
-                                "Previous match",
-                            ))
-                            .tooltip(crate::locale::text("上一个匹配", "Previous match"))
-                            .disabled(!has_matches || search_busy)
-                            .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
+                        icon_button(
+                            "file-editor-previous-match",
+                            IconName::ArrowUp,
+                            crate::locale::text("上一个匹配", "Previous match"),
+                        )
+                        .tooltip(crate::locale::text("上一个匹配", "Previous match"))
+                        .disabled(!has_matches || search_busy)
+                        .on_click(cx.listener(
+                            |workspace, _: &ClickEvent, _, cx| {
                                 workspace.move_search(false, cx);
-                            })),
+                            },
+                        )),
                     )
                     .child(
-                        Button::new("file-editor-next-match")
-                            .compact()
-                            .flex_shrink_0()
-                            .label("↓")
-                            .accessibility_label(crate::locale::text("下一个匹配", "Next match"))
-                            .tooltip(crate::locale::text("下一个匹配", "Next match"))
-                            .disabled(!has_matches || search_busy)
-                            .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
+                        icon_button(
+                            "file-editor-next-match",
+                            IconName::ArrowDown,
+                            crate::locale::text("下一个匹配", "Next match"),
+                        )
+                        .tooltip(crate::locale::text("下一个匹配", "Next match"))
+                        .disabled(!has_matches || search_busy)
+                        .on_click(cx.listener(
+                            |workspace, _: &ClickEvent, _, cx| {
                                 workspace.move_search(true, cx);
-                            })),
+                            },
+                        )),
                     )
                     .child(
-                        Button::new("file-editor-close-search")
-                            .compact()
-                            .flex_shrink_0()
-                            .label("×")
-                            .accessibility_label(crate::locale::text("关闭查找", "Close find"))
-                            .tooltip(crate::locale::text("关闭查找", "Close find"))
-                            .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
+                        icon_button(
+                            "file-editor-close-search",
+                            IconName::Close,
+                            crate::locale::text("关闭查找", "Close find"),
+                        )
+                        .tooltip(crate::locale::text("关闭查找", "Close find"))
+                        .on_click(cx.listener(
+                            |workspace, _: &ClickEvent, _, cx| {
                                 workspace.close_search(cx);
-                            })),
+                            },
+                        )),
                     )
                     .child(
                         Button::new("file-editor-search-match-case")

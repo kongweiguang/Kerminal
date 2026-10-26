@@ -99,7 +99,8 @@ impl Drop for InstanceConfigRoot {
     }
 }
 
-/// 防止两个真实测试配置目录互相发送激活消息，并覆盖 Windows 首次目录尚不存在的启动。
+/// 两种构建模式都必须按目录隔离，不能与旧版固定产品身份或另一测试根互发激活消息。
+/// 同时覆盖 Windows 首次目录尚不存在的启动。
 ///
 /// @author kongweiguang
 #[test]
@@ -118,6 +119,8 @@ fn different_config_roots_have_distinct_instance_ids() {
     }
 
     assert_ne!(first, second);
+    assert_ne!(first, APPLICATION_ID);
+    assert_ne!(second, APPLICATION_ID);
     assert!(first.starts_with(APPLICATION_ID));
     assert!(second.starts_with(APPLICATION_ID));
 }

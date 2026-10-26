@@ -10,6 +10,7 @@ use gpui_kit::{
 use kerminal_application::{
     ApplicationTaskExecutor, PublicErrorCode,
     agents::{AgentHistoryMode, AgentLauncherCatalog, AgentService, AgentSessionView},
+    sessions::TerminalPalette,
 };
 use kerminal_domain::{
     agents::{AgentLauncherKey, AgentSessionScope, AgentSessionStatus, AgentTargetBinding},
@@ -193,6 +194,7 @@ pub struct AgentsPanel {
     context_preview_generation: u64,
     context_preview_loading: bool,
     theme_mode: kerminal_application::preferences::ThemeMode,
+    terminal_palette: Option<TerminalPalette>,
     busy: bool,
     operation_cancellation: Option<CancellationToken>,
     loading: bool,
@@ -254,6 +256,7 @@ impl AgentsPanel {
             context_preview_generation: 0,
             context_preview_loading: false,
             theme_mode: kerminal_application::preferences::ThemeMode::System,
+            terminal_palette: None,
             busy: false,
             operation_cancellation: None,
             loading: false,
@@ -268,6 +271,16 @@ impl AgentsPanel {
         panel.reload(cx);
         panel.reload_launcher_catalog(cx);
         panel
+    }
+
+    /// 保存 Root 当前色盘供新建、历史派生和恢复使用，避免 PTY 启动早于异步主题同步。
+    ///
+    /// @author kongweiguang
+    pub fn set_terminal_palette(&mut self, palette: TerminalPalette, cx: &mut Context<Self>) {
+        if self.terminal_palette != Some(palette) {
+            self.terminal_palette = Some(palette);
+            cx.notify();
+        }
     }
 
     /// 根窗口同步新建会话的归属范围；范围改变时作废旧预览请求，不改写既有会话归属。
@@ -401,6 +414,13 @@ impl AgentsPanel {
 
         self.select_agent(agent_session_id, cx);
         Ok(())
+    }
+
+    /// 标签切回时从原面板恢复选择，不重新挑选历史项或改变 CLI 首选目标。
+    ///
+    /// @author kongweiguang
+    pub fn selected_agent_session_id(&self) -> Option<AgentSessionId> {
+        self.selected_agent.clone()
     }
 
     /// 返回当前 Agent-owned terminal id；没有活进程时不伪造 canvas 目标。

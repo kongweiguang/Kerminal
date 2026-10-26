@@ -13,7 +13,7 @@ use gpui_kit::{
     AnyElement, ClickEvent, Context, ElementId, InteractiveElement as _, IntoElement, Render,
     SharedString, StatefulInteractiveElement as _, Window,
     component::{
-        Disableable as _, Icon, IconName,
+        Disableable as _, Icon, IconName, Sizable as _,
         button::{Button, ButtonVariants as _},
         input::Input,
         tooltip::Tooltip,
@@ -576,7 +576,7 @@ pub(super) fn icon_button(
     icon_button_without_tooltip(id, icon, label.clone(), disabled).tooltip(label)
 }
 
-/// 构造不绑定 Kit 独立浮层的图标按钮，让少数会立即卸载的触发器改用 GPUI 元素生命周期提示。
+/// 复用通用按钮语义并保留文件区现有几何；立即卸载的触发器仍由调用方管理元素生命周期提示。
 ///
 /// @author kongweiguang
 pub(super) fn icon_button_without_tooltip(
@@ -585,19 +585,14 @@ pub(super) fn icon_button_without_tooltip(
     label: SharedString,
     disabled: bool,
 ) -> Button {
-    Button::new(id)
-        .compact()
-        .ghost()
-        .icon(icon)
+    crate::ui_button::icon_button(id, icon, label)
+        .with_size(gpui_kit::component::Size::Medium)
         .w(px(28.))
         .h(px(26.))
-        .flex_shrink_0()
-        .accessibility_label(label)
-        .tab_stop(true)
         .disabled(disabled)
 }
 
-/// 完整 Kit 图标集仅用于少数通用组件图标集中未收录的图标，按钮交互样式保持一致。
+/// 完整 Kit 图标与兼容图标共用相同构造路径，保留文件区既有尺寸和提示生命周期。
 ///
 /// @author kongweiguang
 fn asset_icon_button(
@@ -606,15 +601,10 @@ fn asset_icon_button(
     label: SharedString,
     disabled: bool,
 ) -> Button {
-    Button::new(id)
-        .compact()
-        .ghost()
-        .icon(icon)
+    crate::ui_button::icon_button(id, icon, label.clone())
+        .with_size(gpui_kit::component::Size::Medium)
         .w(px(28.))
         .h(px(26.))
-        .flex_shrink_0()
-        .accessibility_label(label.clone())
-        .tab_stop(true)
         .disabled(disabled)
         .tooltip(label)
 }

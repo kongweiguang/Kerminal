@@ -107,7 +107,7 @@ impl OperationsView {
         )
     }
 
-    /// 将标题、真实目标、采样态和显式刷新放在同一页头；目标缺失时禁用动作但仍说明原因。
+    /// 标题、目标与采样态共用页头；状态行的两端都可省略，窄栏和英文长状态也不会挤动下方内容。
     ///
     /// @author kongweiguang
     fn render_server_header(
@@ -264,16 +264,24 @@ impl OperationsView {
                 div()
                     .w_full()
                     .flex()
-                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_2()
                     .text_size(theme.text_xs)
-                    .child(div().text_color(status_color).child(sampling_status))
                     .child(
                         div()
                             .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_color(status_color)
+                            .child(sampling_status),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
                             .text_color(theme.muted)
+                            .text_right()
                             .truncate()
                             .child(last_updated),
                     ),
@@ -1586,11 +1594,12 @@ fn server_gpu_utilization(
     (!readings.is_empty()).then(|| readings.iter().sum::<f64>() / readings.len() as f64)
 }
 
-/// 首次加载需要提示；后台刷新已有快照时不重复占用概览内容高度，失败和取消仍显示。
+/// 已有快照的采集中与完成态都不挂载反馈行，避免空行仍参与 flex gap 导致卡片跳动。
+/// 首次加载、失败和取消继续显示明确反馈，不能为了稳定高度而隐藏异常。
 ///
 /// @author kongweiguang
 fn should_render_server_feedback<T>(state: &SectionState<T>) -> bool {
-    state.phase() != SectionPhase::Loading || state.data().is_none()
+    !matches!(state.phase(), SectionPhase::Loading | SectionPhase::Ready) || state.data().is_none()
 }
 
 /// 页头始终提供当前服务器的刷新入口；目标不可用或采样进行中时禁用以防重复请求。

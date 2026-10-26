@@ -13,7 +13,10 @@ use kerminal_application::{
     preferences::{ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId},
     sessions::UiSessionBinding,
 };
-use kerminal_domain::{files::FileEndpoint, identity::HostId};
+use kerminal_domain::{
+    files::FileEndpoint,
+    identity::{HostId, TabId},
+};
 
 use crate::{
     features::operations::{OperationsEvent, OperationsSection, OperationsView},
@@ -650,10 +653,13 @@ impl RootView {
         Some((endpoint, lease))
     }
 
-    /// 同步右栏文件面板当前可信 pane；切换 Tab 只更新文件显示目标，不触碰 Agent 绑定。
+    /// 同步同标签文件面板的可信 pane；切换过渡期间不把新目标写进旧实体，也不触碰 Agent 绑定。
     ///
     /// @author kongweiguang
     fn try_bind_files_from_active_terminal(&mut self, cx: &mut Context<Self>) {
+        if !self.tab_tool_contents_are_current() {
+            return;
+        }
         let (endpoint, lease) = self
             .active_terminal_files_target()
             .map(|(endpoint, lease)| (Some(endpoint), lease))
@@ -684,7 +690,7 @@ impl RootView {
         cx.notify();
     }
 
-    /// 只持久化当前工具的明确用户拖动内容宽度，去掉 4px 槽；动态默认/程序恢复从不走此入口。
+    /// 将当前工具的明确拖动尺寸作为右栏共享偏好持久化，默认值回到统一尺寸时清除旧覆盖。
     ///
     /// @author kongweiguang
     pub(super) fn record_user_attached_width(
@@ -696,8 +702,8 @@ impl RootView {
         let Some(content) = super::workbench::workbench_content_dimension(
             width,
             super::workbench::RESIZABLE_EDGE_GUTTER,
-            260,
-            680,
+            130,
+            1_360,
         ) else {
             return;
         };
@@ -711,15 +717,26 @@ impl RootView {
         self.workbench_dock_restore_width = None;
         let mut layout = self.current_workbench_layout_intent();
         if self.tool_rail_state.attached_width(tool).is_some() {
-            layout.dock_panel_widths.insert(tool, content);
+            for shared_tool in [
+                ToolRailToolId::AgentLauncher,
+                ToolRailToolId::Sftp,
+                ToolRailToolId::Containers,
+                ToolRailToolId::Snippets,
+                ToolRailToolId::Tmux,
+                ToolRailToolId::Ports,
+                ToolRailToolId::System,
+                ToolRailToolId::Logs,
+            ] {
+                layout.dock_panel_widths.insert(shared_tool, content);
+            }
         } else {
-            layout.dock_panel_widths.remove(&tool);
+            layout.dock_panel_widths.clear();
         }
         self.request_workbench_layout_intent(layout, cx);
         cx.notify();
     }
 
-    /// 仅从当前确定绑定的内容状态选择 Agent 默认宽度；激活与绘制共用此只读规则，不能猜两套预算。
+    /// 所有右栏工具共享一个默认宽度，Agent 运行态变化也不触发尺寸切换。
     ///
     /// @author kongweiguang
     pub(super) fn current_attached_default_width(&self, tool: ToolRailToolId) -> gpui_kit::Pixels {
@@ -753,7 +770,7 @@ impl RootView {
             && self.selected_agent_session_id.is_some()
     }
 
-    /// 仅为可见工具装配业务内容；SFTP 使用独立浏览实体，避免当前终端绑定污染中心文件工作区。
+    /// 工具打开顺序和内容 Entity 都按活动标签恢复，右栏尺寸仍由共享 settings 控制。
     ///
     /// @author kongweiguang
     pub(super) fn workbench_tool_panels(
@@ -762,7 +779,40 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> WorkbenchToolPanels {
         let settings = self.current_tool_rail_settings();
+        let (active_tab_id, live_tab_ids) = self
+            .workspace_controller
+            .as_ref()
+            .map(|controller| {
+                let snapshot = controller.snapshot();
+                (
+                    snapshot.active_tab_id.clone(),
+                    snapshot
+                        .terminal_tabs
+                        .iter()
+                        .map(|tab| tab.id().clone())
+                        .collect::<Vec<TabId>>(),
+                )
+            })
+            .unwrap_or_default();
+        if let Some(collapsed) = self.tool_rail_state.activate_tab(
+            active_tab_id,
+            &live_tab_ids,
+            self.right_dock_collapsed,
+        ) {
+            self.right_dock_collapsed = collapsed;
+            self.compact_tool_drawer_open = false;
+        }
+        let previous_tool = self.tool_rail_state.attached_tool();
         let layout = self.tool_rail_state.project(&settings);
+        if previous_tool != layout.panels.attached {
+            let next_default = layout
+                .panels
+                .attached
+                .map(|tool| self.current_attached_default_width(tool));
+            self.tool_rail_state
+                .set_attached_tool(layout.panels.attached, next_default);
+            self.prepare_attached_dock_width_restore(layout.panels.attached);
+        }
         let theme = ThemeTokens::current(window, cx);
         let window_active = window.is_window_active();
 
@@ -781,6 +831,7 @@ impl RootView {
             });
         }
         if contains_tool(layout.panels, ToolRailToolId::Sftp) {
+            self.ensure_sftp_panel(window, cx);
             self.try_bind_files_from_active_terminal(cx);
         }
         let snippets_compact = is_compact_slot(ToolRailToolId::Snippets);
@@ -844,6 +895,21 @@ impl RootView {
         WorkbenchToolPanels { layout, renderers }
     }
 
+    /// SFTP 首次出现在当前标签时创建独立 FilesPane，并同时安装其 Root 事件桥接。
+    ///
+    /// @author kongweiguang
+    fn ensure_sftp_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sftp_panel.is_some() {
+            return;
+        }
+        let panel = Self::new_files_panel(&self.services, cx);
+        let subscriptions = panel
+            .as_ref()
+            .map(|panel| Self::subscribe_files_pane_events(panel, window, cx));
+        self.sftp_panel = panel;
+        self._sftp_panel_subscriptions = subscriptions;
+    }
+
     /// 供中心内容构造器判断同一 Files/Commands Entity 是否已由 ToolRail 唯一托管。
     ///
     /// @author kongweiguang
@@ -891,7 +957,7 @@ impl RootView {
         }
     }
 
-    /// 按需建立唯一工具视图；容器从真实 pane 初始化，危险确认固定回带原 Entity 和目标。
+    /// 按需建立当前标签的工具视图；容器从真实 pane 初始化，确认事件只更新当前实体。
     ///
     /// @author kongweiguang
     fn ensure_operations_panel(
@@ -942,6 +1008,13 @@ impl RootView {
                 .map(|(pane_id, _)| pane_id.clone())
                 .collect::<Vec<_>>();
             if let OperationsEvent::RootConfirmationChanged = event {
+                let is_current = root
+                    .tool_rail_operations_views
+                    .values()
+                    .any(|current| current.entity_id() == source.entity_id());
+                if !is_current {
+                    return;
+                }
                 let active = source.read(cx).root_confirmation_active();
                 root.sync_operations_root_confirmation(source.clone(), active, window, cx);
             } else if let OperationsEvent::ContainerExecRequested { target, .. } = event {
@@ -999,10 +1072,11 @@ impl RootView {
     }
 
     /// 容器使用精确 session 上下文，其它工具保留各自目标规则；侧栏选择不能改写容器宿主。
-    /// 同源名称只用于展示，绑定和异步代次仍使用稳定身份。
+    /// 同源名称只用于展示；标签换挂前只更新主运维页，不覆盖旧标签工具的绑定与草稿。
     ///
     /// @author kongweiguang
     pub(super) fn refresh_operations_panel_targets(&mut self, cx: &mut Context<Self>) {
+        let tools_current = self.tab_tool_contents_are_current();
         let tmux_binding = super::operations::focused_tmux_quickref_binding(self);
         let tmux_attach_binding = super::operations::focused_tmux_attach_binding(self);
         let fixed_target = self.tool_rail_operation_target();
@@ -1020,6 +1094,7 @@ impl RootView {
         let views = self
             .tool_rail_operations_views
             .iter()
+            .filter(|_| tools_current)
             .map(|(tool, view)| {
                 (
                     view.clone(),

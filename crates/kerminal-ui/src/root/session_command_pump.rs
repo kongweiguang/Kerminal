@@ -141,6 +141,11 @@ impl SessionCommandReceipt {
                 SessionCommandBindingSource::InputHandler,
                 None,
             ),
+            session_queue::SessionWork::WheelInputBatch(batch) => (
+                Some(batch.binding.clone()),
+                SessionCommandBindingSource::InputHandler,
+                None,
+            ),
             session_queue::SessionWork::Scroll { binding, .. }
             | session_queue::SessionWork::ScrollTo { binding, .. }
             | session_queue::SessionWork::HistoryResize { binding, .. } => (
@@ -254,6 +259,7 @@ fn session_work_binding_is_current(
             input_binding == Some(binding) && view_binding == Some(binding)
         }
         session_queue::SessionWork::UiInput(work) => input_binding == Some(&work.request.binding),
+        session_queue::SessionWork::WheelInputBatch(batch) => input_binding == Some(&batch.binding),
         session_queue::SessionWork::Input { .. } => input_binding.is_some(),
     }
 }
@@ -653,6 +659,11 @@ impl RootView {
                 {
                     Some(&work.request.binding)
                 }
+                session_queue::SessionWork::WheelInputBatch(batch)
+                    if batch.events.iter().any(input_returns_viewport_to_bottom) =>
+                {
+                    Some(&batch.binding)
+                }
                 _ => None,
             };
             let viewport_refresh_binding = viewport_binding.cloned();
@@ -671,6 +682,21 @@ impl RootView {
                     work.command_line_ticket.clone(),
                     work.origin,
                 )),
+                session_queue::SessionWork::WheelInputBatch(batch) => {
+                    batch.events.last().cloned().map(|event| {
+                        (
+                            UiTerminalInputRequest {
+                                binding: batch.binding.clone(),
+                                expected_context: None,
+                                projection: UiInputProjection::Invalidates,
+                                event,
+                            },
+                            None,
+                            None,
+                            session_queue::InputOrigin::Direct,
+                        )
+                    })
+                }
                 _ => None,
             };
             // 只在该 session FIFO 真正出队后读取已 ACK 的投影，避免快打时提前绑定旧 input_generation。
@@ -861,6 +887,32 @@ impl RootView {
                                 .await;
                             (write_result, None)
                         }
+                    }
+                    session_queue::SessionWork::WheelInputBatch(batch) => {
+                        let binding = batch.binding;
+                        let events = batch.events;
+                        let write_result = executor
+                            .run(move |_| async move {
+                                let mut context = None;
+                                for event in events {
+                                    if input_returns_viewport_to_bottom(&event) {
+                                        sessions
+                                            .scroll_ui_to_offset(binding.clone(), 0)
+                                            .await?;
+                                    }
+                                    context = Some(sessions
+                                        .write_ui_input(UiTerminalInputRequest {
+                                            binding: binding.clone(),
+                                            expected_context: None,
+                                            projection: UiInputProjection::Invalidates,
+                                            event,
+                                        })
+                                        .await?);
+                                }
+                                Ok(context)
+                            })
+                            .await;
+                        (write_result, None)
                     }
                     session_queue::SessionWork::Scroll { binding, lines } => (
                         executor
@@ -1421,6 +1473,7 @@ impl RootView {
     /// 滚动/SelectionScroll/HistoryResize 只需精确只读 view binding；运行态 resize 要求 live 与 view binding 同代。
     /// 固定绑定的焦点通知不参与命令行编辑票据；其真实 writer ACK 仍在同一 lane 返回。
     /// committed Text 只有经精确已知行 edit ticket 核验后才改为 Tracked，未知输入保留失效语义。
+    /// 滚轮批次不签发行编辑票据，但入队前仍须失效绑定投影，避免旧命令行状态被后续 Enter 复用。
     ///
     /// @author kongweiguang
     pub(super) fn enqueue_session_command(
@@ -1542,6 +1595,10 @@ impl RootView {
                         self.command_line_projection
                             .invalidate_binding(&work.request.binding);
                         None
+                    } else if work.wheel_input {
+                        self.command_line_projection
+                            .invalidate_binding(&work.request.binding);
+                        None
                     } else if matches!(
                         work.request.event,
                         kerminal_terminal::input::TerminalInputEvent::Focus(_)
@@ -1557,8 +1614,12 @@ impl RootView {
                     // 生产者不能预置来源或票据来授权命令行跟踪写入。
                     work.origin = session_queue::InputOrigin::Direct;
                     let session_id = work.request.binding.session_id.clone();
-                    self.session_commands
-                        .enqueue(session_id, session_queue::SessionWork::UiInput(work))
+                    if work.wheel_input {
+                        self.session_commands.enqueue_wheel_input(session_id, *work)
+                    } else {
+                        self.session_commands
+                            .enqueue(session_id, session_queue::SessionWork::UiInput(work))
+                    }
                 }
                 SessionCommand::Scroll { binding, lines } => self.session_commands.enqueue(
                     binding.session_id.clone(),

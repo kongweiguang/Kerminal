@@ -14,7 +14,7 @@ use kerminal_terminal::input::{
 
 use crate::root::session_queue::{
     InputOrigin, SessionCommandQueues, SessionQueueError, SessionQueueLimits, SessionWork,
-    SnapshotRequestGate, is_broadcastable_input,
+    SnapshotRequestGate, UiInputWork, WheelInputBatch, is_broadcastable_input,
 };
 
 fn limits(concurrent_sessions: usize) -> SessionQueueLimits {
@@ -36,6 +36,32 @@ fn ui_binding(session_id: SessionId) -> UiSessionBinding {
         },
         session_generation: 7,
     }
+}
+
+/// 创建带精确 pane binding 的协议滚轮事件，让队列测试直接覆盖输入批次准入。
+///
+/// @author kongweiguang
+fn wheel_work(binding: &UiSessionBinding, event: TerminalInputEvent) -> UiInputWork {
+    UiInputWork::new_wheel(UiTerminalInputRequest {
+        binding: binding.clone(),
+        expected_context: None,
+        projection: UiInputProjection::Invalidates,
+        event,
+    })
+}
+
+/// 每个鼠标步保留自身位置和修饰键，适用于连续但指针位置有变化的滚动报告。
+///
+/// @author kongweiguang
+fn wheel_mouse(column: u16, row: u16) -> TerminalInputEvent {
+    TerminalInputEvent::Mouse(TerminalMouseEvent {
+        button: TerminalMouseButton::WheelUp,
+        action: TerminalMouseAction::Scroll,
+        button_down: false,
+        column,
+        row,
+        modifiers: InputModifiers::default(),
+    })
 }
 
 /// 同会话输入保持 FIFO，释放并发名额后按 ready 队列公平服务更早等待的 lane。
@@ -168,6 +194,206 @@ fn queues_are_fifo_per_session_and_parallel_between_sessions() {
     assert!(queues.complete(&next_first.session_id));
     assert!(queues.take_ready().is_none());
     assert_eq!((queues.queued_commands, queues.queued_input_bytes), (0, 0));
+}
+
+/// 突发滚轮按有界批次复用 FIFO 槽位，事件字节仍逐项计费，取消摘要反映全部未发输入。
+///
+/// @author kongweiguang
+#[test]
+fn wheel_bursts_are_batched_without_exceeding_count_or_byte_budgets() {
+    let binding = ui_binding(SessionId::new());
+    let mut queues = SessionCommandQueues::with_limits(SessionQueueLimits {
+        per_session_commands: 2,
+        total_commands: 2,
+        total_input_bytes: 16 * 1024,
+        concurrent_sessions: 1,
+    });
+
+    for index in 0..512_u16 {
+        queues
+            .enqueue_wheel_input(
+                binding.session_id.clone(),
+                wheel_work(&binding, wheel_mouse(index, index / 2)),
+            )
+            .unwrap();
+    }
+
+    assert_eq!(queues.queued_commands, 2);
+    assert_eq!(queues.queued_input_bytes, 16 * 1024);
+    let pending = &queues.lanes[&binding.session_id].pending;
+    assert_eq!(pending.len(), 2);
+    for (batch, start) in pending.iter().zip([0, 256]) {
+        let SessionWork::WheelInputBatch(batch) = batch else {
+            panic!("wheel input must use a bounded batch");
+        };
+        assert_eq!(batch.events.len(), 256);
+        assert_eq!(batch.binding, binding);
+        assert_eq!(batch.events.first(), Some(&wheel_mouse(start, start / 2)));
+        let last = start + 255;
+        assert_eq!(batch.events.last(), Some(&wheel_mouse(last, last / 2)));
+    }
+    assert_eq!(
+        queues.enqueue_wheel_input(
+            binding.session_id.clone(),
+            wheel_work(&binding, wheel_mouse(512, 256)),
+        ),
+        Err(SessionQueueError::QueueFull)
+    );
+
+    let dropped = queues.cancel_pending(&binding.session_id);
+    assert_eq!(dropped.commands, 2);
+    assert_eq!(dropped.input_events, 512);
+    assert_eq!(dropped.input_bytes, 16 * 1024);
+    assert_eq!((queues.queued_commands, queues.queued_input_bytes), (0, 0));
+}
+
+/// 只有滚轮专属标记可合批；普通方向键会打断批次，并继续按原始 FIFO 顺序写入。
+///
+/// @author kongweiguang
+#[test]
+fn wheel_batches_keep_order_around_an_ordinary_arrow_key() {
+    let binding = ui_binding(SessionId::new());
+    let mut queues = SessionCommandQueues::with_limits(limits(1));
+    queues
+        .enqueue_wheel_input(
+            binding.session_id.clone(),
+            wheel_work(&binding, wheel_mouse(2, 3)),
+        )
+        .unwrap();
+    queues
+        .enqueue_wheel_input(
+            binding.session_id.clone(),
+            wheel_work(&binding, wheel_mouse(4, 5)),
+        )
+        .unwrap();
+    let ordinary_up = TerminalInputEvent::Key(TerminalKeyEvent {
+        key: TerminalKey::Up,
+        phase: KeyPhase::Press,
+        modifiers: InputModifiers::default(),
+    });
+    queues
+        .enqueue(
+            binding.session_id.clone(),
+            SessionWork::UiInput(Box::new(UiInputWork::new(
+                UiTerminalInputRequest {
+                    binding: binding.clone(),
+                    expected_context: None,
+                    projection: UiInputProjection::Invalidates,
+                    event: ordinary_up.clone(),
+                },
+                None,
+            ))),
+        )
+        .unwrap();
+    queues
+        .enqueue_wheel_input(
+            binding.session_id.clone(),
+            wheel_work(&binding, wheel_mouse(6, 7)),
+        )
+        .unwrap();
+
+    let first = queues.take_ready().expect("first wheel batch is ready");
+    let SessionWork::WheelInputBatch(WheelInputBatch {
+        binding: first_binding,
+        events,
+    }) = first.work
+    else {
+        panic!("first item should be a wheel batch");
+    };
+    assert_eq!(first_binding, binding);
+    assert_eq!(events, [wheel_mouse(2, 3), wheel_mouse(4, 5)]);
+    assert!(queues.complete(&binding.session_id));
+
+    let second = queues
+        .take_ready()
+        .expect("ordinary key stays between wheel batches");
+    let SessionWork::UiInput(work) = second.work else {
+        panic!("ordinary key must keep its original UI input item");
+    };
+    assert_eq!(work.request.binding, binding);
+    assert_eq!(work.request.event, ordinary_up);
+    assert!(!work.wheel_input);
+    assert!(queues.complete(&binding.session_id));
+
+    let third = queues
+        .take_ready()
+        .expect("second wheel batch remains last");
+    let SessionWork::WheelInputBatch(WheelInputBatch {
+        binding: last_binding,
+        events,
+    }) = third.work
+    else {
+        panic!("last item should be a wheel batch");
+    };
+    assert_eq!(last_binding, binding);
+    assert_eq!(events, [wheel_mouse(6, 7)]);
+    assert!(queues.complete(&binding.session_id));
+    assert!(queues.take_ready().is_none());
+}
+
+/// 会话 ID 相同但 generation 改变时必须开启新批次，迟到输入不能跨重连绑定。
+///
+/// @author kongweiguang
+#[test]
+fn wheel_batches_do_not_cross_session_generations() {
+    let original = ui_binding(SessionId::new());
+    let reconnected = UiSessionBinding {
+        session_id: original.session_id.clone(),
+        owner: original.owner.clone(),
+        session_generation: original.session_generation + 1,
+    };
+    let mut queues = SessionCommandQueues::with_limits(limits(1));
+    queues
+        .enqueue_wheel_input(
+            original.session_id.clone(),
+            wheel_work(&original, wheel_mouse(1, 1)),
+        )
+        .unwrap();
+    queues
+        .enqueue_wheel_input(
+            reconnected.session_id.clone(),
+            wheel_work(&reconnected, wheel_mouse(2, 2)),
+        )
+        .unwrap();
+
+    let pending = &queues.lanes[&original.session_id].pending;
+    assert_eq!(pending.len(), 2);
+    for (work, expected_binding) in pending.iter().zip([&original, &reconnected]) {
+        let SessionWork::WheelInputBatch(batch) = work else {
+            panic!("each generation should own its wheel batch");
+        };
+        assert_eq!(&batch.binding, expected_binding);
+        assert_eq!(batch.events.len(), 1);
+    }
+}
+
+/// 替代滚动方向键可以批量串行写出，但相反方向仍逐项保留原顺序。
+///
+/// @author kongweiguang
+#[test]
+fn alternate_scroll_batches_preserve_each_arrow_direction() {
+    let binding = ui_binding(SessionId::new());
+    let mut queues = SessionCommandQueues::with_limits(limits(1));
+    let key = |key| {
+        TerminalInputEvent::Key(TerminalKeyEvent {
+            key,
+            phase: KeyPhase::Press,
+            modifiers: InputModifiers::default(),
+        })
+    };
+    for event in [key(TerminalKey::Up), key(TerminalKey::Down)] {
+        queues
+            .enqueue_wheel_input(binding.session_id.clone(), wheel_work(&binding, event))
+            .unwrap();
+    }
+
+    let ready = queues.take_ready().expect("alternate wheel batch is ready");
+    let SessionWork::WheelInputBatch(batch) = ready.work else {
+        panic!("alternate scroll uses the wheel batch path");
+    };
+    assert_eq!(batch.binding, binding);
+    assert_eq!(batch.events, [key(TerminalKey::Up), key(TerminalKey::Down)]);
+    assert!(queues.complete(&ready.session_id));
 }
 
 /// 接受计划的 CAS 下一步优先于后来排队的输入，但仍要等当前写入 ACK 后发送。

@@ -243,6 +243,7 @@ async fn published_id_conflicts_while_live_and_after_close_before_provider_open(
         }),
         owner: SessionOwner::Mcp,
         size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+        initial_palette: None,
     };
     let first = manager
         .create(request.clone())
@@ -329,6 +330,7 @@ async fn failed_open_with_completed_cleanup_can_retry_same_id() {
         }),
         owner: SessionOwner::Mcp,
         size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+        initial_palette: None,
     };
     let session_id = SessionId::new();
 
@@ -396,6 +398,7 @@ async fn concurrent_preallocated_id_opens_provider_once() {
         }),
         owner: SessionOwner::Mcp,
         size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+        initial_palette: None,
     };
     let session_id = SessionId::new();
     let first_manager = Arc::clone(&manager);
@@ -467,6 +470,7 @@ async fn queued_create_result_drop_is_closed_by_manager_owner() {
         }),
         owner: SessionOwner::Mcp,
         size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+        initial_palette: None,
     };
     let mut caller =
         Box::pin(manager.create_with_transport_factory(request, factory, CancellationToken::new()));
@@ -547,6 +551,7 @@ async fn next_create_retries_pending_open_cleanup_before_acquiring_capacity() {
         }),
         owner: SessionOwner::Mcp,
         size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+        initial_palette: None,
     };
 
     let first = manager
@@ -633,6 +638,7 @@ async fn late_failed_open_after_cancellation_keeps_cleanup_owner() {
         }),
         owner: SessionOwner::Mcp,
         size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+        initial_palette: None,
     };
     let session_id = SessionId::new();
     let caller_manager = Arc::clone(&manager);
@@ -666,6 +672,7 @@ async fn late_failed_open_after_cancellation_keeps_cleanup_owner() {
                 }),
                 owner: SessionOwner::Mcp,
                 size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+                initial_palette: None,
             },
             session_id.clone(),
             CancellationToken::new(),
@@ -697,6 +704,7 @@ async fn late_failed_open_after_cancellation_keeps_cleanup_owner() {
                 }),
                 owner: SessionOwner::Mcp,
                 size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+                initial_palette: None,
             },
             session_id,
             CancellationToken::new(),

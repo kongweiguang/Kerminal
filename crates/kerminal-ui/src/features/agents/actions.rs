@@ -383,6 +383,7 @@ impl AgentsPanel {
             title: None,
             scope,
             target: candidate.unwrap_or_else(|| AgentTargetBinding::unbound(0)),
+            initial_palette: self.terminal_palette,
         };
         let selection_guard = (
             self.selected_agent.clone(),
@@ -505,6 +506,7 @@ impl AgentsPanel {
             scope: self.scope.clone(),
             target,
             launcher_key: Some(launcher_key),
+            initial_palette: self.terminal_palette,
         };
         let selection_guard = (
             self.selected_agent.clone(),
@@ -604,6 +606,7 @@ impl AgentsPanel {
         let selected_before = self.selected_agent.clone();
         let agents = self.agents.clone();
         let executor = self.executor.clone();
+        let initial_palette = self.terminal_palette;
         self.start_lifecycle_operation(
             AgentLifecycleOperation {
                 target_id: id.clone(),
@@ -616,7 +619,11 @@ impl AgentsPanel {
                 cancellable: true,
             },
             cx,
-            move |cancel| async move { agents.resume(id, cancel).await },
+            move |cancel| async move {
+                agents
+                    .resume_with_palette(id, initial_palette, cancel)
+                    .await
+            },
             executor,
         );
     }

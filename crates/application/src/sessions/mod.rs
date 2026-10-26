@@ -56,6 +56,8 @@ pub struct CreateSessionRequest {
     pub target: SessionTarget,
     pub owner: SessionOwner,
     pub size: TerminalSize,
+    /// 可选的首帧色盘；PTY 输出 reader 启动前应用，避免程序启动时的 OSC 颜色查询读到默认色。
+    pub initial_palette: Option<TerminalPalette>,
 }
 
 /// 已建立 transport 接入唯一 runtime registry 时使用的请求。
@@ -64,6 +66,8 @@ pub struct AttachTransportRequest {
     pub target: SessionTarget,
     pub owner: SessionOwner,
     pub size: TerminalSize,
+    /// 创建路径保留的首帧色盘；engine 在 reader 启动前应用，供绘制和 OSC 查询共享。
+    pub initial_palette: Option<TerminalPalette>,
 }
 
 /// 清理失败时 manager 仍持有资源 owner，并会在后续 shutdown 中继续回收。

@@ -291,8 +291,8 @@ pub(crate) fn handle(
             ] {
                 for _ in 0..count {
                     let accepted = root.enqueue_session_command(
-                        SessionCommand::UiInput(Box::new(super::session_queue::UiInputWork::new(
-                            UiTerminalInputRequest {
+                        SessionCommand::UiInput(Box::new(
+                            super::session_queue::UiInputWork::new_wheel(UiTerminalInputRequest {
                                 binding: request.binding.clone(),
                                 expected_context: None,
                                 projection: UiInputProjection::Invalidates,
@@ -304,9 +304,8 @@ pub(crate) fn handle(
                                     row,
                                     modifiers: request.modifiers,
                                 }),
-                            },
-                            None,
-                        ))),
+                            }),
+                        )),
                         cx,
                     );
                     if !accepted {
@@ -325,8 +324,8 @@ pub(crate) fn handle(
             }
             for _ in 0..count {
                 let accepted = root.enqueue_session_command(
-                    SessionCommand::UiInput(Box::new(super::session_queue::UiInputWork::new(
-                        UiTerminalInputRequest {
+                    SessionCommand::UiInput(Box::new(
+                        super::session_queue::UiInputWork::new_wheel(UiTerminalInputRequest {
                             binding: request.binding.clone(),
                             expected_context: None,
                             projection: UiInputProjection::Invalidates,
@@ -335,9 +334,8 @@ pub(crate) fn handle(
                                 phase: KeyPhase::Press,
                                 modifiers: InputModifiers::default(),
                             }),
-                        },
-                        None,
-                    ))),
+                        }),
+                    )),
                     cx,
                 );
                 if !accepted {

@@ -997,12 +997,20 @@ impl RootView {
         }
     }
 
-    /// 返回 Root 当前注册的所有独立代理实体；不同宿主不复用可变叶子状态。
+    /// 主运维页持续可用；标签换挂前跳过旧 Ports 实体，避免新 pane 投影清除其原选择。
+    ///
+    /// @author kongweiguang
     fn proxy_panels(&self) -> Vec<Entity<ProxyApplicationPanel>> {
+        let tools_current = self.tab_tool_contents_are_current();
         self.proxy_panel
             .iter()
             .cloned()
-            .chain(self.tool_rail_proxy_panels.values().cloned())
+            .chain(
+                self.tool_rail_proxy_panels
+                    .values()
+                    .filter(|_| tools_current)
+                    .cloned(),
+            )
             .collect()
     }
 

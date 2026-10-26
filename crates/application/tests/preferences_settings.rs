@@ -327,11 +327,11 @@ fn validated_workbench_layout_bounds_logical_content_dimensions() {
     assert_eq!(validated.workbench_layout.host_sidebar_width, 168);
     assert_eq!(
         validated.workbench_layout.dock_panel_widths[&ToolRailToolId::Sftp],
-        680
+        1_360
     );
     assert_eq!(
         validated.workbench_layout.dock_panel_widths[&ToolRailToolId::Containers],
-        260
+        130
     );
     assert_eq!(validated.workbench_layout.bottom_panel_height, 180);
     assert!(!validated.workbench_layout.host_sidebar_collapsed);

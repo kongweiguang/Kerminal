@@ -351,6 +351,7 @@ async fn create_session(factory: Arc<RecoveryFactory>) -> (Arc<SessionManager>, 
                 pane_id: PaneId::new(),
             },
             size: TerminalSize::new(80, 24, 0, 0).expect("valid test grid"),
+            initial_palette: None,
         })
         .await
         .expect("create first fake transport");
