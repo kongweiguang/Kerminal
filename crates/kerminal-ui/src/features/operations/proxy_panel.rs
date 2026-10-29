@@ -169,6 +169,25 @@ pub enum ProxyOperationStatus {
     Reconciled,
 }
 
+/// 隧道行只读投影的代理入口状态；详细异步生命周期仍由此面板唯一持有。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ProxyForwardActionState {
+    pub busy: bool,
+    pub current_enabled: bool,
+    pub current_reason: Option<SharedString>,
+    pub future_enabled: bool,
+    pub future_active: bool,
+    pub future_reason: Option<SharedString>,
+    pub reconcile_current: bool,
+}
+
+/// 一次代理操作的轻量结果由隧道行承接，避免重新挂载完整代理工具面板。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ProxyForwardFeedback {
+    pub message: SharedString,
+    pub is_error: bool,
+}
+
 /// 用例未执行或拒绝代理应用时，展示稳定原因并允许用户继续查看安全脚本。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProxyUnavailableReason {
@@ -246,6 +265,7 @@ pub struct ProxyApplicationPanel {
     next_request_id: u64,
     last_status: Option<ProxyOperationStatus>,
     last_status_context: Option<(Option<HostId>, String)>,
+    last_status_forward_id: Option<String>,
     last_history_result: Option<ProxyHistoryResult>,
     review_script: Option<ProxyReviewScript>,
 }
@@ -276,6 +296,7 @@ impl ProxyApplicationPanel {
             next_request_id: 0,
             last_status: None,
             last_status_context: None,
+            last_status_forward_id: None,
             last_history_result: None,
             review_script: None,
         }
@@ -303,6 +324,7 @@ impl ProxyApplicationPanel {
             self.review_script = None;
             self.last_status = None;
             self.last_status_context = None;
+            self.last_status_forward_id = None;
             self.last_history_result = None;
         }
         self.projection = projection;
@@ -334,6 +356,7 @@ impl ProxyApplicationPanel {
             self.review_script = None;
             self.last_status = None;
             self.last_status_context = None;
+            self.last_status_forward_id = None;
             self.last_history_result = None;
         }
         self.projection.host_id = host_id;
@@ -373,6 +396,182 @@ impl ProxyApplicationPanel {
     /// Root 只可使用回读证明的原转发 ID；停止态转发不会由列表选择重新推断。
     pub fn current_recovery_forward_id(&self) -> Option<&str> {
         self.recovery_forward_id.as_deref()
+    }
+
+    /// 为单条远端 SOCKS 行投影可用操作和禁用原因；目标资格仍以代理状态机的快照为准。
+    pub(super) fn action_state_for_forward(&self, forward_id: &str) -> ProxyForwardActionState {
+        let busy = self.pending.is_some();
+        let forward = eligible_socks_forwards(&self.projection)
+            .into_iter()
+            .find(|forward| forward.forward.id == forward_id);
+        let current_reason = match forward {
+            None => Some(ProxyUnavailableReason::ForwardUnavailable),
+            Some(_) => self
+                .current_binding_for_forward(forward_id)
+                .err()
+                .or_else(|| {
+                    self.projection
+                        .current_session
+                        .as_ref()
+                        .filter(|session| session.application == ProxyCurrentApplication::Applied)
+                        .map(|_| ProxyUnavailableReason::AlreadyApplied)
+                }),
+        };
+        let current_reason = if busy {
+            Some(crate::locale::text(
+                "正在处理代理操作。",
+                "A proxy operation is in progress.",
+            ))
+        } else {
+            current_reason.map(unavailable_reason_text)
+        };
+        let current_enabled = !busy && current_reason.is_none();
+        let (future_enabled, future_active, future_reason) =
+            match (&self.projection.future, forward) {
+                (
+                    ProxyFutureProjection::Ready {
+                        host_id,
+                        forward_id: selected,
+                        ..
+                    },
+                    Some(forward),
+                ) if self.projection.host_id.as_ref() == Some(host_id)
+                    && host_id == &forward.forward.config.host_id =>
+                {
+                    (
+                        !busy,
+                        selected.as_deref() == Some(forward_id),
+                        if busy {
+                            Some(crate::locale::text(
+                                "正在处理代理操作。",
+                                "A proxy operation is in progress.",
+                            ))
+                        } else {
+                            None
+                        },
+                    )
+                }
+                (ProxyFutureProjection::OutcomeUnknown { .. }, _) => (
+                    false,
+                    false,
+                    Some(crate::locale::text(
+                        "后续代理设置结果未知，请先刷新状态。",
+                        "The future proxy setting is unknown. Refresh its status first.",
+                    )),
+                ),
+                (ProxyFutureProjection::Loading { .. }, _) => (
+                    false,
+                    false,
+                    Some(crate::locale::text(
+                        "正在读取后续代理设置。",
+                        "Loading future proxy settings.",
+                    )),
+                ),
+                (ProxyFutureProjection::Unavailable { .. }, _) => (
+                    false,
+                    false,
+                    Some(crate::locale::text(
+                        "后续代理设置暂不可用。",
+                        "Future proxy settings are unavailable.",
+                    )),
+                ),
+                _ => (
+                    false,
+                    false,
+                    Some(crate::locale::text(
+                        "请启动活动的远端 SOCKS 隧道后再设置。",
+                        "Start an active remote SOCKS tunnel before changing this setting.",
+                    )),
+                ),
+            };
+        let reconcile_current = !busy
+            && self.recovery_forward_id.as_deref() == Some(forward_id)
+            && self
+                .projection
+                .current_session
+                .as_ref()
+                .is_some_and(|session| {
+                    session.application == ProxyCurrentApplication::OutcomeUnknown
+                        && session.availability == ProxyCurrentAvailability::Ready
+                });
+
+        ProxyForwardActionState {
+            busy,
+            current_enabled,
+            current_reason,
+            future_enabled,
+            future_active,
+            future_reason,
+            reconcile_current,
+        }
+    }
+
+    /// 只把仍归属于该隧道 ID 的最新操作状态放回对应行，避免切换选择后串到另一隧道。
+    pub(super) fn feedback_for_forward(&self, forward_id: &str) -> Option<ProxyForwardFeedback> {
+        if self.last_status_forward_id.as_deref() != Some(forward_id) {
+            return None;
+        }
+        let status = self.last_status.as_ref()?;
+        let (message, is_error) = match status {
+            ProxyOperationStatus::Applying => (
+                crate::locale::text("正在应用代理…", "Applying proxy…"),
+                false,
+            ),
+            ProxyOperationStatus::Applied => (
+                crate::locale::text(
+                    "代理已应用到当前终端。",
+                    "Proxy applied to the current terminal.",
+                ),
+                false,
+            ),
+            ProxyOperationStatus::NotApplied(reason) => (unavailable_reason_text(*reason), false),
+            ProxyOperationStatus::OutcomeUnknown => (
+                crate::locale::text(
+                    "代理操作结果未知；请核对原终端状态后再继续。",
+                    "The proxy operation result is unknown. Check the original terminal before continuing.",
+                ),
+                true,
+            ),
+            ProxyOperationStatus::Failed(message) => (message.clone(), true),
+            ProxyOperationStatus::CancelRequested => (
+                crate::locale::text("正在取消代理操作…", "Cancelling proxy operation…"),
+                false,
+            ),
+            ProxyOperationStatus::Cancelled => (
+                crate::locale::text("代理操作已取消。", "Proxy operation cancelled."),
+                false,
+            ),
+            ProxyOperationStatus::FutureEnabled => (
+                crate::locale::text(
+                    "同主机后续新建的 SSH 终端将使用此代理。",
+                    "New SSH terminals for this host will use this proxy.",
+                ),
+                false,
+            ),
+            ProxyOperationStatus::FutureDisabled => (
+                crate::locale::text("已关闭后续终端代理。", "Future terminal proxy use is off."),
+                false,
+            ),
+            ProxyOperationStatus::ScriptReady => (
+                crate::locale::text("代理脚本已准备好。", "The proxy script is ready."),
+                false,
+            ),
+            ProxyOperationStatus::Restored => (
+                crate::locale::text(
+                    "当前终端代理环境已恢复。",
+                    "The current terminal proxy environment was restored.",
+                ),
+                false,
+            ),
+            ProxyOperationStatus::Reconciled => (
+                crate::locale::text(
+                    "当前终端代理状态已核对。",
+                    "The current terminal proxy status was checked.",
+                ),
+                false,
+            ),
+        };
+        Some(ProxyForwardFeedback { message, is_error })
     }
 
     /// Root 同步冻结 binding 与回读证明的恢复 ID；面板不从活动列表重建历史事务。
@@ -416,6 +615,7 @@ impl ProxyApplicationPanel {
         } else {
             self.last_status_context =
                 Some((pending.host_id.clone(), pending.forward_name.clone()));
+            self.last_status_forward_id = pending.forward_id.clone();
             if status == ProxyOperationStatus::OutcomeUnknown {
                 self.mark_operation_outcome_unknown(&pending);
             }
@@ -450,6 +650,7 @@ impl ProxyApplicationPanel {
         }
         let pending = pending.clone();
         self.last_status_context = Some((pending.host_id.clone(), pending.forward_name.clone()));
+        self.last_status_forward_id = pending.forward_id.clone();
         self.last_history_result = history;
         if status == ProxyOperationStatus::OutcomeUnknown {
             self.mark_operation_outcome_unknown(&pending);
@@ -481,6 +682,7 @@ impl ProxyApplicationPanel {
         }
         let pending = pending.clone();
         self.last_status_context = Some((pending.host_id.clone(), pending.forward_name.clone()));
+        self.last_status_forward_id = pending.forward_id.clone();
         if !pending_current_result_matches(&pending, &result)
             || !current_result_kind_matches(&pending, &result.outcome)
         {
@@ -541,6 +743,7 @@ impl ProxyApplicationPanel {
         }
         self.review_script = Some(script);
         self.last_status_context = Some((pending.host_id.clone(), pending.forward_name.clone()));
+        self.last_status_forward_id = pending.forward_id.clone();
         self.last_status = Some(ProxyOperationStatus::ScriptReady);
         self.pending = None;
         cx.notify();
@@ -593,6 +796,7 @@ impl ProxyApplicationPanel {
             result_revision,
         );
         self.last_status_context = Some((pending.host_id.clone(), pending.forward_name.clone()));
+        self.last_status_forward_id = pending.forward_id.clone();
         if self.projection.host_id.as_ref() == Some(&result_host_id) {
             self.projection.future = state;
         }
@@ -627,6 +831,7 @@ impl ProxyApplicationPanel {
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         let request_id = self.next_request_id;
         self.last_status_context = Some((request.host_id.clone(), request.forward_name.clone()));
+        self.last_status_forward_id = request.forward_id.clone();
         self.pending = Some(PendingProxyOperation {
             request_id,
             kind: request.kind,
@@ -673,9 +878,13 @@ impl ProxyApplicationPanel {
     }
 
     /// 当前 Apply 只携带拍摄快照时的 UiSessionBinding，要求同主机 SSH 且真实 shell integration 可用。
-    fn current_binding(&self) -> Result<UiSessionBinding, ProxyUnavailableReason> {
-        let forward = self
-            .selected_forward()
+    fn current_binding_for_forward(
+        &self,
+        forward_id: &str,
+    ) -> Result<UiSessionBinding, ProxyUnavailableReason> {
+        let forward = eligible_socks_forwards(&self.projection)
+            .into_iter()
+            .find(|forward| forward.forward.id == forward_id)
             .ok_or(ProxyUnavailableReason::ForwardUnavailable)?;
         let current = self
             .projection
@@ -704,6 +913,15 @@ impl ProxyApplicationPanel {
                 Err(ProxyUnavailableReason::UnsupportedTarget)
             }
         }
+    }
+
+    /// 旧选择器入口继续使用统一的目标身份校验，不让绘制层推断当前转发。
+    fn current_binding(&self) -> Result<UiSessionBinding, ProxyUnavailableReason> {
+        let selected = self
+            .selected_forward_id
+            .as_deref()
+            .ok_or(ProxyUnavailableReason::ForwardUnavailable)?;
+        self.current_binding_for_forward(selected)
     }
 
     /// 恢复按原记录定位而非活动转发；同时要求 UI owner、主机、generation 与提示符状态仍可信。
@@ -798,6 +1016,12 @@ impl ProxyApplicationPanel {
         cx.notify();
     }
 
+    /// 行内操作先绑定用户点选的隧道，再复用原提示符、session generation 和请求回执门禁。
+    pub(super) fn apply_to_current_forward(&mut self, forward_id: String, cx: &mut Context<Self>) {
+        self.select_forward(forward_id, cx);
+        self.apply_to_current(cx);
+    }
+
     /// 只恢复唯一回读出的原记录，不要求原转发仍活动，避免停止隧道后丢失清理入口。
     fn restore_current(&mut self, cx: &mut Context<Self>) {
         let (forward_id, host_id, binding) =
@@ -829,7 +1053,7 @@ impl ProxyApplicationPanel {
     }
 
     /// 未知状态只对原事务做只读核对；核对完成前不发起恢复或新的应用。
-    fn reconcile_current(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn reconcile_current(&mut self, cx: &mut Context<Self>) {
         let (forward_id, host_id, binding) =
             match self.recovery_binding(ProxyCurrentApplication::OutcomeUnknown) {
                 Ok(target) => target,
@@ -904,6 +1128,12 @@ impl ProxyApplicationPanel {
         cx.notify();
     }
 
+    /// Future policy 仍按主机 revision 做 CAS，只把行 ID 明确选中后委托原用例。
+    pub(super) fn toggle_future_for_forward(&mut self, forward_id: String, cx: &mut Context<Self>) {
+        self.select_forward(forward_id, cx);
+        self.toggle_future(cx);
+    }
+
     /// 请求生成配置示例前要求同一主机有可信 shell 方言；未知时不回退到 POSIX。
     fn request_profile_script(&mut self, cx: &mut Context<Self>) {
         let Some(forward) = self.selected_forward().cloned() else {
@@ -964,6 +1194,9 @@ impl ProxyApplicationPanel {
                     forward.forward.config.name.clone(),
                 )
             });
+            self.last_status_forward_id = self
+                .selected_forward()
+                .map(|forward| forward.forward.id.clone());
             self.last_status = Some(status);
             cx.notify();
         }
@@ -981,6 +1214,7 @@ impl ProxyApplicationPanel {
             self.review_script = None;
             self.last_status = None;
             self.last_status_context = None;
+            self.last_status_forward_id = None;
             self.emit_selection_changed(cx);
             cx.notify();
         }

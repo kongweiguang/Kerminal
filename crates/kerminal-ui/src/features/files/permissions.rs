@@ -23,6 +23,13 @@ pub(super) fn format_posix_mode(kind: FileEntryKind, mode: u32) -> String {
     format!("{kind_prefix}{}", mode::format_symbolic_mode(mode))
 }
 
+/// 与权限对话框共享八进制格式化，但不把内部 mode 模块暴露给文件面板外的调用方。
+///
+/// @author kongweiguang
+pub(super) fn format_octal_mode(mode: u32) -> String {
+    mode::format_octal_mode(mode)
+}
+
 use crate::locale;
 
 /// 输入框只缓存用户正在编辑的 mode；真实权限与可用能力来自当前 FileEntry 和服务响应。
@@ -63,10 +70,18 @@ impl PermissionEditor {
                 "Octal mode, e.g. 0755",
             ))
         });
-        let subscription = cx.subscribe(&input, |_, _, event, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
+        let subscription = cx.subscribe(&input, |pane, input, event, cx| match event {
+            InputEvent::Change => cx.notify(),
+            InputEvent::PressEnter {
+                secondary: false,
+                shift: false,
+            } if pane.permission_dialog_target.is_some()
+                && pane.delete_confirmation.is_none()
+                && !input.read(cx).is_composing() =>
+            {
+                pane.confirm_global_dialog(cx);
             }
+            InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
         });
         self.input = Some(input);
         self._subscription = Some(subscription);
@@ -292,6 +307,13 @@ impl super::FilesPane {
                     pane.permissions.busy = false;
                     match result {
                         Ok(()) => {
+                            if pane
+                                .permission_dialog_target
+                                .as_ref()
+                                .is_some_and(|(_, target)| target == &endpoint)
+                            {
+                                pane.permission_dialog_target = None;
+                            }
                             pane.status = Some(
                                 locale::text("文件权限已更新。", "Permissions updated.")
                                     .to_string(),
@@ -306,7 +328,7 @@ impl super::FilesPane {
                                 kerminal_application::PublicErrorCode::Unsupported
                                     | kerminal_application::PublicErrorCode::CapabilityNotSupported
                             ) {
-                                pane.permissions.mark_unsupported(endpoint);
+                                pane.permissions.mark_unsupported(endpoint.clone());
                             }
                             pane.status = Some(super::localized_error(&error));
                         }

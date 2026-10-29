@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 use std::rc::Rc;
 
 use gpui::{
@@ -174,6 +176,9 @@ pub struct Popover {
     style: StyleRefinement,
     anchor: Anchor,
     offset: gpui::Pixels,
+    auto_flip: bool,
+    trigger_width: Option<(gpui::Pixels, gpui::Pixels)>,
+    available_height: Option<(gpui::Pixels, gpui::Pixels)>,
     on_position: Option<Box<dyn Fn(ResolvedPosition, gpui::Bounds<gpui::Pixels>)>>,
     default_open: bool,
     open: Option<bool>,
@@ -186,12 +191,16 @@ pub struct Popover {
 }
 
 impl Popover {
+    /// 保持 corner 定位作为兼容默认值，避免为现有调用方改变弹层位置。
     pub fn new(id: impl Into<ElementId>) -> Self {
         Self {
             id: id.into(),
             style: StyleRefinement::default(),
             anchor: Anchor::TopLeft,
             offset: gpui::px(0.),
+            auto_flip: false,
+            trigger_width: None,
+            available_height: None,
             on_position: None,
             default_open: false,
             open: None,
@@ -212,6 +221,32 @@ impl Popover {
     /// Gap from the trigger along the anchor's outward direction, zero by default.
     pub fn offset(mut self, offset: gpui::Pixels) -> Self {
         self.offset = offset;
+        self
+    }
+
+    /// 空间不足时允许弹层翻到 anchor 指定边的相反侧。
+    pub fn auto_flip(mut self) -> Self {
+        self.auto_flip = true;
+        self
+    }
+
+    /// Constrain popup content width from the measured trigger, capped to the viewport by Popup.
+    pub fn trigger_width(mut self, min: gpui::Pixels, max: gpui::Pixels) -> Self {
+        self.trigger_width = Some((min, max));
+        self
+    }
+
+    /// 对垂直菜单按选定边空间限制首帧布局，参数分别为翻转阈值和总高度上限。
+    pub fn available_height(
+        mut self,
+        minimum_space: gpui::Pixels,
+        max_height: gpui::Pixels,
+    ) -> Self {
+        self.auto_flip = true;
+        self.available_height = Some((
+            minimum_space.max(gpui::px(0.)),
+            max_height.max(gpui::px(0.)),
+        ));
         self
     }
 
@@ -299,6 +334,7 @@ impl Styled for Popover {
 }
 
 impl RenderOnce for Popover {
+    /// 仅透传 opt-in 定位约束；状态机、焦点和关闭路径仍由 PopoverState 管理。
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = window.use_keyed_state(self.id.clone(), cx, |_, cx| {
             PopoverState::new(self.default_open, cx)
@@ -321,6 +357,13 @@ impl RenderOnce for Popover {
             .refine_style(&self.style)
             .anchor(self.anchor)
             .offset(self.offset)
+            .when(self.auto_flip, |this| this.auto_flip())
+            .when_some(self.trigger_width, |this, (min, max)| {
+                this.trigger_width(min, max)
+            })
+            .when_some(self.available_height, |this, (minimum, maximum)| {
+                this.available_height(minimum, maximum)
+            })
             .when_some(self.on_position, |this, callback| {
                 this.on_position(callback)
             })
@@ -380,6 +423,42 @@ mod tests {
     use super::*;
     use gpui::{AppContext as _, Context, Render, point, px};
     use std::{cell::RefCell, rc::Rc};
+
+    /// 保证翻转能力为 opt-in，兼容既有 popover 的固定 anchor 定位。
+    #[test]
+    fn auto_flip_is_opt_in() {
+        assert!(!Popover::new("legacy-popover").auto_flip);
+        assert!(Popover::new("flipping-popover").auto_flip().auto_flip);
+    }
+
+    /// 宽度约束默认不影响其他调用方，且 builder 保留调用方给定的像素区间。
+    #[test]
+    fn trigger_width_is_opt_in() {
+        assert_eq!(Popover::new("legacy-width").trigger_width, None);
+        assert_eq!(
+            Popover::new("bounded-width")
+                .trigger_width(gpui::px(240.), gpui::px(360.))
+                .trigger_width,
+            Some((gpui::px(240.), gpui::px(360.)))
+        );
+    }
+
+    /// The vertical menu constraint remains absent by default and clamps invalid negative sizes.
+    #[test]
+    fn available_height_is_opt_in_and_non_negative() {
+        assert_eq!(Popover::new("legacy-height").available_height, None);
+        assert_eq!(
+            Popover::new("bounded-height")
+                .available_height(gpui::px(-1.), gpui::px(320.))
+                .available_height,
+            Some((gpui::px(0.), gpui::px(320.)))
+        );
+        assert!(
+            Popover::new("bounded-height")
+                .available_height(gpui::px(152.), gpui::px(320.))
+                .auto_flip
+        );
+    }
 
     /// Popover state lives in element state, which is collected as soon as it
     /// stops being rendered — a trigger scrolled out of a virtual list, a panel

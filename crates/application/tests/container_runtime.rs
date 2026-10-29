@@ -2,7 +2,11 @@
 //!
 //! @author kongweiguang
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use kerminal_application::{
@@ -22,11 +26,14 @@ use kerminal_application::{
 };
 use kerminal_domain::{
     files::ContainerRuntime,
-    identity::SessionId,
+    identity::{HostId, SessionId},
     operations::{
         ComposeAction, ComposeProjectTarget, ContainerListQuery, ContainerStatus, ContainerTarget,
     },
-    sessions::{SessionInfo, TerminalSize},
+    sessions::{
+        LocalSessionTarget, SessionInfo, SessionLifecycle, SessionOwner, SessionTarget,
+        SshInitialCommand, SshSessionTarget, TerminalSize,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -127,7 +134,13 @@ impl OperationsCommandExecutor for FixedCommandOutput {
     }
 }
 
-struct UnusedSessions;
+/// 将请求与协作取消令牌作为一次捕获保存，测试无需暴露嵌套同步容器结构。
+type CapturedSessionCreate = Arc<Mutex<Option<(CreateSessionRequest, CancellationToken)>>>;
+
+#[derive(Default)]
+struct UnusedSessions {
+    captured_create: Option<CapturedSessionCreate>,
+}
 
 #[async_trait]
 impl SessionService for UnusedSessions {
@@ -136,13 +149,27 @@ impl SessionService for UnusedSessions {
         unused_session_api()
     }
 
-    /// 列表摘要测试不创建可取消会话。
+    /// 摘要测试拒绝意外会话；日志测试可选捕获真实请求与取消令牌。
     async fn create_cancellable(
         &self,
-        _request: CreateSessionRequest,
-        _cancellation: CancellationToken,
+        request: CreateSessionRequest,
+        cancellation: CancellationToken,
     ) -> AppResult<SessionInfo> {
-        unused_session_api()
+        let Some(captured_create) = &self.captured_create else {
+            return unused_session_api();
+        };
+        *captured_create
+            .lock()
+            .expect("session request capture mutex should not be poisoned") =
+            Some((request.clone(), cancellation));
+        Ok(SessionInfo {
+            session_id: SessionId::new(),
+            target: request.target,
+            owner: request.owner,
+            size: request.size,
+            lifecycle: SessionLifecycle::Running,
+            exit_status: None,
+        })
     }
 
     /// 列表摘要测试不查询会话目录。
@@ -307,7 +334,100 @@ fn unused_session_api<T>() -> AppResult<T> {
     ))
 }
 
-/// 经公开 service 入口执行 Docker 的逐行 JSON 对象解析，并保留列表字段。
+/// 通过可取消会话入口捕获创建请求，使日志目标测试不启动 PTY 或真实 Docker/Podman。
+///
+/// @author kongweiguang
+fn service_with_session_capture() -> (
+    ContainerRuntimeService,
+    CapturedSessionCreate,
+    Arc<FixedCommandOutput>,
+) {
+    let executor = Arc::new(FixedCommandOutput::new(Vec::new()));
+    let captured_create = Arc::new(Mutex::new(None));
+    let sessions = Arc::new(UnusedSessions {
+        captured_create: Some(captured_create.clone()),
+    });
+    (
+        ContainerRuntimeService::new(executor.clone(), sessions),
+        captured_create,
+        executor,
+    )
+}
+
+/// Docker 本机与 Podman SSH 日志目标保留 argv 边界、调用 owner、尺寸及取消语义。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn open_logs_preserves_local_and_ssh_targets_owner_size_and_cancellation() {
+    let (service, captured_create, executor) = service_with_session_capture();
+    let size = TerminalSize::new(104, 32, 0, 0).expect("日志终端尺寸有效");
+    let owner = SessionOwner::Service {
+        name: "container logs fixture".to_owned(),
+    };
+    let container_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let remote_host = HostId::new();
+
+    for (runtime, host_id) in [
+        (ContainerRuntime::Docker, None),
+        (ContainerRuntime::Podman, Some(remote_host.clone())),
+    ] {
+        let cancellation = CancellationToken::new();
+        let info = service
+            .open_logs(
+                ContainerTarget {
+                    host_id: host_id.clone(),
+                    runtime,
+                    container_id: container_id.to_owned(),
+                },
+                owner.clone(),
+                size,
+                cancellation.clone(),
+            )
+            .await
+            .expect("fake session service should return its captured log session");
+
+        let (request, received_cancellation) = captured_create
+            .lock()
+            .expect("session request capture mutex should not be poisoned")
+            .take()
+            .expect("open_logs should create one cancellable session");
+        let program = match runtime {
+            ContainerRuntime::Docker => "docker",
+            ContainerRuntime::Podman => "podman",
+        };
+        let arguments = ["logs", "--tail", "200", "-f", container_id];
+        let expected_target = match host_id {
+            None => SessionTarget::Local(LocalSessionTarget {
+                program: OsString::from(program),
+                args: arguments.into_iter().map(OsString::from).collect(),
+                working_directory: None,
+                environment: BTreeMap::new(),
+            }),
+            Some(host_id) => SessionTarget::Ssh(SshSessionTarget {
+                host_id,
+                working_directory: None,
+                command: Some(SshInitialCommand::Process {
+                    program: program.to_owned(),
+                    args: arguments.into_iter().map(str::to_owned).collect(),
+                }),
+            }),
+        };
+        assert_eq!(request.target, expected_target);
+        assert_eq!(request.owner, owner);
+        assert_eq!(request.size, size);
+        assert_eq!(request.initial_palette, None);
+        assert_eq!(info.target, expected_target);
+        assert_eq!(info.owner, owner);
+        assert_eq!(info.size, size);
+
+        cancellation.cancel();
+        assert!(received_cancellation.is_cancelled());
+    }
+
+    assert!(executor.invocations().is_empty());
+}
+
+/// 经公开 service 入口解析 Docker 标准 Compose 标签，并要求它优先于并存的历史标签。
 #[tokio::test]
 async fn docker_ndjson_maps_string_names_labels_and_ports() {
     let stdout = concat!(
@@ -316,7 +436,8 @@ async fn docker_ndjson_maps_string_names_labels_and_ports() {
         "\"Ports\":\"0.0.0.0:8080->80/tcp, :::8443->443/tcp\",",
         "\"Labels\":\"com.docker.compose.project=demo,com.docker.compose.service=web,",
         "com.docker.compose.project.working_dir=/srv/demo,",
-        "com.docker.compose.config_files=/srv/demo/compose.yml,/srv/demo/override.yml\"}\n",
+        "com.docker.compose.project.config_files=/srv/demo/compose.yml,/srv/demo/override.yml,",
+        "com.docker.compose.config_files=/legacy/compose.yml\"}\n",
         "\n",
         "{\"ID\":\"1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",",
         "\"Names\":\"docker-worker\",\"Image\":\"busybox:latest\",\"Status\":\"Exited (0)\",",
@@ -356,7 +477,7 @@ async fn docker_ndjson_maps_string_names_labels_and_ports() {
     assert_list_invocation(&executor, ContainerRuntime::Docker);
 }
 
-/// 经公开 service 入口解析 Podman 3.4.4 的数组、名称数组、标签 map 和端口映射数组。
+/// 经公开 service 入口解析 Podman 3.4.4 数组形状，并保留仅有历史 Compose 标签时的兼容回退。
 #[tokio::test]
 async fn podman_array_maps_null_and_populated_runtime_fields() {
     let stdout = br#"[
@@ -437,6 +558,36 @@ async fn podman_array_maps_null_and_populated_runtime_fields() {
     assert_eq!(rows[2].name, "podman-no-mappings");
     assert!(rows[2].labels.is_empty());
     assert!(rows[2].ports.is_empty());
+}
+
+/// 本次 inspect 自带标签供详情展示；UI 扩展不改变既有 MCP 序列化字段集合。
+#[tokio::test]
+async fn inspect_labels_share_the_exact_target_and_preserve_the_external_projection() {
+    let stdout = br#"[{"Id":"0123456789abcdef","Name":"/fixture","Config":{"Image":"alpine","Labels":{"fixture.owner":"right-rail","fixture.kind":"inspect"}},"State":{"Status":"running","Running":true}}]"#;
+    let (service, _) = service(stdout);
+    let target = ContainerTarget {
+        host_id: Some(HostId::new()),
+        runtime: ContainerRuntime::Docker,
+        container_id: "0123456789abcdef".to_owned(),
+    };
+    let details = service
+        .inspect(target.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(details.target, target);
+    assert_eq!(
+        details.labels,
+        vec![
+            ("fixture.kind".to_owned(), "inspect".to_owned()),
+            ("fixture.owner".to_owned(), "right-rail".to_owned()),
+        ]
+    );
+    let serialized = serde_json::to_value(&details).unwrap();
+    assert!(serialized.get("labels").is_none());
+    let restored: kerminal_domain::operations::ContainerInspect =
+        serde_json::from_value(serialized).unwrap();
+    assert!(restored.labels.is_empty());
+    assert_eq!(restored.target, details.target);
 }
 
 /// 两种 runtime 的合法空结果分别为空输出和 JSON 空数组。
@@ -781,7 +932,7 @@ fn container_target(runtime: ContainerRuntime) -> ContainerTarget {
 fn service(stdout: &[u8]) -> (ContainerRuntimeService, Arc<FixedCommandOutput>) {
     let executor = Arc::new(FixedCommandOutput::new(stdout.to_vec()));
     (
-        ContainerRuntimeService::new(executor.clone(), Arc::new(UnusedSessions)),
+        ContainerRuntimeService::new(executor.clone(), Arc::new(UnusedSessions::default())),
         executor,
     )
 }
@@ -796,7 +947,7 @@ fn service_with_exit_code(
         exit_code,
     ));
     (
-        ContainerRuntimeService::new(executor.clone(), Arc::new(UnusedSessions)),
+        ContainerRuntimeService::new(executor.clone(), Arc::new(UnusedSessions::default())),
         executor,
     )
 }
@@ -814,7 +965,7 @@ fn service_with_result(
         exit_code,
     ));
     (
-        ContainerRuntimeService::new(executor.clone(), Arc::new(UnusedSessions)),
+        ContainerRuntimeService::new(executor.clone(), Arc::new(UnusedSessions::default())),
         executor,
     )
 }

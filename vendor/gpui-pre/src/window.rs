@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -45,6 +47,7 @@ use refineable::Refineable;
 use scheduler::Instant;
 use slotmap::SlotMap;
 use smallvec::SmallVec;
+
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
@@ -2901,6 +2904,17 @@ impl Window {
         self.platform_window.bounds()
     }
 
+    /// Returns the current frame bounds for a debug selector without exposing or changing frame state.
+    ///
+    /// The test-support gate keeps selector inspection out of production builds while allowing
+    /// acceptance drivers to dispatch input at the exact rendered control.
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "test-support")]
+    pub fn debug_selector_bounds(&self, selector: &str) -> Option<Bounds<Pixels>> {
+        self.rendered_frame.debug_bounds.get(selector).copied()
+    }
+
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
@@ -4797,6 +4811,94 @@ impl Window {
         } else {
             vertical_band
         }
+    }
+
+    /// Paint an opt-in Gaussian backdrop filter; radius is its standard deviation in logical pixels before display scaling.
+    ///
+    /// Scene ordering includes the sampling support and advances active layers so the child surface always paints above.
+    #[cfg(target_os = "windows")]
+    pub fn paint_backdrop_filter(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        radius: Pixels,
+        corner_radii: Corners<Pixels>,
+        saturation: f32,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let opacity = self.element_opacity();
+        if opacity <= 0. {
+            return;
+        }
+
+        let snapped_bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        let clipped_bounds = snapped_bounds.intersect(&content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return;
+        }
+
+        let scale_factor = self.scale_factor();
+        let blur_radius = if radius.0.is_finite() {
+            radius.0.clamp(0., 128.) * scale_factor
+        } else {
+            0.
+        };
+        let saturation = if saturation.is_finite() {
+            saturation.clamp(0., 2.)
+        } else {
+            1.
+        };
+        let filter = crate::scene::BackdropFilter {
+            order: 0,
+            mode: 2,
+            bounds: snapped_bounds,
+            content_mask,
+            corner_radii: corner_radii
+                .scale(scale_factor)
+                .clamp_radii_for_quad_size(snapped_bounds.size),
+            blur_radius,
+            saturation,
+            opacity,
+            pad: 0,
+        };
+
+        self.next_frame.scene.insert_primitive(filter);
+    }
+
+    /// Keep blur and filter on one scene path so radius, clipping, and platform fallback cannot drift.
+    #[cfg(target_os = "windows")]
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        radius: Pixels,
+        corner_radii: Corners<Pixels>,
+    ) {
+        self.paint_backdrop_filter(bounds, radius, corner_radii, 1.);
+    }
+
+    /// Keep the cross-platform API stable; only the Windows renderer implements backdrop filtering.
+    #[cfg(not(target_os = "windows"))]
+    pub fn paint_backdrop_filter(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        radius: Pixels,
+        corner_radii: Corners<Pixels>,
+        saturation: f32,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let _ = (bounds, radius, corner_radii, saturation);
+    }
+
+    /// Preserve the same call contract where the platform renderer intentionally treats filters as no-ops.
+    #[cfg(not(target_os = "windows"))]
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        radius: Pixels,
+        corner_radii: Corners<Pixels>,
+    ) {
+        self.paint_backdrop_filter(bounds, radius, corner_radii, 1.);
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.

@@ -113,6 +113,7 @@ pub(super) fn handle_operations_event(
         OperationsEvent::OpenComposeConfigRequested {
             endpoint,
             selection_name,
+            root_path,
             container_panel_context,
         } => {
             if container_context_is_current(
@@ -122,7 +123,30 @@ pub(super) fn handle_operations_event(
                 true,
                 cx,
             ) {
-                open_compose_config(root, endpoint.clone(), selection_name, window, cx);
+                open_compose_config(
+                    root,
+                    endpoint.clone(),
+                    selection_name,
+                    root_path.as_deref(),
+                    window,
+                    cx,
+                );
+            }
+        }
+        OperationsEvent::ComposeYamlPreviewRequested {
+            context,
+            request_id,
+            endpoint,
+        } => {
+            if container_context_is_current(root, operations_view, context.as_ref(), true, cx) {
+                read_compose_yaml_preview(
+                    root,
+                    operations_view,
+                    *request_id,
+                    endpoint.clone(),
+                    window,
+                    cx,
+                );
             }
         }
         OperationsEvent::SendTmuxQuickrefRequested {
@@ -159,6 +183,36 @@ pub(super) fn handle_operations_event(
                 open_operation_terminal(root, container_exec_intent(target, command), window, cx);
             }
         }
+        OperationsEvent::ContainerLogsRequested {
+            container_panel_context,
+            target,
+            name,
+        } => {
+            if container_context_is_current(
+                root,
+                operations_view,
+                container_panel_context.as_ref(),
+                true,
+                cx,
+            ) {
+                open_operation_terminal(root, container_logs_intent(target, name), window, cx);
+            }
+        }
+        OperationsEvent::ContainerPinRequested {
+            context,
+            target,
+            container,
+        } => {
+            if container_context_is_current(root, operations_view, context.as_ref(), true, cx) {
+                super::connections::pin_container_from_operations(
+                    root,
+                    context.as_ref(),
+                    target,
+                    container,
+                    cx,
+                );
+            }
+        }
         OperationsEvent::TmuxAttachRequested {
             target,
             session_id,
@@ -180,20 +234,8 @@ pub(super) fn handle_operations_event(
                 root.request_workspace_pane_focus(tab_id.clone(), pane_id.clone(), window, cx);
             }
         }
-        OperationsEvent::TmuxDetachCurrentRequested {
-            target,
-            session_id,
-            terminal,
-        } => {
-            detach_tmux_in_current_terminal(
-                root,
-                target,
-                session_id,
-                terminal,
-                operations_view,
-                window,
-                cx,
-            );
+        OperationsEvent::TmuxDetachCurrentRequested { target, terminal } => {
+            detach_tmux_in_current_terminal(root, target, terminal, operations_view, window, cx);
         }
     }
 }
@@ -231,7 +273,7 @@ fn container_context_is_current(
     allowed
 }
 
-/// 只比较三份同源身份；读取可落在当前容器，改变容器或打开文件/终端只能来自宿主管理模式。
+/// 写请求比较来源、冻结意图和 Root 当前上下文；WorkspaceHost 的 tab/host 身份必须逐项一致。
 ///
 /// @author kongweiguang
 fn container_context_allows_request(
@@ -245,19 +287,114 @@ fn container_context_allows_request(
             && expected == fresh
             && matches!(
                 fresh,
-                ContainerPanelContext::Host { .. } | ContainerPanelContext::ContainerInfo { .. }
+                ContainerPanelContext::Host { .. }
+                    | ContainerPanelContext::WorkspaceHost { .. }
+                    | ContainerPanelContext::ContainerInfo { .. }
             )
-            && (!require_host || matches!(fresh, ContainerPanelContext::Host { .. }))
+            && (!require_host
+                || matches!(
+                    fresh,
+                    ContainerPanelContext::Host { .. }
+                        | ContainerPanelContext::WorkspaceHost { .. }
+                ))
     })
 }
 
 /// Compose 文件只允许进入本机或 SSH 文件浏览器；容器 endpoint 属于不同文件系统，必须拒绝。
 ///
 /// @author kongweiguang
+fn read_compose_yaml_preview(
+    root: &RootView,
+    source: &Entity<OperationsView>,
+    request_id: u64,
+    endpoint: FileEndpoint,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+) {
+    let failure = if !is_host_file_endpoint(&endpoint) {
+        Some("Compose 配置必须来自本机或 SSH 主机文件。")
+    } else {
+        match (source.read(cx).container_panel_context(), &endpoint) {
+            (
+                Some(ContainerPanelContext::Host { host_id: None, .. }),
+                FileEndpoint::Local { .. },
+            )
+            | (None, _) => None,
+            (
+                Some(ContainerPanelContext::Host {
+                    host_id: Some(expected),
+                    ..
+                }),
+                FileEndpoint::Remote { host_id, .. },
+            ) if expected == host_id => None,
+            (
+                Some(ContainerPanelContext::WorkspaceHost {
+                    host_id: expected, ..
+                }),
+                FileEndpoint::Remote { host_id, .. },
+            ) if expected == host_id => None,
+            _ => Some("Compose 配置目标已变化，请重新选择项目。"),
+        }
+    };
+    if let Some(message) = failure {
+        source.update(cx, |view, cx| {
+            view.report_compose_yaml_preview(
+                request_id,
+                endpoint,
+                Err(message.to_owned()),
+                window,
+                cx,
+            );
+        });
+        return;
+    }
+    let Some(files) = root.services.files.clone() else {
+        source.update(cx, |view, cx| {
+            view.report_compose_yaml_preview(
+                request_id,
+                endpoint,
+                Err("文件与传输服务尚未装配。".to_owned()),
+                window,
+                cx,
+            );
+        });
+        return;
+    };
+    let executor = root.services.executor.clone();
+    let source = source.downgrade();
+    let window_handle = window.window_handle();
+    let read_endpoint = endpoint.clone();
+    cx.spawn(async move |_, cx| {
+        let result = executor
+            .run(move |cancellation| async move {
+                files
+                    .preview_file(
+                        cancellation,
+                        read_endpoint,
+                        crate::features::operations::COMPOSE_YAML_PREVIEW_MAX_BYTES,
+                    )
+                    .await
+            })
+            .await
+            .map_err(|error| error.public_message().to_owned());
+        let _ = window_handle.update(cx, |_, window, app| {
+            let _ = source.update(app, |view, cx| {
+                view.report_compose_yaml_preview(request_id, endpoint, result, window, cx)
+            });
+        });
+    })
+    .detach();
+}
+
+/// Compose YAML 与 main 一样打开中央只读文件 Tab；保留冻结端点，不转向共享 SFTP 浏览器。
+/// 描述登记与工作区快照提交必须同时成功，失败时撤销本轮登记，已存在的同源标签直接激活。
+///
+/// @author kongweiguang
 fn open_compose_config(
     root: &mut RootView,
     endpoint: FileEndpoint,
     selection_name: &str,
+    configured_root_path: Option<&str>,
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) {
@@ -269,26 +406,99 @@ fn open_compose_config(
         cx.notify();
         return;
     }
-    let Some(files_pane) = root.files_pane.clone() else {
+    if root.file_editor_workspace.is_none() {
         root.status = Some(crate::locale::text(
-            "文件与传输服务尚未装配。",
-            "File and transfer services are unavailable.",
+            "文件编辑服务尚未配置。",
+            "The file editor service is unavailable.",
         ));
         cx.notify();
         return;
-    };
-    let selection_name = selection_name.to_owned();
-    match files_pane.update(cx, |pane, cx| {
-        pane.open_endpoint_with_selection(endpoint, Some(selection_name), cx)
-    }) {
-        Ok(()) => {
-            root.open_shared_sftp_workbench(window, cx);
-        }
-        Err(error) => {
-            root.status = Some(error.public_message().to_owned().into());
-            cx.notify();
-        }
     }
+    let (target, path, machine_id, root_path) = match &endpoint {
+        FileEndpoint::Remote { host_id, path } => (
+            WorkspaceTargetRef::Ssh {
+                host_id: host_id.clone(),
+            },
+            path.to_string(),
+            host_id.as_str().to_owned(),
+            path.parent().map(|parent| parent.to_string()),
+        ),
+        FileEndpoint::Local { path } => (
+            WorkspaceTargetRef::Local { profile_id: None },
+            path.to_string_lossy().into_owned(),
+            "local".to_owned(),
+            path.parent()
+                .map(|parent| parent.to_string_lossy().into_owned()),
+        ),
+        FileEndpoint::Container { .. } => return,
+    };
+    let root_path = configured_root_path.map(str::to_owned).or(root_path);
+    let Some(controller) = root.workspace_controller.as_ref() else {
+        root.status = Some("工作区尚未就绪，未打开 Compose YAML。".into());
+        cx.notify();
+        return;
+    };
+    use kerminal_application::workspace::{
+        WorkspaceFileAccess, WorkspaceFileSource, WorkspaceSessionTab,
+    };
+    if let Some(id) = controller
+        .snapshot()
+        .terminal_tabs
+        .iter()
+        .find_map(|tab| match tab {
+            WorkspaceSessionTab::WorkspaceFile {
+                id,
+                target: candidate,
+                path: candidate_path,
+                source: WorkspaceFileSource::ComposeYaml,
+                access: WorkspaceFileAccess::Readonly,
+                ..
+            } if candidate == &target && candidate_path == &path => Some(id.clone()),
+            _ => None,
+        })
+    {
+        // 去重后仍须先提交 controller 的活动身份；只投影编辑器会在下一帧被原 Tab 覆盖。
+        let event = crate::features::workspace_tabs::WorkspaceTabEvent::Activate(id.clone());
+        if root.handle_workspace_tab_event(&event, window, cx) {
+            root.activate_workspace_tab(&id, window, cx);
+        }
+        return;
+    }
+    let mut snapshot = controller.snapshot().clone();
+    let id = kerminal_domain::identity::TabId::new();
+    let tab = WorkspaceSessionTab::WorkspaceFile {
+        id: id.clone(),
+        tab_group_id: None,
+        title: selection_name.to_owned(),
+        machine_id,
+        target,
+        path,
+        root_path,
+        access: WorkspaceFileAccess::Readonly,
+        source: WorkspaceFileSource::ComposeYaml,
+    };
+    snapshot.terminal_tabs.push(tab.clone());
+    snapshot.active_tab_id = Some(id.clone());
+    snapshot.focused_pane_id = None;
+    if !root.workspace_files.register_pending_compose_yaml_tab(tab) {
+        root.status = Some("文件工作区尚未就绪，未打开 Compose YAML。".into());
+        cx.notify();
+        return;
+    }
+    if let Err(error) = root
+        .workspace_controller
+        .as_mut()
+        .expect("controller was checked above")
+        .synchronize_snapshot(snapshot)
+    {
+        root.remove_workspace_file_tab_after_close(&id);
+        root.status = Some(error.public_message().to_owned().into());
+        cx.notify();
+        return;
+    }
+    root.refresh_workspace_views(cx);
+    root.activate_workspace_tab(&id, window, cx);
+    root.persist_workspace_snapshot(cx);
 }
 
 /// Compose 只接受宿主文件系统端点，避免把 host 路径错送到容器文件浏览器。
@@ -435,7 +645,7 @@ fn tmux_quickref_is_current(
     pane_id: &kerminal_domain::identity::PaneId,
     binding: &UiSessionBinding,
     target: &TmuxTarget,
-    session_id: &str,
+    _session_id: &str,
 ) -> bool {
     if root.center_panel != CenterPanel::Terminal {
         return false;
@@ -458,9 +668,6 @@ fn tmux_quickref_is_current(
         return false;
     }
     let Some(pane) = root.workspace_runtime.pane(pane_id) else {
-        return false;
-    };
-    let Some(persisted_tmux) = pane.persisted.tmux_binding.as_ref() else {
         return false;
     };
     let expected_owner = SessionOwner::Ui {
@@ -490,7 +697,8 @@ fn tmux_quickref_is_current(
         && binding.owner == expected_owner
         && registration.binding == *binding
         && target_is_same_transport
-        && tmux_binding_matches_request(persisted_tmux, target, session_id)
+        && focused_tmux_attach_binding(root)
+            .is_some_and(|terminal| terminal.target.matches_tmux_target(target))
 }
 
 /// 比较 tmux attach 时保存的目标身份，不能因当前侧栏主机变化而把快捷内容转投到另一连接。
@@ -553,7 +761,6 @@ pub(super) fn focused_tmux_quickref_binding(
     let pane = root.workspace_runtime.pane(pane_id)?;
     if pane.tab_id != *tab_id
         || pane.phase != RuntimePanePhase::Ready
-        || pane.persisted.tmux_binding.is_none()
         || !matches!(
             pane.target.as_ref(),
             Some(SessionTarget::Ssh(_) | SessionTarget::Local(_))
@@ -576,6 +783,36 @@ pub(super) fn focused_tmux_quickref_binding(
         pane_id: pane_id.clone(),
         binding,
     })
+}
+
+/// 当前会话标记只接受精确 focused pane 的 tmux 持久绑定，不从面板最近点击的行猜测。
+/// @author kongweiguang
+pub(super) fn focused_tmux_current_session_id(root: &RootView) -> Option<String> {
+    let terminal = focused_tmux_attach_binding(root)?;
+    let pane = root.workspace_runtime.pane(&terminal.pane_id)?;
+    let binding = pane.persisted.tmux_binding.as_ref()?;
+    tmux_binding_matches_request(
+        binding,
+        &terminal.target.to_tmux_target(),
+        &binding.session_id,
+    )
+    .then(|| binding.session_id.clone())
+}
+
+/// 名称仅用于 main 的当前行显示回退；沿用精确 pane/host 校验，命令执行仍使用快照中的会话 ID。
+///
+/// @author kongweiguang
+pub(super) fn focused_tmux_current_session_name(root: &RootView) -> Option<String> {
+    let terminal = focused_tmux_attach_binding(root)?;
+    let pane = root.workspace_runtime.pane(&terminal.pane_id)?;
+    let binding = pane.persisted.tmux_binding.as_ref()?;
+    let name = binding.session_name.trim();
+    (tmux_binding_matches_request(
+        binding,
+        &terminal.target.to_tmux_target(),
+        &binding.session_id,
+    ) && !name.is_empty())
+    .then(|| binding.session_name.clone())
 }
 
 /// Project only the focused, Ready host-local or SSH pane; typed target and owner prevent cross-pane fallback.
@@ -761,6 +998,46 @@ fn container_exec_intent(target: &ContainerTarget, command: &[String]) -> Worksp
     }
 }
 
+/// 日志在新的宿主终端持续输出，标题沿用发起时的容器名称；命令不进入工作区恢复重放路径。
+/// @author kongweiguang
+fn container_logs_intent(target: &ContainerTarget, name: &str) -> WorkspaceTerminalIntent {
+    let workspace_target = target
+        .host_id
+        .as_ref()
+        .map(|host_id| WorkspaceTargetRef::Ssh {
+            host_id: host_id.clone(),
+        });
+    let pane = workspace_pane(
+        target
+            .host_id
+            .as_ref()
+            .map_or_else(|| "machine-local".to_owned(), |id| id.as_str().to_owned()),
+        if target.host_id.is_some() {
+            WorkspacePaneMode::Ssh
+        } else {
+            WorkspacePaneMode::Local
+        },
+        workspace_target.or(Some(WorkspaceTargetRef::Local { profile_id: None })),
+        target.host_id.clone(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    WorkspaceTerminalIntent {
+        pane,
+        title: format!("{name} logs"),
+        kind: WorkspaceTerminalOpenKind::ContainerLogs {
+            target: target.clone(),
+        },
+        transient: true,
+    }
+}
+
 /// 只在精确 pane binding 和可信 shell 方言都匹配时向原 pane 排队；仅在命令和回车均排队后返回绑定，供宿主恢复原 pane 焦点。
 ///
 /// @author kongweiguang
@@ -870,28 +1147,26 @@ fn attach_tmux_in_current_terminal(
 }
 
 /// 分离只向原 pane 的 FIFO 发送默认前缀按键，不以主机 clients 数猜测 client，也不在未知 shell 提交 detach 命令。
-/// attach intent 仅代表先前排队；失败和半次按键都保留核对提示，不宣称已断开或自动重放。
+/// 点击时冻结的 pane owner/generation 在入队前再次核对；失败和半次按键不会自动改投或重放。
 ///
 /// @author kongweiguang
 fn detach_tmux_in_current_terminal(
     root: &mut RootView,
     target: &TmuxTarget,
-    session_id: &str,
     terminal: &TmuxAttachTerminalBinding,
     operations_view: &Entity<OperationsView>,
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) {
     let binding = current_tmux_terminal_binding(root, target, terminal);
-    if !valid_tmux_session_id(session_id)
-        || root.tool_panel_overlay_focus_is_blocked(window, cx)
+    if root.tool_panel_overlay_focus_is_blocked(window, cx)
         || binding.is_none()
         || !operations_view
             .read(cx)
-            .tmux_detach_request_is_current(target, session_id, terminal)
+            .tmux_detach_request_is_current(target, terminal)
     {
         operations_view.update(cx, |view, cx| {
-            view.report_tmux_detach_current_result(target, session_id, terminal, false, cx);
+            view.report_tmux_detach_current_result(target, terminal, false, cx);
         });
         root.status = Some(crate::locale::text(
             "当前终端或目标已变化；tmux 分离按键未发送，请重新核对。",
@@ -901,21 +1176,10 @@ fn detach_tmux_in_current_terminal(
         return;
     }
     let binding = binding.expect("validated current terminal binding");
-    let events = [
-        TerminalInputEvent::Key(TerminalKeyEvent {
-            key: TerminalKey::Character('b'),
-            phase: KeyPhase::Press,
-            modifiers: InputModifiers {
-                control: true,
-                ..InputModifiers::default()
-            },
-        }),
-        tmux_shortcut_key_event('d'),
-    ];
-    for event in events {
+    for event in tmux_detach_key_events() {
         if !enqueue_tmux_event(root, &binding, event, cx) {
             operations_view.update(cx, |view, cx| {
-                view.report_tmux_detach_current_result(target, session_id, terminal, false, cx);
+                view.report_tmux_detach_current_result(target, terminal, false, cx);
             });
             root.status = Some(crate::locale::text(
                 "分离按键未能完整排队；请核对原终端，不会自动重放。",
@@ -926,13 +1190,30 @@ fn detach_tmux_in_current_terminal(
         }
     }
     operations_view.update(cx, |view, cx| {
-        view.report_tmux_detach_current_result(target, session_id, terminal, true, cx);
+        view.report_tmux_detach_current_result(target, terminal, true, cx);
     });
     if let SessionOwner::Ui { tab_id, pane_id } = &binding.owner {
         root.focused_agent_terminal = false;
         root.request_workspace_pane_focus(tab_id.clone(), pane_id.clone(), window, cx);
     }
     cx.notify();
+}
+
+/// 按 main 的分离行为生成同一 FIFO 中的 Ctrl-B 与 d 两个按键事件，不发送 shell 命令。
+///
+/// @author kongweiguang
+fn tmux_detach_key_events() -> [TerminalInputEvent; 2] {
+    [
+        TerminalInputEvent::Key(TerminalKeyEvent {
+            key: TerminalKey::Character('b'),
+            phase: KeyPhase::Press,
+            modifiers: InputModifiers {
+                control: true,
+                ..InputModifiers::default()
+            },
+        }),
+        tmux_shortcut_key_event('d'),
+    ]
 }
 
 /// 只读取与活动 session、owner 和 generation 完全一致的服务上下文，禁止按本机或 SSH 猜测方言。

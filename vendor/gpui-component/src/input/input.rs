@@ -115,6 +115,7 @@ pub struct Input {
     id: Option<ElementId>,
     state: TextInputState,
     style: StyleRefinement,
+    hover_style: Option<StyleRefinement>,
     size: Size,
     prefix: Option<AnyElement>,
     suffix: Option<AnyElement>,
@@ -209,6 +210,14 @@ impl Input {
         self
     }
 
+    /// 设置指针悬停时合并到输入外框的样式；默认不覆盖现有外观，禁用时不应用。
+    ///
+    /// @author kongweiguang
+    pub fn hover_style(mut self, style: StyleRefinement) -> Self {
+        self.hover_style = Some(style);
+        self
+    }
+
     /// Create a new [`Input`] element bind to the [`InputState`].
     pub fn new(state: &Entity<InputState>) -> Self {
         Self::with_state(state.clone().into())
@@ -222,12 +231,16 @@ impl Input {
         Self::with_state(state.into())
     }
 
+    /// 缺省不附加悬停 refinement，保持未显式配置的输入沿用 Kit 原有呈现。
+    ///
+    /// @author kongweiguang
     fn with_state(state: TextInputState) -> Self {
         Self {
             id: None,
             state,
             size: Size::default(),
             style: StyleRefinement::default(),
+            hover_style: None,
             prefix: None,
             suffix: None,
             height: None,
@@ -533,6 +546,9 @@ impl Styled for Input {
 }
 
 impl RenderOnce for Input {
+    /// 将可选 hover refinement 施加到底层 BaseInput 外框，并在实际禁用状态跳过它。
+    ///
+    /// @author kongweiguang
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         const LINE_HEIGHT: Rems = Rems(1.25);
         let text_align = self.style.text.text_align.unwrap_or(TextAlign::Left);
@@ -673,6 +689,7 @@ impl RenderOnce for Input {
             .extend(Self::render_touch_selection(&state, window, cx));
 
         let presentation = state.presentation(cx);
+        let hover_style = self.hover_style.filter(|_| !presentation.is_disabled());
         let content_type = self.content_type;
         let disabled = self.disabled;
         let is_multi_line = presentation.is_multi_line();
@@ -801,6 +818,9 @@ impl RenderOnce for Input {
             .items_center()
             .gap(gap_x)
             .refine_style(&self.style)
+            .when_some(hover_style, |this, hover_style| {
+                this.hover(move |style| style.refine_style(&hover_style))
+            })
             .when(
                 focused && self.appearance && self.bordered && self.focus_bordered,
                 |this| this.focus_ring_style(window, cx),

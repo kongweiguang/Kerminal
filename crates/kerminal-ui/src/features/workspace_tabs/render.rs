@@ -54,6 +54,9 @@ type WorkspaceTabKeyboardTargets = Rc<Vec<(TabId, FocusHandle)>>;
 
 const WORKSPACE_TAB_BUTTON_WIDTH: f32 = 28.;
 const WORKSPACE_TAB_GAP: f32 = 4.;
+const WORKSPACE_TAB_HEIGHT: f32 = 36.;
+const WORKSPACE_TAB_PADDING_X: f32 = 10.;
+const WORKSPACE_TAB_CONTENT_GAP: f32 = 8.;
 const WORKSPACE_TAB_DRAG_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// 固定一帧内的新建目标目录、搜索和 owner，避免列表内容与重试来源来自不同快照。
@@ -173,7 +176,7 @@ struct TabDragPreview {
 impl Render for TabDragPreview {
     /// 用简短预览反馈拖动目标，不重建原标签或其关联运行态。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ThemeTokens::current(window, cx);
+        let theme = ThemeTokens::current(window, cx).for_workbench();
         div()
             .px_3()
             .py_2()
@@ -196,7 +199,7 @@ struct GroupDragPreview {
 impl Render for GroupDragPreview {
     /// 为分组排序显示轻量预览，拖动不会变更持久化快照。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ThemeTokens::current(window, cx);
+        let theme = ThemeTokens::current(window, cx).for_workbench();
         div()
             .px_3()
             .py_2()
@@ -408,9 +411,9 @@ impl WorkspaceTabs {
     /// 右键菜单捕获稳定身份；持久标签可拖动，共享 SFTP 临时视图固定在自己的工作台入口中。
     /// 标题用可聚焦 Tab 语义承载切换和拖动；未修饰的键盘激活复用同一事件，组合键交给 Root/系统。
     /// 每个 Tab 使用稳定焦点句柄；每次裸方向键/Home/End都用真实边界最小滚动，包括焦点已在目标的情况。
-    /// 活动外框保留透明一像素边框以固定关闭按钮几何，表面只由内层主体和外弧绘制，避免整栏重复轮廓。
+    /// 外框统一使用 main 的高度、圆角和内距，关闭命中区独立保留 22px，末项不会贴右缘。
     /// 拖放边界绑定到完整标签外框，关闭按钮仍独立接收点击。
-    /// 活动标签只保留顶部圆角和直落到底的侧边，让标签栏与工作区自然衔接且不改命中范围。
+    /// 标签本身不叠加组内横向留白；分隔线到首项的距离由工作台唯一外层提供。
     ///
     /// @author kongweiguang
     fn render_tab(
@@ -463,7 +466,6 @@ impl WorkspaceTabs {
             .h_full()
             .flex_1()
             .min_w(px(0.))
-            .px_2()
             .flex()
             .items_center()
             .gap_2()
@@ -577,10 +579,10 @@ impl WorkspaceTabs {
             .flex_none()
             .flex()
             .items_center()
-            .gap_1()
-            .h(px(36.))
-            .px_2()
-            .rounded_lg()
+            .gap(px(WORKSPACE_TAB_CONTENT_GAP))
+            .h(px(WORKSPACE_TAB_HEIGHT))
+            .px(px(WORKSPACE_TAB_PADDING_X))
+            .rounded(theme.radius)
             .border_1()
             .border_color(if active {
                 theme.background.opacity(0.)
@@ -653,13 +655,9 @@ impl WorkspaceTabs {
                 div()
                     .absolute()
                     .debug_selector(move || active_body_selector.clone())
-                    .left_2()
-                    .right_2()
-                    .top_0()
-                    .bottom_0()
-                    .rounded_t_lg()
+                    .inset_0()
+                    .rounded(theme.radius)
                     .border_1()
-                    .border_b_0()
                     .border_color(theme.border)
                     .bg(theme.background),
             )
@@ -733,7 +731,7 @@ impl WorkspaceTabs {
                 tabs.push(self.render_tab(index, theme, keyboard_targets.clone(), cx));
                 previous_index = Some(index);
             }
-            let region = div().px_2().flex().items_center().gap_0().children(tabs);
+            let region = div().flex().items_center().gap_0().children(tabs);
             let region = match (reveal_index, tab_reveal) {
                 (Some(index), Some(TabRevealMeasurement { bounds, .. })) => region
                     .on_children_prepainted(move |children, _, _| {
@@ -988,7 +986,7 @@ impl WorkspaceTabs {
             tab_row.push(self.render_tab(index, theme, keyboard_targets.clone(), cx));
             previous_index = Some(index);
         }
-        let tab_row = div().px_2().flex().items_center().gap_0().children(tab_row);
+        let tab_row = div().flex().items_center().gap_0().children(tab_row);
         let tab_row = match (reveal_index, tab_reveal) {
             (Some(index), Some(TabRevealMeasurement { bounds, .. })) => tab_row
                 .on_children_prepainted(move |children, _, _| {
@@ -1057,7 +1055,7 @@ impl Render for WorkspaceTabs {
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reconcile_tab_focus_handles(cx);
-        let theme = ThemeTokens::current(window, cx);
+        let theme = ThemeTokens::current(window, cx).for_workbench();
         let scroll_max = self.scroll_handle.max_offset().x;
         let picker_visible = self.show_tab_picker;
         let pending_tab_reveal = self.pending_tab_reveal.clone();
@@ -1363,7 +1361,7 @@ impl Render for WorkspaceTabs {
                     )
                 })
                 .unwrap_or_default();
-            let create_theme = ThemeTokens::current(window, cx);
+            let create_theme = ThemeTokens::current(window, cx).for_workbench();
             let create_query = self.create_target_query.clone();
             let target_list_tabs = tabs_entity.clone();
             let create_content =
@@ -1458,7 +1456,7 @@ impl Render for WorkspaceTabs {
                     .w_full()
                     .min_w(px(0.))
                     .h(px(36.))
-                    .px_2()
+                    .pr_2()
                     .flex()
                     .items_center()
                     .gap_1()
@@ -1519,7 +1517,7 @@ impl Render for WorkspaceTabs {
                     .w_full()
                     .min_w(px(0.))
                     .h(px(36.))
-                    .px_2()
+                    .pr_2()
                     .flex()
                     .items_center()
                     .gap_1()
@@ -1531,6 +1529,7 @@ impl Render for WorkspaceTabs {
         };
         div()
             .id("workspace-tabs-view")
+            .debug_selector(|| "workspace-tabs-view".to_owned())
             .w_full()
             .min_w(px(0.))
             .h_full()

@@ -1370,7 +1370,8 @@ impl TransferService {
         }
     }
 
-    /// 申请全局和按 HostId 排序的 per-host 许可，防止跨主机复制产生死锁。
+    /// 申请共享计数下的入队快照许可，防止跨主机复制死锁及配置版本间重复计算活动任务。
+    /// @author kongweiguang
     async fn acquire_permits(
         &self,
         request: &TransferRequest,
@@ -1379,7 +1380,7 @@ impl TransferService {
         destination_sftp: Option<&HostSftpOptions>,
         cancellation: &CancellationToken,
     ) -> Result<AttemptPermit, ()> {
-        if sftp_policy.is_some() {
+        if let Some(snapshot) = sftp_policy {
             let hosts = [
                 (&request.source, source_sftp),
                 (&request.destination, destination_sftp),
@@ -1396,7 +1397,7 @@ impl TransferService {
             let permit = self
                 .inner
                 .sftp_policy
-                .acquire_with_host_limits(hosts, cancellation)
+                .acquire_with_host_limits_at_snapshot(hosts, snapshot, cancellation)
                 .await
                 .map_err(|_| ())?;
             return Ok(AttemptPermit {

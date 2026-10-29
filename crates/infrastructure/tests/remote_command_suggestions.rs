@@ -46,7 +46,7 @@ fn test_host_id() -> HostId {
 
 /// 为远端路径测试装配只读内存 listing，计数用于验证关闭策略不会发起 I/O。
 fn provider(
-    enabled: bool,
+    runtime_available: bool,
     list_calls: Arc<AtomicUsize>,
 ) -> (
     RemoteCommandSuggestionProvider,
@@ -56,7 +56,7 @@ fn provider(
     Arc<FakeRemoteState>,
 ) {
     provider_with_shell(
-        enabled,
+        runtime_available,
         list_calls,
         RemoteShellKind::Bash,
         RemoteShellDialect::Posix,
@@ -66,7 +66,7 @@ fn provider(
 
 /// 为连接边界测试设置可信 shell 元数据与可取消行为，仍只使用内存 lease。
 fn provider_with_shell(
-    enabled: bool,
+    runtime_available: bool,
     list_calls: Arc<AtomicUsize>,
     shell_kind: RemoteShellKind,
     shell_dialect: RemoteShellDialect,
@@ -88,7 +88,7 @@ fn provider_with_shell(
         Arc::new(FakeBookmarks),
     )
     .expect("fake file service is valid");
-    let policy = RemoteSuggestionPolicy::new(enabled);
+    let policy = RemoteSuggestionPolicy::new(runtime_available);
     let connect_calls = Arc::new(AtomicUsize::new(0));
     let command_calls = Arc::new(AtomicUsize::new(0));
     let state = Arc::new(FakeRemoteState {
@@ -539,9 +539,9 @@ impl RemoteCommandStream for FakeSuggestionStream {
     }
 }
 
-/// 关闭 remoteProbe 后不查询目录；动态重新开启后才访问已绑定 SSH 的一层目录。
+/// 运行态门禁关闭时不访问目录；恢复可写后才访问已绑定 SSH 的一层目录。
 #[tokio::test]
-async fn remote_probe_policy_is_checked_before_io() {
+async fn runtime_gate_is_checked_before_remote_io() {
     let calls = Arc::new(AtomicUsize::new(0));
     let (service, policy, command_calls, connect_calls, _) = provider(false, calls.clone());
     let query = request("cd 文", vec![SuggestionProviderKind::RemotePath]);
@@ -556,7 +556,7 @@ async fn remote_probe_policy_is_checked_before_io() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-    policy.set_remote_probe_enabled(true);
+    policy.set_runtime_available(true);
     let candidates = service
         .suggest(query, cancellation)
         .await
@@ -573,44 +573,28 @@ async fn remote_probe_policy_is_checked_before_io() {
     assert_eq!(candidate.replacement_range.end, 4);
 }
 
-/// 来源级策略只阻断对应 adapter 查询，避免关闭单项建议误伤其它远端能力。
+/// 恢复态门禁关闭时路径、PATH 命令和 Git 三类远端来源都不触发 I/O。
 #[tokio::test]
-async fn provider_policy_disables_only_selected_remote_source() {
+async fn runtime_gate_blocks_all_remote_sources_before_io() {
     let list_calls = Arc::new(AtomicUsize::new(0));
-    let (service, policy, command_calls, connect_calls, _) = provider(true, list_calls.clone());
-    policy.set_remote_path_enabled(false);
-    policy.set_remote_command_enabled(false);
+    let (service, _, command_calls, connect_calls, _) = provider(false, list_calls.clone());
 
     let path = request("cd 文", vec![SuggestionProviderKind::RemotePath]);
     let commands = request("vi", vec![SuggestionProviderKind::RemoteCommand]);
     let git = request("git checkout feat", vec![SuggestionProviderKind::Git]);
-    assert!(
-        service
-            .suggest(path, CancellationToken::new())
-            .await
-            .expect("disabled path source returns empty")
-            .is_empty()
-    );
-    assert!(
-        service
-            .suggest(commands, CancellationToken::new())
-            .await
-            .expect("disabled command source returns empty")
-            .is_empty()
-    );
-    let git_candidates = service
-        .suggest(git, CancellationToken::new())
-        .await
-        .expect("enabled Git source remains available");
+    for query in [path, commands, git] {
+        assert!(
+            service
+                .suggest(query, CancellationToken::new())
+                .await
+                .expect("closed runtime gate returns empty")
+                .is_empty()
+        );
+    }
 
-    assert!(
-        git_candidates
-            .iter()
-            .any(|candidate| candidate.display_text == "feature/login")
-    );
     assert_eq!(list_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(command_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(command_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
 }
 
 /// 缺 session/generation 或超长输入的请求不绑定终端，也不触发无界解析。

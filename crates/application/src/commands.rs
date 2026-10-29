@@ -4,7 +4,10 @@
 //!
 //! @author kongweiguang
 
-use std::{sync::Arc, time::SystemTime};
+use std::{
+    sync::{Arc, RwLock},
+    time::SystemTime,
+};
 
 use async_trait::async_trait;
 use kerminal_domain::{
@@ -25,7 +28,10 @@ use kerminal_domain::{
 use crate::{
     AppError, AppResult, PublicErrorCode,
     configuration_changes::{ConfigurationChangeService, ConfigurationChangeSubscription},
-    preferences::PreferencesService,
+    preferences::{
+        PreferencesService, TerminalCommandSuggestionRemoteRefresh,
+        TerminalInlineSuggestionSettings,
+    },
     sessions::{SessionFilter, SessionService, UiSessionBinding, UiSnippetCommandLineRequest},
 };
 use tokio_util::sync::CancellationToken;
@@ -371,8 +377,97 @@ pub struct CommandsService {
     suggestion_feedback: Option<Arc<dyn CommandSuggestionFeedbackRepository>>,
     snippet_preferences: Option<Arc<dyn SnippetPreferenceRepository>>,
     configuration_changes: Option<ConfigurationChangeService>,
+    suggestion_settings_preview: SuggestionSettingsPreview,
     command_coordinator: coordinator::SessionCommandCoordinator,
 }
+
+/// Root 在设置预览更新时写入共享快照，终端查询只短暂持锁并复制设置值。
+#[derive(Clone, Default)]
+struct SuggestionSettingsPreview {
+    settings: Arc<RwLock<Option<TerminalInlineSuggestionSettings>>>,
+}
+
+impl SuggestionSettingsPreview {
+    /// 以最新预览覆盖前一快照，避免快速连续编辑累积未消费的配置事件。
+    fn update(&self, settings: &TerminalInlineSuggestionSettings) {
+        *self
+            .settings
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(settings.clone());
+    }
+
+    /// 复制当前快照后立即释放锁，禁止持锁跨越异步 provider 查询。
+    fn current(&self) -> Option<TerminalInlineSuggestionSettings> {
+        self.settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// 判断请求显式选择的来源是否包含远端能力；缺省列表按 provider 实际注册能力处理。
+fn request_has_remote_provider(
+    request: &CommandSuggestionRequest,
+    supported: &[SuggestionProviderKind],
+) -> bool {
+    request
+        .providers
+        .as_deref()
+        .unwrap_or(supported)
+        .iter()
+        .copied()
+        .any(is_remote_suggestion_provider)
+}
+
+/// 只将三类需要 SSH/SFTP 的来源纳入远端配置门禁，本地历史、片段和 spec 仍由请求方选择。
+fn is_remote_suggestion_provider(provider: SuggestionProviderKind) -> bool {
+    matches!(
+        provider,
+        SuggestionProviderKind::RemotePath
+            | SuggestionProviderKind::RemoteCommand
+            | SuggestionProviderKind::Git
+    )
+}
+
+/// 保留请求已选的本地来源，并对远端来源再次应用持久设置和配置恢复硬门禁。
+fn restrict_remote_providers_to_persisted_settings(
+    request: &mut CommandSuggestionRequest,
+    supported: Vec<SuggestionProviderKind>,
+    settings: Option<&TerminalInlineSuggestionSettings>,
+    runtime_available: bool,
+) {
+    let remote_enabled = runtime_available
+        && request.target == CommandHistoryTarget::Ssh
+        && request.remote_host_id.is_some()
+        && settings.is_some_and(|settings| {
+            settings.remote_probe_enabled
+                && settings.remote_refresh == TerminalCommandSuggestionRemoteRefresh::Safe
+        });
+    let requested = request.providers.take().unwrap_or(supported);
+    request.providers = Some(
+        requested
+            .into_iter()
+            .filter(|provider| match provider {
+                SuggestionProviderKind::RemotePath => {
+                    remote_enabled
+                        && settings.is_some_and(|settings| settings.providers.remote_path)
+                }
+                SuggestionProviderKind::RemoteCommand => {
+                    remote_enabled
+                        && settings.is_some_and(|settings| settings.providers.remote_command)
+                }
+                SuggestionProviderKind::Git => {
+                    remote_enabled && settings.is_some_and(|settings| settings.providers.git)
+                }
+                _ => true,
+            })
+            .collect(),
+    );
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/suggestion_policy.rs"]
+mod suggestion_policy_tests;
 
 impl CommandsService {
     /// 返回历史子系统启动状态，保留只读恢复或 SQLite 初始化故障的可见原因。
@@ -434,6 +529,7 @@ impl CommandsService {
             suggestion_feedback: None,
             snippet_preferences: None,
             configuration_changes: None,
+            suggestion_settings_preview: SuggestionSettingsPreview::default(),
             command_coordinator: coordinator::SessionCommandCoordinator::default(),
         }
     }
@@ -444,10 +540,15 @@ impl CommandsService {
         self
     }
 
-    /// 复用同一 settings 用例，使终端建议每次按文件中的用户策略实时筛选来源。
+    /// 复用同一 settings 用例；通用建议按持久策略筛选，终端预览可由 Root 单独覆盖。
     pub fn with_preferences(mut self, service: PreferencesService) -> Self {
         self.preferences = Some(service);
         self
+    }
+
+    /// 将设置面板当前快照提供给绑定 UI 的终端建议，不改变通用或 MCP 查询策略。
+    pub fn update_suggestion_settings(&self, settings: &TerminalInlineSuggestionSettings) {
+        self.suggestion_settings_preview.update(settings);
     }
 
     /// 让同一个 command.sqlite repository 同时承担建议反馈和保留期清理。
@@ -696,14 +797,40 @@ impl CommandsService {
         self.workflows.delete_versioned(workflow_id, revision).await
     }
 
-    /// 返回显式 session 上的建议候选，不从当前 Tab 或其它 session 猜目标。
+    /// 返回显式 session 上的建议候选；远端来源只按持久设置筛选，不读取 UI 预览。
     pub async fn suggestions(
         &self,
-        request: CommandSuggestionRequest,
+        mut request: CommandSuggestionRequest,
         cancellation: CancellationToken,
     ) -> AppResult<Vec<CommandSuggestionCandidate>> {
         if request.input.chars().count() > 4_000 {
             return Err(AppError::invalid("建议输入超过长度限制"));
+        }
+
+        if let Some(preferences) = &self.preferences {
+            let supported = self.suggestions.supported_providers();
+            if request_has_remote_provider(&request, &supported) {
+                let runtime_available = preferences.recovery_state().mode
+                    == kerminal_domain::preferences::ConfigurationMode::ReadWrite;
+                let settings = if runtime_available {
+                    Some(
+                        preferences
+                            .load_settings()
+                            .await?
+                            .settings
+                            .terminal
+                            .inline_suggestion,
+                    )
+                } else {
+                    None
+                };
+                restrict_remote_providers_to_persisted_settings(
+                    &mut request,
+                    supported,
+                    settings.as_ref(),
+                    runtime_available,
+                );
+            }
         }
         self.suggestions.suggest(request, cancellation).await
     }

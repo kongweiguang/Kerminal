@@ -291,7 +291,9 @@ pub struct ToolRailSettings {
 }
 
 impl Default for ToolRailSettings {
-    /// 沿用历史右栏顺序，并默认只将命令历史固定在底部。
+    /// 新配置只包含当前八个产品入口，并默认只将命令历史固定在底部。
+    ///
+    /// @author kongweiguang
     fn default() -> Self {
         let order = default_tool_rail_order();
         Self {
@@ -308,16 +310,10 @@ impl Default for ToolRailSettings {
 }
 
 impl ToolRailSettings {
-    /// 存量 Files 与 Containers 停靠值继续可读，但运行时投影固定到右侧抽屉，保留配置兼容性。
-    ///
-    /// 这是只读有效视图，不归一化或重写持久化的每工具位置表。
+    /// 停靠位置由每个工具独立决定，旧 Context 键只作为可读配置兼容项。
     ///
     /// @author kongweiguang
     pub fn effective_panel_placement(&self, tool: ToolRailToolId) -> ToolRailPanelPlacement {
-        if matches!(tool, ToolRailToolId::Sftp | ToolRailToolId::Containers) {
-            return ToolRailPanelPlacement::Attached;
-        }
-
         self.panel_placements
             .get(&tool)
             .copied()
@@ -345,8 +341,14 @@ impl ToolRailSettings {
                 hidden.push(tool);
             }
         }
-        if hidden.len() >= order.len()
-            && let Some(first) = order.first()
+        let customizable = order
+            .iter()
+            .copied()
+            .filter(|tool| *tool != ToolRailToolId::Context)
+            .collect::<Vec<_>>();
+        if !customizable.is_empty()
+            && customizable.iter().all(|tool| hidden.contains(tool))
+            && let Some(first) = customizable.first()
         {
             hidden.retain(|tool| tool != first);
         }
@@ -369,19 +371,18 @@ impl ToolRailSettings {
     }
 }
 
-/// 默认顺序保留旧版习惯，并将容器入口紧随文件工具，方便按工作场景切换。
+/// 新安装顺序与 main 右栏一致，容器入口位于八项工具末尾。
 ///
 /// @author kongweiguang
 fn default_tool_rail_order() -> Vec<ToolRailToolId> {
     vec![
-        ToolRailToolId::Context,
         ToolRailToolId::AgentLauncher,
         ToolRailToolId::Sftp,
-        ToolRailToolId::Containers,
         ToolRailToolId::Snippets,
         ToolRailToolId::Tmux,
         ToolRailToolId::Ports,
         ToolRailToolId::System,
         ToolRailToolId::Logs,
+        ToolRailToolId::Containers,
     ]
 }

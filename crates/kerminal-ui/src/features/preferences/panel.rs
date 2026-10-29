@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::collections::BTreeMap;
 
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, Focusable as _, SharedString, Subscription,
@@ -19,8 +19,7 @@ use kerminal_application::{
     configuration_changes::ConfigurationChangeService,
     configuration_directory::ConfigurationDirectoryService,
     configuration_sync::{
-        ConfigurationSyncOperationKind, ConfigurationSyncOperationResult, ConfigurationSyncService,
-        ConfigurationSyncStatus,
+        ConfigurationSyncOperationResult, ConfigurationSyncService, ConfigurationSyncStatus,
     },
     connections::credentials::{VaultKeyAvailability, VaultKeyManagementService},
     connections::management::{HostGroup, HostGroupSnapshot, HostManagementService},
@@ -40,18 +39,26 @@ use super::{ConfigDraft, DraftSnapshot, ProfileIssue, SettingsIssue};
 
 #[path = "panel/advanced.rs"]
 mod advanced;
+#[path = "panel/autosave.rs"]
+mod autosave;
 #[path = "panel/changes.rs"]
 mod changes;
 #[path = "panel/close.rs"]
 mod close;
+#[path = "panel/color_sampling.rs"]
+mod color_sampling;
+#[path = "panel/connectivity.rs"]
+mod connectivity;
 #[path = "panel/custom_agent.rs"]
 mod custom_agent;
+#[path = "panel/desktop_about.rs"]
+mod desktop_about;
 #[path = "panel/forms.rs"]
 mod forms;
 #[path = "panel/profiles.rs"]
 mod profiles;
 #[path = "panel/protocol.rs"]
-mod protocol;
+pub(super) mod protocol;
 #[path = "panel/recovery.rs"]
 mod recovery;
 #[path = "panel/settings.rs"]
@@ -59,19 +66,20 @@ mod settings;
 #[path = "panel/sync.rs"]
 mod sync;
 #[path = "panel/terminal.rs"]
-mod terminal;
+pub(super) mod terminal;
 #[path = "panel/vault.rs"]
 mod vault;
 #[path = "panel/workbench_layout.rs"]
 mod workbench_layout;
 use forms::{set_input, set_textarea};
-pub(super) use vault::{availability_label, vault_action_policy};
 
 /// 偏好页面只向根视图发出已保存主题和返回意图，不直接重配整个工作台。
 #[derive(Clone, Debug, PartialEq)]
 pub enum PreferencesEvent {
     /// 首次读取完成后向根视图提供完整运行设置，覆盖异步构造后的订阅时序。
     SettingsLoaded(SettingsSnapshot),
+    /// 有效输入立即投影到工作台，持久化确认独立于运行态预览。
+    SettingsPreview(SettingsSnapshot),
     /// 仅在 application 确认 settings TOML 已 CAS 保存后发送完整快照供根视图增量应用。
     SettingsSaved(SettingsSnapshot),
     /// 自定义 Agent 管理器专用确认；仅在 CAS 成功或无变化且设置快照已核实时发送。
@@ -103,10 +111,6 @@ pub enum PreferencesEvent {
     },
     /// 用户完成 dirty-close 选择后请求 Root 恢复打开设置前的工作区页面。
     CloseRequested,
-    /// 用户通过设置搜索明确前往现有 MCP 运行时页，Root 只在草稿关闭门禁通过后执行导航。
-    OpenMcpRuntimeRequested,
-    /// 用户通过“关于与更新”入口前往已有更新工作区；不在偏好页触发更新操作。
-    OpenUpdatesRequested,
     /// 用户确认丢弃偏好草稿后，根视图继续检查其它编辑器并串行执行退出。
     QuitConfirmed,
     /// 用户取消偏好草稿的退出确认，RootView 保留当前应用状态。
@@ -125,13 +129,13 @@ pub(super) enum SettingsSuccessStatus {
 }
 
 impl SettingsSuccessStatus {
-    /// 按当前语言即时生成成功反馈，避免切换语言后继续展示旧语言字符串。
+    /// 按当前语言即时生成反馈；保存状态使用 main 的短标签，切换语言后不保留旧字符串。
     ///
     /// @author kongweiguang
     pub(super) fn message(self, language: crate::locale::UiLanguage) -> &'static str {
         match (self, language) {
-            (Self::Saved, crate::locale::UiLanguage::ZhCn) => "设置已保存。",
-            (Self::Saved, crate::locale::UiLanguage::EnUs) => "Settings saved.",
+            (Self::Saved, crate::locale::UiLanguage::ZhCn) => "设置已保存",
+            (Self::Saved, crate::locale::UiLanguage::EnUs) => "Settings saved",
             (Self::Reloaded, crate::locale::UiLanguage::ZhCn) => "设置已重新载入。",
             (Self::Reloaded, crate::locale::UiLanguage::EnUs) => "Settings reloaded.",
         }
@@ -314,18 +318,17 @@ pub(super) fn localized_error(error: &AppError) -> String {
 pub(super) enum PreferencesSection {
     Appearance,
     Terminal,
+    KeywordHighlights,
+    CommandSuggestions,
+    Sftp,
+    ExternalLaunch,
+    Mcp,
+    Desktop,
+    About,
     Shortcuts,
     Profiles,
     Integrations,
     ConfigurationSync,
-    Vault,
-}
-
-/// 搜索导航离开设置页时携带的受控目标，不把页面 ID 当成任意 Root 命令。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PreferencesNavigationDestination {
-    McpRuntime,
-    Updates,
 }
 
 /// settings 文本输入的领域字段映射；解析失败时保留 UI 草稿文本并阻止保存。
@@ -345,8 +348,6 @@ pub(super) enum SettingsTextField {
     SftpIdleTimeout,
     NotificationMinDuration,
     NotificationThrottle,
-    SuggestionAuditRetention,
-    SuggestionFeedbackRetention,
 }
 
 /// Profile 表单输入字段，args/env 按行编辑并在进入 application 用例前解析。
@@ -364,19 +365,6 @@ pub(super) enum ProfileTextField {
 pub(super) enum AgentLauncherTextField {
     Name,
     Command,
-}
-
-/// 关键词规则输入订阅将未保存的新规则与已保存规则分开追踪。
-#[derive(Clone)]
-pub(super) enum KeywordTextField {
-    NewPattern,
-    NewNote,
-    RulePattern(String),
-    RuleNote(String),
-    LightForeground(String),
-    LightBackground(String),
-    DarkForeground(String),
-    DarkBackground(String),
 }
 
 /// 单个快捷键的三平台受控输入；Windows 主键与备用键同属一列，避免压缩平台列宽。
@@ -429,28 +417,17 @@ pub(super) struct AgentLauncherInputs {
     pub(super) command: Entity<InputState>,
 }
 
-/// 终端建议保留期、新关键词草稿与规则编辑实体的稳定集合。
-pub(super) struct TerminalBehaviorInputs {
-    pub(super) audit_retention_days: Entity<InputState>,
-    pub(super) feedback_retention_days: Entity<InputState>,
-    pub(super) new_keyword_pattern: Entity<InputState>,
-    pub(super) new_keyword_note: Entity<InputState>,
-    pub(super) keyword_rules: Vec<KeywordRuleInputs>,
-}
-
-/// 规则列表按持久 ID 关联输入状态，重载时整体重建，避免旧订阅指向新行。
-pub(super) struct KeywordRuleInputs {
-    pub(super) id: String,
-    pub(super) pattern: Entity<InputState>,
-    pub(super) note: Entity<InputState>,
-    pub(super) light_foreground: Entity<InputState>,
-    pub(super) light_background: Entity<InputState>,
-    pub(super) dark_foreground: Entity<InputState>,
-    pub(super) dark_background: Entity<InputState>,
-}
-
 /// settings 与 Profile 页面状态只保存 typed 快照和 opaque revision，文件访问由 application 负责。
 pub struct PreferencesPanel {
+    screen_color_sampling: color_sampling::ScreenColorSamplingState,
+    settings_autosave: autosave::SettingsAutosaveState,
+    pub(super) keyword_editor: terminal::KeywordEditorState,
+    pub(super) suggestion_selects: terminal::SuggestionSelects,
+    pub(super) connectivity: connectivity::ConnectivityState,
+    pub(super) desktop_about: desktop_about::DesktopAboutState,
+    pub(super) shortcut_platform: super::KeyboardPlatform,
+    pub(super) inline_updates: Option<Entity<crate::features::updates::UpdatesPanel>>,
+    pub(super) _inline_updates_subscription: Option<Subscription>,
     preferences: PreferencesService,
     profiles: ProfileService,
     pub(super) host_management: Option<HostManagementService>,
@@ -499,26 +476,24 @@ pub struct PreferencesPanel {
     pub(super) window_opacity_slider: Entity<SliderState>,
     pub(super) _appearance_control_subscriptions: Vec<Subscription>,
     pub(super) content_scroll: gpui_kit::ScrollHandle,
+    pub(super) settings_content_focus: gpui_kit::FocusHandle,
+    pub(super) settings_close_focus: gpui_kit::FocusHandle,
+    pub(super) terminal_renderer_open: bool,
+    pub(super) sftp_advanced_open: bool,
     pub(super) vault_availability: Option<VaultKeyAvailability>,
     pub(super) vault_loading: bool,
     pub(super) vault_busy: bool,
     pub(super) vault_outcome_unknown: bool,
     pub(super) vault_status: Option<String>,
     pub(super) vault_error: Option<String>,
-    pub(super) vault_import_candidate: Option<PathBuf>,
-    pub(super) vault_restore_candidate: Option<(PathBuf, PathBuf)>,
-    pub(super) vault_rotation_verified: bool,
     pub(super) sync_status: Option<ConfigurationSyncStatus>,
     pub(super) sync_loading: bool,
-    pub(super) sync_busy: Option<ConfigurationSyncOperationKind>,
-    sync_cancellation: Option<sync::SyncCancellationHandle>,
     pub(super) sync_result: Option<ConfigurationSyncOperationResult>,
     pub(super) sync_error: Option<String>,
     pub(super) sync_outcome_unknown: bool,
     pub(super) settings_inputs: SettingsInputs,
     pub(super) profile_inputs: ProfileInputs,
     pub(super) agent_launcher_inputs: AgentLauncherInputs,
-    pub(super) terminal_behavior_inputs: TerminalBehaviorInputs,
     pub(super) shortcut_inputs: Vec<ShortcutInputs>,
     pub(super) settings_input_errors: BTreeMap<&'static str, String>,
     pub(super) profile_input_errors: BTreeMap<&'static str, String>,
@@ -543,8 +518,6 @@ pub struct PreferencesPanel {
     pub(super) profile_switch_confirmation: bool,
     pub(super) profile_reload_confirmation: bool,
     pub(super) profile_delete_confirmation: bool,
-    pub(super) settings_reload_confirmation: bool,
-    pending_navigation: Option<PreferencesNavigationDestination>,
     pub(super) pending_profile_selection: Option<Option<String>>,
     pub(super) pending_profile_group_id: Option<Option<String>>,
     pub(super) profile_list_error: Option<String>,
@@ -554,12 +527,8 @@ pub struct PreferencesPanel {
     pub(super) _profile_subscriptions: Vec<Subscription>,
     pub(super) shortcut_subscriptions: Vec<Subscription>,
     pub(super) _agent_launcher_subscriptions: Vec<Subscription>,
-    pub(super) _terminal_behavior_subscriptions: Vec<Subscription>,
-    pub(super) keyword_rule_subscriptions: Vec<Subscription>,
     pub(super) custom_agent_name: String,
     pub(super) custom_agent_command: String,
-    pub(super) new_keyword_pattern: String,
-    pub(super) new_keyword_note: String,
 }
 
 /// 将偏好面板长期依赖集中装配，避免构造参数次序掩盖各服务的可选性。
@@ -574,11 +543,13 @@ pub(crate) struct PreferencesPanelServices {
     pub(crate) external_protocol: Option<ExternalProtocolService>,
     pub(crate) configuration_directory: Option<ConfigurationDirectoryService>,
     pub(crate) mcp_runtime_available: bool,
+    pub(crate) mcp_runtime:
+        Option<std::sync::Arc<dyn kerminal_application::mcp_runtime::McpRuntimeControl>>,
     pub(crate) executor: ApplicationTaskExecutor,
 }
 
 impl PreferencesPanel {
-    /// 使用 composition root 注入的服务；输入状态在窗口创建时建立以保持原生焦点和 IME 行为。
+    /// 使用 composition root 注入的服务；输入实体保持原生焦点和 IME，快捷键平台在 macOS 默认选 Mac、其它桌面选 Windows。
     ///
     /// @author kongweiguang
     pub(crate) fn new(
@@ -595,9 +566,15 @@ impl PreferencesPanel {
             external_protocol,
             configuration_directory,
             mcp_runtime_available,
+            mcp_runtime,
             executor,
         } = services;
+        let keyword_editor = terminal::KeywordEditorState::new(window, cx);
+        let suggestion_selects = terminal::SuggestionSelects::new(window, cx);
+        let connectivity =
+            connectivity::ConnectivityState::new(mcp_runtime, executor.clone(), window, cx);
         let (settings_inputs, settings_subscriptions) = Self::create_settings_inputs(window, cx);
+        Self::configure_settings_number_inputs(&settings_inputs, window, cx);
         let (profile_inputs, profile_subscriptions) = Self::create_profile_inputs(window, cx);
         let profile_group_select =
             cx.new(|cx| SelectState::new(profile_group_options(&[], None), None, window, cx));
@@ -611,8 +588,6 @@ impl PreferencesPanel {
         );
         let (agent_launcher_inputs, agent_launcher_subscriptions) =
             Self::create_agent_launcher_inputs(window, cx);
-        let (terminal_behavior_inputs, terminal_behavior_subscriptions) =
-            Self::create_terminal_behavior_inputs(window, cx);
         let interface_language_select =
             cx.new(|cx| SelectState::new(interface_language_options(), None, window, cx));
         let background_opacity_slider = cx.new(|_| {
@@ -673,6 +648,19 @@ impl PreferencesPanel {
             },
         );
         let mut panel = Self {
+            screen_color_sampling: color_sampling::ScreenColorSamplingState::default(),
+            settings_autosave: autosave::SettingsAutosaveState::default(),
+            keyword_editor,
+            suggestion_selects,
+            connectivity,
+            desktop_about: desktop_about::DesktopAboutState::default(),
+            shortcut_platform: if cfg!(target_os = "macos") {
+                super::KeyboardPlatform::Mac
+            } else {
+                super::KeyboardPlatform::Windows
+            },
+            inline_updates: None,
+            _inline_updates_subscription: None,
             recovery: preferences.recovery_state(),
             preferences,
             profiles,
@@ -720,26 +708,24 @@ impl PreferencesPanel {
             window_opacity_slider,
             _appearance_control_subscriptions: appearance_control_subscriptions,
             content_scroll: gpui_kit::ScrollHandle::new(),
+            settings_content_focus: cx.focus_handle(),
+            settings_close_focus: cx.focus_handle(),
+            terminal_renderer_open: false,
+            sftp_advanced_open: false,
             vault_availability: None,
             vault_loading: false,
             vault_busy: false,
             vault_outcome_unknown: false,
             vault_status: None,
             vault_error: None,
-            vault_import_candidate: None,
-            vault_restore_candidate: None,
-            vault_rotation_verified: false,
             sync_status: None,
             sync_loading: false,
-            sync_busy: None,
-            sync_cancellation: None,
             sync_result: None,
             sync_error: None,
             sync_outcome_unknown: false,
             settings_inputs,
             profile_inputs,
             agent_launcher_inputs,
-            terminal_behavior_inputs,
             shortcut_inputs: Vec::new(),
             settings_input_errors: BTreeMap::new(),
             profile_input_errors: BTreeMap::new(),
@@ -761,8 +747,6 @@ impl PreferencesPanel {
             profile_switch_confirmation: false,
             profile_reload_confirmation: false,
             profile_delete_confirmation: false,
-            settings_reload_confirmation: false,
-            pending_navigation: None,
             pending_profile_selection: None,
             pending_profile_group_id: None,
             profile_list_error: None,
@@ -771,12 +755,8 @@ impl PreferencesPanel {
             _profile_subscriptions: profile_subscriptions,
             shortcut_subscriptions: Vec::new(),
             _agent_launcher_subscriptions: agent_launcher_subscriptions,
-            _terminal_behavior_subscriptions: terminal_behavior_subscriptions,
-            keyword_rule_subscriptions: Vec::new(),
             custom_agent_name: String::new(),
             custom_agent_command: String::new(),
-            new_keyword_pattern: String::new(),
-            new_keyword_note: String::new(),
         };
         panel.ensure_loaded(window, cx);
         panel.load_integrations(cx);
@@ -826,56 +806,27 @@ impl PreferencesPanel {
         }
     }
 
-    /// 搜索过滤改变可见页面时同步选中目标；只调整导航投影，不重建或覆盖草稿与输入焦点。
-    ///
+    /// 输入只更新结果列表；与 main 一样，用户选择结果后才切页和定位。
     /// @author kongweiguang
     pub(super) fn update_navigation_search_query(&mut self, query: String, cx: &mut Context<Self>) {
-        if self.navigation_search_query == query {
-            return;
+        if self.navigation_search_query != query {
+            self.navigation_search_query = query;
+            cx.notify();
         }
-        self.navigation_search_query = query;
-        let selection = self.reconcile_navigation_search_selection();
-        self.pending_navigation_search_scroll = if selection.has_matches
-            && !self.navigation_search_query.trim().is_empty()
-            && selection.destination.is_none()
-            && selection.section != PreferencesSection::Profiles
-        {
-            selection.scroll_index
-        } else {
-            None
-        };
-        cx.notify();
     }
 
-    /// 同步搜索命中目标与滚动索引；只投影面板状态，不触发 Profile 重载或外部导航。
-    ///
+    /// 搜索投影不改变正在浏览的页面和草稿，避免每次键入时正文跳动或失焦。
     /// @author kongweiguang
     pub(super) fn reconcile_navigation_search_selection(
         &mut self,
     ) -> super::render::NavigationSearchSelection {
-        let selection = super::render::resolve_navigation_search_selection(
+        super::render::resolve_navigation_search_selection(
             &self.navigation_search_query,
             self.section,
             self.selected_navigation_target.as_deref(),
             self.settings.as_ref().map(|draft| draft.value()),
             self.mcp_runtime_available,
-        );
-        let selection_changed = self.section != selection.section
-            || self.selected_navigation_target != selection.selected_target;
-        self.section = selection.section;
-        self.selected_navigation_target = selection.selected_target.clone();
-        if selection_changed {
-            self.pending_navigation_search_scroll = if selection.has_matches
-                && !self.navigation_search_query.trim().is_empty()
-                && selection.destination.is_none()
-                && selection.section != PreferencesSection::Profiles
-            {
-                selection.scroll_index
-            } else {
-                None
-            };
-        }
-        selection
+        )
     }
 
     /// Root 的 settings.keybindings 动作复用面板导航；只切换显示，不保存或丢弃任一草稿，关闭仍走双草稿保护。
@@ -883,12 +834,47 @@ impl PreferencesPanel {
         self.select_section(PreferencesSection::Shortcuts, cx);
     }
 
-    /// 首次打开偏好弹层时将焦点放入搜索框，避免快捷键输入落到后层终端。
+    /// main 无 autofocus 字段时聚焦首个关闭按钮，保持初始 Tab 顺序且隔离后层终端输入。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn focus_initial_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.settings_close_focus, cx);
+    }
+
+    /// 显式搜索动作聚焦搜索框；普通打开沿用 main 的关闭按钮初始焦点。
     ///
     /// @author kongweiguang
     pub fn focus_navigation_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let focus = self.navigation_search.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
+    }
+
+    /// 普通入口像 main 重新挂载设置正文；保留在途保存，并重新核实上次未确认的写入结果。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn begin_modal_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.section = PreferencesSection::Appearance;
+        self.navigation_search_query.clear();
+        self.selected_navigation_target = None;
+        self.pending_navigation_search_scroll = None;
+        set_input(&self.navigation_search, String::new(), window, cx);
+        self.reset_page_disclosures();
+        self.content_scroll.scroll_to_top_of_item(0);
+        self.recover_pending_settings_on_open(cx);
+        self.refresh_integrations_on_modal_open(cx);
+        cx.notify();
+    }
+
+    /// main 的条件页面在切页时卸载 disclosure；运行态服务与保存任务不属于这些呈现状态。
+    ///
+    /// @author kongweiguang
+    pub(super) fn reset_page_disclosures(&mut self) {
+        self.screen_color_sampling.cancel();
+        self.terminal_renderer_open = false;
+        self.sftp_advanced_open = false;
+        self.desktop_about.advanced_expanded = false;
+        self.connectivity.external_compatibility_expanded = false;
+        self.connectivity.mcp_connection_expanded = false;
     }
 
     /// 原地刷新所有缓存输入的本地化占位符，不重建实体、查询、草稿或焦点。
@@ -906,17 +892,17 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 模态内 Escape 先撤销最上层确认，再清除导航查询；仅查询为空时才走离开草稿门禁。
+    /// 子控件先消费浮层 Escape；到达面板后撤销确认或关闭设置，与 main 遮罩语义一致。
     ///
     /// @author kongweiguang
-    pub fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn handle_escape(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.screen_color_sampling.cancel() {
+            cx.notify();
+            return;
+        }
         // 关闭最上层确认框优先于搜索清理或页面关闭，避免 Escape 越过用户确认。
         if self.quit_confirmation {
             self.cancel_quit(cx);
-            return;
-        }
-        if self.settings_reload_confirmation {
-            self.cancel_reload_settings(cx);
             return;
         }
         if self.profile_delete_confirmation {
@@ -935,13 +921,6 @@ impl PreferencesPanel {
         }
         if self.close_confirmation {
             self.cancel_close(cx);
-            return;
-        }
-        if !self.navigation_search_query.is_empty() {
-            self.navigation_search_query.clear();
-            set_input(&self.navigation_search, String::new(), window, cx);
-            self.focus_navigation_search(window, cx);
-            cx.notify();
             return;
         }
         self.request_close(cx);
@@ -1069,11 +1048,12 @@ impl PreferencesPanel {
             value: versioned.settings,
             revision: versioned.revision,
         };
+        self.settings_autosave.reset();
         self.sync_settings_inputs(&snapshot.value, window, cx);
         self.theme_mode = snapshot.value.theme_mode;
         self.settings_input_errors.clear();
         self.rebuild_shortcut_inputs(&snapshot.value, window, cx);
-        self.rebuild_keyword_inputs(
+        self.reconcile_keyword_editor(
             &snapshot.value.terminal.keyword_highlights.rules,
             window,
             cx,
@@ -1231,13 +1211,32 @@ impl PreferencesPanel {
         self.reset_profile_form(draft, Some(revision), is_default, window, cx);
     }
 
-    /// 在输入实体中恢复服务端确认值；InputState.set_value 不发 Change，避免误标 dirty。
+    /// 在读取回执中同步输入、选择和滑块，避免在 render 内改实体或让隐藏窗口等待呈现后才获得初始值。
+    /// InputState.set_value 不发 Change；Select/Slider 的已确认值同步共用本次快照。
     fn sync_settings_inputs(
         &self,
         settings: &SettingsSnapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.interface_language_select.update(cx, |select, cx| {
+            select.set_selected_value(&settings.interface_language, window, cx);
+        });
+        for (slider, percentage, minimum) in [
+            (
+                &self.background_opacity_slider,
+                settings.background_opacity,
+                0.,
+            ),
+            (&self.window_opacity_slider, settings.window_opacity, 35.),
+        ] {
+            let next = f32::from(percentage).clamp(minimum, 100.);
+            if slider.read(cx).value().end().round() != next {
+                slider.update(cx, |state, cx| state.set_value(next, window, cx));
+            }
+        }
+        self.suggestion_selects
+            .sync_from_settings(settings, window, cx);
         set_input(
             &self.settings_inputs.font_family,
             settings.terminal.font_family.clone(),
@@ -1300,7 +1299,7 @@ impl PreferencesPanel {
         );
         set_input(
             &self.settings_inputs.sftp_packet_bytes,
-            settings.sftp.packet_bytes.to_string(),
+            (f64::from(settings.sftp.packet_bytes) / 1_048_576.).to_string(),
             window,
             cx,
         );
@@ -1312,33 +1311,13 @@ impl PreferencesPanel {
         );
         set_input(
             &self.settings_inputs.notification_min_duration,
-            settings.desktop_notifications.min_duration_ms.to_string(),
+            (f64::from(settings.desktop_notifications.min_duration_ms) / 1000.).to_string(),
             window,
             cx,
         );
         set_input(
             &self.settings_inputs.notification_throttle,
-            settings.desktop_notifications.throttle_ms.to_string(),
-            window,
-            cx,
-        );
-        set_input(
-            &self.terminal_behavior_inputs.audit_retention_days,
-            settings
-                .terminal
-                .inline_suggestion
-                .audit_retention_days
-                .to_string(),
-            window,
-            cx,
-        );
-        set_input(
-            &self.terminal_behavior_inputs.feedback_retention_days,
-            settings
-                .terminal
-                .inline_suggestion
-                .feedback_retention_days
-                .to_string(),
+            (f64::from(settings.desktop_notifications.throttle_ms) / 1000.).to_string(),
             window,
             cx,
         );

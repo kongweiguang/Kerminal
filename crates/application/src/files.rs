@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{AppError, AppResult};
 
+pub mod clipboard_download;
 pub mod editor;
 
 /// 文本读取与编辑共享领域层预算，避免多个入口各自漂移出不同上限。

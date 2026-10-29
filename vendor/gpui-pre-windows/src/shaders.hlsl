@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 #include "alpha_correction.hlsl"
 
 cbuffer GlobalParams: register(b0) {
@@ -32,6 +34,10 @@ struct Corners {
     float top_right;
     float bottom_right;
     float bottom_left;
+};
+
+struct ContentMask {
+    Bounds bounds;
 };
 
 struct Edges {
@@ -1264,5 +1270,110 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         color = float4(grayscale, sample.a);
     }
     color.a *= sprite.opacity * saturate(0.5 - distance);
+    return color;
+}
+
+/*
+**
+**              Backdrop filters
+**
+*/
+
+struct BackdropFilter {
+    uint order;
+    uint mode;
+    Bounds bounds;
+    ContentMask content_mask;
+    Corners corner_radii;
+    float blur_radius;
+    float saturation;
+    float opacity;
+    uint pad;
+};
+
+struct BackdropFilterVertexOutput {
+    nointerpolation uint filter_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct BackdropFilterFragmentInput {
+    nointerpolation uint filter_id: TEXCOORD0;
+    float4 position: SV_Position;
+};
+
+StructuredBuffer<BackdropFilter> backdrop_filters: register(t1);
+
+// Map one filter instance to its clipped rectangle in the current viewport.
+BackdropFilterVertexOutput backdrop_filter_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint filter_id = batch_start_index + instance_id;
+    BackdropFilter filter = backdrop_filters[filter_id];
+    BackdropFilterVertexOutput output;
+    output.position = to_device_position(unit_vertex, filter.bounds);
+    output.clip_distance = distance_from_clip_rect(unit_vertex, filter.bounds,
+                                                    filter.content_mask.bounds);
+    output.filter_id = filter_id;
+    return output;
+}
+
+float gaussian_weight(float distance, float sigma) {
+    return exp(-(distance * distance) / (2. * sigma * sigma));
+}
+
+float4 sample_backdrop(float2 uv) {
+    float2 half_texel = 0.5 / global_viewport_size;
+    return t_sprite.Sample(s_sprite, clamp(uv, half_texel, 1. - half_texel));
+}
+
+// Normalize the discrete +/-3 sigma kernel; paired linear samples preserve adjacent taps without sparse-radius ghosting.
+float4 backdrop_blur_sample(float2 uv, float2 axis, float sigma) {
+    sigma = max(sigma, 0.);
+    if (sigma <= 0.001) {
+        return sample_backdrop(uv);
+    }
+
+    float2 texel_step = axis / global_viewport_size;
+    int support = (int)ceil(3. * sigma);
+    float normalization = 1.;
+    for (int offset = 1; offset <= support; offset++) {
+        normalization += 2. * gaussian_weight((float)offset, sigma);
+    }
+
+    float4 color = sample_backdrop(uv) / normalization;
+    for (int offset = 1; offset <= support; offset += 2) {
+        float first_weight = gaussian_weight((float)offset, sigma);
+        float second_weight = offset < support
+            ? gaussian_weight((float)(offset + 1), sigma)
+            : 0.;
+        float pair_weight = first_weight + second_weight;
+        if (pair_weight <= 1e-8) {
+            continue;
+        }
+        float sample_offset =
+            ((float)offset * first_weight + (float)(offset + 1) * second_weight) / pair_weight;
+        float2 delta = texel_step * sample_offset;
+        float normalized_pair_weight = pair_weight / normalization;
+        color += sample_backdrop(uv - delta) * normalized_pair_weight;
+        color += sample_backdrop(uv + delta) * normalized_pair_weight;
+    }
+    return color;
+}
+
+// Reuse the same shader for horizontal blur, vertical blur, and rounded final composition.
+float4 backdrop_filter_fragment(BackdropFilterFragmentInput input): SV_Target {
+    BackdropFilter filter = backdrop_filters[input.filter_id];
+    if (filter.mode < 2u) {
+        float2 axis = filter.mode == 0u ? float2(1., 0.) : float2(0., 1.);
+        float2 uv = input.position.xy / global_viewport_size;
+        return backdrop_blur_sample(uv, axis, filter.blur_radius);
+    }
+
+    float distance = quad_sdf(input.position.xy, filter.bounds, filter.corner_radii);
+    float2 uv = input.position.xy / global_viewport_size;
+    float4 color = sample_backdrop(uv);
+    float luminance = dot(color.rgb, GRAYSCALE_FACTORS);
+    color.rgb = lerp(luminance.xxx, color.rgb, clamp(filter.saturation, 0., 2.));
+    color.a *= saturate(filter.opacity) * saturate(0.5 - distance);
     return color;
 }

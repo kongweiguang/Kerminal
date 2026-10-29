@@ -311,6 +311,7 @@ fn fixture() -> PumpFixture {
     let pane_id = PaneId::new();
     let session_id = SessionId::new();
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: Some(pane_id.clone()),
         selected_machine_id: None,

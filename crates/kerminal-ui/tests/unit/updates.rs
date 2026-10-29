@@ -25,12 +25,15 @@ use kerminal_application::{
 };
 
 use super::{
-    UpdatePanelState,
+    SettingsInstallStep, UpdatePanelState,
     about::{APP_VERSION, LICENSE_SPDX, LICENSE_TEXT, PROJECT_REPOSITORY, repository_url},
-    can_acknowledge_recovery, can_exit_after_install_failure, can_retry_host_install,
-    format_progress, listener_recovery_failure_matches, localized,
+    can_acknowledge_recovery, can_check_for_updates, can_exit_after_install_failure,
+    can_retry_host_install, format_progress, listener_recovery_failure_matches, localized,
     notification_candidate_for_check, notify_update_available, recovery_state_label,
-    restart_failure_matches, take_check_operation, update_notification_diagnostic,
+    restart_failure_matches,
+    settings::{idle_update_status_label, settings_check_allowed},
+    settings_install_step, take_check_operation, take_settings_auto_install_after_download,
+    update_notification_diagnostic,
 };
 
 #[derive(Default)]
@@ -355,4 +358,94 @@ fn notification_failure_keeps_the_update_candidate_unchanged() {
         UpdatePanelState::Available(current) => assert_eq!(current, candidate),
         _ => panic!("notification failure must preserve the available candidate"),
     }
+}
+
+#[test]
+/// About 只将可用候选下载后安装，已验签包直接安装，其余状态不重复启动事务。
+fn about_install_action_selects_one_safe_update_step() {
+    let available = UpdatePanelState::Available(update_candidate("0.4.2"));
+    let verified = UpdatePanelState::ReadyToInstall(downloaded_update(DownloadedUpdateId::new()));
+    let downloading = UpdatePanelState::Downloading(update_candidate("0.4.2"));
+
+    assert_eq!(
+        settings_install_step(&available),
+        SettingsInstallStep::DownloadThenInstall
+    );
+    assert_eq!(
+        settings_install_step(&verified),
+        SettingsInstallStep::InstallVerified
+    );
+    assert_eq!(
+        settings_install_step(&downloading),
+        SettingsInstallStep::Ignore
+    );
+}
+
+#[test]
+/// 单步安装只在 About 已请求且下载返回已验签句柄后自动进入 Root 安装保护。
+fn about_install_consumes_request_and_continues_only_after_verified_download_success() {
+    let verified = Ok(downloaded_update(DownloadedUpdateId::new()));
+    let failed: AppResult<DownloadedUpdate> = Err(AppError::infrastructure("下载失败"));
+    let cancelled: AppResult<DownloadedUpdate> = Err(AppError::cancelled("下载取消"));
+    let mut requested = true;
+    let mut failed_request = true;
+    let mut cancelled_request = true;
+
+    assert!(take_settings_auto_install_after_download(
+        &mut requested,
+        false,
+        &verified
+    ));
+    assert!(!requested);
+    assert!(!take_settings_auto_install_after_download(
+        &mut failed_request,
+        false,
+        &failed
+    ));
+    assert!(!failed_request);
+    assert!(!take_settings_auto_install_after_download(
+        &mut cancelled_request,
+        true,
+        &verified
+    ));
+    assert!(!cancelled_request);
+    assert!(!take_settings_auto_install_after_download(
+        &mut cancelled_request,
+        true,
+        &cancelled
+    ));
+}
+
+#[test]
+/// 手动检查不能取代正在安装的已验签包，也不能覆盖忙碌和不可用状态。
+fn about_update_check_preserves_staged_packages_and_terminal_states() {
+    let available = UpdatePanelState::Available(update_candidate("0.4.2"));
+    let verified = UpdatePanelState::ReadyToInstall(downloaded_update(DownloadedUpdateId::new()));
+    let restarting = UpdatePanelState::RestartPending(downloaded_update(DownloadedUpdateId::new()));
+
+    assert!(settings_check_allowed(&available, true, false));
+    assert!(!settings_check_allowed(&available, false, false));
+    assert!(!settings_check_allowed(&available, true, true));
+    assert!(!settings_check_allowed(&verified, true, false));
+    assert!(!settings_check_allowed(&restarting, true, false));
+    assert!(can_check_for_updates(&available));
+    assert!(!can_check_for_updates(&verified));
+    assert!(!can_check_for_updates(&restarting));
+}
+
+#[test]
+/// 已配置更新源的检查失败保持可重试语义，不误报为安装形态不可用。
+fn idle_update_status_distinguishes_failure_from_unavailable_service() {
+    assert_eq!(
+        idle_update_status_label(true, true),
+        localized("失败", "Failed")
+    );
+    assert_eq!(
+        idle_update_status_label(false, true),
+        localized("不可用", "Unavailable")
+    );
+    assert_eq!(
+        idle_update_status_label(true, false),
+        localized("可检查", "Ready to check")
+    );
 }

@@ -3,60 +3,9 @@
 //! @author kongweiguang
 
 use gpui_kit::Context;
-use kerminal_application::{
-    AppError, PublicErrorCode,
-    configuration_sync::{
-        ConfigurationSyncOperationKind, ConfigurationSyncOperationResult, ConfigurationSyncOutcome,
-        ConfigurationSyncService,
-    },
-};
-use std::sync::{Arc, Mutex};
-use tokio_util::sync::CancellationToken;
+use kerminal_application::{PublicErrorCode, configuration_sync::ConfigurationSyncOutcome};
 
 use super::PreferencesPanel;
-
-#[derive(Clone, Default)]
-pub(super) struct SyncCancellationHandle {
-    state: Arc<Mutex<SyncCancellationState>>,
-}
-
-#[derive(Default)]
-struct SyncCancellationState {
-    token: Option<CancellationToken>,
-    requested: bool,
-}
-
-impl SyncCancellationHandle {
-    /// 记录 executor 交给 application 用例的令牌；若用户先点取消则立即转发请求。
-    fn install(&self, token: CancellationToken) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.requested {
-            token.cancel();
-        }
-        state.token = Some(token);
-    }
-
-    /// 只请求 application 协作取消并等待原用例清理回执，不中断 Git 子进程或丢弃结果。
-    pub(super) fn request_cancel(&self) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.requested {
-            return false;
-        }
-        state.requested = true;
-        if let Some(token) = state.token.as_ref() {
-            token.cancel();
-        }
-        true
-    }
-
-    /// UI 通过令牌状态显示“正在等待清理”，不会把取消请求冒充为已完成。
-    pub(super) fn cancel_requested(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .requested
-    }
-}
 
 impl PreferencesPanel {
     /// 状态读取只查询本地工作树；远端引用必须由用户显式 Fetch 更新。
@@ -64,7 +13,7 @@ impl PreferencesPanel {
         &mut self,
         cx: &mut Context<Self>,
     ) {
-        if self.sync_loading || self.sync_busy.is_some() {
+        if self.sync_loading || self.connectivity.sync_running || self.connectivity.key_saving {
             return;
         }
         let Some(service) = self.configuration_sync.clone() else {
@@ -102,21 +51,19 @@ impl PreferencesPanel {
         .detach();
     }
 
-    /// 启动一个显式 Git 操作，并保留本地提交、远端推送与未知结果的区别。
-    pub(in crate::features::preferences) fn run_configuration_sync(
-        &mut self,
-        kind: ConfigurationSyncOperationKind,
-        cx: &mut Context<Self>,
-    ) {
-        if self.sync_loading || self.sync_busy.is_some() {
+    /// 同步与密钥保存共享忙碌门禁，避免两个工作区写操作并行触碰同一批文件。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn run_workspace_sync(&mut self, cx: &mut Context<Self>) {
+        if self.connectivity.sync_running
+            || self.sync_loading
+            || self.connectivity.key_loading
+            || self.connectivity.key_saving
+        {
             return;
         }
-        if self.sync_outcome_unknown && kind != ConfigurationSyncOperationKind::Fetch {
-            self.sync_error = Some(crate::locale::text(
-                "上次操作结果未知，请先 Fetch 并检查仓库状态。",
-                "The previous result is unknown. Fetch and inspect the repository before continuing.",
-            ).to_string());
-            cx.notify();
+        if self.sync_outcome_unknown {
+            self.verify_workspace_sync(cx);
             return;
         }
         let Some(service) = self.configuration_sync.clone() else {
@@ -131,37 +78,24 @@ impl PreferencesPanel {
             return;
         };
 
-        self.sync_busy = Some(kind);
+        self.connectivity.sync_running = true;
+        self.connectivity.sync_run_result = None;
         self.sync_error = None;
         self.sync_result = None;
-        let cancellation_handle = SyncCancellationHandle::default();
-        self.sync_cancellation = Some(cancellation_handle.clone());
         let executor = self.executor.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |cancellation| {
-                    cancellation_handle.install(cancellation.clone());
-                    async move { execute_sync_action(service, kind, cancellation).await }
-                })
+                .run(|cancellation| async move { service.synchronize(cancellation).await })
                 .await;
             let _ = this.update(cx, |panel, cx| {
-                panel.sync_busy = None;
-                panel.sync_cancellation = None;
+                panel.connectivity.sync_running = false;
                 match result {
-                    Ok(operation) => {
+                    Ok(result) => {
                         panel.sync_outcome_unknown =
-                            operation.outcome == ConfigurationSyncOutcome::OutcomeUnknown;
-                        if kind == ConfigurationSyncOperationKind::Fetch
-                            && matches!(
-                                operation.outcome,
-                                ConfigurationSyncOutcome::Succeeded
-                                    | ConfigurationSyncOutcome::NoChanges
-                            )
-                        {
-                            panel.sync_outcome_unknown = false;
-                        }
-                        panel.sync_result = Some(operation);
+                            result.outcome == ConfigurationSyncOutcome::OutcomeUnknown;
+                        panel.sync_result = result.stages.last().cloned();
+                        panel.connectivity.sync_run_result = Some(result);
                     }
                     Err(error) => {
                         if error.public_code() == PublicErrorCode::OutcomeUnknown {
@@ -171,6 +105,13 @@ impl PreferencesPanel {
                     }
                 }
                 cx.notify();
+                let workspace_outcome_unknown = panel.sync_outcome_unknown;
+                panel.connectivity.resume_pending_documents(
+                    panel.vault_keys.clone(),
+                    panel.configuration_sync.clone(),
+                    workspace_outcome_unknown,
+                    cx,
+                );
                 if !panel.sync_outcome_unknown {
                     panel.refresh_configuration_sync(cx);
                 }
@@ -179,61 +120,133 @@ impl PreferencesPanel {
         .detach();
     }
 
-    /// 取消按钮仅发出协作信号，UI 仍等待 application 返回清理或未知结果回执。
-    pub(in crate::features::preferences) fn cancel_configuration_sync(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
-        let requested = self
-            .sync_cancellation
-            .as_ref()
-            .is_some_and(SyncCancellationHandle::request_cancel);
-        if requested {
-            self.sync_error = Some(crate::locale::text(
-                "已请求取消，正在等待 Git 清理回执；完成前不能启动另一项同步。",
-                "Cancellation requested. Waiting for Git cleanup before another sync can start.",
-            ).to_string());
-        }
+    /// 结果未知时先更新远端引用并回读领先/落后状态，未取得完整回执前不重放同步写操作。
+    fn verify_workspace_sync(&mut self, cx: &mut Context<Self>) {
+        let Some(service) = self.configuration_sync.clone() else {
+            self.sync_error = Some(
+                crate::locale::text(
+                    "配置同步服务未由应用装配。",
+                    "The configuration sync service is unavailable.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+
+        self.connectivity.sync_running = true;
+        self.sync_error = None;
+        let executor = self.executor.clone();
         cx.notify();
-    }
-
-    /// 只向同步视图投影取消请求状态，令牌本身仍由面板用例私有持有。
-    pub(in crate::features::preferences) fn sync_cancel_requested(&self) -> bool {
-        self.sync_cancellation
-            .as_ref()
-            .is_some_and(SyncCancellationHandle::cancel_requested)
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .run(move |cancellation| async move {
+                    let fetch = service.fetch(cancellation).await?;
+                    let status = if matches!(
+                        fetch.outcome,
+                        ConfigurationSyncOutcome::Succeeded | ConfigurationSyncOutcome::NoChanges
+                    ) {
+                        Some(service.status().await?)
+                    } else {
+                        None
+                    };
+                    Ok((fetch, status))
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.connectivity.sync_running = false;
+                match result {
+                    Ok((fetch, Some(status))) => {
+                        let summary = crate::locale::text(
+                            format!(
+                                "远端状态已刷新，本地领先 {}、落后 {}；核对后可重新同步。",
+                                status.ahead.map_or_else(|| "未知".to_owned(), |count| count.to_string()),
+                                status.behind.map_or_else(|| "未知".to_owned(), |count| count.to_string()),
+                            ),
+                            format!(
+                                "Remote status refreshed: {} ahead and {} behind. Review it before syncing again.",
+                                status.ahead.map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                                status.behind.map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                            ),
+                        ).to_string();
+                        panel.sync_status = Some(status);
+                        panel.sync_outcome_unknown = false;
+                        panel.sync_result = None;
+                        panel.connectivity.sync_run_result =
+                            Some(kerminal_application::configuration_sync::ConfigurationSyncRunResult {
+                                outcome: fetch.outcome,
+                                summary,
+                                stages: vec![fetch],
+                            });
+                        panel.sync_error = None;
+                    }
+                    Ok((fetch, None)) => {
+                        panel.connectivity.sync_run_result =
+                            Some(kerminal_application::configuration_sync::ConfigurationSyncRunResult {
+                                outcome: fetch.outcome,
+                                summary: fetch.summary.clone(),
+                                stages: vec![fetch],
+                            });
+                    }
+                    Err(error) => panel.sync_error = Some(super::localized_error(&error)),
+                }
+                cx.notify();
+                let workspace_outcome_unknown = panel.sync_outcome_unknown;
+                panel.connectivity.resume_pending_documents(
+                    panel.vault_keys.clone(),
+                    panel.configuration_sync.clone(),
+                    workspace_outcome_unknown,
+                    cx,
+                );
+            });
+        })
+        .detach();
     }
 }
 
-#[cfg(test)]
-#[path = "../../../../tests/unit/preferences_sync_cancellation.rs"]
-mod tests;
-
-/// 将唯一的同步操作 enum 映射到 application 用例，取消令牌随网络/进程操作传播。
-async fn execute_sync_action(
-    service: ConfigurationSyncService,
-    kind: ConfigurationSyncOperationKind,
-    cancellation: CancellationToken,
-) -> Result<ConfigurationSyncOperationResult, AppError> {
-    match kind {
-        ConfigurationSyncOperationKind::Fetch => service.fetch(cancellation).await,
-        ConfigurationSyncOperationKind::Pull => service.pull(cancellation).await,
-        ConfigurationSyncOperationKind::Commit => service.commit(cancellation).await,
-        ConfigurationSyncOperationKind::Push => service.push(cancellation).await,
-        ConfigurationSyncOperationKind::ContinueRebase => {
-            service.continue_rebase(cancellation).await
-        }
-        ConfigurationSyncOperationKind::AbortRebase => service.abort_rebase(cancellation).await,
-    }
-}
-
-/// 首次建立面板时读取配置仓库、Vault readiness 和外部协议状态，不触发变更操作。
+/// 首次建立面板时读取配置仓库与外部协议状态；仅空白工作区按既有用例初始化 Vault key。
 ///
 /// @author kongweiguang
 impl PreferencesPanel {
+    /// 首次读取由密钥文档流程串行完成 readiness 检查和空白 workspace bootstrap，避免旧状态回包覆盖新 key。
     pub(super) fn load_integrations(&mut self, cx: &mut Context<Self>) {
         self.refresh_configuration_sync(cx);
-        self.refresh_vault_availability(cx);
         self.refresh_external_protocol(cx);
+        let loading_documents = self.connectivity.load_documents(
+            self.vault_keys.clone(),
+            self.configuration_sync.clone(),
+            false,
+            false,
+            cx,
+        );
+        if !loading_documents {
+            self.refresh_vault_availability(cx);
+        }
+        self.connectivity.refresh_mcp(cx);
+    }
+
+    /// 每次重新打开设置时刷新运行态与工作区快照；在途或未知写入不会覆盖密钥草稿。
+    ///
+    /// Root 在 modal session 重置导航后调用此方法；密钥回读遇到在途操作会延后到回执后。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn refresh_integrations_on_modal_open(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_external_protocol(cx);
+        self.refresh_configuration_sync(cx);
+        self.connectivity.refresh_mcp(cx);
+        let workspace_outcome_unknown = self.sync_outcome_unknown;
+        let loading_documents = self.connectivity.load_documents(
+            self.vault_keys.clone(),
+            self.configuration_sync.clone(),
+            true,
+            workspace_outcome_unknown,
+            cx,
+        );
+        if !loading_documents {
+            self.refresh_vault_availability(cx);
+        }
     }
 }

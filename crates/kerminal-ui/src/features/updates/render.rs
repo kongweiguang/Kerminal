@@ -16,8 +16,8 @@ use kerminal_application::updates::UpdateCandidate;
 
 use super::{
     UpdatePanelState, UpdatesPanel, about::APP_VERSION, about::LICENSE_SPDX, about::LICENSE_TEXT,
-    about::repository_url, can_exit_after_install_failure, format_progress, install_result_summary,
-    localized, recovery_state_label,
+    about::repository_url, can_check_for_updates, can_exit_after_install_failure, format_progress,
+    install_result_summary, localized, recovery_state_label,
 };
 use crate::theme::ThemeTokens;
 
@@ -75,7 +75,9 @@ impl Render for UpdatesPanel {
                 } else {
                     localized("检查更新", "Check for updates")
                 })
-                .disabled(unavailable || busy || host_terminal)
+                .disabled(
+                    unavailable || busy || host_terminal || !can_check_for_updates(&self.state),
+                )
                 .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| panel.check_for_updates(cx))),
         );
         if checking || downloading {

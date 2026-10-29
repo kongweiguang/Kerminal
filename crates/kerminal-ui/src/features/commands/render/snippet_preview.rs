@@ -14,6 +14,7 @@ use gpui_kit::{
     px,
 };
 use kerminal_domain::commands::{SnippetDefaultAction, SnippetPreferenceKey};
+use zeroize::Zeroize;
 
 use crate::theme::ThemeTokens;
 
@@ -120,6 +121,17 @@ impl CommandsView {
                 let command = self
                     .snippet_command
                     .update(cx, |input, _| input.text().to_string());
+                let rendered_for_fill =
+                    super::super::super::snippet_fill::render_selected_snippet_direct(self, cx);
+                let terminal_fill_multiline = rendered_for_fill
+                    .as_ref()
+                    .is_some_and(|rendered| terminal_fill_command_is_multiline(&rendered.command));
+                let terminal_fill_command_valid = rendered_for_fill
+                    .as_ref()
+                    .is_some_and(|rendered| terminal_fill_command_is_valid(&rendered.command));
+                if let Some(mut rendered) = rendered_for_fill {
+                    rendered.command.zeroize();
+                }
                 let command_label = crate::locale::text("命令模板", "Command template");
                 let copy_label = crate::locale::text("复制片段模板", "Copy snippet template");
                 let variables = self.render_snippet_runtime_variables(theme, cx);
@@ -134,9 +146,15 @@ impl CommandsView {
                 let can_fill = !self.snippet_saving
                     && self.pending_snippet_transition.is_none()
                     && !self.snippet_terminal_fill_in_flight();
+                let can_fill_terminal = can_fill
+                    && has_target
+                    && self.snippet_execution.is_some()
+                    && self.selected_snippet.is_some()
+                    && terminal_fill_command_valid;
                 let can_send = has_target
                     && self.snippet_execution.is_some()
                     && !fill_blocked
+                    && self.pending_snippet_run.is_none()
                     && !self.snippet_saving
                     && !self.confirm_snippet_delete
                     && self.pending_snippet_transition.is_none();
@@ -195,6 +213,18 @@ impl CommandsView {
                                 ),
                         )
                         .when_some(variable_body, |panel, variables| panel.child(variables))
+                        .when(terminal_fill_multiline, |panel| {
+                            panel.child(
+                                div()
+                                    .w_full()
+                                    .text_size(theme.text_xs)
+                                    .text_color(theme.warning)
+                                    .child(crate::locale::text(
+                                        "多行片段不能直接填入输入行；运行前会要求确认完整内容。",
+                                        "Multiline snippets cannot be filled into the input line; review the full command before running.",
+                                    )),
+                            )
+                        })
                         .child(
                             div()
                                 .w_full()
@@ -344,6 +374,30 @@ impl CommandsView {
                                         ),
                                     )
                                 })
+                                .when(self.compact_layout, |actions| {
+                                    actions.child(
+                                        Button::new(format!(
+                                            "snippet-preview-terminal-fill-{}-{}",
+                                            preview_origin(key),
+                                            key.snippet_id
+                                        ))
+                                        .compact()
+                                        .h(px(32.))
+                                        .when(fill_primary, Button::primary)
+                                        .when(!fill_primary, Button::secondary)
+                                        .label(crate::locale::text("填入", "Fill"))
+                                        .tooltip(crate::locale::text(
+                                            "填入当前终端输入行，不提交命令",
+                                            "Fill the terminal input without submitting the command",
+                                        ))
+                                        .disabled(!can_fill_terminal)
+                                        .on_click(cx.listener(
+                                            |view, _: &ClickEvent, window, cx| {
+                                                view.fill_snippet(window, cx);
+                                            },
+                                        )),
+                                    )
+                                })
                                 .child(
                                     Button::new(format!(
                                         "snippet-preview-send-{}-{}",
@@ -354,15 +408,23 @@ impl CommandsView {
                                     .h(px(32.))
                                     .when(run_primary, Button::primary)
                                     .when(!run_primary, Button::secondary)
-                                    .label(crate::locale::text("发送", "Send"))
+                                    .label(if self.compact_layout {
+                                        crate::locale::text("运行", "Run")
+                                    } else {
+                                        crate::locale::text("发送", "Send")
+                                    })
                                     .tooltip(crate::locale::text(
-                                        "发送到当前终端",
-                                        "Send to the current terminal",
+                                        "运行片段到当前终端",
+                                        "Run the snippet in the current terminal",
                                     ))
                                     .disabled(!can_send)
                                     .on_click(cx.listener(
                                         |view, _: &ClickEvent, window, cx| {
-                                            view.send_snippet_terminal(window, cx);
+                                            if view.compact_layout {
+                                                view.request_snippet_run_terminal(window, cx);
+                                            } else {
+                                                view.send_snippet_terminal(window, cx);
+                                            }
                                         },
                                     )),
                                 ),
@@ -386,3 +448,22 @@ fn preview_origin(key: &SnippetPreferenceKey) -> &'static str {
         kerminal_domain::commands::SnippetCatalogOrigin::User => "user",
     }
 }
+
+/// Fill 与应用层都先 trim，再检查变量展开后的正文 CR/LF；尾随换行不会造成错误禁用。
+///
+/// @author kongweiguang
+fn terminal_fill_command_is_valid(command: &str) -> bool {
+    let command = command.trim();
+    !command.is_empty() && !command.contains(['\r', '\n'])
+}
+
+/// 只对 trim 后的变量展开正文提示多行限制，文案与主分支展开预览保持一致。
+///
+/// @author kongweiguang
+fn terminal_fill_command_is_multiline(command: &str) -> bool {
+    command.trim().contains(['\r', '\n'])
+}
+
+#[cfg(test)]
+#[path = "../../../../tests/unit/commands_snippet_preview_gate.rs"]
+mod terminal_fill_gate_tests;

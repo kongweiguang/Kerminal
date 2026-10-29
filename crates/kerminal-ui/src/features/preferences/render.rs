@@ -3,13 +3,12 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    ClickEvent, Context, IntoElement, Render, Window,
+    ClickEvent, Context, Focusable as _, IntoElement, Render, Window,
     assets::IconName,
     base::Selectable,
     component::{
         Disableable, Icon,
         button::{Button, ButtonVariants},
-        input::Input,
     },
     div,
     prelude::*,
@@ -19,13 +18,7 @@ use kerminal_domain::preferences::{ConfigurationMode, ConfigurationRecoveryState
 
 use crate::theme::ThemeTokens;
 
-use super::{
-    panel::{
-        PreferencesNavigationDestination, PreferencesPanel, PreferencesSection,
-        recovery_issue_label,
-    },
-    render_settings::keybinding_label,
-};
+use super::panel::{PreferencesPanel, PreferencesSection, recovery_issue_label};
 
 /// 搜索结果保存实际页面卡片索引，导航时可定位到对应设置而非只切换大类。
 ///
@@ -34,11 +27,11 @@ struct NavigationTarget {
     id: String,
     section: PreferencesSection,
     label: gpui_kit::SharedString,
+    description: String,
     keywords: String,
     icon: IconName,
     scroll_index: Option<usize>,
     category: bool,
-    destination: Option<PreferencesNavigationDestination>,
 }
 
 /// 搜索栏过滤后的正文选择；无匹配时保留原 section 并呈现空态，外部目标独立投影。
@@ -48,33 +41,6 @@ pub(super) struct NavigationSearchSelection {
     pub(super) selected_target: Option<String>,
     pub(super) has_matches: bool,
     pub(super) scroll_index: Option<usize>,
-    pub(super) destination: Option<PreferencesNavigationDestination>,
-}
-
-/// 正文只展示命中字段、受控外部目的地或空态，避免搜索结果落到同类但无关页面。
-///
-/// @author kongweiguang
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NavigationBodyProjection {
-    NoResults,
-    Destination(PreferencesNavigationDestination),
-    Section(PreferencesSection),
-}
-
-/// 将搜索选择映射到唯一正文分支；renderer 与测试共同消费此纯投影。
-///
-/// @author kongweiguang
-fn project_navigation_body(
-    query: &str,
-    selection: &NavigationSearchSelection,
-) -> NavigationBodyProjection {
-    if !query.trim().is_empty() && !selection.has_matches {
-        NavigationBodyProjection::NoResults
-    } else if let Some(destination) = selection.destination {
-        NavigationBodyProjection::Destination(destination)
-    } else {
-        NavigationBodyProjection::Section(selection.section)
-    }
 }
 
 /// 将查询投影为实际导航结果；字段命中优先于宽泛分类，避免展示不相关的页面入口。
@@ -88,7 +54,11 @@ fn matching_navigation_targets(
     let query = query.trim().to_lowercase();
     let matches = navigation_targets(settings, mcp_runtime_available)
         .into_iter()
-        .filter(|target| matches_navigation_query(&target.keywords, &query))
+        .filter(|target| {
+            (query.is_empty() || !target.category)
+                && matches_navigation_query(&target.keywords, &query)
+        })
+        .take(if query.is_empty() { usize::MAX } else { 8 })
         .collect::<Vec<_>>();
     if query.is_empty() || !matches.iter().any(|target| !target.category) {
         return matches;
@@ -115,7 +85,6 @@ pub(super) fn resolve_navigation_search_selection(
             selected_target: None,
             has_matches: true,
             scroll_index: None,
-            destination: None,
         };
     }
 
@@ -126,7 +95,6 @@ pub(super) fn resolve_navigation_search_selection(
             selected_target: None,
             has_matches: false,
             scroll_index: None,
-            destination: None,
         };
     };
 
@@ -136,7 +104,6 @@ pub(super) fn resolve_navigation_search_selection(
             selected_target: Some(selected.id.clone()),
             has_matches: true,
             scroll_index: selected.scroll_index,
-            destination: selected.destination,
         };
     }
     if let Some(current_page_match) = matches
@@ -148,7 +115,6 @@ pub(super) fn resolve_navigation_search_selection(
             selected_target: Some(current_page_match.id.clone()),
             has_matches: true,
             scroll_index: current_page_match.scroll_index,
-            destination: current_page_match.destination,
         };
     }
 
@@ -157,7 +123,6 @@ pub(super) fn resolve_navigation_search_selection(
         selected_target: Some(first.id.clone()),
         has_matches: true,
         scroll_index: first.scroll_index,
-        destination: first.destination,
     }
 }
 
@@ -181,291 +146,255 @@ struct NavigationTargetSpec<'a> {
 ///
 /// @author kongweiguang
 fn navigation_targets(
-    settings: Option<&kerminal_application::preferences::SettingsSnapshot>,
+    _settings: Option<&kerminal_application::preferences::SettingsSnapshot>,
     mcp_runtime_available: bool,
 ) -> Vec<NavigationTarget> {
-    let mut targets = vec![
-        navigation_target(NavigationTargetSpec {
-            id: "category-appearance",
-            section: PreferencesSection::Appearance,
-            zh_label: "外观",
-            en_label: "Appearance",
-            keywords: "界面 外观 主题 theme language 语言 density 密度 background 背景 image 图片 opacity 透明度",
-            icon: IconName::Palette,
-            scroll_index: Some(0),
-            category: true,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "appearance-theme",
-            section: PreferencesSection::Appearance,
-            zh_label: "主题",
-            en_label: "Theme",
-            keywords: "主题 theme light 浅色 dark 深色 system 系统 appearance 外观",
-            icon: IconName::Palette,
-            scroll_index: Some(0),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "appearance-language",
-            section: PreferencesSection::Appearance,
-            zh_label: "界面语言",
-            en_label: "Interface language",
-            keywords: "语言 language zh 中文 english 英文",
-            icon: IconName::Palette,
-            scroll_index: Some(0),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "appearance-density",
-            section: PreferencesSection::Appearance,
-            zh_label: "界面密度",
-            en_label: "Interface density",
-            keywords: "密度 density compact 紧凑 comfortable 舒适 spacious 宽松",
-            icon: IconName::Palette,
-            scroll_index: Some(0),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "appearance-background",
-            section: PreferencesSection::Appearance,
-            zh_label: "背景图片与透明度",
-            en_label: "Background image and opacity",
-            keywords: "背景 background image 图片 fit 适配 cover contain tile 平铺 opacity 透明度 window 窗口",
-            icon: IconName::Palette,
-            scroll_index: Some(1),
-            category: false,
-        }),
-        {
-            let mut target = navigation_target(NavigationTargetSpec {
-                id: "about-updates",
-                section: PreferencesSection::Appearance,
-                zh_label: "关于与更新",
-                en_label: "About & updates",
-                keywords: "about 关于 updates update version 版本 更新 release 发布",
-                icon: IconName::Info,
-                scroll_index: None,
-                category: false,
-            });
-            target.destination = Some(PreferencesNavigationDestination::Updates);
-            target
-        },
-        navigation_target(NavigationTargetSpec {
-            id: "category-terminal",
-            section: PreferencesSection::Terminal,
-            zh_label: "终端外观",
-            en_label: "Terminal",
-            keywords: "终端 terminal font 字体字号 size 行高 line-height scrollback 滚屏 cursor 光标 color 颜色 palette shell",
-            icon: IconName::SquareTerminal,
-            scroll_index: Some(0),
-            category: true,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "terminal-font",
-            section: PreferencesSection::Terminal,
-            zh_label: "字体与滚屏缓冲",
-            en_label: "Font and scrollback",
-            keywords: "font family 字体字号 size 字体与滚动 line-height 行高 scrollback 滚动 滚屏 缓冲 滚屏缓冲行数",
-            icon: IconName::SquareTerminal,
-            scroll_index: Some(1),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "terminal-cursor-color",
-            section: PreferencesSection::Terminal,
-            zh_label: "光标与配色",
-            en_label: "Cursor and color scheme",
-            keywords: "cursor 光标 blink 闪烁 style 样式 color scheme 配色 palette 颜色",
-            icon: IconName::SquareTerminal,
-            scroll_index: Some(2),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "terminal-behavior",
-            section: PreferencesSection::Terminal,
-            zh_label: "输入行为、建议与关键词",
-            en_label: "Input behavior, suggestions, and keywords",
-            keywords: "terminal behavior rightclick 右键 option meta paste 粘贴 suggestion 建议 inline suggestion command block 命令块 highlight 高亮 keyword 关键词 selection copy",
-            icon: IconName::SquareTerminal,
-            scroll_index: Some(3),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "category-shortcuts",
-            section: PreferencesSection::Shortcuts,
-            zh_label: "快捷键",
-            en_label: "Keyboard shortcuts",
-            keywords: "快捷键 shortcut shortcuts keyboard 键盘 binding 绑定 conflict 冲突 invalid 无效",
-            icon: IconName::Keyboard,
-            scroll_index: Some(0),
-            category: true,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "shortcuts-diagnostics",
-            section: PreferencesSection::Shortcuts,
-            zh_label: "快捷键冲突与校验",
-            en_label: "Shortcut conflicts and validation",
-            keywords: "快捷键 shortcut conflict 冲突 invalid 无效 binding 绑定 parser chord 组合键",
-            icon: IconName::Keyboard,
-            scroll_index: Some(0),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "category-integrations",
-            section: PreferencesSection::Integrations,
-            zh_label: "通知与集成",
-            en_label: "Notifications",
-            keywords: "通知 notification integrations 集成 sftp launcher 启动器 suggestions 建议 keywords 关键词 toolrail 工具栏 agent external launch 外部启动",
-            icon: IconName::Bell,
-            scroll_index: Some(0),
-            category: true,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "integrations-notifications",
-            section: PreferencesSection::Integrations,
-            zh_label: "桌面通知",
-            en_label: "Desktop notifications",
-            keywords: "notification notifications 桌面通知 duration throttle important 后台重要事件",
-            icon: IconName::Bell,
-            scroll_index: Some(1),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "integrations-external-launch",
-            section: PreferencesSection::Integrations,
-            zh_label: "外部启动",
-            en_label: "External launch",
-            keywords: "external launch 外部启动 ssh sources 来源 vendor args third party 第三方 sftp",
-            icon: IconName::Bell,
-            scroll_index: Some(2),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "integrations-sftp",
-            section: PreferencesSection::Integrations,
-            zh_label: "SFTP 传输",
-            en_label: "SFTP transfers",
-            keywords: "sftp transfer transfers 传输 concurrency 并发 pipeline packet bytes idle timeout 空闲超时",
-            icon: IconName::Bell,
-            scroll_index: Some(3),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "integrations-agent-launcher",
-            section: PreferencesSection::Integrations,
-            zh_label: "Agent 启动器",
-            en_label: "Agent Launcher",
-            keywords: "agent launcher 启动器 codex claude custom 自定义 command 命令",
-            icon: IconName::Bell,
-            scroll_index: Some(4),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "integrations-tool-rail",
-            section: PreferencesSection::Integrations,
-            zh_label: "工具栏布局",
-            en_label: "Tool rail layout",
-            keywords: "tool rail toolbar 工具栏 order 顺序 hidden 隐藏 bottom 底部 pin placement 位置",
-            icon: IconName::Bell,
-            scroll_index: Some(5),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "integrations-protocol",
-            section: PreferencesSection::Integrations,
-            zh_label: "kerminal:// 协议状态",
-            en_label: "kerminal:// protocol status",
-            keywords: "external protocol URI handler URL 链接 注册状态",
-            icon: IconName::ExternalLink,
-            scroll_index: Some(6),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "category-sync",
-            section: PreferencesSection::ConfigurationSync,
-            zh_label: "配置同步",
-            en_label: "Configuration sync",
-            keywords: "配置同步 configuration sync git fetch pull commit push 冲突 conflict remote 远端",
-            icon: IconName::CloudSync,
-            scroll_index: Some(0),
-            category: true,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "sync-actions",
-            section: PreferencesSection::ConfigurationSync,
-            zh_label: "同步操作与仓库状态",
-            en_label: "Sync actions and repository status",
-            keywords: "fetch pull commit push remote 远端 branch 分支 upstream ahead behind conflict 冲突 rebase 变基",
-            icon: IconName::CloudSync,
-            scroll_index: Some(0),
-            category: false,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "category-vault",
-            section: PreferencesSection::Vault,
-            zh_label: "凭据密钥",
-            en_label: "Vault keys",
-            keywords: "凭据 vault key 密钥 credential recovery 恢复 import export rotate 轮换 backup 备份",
-            icon: IconName::KeyRound,
-            scroll_index: Some(0),
-            category: true,
-        }),
-        navigation_target(NavigationTargetSpec {
-            id: "vault-actions",
-            section: PreferencesSection::Vault,
-            zh_label: "密钥检查、导入与备份",
-            en_label: "Key checks, import, and backup",
-            keywords: "vault key readiness 状态 import 导入 export 导出 rotate 轮换 restore 恢复 backup 备份",
-            icon: IconName::KeyRound,
-            scroll_index: Some(0),
-            category: false,
-        }),
+    let _ = mcp_runtime_available;
+    let pages = [
+        (
+            "appearance",
+            PreferencesSection::Appearance,
+            "界面外观",
+            "Appearance",
+            "语言 language 主题 theme 透明度 opacity 密度 density 背景 图片 background",
+            IconName::MonitorCog,
+        ),
+        (
+            "terminal",
+            PreferencesSection::Terminal,
+            "终端",
+            "Terminal",
+            "配色 color 字体 font 字号 行高 字重 渲染 renderer 光标 cursor 右键 滚屏 scrollback",
+            IconName::Terminal,
+        ),
+        (
+            "keywords",
+            PreferencesSection::KeywordHighlights,
+            "关键词高亮",
+            "Keyword highlights",
+            "关键词 高亮 keyword highlight 规则 正则 regex 色板 颜色 预览",
+            IconName::Highlighter,
+        ),
+        (
+            "suggestions",
+            PreferencesSection::CommandSuggestions,
+            "命令提示",
+            "Command suggestions",
+            "命令 提示 suggestion Provider 历史 远端 路径 Git CLI Spec 接受键 Tab",
+            IconName::Clipboard,
+        ),
+        (
+            "sftp",
+            PreferencesSection::Sftp,
+            "SFTP",
+            "SFTP",
+            "SFTP 传输 并发 concurrency 流水线 pipeline 包大小 packet 超时 timeout 高级",
+            IconName::Network,
+        ),
+        (
+            "external-launch",
+            PreferencesSection::ExternalLaunch,
+            "外部启动",
+            "External launch",
+            "外部 启动 external launch SSH 协议 注册 URI 参数 来源 模板",
+            IconName::Route,
+        ),
+        (
+            "mcp",
+            PreferencesSection::Mcp,
+            "MCP",
+            "MCP",
+            "MCP 服务 启动 停止 endpoint JSON 连接信息 复制",
+            IconName::Puzzle,
+        ),
+        (
+            "sync",
+            PreferencesSection::ConfigurationSync,
+            "同步",
+            "Sync",
+            "同步 sync Git 工作区 密钥 vault key 保存",
+            IconName::KeyRound,
+        ),
+        (
+            "desktop",
+            PreferencesSection::Desktop,
+            "桌面",
+            "Desktop",
+            "桌面 通知 notification 耗时 阈值 节流 高级",
+            IconName::Bell,
+        ),
+        (
+            "shortcuts",
+            PreferencesSection::Shortcuts,
+            "快捷键列表",
+            "Keyboard shortcuts",
+            "快捷键 shortcut keyboard Windows macOS 绑定 binding 默认 恢复",
+            IconName::Keyboard,
+        ),
+        (
+            "about",
+            PreferencesSection::About,
+            "关于",
+            "About",
+            "关于 about 版本 version 协议 license GitHub 更新 update 下载 安装 重启",
+            IconName::Info,
+        ),
     ];
-
-    if let Some(settings) = settings {
-        for (index, binding) in settings.keybindings.iter().enumerate() {
-            let display_name = keybinding_label(&binding.action, &binding.label).to_string();
-            let zh_label = format!("快捷键 · {display_name}");
-            let en_label = format!("Shortcut · {display_name}");
-            let label = crate::locale::text(zh_label, en_label);
-            let keywords = format!(
-                "{} {} {} {} {} {} {} {} 快捷键 keyboard shortcut binding 组合键",
-                binding.action,
-                binding.label,
-                binding.description,
-                binding.binding,
-                binding.windows_binding,
-                binding
-                    .windows_alternate_binding
-                    .as_deref()
-                    .unwrap_or_default(),
-                binding.linux_binding.as_deref().unwrap_or_default(),
-                binding.mac_binding
-            );
-            targets.push(NavigationTarget {
-                id: format!("keybinding-{index}"),
-                section: PreferencesSection::Shortcuts,
-                label,
+    let mut targets: Vec<_> = pages
+        .into_iter()
+        .map(|(id, section, zh_label, en_label, keywords, icon)| {
+            navigation_target(NavigationTargetSpec {
+                id,
+                section,
+                zh_label,
+                en_label,
                 keywords,
-                icon: IconName::Keyboard,
-                scroll_index: Some(index + 2),
-                category: false,
-                destination: None,
-            });
-        }
-    }
-
-    if mcp_runtime_available {
+                icon,
+                scroll_index: Some(0),
+                category: true,
+            })
+        })
+        .collect();
+    // 与 main 同源的十八个搜索入口；标题、说明、分类与关键词共同参与匹配。
+    for (id, section, title, description, index) in [
+        (
+            "settings-interface-appearance-panel",
+            PreferencesSection::Appearance,
+            "应用外观",
+            "切换深色、浅色或跟随系统。 dark light system theme 主题 深色 浅色",
+            0,
+        ),
+        (
+            "settings-interface-basics-panel",
+            PreferencesSection::Appearance,
+            "界面基础设置",
+            "界面语言、密度和窗口透明度。 language density opacity 语言 密度 透明度",
+            0,
+        ),
+        (
+            "settings-background-panel",
+            PreferencesSection::Appearance,
+            "主页面背景",
+            "选择工作台背景图、透明度和铺放方式。 background image 壁纸 背景 图片",
+            1,
+        ),
+        (
+            "settings-terminal-theme-panel",
+            PreferencesSection::Terminal,
+            "终端主题",
+            "分别设置浅色和深色终端配色。 terminal color scheme 终端 主题 配色",
+            0,
+        ),
+        (
+            "settings-terminal-font-panel",
+            PreferencesSection::Terminal,
+            "字体配置",
+            "终端字体、字号、行高和字重。 font size line height 字体 字号 行高 字重",
+            1,
+        ),
+        (
+            "settings-terminal-renderer-panel",
+            PreferencesSection::Terminal,
+            "终端渲染",
+            "GPUI 原生终端渲染与真实诊断状态。 renderer webgl gpu cpu 渲染 显卡 加速",
+            2,
+        ),
+        (
+            "settings-terminal-interaction-panel",
+            PreferencesSection::Terminal,
+            "终端交互",
+            "选中复制、右键行为、自动重连和滚屏缓冲。 copy right click reconnect scrollback 右键 复制 重连 缓冲",
+            3,
+        ),
+        (
+            "settings-terminal-cursor-panel",
+            PreferencesSection::Terminal,
+            "光标形态",
+            "光标样式和闪烁行为。 cursor blink 光标 闪烁",
+            4,
+        ),
+        (
+            "settings-keyword-highlights-panel",
+            PreferencesSection::KeywordHighlights,
+            "关键词高亮规则",
+            "全局终端文本、整词或安全正则高亮规则。 highlight keyword regex word 关键词 高亮 正则 整词 颜色",
+            0,
+        ),
+        (
+            "settings-command-suggestions-policy-panel",
+            PreferencesSection::CommandSuggestions,
+            "命令灰色提示",
+            "灰色命令提示开关、接受按键和远端探测策略。 suggestion ghost inline 提示 灰色提示 接受按键",
+            0,
+        ),
+        (
+            "settings-command-suggestions-providers-panel",
+            PreferencesSection::CommandSuggestions,
+            "提示 Provider",
+            "历史、远端路径、远端命令、Git 和 CLI Spec provider。 provider history git remote 历史 远端 spec",
+            1,
+        ),
+        (
+            "settings-sftp-panel",
+            PreferencesSection::Sftp,
+            "SFTP 传输",
+            "SFTP 传输并发、pipeline 和超时。 sftp transfer pipeline timeout 传输 并发 超时",
+            0,
+        ),
+        (
+            "settings-external-launch-compatibility",
+            PreferencesSection::ExternalLaunch,
+            "外部 SSH 启动",
+            "堡垒机、第三方 SSH 参数和 kerminal:// SSH 入口。 external bastion jump ssh putty mobaxterm xshell securecrt kerminal:// 跳板机 堡垒机 外部启动",
+            0,
+        ),
+        (
+            "settings-mcp-connection-info",
+            PreferencesSection::Mcp,
+            "MCP Server",
+            "Kerminal MCP Server 状态、endpoint 和工具导航。 mcp server endpoint agent 工具",
+            0,
+        ),
+        (
+            "settings-sync-panel",
+            PreferencesSection::ConfigurationSync,
+            "同步",
+            "Git、密钥和配置同步。 sync git key 同步 密钥",
+            0,
+        ),
+        (
+            "settings-desktop-panel",
+            PreferencesSection::Desktop,
+            "桌面通知",
+            "系统通知、后台事件和节流。 notification desktop background 通知 后台 节流",
+            0,
+        ),
+        (
+            "settings-keybindings-panel",
+            PreferencesSection::Shortcuts,
+            "快捷键",
+            "Windows 和 macOS 快捷键列表。 keyboard shortcut keybinding 快捷键 键盘",
+            0,
+        ),
+        (
+            "settings-about-panel",
+            PreferencesSection::About,
+            "关于",
+            "版本、更新和项目链接。 about version update 关于 版本 更新",
+            0,
+        ),
+    ] {
         let mut target = navigation_target(NavigationTargetSpec {
-            id: "mcp-runtime",
-            section: PreferencesSection::Integrations,
-            zh_label: "MCP 运行时",
-            en_label: "MCP runtime",
-            keywords: "model context protocol server listener tools endpoint",
-            icon: IconName::Network,
-            scroll_index: None,
+            id,
+            section,
+            zh_label: title,
+            en_label: title,
+            keywords: description,
+            icon: IconName::Search,
+            scroll_index: Some(index),
             category: false,
         });
-        target.destination = Some(PreferencesNavigationDestination::McpRuntime);
+        target.description = description.to_owned();
         targets.push(target);
     }
 
@@ -490,269 +419,170 @@ fn navigation_target(spec: NavigationTargetSpec<'_>) -> NavigationTarget {
         id: id.to_owned(),
         section,
         label: crate::locale::text(zh_label, en_label),
+        description: String::new(),
         keywords: format!("{zh_label} {en_label} {keywords}"),
         icon,
         scroll_index,
         category,
-        destination: None,
     }
 }
 
 impl Render for PreferencesPanel {
-    /// 根据当前系统外观与已保存主题绘制面板，GPUI 的实际窗口外观变化仍由根视图订阅。
+    /// 沿用 main 的十一页和即时反馈；输入搜索时正文保留当前页，避免滚动与焦点跳动。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_loaded(window, cx);
-        let search_selection = self.reconcile_navigation_search_selection();
+        let _search_selection = self.reconcile_navigation_search_selection();
         if let Some(index) = self.pending_navigation_search_scroll.take() {
             let scroll = self.content_scroll.clone();
             window.on_next_frame(move |_, _| scroll.scroll_to_top_of_item(index));
         }
-        let theme = ThemeTokens::current(window, cx);
-        let query = self.navigation_search_query.trim();
-        let content = match project_navigation_body(query, &search_selection) {
-            NavigationBodyProjection::NoResults => {
-                self.render_no_search_results(theme).into_any_element()
+        let theme = ThemeTokens::current(window, cx).for_settings();
+        let content = match self.section {
+            PreferencesSection::Appearance => {
+                self.render_appearance(theme, window, cx).into_any_element()
             }
-            NavigationBodyProjection::Destination(destination) => self
-                .render_search_destination(destination, theme, cx)
+            PreferencesSection::Terminal => {
+                self.render_terminal(theme, window, cx).into_any_element()
+            }
+            PreferencesSection::KeywordHighlights => self
+                .render_keyword_highlights(theme, window, cx)
                 .into_any_element(),
-            NavigationBodyProjection::Section(section) => match section {
-                PreferencesSection::Appearance => {
-                    self.render_appearance(theme, window, cx).into_any_element()
-                }
-                PreferencesSection::Terminal => self.render_terminal(theme, cx).into_any_element(),
-                PreferencesSection::Shortcuts => {
-                    self.render_shortcuts(theme, cx).into_any_element()
-                }
-                PreferencesSection::Profiles => {
-                    self.render_profiles(theme, window, cx).into_any_element()
-                }
-                PreferencesSection::Integrations => {
-                    self.render_integrations(theme, cx).into_any_element()
-                }
-                PreferencesSection::ConfigurationSync => {
-                    self.render_configuration_sync(theme, cx).into_any_element()
-                }
-                PreferencesSection::Vault => self.render_vault(theme, cx).into_any_element(),
-            },
+            PreferencesSection::CommandSuggestions => self
+                .render_command_suggestions(theme, window, cx)
+                .into_any_element(),
+            PreferencesSection::Sftp => self.render_sftp(theme, window, cx).into_any_element(),
+            PreferencesSection::ExternalLaunch => self
+                .render_external_launch(theme, window, cx)
+                .into_any_element(),
+            PreferencesSection::Mcp => self.render_mcp_settings(theme, cx).into_any_element(),
+            PreferencesSection::Desktop => {
+                self.render_desktop_settings(theme, cx).into_any_element()
+            }
+            PreferencesSection::About => self.render_about_settings(theme, cx).into_any_element(),
+            PreferencesSection::Shortcuts => self
+                .render_keybindings_settings(theme, cx)
+                .into_any_element(),
+            PreferencesSection::Profiles => {
+                self.render_profiles(theme, window, cx).into_any_element()
+            }
+            PreferencesSection::Integrations => {
+                self.render_integrations(theme, cx).into_any_element()
+            }
+            PreferencesSection::ConfigurationSync => {
+                self.render_configuration_sync(theme, cx).into_any_element()
+            }
         };
 
-        div()
-            .id("preferences-panel")
-            .size_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(self.render_header(theme, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .flex()
-                    .overflow_hidden()
-                    .child(self.render_sidebar(theme, window, cx))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .overflow_hidden()
-                            .child(self.render_recovery(theme, cx))
-                            .child(content)
-                            .child(self.render_footer(theme, cx)),
-                    ),
-            )
-            .when_some(
-                self.render_close_confirmation(theme, cx),
-                |root, overlay| root.child(overlay),
-            )
-            .when_some(
-                self.render_profile_switch_confirmation(theme, cx),
-                |root, overlay| root.child(overlay),
-            )
-            .when_some(
-                self.render_profile_reload_confirmation(theme, cx),
-                |root, overlay| root.child(overlay),
-            )
-            .when_some(
-                self.render_profile_delete_confirmation(theme, cx),
-                |root, overlay| root.child(overlay),
-            )
-            .when_some(
-                self.render_settings_reload_confirmation(theme, cx),
-                |root, overlay| root.child(overlay),
-            )
-            .when_some(self.render_quit_confirmation(theme, cx), |root, overlay| {
-                root.child(overlay)
-            })
+        settings_text_font(
+            div()
+                .id("preferences-panel")
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .font_weight(gpui_kit::FontWeight::NORMAL)
+                .text_color(theme.foreground)
+                .child(self.render_header(theme, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .gap(px(16.))
+                        .px(px(20.))
+                        .py(px(16.))
+                        .overflow_hidden()
+                        .child(self.render_sidebar(theme, window, cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .track_focus(&self.settings_content_focus)
+                                .flex()
+                                .flex_col()
+                                .overflow_hidden()
+                                .child(self.render_recovery(theme, cx))
+                                .child(content),
+                        ),
+                )
+                .when_some(
+                    self.render_close_confirmation(theme, cx),
+                    |root, overlay| root.child(overlay),
+                )
+                .when_some(
+                    self.render_profile_switch_confirmation(theme, cx),
+                    |root, overlay| root.child(overlay),
+                )
+                .when_some(
+                    self.render_profile_reload_confirmation(theme, cx),
+                    |root, overlay| root.child(overlay),
+                )
+                .when_some(
+                    self.render_profile_delete_confirmation(theme, cx),
+                    |root, overlay| root.child(overlay),
+                )
+                .when_some(self.render_quit_confirmation(theme, cx), |root, overlay| {
+                    root.child(overlay)
+                }),
+        )
+    }
+}
+
+/// Windows Segoe UI does not contain CJK glyphs; direct its fallback to the same YaHei UI family WebView resolves first.
+/// The settings subtree owns this fallback so other GPUI surfaces keep their existing platform typography.
+///
+/// @author kongweiguang
+fn settings_text_font<T: gpui_kit::Styled>(element: T) -> T {
+    #[cfg(target_os = "windows")]
+    {
+        let font = gpui_pre::font("Segoe UI");
+        element.font(gpui_pre::Font {
+            fallbacks: Some(gpui_pre::FontFallbacks::from_fonts(vec![
+                "Microsoft YaHei UI".to_owned(),
+                "Microsoft YaHei".to_owned(),
+            ])),
+            ..font
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        element
     }
 }
 
 impl PreferencesPanel {
-    /// 外部运行时与更新结果不伪装成本地配置；按钮沿用现有离开草稿门禁。
-    ///
-    /// @author kongweiguang
-    fn render_search_destination(
-        &mut self,
-        destination: PreferencesNavigationDestination,
-        theme: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        match destination {
-            PreferencesNavigationDestination::McpRuntime => div()
-                .id("preferences-mcp-runtime-search-result")
-                .w_full()
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.background)
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(560.))
-                        .rounded(theme.radius)
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.panel)
-                        .p_6()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_size(theme.text_title)
-                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                .text_color(theme.foreground)
-                                .child(crate::locale::text("MCP 运行时", "MCP runtime")),
-                        )
-                        .child(
-                            div()
-                                .text_size(theme.text_body)
-                                .text_color(theme.muted)
-                                .child(crate::locale::text(
-                                    "MCP 控制位于运行态独立工作区，不属于本地设置项。",
-                                    "MCP controls live in a separate runtime workspace, not in local settings.",
-                                )),
-                        )
-                        .child(
-                            Button::new("preferences-open-mcp-runtime")
-                                .primary()
-                                .label(crate::locale::text(
-                                    "打开 MCP 运行时",
-                                    "Open MCP runtime",
-                                ))
-                                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                    panel.request_mcp_runtime_navigation(cx);
-                                })),
-                        ),
-                ),
-            PreferencesNavigationDestination::Updates => div()
-                .id("preferences-updates-search-result")
-                .w_full()
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.background)
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(560.))
-                        .rounded(theme.radius)
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.panel)
-                        .p_6()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_size(theme.text_title)
-                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                .text_color(theme.foreground)
-                                .child(crate::locale::text("关于与更新", "About & updates")),
-                        )
-                        .child(
-                            div()
-                                .text_size(theme.text_body)
-                                .text_color(theme.muted)
-                                .child(crate::locale::text(
-                                    "版本信息与更新操作位于工作台的更新面板。",
-                                    "Version information and update actions are available in the Updates workspace.",
-                                )),
-                        )
-                        .child(
-                            Button::new("preferences-open-updates")
-                                .primary()
-                                .label(crate::locale::text("打开更新面板", "Open Updates"))
-                                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                    panel.request_updates_navigation(cx);
-                                })),
-                        ),
-                ),
-        }
-    }
-
-    /// 搜索无命中时清楚说明结果为空，避免继续展示与查询无关的旧设置页。
-    ///
-    /// @author kongweiguang
-    fn render_no_search_results(&self, theme: ThemeTokens) -> impl IntoElement {
-        div()
-            .id("preferences-no-search-results")
-            .w_full()
-            .h_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme.background)
-            .child(
-                div()
-                    .max_w(px(420.))
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.panel)
-                    .px_5()
-                    .py_4()
-                    .text_size(theme.text_body)
-                    .text_color(theme.muted)
-                    .child(crate::locale::text(
-                        "没有匹配的设置，请尝试其他关键词。",
-                        "No settings match this search. Try another keyword.",
-                    )),
-            )
-    }
-
-    /// 标题栏用模态关闭图标；Root 恢复打开前页面，离开仍执行同一草稿关闭门禁。
+    /// 标题栏保持 main 的 36px 关闭控件和上下 16px 留白，不随正文的 flex 压缩。
+    /// Root 恢复打开前页面，离开仍执行同一草稿关闭门禁。
     ///
     /// @author kongweiguang
     fn render_header(&mut self, theme: ThemeTokens, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w_full()
-            .h(px(68.))
+            .h(px(69.))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme.border)
             .px_5()
             .flex()
-            .items_center()
+            .items_start()
+            .py_4()
             .gap_3()
-            .bg(theme.panel)
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(18.))
-                    .font_weight(gpui_kit::FontWeight::BOLD)
+                    .text_size(px(17.))
+                    .line_height(px(24.))
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .child(crate::locale::text("设置", "Settings")),
             )
             .child(
                 Button::new("preferences-close")
+                    .focus_handle(&self.settings_close_focus)
+                    .size(px(36.))
                     .compact()
-                    .ghost()
+                    .custom(super::render_settings::settings_ghost_variant(theme, cx))
                     .icon(IconName::Close)
                     .accessibility_label(crate::locale::text("关闭设置", "Close settings"))
                     .tooltip(crate::locale::text("关闭设置", "Close settings"))
@@ -762,7 +592,7 @@ impl PreferencesPanel {
             )
     }
 
-    /// 默认菜单只列类别，搜索按实际字段过滤；固定窄栏的底部使用短提示，避免标点单独换行。
+    /// 分类与搜索结果共用 main 的窄侧栏；暴露裁切边界供验收先滚动再点击，避免误点栏外控件。
     ///
     /// @author kongweiguang
     fn render_sidebar(
@@ -787,15 +617,54 @@ impl PreferencesPanel {
         };
         let no_matches = !query.is_empty() && matches.is_empty();
         let mut sidebar = div()
-            .w(px(204.))
+            .w(px(190.))
             .flex_shrink_0()
-            .h_full()
+            .self_start()
+            .max_h_full()
             .flex()
             .flex_col()
             .gap_2()
-            .p_3()
-            .bg(theme.sidebar)
-            .child(Input::new(&self.navigation_search).w_full().h(px(36.)));
+            .pr(px(16.))
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                div().id("preferences-search").child(
+                    gpui_kit::Styled::h(
+                        super::render_settings::settings_input(&self.navigation_search, theme),
+                        px(36.),
+                    )
+                    .w_full()
+                    .prefix(
+                        Icon::new(IconName::Search)
+                            .size(px(16.))
+                            .text_color(theme.muted),
+                    )
+                    .suffix(div().when(
+                        !self.navigation_search_query.is_empty(),
+                        |row| {
+                            row.child(
+                                Button::new("preferences-search-clear")
+                                    .custom(super::render_settings::settings_ghost_variant(
+                                        theme, cx,
+                                    ))
+                                    .size(px(24.))
+                                    .icon(IconName::Close)
+                                    .accessibility_label(crate::locale::text(
+                                        "清除设置搜索",
+                                        "Clear settings search",
+                                    ))
+                                    .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                                        panel.navigation_search_query.clear();
+                                        panel.navigation_search.update(cx, |input, cx| {
+                                            input.set_value(String::new(), window, cx)
+                                        });
+                                        cx.notify();
+                                    })),
+                            )
+                        },
+                    )),
+                ),
+            );
         let mut nav_rows = matches
             .into_iter()
             .map(|target| self.nav_button(target, theme, cx).into_any_element())
@@ -807,8 +676,8 @@ impl PreferencesPanel {
                     .text_size(theme.text_sm)
                     .text_color(theme.muted)
                     .child(crate::locale::text(
-                        "没有匹配的设置",
-                        "No matching settings",
+                        "没有找到匹配设置。",
+                        "No matching settings found.",
                     ))
                     .into_any_element(),
             );
@@ -816,7 +685,8 @@ impl PreferencesPanel {
         sidebar = sidebar.child(
             div()
                 .id("preferences-navigation-results")
-                .flex_1()
+                .debug_selector(|| "preferences-navigation-viewport".into())
+                .flex_shrink_1()
                 .min_h(px(0.))
                 .overflow_y_scroll()
                 .flex()
@@ -824,17 +694,7 @@ impl PreferencesPanel {
                 .gap_1()
                 .children(nav_rows),
         );
-        sidebar.child(
-            div()
-                .mt_3()
-                .px_2()
-                .text_size(theme.text_sm)
-                .text_color(theme.muted)
-                .child(crate::locale::text(
-                    "配置保存在本机",
-                    "Settings stored locally",
-                )),
-        )
+        sidebar
     }
 
     /// 导航项保持左对齐的扁平 ghost 外观；外部工作区目标经共享离开门禁处理。
@@ -845,7 +705,7 @@ impl PreferencesPanel {
         target: NavigationTarget,
         theme: ThemeTokens,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui_kit::AnyElement {
         let selected = if self.navigation_search_query.trim().is_empty() {
             target.category && self.section == target.section
         } else {
@@ -854,20 +714,69 @@ impl PreferencesPanel {
         let target_id = target.id.clone();
         let target_section = target.section;
         let scroll_index = target.scroll_index;
-        let destination = target.destination;
+        if !target.category {
+            let description = target
+                .description
+                .split_once('。')
+                .map_or(target.description.as_str(), |(text, _)| text)
+                .to_owned();
+            let category = navigation_targets(None, self.mcp_runtime_available)
+                .into_iter()
+                .find(|entry| entry.category && entry.section == target.section)
+                .map(|entry| entry.label)
+                .unwrap_or_default();
+            let description = format!("{category} · {description}。");
+            return Button::new(format!("preferences-nav-{}", target.id))
+                .custom(super::render_settings::settings_ghost_variant(theme, cx))
+                .w_full()
+                .h_auto()
+                .px(px(10.))
+                .py(px(8.))
+                .accessibility_label(format!("打开设置项：{}", target.label))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_left()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(theme.settings_medium_font_weight())
+                                .child(target.label),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.muted)
+                                .child(description),
+                        ),
+                )
+                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                    panel.navigate_to_target(
+                        target_id.clone(),
+                        target_section,
+                        scroll_index,
+                        window,
+                        cx,
+                    );
+                }))
+                .into_any_element();
+        }
         let label = target.label.clone();
-        let text_color = if selected {
-            theme.selected_foreground
-        } else {
-            theme.foreground
-        };
-        let icon_color = if selected { theme.accent } else { theme.muted };
+        let text_color = theme.settings_choice_foreground(selected);
+        let icon_color = if selected { text_color } else { theme.muted };
         let button = Button::new(format!("preferences-nav-{}", target.id))
             .w_full()
-            .h(px(44.))
+            .min_h(px(40.))
+            .h_auto()
             .compact()
-            .ghost()
+            .px(px(8.))
+            .py(px(6.))
+            .custom(super::render_settings::settings_ghost_variant(theme, cx))
             .selected(selected)
+            .when(selected, |button| button.bg(theme.surface_selected()))
             .accessibility_label(label.clone())
             .child(
                 div()
@@ -878,54 +787,44 @@ impl PreferencesPanel {
                     .gap_2()
                     .child(
                         div()
-                            .size(px(28.))
+                            .size(px(32.))
                             .flex_shrink_0()
                             .rounded(theme.radius_sm)
                             .bg(if selected {
-                                theme.accent.opacity(0.12)
+                                theme.surface_selected()
                             } else {
-                                theme.panel
+                                theme.muted_surface()
                             })
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(Icon::new(target.icon).size(px(18.)).text_color(icon_color)),
+                            .child(Icon::new(target.icon).size(px(16.)).text_color(icon_color)),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.))
                             .text_left()
-                            .text_size(theme.text_body)
-                            .font_weight(if selected {
-                                gpui_kit::FontWeight::MEDIUM
-                            } else {
-                                gpui_kit::FontWeight::NORMAL
-                            })
+                            .text_size(px(13.))
+                            .font_weight(theme.settings_medium_font_weight())
                             .text_color(text_color)
                             .child(label),
                     ),
             )
-            .on_click(
-                cx.listener(move |panel, _: &ClickEvent, window, cx| match destination {
-                    Some(PreferencesNavigationDestination::McpRuntime) => {
-                        panel.request_mcp_runtime_navigation(cx);
-                    }
-                    Some(PreferencesNavigationDestination::Updates) => {
-                        panel.request_updates_navigation(cx);
-                    }
-                    None => {
-                        panel.navigate_to_target(
-                            target_id.clone(),
-                            target_section,
-                            scroll_index,
-                            window,
-                            cx,
-                        );
-                    }
-                }),
-            );
-        div().w_full().rounded(theme.radius_sm).child(button)
+            .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                panel.navigate_to_target(
+                    target_id.clone(),
+                    target_section,
+                    scroll_index,
+                    window,
+                    cx,
+                );
+            }));
+        div()
+            .w_full()
+            .rounded(theme.control_radius)
+            .child(button)
+            .into_any_element()
     }
 
     /// 切换页面后等新滚动内容完成布局再定位，避免搜索结果指向上一页的组件索引。
@@ -941,8 +840,47 @@ impl PreferencesPanel {
     ) {
         let changed = self.section != section
             || self.selected_navigation_target.as_deref() != Some(id.as_str());
+        if self.section != section {
+            self.reset_page_disclosures();
+            if self.section == PreferencesSection::KeywordHighlights {
+                self.discard_pending_keyword_rule();
+            }
+        }
         self.section = section;
+        match id.as_str() {
+            "settings-external-launch-compatibility" => {
+                self.reveal_connectivity_target("external-sources", cx)
+            }
+            "settings-mcp-connection-info" => self.reveal_connectivity_target("mcp-connection", cx),
+            _ => {}
+        }
+        match section {
+            PreferencesSection::Terminal if id == "settings-terminal-renderer-panel" => {
+                self.reveal_terminal_renderer(cx)
+            }
+            PreferencesSection::Sftp if id == "settings-sftp-panel" => {
+                self.reveal_sftp_advanced(cx)
+            }
+            PreferencesSection::Desktop if id == "settings-desktop-panel" => {
+                self.reveal_desktop_advanced(cx)
+            }
+            _ => {}
+        }
+        let focus = match id.as_str() {
+            "settings-terminal-font-panel" => {
+                self.settings_inputs.font_family.read(cx).focus_handle(cx)
+            }
+            "settings-background-panel" => self
+                .settings_inputs
+                .background_path
+                .read(cx)
+                .focus_handle(cx),
+            _ => self.settings_content_focus.clone(),
+        };
         self.selected_navigation_target = Some(id);
+        self.navigation_search_query.clear();
+        self.navigation_search
+            .update(cx, |input, cx| input.set_value(String::new(), window, cx));
         if changed {
             cx.notify();
         }
@@ -952,6 +890,7 @@ impl PreferencesPanel {
             let scroll = self.content_scroll.clone();
             window.on_next_frame(move |_, _| scroll.scroll_to_top_of_item(index));
         }
+        window.on_next_frame(move |window, cx| window.focus(&focus, cx));
     }
 
     /// 只读恢复条目提供固定配置目录入口，状态只反映系统请求回执，不承诺窗口已显示。
@@ -1017,171 +956,55 @@ impl PreferencesPanel {
         })
     }
 
-    /// 底栏在窄内容区允许状态和操作换行，并让提示准确表达显式保存语义。
-    ///
+    /// 保存反馈放在正文末尾；只有确认成功才显示 main 的勾，失败和在途状态不冒充保存完成。
     /// @author kongweiguang
-    fn render_footer(&mut self, theme: ThemeTokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let dirty = match self.section {
-            PreferencesSection::Profiles => self
-                .profile_draft
-                .as_ref()
-                .is_some_and(|draft| draft.is_dirty()),
-            PreferencesSection::ConfigurationSync | PreferencesSection::Vault => false,
-            _ => self.settings.as_ref().is_some_and(|draft| draft.is_dirty()),
-        };
-        let saving = match self.section {
-            PreferencesSection::Profiles => {
-                self.profile_draft
-                    .as_ref()
-                    .is_some_and(|draft| draft.status() == super::DraftStatus::Saving)
-                    || self.profile_operation_running
-            }
-            PreferencesSection::ConfigurationSync | PreferencesSection::Vault => {
-                self.sync_busy.is_some()
-                    || self.vault_busy
-                    || self.vault_loading
-                    || self.sync_loading
-            }
-            _ => self
-                .settings
-                .as_ref()
-                .is_some_and(|draft| draft.status() == super::DraftStatus::Saving),
-        };
-        let can_save = dirty
-            && !saving
-            && self.recovery.mode != ConfigurationMode::ReadOnlyRecovery
-            && (self.section == PreferencesSection::Profiles
-                || !self.settings.as_ref().is_some_and(|draft| {
+    pub(super) fn render_save_notice(&self, theme: ThemeTokens) -> impl IntoElement {
+        let message = self
+            .settings_error
+            .as_deref()
+            .or(self.status.as_deref())
+            .map(str::to_owned)
+            .or_else(|| {
+                self.settings_success_status
+                    .map(|state| state.message(crate::locale::current_language()).to_owned())
+            });
+        div().when_some(message, |row, message| {
+            let failed = self.settings_error.is_some()
+                || !self.settings_input_errors.is_empty()
+                || self.settings_issues.iter().any(|issue| issue.blocks_save())
+                || self.settings.as_ref().is_some_and(|draft| {
                     matches!(
                         draft.status(),
-                        super::DraftStatus::ExternalConflict | super::DraftStatus::OutcomeUnknown
+                        super::DraftStatus::Failed
+                            | super::DraftStatus::ExternalConflict
+                            | super::DraftStatus::OutcomeUnknown
                     )
-                }))
-            && match self.section {
-                PreferencesSection::Profiles => self.profile_input_errors.is_empty(),
-                PreferencesSection::ConfigurationSync | PreferencesSection::Vault => false,
-                _ => self.settings_input_errors.is_empty(),
-            };
-        let save_label = if saving {
-            crate::locale::text("保存中…", "Saving…")
-        } else {
-            crate::locale::text("保存更改", "Save changes")
-        };
-        let settings_footer_error = (!matches!(
-            self.section,
-            PreferencesSection::Profiles
-                | PreferencesSection::ConfigurationSync
-                | PreferencesSection::Vault
-        ))
-        .then_some(self.settings_error.as_deref())
-        .flatten();
-        let footer_status = self.status.as_deref().or_else(|| {
-            self.settings_success_status
-                .map(|status| status.message(crate::locale::current_language()))
-        });
-        let (footer_message, footer_message_is_error) =
-            settings_footer_message(settings_footer_error, footer_status)
-                .map_or((None, false), |(message, is_error)| {
-                    (Some(message.to_owned()), is_error)
                 });
-        let mut footer = div()
-            .w_full()
-            .min_h(px(52.))
-            .px_4()
-            .py_2()
-            .flex()
-            .flex_wrap()
-            .flex_shrink_0()
-            .items_center()
-            .gap_2()
-            .bg(theme.panel)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .text_size(px(12.))
-                    .text_color(if footer_message_is_error {
-                        theme.error
-                    } else {
-                        theme.muted
-                    })
-                    .child(footer_message.unwrap_or_else(|| {
-                        if dirty {
-                            crate::locale::text("有未保存修改", "Unsaved changes").to_string()
-                        } else {
-                            crate::locale::text(
-                                "更改会在保存后生效。",
-                                "Changes take effect after saving.",
-                            )
-                            .to_string()
-                        }
-                    })),
-            );
-        let blocking_settings_issues = self
-            .settings_issues
-            .iter()
-            .filter(|issue| issue.blocks_save())
-            .count();
-        if blocking_settings_issues > 0 {
-            footer = footer.child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(12.))
-                    .text_color(theme.error)
-                    .child(crate::locale::text(
-                        format!("{} 项设置需要修正", blocking_settings_issues),
-                        format!("{} settings need correction", blocking_settings_issues),
-                    )),
-            );
-        }
-        let settings_reload_needed = !matches!(
-            self.section,
-            PreferencesSection::Profiles
-                | PreferencesSection::ConfigurationSync
-                | PreferencesSection::Vault
-        ) && (self.settings_error.is_some()
-            || self.settings.as_ref().is_some_and(|draft| {
-                matches!(
-                    draft.status(),
-                    super::DraftStatus::ExternalConflict | super::DraftStatus::OutcomeUnknown
+            let color = if failed { theme.error } else { theme.success };
+            row.rounded(theme.control_radius)
+                .border_1()
+                .border_color(color.opacity(0.2))
+                .bg(color.opacity(0.1))
+                .px_3()
+                .py_2()
+                .text_size(px(13.))
+                .text_color(if failed {
+                    color
+                } else {
+                    theme.settings_saved_foreground()
+                })
+                .flex()
+                .items_center()
+                .gap_2()
+                .when(
+                    !failed
+                        && self.status.is_none()
+                        && self.settings_success_status
+                            == Some(super::panel::SettingsSuccessStatus::Saved),
+                    |notice| notice.child(Icon::new(IconName::Check).size(px(16.))),
                 )
-            }));
-        if settings_reload_needed {
-            footer = footer.child(
-                Button::new("preferences-reload")
-                    .compact()
-                    .flex_shrink_0()
-                    .label(if self.loading_settings {
-                        crate::locale::text("重新读取中…", "Reloading…")
-                    } else {
-                        crate::locale::text("重新读取", "Reload")
-                    })
-                    .disabled(self.loading_settings || saving)
-                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                        panel.request_reload_settings(cx)
-                    })),
-            );
-        }
-        // Profile 页面在所选记录表单内保存，footer 仅显示状态以免同一操作出现两个入口。
-        if matches!(
-            self.section,
-            PreferencesSection::Profiles
-                | PreferencesSection::ConfigurationSync
-                | PreferencesSection::Vault
-        ) {
-            return footer;
-        }
-        footer.child(
-            Button::new("preferences-save")
-                .compact()
-                .flex_shrink_0()
-                .primary()
-                .label(save_label)
-                .disabled(!can_save)
-                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                    panel.save_settings(cx);
-                })),
-        )
+                .child(message)
+        })
     }
 
     /// Dirty-close 提示同时覆盖两个草稿上下文，取消保留输入，丢弃后才发出根视图返回事件。
@@ -1442,71 +1265,6 @@ impl PreferencesPanel {
         })
     }
 
-    /// settings 外部冲突会保留本地草稿，只有用户确认后才接受新的配置 revision。
-    fn render_settings_reload_confirmation(
-        &mut self,
-        theme: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        self.settings_reload_confirmation.then(|| {
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(gpui_kit::hsla(0., 0., 0., 0.45))
-                .child(
-                    div()
-                        .w(px(420.))
-                        .p_4()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .bg(theme.panel)
-                        .border_1()
-                        .border_color(theme.muted)
-                        .rounded_md()
-                        .child(crate::locale::text(
-                            crate::locale::text(
-                                "重新读取会放弃本地设置草稿",
-                                "Reloading will discard local settings changes",
-                            ),
-                            "Reloading will discard local settings changes",
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    Button::new("preferences-reload-cancel")
-                                        .compact()
-                                        .label(crate::locale::text("继续编辑", "Keep editing"))
-                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                            panel.cancel_reload_settings(cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("preferences-reload-confirm")
-                                        .compact()
-                                        .primary()
-                                        .label(crate::locale::text(
-                                            crate::locale::text(
-                                                "丢弃并重新读取",
-                                                "Discard and reload",
-                                            ),
-                                            "Discard and reload",
-                                        ))
-                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                            panel.confirm_reload_settings(cx)
-                                        })),
-                                ),
-                        ),
-                )
-        })
-    }
-
     /// 偏好草稿退出确认由面板先完成，根窗口再依次检查编辑器并决定是否关闭。
     fn render_quit_confirmation(
         &mut self,
@@ -1630,18 +1388,6 @@ pub(super) fn recovery_banner(
             .child(crate::locale::text("配置处于只读恢复模式。请先备份并修复列出的文件；应用不会用默认值覆盖原内容。", "Configuration is in read-only recovery mode. Back up and repair the listed files; defaults will not overwrite them."))
             .children(rows),
     )
-}
-
-/// 固定页脚优先显示 settings 读回错误，避免旧的成功或重载状态掩盖当前冲突。
-///
-/// @author kongweiguang
-pub(in crate::features::preferences) fn settings_footer_message<'a>(
-    settings_error: Option<&'a str>,
-    status: Option<&'a str>,
-) -> Option<(&'a str, bool)> {
-    settings_error
-        .map(|message| (message, true))
-        .or_else(|| status.map(|message| (message, false)))
 }
 
 /// 保存错误或重载中的错误通过安全文案显示；调用方从不格式化 AppError source。

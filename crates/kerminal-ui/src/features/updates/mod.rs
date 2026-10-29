@@ -18,6 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 mod about;
 mod render;
+mod settings;
+
+pub(crate) use settings::{AboutUpdateAction, about_identity, about_repository_url};
 
 /// 需要退出保护的安装和重启动作作为类型化意图交给 Root 处理。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +75,8 @@ pub struct UpdatesPanel {
     pending_notification: Option<(u64, kerminal_application::updates::UpdateCandidateId)>,
     active_cancel: Option<CancellationToken>,
     cancel_requested: bool,
+    /// 设置页单步安装等待当前下载回执；只在签名验证成功后继续 Root 安装保护。
+    settings_auto_install: bool,
     check_generation: u64,
     active_check_generation: Option<u64>,
     recovery_records: Vec<UpdateRecoveryRecord>,
@@ -124,6 +129,7 @@ impl UpdatesPanel {
             pending_notification: None,
             active_cancel: None,
             cancel_requested: false,
+            settings_auto_install: false,
             check_generation: 0,
             active_check_generation: None,
             recovery_records: Vec::new(),
@@ -288,7 +294,7 @@ impl UpdatesPanel {
         cx.notify();
     }
 
-    /// 每轮检查分配独立代次并沿用共享执行器，避免取消或迟到结果触发重复通知。
+    /// 每轮检查分配独立代次；仅空闲或候选状态可检查，避免替换已验签安装句柄。
     pub fn check_for_updates(&mut self, cx: &mut Context<Self>) {
         let Some(service) = &self.service else {
             return;
@@ -296,7 +302,7 @@ impl UpdatesPanel {
         if service.availability() != UpdateAvailability::Configured {
             return;
         }
-        if self.is_busy() {
+        if !can_check_for_updates(&self.state) {
             return;
         }
 
@@ -798,7 +804,7 @@ impl UpdatesPanel {
         }
     }
 
-    /// 下载完成后只把经过 application/infra 验签确认的 DownloadedUpdate 暴露给安装与丢弃按钮。
+    /// 下载只接受 application/infra 验签句柄；设置单步安装随后仍通过 Root 的安装保护。
     fn finish_download(
         &mut self,
         candidate: UpdateCandidate,
@@ -806,6 +812,11 @@ impl UpdatesPanel {
         was_cancelled: bool,
         cx: &mut Context<Self>,
     ) {
+        let continue_to_install = take_settings_auto_install_after_download(
+            &mut self.settings_auto_install,
+            was_cancelled,
+            &result,
+        );
         self.active_cancel = None;
         self.cancel_requested = false;
         self.progress = UpdateProgress::default();
@@ -831,6 +842,9 @@ impl UpdatesPanel {
                 self.status = Some(localized_error(&error));
                 self.status_is_error = true;
             }
+        }
+        if continue_to_install {
+            self.request_install(cx);
         }
         cx.notify();
     }
@@ -1011,12 +1025,45 @@ fn can_retry_host_install(state: &UpdatePanelState) -> bool {
     )
 }
 
+/// 更新检查只允许空闲、无更新和候选态，保留已验签包及所有安装终态句柄。
+fn can_check_for_updates(state: &UpdatePanelState) -> bool {
+    matches!(
+        state,
+        UpdatePanelState::Idle | UpdatePanelState::NoUpdate | UpdatePanelState::Available(_)
+    )
+}
+
 /// Root 退出门禁只应从失败状态接受退出请求，其他状态不暴露失败恢复动作。
 fn can_exit_after_install_failure(state: &UpdatePanelState) -> bool {
     matches!(
         state,
         UpdatePanelState::StoppedUpdateFailed { .. } | UpdatePanelState::HostRecoveryFailed { .. }
     )
+}
+
+/// 设置页一次点击只接受候选下载或已验签包安装，其他状态不能覆盖运行中的事务。
+fn settings_install_step(state: &UpdatePanelState) -> SettingsInstallStep {
+    match state {
+        UpdatePanelState::Available(_) => SettingsInstallStep::DownloadThenInstall,
+        UpdatePanelState::ReadyToInstall(_) => SettingsInstallStep::InstallVerified,
+        _ => SettingsInstallStep::Ignore,
+    }
+}
+
+/// 消费单次自动安装意图；取消或失败后清空意图，下一次尝试必须来自新的用户操作。
+fn take_settings_auto_install_after_download(
+    settings_install_requested: &mut bool,
+    cancellation_requested: bool,
+    result: &kerminal_application::AppResult<DownloadedUpdate>,
+) -> bool {
+    std::mem::take(settings_install_requested) && !cancellation_requested && result.is_ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsInstallStep {
+    DownloadThenInstall,
+    InstallVerified,
+    Ignore,
 }
 
 /// 把稳定错误类别映射成更新场景的双语安全提示，不展示底层 URL 或路径。

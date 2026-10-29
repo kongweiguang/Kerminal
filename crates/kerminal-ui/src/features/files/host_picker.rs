@@ -20,6 +20,15 @@ pub struct SftpHostRequested {
     pub host_id: HostId,
 }
 
+/// 紧凑文件栏请求 Root 按已验证的主机密钥流程信任该主机；不在 FilesPane 内建立连接。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SftpHostKeyTrustRequested {
+    pub request_id: u64,
+    pub host_id: HostId,
+}
+
 /// 请求 Root 打开现有连接管理创建流程，不在文件工作区直接编辑主机配置。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CreateSftpHostRequested;

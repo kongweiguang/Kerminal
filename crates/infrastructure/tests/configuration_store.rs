@@ -529,6 +529,63 @@ async fn configuration_validator_returns_read_only_report_with_stable_wire_shape
     assert_eq!(fs::read(temp.0.join(".gitignore")).unwrap(), before);
 }
 
+/// 离线入口可检查尚不存在的配置根，且不创建目录、存储锁或生成指南。
+///
+/// @author kongweiguang
+#[test]
+fn standalone_configuration_validator_does_not_initialize_missing_root() {
+    let temp = TemporaryConfigRoot::new();
+    let root = temp.0.join("not-initialized");
+
+    let report = ConfigurationStore::validate_root(&root, ConfigurationValidationScope::All)
+        .expect("缺省配置根可只读校验");
+
+    assert!(report.valid);
+    assert!(!root.exists());
+}
+
+/// 独立入口复用真实 schema validator，并保留非法 TOML 原文且不落锁或播种文件。
+///
+/// @author kongweiguang
+#[test]
+fn standalone_configuration_validator_reports_schema_errors_without_writes() {
+    let temp = TemporaryConfigRoot::new();
+    let root = temp.0.join("offline-validation");
+    fs::create_dir_all(&root).expect("创建隔离校验根");
+    let source = b"schema_version = 99\n";
+    fs::write(root.join("settings.toml"), source).expect("写入未来 schema 设置");
+
+    let report = ConfigurationStore::validate_root(&root, ConfigurationValidationScope::Settings)
+        .expect("schema 问题作为诊断返回");
+
+    assert!(!report.valid);
+    assert_eq!(report.error_count, 1);
+    assert_eq!(fs::read(root.join("settings.toml")).unwrap(), source);
+    assert!(!root.join(".storage.lock").exists());
+    assert!(!root.join("kerminal-config.md").exists());
+}
+
+/// 离线校验遇到待恢复 journal 时 fail closed，但不接管恢复或改动 journal。
+///
+/// @author kongweiguang
+#[test]
+fn standalone_configuration_validator_rejects_pending_transaction_without_recovery() {
+    let temp = TemporaryConfigRoot::new();
+    let root = temp.0.join("pending-transaction");
+    let transaction_directory = root.join(".storage-transactions");
+    fs::create_dir_all(&transaction_directory).expect("创建隔离事务目录");
+    let journal = transaction_directory.join("profile-default.json");
+    let source = br#"{"schema_version":1}"#;
+    fs::write(&journal, source).expect("写入模拟待恢复 journal");
+
+    let result = ConfigurationStore::validate_root(&root, ConfigurationValidationScope::All);
+
+    assert!(result.is_err());
+    assert_eq!(fs::read(&journal).unwrap(), source);
+    assert!(!root.join(".storage.lock").exists());
+    assert!(!root.join("kerminal-config.md").exists());
+}
+
 #[tokio::test]
 /// 直接把唯一配置指南中的六类示例写入隔离根并经真实只读 validator 校验。
 async fn configuration_guide_examples_pass_the_configuration_validator() {

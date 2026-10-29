@@ -3,10 +3,14 @@
 //! @author kongweiguang
 
 use kerminal_application::workspace::{
-    WorkspaceLocalMachineScope, WorkspaceMachineStatus, WorkspaceSessionDocument,
-    WorkspaceSessionInvalidReason,
+    WorkspaceLocalMachineScope, WorkspaceMachineStatus, WorkspacePinnedContainer,
+    WorkspaceSessionDocument, WorkspaceSessionInvalidReason,
 };
-use kerminal_domain::{identity::PaneId, workspace::TerminalLayoutNode};
+use kerminal_domain::{
+    identity::{HostId, PaneId},
+    operations::{ContainerRuntime, ContainerTarget},
+    workspace::TerminalLayoutNode,
+};
 use serde_json::{Value, json};
 
 /// 生成满足当前版本根结构的最小文档，便于测试只关注一个边界条件。
@@ -37,6 +41,21 @@ fn row_by_id<'a>(rows: &'a Value, id: &str) -> &'a Value {
         .iter()
         .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
         .unwrap_or_else(|| panic!("workspace row {id} should exist"))
+}
+
+/// 构造绑定到 SSH 宿主的容器 pin，避免测试用不完整目标绕过快照验证。
+/// @author kongweiguang
+fn pinned_container(host_id: &HostId, container_id: &str, name: &str) -> WorkspacePinnedContainer {
+    WorkspacePinnedContainer {
+        target: ContainerTarget {
+            host_id: Some(host_id.clone()),
+            runtime: ContainerRuntime::Docker,
+            container_id: container_id.to_owned(),
+        },
+        name: name.to_owned(),
+        description: "image · running".to_owned(),
+        group_id: Some("group-production".to_owned()),
+    }
 }
 
 /// 未知扩展字段必须往返保留，避免原生 UI 保存时擦除旧版本或插件数据。
@@ -404,5 +423,65 @@ fn unknown_target_is_preserved_as_unavailable_instead_of_falling_back() {
     assert_eq!(
         document.as_value()["terminalPanes"][0]["target"]["kind"],
         json!("futureProtocol")
+    );
+}
+
+/// 固定容器紧随父 SSH 主机且维持顺序；未知侧栏数据保留，移除与重加更新旧标记。
+/// @author kongweiguang
+#[test]
+fn pinned_container_rows_round_trip_in_parent_order_and_track_removal() {
+    let host_id = HostId::new();
+    let first = pinned_container(&host_id, "container-first", "first");
+    let second = pinned_container(&host_id, "container-second", "second");
+    let mut source = valid_document();
+    source["sidebarMachines"] = json!([
+        {
+            "id": host_id.as_str(),
+            "kind": "ssh",
+            "futureHostField": {"opaque": true}
+        },
+        {"id": "future-row", "kind": "futureMachine", "future": [1, 2]}
+    ]);
+    let mut document = WorkspaceSessionDocument::try_from_value(source).unwrap();
+    let mut snapshot = document.workspace_snapshot().unwrap();
+    snapshot.pinned_containers = vec![first.clone(), second.clone()];
+
+    document.update_known_fields(&snapshot).unwrap();
+    let encoded = document.as_value();
+    let rows = encoded["sidebarMachines"].as_array().unwrap();
+    assert_eq!(rows[0]["id"], host_id.as_str());
+    assert_eq!(rows[1]["id"], first.stable_id());
+    assert_eq!(rows[2]["id"], second.stable_id());
+    assert_eq!(rows[3]["id"], "future-row");
+    assert_eq!(rows[0]["futureHostField"]["opaque"], true);
+
+    snapshot.pinned_containers.clear();
+    document.update_known_fields(&snapshot).unwrap();
+    assert_eq!(
+        document.as_value()["removedSidebarMachineIds"],
+        json!([first.stable_id(), second.stable_id()])
+    );
+
+    snapshot.pinned_containers = vec![first.clone(), second.clone()];
+    document.update_known_fields(&snapshot).unwrap();
+    assert_eq!(document.as_value()["removedSidebarMachineIds"], json!([]));
+}
+
+/// 已知 dockerContainer 行若损坏必须拒绝加载，不能被当成未来字段而静默保留。
+/// @author kongweiguang
+#[test]
+fn malformed_known_pinned_container_is_rejected() {
+    let mut source = valid_document();
+    source["sidebarMachines"] = json!([{
+        "id": "docker:host-1:container-1",
+        "kind": "dockerContainer",
+        "parentMachineId": "host-1",
+        "name": "container",
+        "target": {"kind": "futureContainerTarget"}
+    }]);
+
+    assert_eq!(
+        WorkspaceSessionDocument::try_from_value(source).unwrap_err(),
+        WorkspaceSessionInvalidReason::InvalidSchema
     );
 }

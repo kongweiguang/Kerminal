@@ -65,3 +65,24 @@ fn material_projection_is_idempotent_from_base_palette() {
     assert!(first.shell.a < 1.0);
     assert!(first.image_veil > 0.0);
 }
+
+/// 工作台局部配色不能重复降低材质透明度，也不能因跟随系统主题而污染原始令牌。
+///
+/// @author kongweiguang
+#[test]
+fn workbench_palette_preserves_material_alpha_in_all_theme_modes() {
+    for appearance in [WindowAppearance::Light, WindowAppearance::Dark] {
+        for mode in [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System] {
+            let base = ThemeTokens::for_mode(appearance, mode);
+            let first = base.for_workbench();
+            let repeated = first.for_workbench();
+            assert_eq!(first.materials, repeated.materials);
+            assert_eq!(first.sidebar, repeated.sidebar);
+            assert_eq!(first.materials.chrome.a, base.materials.chrome.a);
+            assert_eq!(first.materials.workspace.a, base.materials.workspace.a);
+            assert_eq!(first.materials.panel.a, base.materials.panel.a);
+            assert_eq!(first.dark, base.dark);
+            assert_ne!(first.foreground, first.sidebar);
+        }
+    }
+}

@@ -36,10 +36,12 @@ struct ServerMonitorTierRequest {
 }
 
 impl OperationsView {
-    /// 为每个写用例创建视图持有的取消令牌，使取消按钮与窗口销毁都能通知应用边界。
+    /// 新写操作先清旧反馈，再创建视图持有的取消令牌；错误不能被前次成功提示掩盖。
     ///
     /// @author kongweiguang
     fn begin_operation_mutation(&mut self) -> CancellationToken {
+        self.status = None;
+        self.forward_success_notice = None;
         let cancellation = CancellationToken::new();
         self.mutation_cancellation = Some(cancellation.clone());
         cancellation
@@ -51,6 +53,17 @@ impl OperationsView {
     fn finish_operation_mutation(&mut self) {
         self.mutation_cancellation = None;
         self.busy = false;
+    }
+
+    /// 隧道在 main 中有独立绿色成功行；宽工作区仍沿用原结果区，错误通道不复用成功样式。
+    fn set_forward_success_notice(&mut self, message: String) {
+        self.status = None;
+        self.forward_success_notice = None;
+        if self.compact_layout {
+            self.forward_success_notice = Some(message);
+        } else {
+            self.status = Some(message);
+        }
     }
 
     /// 取消仅发出协作请求；命令结果无回执时仍需读取原目标确认实际状态。
@@ -274,17 +287,6 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 返回当前连接主机或本机资源，避免容器详情改变运维面板的目标语义后无法回退。
-    pub(super) fn show_host_server_info(&mut self, cx: &mut Context<Self>) {
-        let target = self
-            .host_target
-            .as_ref()
-            .map_or(ServerInfoTarget::Local, |host_id| ServerInfoTarget::Ssh {
-                host_id: host_id.clone(),
-            });
-        self.select_server_info_target(target, cx);
-    }
-
     /// 用户主动刷新失效所有层级缓存；后台自动刷新则由分层 driver 使用 TTL。
     pub(super) fn load_server(&mut self, cx: &mut Context<Self>) {
         if !self.active || !self.server_section_visible() {
@@ -344,25 +346,6 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 目标变化会单独取消服务器快照，dashboard 其他 section 不因切容器而作废。
-    fn select_server_info_target(&mut self, target: ServerInfoTarget, cx: &mut Context<Self>) {
-        if self.server_info_target == target {
-            if self.active {
-                self.load_server(cx);
-            }
-            return;
-        }
-        self.server_info_target = target;
-        self.server_generation = self.server_generation.wrapping_add(1).max(1);
-        self.server.reset(self.server_generation);
-        self.server_history.reset();
-        self.server_info_panel = super::state::ServerInfoPanel::Overview;
-        self.publish_server_monitor_configuration();
-        if self.active {
-            self.load_server(cx);
-        }
-    }
-
     /// Docker/Podman 列表独立刷新且按完整 target 判定旧详情是否失效，失败仍保留原列表。
     /// @author kongweiguang
     /// 宿主模式才读取全量列表；ContainerInfo 和不可用 context 不会触发宿主查询。
@@ -379,10 +362,16 @@ impl OperationsView {
                 self.container_panel_context.as_ref(),
                 Some(ContainerPanelContext::Host { host_id, .. }) if host_id != &self.host_target
             )
+            || matches!(
+                self.container_panel_context.as_ref(),
+                Some(ContainerPanelContext::WorkspaceHost { host_id, .. })
+                    if Some(host_id) != self.host_target.as_ref()
+            )
         {
             return;
         }
         let ticket = self.containers.begin(self.container_generation);
+        let include_stopped = self.container_host.include_stopped();
         let cancel_request = ticket.cancellation.clone();
         let generation = self.container_generation;
         let target_host = self.host_target.clone();
@@ -399,7 +388,7 @@ impl OperationsView {
                         ContainerListQuery {
                             host_id: query_host.clone(),
                             runtime,
-                            include_stopped: true,
+                            include_stopped,
                         },
                         cancel,
                     )
@@ -691,6 +680,8 @@ impl OperationsView {
             return;
         }
         self.runtime = runtime;
+        self.container_host
+            .reset_for_target(self.host_target.as_ref(), runtime);
         self.container_generation = self.container_generation.wrapping_add(1).max(1);
         self.containers.reset(self.container_generation);
         self.compose_projects.clear();
@@ -704,7 +695,7 @@ impl OperationsView {
         self.container_output.reset();
         self.container_output_target_label = None;
         self.status = None;
-        self.container_pending_remove = None;
+        self.container_delete_confirmation = None;
         self.load_containers(cx);
     }
 
@@ -766,7 +757,8 @@ impl OperationsView {
         }
     }
 
-    /// 容器写入结果始终归属原 host/runtime；force 与目标同批冻结，取消后等待命令 worker 回执再释放 busy。
+    /// 容器写入结果始终归属原 host/runtime；确定成功由刷新列表体现，待核验和失败才保留提示。
+    /// force 与目标同批冻结，取消后等待命令 worker 回执再释放 busy。
     ///
     /// @author kongweiguang
     pub(super) fn mutate_container(
@@ -789,7 +781,7 @@ impl OperationsView {
         let target_runtime = target.runtime;
         let operation_context = self.container_panel_context.clone();
         let operation_generation = self.container_generation;
-        self.container_pending_remove = None;
+        self.container_delete_confirmation = None;
         let operations = self.operations.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
@@ -813,6 +805,8 @@ impl OperationsView {
                     );
                     let panel_is_current = view.container_panel_context == operation_context
                         && view.container_generation == operation_generation;
+                    let show_feedback = !view.compact_layout
+                        || !matches!(&result, Ok(receipt) if !receipt.refresh_required);
                     let message = match result {
                         Ok(receipt) if receipt.refresh_required => crate::locale::text(
                             "容器操作完成；运行态刷新可重新读取。",
@@ -831,9 +825,9 @@ impl OperationsView {
                         Err(error) => mutation_error_message(error, cancellation_requested),
                     };
                     if target_is_current && panel_is_current {
-                        view.status = Some(message);
+                        view.status = show_feedback.then_some(message);
                         view.load_containers(cx);
-                    } else {
+                    } else if show_feedback {
                         view.remember_container_feedback(
                             target_host.clone(),
                             target_runtime,
@@ -918,6 +912,7 @@ impl OperationsView {
     }
 
     /// 日志和 stats 按精确容器与查询类型保留最近快照，防止切换类型时展示错对象。
+    /// 资源回执保留结构与原始 JSON，格式化只能发生在呈现层，避免监控页丢失指标。
     ///
     /// @author kongweiguang
     pub(super) fn inspect_container_output(
@@ -979,24 +974,18 @@ impl OperationsView {
                                 } else {
                                     String::new()
                                 };
-                                Ok(super::render::bounded_text(
-                                    &format!("{}\n{}{}", output.stdout, output.stderr, truncation),
-                                    24_000,
+                                Ok(super::ContainerOutputData::Logs(
+                                    super::render::bounded_text(
+                                        &format!(
+                                            "{}\n{}{}",
+                                            output.stdout, output.stderr, truncation
+                                        ),
+                                        24_000,
+                                    ),
                                 ))
                             } else {
                                 let stats = operations.containers.stats(target, cancel).await?;
-                                Ok(format!(
-                                    "CPU {} · {} {} / {} · {} {} · {} {} · PIDs {}",
-                                    stats.cpu_percent.as_deref().unwrap_or("—"),
-                                    crate::locale::text("内存", "memory"),
-                                    stats.memory_usage.as_deref().unwrap_or("—"),
-                                    stats.memory_percent.as_deref().unwrap_or("—"),
-                                    crate::locale::text("网络", "network"),
-                                    stats.network_io.as_deref().unwrap_or("—"),
-                                    crate::locale::text("磁盘", "disk"),
-                                    stats.block_io.as_deref().unwrap_or("—"),
-                                    stats.pids.as_deref().unwrap_or("—"),
-                                ))
+                                Ok(super::ContainerOutputData::Stats(stats))
                             }
                         },
                     )
@@ -1066,44 +1055,6 @@ impl OperationsView {
             self.submit_container_read(target, kind, cx);
         }
     }
-    /// 拆除入口始终只申请根层确认，重复点击不能把已存在的确认视为用户同意。
-    pub(super) fn mutate_compose(
-        &mut self,
-        target: ComposeProjectTarget,
-        action: ComposeAction,
-        ticket: &ContainerPanelActionTicket,
-        cx: &mut Context<Self>,
-    ) {
-        if self.busy
-            || !self.container_action_ticket_is_current(ticket, None)
-            || !matches!(
-                self.container_panel_context,
-                None | Some(ContainerPanelContext::Host { .. })
-            )
-            || self.host_target != target.host_id
-            || self.runtime != target.runtime
-        {
-            return;
-        }
-        if action == ComposeAction::Down {
-            self.forward_pending_delete = None;
-            self.compose_pending_down = Some(target);
-            self.compose_pending_context = self.container_panel_context.clone();
-            cx.emit(OperationsEvent::RootConfirmationChanged);
-            cx.notify();
-            return;
-        }
-        if let Some(context) = self.container_panel_context.clone() {
-            cx.emit(OperationsEvent::ComposeMutationRequested {
-                context,
-                target,
-                action,
-            });
-        } else {
-            self.execute_compose(target, action, cx);
-        }
-    }
-
     /// Compose 回执绑定原 host/runtime；仅根确认可到达 Down，取消后仍等 worker 收尾并刷新原目标。
     /// @author kongweiguang
     pub(super) fn execute_compose(
@@ -1117,6 +1068,7 @@ impl OperationsView {
             || !matches!(
                 self.container_panel_context,
                 None | Some(ContainerPanelContext::Host { .. })
+                    | Some(ContainerPanelContext::WorkspaceHost { .. })
             )
             || self.host_target != target.host_id
             || self.runtime != target.runtime
@@ -1153,6 +1105,8 @@ impl OperationsView {
                     );
                     let panel_is_current = view.container_panel_context == operation_context
                         && view.container_generation == operation_generation;
+                    let show_feedback = !view.compact_layout
+                        || !matches!(&result, Ok(receipt) if !receipt.refresh_required);
                     let message = match result {
                         Ok(receipt) if receipt.refresh_required => crate::locale::text(
                             "Compose 命令完成；回到此宿主时将重新读取状态。",
@@ -1167,9 +1121,9 @@ impl OperationsView {
                         Err(error) => mutation_error_message(error, cancellation_requested),
                     };
                     if target_is_current && panel_is_current {
-                        view.status = Some(message);
+                        view.status = show_feedback.then_some(message);
                         view.load_containers(cx);
-                    } else {
+                    } else if show_feedback {
                         view.remember_container_feedback(
                             target_host.clone(),
                             target_runtime,
@@ -1182,33 +1136,6 @@ impl OperationsView {
         })
         .detach();
         cx.notify();
-    }
-
-    /// 文件入口只发布容器 target 与 POSIX 起始目录，由 Root 组合统一 FileService。
-    /// 文件动作只从当前 Host 行发出，并把 context 一并交给 Root 再做 live binding 检查。
-    ///
-    /// @author kongweiguang
-    pub(super) fn request_container_files(
-        &self,
-        target: ContainerTarget,
-        ticket: &ContainerPanelActionTicket,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.container_action_ticket_is_current(ticket, Some(&target))
-            || !self.container_read_allowed(&target)
-            || matches!(
-                self.container_panel_context,
-                Some(ContainerPanelContext::ContainerInfo { .. })
-                    | Some(ContainerPanelContext::Unavailable { .. })
-            )
-        {
-            return;
-        }
-        cx.emit(OperationsEvent::OpenContainerFilesRequested {
-            container_panel_context: self.container_panel_context.clone(),
-            target,
-            path: "/".to_owned(),
-        });
     }
 
     /// Compose 配置路径按真实 host 类型构造成文件端点，事件由 Root 交给 FilesPane 校验后预览。
@@ -1224,6 +1151,7 @@ impl OperationsView {
             || !matches!(
                 self.container_panel_context,
                 None | Some(ContainerPanelContext::Host { .. })
+                    | Some(ContainerPanelContext::WorkspaceHost { .. })
             )
             || self.host_target != host_id
         {
@@ -1246,6 +1174,7 @@ impl OperationsView {
             container_panel_context: self.container_panel_context.clone(),
             endpoint,
             selection_name,
+            root_path: working_directory.filter(|path| !path.is_empty()),
         });
     }
 
@@ -1260,17 +1189,7 @@ impl OperationsView {
         if !self.tmux_target_available() {
             return;
         }
-        let Some(session_id) = self.tmux_details.session_id.clone() else {
-            self.status = Some(
-                crate::locale::text(
-                    "先选择一个 tmux session，再发送快捷内容。",
-                    "Select a tmux session before sending quickref content.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        };
+        let session_id = self.tmux_current_session_id.clone().unwrap_or_default();
         let Some(binding) = self.tmux_quickref_binding.clone() else {
             self.status = Some(
                 crate::locale::text(
@@ -1292,15 +1211,48 @@ impl OperationsView {
         });
         self.status = Some(
             crate::locale::text(
-                "已请求发送到所选 tmux session；请核对目标终端回显。",
-                "Send requested for the selected tmux session; verify the target terminal output.",
+                "已请求发送到当前终端；请核对终端回显。",
+                "Send requested for the current terminal; verify its output.",
             )
             .to_string(),
         );
         cx.notify();
     }
 
+    /// 日志请求冻结列表中的容器名称与目标，Root 建立日志 Tab 时不再从变化后的选择推断标题。
+    /// @author kongweiguang
+    pub(super) fn request_container_logs(
+        &mut self,
+        target: ContainerTarget,
+        ticket: &ContainerPanelActionTicket,
+        cx: &mut Context<Self>,
+    ) {
+        if self.container_action_ticket_is_current(ticket, Some(&target))
+            && self.container_read_allowed(&target)
+        {
+            let name = self
+                .containers
+                .data()
+                .and_then(|rows| rows.iter().find(|row| row.target == target))
+                .map(|row| row.name.clone())
+                .or_else(|| {
+                    self.container_inspect
+                        .data()
+                        .filter(|details| details.target == target)
+                        .map(|details| details.name.clone())
+                })
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| target.container_id.clone());
+            cx.emit(OperationsEvent::ContainerLogsRequested {
+                container_panel_context: self.container_panel_context.clone(),
+                target,
+                name,
+            });
+        }
+    }
+
     /// 容器 exec 输入先形成程序和逐行 argv，再由 Root 分配共享 SessionService 的 UI owner。
+    /// @author kongweiguang
     pub(super) fn request_container_exec(
         &mut self,
         target: ContainerTarget,
@@ -1312,6 +1264,7 @@ impl OperationsView {
             || !matches!(
                 self.container_panel_context,
                 None | Some(ContainerPanelContext::Host { .. })
+                    | Some(ContainerPanelContext::WorkspaceHost { .. })
             )
             || self.containers.data().is_some_and(|rows| {
                 rows.iter().all(|row| {
@@ -1331,6 +1284,7 @@ impl OperationsView {
             && matches!(
                 self.container_panel_context,
                 Some(ContainerPanelContext::Host { .. })
+                    | Some(ContainerPanelContext::WorkspaceHost { .. })
             ) {
             // 宿主紧凑行提供常用 shell 入口；显式填写程序时仍保留原 argv 校验。
             Ok(vec!["sh".to_owned()])
@@ -1351,7 +1305,7 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 新 session 仅继承同一 host/profile pane 的工作目录；弹窗在提交瞬间复核冻结目标，成功回执才关闭。
+    /// 新 session 只继承弹框打开时捕获的 cwd；即使捕获结果为空，提交也不再读取后来 pane 的目录。
     ///
     /// @author kongweiguang
     pub(super) fn create_tmux_session(&mut self, cx: &mut Context<Self>) {
@@ -1376,6 +1330,17 @@ impl OperationsView {
         let Some(inputs) = self.inputs.as_ref() else {
             return;
         };
+        let Some(frozen_working_directory) = self.tmux_create_cwd_snapshot.clone() else {
+            self.status = Some(
+                crate::locale::text(
+                    "创建目标上下文已失效，请关闭后重新打开。",
+                    "The create target context expired. Close and reopen the dialog.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
         let name = self.input_value(&inputs.tmux_name, cx).trim().to_owned();
         let working_directory = self
             .input_value(&inputs.tmux_working_directory, cx)
@@ -1393,14 +1358,10 @@ impl OperationsView {
         let request_cancellation = self.begin_operation_mutation();
         let cancellation_status = request_cancellation.clone();
         let target = self.tmux_target();
-        let working_directory = (!working_directory.is_empty())
-            .then_some(working_directory)
-            .or_else(|| {
-                self.tmux_attach_binding
-                    .as_ref()
-                    .filter(|binding| binding.target.matches_tmux_target(&target))
-                    .and_then(|binding| binding.working_directory.clone())
-            });
+        let working_directory = resolve_tmux_create_working_directory(
+            &working_directory,
+            frozen_working_directory.as_deref(),
+        );
         let request = TmuxCreateRequest {
             target,
             name,
@@ -1431,10 +1392,11 @@ impl OperationsView {
                             view.clear_tmux_dialog();
                             cx.emit(OperationsEvent::RootConfirmationChanged);
                         }
-                        view.status = Some(match result {
-                            Ok(receipt) => mutation_message(Ok(receipt)),
-                            Err(error) => mutation_error_message(error, cancellation_requested),
-                        });
+                        view.status = tmux_mutation_feedback(
+                            result,
+                            cancellation_requested,
+                            view.compact_layout,
+                        );
                     }
                     if disposition.refresh_current_host {
                         view.load_tmux(cx);
@@ -1739,10 +1701,11 @@ impl OperationsView {
                             view.clear_tmux_dialog();
                             cx.emit(OperationsEvent::RootConfirmationChanged);
                         }
-                        view.status = Some(match result {
-                            Ok(receipt) => mutation_message(Ok(receipt)),
-                            Err(error) => mutation_error_message(error, cancellation_requested),
-                        });
+                        view.status = tmux_mutation_feedback(
+                            result,
+                            cancellation_requested,
+                            view.compact_layout,
+                        );
                     }
                     if disposition.refresh_current_host {
                         view.load_tmux(cx);
@@ -1798,10 +1761,13 @@ impl OperationsView {
                             cx.emit(OperationsEvent::RootConfirmationChanged);
                         }
                         let killed = matches!(&result, Ok(true));
-                        view.status = Some(match result {
-                            Ok(killed) => kill_session_result_message(Ok(killed)),
-                            Err(error) => mutation_error_message(error, cancellation_requested),
-                        });
+                        view.status = match result {
+                            Ok(true) if view.compact_layout => None,
+                            Ok(killed) => Some(kill_session_result_message(Ok(killed))),
+                            Err(error) => {
+                                Some(mutation_error_message(error, cancellation_requested))
+                            }
+                        };
                         if killed
                             && view.tmux_details.session_id.as_deref()
                                 == Some(killed_session_id.as_str())
@@ -1854,11 +1820,16 @@ impl OperationsView {
                         view.tmux_view_generation,
                     );
                     if disposition.update_current_view {
-                        view.status = Some(match result {
-                            Ok(()) => crate::locale::text("客户端已分离。", "Client detached.")
-                                .to_string(),
-                            Err(error) => mutation_error_message(error, cancellation_requested),
-                        });
+                        view.status = match result {
+                            Ok(()) if view.compact_layout => None,
+                            Ok(()) => Some(
+                                crate::locale::text("客户端已分离。", "Client detached.")
+                                    .to_string(),
+                            ),
+                            Err(error) => {
+                                Some(mutation_error_message(error, cancellation_requested))
+                            }
+                        };
                     }
                     if disposition.refresh_current_host {
                         view.load_tmux(cx);
@@ -1938,10 +1909,12 @@ impl OperationsView {
             // 此表单不编辑代理应用策略，不能在修改名称或端口时抹掉原意图。
             config.proxy_apply_scope = expected.config.proxy_apply_scope;
         }
+        let transient_edit = self.forward_edit_transient_id.is_some();
         let attempted = PortForwardDefinition {
             id: self
                 .forward_edit_expected
                 .as_ref()
+                .filter(|_| !transient_edit)
                 .map(|definition| definition.id.clone())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             config: config.clone(),
@@ -1960,10 +1933,15 @@ impl OperationsView {
                         return Err(AppError::cancelled("保存转发定义已取消"));
                     }
                     let definition = match expected {
-                        Some(expected) => operations
-                            .port_forwards
-                            .update_definition(expected, config)
-                            .await?,
+                        Some(expected) => {
+                            // main 编辑会停止旧隧道后启动新配置；CAS 仍阻止覆盖同时被修改的定义。
+                            operations.port_forwards.stop_definition_instance(&expected).await?;
+                            if transient_edit {
+                                operations.port_forwards.create_definition_with_id(new_id, config).await?
+                            } else {
+                                operations.port_forwards.update_definition(expected, config).await?
+                            }
+                        },
                         None => operations.port_forwards.create_definition_with_id(new_id, config).await?,
                     };
                     let start_result = if start_after_save {
@@ -1990,6 +1968,7 @@ impl OperationsView {
                     match result {
                         Ok((definition, None)) => {
                             view.forward_edit_expected = None;
+                            view.forward_edit_transient_id = None;
                             view.forward_add_host_expected = None;
                             if let Some(inputs) = view.inputs.as_mut() {
                                 inputs.forward_form_open = next_forward_form_open(
@@ -1997,13 +1976,14 @@ impl OperationsView {
                                     ForwardFormTransition::CreateSucceeded,
                                 );
                             }
-                            view.status = Some(crate::locale::text(
+                            view.set_forward_success_notice(crate::locale::text(
                                 format!("已保存转发定义：{}", definition.config.name),
                                 format!("Saved forward definition: {}", definition.config.name),
                             ).to_string());
                         }
                         Ok((definition, Some(Ok(snapshot)))) => {
                             view.forward_edit_expected = None;
+                            view.forward_edit_transient_id = None;
                             view.forward_add_host_expected = None;
                             if let Some(inputs) = view.inputs.as_mut() {
                                 inputs.forward_form_open = next_forward_form_open(
@@ -2011,13 +1991,14 @@ impl OperationsView {
                                     ForwardFormTransition::CreateSucceeded,
                                 );
                             }
-                            view.status = Some(crate::locale::text(
+                            view.set_forward_success_notice(crate::locale::text(
                                 format!("已启动 {}：{}", definition.config.name, snapshot.actual_bind),
                                 format!("Started {}: {}", definition.config.name, snapshot.actual_bind),
                             ).to_string());
                         }
                         Ok((_definition, Some(Err(error)))) => {
                             view.forward_edit_expected = None;
+                            view.forward_edit_transient_id = None;
                             view.forward_add_host_expected = None;
                             if let Some(inputs) = view.inputs.as_mut() {
                                 inputs.forward_form_open = false;
@@ -2054,6 +2035,10 @@ impl OperationsView {
                     }
                     // 定义清单和运行快照共享同一全局 revision，迟到写回后以仓储读取为准。
                     view.load_forwards(cx);
+                    // 未知提交只自动回读原 ID；继续使用原有保存/取消入口处理，不增加专用核对控件。
+                    if view.forward_save_pending.is_some() {
+                        view.reconcile_forward_save(cx);
+                    }
                     cx.notify();
                 });
             });
@@ -2089,6 +2074,7 @@ impl OperationsView {
                     Ok(Some(actual)) if actual == expected => {
                         view.forward_save_pending = None;
                         view.forward_edit_expected = None;
+                            view.forward_edit_transient_id = None;
                         view.forward_add_host_expected = None;
                         if let Some(inputs) = view.inputs.as_mut() {
                             inputs.forward_form_open = false;
@@ -2136,6 +2122,7 @@ impl OperationsView {
         }
         self.forward_save_pending = None;
         self.forward_edit_expected = None;
+        self.forward_edit_transient_id = None;
         self.forward_add_host_expected = None;
         let forward_form_was_open = self
             .inputs
@@ -2175,15 +2162,19 @@ impl OperationsView {
             cx.update(|app| {
                 let _ = this.update(app, |view, cx| {
                     view.finish_operation_mutation();
-                    view.status = Some(match result {
-                        Ok(snapshot) => crate::locale::text(
-                            format!("转发已启动：{}", snapshot.actual_bind),
-                            format!("Forward started: {}", snapshot.actual_bind),
-                        )
-                        .to_string(),
-                        Err(error) if cancellation_requested => mutation_error_message(error, true),
-                        Err(error) => error.public_message().to_owned(),
-                    });
+                    match result {
+                        Ok(snapshot) => view.set_forward_success_notice(
+                            crate::locale::text(
+                                format!("转发已启动：{}", snapshot.actual_bind),
+                                format!("Forward started: {}", snapshot.actual_bind),
+                            )
+                            .to_string(),
+                        ),
+                        Err(error) => {
+                            view.status =
+                                Some(mutation_error_message(error, cancellation_requested))
+                        }
+                    }
                     view.load_forwards(cx);
                 });
             });
@@ -2192,7 +2183,8 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 只删除经二次确认的停止定义；应用层再次核对活动 owner 后才提交持久删除。
+    /// main 的删除入口直接提交；冻结配置仍需与当前清单完全匹配，防止旧行回调删除新定义。
+    /// @author kongweiguang
     pub(super) fn delete_forward_definition(
         &mut self,
         expected: PortForwardDefinition,
@@ -2201,29 +2193,48 @@ impl OperationsView {
         if self.busy {
             return;
         }
-        if self.forward_pending_delete.as_ref() != Some(&expected) {
+        if !self.active
+            || !self.forwards.data().is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row.forward.id == expected.id
+                        && row.forward.config == expected.config
+                        && row.persistent
+                })
+            })
+        {
             return;
         }
         self.busy = true;
         self.forward_pending_delete = None;
+        self.status = None;
+        self.forward_success_notice = None;
         cx.emit(OperationsEvent::RootConfirmationChanged);
         let operations = self.operations.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
-            let result =
-                executor
-                    .run(move |_| async move {
-                        operations.port_forwards.delete_definition(expected).await
-                    })
-                    .await;
+            let result = executor
+                .run(move |_| async move {
+                    operations
+                        .port_forwards
+                        .stop_definition_instance(&expected)
+                        .await?;
+                    operations.port_forwards.delete_definition(expected).await
+                })
+                .await;
             cx.update(|app| {
                 let _ = this.update(app, |view, cx| {
                     view.busy = false;
-                    view.status = Some(simple_result_message(
+                    let succeeded = result.is_ok();
+                    let message = simple_result_message(
                         result,
                         "转发定义已删除。",
                         "Forward definition deleted.",
-                    ));
+                    );
+                    if succeeded {
+                        view.set_forward_success_notice(message);
+                    } else {
+                        view.status = Some(message);
+                    }
                     view.load_forwards(cx);
                 });
             });
@@ -2232,12 +2243,14 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 只停止行中指定转发 ID；其他隧道保留原有生命周期。
+    /// 只停止行中指定转发 ID；成功以 main 的行内反馈呈现，失败保留原对象错误。
     pub(super) fn stop_forward(&mut self, id: String, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
         self.busy = true;
+        self.status = None;
+        self.forward_success_notice = None;
         let operations = self.operations.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
@@ -2247,11 +2260,14 @@ impl OperationsView {
             cx.update(|app| {
                 let _ = this.update(app, |view, cx| {
                     view.busy = false;
-                    view.status = Some(simple_result_message(
-                        result,
-                        "端口转发已关闭。",
-                        "Port forward stopped.",
-                    ));
+                    let succeeded = result.is_ok();
+                    let message =
+                        simple_result_message(result, "端口转发已关闭。", "Port forward stopped.");
+                    if succeeded {
+                        view.set_forward_success_notice(message);
+                    } else {
+                        view.status = Some(message);
+                    }
                     view.load_forwards(cx);
                 });
             });
@@ -2270,6 +2286,21 @@ pub(super) fn tmux_session_creation_enabled(
     capability: Option<&TmuxCapability>,
 ) -> bool {
     !busy && target_available && capability.is_some_and(|capability| capability.available)
+}
+
+/// 空白输入沿用弹框打开时捕获的 cwd；该解析不接受 live binding，避免提交时跨到新目录。
+///
+/// @author kongweiguang
+pub(super) fn resolve_tmux_create_working_directory(
+    input_value: &str,
+    frozen_working_directory: Option<&str>,
+) -> Option<String> {
+    let input_value = input_value.trim();
+    if input_value.is_empty() {
+        frozen_working_directory.map(str::to_owned)
+    } else {
+        Some(input_value.to_owned())
+    }
 }
 
 /// 通过共享应用任务执行器读取单个层级，保持该面板自己的取消票据。
@@ -2414,6 +2445,19 @@ where
     }
 }
 
+/// tmux 右栏以会话列表展示确定成功，仅保留刷新失败、执行错误和未知结果的恢复提示。
+fn tmux_mutation_feedback(
+    result: Result<TmuxMutationReceipt, AppError>,
+    cancellation_requested: bool,
+    compact: bool,
+) -> Option<String> {
+    match result {
+        Ok(receipt) if compact && !receipt.refresh_required => None,
+        Ok(receipt) => Some(mutation_message(Ok(receipt))),
+        Err(error) => Some(mutation_error_message(error, cancellation_requested)),
+    }
+}
+
 /// 只为带 refresh_required 回执的 tmux 创建/重命名提供轻量格式化约束。
 trait HasRefreshRequired {
     /// 返回 mutation 回执是否要求独立重试状态刷新。
@@ -2449,7 +2493,7 @@ fn kill_session_result_message(result: Result<bool, AppError>) -> String {
 }
 
 /// 只从显式 Compose host 元数据构造 Local/Remote 文件目标，拒绝含糊相对路径和无文件名路径。
-fn compose_config_endpoint(
+pub(super) fn compose_config_endpoint(
     host_id: Option<kerminal_domain::identity::HostId>,
     source_path: &str,
     working_directory: Option<&str>,

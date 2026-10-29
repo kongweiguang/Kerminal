@@ -35,10 +35,11 @@ pub(crate) struct InterfaceDensityMetrics {
     pub(crate) tab_bar_height: f32,
     pub(crate) status_bar_height: f32,
     pub(crate) tool_rail_padding_y: f32,
+    pub(crate) terminal_content_inset: f32,
 }
 
 impl InterfaceDensityMetrics {
-    /// 保持三个密度等级的间距和可见条高单调变化，避免只保存枚举却没有界面效果。
+    /// 保持三个密度等级的间距和可见条高单调变化，终端与工具栏共用 main 的内容缩进。
     pub(crate) fn from_density(density: InterfaceDensity) -> Self {
         match density {
             InterfaceDensity::Compact => Self {
@@ -49,6 +50,7 @@ impl InterfaceDensityMetrics {
                 tab_bar_height: 34.0,
                 status_bar_height: 24.0,
                 tool_rail_padding_y: 8.0,
+                terminal_content_inset: 6.0,
             },
             InterfaceDensity::Comfortable => Self {
                 item_gap: 12.0,
@@ -58,6 +60,7 @@ impl InterfaceDensityMetrics {
                 tab_bar_height: 38.0,
                 status_bar_height: 26.0,
                 tool_rail_padding_y: 12.0,
+                terminal_content_inset: 8.0,
             },
             InterfaceDensity::Spacious => Self {
                 item_gap: 16.0,
@@ -67,6 +70,7 @@ impl InterfaceDensityMetrics {
                 tab_bar_height: 46.0,
                 status_bar_height: 32.0,
                 tool_rail_padding_y: 16.0,
+                terminal_content_inset: 12.0,
             },
         }
     }
@@ -108,9 +112,24 @@ pub(super) fn apply_snapshot(
     root.terminal_metrics = runtime.terminal_metrics;
     root.terminal_scrollback = runtime.terminal_scrollback;
     root.cursor_blink_enabled = runtime.cursor_blink_enabled;
+    if let Some(notifications) = &root.services.notifications
+        && let Err(error) = notifications.update_settings(snapshot.desktop_notifications)
+    {
+        root.status = Some(error.public_message().into());
+    }
     if let Some(navigation) = root.host_navigation.as_ref() {
         navigation.update(cx, |navigation, cx| {
             navigation.set_interface_density(snapshot.interface_density, cx);
+        });
+    }
+    for files in root.files_pane.iter().chain(root.sftp_panel.iter()) {
+        files.update(cx, |files, cx| {
+            files.set_interface_density(snapshot.interface_density, cx);
+        });
+    }
+    for files in root.workspace_files.files_panes() {
+        files.update(cx, |files, cx| {
+            files.set_interface_density(snapshot.interface_density, cx);
         });
     }
 
@@ -205,6 +224,16 @@ pub(crate) fn interface_density_metrics(root: &RootView) -> InterfaceDensityMetr
     interface_density_metrics_from_snapshot(root.settings_snapshot.as_ref())
 }
 
+/// 懒加载和标签恢复使用当前确认的设置；没有快照时与产品缺省密度一致，不复用旧实体的展示值。
+///
+/// @author kongweiguang
+pub(super) fn current_interface_density(root: &RootView) -> InterfaceDensity {
+    root.settings_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.interface_density)
+        .unwrap_or(InterfaceDensity::Compact)
+}
+
 /// 把持久化密度只映射到实际 spacing/height，不让页面或 panel 再维护另一套阈值。
 fn interface_density_metrics_from_snapshot(
     snapshot: Option<&SettingsSnapshot>,
@@ -224,6 +253,27 @@ pub(super) fn background_settings(root: &RootView) -> Option<TerminalBackgroundS
 /// 从 Root 保存的快照生成按键与鼠标策略；加载前交由工作台既有默认行为处理。
 pub(super) fn interaction_policy(root: &RootView) -> Option<TerminalInteractionPolicy> {
     interaction_policy_from_snapshot(root.settings_snapshot.as_ref())
+}
+
+/// 浅深配色分别保存；运行态按实际主题选择，避免设置按钮改变但终端仍读取旧通用色盘。
+/// @author kongweiguang
+pub(super) fn terminal_scheme_for_snapshot(
+    snapshot: &SettingsSnapshot,
+    appearance: gpui_kit::WindowAppearance,
+) -> kerminal_application::preferences::TerminalColorScheme {
+    let dark = match snapshot.theme_mode {
+        ThemeMode::Dark => true,
+        ThemeMode::Light => false,
+        ThemeMode::System => matches!(
+            appearance,
+            gpui_kit::WindowAppearance::Dark | gpui_kit::WindowAppearance::VibrantDark
+        ),
+    };
+    if dark {
+        snapshot.terminal.dark_color_scheme
+    } else {
+        snapshot.terminal.light_color_scheme
+    }
 }
 
 /// 关键词只从已加载快照刷新各 pane；失败提示和旧规则保留由工具叶子统一负责。

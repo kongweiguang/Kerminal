@@ -12,6 +12,7 @@ pub(crate) struct MenuItemElement {
     id: ElementId,
     aria_label: Option<SharedString>,
     style: StyleRefinement,
+    interactive_style: Option<StyleRefinement>,
     disabled: bool,
     selected: bool,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
@@ -20,13 +21,16 @@ pub(crate) struct MenuItemElement {
 }
 
 impl MenuItemElement {
-    /// Create a new MenuItem with the given ID.
+    /// Create a row whose interactive appearance remains the component default unless its owner opts in.
+    ///
+    /// @author kongweiguang
     pub(crate) fn new(id: impl Into<ElementId>) -> Self {
         let id: ElementId = id.into();
         Self {
             id: id.clone(),
             aria_label: None,
             style: StyleRefinement::default(),
+            interactive_style: None,
             disabled: false,
             selected: false,
             on_click: None,
@@ -38,6 +42,17 @@ impl MenuItemElement {
     /// Set ListItem as the selected item style.
     pub(crate) fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+
+    /// Refine both hover and current-item highlight states after their component defaults.
+    ///
+    /// Keeping this separate from the base style prevents menu-specific highlight policy from
+    /// changing ordinary row styling or disabled treatment.
+    ///
+    /// @author kongweiguang
+    pub(crate) fn interactive_style(mut self, style: StyleRefinement) -> Self {
+        self.interactive_style = Some(style);
         self
     }
 
@@ -90,7 +105,13 @@ impl ParentElement for MenuItemElement {
 }
 
 impl RenderOnce for MenuItemElement {
+    /// Render the base row and its states, applying a menu-specific refinement only to active rows.
+    ///
+    /// @author kongweiguang
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let hover_style = self.interactive_style.clone();
+        let selected_style = self.interactive_style;
+
         h_flex()
             .id(self.id)
             .test_support()
@@ -114,12 +135,24 @@ impl RenderOnce for MenuItemElement {
                 // element before registering its group, and that fallback keeps
                 // the pointer's item lit after a key moves the highlight away.
                 this.hover(|this| {
-                    this.bg(cx.theme().tokens.accent)
-                        .text_color(cx.theme().accent_foreground)
+                    let this = this
+                        .bg(cx.theme().tokens.accent)
+                        .text_color(cx.theme().accent_foreground);
+                    if let Some(style) = hover_style.as_ref() {
+                        this.refine_style(style)
+                    } else {
+                        this
+                    }
                 })
                 .when(self.selected, |this| {
-                    this.bg(cx.theme().tokens.accent)
-                        .text_color(cx.theme().accent_foreground)
+                    let this = this
+                        .bg(cx.theme().tokens.accent)
+                        .text_color(cx.theme().accent_foreground);
+                    if let Some(style) = selected_style.as_ref() {
+                        this.refine_style(style)
+                    } else {
+                        this
+                    }
                 })
                 .when_some(self.on_click, |this, on_click| {
                     this.on_mouse_down(MouseButton::Left, move |_, _, cx| {

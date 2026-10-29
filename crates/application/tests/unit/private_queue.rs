@@ -639,6 +639,74 @@ async fn default_idle_timeout_tracks_live_sftp_policy_updates() {
     assert_eq!(service.default_idle_timeout_seconds(), 240);
 }
 
+/// 队列 worker 以记录中的入队快照准入；新任务读取热更新后的并发上限。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn queued_sftp_task_keeps_enqueue_concurrency_limit_after_update() {
+    let (service, _, request, _) =
+        service_for_kind(BackendMode::NoChanges, TransferKind::Directory);
+    let host = request
+        .source
+        .host_id()
+        .cloned()
+        .expect("fixture source is remote");
+    let old_policy = service
+        .inner
+        .sftp_policy
+        .update(SftpPerformanceSettings {
+            global_transfers: 1,
+            host_transfers: 1,
+            ..SftpPerformanceSettings::default()
+        })
+        .expect("valid initial policy is applied");
+    let blocker = service
+        .inner
+        .sftp_policy
+        .acquire_with_host_limits_at_snapshot([(host, None)], old_policy, &CancellationToken::new())
+        .await
+        .expect("test blocker owns the initial SFTP slot");
+
+    let queued = service
+        .enqueue(request.clone())
+        .await
+        .expect("first transfer is accepted");
+    wait_for_status(&service, &queued.id, TransferStatus::Connecting).await;
+
+    service
+        .inner
+        .sftp_policy
+        .update(SftpPerformanceSettings {
+            global_transfers: 2,
+            host_transfers: 2,
+            ..SftpPerformanceSettings::default()
+        })
+        .expect("new task limits are applied");
+    let new_task = service
+        .enqueue(request)
+        .await
+        .expect("second transfer is accepted with the new policy");
+    wait_for_status(&service, &new_task.id, TransferStatus::Unchanged).await;
+    sleep(Duration::from_millis(25)).await;
+
+    assert_eq!(
+        service
+            .get(&queued.id)
+            .await
+            .expect("queued transfer remains available")
+            .status,
+        TransferStatus::Connecting,
+        "an enqueue snapshot must keep the old host admission limit"
+    );
+
+    drop(blocker);
+    wait_for_status(&service, &queued.id, TransferStatus::Unchanged).await;
+    service
+        .shutdown()
+        .await
+        .expect("all queue workers are joined after their permits are released");
+}
+
 /// 新任务快照读取更新后的策略，而既有任务的 idle 预算始终保持入队时的值。
 /// @author kongweiguang
 #[tokio::test]

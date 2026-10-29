@@ -8,15 +8,18 @@ use kerminal_application::{
     connections::RdpClientLifecycle,
     platform::external_launch::{ExternalLaunchIntent, ExternalRoutedTarget},
     workspace::{
-        WorkspaceMachineStatus, WorkspacePaneMode, WorkspaceSessionPane, WorkspaceSessionTab,
-        WorkspaceTargetRef,
+        WorkspaceMachineStatus, WorkspacePaneMode, WorkspacePinnedContainer, WorkspaceSessionPane,
+        WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTargetRef,
     },
 };
 use kerminal_domain::{
     connections::RemoteProtocol,
-    files::{FileEndpoint, RemotePath},
+    files::{ContainerRuntime, FileEndpoint, RemotePath},
     identity::{HostId, PaneId, TabId},
-    sessions::{SessionTarget, SshInitialCommand, SshSessionTarget, TerminalSize},
+    operations::{ContainerSummary, ContainerTarget},
+    sessions::{
+        ContainerSessionTarget, SessionTarget, SshInitialCommand, SshSessionTarget, TerminalSize,
+    },
 };
 
 use super::workspace_files::sftp_transfer_tab_for_host;
@@ -24,7 +27,8 @@ use crate::features::connections::{
     ConnectionsEvent, HostFilePickerTarget, HostNavigationEvent, HostSessionProjection,
     HostSessionStatus,
 };
-use crate::features::workspace_controller::WorkspacePersistenceState;
+use crate::features::operations::ContainerPanelContext;
+use crate::features::workspace_controller::{WorkspaceControllerEffect, WorkspacePersistenceState};
 
 use super::workspace_runtime::RuntimePanePhase;
 use super::{CenterPanel, RootView, TerminalTargetRequest, WorkspaceTerminalOpenKind};
@@ -1045,10 +1049,412 @@ fn finish_group_rename_return(
     }
 }
 
+/// Root 只允许固定当前 SSH pane 或文件 Tab 宿主下、且摘要与事件目标完全一致的容器。
+/// @author kongweiguang
+pub(super) fn pin_container_from_operations(
+    root: &mut RootView,
+    context: Option<&ContainerPanelContext>,
+    target: &ContainerTarget,
+    container: &ContainerSummary,
+    cx: &mut Context<RootView>,
+) {
+    let context_host_id = match context {
+        Some(ContainerPanelContext::Host {
+            host_id: Some(host_id),
+            ..
+        }) => host_id,
+        Some(ContainerPanelContext::WorkspaceHost { host_id, .. }) => host_id,
+        _ => {
+            root.status = Some(crate::locale::text(
+                "固定容器需要当前 SSH 主机上下文。",
+                "Pinning a container requires the current SSH host context.",
+            ));
+            cx.notify();
+            return;
+        }
+    };
+    let Some(host_id) = target.host_id.as_ref() else {
+        root.status = Some(crate::locale::text(
+            "只能固定远程 SSH 主机中的容器。",
+            "Only containers on a remote SSH host can be pinned.",
+        ));
+        cx.notify();
+        return;
+    };
+    if host_id != context_host_id || container.target != *target {
+        root.status = Some(crate::locale::text(
+            "容器目标已变化，未固定。",
+            "The container target changed; nothing was pinned.",
+        ));
+        cx.notify();
+        return;
+    }
+    let Some(navigation) = root.host_navigation.as_ref() else {
+        root.status = Some(crate::locale::text(
+            "主机导航尚未就绪，未固定容器。",
+            "Host navigation is unavailable; the container was not pinned.",
+        ));
+        cx.notify();
+        return;
+    };
+    let Some(group_id) = navigation.read(cx).ssh_host_group_id(host_id) else {
+        root.status = Some(crate::locale::text(
+            "SSH 主机已不存在或协议已变化，未固定容器。",
+            "The SSH host no longer exists or its protocol changed; the container was not pinned.",
+        ));
+        cx.notify();
+        return;
+    };
+    let Some(mut snapshot) = root
+        .workspace_controller
+        .as_ref()
+        .map(|controller| controller.snapshot().clone())
+    else {
+        root.status = Some(crate::locale::text(
+            "工作区尚未就绪，未固定容器。",
+            "The workspace is not ready; the container was not pinned.",
+        ));
+        cx.notify();
+        return;
+    };
+    let name = if container.name.trim().is_empty() {
+        container.short_id.clone()
+    } else {
+        container.name.clone()
+    };
+    let description = match (container.image.trim(), container.status_text.trim()) {
+        ("", status) => status.to_owned(),
+        (image, "") => image.to_owned(),
+        (image, status) => format!("{image} · {status}"),
+    };
+    let pin = WorkspacePinnedContainer {
+        target: target.clone(),
+        name,
+        description,
+        group_id,
+    };
+    upsert_pinned_container_snapshot(&mut snapshot, pin);
+    synchronize_sidebar_snapshot(root, snapshot, cx);
+}
+
+/// 重复固定更新同一个稳定身份，并把选中状态一并写入快照。
+/// @author kongweiguang
+fn upsert_pinned_container_snapshot(
+    snapshot: &mut WorkspaceSessionSnapshot,
+    container: WorkspacePinnedContainer,
+) -> bool {
+    let stable_id = container.stable_id();
+    let changed_pin = match snapshot
+        .pinned_containers
+        .iter_mut()
+        .find(|existing| existing.stable_id() == stable_id)
+    {
+        Some(existing) => {
+            let changed = existing != &container;
+            if changed {
+                *existing = container;
+            }
+            changed
+        }
+        None => {
+            snapshot.pinned_containers.push(container);
+            true
+        }
+    };
+    let changed_selection = snapshot.selected_machine_id.as_deref() != Some(stable_id.as_str());
+    if changed_selection {
+        snapshot.selected_machine_id = Some(stable_id);
+    }
+    changed_pin || changed_selection
+}
+
+/// 选择只更新 selectedMachineId，不触碰活动标签、焦点 pane 或任何终端资源。
+/// @author kongweiguang
+fn select_pinned_container_snapshot(
+    snapshot: &mut WorkspaceSessionSnapshot,
+    stable_id: &str,
+) -> bool {
+    if !snapshot
+        .pinned_containers
+        .iter()
+        .any(|container| container.stable_id() == stable_id)
+        || snapshot.selected_machine_id.as_deref() == Some(stable_id)
+    {
+        return false;
+    }
+    snapshot.selected_machine_id = Some(stable_id.to_owned());
+    true
+}
+
+/// 移除选中的容器时清空侧栏选择，pin 差集由 codec 生成兼容移除标记。
+/// @author kongweiguang
+fn remove_pinned_container_snapshot(
+    snapshot: &mut WorkspaceSessionSnapshot,
+    stable_id: &str,
+) -> bool {
+    let Some(index) = snapshot
+        .pinned_containers
+        .iter()
+        .position(|container| container.stable_id() == stable_id)
+    else {
+        return false;
+    };
+    snapshot.pinned_containers.remove(index);
+    if snapshot.selected_machine_id.as_deref() == Some(stable_id) {
+        snapshot.selected_machine_id = None;
+    }
+    true
+}
+
+/// 导航选择和容器 pin 复用同一 workspace snapshot CAS 保存路径。
+/// @author kongweiguang
+fn synchronize_sidebar_snapshot(
+    root: &mut RootView,
+    snapshot: WorkspaceSessionSnapshot,
+    cx: &mut Context<RootView>,
+) -> bool {
+    let result = root
+        .workspace_controller
+        .as_mut()
+        .map(|controller| controller.synchronize_snapshot(snapshot));
+    match result {
+        Some(Ok(WorkspaceControllerEffect::Changed { .. })) => {
+            root.refresh_workspace_views(cx);
+            root.persist_workspace_snapshot(cx);
+            true
+        }
+        Some(Ok(WorkspaceControllerEffect::Unchanged)) => false,
+        Some(Ok(WorkspaceControllerEffect::ResourceOperation(operation))) => {
+            root.handle_workspace_resource_operation(operation, cx);
+            false
+        }
+        Some(Err(error)) => {
+            root.status = Some(error.public_message().to_owned().into());
+            cx.notify();
+            false
+        }
+        None => {
+            root.status = Some(crate::locale::text(
+                "工作区尚未就绪，请稍后重试。",
+                "The workspace is not ready. Try again shortly.",
+            ));
+            cx.notify();
+            false
+        }
+    }
+}
+
+/// 只复用目标完全相同的 Ready/Opening 容器会话，多个候选时要求用户自行选择。
+/// @author kongweiguang
+fn existing_container_session_target(
+    root: &RootView,
+    requested: &ContainerTarget,
+) -> ExistingContainerSessionTarget {
+    let Some(controller) = root.workspace_controller.as_ref() else {
+        return ExistingContainerSessionTarget::Missing;
+    };
+    let snapshot = controller.snapshot();
+    let candidates = root
+        .workspace_runtime
+        .panes()
+        .filter_map(|(pane_id, pane)| {
+            if !matches!(
+                session_status_for_phase(pane.phase),
+                Some(HostSessionStatus::Ready | HostSessionStatus::Opening)
+            ) {
+                return None;
+            }
+            let matches_target = matches!(
+                &pane.persisted.target,
+                Some(WorkspaceTargetRef::DockerContainer {
+                    host_id,
+                    container_id,
+                    runtime,
+                    ..
+                }) if Some(host_id) == requested.host_id.as_ref()
+                    && container_id == &requested.container_id
+                    && *runtime == workspace_container_runtime(requested.runtime)
+            );
+            if !matches_target
+                || pane
+                    .persisted
+                    .remote_host_id
+                    .as_ref()
+                    .is_some_and(|host_id| Some(host_id) != requested.host_id.as_ref())
+            {
+                return None;
+            }
+            if let Some(target) = pane.target.as_ref() {
+                if !runtime_container_target_matches(requested, target) {
+                    return None;
+                }
+            } else if pane.phase == RuntimePanePhase::Ready || pane.session_id.is_some() {
+                return None;
+            }
+            if pane.phase == RuntimePanePhase::Ready && pane.session_id.is_none() {
+                return None;
+            }
+            let tab_contains_pane = snapshot.terminal_tabs.iter().any(|tab| {
+                tab.id() == &pane.tab_id
+                    && tab
+                        .terminal_layout()
+                        .is_some_and(|layout| layout.contains_pane(pane_id))
+            });
+            tab_contains_pane.then(|| (pane.tab_id.clone(), pane_id.clone()))
+        })
+        .collect();
+    select_existing_container_session_target(candidates)
+}
+
+/// Convert file/runtime identity once when comparing a persisted container target.
+/// @author kongweiguang
+fn workspace_container_runtime(
+    runtime: ContainerRuntime,
+) -> kerminal_application::workspace::WorkspaceContainerRuntime {
+    match runtime {
+        ContainerRuntime::Docker => {
+            kerminal_application::workspace::WorkspaceContainerRuntime::Docker
+        }
+        ContainerRuntime::Podman => {
+            kerminal_application::workspace::WorkspaceContainerRuntime::Podman
+        }
+    }
+}
+
+/// 只有同 HostId、运行时和完整容器 ID 的运行态容器会话可被重复打开时复用。
+/// @author kongweiguang
+fn runtime_container_target_matches(requested: &ContainerTarget, target: &SessionTarget) -> bool {
+    matches!(target, SessionTarget::Container(target)
+        if target.host_id == requested.host_id
+            && target.runtime == requested.runtime
+            && target.container_id == requested.container_id)
+}
+
+/// 选择或移除固定容器时只改 sidebar projection，并经同一 CAS 保存入口闭环。
+/// @author kongweiguang
+fn handle_pinned_container_selection(
+    root: &mut RootView,
+    stable_id: &str,
+    cx: &mut Context<RootView>,
+) {
+    let Some(mut snapshot) = root
+        .workspace_controller
+        .as_ref()
+        .map(|controller| controller.snapshot().clone())
+    else {
+        return;
+    };
+    if select_pinned_container_snapshot(&mut snapshot, stable_id) {
+        synchronize_sidebar_snapshot(root, snapshot, cx);
+    }
+}
+
+/// Pin 在 workspace 中消失时同步清空选中态；codec 会据此记录旧主机侧栏移除标记。
+/// @author kongweiguang
+fn handle_pinned_container_removal(
+    root: &mut RootView,
+    stable_id: &str,
+    cx: &mut Context<RootView>,
+) {
+    let Some(mut snapshot) = root
+        .workspace_controller
+        .as_ref()
+        .map(|controller| controller.snapshot().clone())
+    else {
+        return;
+    };
+    if remove_pinned_container_snapshot(&mut snapshot, stable_id) {
+        synchronize_sidebar_snapshot(root, snapshot, cx);
+    }
+}
+
+/// 双击复用唯一同目标容器会话，否则创建默认容器 shell；所有入口都绑定原 SSH HostId。
+/// @author kongweiguang
+fn open_pinned_container(
+    root: &mut RootView,
+    stable_id: &str,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+) {
+    let Some(mut snapshot) = root
+        .workspace_controller
+        .as_ref()
+        .map(|controller| controller.snapshot().clone())
+    else {
+        return;
+    };
+    let Some(container) = snapshot
+        .pinned_containers
+        .iter()
+        .find(|container| container.stable_id() == stable_id)
+        .cloned()
+    else {
+        root.refresh_workspace_views(cx);
+        return;
+    };
+    let Some(host_id) = container.target.host_id.clone() else {
+        root.status = Some(crate::locale::text(
+            "此固定容器没有 SSH 主机目标，无法打开终端。",
+            "This pinned container has no SSH host target and cannot be opened.",
+        ));
+        cx.notify();
+        return;
+    };
+    let Some(navigation) = root.host_navigation.as_ref() else {
+        root.status = Some(crate::locale::text(
+            "主机导航尚未就绪，无法打开容器终端。",
+            "Host navigation is unavailable; the container terminal cannot be opened.",
+        ));
+        cx.notify();
+        return;
+    };
+    if navigation.read(cx).ssh_host_group_id(&host_id).is_none() {
+        root.status = Some(crate::locale::text(
+            "SSH 主机已不存在或协议已变化，无法打开容器终端。",
+            "The SSH host no longer exists or its protocol changed; the container terminal cannot be opened.",
+        ));
+        cx.notify();
+        return;
+    }
+    if select_pinned_container_snapshot(&mut snapshot, stable_id) {
+        synchronize_sidebar_snapshot(root, snapshot, cx);
+    }
+
+    match existing_container_session_target(root, &container.target) {
+        ExistingContainerSessionTarget::Unique { tab_id, pane_id } => {
+            activate_container_session_target(root, &tab_id, &pane_id, window, cx);
+            return;
+        }
+        ExistingContainerSessionTarget::Multiple => {
+            root.status = Some(crate::locale::text(
+                "此容器有多个活动会话，请在工作区中选择目标标签和分屏。",
+                "This container has multiple active sessions. Choose the intended tab and pane in the workspace.",
+            ));
+            cx.notify();
+            return;
+        }
+        ExistingContainerSessionTarget::Missing => {}
+    }
+    root.create_terminal_for_target(
+        TerminalTargetRequest::ExplicitHost {
+            host_id: host_id.clone(),
+            target: SessionTarget::Container(ContainerSessionTarget {
+                host_id: Some(host_id),
+                runtime: container.target.runtime,
+                container_id: container.target.container_id,
+                command: Vec::new(),
+            }),
+        },
+        window,
+        cx,
+    );
+}
+
 /// 路由主机与本地 Profile 意图；容器目标由活动终端绑定，不从左栏选择或覆盖。
 ///
 /// Hosts 选择切换到中心详情；创建/重命名共享原工作区返回点，中心不再打开重复连接目录。
 /// 本地主机表单复用 ConnectionsPanel 的编辑器模态；连接与传输继续使用原有会话路径。
+/// 每次显式终端连接意图都会交给连接面板预检并创建独立会话，不因同主机已有 pane 而改为激活旧标签。
 /// 顶部工作台和折叠直接路由现有 Root 状态，不要求选中主机或先创建终端。
 /// @author kongweiguang
 pub(super) fn handle_host_navigation_event(
@@ -1057,6 +1463,21 @@ pub(super) fn handle_host_navigation_event(
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) {
+    match event {
+        HostNavigationEvent::PinnedContainerSelected { stable_id } => {
+            handle_pinned_container_selection(root, stable_id, cx);
+            return;
+        }
+        HostNavigationEvent::PinnedContainerOpenRequested { stable_id } => {
+            open_pinned_container(root, stable_id, window, cx);
+            return;
+        }
+        HostNavigationEvent::PinnedContainerRemoveRequested { stable_id } => {
+            handle_pinned_container_removal(root, stable_id, cx);
+            return;
+        }
+        _ => {}
+    }
     let group_editor_return_panel = if matches!(
         event,
         HostNavigationEvent::CreateGroupRequested
@@ -1111,46 +1532,8 @@ pub(super) fn handle_host_navigation_event(
         HostNavigationEvent::HostSelected { .. } => {
             root.set_center_panel(CenterPanel::Connections, window, cx);
         }
-        HostNavigationEvent::ConnectRequested { host_id } => {
-            match existing_host_session_target(root, host_id) {
-                ExistingHostSessionTarget::Unique { tab_id, pane_id } => {
-                    activate_host_session_target(root, &tab_id, &pane_id, window, cx);
-                    return;
-                }
-                ExistingHostSessionTarget::Multiple => {
-                    root.status = Some(crate::locale::text(
-                        "此主机有多个活动会话，请在工作区中选择目标标签和分屏。",
-                        "This host has multiple active sessions. Choose the intended tab and pane in the workspace.",
-                    ));
-                    cx.notify();
-                    return;
-                }
-                ExistingHostSessionTarget::Missing => {}
-            }
-        }
-        HostNavigationEvent::ActivateExistingSessionRequested { host_id } => {
-            match existing_host_session_target(root, host_id) {
-                ExistingHostSessionTarget::Unique { tab_id, pane_id } => {
-                    activate_host_session_target(root, &tab_id, &pane_id, window, cx);
-                }
-                ExistingHostSessionTarget::Multiple => {
-                    root.status = Some(crate::locale::text(
-                        "此主机有多个活动会话，请在工作区中选择目标标签和分屏。",
-                        "This host has multiple active sessions. Choose the intended tab and pane in the workspace.",
-                    ));
-                    cx.notify();
-                }
-                ExistingHostSessionTarget::Missing => {
-                    root.status = Some(crate::locale::text(
-                        "活动会话状态已变化，未新建连接；请重新查看主机状态。",
-                        "The active session changed. No new connection was created; review the host status and try again.",
-                    ));
-                    cx.notify();
-                }
-            }
-            return;
-        }
-        HostNavigationEvent::OpenSftpRequested { .. } => {}
+        HostNavigationEvent::ConnectRequested { .. }
+        | HostNavigationEvent::OpenSftpRequested { .. } => {}
         HostNavigationEvent::CreateSftpTransferTabRequested { .. } => {}
         HostNavigationEvent::EditHostRequested { .. }
         | HostNavigationEvent::CopyHostRequested { .. }
@@ -1172,6 +1555,9 @@ pub(super) fn handle_host_navigation_event(
         | HostNavigationEvent::DeleteGroupRequested { .. } => {
             root.set_center_panel(CenterPanel::Connections, window, cx);
         }
+        HostNavigationEvent::PinnedContainerSelected { .. }
+        | HostNavigationEvent::PinnedContainerOpenRequested { .. }
+        | HostNavigationEvent::PinnedContainerRemoveRequested { .. } => {}
     }
 
     let Some(panel) = root.connections_panel.clone() else {
@@ -1194,7 +1580,9 @@ pub(super) fn handle_host_navigation_event(
         HostNavigationEvent::OpenSftpWorkbenchRequested
         | HostNavigationEvent::LocalProfileSelected { .. }
         | HostNavigationEvent::LocalProfileConnectRequested { .. }
-        | HostNavigationEvent::ActivateExistingSessionRequested { .. } => {}
+        | HostNavigationEvent::PinnedContainerSelected { .. }
+        | HostNavigationEvent::PinnedContainerOpenRequested { .. }
+        | HostNavigationEvent::PinnedContainerRemoveRequested { .. } => {}
         HostNavigationEvent::HostSelected { host_id } => panel.select_host_id(host_id, cx),
         HostNavigationEvent::ConnectRequested { host_id } => {
             panel.request_connect_host(host_id, cx)
@@ -1269,76 +1657,24 @@ fn local_profile_target_request(profile_id: &str) -> TerminalTargetRequest {
     }
 }
 
-/// 只从当前有效 pane 中选取明确属于该 HostId 的 Ready/Opening 会话，拒绝旧投影和目标漂移。
+/// 固定容器的多个活动 pane 不自动猜选，需由用户在工作区明确确定目标。
 /// @author kongweiguang
-fn existing_host_session_target(
-    root: &RootView,
-    requested_host_id: &HostId,
-) -> ExistingHostSessionTarget {
-    let Some(controller) = root.workspace_controller.as_ref() else {
-        return ExistingHostSessionTarget::Missing;
-    };
-    let snapshot = controller.snapshot();
-    let candidates = root
-        .workspace_runtime
-        .panes()
-        .filter_map(|(pane_id, pane)| {
-            if !matches!(
-                session_status_for_phase(pane.phase),
-                Some(HostSessionStatus::Ready | HostSessionStatus::Opening)
-            ) {
-                return None;
-            }
-            let (host_id, protocol) = persisted_remote_host(&pane.persisted.target)?;
-            if &host_id != requested_host_id
-                || pane
-                    .persisted
-                    .remote_host_id
-                    .as_ref()
-                    .is_some_and(|persisted_id| persisted_id != &host_id)
-            {
-                return None;
-            }
-            if let Some(target) = pane.target.as_ref() {
-                if !runtime_target_matches(&host_id, protocol, target) {
-                    return None;
-                }
-            } else if pane.phase == RuntimePanePhase::Ready || pane.session_id.is_some() {
-                return None;
-            }
-            if pane.phase == RuntimePanePhase::Ready && pane.session_id.is_none() {
-                return None;
-            }
-            let tab_contains_pane = snapshot.terminal_tabs.iter().any(|tab| {
-                tab.id() == &pane.tab_id
-                    && tab
-                        .terminal_layout()
-                        .is_some_and(|layout| layout.contains_pane(pane_id))
-            });
-            tab_contains_pane.then(|| (pane.tab_id.clone(), pane_id.clone()))
-        })
-        .collect();
-    select_existing_host_session_target(candidates)
-}
-
-/// 自动激活只接受唯一稳定目标；多个会话必须由用户在工作区自行选择。
-/// @author kongweiguang
-fn select_existing_host_session_target(
+fn select_existing_container_session_target(
     candidates: Vec<(TabId, PaneId)>,
-) -> ExistingHostSessionTarget {
+) -> ExistingContainerSessionTarget {
     match candidates.as_slice() {
-        [] => ExistingHostSessionTarget::Missing,
-        [(tab_id, pane_id)] => ExistingHostSessionTarget::Unique {
+        [] => ExistingContainerSessionTarget::Missing,
+        [(tab_id, pane_id)] => ExistingContainerSessionTarget::Unique {
             tab_id: tab_id.clone(),
             pane_id: pane_id.clone(),
         },
-        _ => ExistingHostSessionTarget::Multiple,
+        _ => ExistingContainerSessionTarget::Multiple,
     }
 }
 
-/// 复用 Root 已有的标签和 pane 激活路径，确保点击只切换视图，不新建或重绑 session。
+/// 固定容器只有一个完全匹配的活动 pane 时复用原标签，避免切换到同主机的其他容器会话。
 /// @author kongweiguang
-fn activate_host_session_target(
+fn activate_container_session_target(
     root: &mut RootView,
     tab_id: &TabId,
     pane_id: &PaneId,
@@ -1350,7 +1686,7 @@ fn activate_host_session_target(
 }
 
 #[derive(Debug, Eq, PartialEq)]
-enum ExistingHostSessionTarget {
+enum ExistingContainerSessionTarget {
     Missing,
     Unique { tab_id: TabId, pane_id: PaneId },
     Multiple,

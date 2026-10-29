@@ -221,6 +221,50 @@ impl SnippetExecutionService {
         Self { commands, sessions }
     }
 
+    /// main 的填入仅粘贴当前预览，不依赖 Shell 集成或空闲提示符；writer 原子核对 binding，避免切目标后改投。
+    /// 与 main 一样先去除首尾空白，再拒绝正文换行；保留行内 Tab，未知回执不能自动重放。
+    ///
+    /// @author kongweiguang
+    pub async fn fill_direct(
+        &self,
+        rendered: SnippetRenderResult,
+        binding: UiSessionBinding,
+        cancellation: CancellationToken,
+    ) -> AppResult<TerminalCommandContext> {
+        let command = Zeroizing::new(rendered.command);
+        let command = command.trim();
+        if command.is_empty() || command.contains(['\r', '\n']) {
+            return Err(AppError::invalid("填入只支持非空单行命令"));
+        }
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("命令片段填入已取消"));
+        }
+        if !matches!(&binding.owner, SessionOwner::Ui { .. }) {
+            return Err(AppError::conflict("命令片段目标不属于可见终端"));
+        }
+        let session = self
+            .sessions
+            .list(SessionFilter::default())
+            .await?
+            .into_iter()
+            .find(|session| session.session_id == binding.session_id)
+            .ok_or_else(|| AppError::not_found("指定终端会话不存在"))?;
+        if session.lifecycle != SessionLifecycle::Running || session.owner != binding.owner {
+            return Err(AppError::conflict("命令片段目标会话已变化或已关闭"));
+        }
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("命令片段填入已取消"));
+        }
+        self.sessions
+            .write_ui_input(UiTerminalInputRequest {
+                binding,
+                expected_context: None,
+                projection: UiInputProjection::Tracked,
+                event: TerminalInputEvent::Paste(command.to_string()),
+            })
+            .await
+    }
+
     /// 直接发送用户当前点击的定义，不读取 catalog、平台、scope、shell 或 prompt 状态。
     ///
     /// 会话 owner 与 Running 前态用于拒绝陈旧目标；最终 owner/generation 仍由 session writer 在 Paste+Enter 的同一事务中 CAS。

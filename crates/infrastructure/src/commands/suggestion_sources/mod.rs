@@ -98,76 +98,39 @@ pub(super) struct CachedDirectoryEntry {
     pub(super) executable: bool,
 }
 
-/// 控制所有远端建议来源的第二道运行时门禁，可由 composition 在设置变更后即时更新。
+/// 只控制配置仓储是否处于可用读写态；用户来源选择由 application 按请求快照传入。
 #[derive(Clone, Default)]
 pub struct RemoteSuggestionPolicy {
-    enabled: Arc<AtomicBool>,
-    remote_path_enabled: Arc<AtomicBool>,
-    remote_command_enabled: Arc<AtomicBool>,
-    git_enabled: Arc<AtomicBool>,
+    runtime_available: Arc<AtomicBool>,
 }
 
 impl RemoteSuggestionPolicy {
-    /// 以总 remoteProbe 设置建立共享门禁；三个远端来源默认单独启用并可由设置覆盖。
-    pub fn new(enabled: bool) -> Self {
+    /// 根据设置仓储恢复态初始化硬门禁，不把持久用户偏好混入共享 provider 状态。
+    pub fn new(runtime_available: bool) -> Self {
         Self {
-            enabled: Arc::new(AtomicBool::new(enabled)),
-            remote_path_enabled: Arc::new(AtomicBool::new(true)),
-            remote_command_enabled: Arc::new(AtomicBool::new(true)),
-            git_enabled: Arc::new(AtomicBool::new(true)),
+            runtime_available: Arc::new(AtomicBool::new(runtime_available)),
         }
     }
 
-    /// 让设置加载、保存和外部文件变更统一更新同一原子开关。
-    pub fn set_remote_probe_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Release);
+    /// 配置恢复或有效重载后更新唯一硬门禁，不受 UI 预览值或旧 watcher 快照影响。
+    pub fn set_runtime_available(&self, available: bool) {
+        self.runtime_available.store(available, Ordering::Release);
     }
 
-    /// 在每次远端 I/O 前复核最新策略，避免旧 UI 请求绕过刚关闭的远端探测。
-    pub fn remote_probe_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Acquire)
+    /// 在每个远端连接和 I/O 前读取恢复态门禁，关闭时任何远端来源都不能继续探测。
+    pub fn runtime_available(&self) -> bool {
+        self.runtime_available.load(Ordering::Acquire)
     }
 
-    /// 让设置层独立关闭路径补全，同时保留其它远端建议来源。
-    pub fn set_remote_path_enabled(&self, enabled: bool) {
-        self.remote_path_enabled.store(enabled, Ordering::Release);
-    }
-
-    /// 在每个路径查询前读取最新来源策略，不因旧请求继续触发 SFTP 枚举。
-    pub fn remote_path_enabled(&self) -> bool {
-        self.remote_path_enabled.load(Ordering::Acquire)
-    }
-
-    /// 让设置层独立关闭可执行命令发现，不影响路径或 Git 建议。
-    pub fn set_remote_command_enabled(&self, enabled: bool) {
-        self.remote_command_enabled
-            .store(enabled, Ordering::Release);
-    }
-
-    /// 在 PATH 查询前读取最新来源策略，禁用后不执行远端命令。
-    pub fn remote_command_enabled(&self) -> bool {
-        self.remote_command_enabled.load(Ordering::Acquire)
-    }
-
-    /// 让设置层独立关闭 Git 建议，不影响其它远端来源。
-    pub fn set_git_enabled(&self, enabled: bool) {
-        self.git_enabled.store(enabled, Ordering::Release);
-    }
-
-    /// 在 Git refs 或 remote 探测前读取最新来源策略。
-    pub fn git_enabled(&self) -> bool {
-        self.git_enabled.load(Ordering::Acquire)
-    }
-
-    /// 在每个来源真正读取缓存或触发远端访问前重新校验设置快照对应的共享门禁。
+    /// 为远端 provider 提供恢复态的最后一道门禁；具体来源是否被用户选中由请求列表决定。
     pub(super) fn allows(&self, provider: SuggestionProviderKind) -> bool {
-        self.remote_probe_enabled()
-            && match provider {
-                SuggestionProviderKind::RemotePath => self.remote_path_enabled(),
-                SuggestionProviderKind::RemoteCommand => self.remote_command_enabled(),
-                SuggestionProviderKind::Git => self.git_enabled(),
-                _ => false,
-            }
+        self.runtime_available()
+            && matches!(
+                provider,
+                SuggestionProviderKind::RemotePath
+                    | SuggestionProviderKind::RemoteCommand
+                    | SuggestionProviderKind::Git
+            )
     }
 }
 
@@ -619,7 +582,7 @@ impl CommandSuggestionProvider for RemoteCommandSuggestionProvider {
         ]
     }
 
-    /// 仅处理明确 SSH session 和用户输入前缀，过期、超时、未知 shell 或禁用策略均安全降级。
+    /// 仅处理明确 SSH session 和用户输入前缀，过期、超时、未知 shell 或恢复态关闭均安全降级。
     async fn suggest(
         &self,
         request: CommandSuggestionRequest,
@@ -633,7 +596,7 @@ impl CommandSuggestionProvider for RemoteCommandSuggestionProvider {
             .chars()
             .take(MAX_REQUEST_INPUT_CHARACTERS + 1)
             .count();
-        if !self.policy.remote_probe_enabled()
+        if !self.policy.runtime_available()
             || request.target != CommandHistoryTarget::Ssh
             || request.session_id.as_deref().is_none_or(|session| {
                 session.trim().is_empty()

@@ -68,9 +68,31 @@ impl RootView {
                         window,
                         cx,
                     );
+                    super::command_blocks::agent::select_pending_send_target(
+                        root,
+                        agent_session_id.as_ref(),
+                        terminal_session_id.as_ref(),
+                        cx,
+                    );
                     if let Some(panel) = root.mcp_runtime_panel.as_ref() {
                         panel.update(cx, |panel, cx| panel.refresh(cx));
                     }
+                }
+                crate::features::agents::AgentPanelEvent::PendingSendConfirmed {
+                    agent_session_id,
+                    request_id,
+                    preview_id,
+                } => {
+                    super::command_blocks::agent::confirm_pending_send(
+                        root,
+                        agent_session_id.clone(),
+                        request_id,
+                        preview_id,
+                        cx,
+                    );
+                }
+                crate::features::agents::AgentPanelEvent::PendingSendCancelled { request_id } => {
+                    super::command_blocks::agent::cancel_pending_send(root, request_id, cx);
                 }
                 crate::features::agents::AgentPanelEvent::OpenCustomAgentManager => {
                     root.open_custom_agent_manager(window, cx);
@@ -156,12 +178,14 @@ impl RootView {
         self.agents_panel = Some(retained.panel.clone());
         self._agent_event_subscription = retained.subscription;
         let candidate = self.current_agent_target_candidate();
+        let target_summary = self.current_agent_target_summary();
         let theme_mode = self.theme_mode;
         let palette = self.current_terminal_palette();
         let (agent_id, session_id) = retained.panel.update(cx, |panel, cx| {
             panel.set_theme_mode(theme_mode, cx);
             panel.set_terminal_palette(palette, cx);
             panel.set_target_candidate(candidate.clone(), cx);
+            panel.set_target_summary(Some(target_summary), cx);
             (
                 panel.selected_agent_session_id(),
                 panel.selected_terminal_session_id(),
@@ -172,5 +196,6 @@ impl RootView {
         let dock_collapsed = self.right_dock_collapsed;
         self.select_agent_terminal(agent_id, session_id, window, cx);
         self.right_dock_collapsed = dock_collapsed;
+        super::command_blocks::agent::active_agent_panel_changed(self, cx);
     }
 }

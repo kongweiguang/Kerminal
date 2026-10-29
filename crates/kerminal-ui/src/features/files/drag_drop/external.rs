@@ -8,7 +8,7 @@ use gpui_kit::Context;
 use kerminal_domain::files::{FileEndpoint, FileEntryKind, TransferKind, TransferRequest};
 
 use super::super::{
-    FilesPane, TransferEnqueueItem, batch_enqueue_message, child_endpoint, enqueue_transfer_items,
+    BatchEnqueueLabels, FilesPane, TransferBatchPlan, TransferEnqueueItem, child_endpoint,
     localized_error, valid_item_name,
 };
 use crate::locale;
@@ -65,19 +65,29 @@ impl FilesPane {
             cx.notify();
             return;
         }
+        let Some(target) = self.capture_transfer_target_snapshot(destination_side) else {
+            self.status = Some(
+                locale::text(
+                    "目标目录尚未读取完成，请刷新后重试。",
+                    "The destination folder is not ready. Refresh it and try again.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
         if !self.begin_transfer_submission(cx) {
             return;
         }
 
         let files = self.files.clone();
-        let transfers = self.transfers.clone();
         let executor = self.executor.clone();
         let conflict_policy = self.queue.conflict_policy;
         let external_target_lease = self.external_target_lease_for_endpoint(&destination_directory);
+        let total = paths.len();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |cancellation| async move {
-                    let total = paths.len();
                     let mut seen = HashSet::with_capacity(total);
                     let mut items = Vec::with_capacity(total);
                     let mut issues = Vec::new();
@@ -184,30 +194,35 @@ impl FilesPane {
                             request,
                         });
                     }
-                    Ok(enqueue_transfer_items(
-                        transfers,
-                        cancellation,
-                        items,
-                        total,
-                        0,
-                        issues,
-                    )
-                    .await)
+                    if cancellation.is_cancelled() {
+                        return Err(kerminal_application::AppError::cancelled(
+                            "外部拖放计划已取消",
+                        ));
+                    }
+                    Ok((items, issues))
                 })
                 .await;
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
-                    pane.end_transfer_submission();
-                    pane.status = match result {
-                        Ok(outcome) => Some(batch_enqueue_message(
-                            "拖入上传任务已入队",
-                            "Dropped upload tasks queued",
-                            outcome,
-                        )),
-                        Err(error) => Some(localized_error(&error)),
+                    match result {
+                        Ok((items, issues)) => pane.enqueue_transfer_batch_started(
+                            TransferBatchPlan {
+                                items,
+                                total,
+                                included_by_selected_directories: 0,
+                                issues,
+                                labels: BatchEnqueueLabels {
+                                action_zh: "拖入上传任务已入队",
+                                action_en: "Dropped upload tasks queued",
+                            },
+                                target,
+                            },
+                            cx,
+                        ),
+                        Err(error) => {
+                            pane.finish_unsubmitted_transfer(localized_error(&error), cx)
+                        }
                     };
-                    pane.reload_transfers(cx);
-                    cx.notify();
                 });
             });
         })

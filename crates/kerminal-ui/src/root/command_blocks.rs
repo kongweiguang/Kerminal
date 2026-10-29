@@ -13,13 +13,15 @@ use kerminal_application::sessions::{
 use kerminal_domain::identity::SessionId;
 use tokio_util::sync::CancellationToken;
 
+use crate::features::commands::{CommandsView, SnippetCurrentCommandRequested};
 use crate::features::terminal_tools::command_blocks::capture_revision_matches;
 use crate::features::terminal_tools::{
     CommandBlockAction, CommandBlockContent, CommandBlockContentUnavailable, CommandBlockEvent,
     CommandBlockProjection, TerminalToolsEvent, TerminalToolsView,
 };
 
-mod agent;
+pub(super) mod agent;
+pub(super) mod agent_pending;
 
 use super::RootView;
 use super::terminal_tools_runtime::{TerminalToolsOwner, owner_is_current, resolve_owner};
@@ -30,6 +32,7 @@ pub(super) struct CommandBlockRuntime {
     next_generation: u64,
     active: HashMap<RequestKey, ActiveRequest>,
     uncertain_agent_submissions: HashSet<UncertainAgentSubmission>,
+    agent_pending_send: agent_pending::AgentPendingSendState,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -43,6 +46,7 @@ struct RequestKey {
 enum RequestOperation {
     Snapshot,
     Transcript(kerminal_application::sessions::CommandBlockId),
+    SnippetPrefill(kerminal_application::sessions::CommandBlockId),
     ImageExport(kerminal_application::sessions::CommandBlockId),
     AgentPreview(kerminal_application::sessions::CommandBlockId),
     AgentSend(kerminal_application::sessions::CommandBlockId),
@@ -189,7 +193,10 @@ impl CommandBlockRuntime {
                 active.cancellation.cancel();
             }
             // Agent 提交即使收到取消也必须等用例返回真实 ACK/未知结果，不能丢弃非幂等写入。
-            keep || matches!(key.operation, RequestOperation::AgentSend(_))
+            keep || matches!(
+                key.operation,
+                RequestOperation::AgentSend(_) | RequestOperation::SnippetPrefill(_)
+            )
         });
     }
 
@@ -201,7 +208,10 @@ impl CommandBlockRuntime {
                 active.cancellation.cancel();
             }
             // 被复用的工具实体不再拥有旧操作，但保留提交 ticket 以接收其最终结果。
-            keep || matches!(key.operation, RequestOperation::AgentSend(_))
+            keep || matches!(
+                key.operation,
+                RequestOperation::AgentSend(_) | RequestOperation::SnippetPrefill(_)
+            )
         });
     }
 
@@ -217,7 +227,7 @@ impl CommandBlockRuntime {
                 true
             } else {
                 match key.operation {
-                    RequestOperation::Snapshot => true,
+                    RequestOperation::Snapshot | RequestOperation::SnippetPrefill(_) => true,
                     RequestOperation::Transcript(block_id)
                     | RequestOperation::ImageExport(block_id)
                     | RequestOperation::AgentPreview(block_id)
@@ -228,7 +238,10 @@ impl CommandBlockRuntime {
                 active.cancellation.cancel();
             }
             // block 从快照移除时也不能丢失正在途中的 Paste+Enter 回执。
-            keep || matches!(key.operation, RequestOperation::AgentSend(_))
+            keep || matches!(
+                key.operation,
+                RequestOperation::AgentSend(_) | RequestOperation::SnippetPrefill(_)
+            )
         });
         self.uncertain_agent_submissions.retain(|entry| {
             entry.session_id != *session_id || live_blocks.contains(&entry.block_id)
@@ -243,7 +256,7 @@ impl CommandBlockRuntime {
     }
 }
 
-/// 读取明示 session 的权威 bounded 命令块快照；订阅通知只触发重新查询。
+/// 读取明示 session 的权威 bounded 命令块快照；Root 重绘也负责刷新 Commands 的当前块投影。
 pub(super) fn refresh_from_event(
     root: &mut RootView,
     source: Entity<TerminalToolsView>,
@@ -339,9 +352,9 @@ pub(super) fn refresh_from_event(
                         tools.set_command_block_snapshot_error(&query_session, message.clone(), cx)
                     });
                     root.status = Some(message.into());
-                    cx.notify();
                 }
             }
+            cx.notify();
         });
     });
     root.command_block_runtime.install_task(&ticket, task);
@@ -352,7 +365,7 @@ pub(super) fn handle_event_from(
     root: &mut RootView,
     source: Entity<TerminalToolsView>,
     event: &TerminalToolsEvent,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<RootView>,
 ) -> bool {
     let TerminalToolsEvent::CommandBlockAction {
@@ -370,7 +383,7 @@ pub(super) fn handle_event_from(
         capture_revision: *capture_revision,
         action: *action,
     };
-    handle_action(root, source, event, cx);
+    handle_action(root, source, event, window, cx);
     true
 }
 
@@ -379,6 +392,7 @@ fn handle_action(
     root: &mut RootView,
     source: Entity<TerminalToolsView>,
     event: CommandBlockEvent,
+    window: &mut Window,
     cx: &mut Context<RootView>,
 ) {
     let Some(owner) = resolve_owner(root, &source, &event.session_id, cx) else {
@@ -501,9 +515,322 @@ fn handle_action(
             request_image_export(root, owner, source, event, generation, text, cx);
         }
         CommandBlockAction::SendToAgent => {
-            agent::request_agent_preview(root, source, event, generation, cx);
+            agent::request_agent_preview(root, source, event, generation, window, cx);
         }
     }
+}
+
+/// 读取点击时冻结的活动 pane 命令块全文；目标、block 身份和 Commands 请求代次共同拒绝迟到结果。
+///
+/// @author kongweiguang
+pub(super) fn request_snippet_current_command(
+    root: &mut RootView,
+    commands: Entity<CommandsView>,
+    event: SnippetCurrentCommandRequested,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+) {
+    let request_id = event.request_id;
+    let reject = |commands: &Entity<CommandsView>, cx: &mut Context<RootView>, message: String| {
+        commands.update(cx, |view, cx| {
+            view.fail_snippet_current_command_request(request_id, message, cx);
+        });
+    };
+    if root
+        .commands_view
+        .as_ref()
+        .is_none_or(|current| current.entity_id() != commands.entity_id())
+    {
+        commands.update(cx, |view, cx| {
+            view.cancel_pending_snippet_command_request(cx)
+        });
+        return;
+    }
+    let Some(target) = root.current_logs_target(cx) else {
+        reject(
+            &commands,
+            cx,
+            crate::locale::text(
+                "当前没有可用的终端命令块。",
+                "There is no terminal command block available.",
+            )
+            .to_string(),
+        );
+        return;
+    };
+    if target.binding() != &event.source.binding {
+        reject(
+            &commands,
+            cx,
+            crate::locale::text(
+                "终端目标已变化，请重新新建片段。",
+                "The terminal target changed. Start the snippet again.",
+            )
+            .to_string(),
+        );
+        return;
+    }
+    let session_id = event.source.binding.session_id.clone();
+    let Some(source) = root.workspace_tools.get(&session_id).cloned() else {
+        reject(
+            &commands,
+            cx,
+            crate::locale::text(
+                "当前终端工具视图已关闭，请重试。",
+                "The current terminal tool view has closed. Try again.",
+            )
+            .to_string(),
+        );
+        return;
+    };
+    let Some(owner) = resolve_owner(root, &source, &session_id, cx) else {
+        reject(
+            &commands,
+            cx,
+            crate::locale::text(
+                "当前终端 pane 已失效，请重试。",
+                "The current terminal pane is no longer available. Try again.",
+            )
+            .to_string(),
+        );
+        return;
+    };
+    let latest = source
+        .read(cx)
+        .latest_submitted_command_block(&session_id, cx);
+    let Some(latest) = latest.filter(|block| {
+        block.id == event.source.block_id
+            && block.session_generation == event.source.session_generation
+            && block.capture_revision == event.source.capture_revision
+            && block.command == event.source.command
+    }) else {
+        reject(
+            &commands,
+            cx,
+            crate::locale::text(
+                "当前命令块已变化，请重新新建片段。",
+                "The current command block changed. Start the snippet again.",
+            )
+            .to_string(),
+        );
+        return;
+    };
+
+    let ticket = root
+        .command_block_runtime
+        .begin(owner.clone(), RequestOperation::SnippetPrefill(latest.id));
+    let sessions = root.services.sessions.clone();
+    let executor = root.services.executor.clone();
+    let callback_ticket = ticket.clone();
+    let callback_owner = owner;
+    let callback_source = source;
+    let callback_commands = commands;
+    let query_session = session_id;
+    let block_id = latest.id;
+    let command = latest.command;
+    let session_generation = event.source.session_generation;
+    let capture_revision = event.source.capture_revision;
+    let task_cancellation = ticket.cancellation.clone();
+
+    let task = cx.spawn_in(window, async move |this, cx| {
+        let service_session = query_session.clone();
+        let result = executor
+            .run_cancellable(
+                task_cancellation,
+                move |operation_cancellation| async move {
+                    sessions
+                        .command_block_output(
+                            service_session,
+                            block_id,
+                            MAX_COMMAND_BLOCK_OUTPUT_BYTES,
+                            &operation_cancellation,
+                        )
+                        .await
+                },
+            )
+            .await;
+        let _ = cx.update(|window, app| {
+            let _ = this.update(app, |root, cx| {
+                if !root.command_block_runtime.is_current(&callback_ticket) {
+                    return;
+                }
+                root.command_block_runtime.finish(&callback_ticket);
+                if root
+                    .commands_view
+                    .as_ref()
+                    .is_none_or(|current| current.entity_id() != callback_commands.entity_id())
+                {
+                    callback_commands
+                        .update(cx, |view, cx| view.cancel_pending_snippet_command_request(cx));
+                    return;
+                }
+                if !owner_is_current(root, &callback_owner, cx) {
+                    callback_commands.update(cx, |view, cx| {
+                        view.fail_snippet_current_command_request(
+                            request_id,
+                            crate::locale::text(
+                                "原终端目标已失效，未创建片段。",
+                                "The original terminal target is no longer available. No snippet was created.",
+                            )
+                            .to_string(),
+                            cx,
+                        );
+                    });
+                    return;
+                }
+                let current_binding = callback_source.read(cx).command_block_binding(cx);
+                if current_binding.as_ref().is_none_or(|(bound_session, bound_generation)| {
+                    bound_session != &query_session || *bound_generation != session_generation
+                }) || !callback_source.read(cx).contains_command_block(block_id, cx)
+                {
+                    callback_commands.update(cx, |view, cx| {
+                        view.fail_snippet_current_command_request(
+                            request_id,
+                            crate::locale::text(
+                                "原命令块已失效，未创建片段。",
+                                "The original command block is no longer available. No snippet was created.",
+                            )
+                            .to_string(),
+                            cx,
+                        );
+                    });
+                    return;
+                }
+                match result {
+                    Ok(snapshot) => match snippet_command_block_text(
+                        snapshot,
+                        &query_session,
+                        block_id,
+                        session_generation,
+                        capture_revision,
+                        &command,
+                    ) {
+                        Ok(text) => {
+                            callback_commands.update(cx, |view, cx| {
+                                view.complete_snippet_current_command_request(
+                                    request_id,
+                                    text,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                        Err(message) => {
+                            callback_commands.update(cx, |view, cx| {
+                                view.fail_snippet_current_command_request(
+                                    request_id,
+                                    message,
+                                    cx,
+                                );
+                            });
+                        }
+                    },
+                    Err(error) => {
+                        callback_commands.update(cx, |view, cx| {
+                            view.fail_snippet_current_command_request(
+                                request_id,
+                                error.public_message().to_owned(),
+                                cx,
+                            );
+                        });
+                    }
+                }
+            });
+        });
+    });
+    root.command_block_runtime.install_task(&ticket, task);
+}
+
+/// 读取命令块输出必须匹配冻结的 session、block 与重连代次；不完整采集仍按 main 预填当前文本。
+///
+/// @author kongweiguang
+fn snippet_command_block_text(
+    snapshot: CommandBlockOutputSnapshot,
+    session_id: &SessionId,
+    block_id: kerminal_application::sessions::CommandBlockId,
+    session_generation: u64,
+    expected_capture_revision: Option<u64>,
+    command: &str,
+) -> Result<String, String> {
+    if &snapshot.session_id != session_id
+        || snapshot.block_id != block_id
+        || block_id.session_generation != session_generation
+    {
+        return Err(crate::locale::text(
+            "命令块输出身份已变化，请重试。",
+            "The command output identity changed. Try again.",
+        )
+        .to_string());
+    }
+    if expected_capture_revision.is_some_and(|expected| snapshot.capture_revision != Some(expected))
+    {
+        return Err(crate::locale::text(
+            "命令输出在读取前已变化，请重新新建片段。",
+            "The command output changed before it could be read. Start the snippet again.",
+        )
+        .to_string());
+    }
+    if snapshot.truncated {
+        return Err(crate::locale::text(
+            "当前命令输出超过可用保留范围，未创建片段。",
+            "The current command output exceeds the retained range. No snippet was created.",
+        )
+        .to_string());
+    }
+    let output = match snapshot.state {
+        CommandBlockOutputState::NotCaptured => {
+            return Err(crate::locale::text(
+                "当前命令输出尚不可读取，未创建片段。",
+                "The current command output is unavailable. No snippet was created.",
+            )
+            .to_string());
+        }
+        CommandBlockOutputState::Evicted => {
+            return Err(crate::locale::text(
+                "当前命令输出已超出保留范围，未创建片段。",
+                "The current command output has expired. No snippet was created.",
+            )
+            .to_string());
+        }
+        CommandBlockOutputState::Capturing
+        | CommandBlockOutputState::Complete { .. }
+        | CommandBlockOutputState::Incomplete(_) => snapshot.text,
+    }
+    .ok_or_else(|| {
+        crate::locale::text(
+            "当前命令输出正文不可用，未创建片段。",
+            "The current command output text is unavailable. No snippet was created.",
+        )
+        .to_string()
+    })?;
+    Ok(main_command_block_text(command, output.as_str()))
+}
+
+/// 采用 main 的命令块正文形状、128k 字符输出尾窗与每行末端空白清理规则。
+///
+/// @author kongweiguang
+fn main_command_block_text(command: &str, output: &str) -> String {
+    const MAIN_OUTPUT_MAX_CHARS: usize = 128_000;
+    let tail_start = output.chars().count().saturating_sub(MAIN_OUTPUT_MAX_CHARS);
+    let output_tail = output
+        .char_indices()
+        .nth(tail_start)
+        .map_or(output, |(index, _)| &output[index..]);
+    let combined = format!("$ {command}\n{output_tail}");
+    let mut cleaned = String::with_capacity(combined.len());
+    for line in combined.split_inclusive('\n') {
+        let (content, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, false), |content| (content, true));
+        cleaned
+            .push_str(content.trim_end_matches(|character: char| {
+                character.is_whitespace() && character != '\t'
+            }));
+        if newline {
+            cleaned.push('\n');
+        }
+    }
+    cleaned.trim_end().to_owned()
 }
 
 /// 只为当前展开的命令块读取有界 transcript，任务同时受 session owner 与 UI 请求代次约束。

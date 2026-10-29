@@ -17,7 +17,9 @@ use kerminal_application::{
         probe::ConnectionProbeService,
     },
     executor::ApplicationTaskExecutor,
-    files::{FileService, editor::FileEditorService},
+    files::{
+        FileService, clipboard_download::FileClipboardDownloadService, editor::FileEditorService,
+    },
     mcp_runtime::McpRuntimeControl,
     operations::OperationsService,
     platform::{
@@ -30,6 +32,8 @@ use kerminal_application::{
     workspace::{WorkspaceService, WorkspaceSessionService},
 };
 use kerminal_domain::files::FileEndpoint;
+
+use crate::features::commands::CommandsConfigurationActions;
 
 /// 可克隆的界面依赖；桌面组合根持有运行时并统一注入。
 #[derive(Clone)]
@@ -46,9 +50,14 @@ pub struct AppServices {
     pub profiles: ProfileService,
     /// Vault key 管理能力只经应用用例暴露，面板不直接访问加密仓储。
     pub vault_keys: Option<VaultKeyManagementService>,
+    /// 屏幕采样仅在用户点击色盘吸管后启动，由平台适配器拥有临时系统资源。
+    pub screen_color_sampler:
+        Option<Arc<dyn kerminal_application::preferences::color_sampler::ScreenColorSampler>>,
     /// 文件与传输服务按组合根结果注入；缺失时不显示不可操作的文件入口。
     pub files: Option<FileService>,
     pub transfers: Option<TransferService>,
+    /// 远端文件系统剪贴板复用同一文件服务、传输队列和桌面系统剪贴板适配器。
+    pub file_clipboard_download: Option<FileClipboardDownloadService>,
     /// 工作区 v3 使用 CAS 仓储保存，损坏/旧版读取结果不自动覆盖。
     pub workspace_sessions: Option<WorkspaceSessionService>,
     /// 终端工具栏与 MCP 共用桌面创建的日志用例，UI 不另建日志仓储。
@@ -65,6 +74,8 @@ pub struct AppServices {
     pub initial_file_endpoint: Option<FileEndpoint>,
     /// 命令历史、片段和工作流页面按组合根创建的 use case 注入。
     pub commands: Option<Arc<CommandsService>>,
+    /// Commands 面板展示组合根投影的实际 snippets 目录与 validator 命令。
+    pub(crate) commands_configuration_actions: CommandsConfigurationActions,
     /// 片段目录入口和 JSON 文件传输都经应用端口处理，视图不持有任意路径 I/O。
     pub configuration_directory: Option<ConfigurationDirectoryService>,
     pub snippet_transfer_files: Option<SnippetTransferFileService>,
@@ -97,6 +108,16 @@ pub struct AppServices {
 }
 
 impl AppServices {
+    /// 注入一次性取色能力，不在 UI 引入平台 API 或持续屏幕采集任务。
+    /// @author kongweiguang
+    pub fn with_screen_color_sampler(
+        mut self,
+        sampler: Arc<dyn kerminal_application::preferences::color_sampler::ScreenColorSampler>,
+    ) -> Self {
+        self.screen_color_sampler = Some(sampler);
+        self
+    }
+
     /// 要求组合根显式提供核心服务，并将可选能力初始化为空，避免界面另建执行器或探测资源。
     ///
     /// @author kongweiguang
@@ -114,8 +135,10 @@ impl AppServices {
             preferences,
             profiles,
             vault_keys: None,
+            screen_color_sampler: None,
             files: None,
             transfers: None,
+            file_clipboard_download: None,
             workspace_sessions: None,
             session_logs: None,
             notifications: None,
@@ -124,6 +147,7 @@ impl AppServices {
             file_editor: None,
             initial_file_endpoint: None,
             commands: None,
+            commands_configuration_actions: CommandsConfigurationActions::default(),
             configuration_directory: None,
             snippet_transfer_files: None,
             configuration_validation: None,
@@ -155,6 +179,34 @@ impl AppServices {
         self.transfers = Some(transfers);
         self.initial_file_endpoint = Some(initial_file_endpoint);
         self
+    }
+
+    /// 安装共享文件下载与系统剪贴板用例；Root 仅负责冻结请求和异步回执。
+    ///
+    /// @author kongweiguang
+    pub fn with_file_clipboard_download(mut self, service: FileClipboardDownloadService) -> Self {
+        self.file_clipboard_download = Some(service);
+        self
+    }
+
+    /// 注入真实 snippets 目录和经过宿主 shell 转义的只读 validator 命令。
+    ///
+    /// @author kongweiguang
+    pub fn with_commands_configuration_actions(
+        mut self,
+        directory: Option<String>,
+        validator_command: Option<String>,
+    ) -> Self {
+        self.commands_configuration_actions =
+            CommandsConfigurationActions::new(directory, validator_command);
+        self
+    }
+
+    /// Root 创建或更新 CommandsView 时读取同一配置动作投影，不在 UI 推导路径或命令。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn commands_configuration_actions(&self) -> CommandsConfigurationActions {
+        self.commands_configuration_actions.clone()
     }
 
     /// 接入唯一工作区 session 仓储；应用重启恢复和后续布局保存共享同一 revision 门禁。

@@ -317,6 +317,7 @@ async fn container_static_tier_does_not_issue_runtime_stats_probe() {
     assert!(identity_script.contains("os="));
     assert!(identity_script.contains("architecture="));
     assert!(identity_script.contains("kernel="));
+    assert!(identity_script.contains("/etc/os-release"));
     assert!(calls.iter().all(|(_, invocation)| {
         invocation.program == "docker" && !invocation.arguments.iter().any(|arg| arg == "stats")
     }));
@@ -399,7 +400,7 @@ async fn container_full_tier_collects_static_slow_and_device_details() {
         (
             "sh",
             Ok(CommandExecutionResult {
-                stdout: b"os=Linux\narchitecture=x86_64\nkernel=6.1.0\n".to_vec(),
+                stdout: b"os=Linux\ndistribution=\"Ubuntu 22.04.5 LTS\"\narchitecture=x86_64\nkernel=6.1.0\n".to_vec(),
                 stderr: Vec::new(),
                 exit_code: Some(0),
                 truncated: false,
@@ -483,7 +484,10 @@ async fn container_full_tier_collects_static_slow_and_device_details() {
         .expect("full container sample should retain supported data");
 
     assert_eq!(snapshot.hostname.as_deref(), Some("demo-container"));
-    assert_eq!(snapshot.operating_system.as_deref(), Some("Linux"));
+    assert_eq!(
+        snapshot.operating_system.as_deref(),
+        Some("Ubuntu 22.04.5 LTS")
+    );
     assert_eq!(snapshot.architecture.as_deref(), Some("x86_64"));
     assert_eq!(snapshot.kernel.as_deref(), Some("6.1.0"));
     assert_eq!(snapshot.disks.len(), 1);

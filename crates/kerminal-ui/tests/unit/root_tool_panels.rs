@@ -9,8 +9,8 @@ use super::{
     center_preserves_terminal_file_context, center_route_uses_tool_rail_entity,
     center_tool_panel_close_is_current, center_tool_panel_escape_target,
     center_tool_panel_focus_on_open, center_tool_placement_focus_is_current,
-    center_tool_placement_focus_is_requested, compact_drawer_close_is_current,
-    compact_drawer_escape_is_current, expanded_center_tool_panel, local_files_endpoint,
+    compact_drawer_close_is_current, compact_drawer_escape_is_current, contains_tool,
+    docked_tool_panel_escape_target, expanded_center_tool_panel, local_files_endpoint,
     ssh_files_endpoint, tool_rail_panel_is_active, tool_rail_panel_is_visible,
     ui_binding_matches_pane,
 };
@@ -18,8 +18,8 @@ use crate::root::{
     keybinding_focus::classify_focus_scope,
     keybindings::KeybindingFocusScope,
     workbench::{
-        ToolRailContextAction, ToolRailPanelSlots, ToolRailPanelState,
-        compact_tool_panel_open_target, compact_tool_rail_panel_should_close,
+        ToolRailPanelSlots, ToolRailPanelState, compact_tool_panel_open_target,
+        compact_tool_rail_panel_should_close,
     },
     workbench_layout::{WorkbenchLayoutInput, resolve_workbench_layout},
 };
@@ -63,43 +63,6 @@ fn center_tool_open_focus_requires_new_unblocked_center_owner() {
     ));
 }
 
-/// 原工具可见且非 Center 的显式变更才登记来源；受理失败、隐藏、未加载和其它停靠动作不产生焦点授权。
-///
-/// @author kongweiguang
-#[test]
-fn center_placement_focus_requires_accepted_visible_non_center_source() {
-    let action = ToolRailContextAction::Dock(ToolRailPanelPlacement::Center);
-    let previous = Some(ToolRailPanelPlacement::Attached);
-    assert!(center_tool_placement_focus_is_requested(
-        action, previous, true, true
-    ));
-    assert!(!center_tool_placement_focus_is_requested(
-        action, previous, true, false
-    ));
-    assert!(!center_tool_placement_focus_is_requested(
-        action, previous, false, true
-    ));
-    assert!(!center_tool_placement_focus_is_requested(
-        action, None, true, true
-    ));
-    assert!(!center_tool_placement_focus_is_requested(
-        action,
-        Some(ToolRailPanelPlacement::Center),
-        true,
-        true,
-    ));
-    for action in [
-        ToolRailContextAction::MoveUp,
-        ToolRailContextAction::Dock(ToolRailPanelPlacement::Attached),
-        ToolRailContextAction::Dock(ToolRailPanelPlacement::Left),
-        ToolRailContextAction::Dock(ToolRailPanelPlacement::Bottom),
-    ] {
-        assert!(!center_tool_placement_focus_is_requested(
-            action, previous, true, true
-        ));
-    }
-}
-
 /// 真实打开状态在配置回执投影时直接搬入 Center，无需 toggle；同一配置不能把关闭的工具凭空打开。
 ///
 /// @author kongweiguang
@@ -119,6 +82,35 @@ fn center_placement_reprojects_open_but_does_not_open_hidden_tool() {
         .insert(tool, ToolRailPanelPlacement::Center);
     assert_eq!(open.project(&settings).panels.center, Some(tool));
     assert_eq!(closed.project(&settings).panels.center, None);
+}
+
+/// 四种 rail 宿主都属于工具面板；片段不能在底部或浮窗中切成中央命令工作区布局。
+///
+/// @author kongweiguang
+#[test]
+fn rail_tool_compact_projection_recognizes_every_panel_slot() {
+    let tool = ToolRailToolId::Snippets;
+    for panels in [
+        ToolRailPanelSlots {
+            attached: Some(tool),
+            ..ToolRailPanelSlots::default()
+        },
+        ToolRailPanelSlots {
+            left: Some(tool),
+            ..ToolRailPanelSlots::default()
+        },
+        ToolRailPanelSlots {
+            bottom: Some(tool),
+            ..ToolRailPanelSlots::default()
+        },
+        ToolRailPanelSlots {
+            center: Some(tool),
+            ..ToolRailPanelSlots::default()
+        },
+    ] {
+        assert!(contains_tool(panels, tool));
+    }
+    assert!(!contains_tool(ToolRailPanelSlots::default(), tool));
 }
 
 /// 迟到成功只能消费原导航与焦点来源；替换 owner、未挂载 center 和上层模态都拒绝，不因 CAS 成功放宽。
@@ -164,6 +156,7 @@ fn compact_tool_shortcut_uses_rendered_active_host_and_preserves_expanded_toggle
             right_dock_collapsed: false,
             host_sidebar_preferred_width: 220.0,
             attached_dock_preferred_width: 420.0,
+            left_tool_panel_preferred_width: 324.0,
             left_tool_open: false,
             attached_tool_open: false,
             bottom_tool_open: false,
@@ -204,11 +197,11 @@ fn compact_tool_shortcut_uses_rendered_active_host_and_preserves_expanded_toggle
     }
 }
 
-/// 832px 无面板时可用展开布局，首次打开后才转为 compact；必须同次补齐宿主，不能等待第二次图标点击。
+/// 900px 断点以下首次打开工具时立即投影到紧凑抽屉，不等待第二次图标点击。
 ///
 /// @author kongweiguang
 #[test]
-fn first_agent_open_reprojects_832px_layout_before_choosing_its_host() {
+fn first_agent_open_in_compact_width_projects_its_requested_owner() {
     let tool = ToolRailToolId::AgentLauncher;
     let tools = [tool];
     let mut settings = ToolRailSettings::default();
@@ -224,6 +217,7 @@ fn first_agent_open_reprojects_832px_layout_before_choosing_its_host() {
         right_dock_collapsed: false,
         host_sidebar_preferred_width: 224.0,
         attached_dock_preferred_width: 324.0,
+        left_tool_panel_preferred_width: 324.0,
         left_tool_open: false,
         attached_tool_open: false,
         bottom_tool_open: false,
@@ -234,8 +228,8 @@ fn first_agent_open_reprojects_832px_layout_before_choosing_its_host() {
         open_tool_order: &[],
     };
     let before = resolve_workbench_layout(&input);
-    assert!(!before.compact_panels);
-    assert!(!before.effective_host_sidebar_collapsed);
+    assert!(before.compact_panels);
+    assert!(before.effective_host_sidebar_collapsed);
 
     state.toggle(&settings, tool);
     let panels = state.project(&settings).panels;
@@ -267,7 +261,7 @@ fn first_agent_open_reprojects_832px_layout_before_choosing_its_host() {
     );
 }
 
-/// 后投影覆盖宽度与底部高度变化；仍能正常展开或已被关闭的工具不能误挂 compact 隐形宿主。
+/// main 仅按窗口宽度进入紧凑抽屉；短窗口的底部面板保持停靠，已关闭工具不能重挂宿主。
 ///
 /// @author kongweiguang
 #[test]
@@ -276,9 +270,9 @@ fn first_tool_open_uses_current_placement_geometry_and_never_reopens_a_closed_ow
     let tools = [tool];
     for (placement, width, height, expected_compact) in [
         (ToolRailPanelPlacement::Attached, 1800.0, 833.0, false),
-        (ToolRailPanelPlacement::Center, 832.0, 833.0, false),
+        (ToolRailPanelPlacement::Center, 832.0, 833.0, true),
         (ToolRailPanelPlacement::Left, 832.0, 833.0, true),
-        (ToolRailPanelPlacement::Bottom, 1800.0, 400.0, true),
+        (ToolRailPanelPlacement::Bottom, 1800.0, 400.0, false),
     ] {
         let mut settings = ToolRailSettings::default();
         settings.panel_placements.insert(tool, placement);
@@ -292,6 +286,7 @@ fn first_tool_open_uses_current_placement_geometry_and_never_reopens_a_closed_ow
             right_dock_collapsed: false,
             host_sidebar_preferred_width: 224.0,
             attached_dock_preferred_width: 324.0,
+            left_tool_panel_preferred_width: 324.0,
             left_tool_open: panels.left.is_some(),
             attached_tool_open: panels.attached.is_some(),
             bottom_tool_open: panels.bottom.is_some(),
@@ -338,6 +333,7 @@ fn compact_first_open_keeps_requested_owner_when_another_tool_was_last_open() {
         right_dock_collapsed: false,
         host_sidebar_preferred_width: 224.0,
         attached_dock_preferred_width: 424.0,
+        left_tool_panel_preferred_width: 324.0,
         left_tool_open: false,
         attached_tool_open: true,
         bottom_tool_open: false,
@@ -351,6 +347,86 @@ fn compact_first_open_keeps_requested_owner_when_another_tool_was_last_open() {
     assert_eq!(
         compact_tool_panel_open_target(tool, panels, plan),
         Some(tool)
+    );
+}
+
+/// Compact 首次打开新工具只保留目标面板；已打开工具切换只改活动顺序，再点当前项只收起抽屉。
+///
+/// @author kongweiguang
+#[test]
+fn compact_new_tool_replaces_other_open_placements_without_changing_activation_semantics() {
+    let previous = ToolRailToolId::AgentLauncher;
+    let other = ToolRailToolId::Logs;
+    let target = ToolRailToolId::Containers;
+    let mut settings = ToolRailSettings::default();
+    settings
+        .panel_placements
+        .insert(previous, ToolRailPanelPlacement::Attached);
+    settings
+        .panel_placements
+        .insert(other, ToolRailPanelPlacement::Center);
+    settings
+        .panel_placements
+        .insert(target, ToolRailPanelPlacement::Left);
+    let mut existing = ToolRailPanelState::default();
+    existing.toggle(&settings, previous);
+    existing.toggle(&settings, other);
+    assert_eq!(existing.project(&settings).panels.attached, Some(previous));
+    assert_eq!(existing.project(&settings).panels.center, Some(other));
+
+    let mut compact = existing.clone();
+    let mut conflict_settings = settings.clone();
+    conflict_settings
+        .panel_placements
+        .insert(other, ToolRailPanelPlacement::Attached);
+    loop {
+        let panels = compact.project(&conflict_settings).panels;
+        let open_tool = [panels.attached, panels.left, panels.bottom, panels.center]
+            .into_iter()
+            .flatten()
+            .next();
+        let Some(open_tool) = open_tool else {
+            break;
+        };
+        compact.toggle(&conflict_settings, open_tool);
+    }
+    compact.toggle(&conflict_settings, target);
+    assert_eq!(
+        compact.project(&conflict_settings).panels,
+        ToolRailPanelSlots {
+            left: Some(target),
+            ..ToolRailPanelSlots::default()
+        }
+    );
+
+    let mut activated_previous = existing.clone();
+    activated_previous.activate(previous);
+    assert_eq!(
+        activated_previous
+            .project(&conflict_settings)
+            .panels
+            .attached,
+        Some(previous)
+    );
+    assert!(!compact_tool_rail_panel_should_close(
+        true,
+        Some(other),
+        previous
+    ));
+    let mut activated_other = existing.clone();
+    activated_other.activate(other);
+    assert_eq!(
+        activated_other.project(&conflict_settings).panels.attached,
+        Some(other)
+    );
+    assert!(compact_tool_rail_panel_should_close(
+        true,
+        Some(other),
+        other
+    ));
+    assert_eq!(
+        activated_other.project(&conflict_settings).panels.attached,
+        Some(other)
     );
 }
 
@@ -368,6 +444,7 @@ fn compact_tool_escape_requires_current_rendered_owner_and_surface() {
         right_dock_collapsed: false,
         host_sidebar_preferred_width: 220.0,
         attached_dock_preferred_width: 420.0,
+        left_tool_panel_preferred_width: 324.0,
         left_tool_open: false,
         attached_tool_open: true,
         bottom_tool_open: false,
@@ -556,6 +633,7 @@ fn responsive_projection_keeps_open_center_owner_until_explicit_close() {
             right_dock_collapsed: false,
             host_sidebar_preferred_width: 220.0,
             attached_dock_preferred_width: 420.0,
+            left_tool_panel_preferred_width: 324.0,
             left_tool_open: false,
             attached_tool_open: false,
             bottom_tool_open: false,
@@ -694,6 +772,101 @@ fn center_tool_escape_revalidates_owner_focus_and_upper_surface() {
     );
 }
 
+/// Docked Escape 只接受实际停靠的当前 owner；compact、折叠右 Dock、菜单/模态和旧回调保持未处理。
+///
+/// @author kongweiguang
+#[test]
+fn docked_escape_revalidates_slot_owner_visibility_and_surface() {
+    let tool = ToolRailToolId::Snippets;
+    let replacement = ToolRailToolId::Logs;
+    for (placement, panels) in [
+        (
+            ToolRailPanelPlacement::Attached,
+            ToolRailPanelSlots {
+                attached: Some(tool),
+                ..ToolRailPanelSlots::default()
+            },
+        ),
+        (
+            ToolRailPanelPlacement::Left,
+            ToolRailPanelSlots {
+                left: Some(tool),
+                ..ToolRailPanelSlots::default()
+            },
+        ),
+        (
+            ToolRailPanelPlacement::Bottom,
+            ToolRailPanelSlots {
+                bottom: Some(tool),
+                ..ToolRailPanelSlots::default()
+            },
+        ),
+    ] {
+        assert_eq!(
+            docked_tool_panel_escape_target("Escape", tool, placement, panels, false, false, false),
+            Some(tool)
+        );
+        assert_eq!(
+            docked_tool_panel_escape_target("enter", tool, placement, panels, false, false, false),
+            None
+        );
+        assert_eq!(
+            docked_tool_panel_escape_target(
+                "Escape",
+                replacement,
+                placement,
+                panels,
+                false,
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            docked_tool_panel_escape_target("Escape", tool, placement, panels, true, false, false),
+            None
+        );
+        assert_eq!(
+            docked_tool_panel_escape_target("Escape", tool, placement, panels, false, false, true),
+            None
+        );
+    }
+
+    let attached_panels = ToolRailPanelSlots {
+        attached: Some(tool),
+        ..ToolRailPanelSlots::default()
+    };
+    assert_eq!(
+        docked_tool_panel_escape_target(
+            "Escape",
+            tool,
+            ToolRailPanelPlacement::Attached,
+            attached_panels,
+            false,
+            true,
+            false,
+        ),
+        None,
+        "a stale right-dock callback cannot expand a panel that is already collapsed"
+    );
+    assert_eq!(
+        docked_tool_panel_escape_target(
+            "Escape",
+            tool,
+            ToolRailPanelPlacement::Center,
+            ToolRailPanelSlots {
+                center: Some(tool),
+                ..ToolRailPanelSlots::default()
+            },
+            false,
+            false,
+            false,
+        ),
+        None,
+        "center keeps its separate focus-owner path"
+    );
+}
+
 /// 使用真实响应式预算验证共享临时句柄不会同时挂到 center 与任一 compact 抽屉，而非靠注释假设互斥。
 ///
 /// @author kongweiguang
@@ -715,6 +888,7 @@ fn center_and_compact_drawers_have_mutually_exclusive_focus_hosts() {
                 right_dock_collapsed: false,
                 host_sidebar_preferred_width: 220.0,
                 attached_dock_preferred_width: 420.0,
+                left_tool_panel_preferred_width: 324.0,
                 left_tool_open: true,
                 attached_tool_open: true,
                 bottom_tool_open: true,

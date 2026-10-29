@@ -991,6 +991,36 @@ impl FileEditorWorkspace {
         }
     }
 
+    /// Reads the loaded document without a typed mutation context so Root can verify the same readonly editor entity.
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub(crate) fn right_rail_acceptance_readonly_file_ready(
+        &self,
+        endpoint: &FileEndpoint,
+        expected_content: &str,
+        cx: &gpui_kit::App,
+    ) -> bool {
+        if self.active_endpoint.as_ref() != Some(endpoint) {
+            return false;
+        }
+        self.tabs
+            .iter()
+            .find(|tab| &tab.endpoint == endpoint)
+            .is_some_and(|tab| {
+                if tab.loading || tab.dirty || !tab.is_readonly() {
+                    return false;
+                }
+                let Some(session) = tab.session.as_ref() else {
+                    return false;
+                };
+                let Some(editor) = tab.editor.as_ref() else {
+                    return false;
+                };
+                session.phase() == EditorPhase::Ready && editor.read(cx).text() == expected_content
+            })
+    }
+
     /// 只在文件身份、活动项、只读、加载或脏状态改变时推送；搜索与光标更新不广播。
     ///
     /// @author kongweiguang

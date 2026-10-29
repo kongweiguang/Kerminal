@@ -20,12 +20,24 @@ fn entry(endpoint: FileEndpoint, modified: Option<&str>) -> FileEntry {
     }
 }
 
-/// 常见右栏宽度应同时保留名称、大小和时间，权限不挤占文件名。
+/// 期望值按 main 的本机时区和当前年格式规则生成，避免测试依赖宿主固定时区。
+///
+/// @author kongweiguang
+fn expected_local_modified(timestamp: DateTime<Utc>) -> String {
+    let local = timestamp.with_timezone(&Local);
+    if local.year() == Local::now().year() {
+        local.format("%m-%d %H:%M").to_string()
+    } else {
+        local.format("%Y-%m-%d").to_string()
+    }
+}
+
+/// main 默认时间列常驻，400px 起增加大小列，540px 前不显示权限列。
 ///
 /// @author kongweiguang
 #[test]
 fn dock_width_keeps_size_and_modified_columns() {
-    for width in [480., 500., 520.] {
+    for width in [400., 480., 500., 520., 539.] {
         let columns = FileTableColumns::for_width(px(width));
         assert!(columns.size);
         assert!(columns.modified);
@@ -33,43 +45,43 @@ fn dock_width_keeps_size_and_modified_columns() {
     }
 }
 
-/// 没有 bounds 和更窄的停靠位先保障名称，320px 起才补大小，不让固定元数据挤走名称。
+/// 400px 以下只保留名称与时间列，防止大小和权限挤占可读名称空间。
 ///
 /// @author kongweiguang
 #[test]
 fn narrow_width_reduces_metadata_before_name_space() {
-    for width in [0., 240., 319.] {
+    for width in [0., 240., 319., 399.] {
         let columns = FileTableColumns::for_width(px(width));
         assert!(!columns.size);
-        assert!(!columns.modified);
+        assert!(columns.modified);
         assert!(!columns.permissions);
     }
-    let columns = FileTableColumns::for_width(px(320.));
+    let columns = FileTableColumns::for_width(px(400.));
     assert!(columns.size);
-    assert!(!columns.modified);
+    assert!(columns.modified);
     assert!(!columns.permissions);
 }
 
-/// 600px 内恢复权限列且在 680px 右栏上限可达；再窄时仍按档位优先保留名称。
+/// 540px 起显示权限列；断点以下继续保留名称、大小和时间列。
 ///
 /// @author kongweiguang
 #[test]
 fn right_dock_width_keeps_permission_column_reachable() {
-    for width in [600., 640., 670., 680.] {
+    for width in [540., 600., 640., 670., 680.] {
         let columns = FileTableColumns::for_width(px(width));
         assert!(columns.size && columns.modified && columns.permissions);
     }
-    for width in [500., 599.] {
+    for width in [400., 500., 539.] {
         let columns = FileTableColumns::for_width(px(width));
         assert!(columns.size && columns.modified && !columns.permissions);
     }
 }
 
-/// 同一时刻的 Local/SFTP 纳秒与容器整秒必须显示相同 UTC 时间，不按字符串长度猜单位。
+/// 同一时刻的 Local/SFTP 纳秒与容器整秒必须显示相同本地时间，不按字符串长度猜单位。
 ///
 /// @author kongweiguang
 #[test]
-fn endpoint_timestamp_units_project_the_same_utc_minute() {
+fn endpoint_timestamp_units_project_the_same_local_time() {
     let local = entry(
         FileEndpoint::Local {
             path: PathBuf::from("sample.txt"),
@@ -90,8 +102,18 @@ fn endpoint_timestamp_units_project_the_same_utc_minute() {
         Some("1700000000"),
     );
     for value in [local, remote, container] {
-        assert_eq!(format_file_modified(&value), "11-14 22:13");
-        assert_eq!(format_file_modified_tooltip(&value), "2023-11-14 22:13 UTC");
+        let timestamp = file_modified_timestamp(&value).unwrap();
+        assert_eq!(
+            format_file_modified(&value, true),
+            expected_local_modified(timestamp)
+        );
+        assert_eq!(
+            format_file_modified_tooltip(&value, true),
+            timestamp
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        );
     }
 }
 
@@ -107,14 +129,24 @@ fn invalid_or_out_of_range_metadata_never_fabricates_a_date() {
             },
             modified,
         );
-        assert_eq!(format_file_modified(&value), "—");
+        assert_eq!(format_file_modified(&value, true), "—");
     }
-    for (raw, expected) in [
-        ("0", "01-01 00:00"),
-        ("951782400000000001", "02-29 00:00"),
-        ("253402300800000000000", "—"),
-        ("170141183460469231731687303715884105727", "—"),
-        ("170141183460469231731687303715884105728", "—"),
+    for raw in ["0", "951782400000000001"] {
+        let value = entry(
+            FileEndpoint::Local {
+                path: PathBuf::from("sample.txt"),
+            },
+            Some(raw),
+        );
+        assert_eq!(
+            format_file_modified(&value, true),
+            expected_local_modified(file_modified_timestamp(&value).unwrap())
+        );
+    }
+    for raw in [
+        "253402300800000000000",
+        "170141183460469231731687303715884105727",
+        "170141183460469231731687303715884105728",
     ] {
         let value = entry(
             FileEndpoint::Local {
@@ -122,7 +154,7 @@ fn invalid_or_out_of_range_metadata_never_fabricates_a_date() {
             },
             Some(raw),
         );
-        assert_eq!(format_file_modified(&value), expected);
+        assert_eq!(format_file_modified(&value, true), "—");
     }
 }
 

@@ -2,7 +2,10 @@
 //!
 //! @author kongweiguang
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use gpui_kit::{
     ClickEvent, Context, EventEmitter, IntoElement, Render, Window, component::button::Button, div,
@@ -99,6 +102,32 @@ pub struct CommandBlockProjection {
     pub command: CommandBlockText,
     pub state: CommandBlockState,
     pub content: CommandBlockContent,
+}
+
+/// 最新可安全预填的已提交命令块身份；Root 必须按其 block ID 读取 transcript。
+///
+/// @author kongweiguang
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct LatestSubmittedCommandBlock {
+    pub(crate) id: CommandBlockId,
+    pub(crate) session_generation: u64,
+    pub(crate) capture_revision: Option<u64>,
+    pub(crate) command: String,
+}
+
+impl fmt::Debug for LatestSubmittedCommandBlock {
+    /// 诊断只保留命令块身份和 revision，不把终端命令正文写进格式化输出。
+    ///
+    /// @author kongweiguang
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LatestSubmittedCommandBlock")
+            .field("id", &self.id)
+            .field("session_generation", &self.session_generation)
+            .field("capture_revision", &self.capture_revision)
+            .field("command", &"<redacted>")
+            .finish()
+    }
 }
 
 /// 用户在某个卡片上明确发起的操作；Root 会再次验证来源和资源代次。
@@ -360,6 +389,34 @@ impl CommandBlockTimeline {
     /// 只暴露当前有界快照的稳定身份，让 Root 回收被驱逐块的异步请求。
     pub(crate) fn block_ids(&self) -> Vec<CommandBlockId> {
         self.blocks.iter().map(|block| block.id).collect()
+    }
+
+    /// 与 main 一样从最近已提交的非空块取值；最新块正文未知时不回退旧命令。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn latest_submitted_command_block(&self) -> Option<LatestSubmittedCommandBlock> {
+        let block = self
+            .blocks
+            .iter()
+            .rev()
+            .find(|block| match &block.command {
+                CommandBlockText::Known(command) => !command.trim().is_empty(),
+                CommandBlockText::Unknown(_) => true,
+            })?;
+        let (_, session_generation) = self.binding()?;
+        if block.id.session_generation != session_generation {
+            return None;
+        }
+        let CommandBlockText::Known(command) = &block.command else {
+            return None;
+        };
+
+        Some(LatestSubmittedCommandBlock {
+            id: block.id,
+            session_generation,
+            capture_revision: self.export_revision(block.id),
+            command: command.clone(),
+        })
     }
 
     /// 用安全状态覆盖旧正文，避免内容查询失败时继续暴露过期输出。

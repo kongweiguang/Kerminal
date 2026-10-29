@@ -19,7 +19,7 @@ use crate::{locale, theme::ThemeTokens};
 
 use super::super::FilesPane;
 
-/// 展示权限输入、当前真实 mode 和明确的不可用原因，不为缺失 metadata 猜默认值；紧凑提示用 Note 节点保留完整辅助说明。
+/// 宽工作台保留行内权限编辑；紧凑栏的权限动作使用 Root 弹框，避免窄面板挤占预览空间。
 ///
 /// @author kongweiguang
 pub(super) fn render_permissions(
@@ -27,6 +27,9 @@ pub(super) fn render_permissions(
     theme: ThemeTokens,
     cx: &mut Context<FilesPane>,
 ) -> AnyElement {
+    if pane.compact_layout {
+        return div().h(px(0.)).into_any_element();
+    }
     let selected = pane.panels[pane.active_side].selected.as_ref();
     let Some(selected) = selected else {
         return div().h(px(0.)).into_any_element();

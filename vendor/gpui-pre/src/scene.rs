@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 // todo("windows"): remove
 #![cfg_attr(windows, allow(dead_code))]
 
@@ -50,10 +52,13 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    #[cfg(target_os = "windows")]
+    pub backdrop_filters: Vec<BackdropFilter>,
 }
 
 #[expect(missing_docs)]
 impl Scene {
+    /// Clear the current frame while retaining each primitive vector's allocation.
     pub fn clear(&mut self) {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
@@ -66,6 +71,8 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        #[cfg(target_os = "windows")]
+        self.backdrop_filters.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -84,6 +91,7 @@ impl Scene {
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
+    /// Assign scene order while keeping backdrop sampling and later layer content on opposite sides of the filter.
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let clipped_bounds = primitive
@@ -91,6 +99,12 @@ impl Scene {
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
+            return;
+        }
+
+        #[cfg(target_os = "windows")]
+        if let Primitive::BackdropFilter(filter) = &primitive {
+            self.insert_backdrop_filter(filter.clone());
             return;
         }
 
@@ -133,11 +147,41 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            #[cfg(target_os = "windows")]
+            Primitive::BackdropFilter(_) => {
+                unreachable!("backdrop filters are inserted through the order barrier")
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Order filters after their Gaussian sample support, then advance active layers so later content paints above.
+    #[cfg(target_os = "windows")]
+    fn insert_backdrop_filter(&mut self, mut filter: BackdropFilter) {
+        let support = if filter.blur_radius.is_finite() {
+            (filter.blur_radius.max(0.) * 3.).ceil()
+        } else {
+            0.
+        };
+        let mut sample_bounds = filter.bounds.clone();
+        sample_bounds.origin.x.0 -= support;
+        sample_bounds.origin.y.0 -= support;
+        sample_bounds.size.width.0 += support * 2.;
+        sample_bounds.size.height.0 += support * 2.;
+
+        filter.order = self.primitive_bounds.insert(sample_bounds.clone());
+        self.backdrop_filters.push(filter.clone());
+        self.paint_operations
+            .push(PaintOperation::Primitive(Primitive::BackdropFilter(filter)));
+
+        let after_filter_order = self.primitive_bounds.insert(sample_bounds);
+        for layer_order in &mut self.layer_stack {
+            *layer_order = after_filter_order;
+        }
+    }
+
+    /// Replay through normal insertion so filters establish the same draw-order barrier in the destination scene.
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
@@ -148,6 +192,7 @@ impl Scene {
         }
     }
 
+    /// Sort typed primitive storage before creating ordered renderer batches.
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
@@ -160,6 +205,8 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        #[cfg(target_os = "windows")]
+        self.backdrop_filters.sort_by_key(|filter| filter.order);
     }
 
     #[cfg_attr(
@@ -169,6 +216,7 @@ impl Scene {
         ),
         allow(dead_code)
     )]
+    /// Merge typed storage by draw order while keeping Windows backdrop work isolated.
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
         BatchIterator {
             shadows_start: 0,
@@ -187,6 +235,10 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            #[cfg(target_os = "windows")]
+            backdrop_filters_start: 0,
+            #[cfg(target_os = "windows")]
+            backdrop_filters_iter: self.backdrop_filters.iter().peekable(),
         }
     }
 }
@@ -209,6 +261,8 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    #[cfg(target_os = "windows")]
+    BackdropFilter,
 }
 
 pub(crate) enum PaintOperation {
@@ -228,10 +282,12 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    #[cfg(target_os = "windows")]
+    BackdropFilter(BackdropFilter),
 }
 
-#[expect(missing_docs)]
 impl Primitive {
+    /// Resolve bounds uniformly so scene clipping and ordering include every platform primitive.
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
@@ -242,9 +298,12 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            #[cfg(target_os = "windows")]
+            Primitive::BackdropFilter(filter) => &filter.bounds,
         }
     }
 
+    /// Resolve the clip mask uniformly for primitives that can be culled before batching.
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
@@ -255,6 +314,8 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            #[cfg(target_os = "windows")]
+            Primitive::BackdropFilter(filter) => &filter.content_mask,
         }
     }
 }
@@ -283,11 +344,16 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    #[cfg(target_os = "windows")]
+    backdrop_filters_start: usize,
+    #[cfg(target_os = "windows")]
+    backdrop_filters_iter: Peekable<slice::Iter<'a, BackdropFilter>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
     type Item = PrimitiveBatch;
 
+    /// Return the next ordered run without merging backdrop filters into ordinary draws.
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
             (
@@ -315,6 +381,11 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            #[cfg(target_os = "windows")]
+            (
+                self.backdrop_filters_iter.peek().map(|filter| filter.order),
+                PrimitiveKind::BackdropFilter,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -461,6 +532,21 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            #[cfg(target_os = "windows")]
+            PrimitiveKind::BackdropFilter => {
+                let filters_start = self.backdrop_filters_start;
+                let mut filters_end = filters_start + 1;
+                self.backdrop_filters_iter.next();
+                while self
+                    .backdrop_filters_iter
+                    .next_if(|filter| (filter.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    filters_end += 1;
+                }
+                self.backdrop_filters_start = filters_end;
+                Some(PrimitiveBatch::BackdropFilters(filters_start..filters_end))
+            }
         }
     }
 }
@@ -493,10 +579,12 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    #[cfg(target_os = "windows")]
+    BackdropFilters(Range<usize>),
 }
 
 impl PrimitiveBatch {
-    #[expect(missing_docs)]
+    /// Name a batch for renderer diagnostics, including the Windows filter path.
     pub fn label(&self) -> String {
         match self {
             Self::Shadows(range) => format!("shadows ({})", range.len()),
@@ -525,6 +613,8 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            #[cfg(target_os = "windows")]
+            Self::BackdropFilters(range) => format!("backdrop filters ({})", range.len()),
         }
     }
 }
@@ -776,6 +866,32 @@ pub struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+/// A Windows-only ordered operation that filters the current scene behind its bounds.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug, Default)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct BackdropFilter {
+    pub order: DrawOrder,
+    pub mode: u32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Gaussian standard deviation in device pixels; the renderer derives weights and support from this value.
+    pub blur_radius: f32,
+    pub saturation: f32,
+    pub opacity: f32,
+    pub pad: u32,
+}
+
+#[cfg(target_os = "windows")]
+impl From<BackdropFilter> for Primitive {
+    /// Preserve filters as distinct scene operations so the renderer snapshots at their order.
+    fn from(filter: BackdropFilter) -> Self {
+        Primitive::BackdropFilter(filter)
     }
 }
 

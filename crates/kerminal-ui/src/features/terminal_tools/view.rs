@@ -29,9 +29,10 @@ use super::selection::{
 };
 use super::{
     BroadcastEvent, BroadcastTargetPicker, BroadcastTargetProjection, CommandBlockAction,
-    CommandBlockProjection, CommandBlockTimeline, SafeTerminalLink, SelectionControls,
-    TerminalLogControls, TerminalLogEvent, TerminalSearchEvent, TerminalSearchToolbar,
-    TerminalSelectionEvent, selection_from_viewport_drag, validate_terminal_link,
+    CommandBlockProjection, CommandBlockTimeline, LatestSubmittedCommandBlock, SafeTerminalLink,
+    SelectionControls, TerminalLogControls, TerminalLogEvent, TerminalSearchEvent,
+    TerminalSearchToolbar, TerminalSelectionEvent, selection_from_viewport_drag,
+    validate_terminal_link,
 };
 
 /// 终端 UI 统一发布用户意图，由 Root 验证会话并调用 Application 用例。
@@ -752,6 +753,24 @@ impl TerminalToolsView {
             .read(cx)
             .binding()
             .map(|(session_id, generation)| (session_id.clone(), generation))
+    }
+
+    /// 只向 Root 暴露当前已确认命令的稳定 block 身份，输出仍须经 Application transcript 查询。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn latest_submitted_command_block(
+        &self,
+        expected_session_id: &SessionId,
+        cx: &App,
+    ) -> Option<LatestSubmittedCommandBlock> {
+        if self.session_id.as_ref() != Some(expected_session_id) {
+            return None;
+        }
+        let timeline = self.command_blocks.read(cx);
+        if timeline.binding()?.0 != expected_session_id {
+            return None;
+        }
+        timeline.latest_submitted_command_block()
     }
 
     /// 设置命令块时间线的策略可见性；折叠只隐藏投影，不清空当前会话数据。

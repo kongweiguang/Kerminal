@@ -2,22 +2,25 @@
 //!
 //! @author kongweiguang
 
-use gpui_kit::{Context, Window};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::{AnyWindowHandle, AppContext as _, Context, Focusable as _, Window};
 use kerminal_application::{
     AppError, ApplicationTaskExecutor,
     agents::{
         AgentHistoryMode, AgentHistoryRequest, AgentResumeRecoveryStatus, AgentSessionView,
-        CreateAgentSessionFromHistoryRequest, CreateAgentSessionRequest,
-        RenameAgentSessionTitleRequest,
+        CreateAgentSessionRequest, RenameAgentSessionTitleRequest, find_reusable_agent_session,
     },
 };
 use kerminal_domain::{
-    agents::{AgentLauncherKey, AgentSessionScope, AgentTargetBinding},
+    agents::{AgentLaunchPermissionMode, AgentLauncherKey, AgentSessionScope, AgentTargetBinding},
     identity::{AgentSessionId, SessionId},
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{AgentLifecycleOperation, AgentPanelEvent, AgentRenameTarget, AgentsPanel};
+use super::{
+    AgentArchiveConfirmationOwner, AgentLifecycleOperation, AgentPanelEvent, AgentRenameTarget,
+    AgentsPanel,
+};
 
 /// 新建模式只撤销右栏的选中投影；Root 据此隐藏原画布，不关闭 Agent 的终端 owner。
 ///
@@ -30,14 +33,6 @@ pub(super) fn new_chat_selection_event() -> AgentPanelEvent {
 }
 
 impl AgentsPanel {
-    /// 标题不是新建前置项，只在用户主动展开命名设置时展示输入框。
-    ///
-    /// @author kongweiguang
-    pub(super) fn toggle_title_editor(&mut self, cx: &mut Context<Self>) {
-        self.title_editor_visible = !self.title_editor_visible;
-        cx.notify();
-    }
-
     /// 刷新会话列表；只在同一 Agent 被真实投影为 Exited 时收敛可解释的操作拒绝。
     ///
     /// @author kongweiguang
@@ -282,6 +277,57 @@ impl AgentsPanel {
         }
     }
 
+    /// 仅明确继续运行会话时按归属持久化当前候选；Tab/候选变化本身不重绑。
+    /// 待核对会话只切回原提示，其余状态尝试受控恢复。
+    ///
+    /// @author kongweiguang
+    pub(super) fn continue_agent_from_history(
+        &mut self,
+        id: AgentSessionId,
+        expected_title: String,
+        mode: AgentHistoryMode,
+        scope: AgentSessionScope,
+        candidate: Option<AgentTargetBinding>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.ensure_history_action(&id, &expected_title, mode, &scope, candidate.as_ref(), cx) {
+            return;
+        }
+        let Some(view) = self
+            .sessions
+            .iter()
+            .find(|view| view.session.agent_session_id == id)
+        else {
+            return;
+        };
+        let running = super::render::has_running_agent_terminal(view);
+        let can_reconcile = super::render::agent_can_reconcile(view);
+        let preferred_target = running.then(|| {
+            preferred_target_binding_for_explicit_continue(view, &self.scope, candidate.as_ref())
+        });
+        if running {
+            if let Some(Some(binding)) = preferred_target {
+                self.persist_preferred_target(
+                    id,
+                    binding,
+                    true,
+                    ("正在更新首选终端…", "Updating the preferred terminal…"),
+                    (
+                        "已切回运行中的 Agent 会话。",
+                        "Returned to the running Agent chat.",
+                    ),
+                    cx,
+                );
+            } else {
+                self.select_agent(id, cx);
+            }
+        } else if can_reconcile {
+            self.select_agent(id, cx);
+        } else {
+            self.resume_agent(id, cx);
+        }
+    }
+
     /// 用同一条目与标题基线打开改名草稿；保留原有历史资格校验，失败时不替换草稿。
     ///
     /// @author kongweiguang
@@ -301,6 +347,8 @@ impl AgentsPanel {
         self.rename_title.update(cx, |input, cx| {
             input.set_value(expected_title.clone(), window, cx)
         });
+        let focus_handle = self.rename_title.read(cx).focus_handle(cx);
+        window.focus(&focus_handle, cx);
         self.rename_target = Some((id, expected_title));
         cx.notify();
     }
@@ -318,6 +366,17 @@ impl AgentsPanel {
         let title = self
             .rename_title
             .update(cx, |input, _| input.value().to_string());
+        if !super::can_save_agent_session_title(&title) {
+            self.status = Some(
+                crate::locale::text(
+                    "标题不能为空，最多 120 个字符。",
+                    "Enter a title with no more than 120 characters.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         let request = RenameAgentSessionTitleRequest {
             agent_session_id: id.clone(),
             expected_title: expected_title.clone(),
@@ -361,48 +420,6 @@ impl AgentsPanel {
     pub(super) fn cancel_agent_rename(&mut self, cx: &mut Context<Self>) {
         self.rename_target = None;
         cx.notify();
-    }
-
-    /// 使用历史启动定义创建全新身份；选择切换时作废旧上下文预览，目标仍取操作时捕获的候选。
-    ///
-    /// @author kongweiguang
-    pub(super) fn create_from_history(
-        &mut self,
-        id: AgentSessionId,
-        expected_title: String,
-        mode: AgentHistoryMode,
-        scope: AgentSessionScope,
-        candidate: Option<AgentTargetBinding>,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.ensure_history_action(&id, &expected_title, mode, &scope, candidate.as_ref(), cx) {
-            return;
-        }
-        let request = CreateAgentSessionFromHistoryRequest {
-            source_agent_session_id: id,
-            title: None,
-            scope,
-            target: candidate.unwrap_or_else(|| AgentTargetBinding::unbound(0)),
-            initial_palette: self.terminal_palette,
-        };
-        let selection_guard = (
-            self.selected_agent.clone(),
-            self.scope.clone(),
-            self.candidate.as_ref().map(|value| value.binding.clone()),
-        );
-        let agents = self.agents.clone();
-        let executor = self.executor.clone();
-        self.start_creation_operation(
-            ("正在使用启动配置新建…", "Creating from launch settings…"),
-            (
-                "已按该启动配置创建独立会话。",
-                "A separate chat was created from this launch configuration.",
-            ),
-            Some(selection_guard),
-            cx,
-            move |cancel| async move { agents.create_from_history(request, cancel).await },
-            executor,
-        );
     }
 
     /// 保留历史、Launcher 与标题草稿，只将活动面板切回现有新建入口，不触碰 CLI 生命周期。
@@ -478,12 +495,22 @@ impl AgentsPanel {
             cx.notify();
             return;
         };
-        if !self.launcher_catalog.as_ref().is_some_and(|catalog| {
-            catalog
-                .options
-                .iter()
-                .any(|option| option.key == launcher_key)
-        }) {
+        let Some(catalog) = self.launcher_catalog.as_ref() else {
+            self.status = Some(
+                crate::locale::text(
+                    "Agent 选项尚未读取成功，请刷新后重试。",
+                    "Agent options are unavailable. Refresh and try again.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(launcher) = catalog
+            .options
+            .iter()
+            .find(|option| option.key == launcher_key)
+        else {
             self.status = Some(
                 crate::locale::text(
                     "所选 Agent 已不在当前配置中；请选择有效选项或刷新。",
@@ -493,16 +520,57 @@ impl AgentsPanel {
             );
             cx.notify();
             return;
+        };
+        if self.loading || !self.sessions_verified {
+            self.status = Some(
+                crate::locale::text(
+                    "Agent 历史尚未核验，请刷新后再进入。",
+                    "Agent history is not verified yet. Refresh before opening a session.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
         }
-        let entered_title = self
-            .title
-            .update(cx, |input, _| input.value().trim().to_owned());
+        let permission_mode = AgentLaunchPermissionMode::default_for(launcher.provider);
+        let reusable = find_reusable_agent_session(
+            &self.sessions,
+            &self.scope,
+            &launcher_key,
+            permission_mode,
+            |launch| catalog.matches_legacy_custom_launch(&launcher_key, launch),
+        )
+        .map(|view| {
+            (
+                view.session.agent_session_id.clone(),
+                super::render::has_running_agent_terminal(view),
+                super::render::agent_can_reconcile(view),
+                super::render::agent_can_resume(view),
+            )
+        });
+        if let Some((id, running, reconcile, resumable)) = reusable {
+            if running || reconcile {
+                self.select_agent(id, cx);
+            } else if resumable {
+                self.resume_agent(id, cx);
+            } else {
+                self.launch_new_session(launcher_key, cx);
+            }
+            return;
+        }
+        self.launch_new_session(launcher_key, cx);
+    }
+
+    /// 仅在历史核验后未找到可复用会话时创建新 PTY，并保留选择基线门禁。
+    ///
+    /// @author kongweiguang
+    fn launch_new_session(&mut self, launcher_key: AgentLauncherKey, cx: &mut Context<Self>) {
         let target = self.candidate.as_ref().map_or_else(
             || AgentTargetBinding::unbound(0),
             |candidate| candidate.binding.clone(),
         );
         let request = CreateAgentSessionRequest {
-            title: (!entered_title.is_empty()).then_some(entered_title),
+            title: None,
             scope: self.scope.clone(),
             target,
             launcher_key: Some(launcher_key),
@@ -687,8 +755,107 @@ impl AgentsPanel {
     ///
     /// @author kongweiguang
     pub(super) fn archive_agent(&mut self, id: AgentSessionId, cx: &mut Context<Self>) {
+        self.start_archive_operation(id, None, ("正在归档 Agent…", "Archiving Agent…"), cx);
+    }
+
+    /// 用当前 Kit 确认框捕获的 owner 提交归档；共享 busy 门禁阻止重复请求。
+    ///
+    /// @author kongweiguang
+    pub(super) fn confirm_archive_confirmation(
+        &mut self,
+        owner: &AgentArchiveConfirmationOwner,
+        window: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !archive_confirmation_can_submit(
+            self.archive_confirmation_owner.as_ref(),
+            owner,
+            self.busy,
+        ) {
+            return false;
+        }
+        if !self.ensure_history_action(
+            &owner.id,
+            &owner.expected_title,
+            owner.mode,
+            &owner.scope,
+            owner.candidate.as_ref(),
+            cx,
+        ) {
+            self.archive_confirmation_error = self.status.clone();
+            return false;
+        }
+        self.archive_confirmation_error = None;
+        let started = self.start_archive_operation(
+            owner.id.clone(),
+            Some((window, owner.clone())),
+            ("正在删除会话记录…", "Deleting chat record…"),
+            cx,
+        );
+        if !started
+            && self
+                .archive_confirmation_owner
+                .as_ref()
+                .is_some_and(|current| current.matches(owner))
+        {
+            self.archive_confirmation_error = self.status.clone();
+            cx.notify();
+        }
+        started
+    }
+
+    /// 将当前 owner、busy 与错误投影给弹框的独立 Render 子实体。
+    ///
+    /// @author kongweiguang
+    pub(super) fn archive_confirmation_feedback(
+        &self,
+        owner: &AgentArchiveConfirmationOwner,
+    ) -> (bool, bool, Option<String>) {
+        let owner_is_current = self
+            .archive_confirmation_owner
+            .as_ref()
+            .is_some_and(|current| current.matches(owner));
+        let error = owner_is_current
+            .then(|| self.archive_confirmation_error.clone())
+            .flatten();
+        (self.busy, owner_is_current, error)
+    }
+
+    /// 取消只移除仍匹配的确认 owner，不触碰所选会话或终端归属。
+    ///
+    /// @author kongweiguang
+    pub(super) fn cancel_archive_confirmation(
+        &mut self,
+        owner: &AgentArchiveConfirmationOwner,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.busy {
-            return;
+            return false;
+        }
+        if self
+            .archive_confirmation_owner
+            .as_ref()
+            .is_some_and(|current| current.matches(owner))
+        {
+            self.archive_confirmation_owner = None;
+            self.archive_confirmation_error = None;
+            cx.notify();
+        }
+        true
+    }
+
+    /// 同时服务无确认的菜单归档与确认框归档，两类入口只在成功收据处理上有差异。
+    ///
+    /// @author kongweiguang
+    fn start_archive_operation(
+        &mut self,
+        id: AgentSessionId,
+        confirmation: Option<(AnyWindowHandle, AgentArchiveConfirmationOwner)>,
+        pending: (&'static str, &'static str),
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.busy {
+            return false;
         }
         let Some(view) = self
             .sessions
@@ -700,21 +867,21 @@ impl AgentsPanel {
                 "This Agent session no longer exists. Refresh and try again.",
                 cx,
             );
-            return;
+            return false;
         };
         if view.session.status == kerminal_domain::agents::AgentSessionStatus::Archived {
             self.show_menu_notice("该会话已经归档。", "This chat is already archived.", cx);
-            return;
+            return false;
         }
         let selected_before = self.selected_agent.clone();
         let agents = self.agents.clone();
         let executor = self.executor.clone();
-        self.start_lifecycle_operation(
+        self.start_lifecycle_operation_with_confirmation(
             AgentLifecycleOperation {
                 target_id: id.clone(),
                 selected_before,
                 terminal_feedback_reset: super::AgentTerminalFeedbackReset::Never,
-                pending: ("正在归档 Agent…", "Archiving Agent…"),
+                pending,
                 success: (
                     "Agent 已归档，历史与上下文已保留。",
                     "Agent archived; its history and context were preserved.",
@@ -724,10 +891,12 @@ impl AgentsPanel {
             cx,
             move |cancel| async move { agents.archive(id, cancel).await },
             executor,
+            confirmation,
         );
+        true
     }
 
-    /// 只有显式点击绑定时才写入新 generation；普通活动 Tab 更新不经过该调用。
+    /// 只有用户显式绑定或继续运行会话时才写入新 generation；普通 Tab/目标变化不经过该调用。
     ///
     /// @author kongweiguang
     pub(super) fn bind_candidate(&mut self, cx: &mut Context<Self>) {
@@ -763,13 +932,39 @@ impl AgentsPanel {
             .saturating_add(1);
         let mut binding = candidate.binding;
         binding.generation = generation;
+        self.persist_preferred_target(
+            id,
+            binding,
+            false,
+            ("正在显式绑定首选终端…", "Binding the preferred terminal…"),
+            (
+                "Agent 首选终端已显式更新。",
+                "Agent preferred terminal updated.",
+            ),
+            cx,
+        );
+    }
+
+    /// 共用持久化绑定事务，并仅在原选择仍未变化时应用继续操作的选择回执。
+    ///
+    /// @author kongweiguang
+    fn persist_preferred_target(
+        &mut self,
+        id: AgentSessionId,
+        binding: AgentTargetBinding,
+        select_after: bool,
+        pending: (&'static str, &'static str),
+        success: (&'static str, &'static str),
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy {
+            return;
+        }
+        let selected_before = self.selected_agent.clone();
         let agents = self.agents.clone();
         let executor = self.executor.clone();
         self.busy = true;
-        self.status = Some(
-            crate::locale::text("正在显式绑定首选终端…", "Binding the preferred terminal…")
-                .to_string(),
-        );
+        self.status = Some(crate::locale::text(pending.0, pending.1).to_string());
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |cancel| async move {
@@ -780,15 +975,22 @@ impl AgentsPanel {
                 panel.busy = false;
                 match result {
                     Ok(view) => {
+                        let persisted_id = view.session.agent_session_id.clone();
                         panel.replace_session_view(view);
-                        panel.status = Some(
-                            crate::locale::text(
-                                "Agent 首选终端已显式更新。",
-                                "Agent preferred terminal updated.",
-                            )
-                            .to_string(),
-                        );
                         cx.emit(AgentPanelEvent::TargetBindingChanged);
+                        if select_after && panel.selected_agent == selected_before {
+                            panel.select_agent(persisted_id, cx);
+                            panel.status =
+                                Some(crate::locale::text(success.0, success.1).to_string());
+                        } else {
+                            panel.status = Some(
+                                crate::locale::text(
+                                    "Agent 首选终端已显式更新。",
+                                    "Agent preferred terminal updated.",
+                                )
+                                .to_string(),
+                            );
+                        }
                     }
                     Err(error) => {
                         panel.show_operation_error("目标绑定失败", "Could not bind target", error)
@@ -1051,6 +1253,23 @@ impl AgentsPanel {
         Build: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<AgentSessionView, AppError>> + Send + 'static,
     {
+        self.start_lifecycle_operation_with_confirmation(operation, cx, build, executor, None);
+    }
+
+    /// 异步生命周期收据只关闭仍属于本次 owner 的确认框，避免旧结果关掉后来打开的窗口。
+    ///
+    /// @author kongweiguang
+    fn start_lifecycle_operation_with_confirmation<Build, Fut>(
+        &mut self,
+        operation: AgentLifecycleOperation,
+        cx: &mut Context<Self>,
+        build: Build,
+        executor: ApplicationTaskExecutor,
+        confirmation: Option<(AnyWindowHandle, AgentArchiveConfirmationOwner)>,
+    ) where
+        Build: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<AgentSessionView, AppError>> + Send + 'static,
+    {
         let AgentLifecycleOperation {
             target_id,
             selected_before,
@@ -1063,6 +1282,7 @@ impl AgentsPanel {
         self.operation_cancellation = cancellation.clone();
         self.busy = true;
         self.status = Some(crate::locale::text(pending.0, pending.1).to_string());
+        let confirmation_window = confirmation.as_ref().map(|(window, _)| *window);
         cx.spawn(async move |this, cx| {
             let result = match cancellation.clone() {
                 Some(cancellation) => executor.run_cancellable(cancellation, build).await,
@@ -1071,9 +1291,41 @@ impl AgentsPanel {
             let cancel_requested = cancellation
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled);
-            let _ = this.update(cx, |panel, cx| {
+            let mut close_confirmation = false;
+            let update_result = this.update(cx, |panel, cx| {
                 panel.operation_cancellation = None;
                 panel.busy = false;
+                if let Some((_, submitted_owner)) = confirmation.as_ref() {
+                    let archive_receipt = result.as_ref().ok().map(|view| {
+                        (
+                            &view.session.agent_session_id,
+                            view.session.status
+                                == kerminal_domain::agents::AgentSessionStatus::Archived,
+                        )
+                    });
+                    close_confirmation = archive_confirmation_should_close(
+                        panel.archive_confirmation_owner.as_ref(),
+                        submitted_owner,
+                        archive_receipt,
+                    );
+                    if close_confirmation {
+                        panel.archive_confirmation_owner = None;
+                        panel.archive_confirmation_error = None;
+                    } else if panel
+                        .archive_confirmation_owner
+                        .as_ref()
+                        .is_some_and(|current| current.matches(submitted_owner))
+                    {
+                        panel.archive_confirmation_error = Some(match &result {
+                            Err(error) => localized_error(error),
+                            Ok(_) => crate::locale::text(
+                                "会话状态已变化，未确认归档完成。请刷新列表后再操作。",
+                                "The chat state changed and archiving was not confirmed. Refresh the list before continuing.",
+                            )
+                            .to_string(),
+                        });
+                    }
+                }
                 match result {
                     Ok(view) => {
                         if should_clear_terminal_feedback_after_lifecycle_success(
@@ -1105,6 +1357,12 @@ impl AgentsPanel {
                             crate::locale::text(
                                 "Agent 已归档，历史与上下文已保留。",
                                 "Agent archived; its history and context were preserved.",
+                            )
+                            .to_string()
+                        } else if confirmation.is_some() {
+                            crate::locale::text(
+                                "归档未得到确认，请刷新会话列表后重试。",
+                                "Archiving was not confirmed. Refresh the chat list before retrying.",
                             )
                             .to_string()
                         } else if let Some(recovery) = recovery {
@@ -1164,6 +1422,10 @@ impl AgentsPanel {
                 }
                 cx.notify();
             });
+            if update_result.is_ok() && close_confirmation
+                && let Some(window) = confirmation_window {
+                let _ = cx.update_window(window, |_, window, app| window.close_dialog(app));
+            }
         })
         .detach();
         cx.notify();
@@ -1198,6 +1460,48 @@ impl AgentsPanel {
             };
         self.status = Some(message);
     }
+}
+
+/// 仅在显式继续、会话归属允许且候选仍属于当前 Tab 时生成新的首选终端代次。
+///
+/// @author kongweiguang
+pub(super) fn preferred_target_binding_for_explicit_continue(
+    view: &AgentSessionView,
+    current_scope: &AgentSessionScope,
+    candidate: Option<&AgentTargetBinding>,
+) -> Option<AgentTargetBinding> {
+    let scope_allows_refresh = match view.session.scope.as_ref() {
+        Some(AgentSessionScope::Global) => true,
+        Some(session_scope) => session_scope == current_scope,
+        None => {
+            let stored_tab_id = view
+                .session
+                .target
+                .as_ref()
+                .and_then(|target| target.tab_id.as_ref());
+            match (current_scope, stored_tab_id) {
+                (AgentSessionScope::Global, None) => true,
+                (AgentSessionScope::Tab { tab_id }, Some(stored_tab_id)) => tab_id == stored_tab_id,
+                _ => false,
+            }
+        }
+    };
+    if !scope_allows_refresh {
+        return None;
+    }
+    let mut binding = candidate?.clone();
+    if let AgentSessionScope::Tab { tab_id } = current_scope
+        && binding.tab_id.as_ref() != Some(tab_id)
+    {
+        return None;
+    }
+    binding.generation = view
+        .session
+        .target
+        .as_ref()
+        .map_or(0, |current| current.generation)
+        .saturating_add(1);
+    Some(binding)
 }
 
 /// 成功读回必须同时匹配反馈 Agent 与当前选择，且看到 typed Exited；未知/运行错误绝不清除。
@@ -1308,3 +1612,30 @@ pub(super) fn should_offer_launcher_setup_help(
             | kerminal_application::PublicErrorCode::ConfigurationCorrupt
     )
 }
+
+/// 只有当前确认 owner 完全匹配且没有其它 Agent 操作时才允许提交。
+///
+/// @author kongweiguang
+fn archive_confirmation_can_submit(
+    current: Option<&AgentArchiveConfirmationOwner>,
+    submitted: &AgentArchiveConfirmationOwner,
+    busy: bool,
+) -> bool {
+    !busy && current.is_some_and(|current| current.matches(submitted))
+}
+
+/// 归档确认只接受同一会话的 Archived 回执；失败、未归档和迟到代次都保留弹框。
+///
+/// @author kongweiguang
+fn archive_confirmation_should_close(
+    current: Option<&AgentArchiveConfirmationOwner>,
+    submitted: &AgentArchiveConfirmationOwner,
+    receipt: Option<(&AgentSessionId, bool)>,
+) -> bool {
+    current.is_some_and(|current| current.matches(submitted))
+        && receipt.is_some_and(|(receipt_id, archived)| receipt_id == &submitted.id && archived)
+}
+
+#[cfg(test)]
+#[path = "../../../tests/unit/agent_archive_confirmation.rs"]
+mod archive_confirmation_tests;

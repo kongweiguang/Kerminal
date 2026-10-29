@@ -506,6 +506,153 @@ async fn saved_forward_lifecycle_keeps_stable_identity_without_auto_start() {
     assert!(restarted.list_managed().await.unwrap().is_empty());
 }
 
+/// 停止定义对缺失 owner 幂等，对运行实例严格绑定 ID 与配置，并允许停止后更新和删除。
+/// @author kongweiguang
+#[tokio::test]
+async fn stop_definition_instance_checks_exact_owner_and_allows_stopped_mutations() {
+    let definitions = Arc::new(DefinitionsFixture::default());
+    let (failure, _receiver) = watch::channel(None);
+    let handle = Arc::new(HandleFixture {
+        bind: endpoint(127, 0, 0, 1, 55002),
+        failure,
+        close_count: AtomicUsize::new(0),
+        fail_first_close: AtomicBool::new(false),
+        fail_all_closes: AtomicBool::new(false),
+        received_deadline: Mutex::new(None),
+    });
+    let service = PortForwardService::new(Arc::new(RuntimeFixture {
+        handle: handle.clone(),
+    }))
+    .with_definition_repository(definitions);
+    let saved = service
+        .create_definition(config())
+        .await
+        .expect("fixture definition is saved");
+
+    service
+        .stop_definition_instance(&saved)
+        .await
+        .expect("a stopped definition has no runtime owner to release");
+    assert_eq!(handle.close_count.load(Ordering::SeqCst), 0);
+
+    service
+        .start_definition(&saved.id, CancellationToken::new())
+        .await
+        .expect("saved definition starts");
+    let unrelated_owner = PortForwardDefinition {
+        id: uuid::Uuid::new_v4().to_string(),
+        config: saved.config.clone(),
+    };
+    service
+        .stop_definition_instance(&unrelated_owner)
+        .await
+        .expect("a missing owner must not retarget the active definition");
+    assert_eq!(handle.close_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        service.get(&saved.id).await.unwrap().forward.state,
+        ForwardState::Active
+    );
+
+    let mut stale_configuration = saved.clone();
+    stale_configuration.config.name.push_str("-stale");
+    let stale_result = service
+        .stop_definition_instance(&stale_configuration)
+        .await
+        .expect_err("a stale config must not release the runtime owner");
+    assert_eq!(stale_result.public_code(), PublicErrorCode::Conflict);
+    assert_eq!(handle.close_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        service.get(&saved.id).await.unwrap().forward.state,
+        ForwardState::Active
+    );
+
+    service
+        .stop_definition_instance(&saved)
+        .await
+        .expect("the matching runtime owner stops");
+    assert_eq!(handle.close_count.load(Ordering::SeqCst), 1);
+    assert!(service.get(&saved.id).await.is_none());
+    let stopped = service.list_managed().await.unwrap();
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].forward.state, ForwardState::Stopped);
+    assert!(stopped[0].actual_bind.is_none());
+
+    let mut updated_config = saved.config.clone();
+    updated_config.name = "updated-forward".to_owned();
+    let updated = service
+        .update_definition(saved, updated_config.clone())
+        .await
+        .expect("a stopped definition can be updated against its CAS baseline");
+    assert_eq!(updated.config, updated_config);
+    service
+        .delete_definition(updated)
+        .await
+        .expect("the stopped updated definition can be deleted");
+    assert!(service.list_managed().await.unwrap().is_empty());
+}
+
+/// 关闭失败必须保留运行 owner 阻止删除；显式重试成功后才允许完成删除。
+/// @author kongweiguang
+#[tokio::test]
+async fn stop_definition_instance_retains_owner_after_close_failure_for_retry() {
+    let definitions = Arc::new(DefinitionsFixture::default());
+    let (failure, _receiver) = watch::channel(None);
+    let handle = Arc::new(HandleFixture {
+        bind: endpoint(127, 0, 0, 1, 55003),
+        failure,
+        close_count: AtomicUsize::new(0),
+        fail_first_close: AtomicBool::new(true),
+        fail_all_closes: AtomicBool::new(false),
+        received_deadline: Mutex::new(None),
+    });
+    let service = PortForwardService::new(Arc::new(RuntimeFixture {
+        handle: handle.clone(),
+    }))
+    .with_definition_repository(definitions);
+    let saved = service
+        .create_definition(config())
+        .await
+        .expect("fixture definition is saved");
+    service
+        .start_definition(&saved.id, CancellationToken::new())
+        .await
+        .expect("saved definition starts");
+
+    let close_error = service
+        .stop_definition_instance(&saved)
+        .await
+        .expect_err("failed runtime cleanup must be visible");
+    assert_eq!(close_error.public_code(), PublicErrorCode::Infrastructure);
+    assert_eq!(handle.close_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        service.get(&saved.id).await.unwrap().forward.state,
+        ForwardState::Failed
+    );
+    assert_eq!(
+        service
+            .delete_definition(saved.clone())
+            .await
+            .expect_err("an owner with uncertain cleanup must block definition deletion")
+            .public_code(),
+        PublicErrorCode::Conflict
+    );
+
+    service
+        .stop_definition_instance(&saved)
+        .await
+        .expect("explicit retry releases the retained runtime owner");
+    assert_eq!(handle.close_count.load(Ordering::SeqCst), 2);
+    let stopped = service.list_managed().await.unwrap();
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].forward.state, ForwardState::Stopped);
+    assert!(stopped[0].actual_bind.is_none());
+    service
+        .delete_definition(saved)
+        .await
+        .expect("deletion succeeds only after the runtime owner is gone");
+    assert!(service.list_managed().await.unwrap().is_empty());
+}
+
 /// 提交已落盘但回执丢失时，原 ID 只读核对能找到原事务，不创建第二条定义或启动隧道。
 #[tokio::test]
 async fn unknown_definition_save_can_be_reviewed_by_original_id_without_replay() {

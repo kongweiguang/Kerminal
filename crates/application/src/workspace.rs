@@ -7,9 +7,10 @@ mod session_document;
 pub use session_document::{
     WorkspaceContainerRuntime, WorkspaceFileAccess, WorkspaceFileSource,
     WorkspaceLocalMachineScope, WorkspaceMachineStatus, WorkspacePaneMode,
-    WorkspaceSessionDocument, WorkspaceSessionPane, WorkspaceSessionSnapshot, WorkspaceSessionTab,
-    WorkspaceTabGroup, WorkspaceTabGroupColor, WorkspaceTabGroupId, WorkspaceTargetRef,
-    WorkspaceTargetUnavailableReason, WorkspaceTmuxBinding,
+    WorkspacePinnedContainer, WorkspaceSessionDocument, WorkspaceSessionPane,
+    WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTabGroup, WorkspaceTabGroupColor,
+    WorkspaceTabGroupId, WorkspaceTargetRef, WorkspaceTargetUnavailableReason,
+    WorkspaceTmuxBinding,
 };
 
 use std::{fmt, sync::Arc};

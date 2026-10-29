@@ -17,10 +17,20 @@ mod terminal_input_handler;
 mod terminal_interaction;
 mod terminal_metrics;
 mod theme;
+mod ui_backdrop;
 mod ui_button;
+mod ui_popup;
 pub mod window_state;
 
+#[cfg(feature = "right-rail-acceptance")]
+pub use features::files::{RightRailSftpTransferItem, RightRailSftpTransferTarget};
 pub use features::{editor::FileEditorWorkspace, preferences::PreferencesPanel};
+#[cfg(feature = "right-rail-acceptance")]
+pub use root::RightRailAcceptanceShellSnapshot;
+#[cfg(feature = "right-rail-acceptance")]
+pub use root::SettingsAcceptanceState;
+#[cfg(feature = "right-rail-acceptance")]
+pub use root::{AgentAcceptanceSetup, ComposeAcceptanceOpenRequest};
 pub use root::{AppServices, QuitIntent, RootHostLifecycle, RootView, RootViewEvent};
 
 /// 先注册 Kit 基础按键，再限定选择器和聚焦终端的覆盖，保留其它控件的正常焦点导航。

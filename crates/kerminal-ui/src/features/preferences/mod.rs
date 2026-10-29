@@ -2,15 +2,27 @@
 //!
 //! @author kongweiguang
 
+mod color_picker;
 mod draft;
 mod panel;
 mod render;
+mod render_command_suggestions;
+mod render_connectivity;
+mod render_desktop_about;
+mod render_keyword_highlights;
 mod render_profiles;
 mod render_settings;
+mod render_sftp;
 mod render_sync;
-mod render_terminal_behavior;
-mod render_vault;
+mod render_terminal;
 mod validation;
+
+#[cfg(feature = "right-rail-acceptance")]
+pub(crate) mod settings_acceptance;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/preferences_settings_ui.rs"]
+mod settings_ui_tests;
 
 pub use draft::{CloseRequest, ConfigDraft, DraftSnapshot, DraftStatus, DraftTransitionError};
 pub use kerminal_application::preferences::{

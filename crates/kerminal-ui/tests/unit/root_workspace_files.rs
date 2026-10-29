@@ -200,6 +200,7 @@ fn localized_local_tab_title_keeps_shell_pane_title() {
 /// 创建最小 typed workspace 快照，避免测试依赖 JSON codec 或磁盘 fixture。
 fn snapshot_with_tabs(tabs: Vec<WorkspaceSessionTab>) -> WorkspaceSessionSnapshot {
     WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: tabs.first().map(|tab| tab.id().clone()),
         focused_pane_id: None,
         selected_machine_id: None,
@@ -222,6 +223,50 @@ fn local_workspace_file(id: TabId, access: WorkspaceFileAccess) -> WorkspaceSess
         access,
         source: WorkspaceFileSource::Local,
     }
+}
+
+/// YAML 新入口必须继承工作区只读策略，重复登记不能替换既有资源描述。
+///
+/// @author kongweiguang
+#[test]
+fn new_compose_yaml_tab_retains_readonly_policy_and_rejects_duplicate_registration() {
+    let mut runtime = WorkspaceFileRuntime::from_snapshot(&snapshot_with_tabs(Vec::new()));
+    let id = TabId::new();
+    let mut tab = local_workspace_file(id.clone(), WorkspaceFileAccess::Readonly);
+    if let WorkspaceSessionTab::WorkspaceFile { source, .. } = &mut tab {
+        *source = WorkspaceFileSource::ComposeYaml;
+    }
+    assert!(runtime.register_pending_compose_yaml_tab(tab.clone()));
+    assert!(!runtime.register_pending_compose_yaml_tab(tab));
+    assert_eq!(
+        runtime.restore_state(&id),
+        Some(&WorkspaceFileRestoreState::Pending)
+    );
+    assert!(
+        runtime.workspace_file_requires_readonly(&FileEndpoint::Local {
+            path: "C:/workspace/notes.txt".into(),
+        })
+    );
+}
+
+/// Compose 专用入口不能被可写文件或一般文件别名绕过，不在快照安装前丢失资源归属。
+///
+/// @author kongweiguang
+#[test]
+fn compose_yaml_registration_rejects_editable_or_non_compose_descriptors() {
+    let mut runtime = WorkspaceFileRuntime::from_snapshot(&snapshot_with_tabs(Vec::new()));
+    let mut editable = local_workspace_file(TabId::new(), WorkspaceFileAccess::Editable);
+    if let WorkspaceSessionTab::WorkspaceFile { source, .. } = &mut editable {
+        *source = WorkspaceFileSource::ComposeYaml;
+    }
+    assert!(!runtime.register_pending_compose_yaml_tab(editable));
+    assert!(
+        !runtime.register_pending_compose_yaml_tab(local_workspace_file(
+            TabId::new(),
+            WorkspaceFileAccess::Readonly,
+        ))
+    );
+    assert!(runtime.pending_tab_ids().is_empty());
 }
 
 /// 映射规则保留 SSH 主机身份和绝对 POSIX 路径，不从标签 machineId 猜测目标。

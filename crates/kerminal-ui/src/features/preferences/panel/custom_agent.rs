@@ -13,14 +13,57 @@ use crate::features::preferences::{DraftStatus, validate_settings};
 
 use super::{PreferencesEvent, PreferencesPanel, keyboard_platform, localized_error};
 
-/// 管理器只留存自己发起的完整提交快照；读回从不借此重置共享偏好草稿。
+/// 管理器版本链只由自身确认的 CAS/读回推进；恢复读回不能擅自重置共享偏好草稿。
 #[derive(Default)]
 pub(super) struct AgentLauncherManagerState {
+    confirmed_baseline: Option<VersionedSettings>,
     pending_save: Option<AgentLauncherPendingSave>,
     recovery: Option<AgentLauncherRecovery>,
     readback_generation: u64,
     readback_active: bool,
     readback_context: Option<AgentLauncherReadBackContext>,
+}
+
+impl AgentLauncherManagerState {
+    /// Root 保持打开时的原始基线；仅管理器自己确认的写入或精确读回能推进当前版本。
+    ///
+    /// @author kongweiguang
+    fn baseline_for<'a>(&'a self, opening: &'a VersionedSettings) -> &'a VersionedSettings {
+        self.confirmed_baseline.as_ref().unwrap_or(opening)
+    }
+
+    /// 记录与管理器已确认结果同源的完整 Settings/revision，供下一次 CAS 延续版本链。
+    ///
+    /// @author kongweiguang
+    fn confirm_baseline(&mut self, versioned: VersionedSettings) {
+        self.confirmed_baseline = Some(versioned);
+    }
+
+    /// 只有提交值与 CAS 后已安装的干净快照一致时，才用其真实 revision 推进管理器版本链。
+    ///
+    /// @author kongweiguang
+    fn confirm_save_baseline(
+        &mut self,
+        pending: &AgentLauncherPendingSave,
+        submitted: &AgentLauncherSettings,
+        installed: Option<VersionedSettings>,
+    ) {
+        if pending.submitted.agent_launcher != *submitted {
+            return;
+        }
+        if let Some(installed) =
+            installed.filter(|installed| installed.settings.agent_launcher == *submitted)
+        {
+            self.confirm_baseline(installed);
+        }
+    }
+
+    /// 管理器关闭后丢弃局部版本链，下次打开必须重新捕获 Root 提供的当前基线。
+    ///
+    /// @author kongweiguang
+    fn release_confirmed_baseline(&mut self) {
+        self.confirmed_baseline = None;
+    }
 }
 
 /// 一次正在写入的管理器请求，完整快照用于识别是否混入了其它偏好改动。
@@ -84,7 +127,7 @@ impl PreferencesPanel {
             })
     }
 
-    /// 首次提交必须匹配打开版本；冲突保留独立草稿并经既有读回门禁恢复，最终写入仍由唯一 CAS owner 执行。
+    /// 首次提交匹配 Root 打开版本，后续只沿管理器确认的版本继续；外部 revision 仍进入读回门禁。
     ///
     /// @author kongweiguang
     pub(crate) fn apply_agent_launcher_change(
@@ -118,7 +161,11 @@ impl PreferencesPanel {
                     .as_ref()
                     .and_then(|draft| draft.revision().clone()),
             };
-            if let Some(conflict) = stale_agent_launcher_change(baseline, &current, &settings) {
+            if let Some(conflict) = stale_agent_launcher_change(
+                self.agent_launcher_manager.baseline_for(baseline),
+                &current,
+                &settings,
+            ) {
                 self.agent_launcher_manager.recovery = Some(conflict);
                 cx.emit(PreferencesEvent::AgentLauncherSaveFailed {
                     code: PublicErrorCode::Conflict,
@@ -166,7 +213,7 @@ impl PreferencesPanel {
         self.submit_agent_launcher_change(original, settings, cx)
     }
 
-    /// 即使提交被同步拒绝，读回仍沿用管理器打开版本；共享草稿另行保留以识别并行编辑。
+    /// 未读回确认前沿用打开或最近一次自有确认版本；共享草稿另行保留以识别并行编辑。
     ///
     /// @author kongweiguang
     pub(crate) fn read_back_agent_launcher_for_manager(
@@ -199,7 +246,7 @@ impl PreferencesPanel {
             status: draft.status(),
             dirty: draft.is_dirty(),
             recovery: agent_launcher_readback_recovery(
-                baseline,
+                self.agent_launcher_manager.baseline_for(baseline),
                 self.agent_launcher_manager.recovery.clone(),
             ),
         };
@@ -230,7 +277,7 @@ impl PreferencesPanel {
         Ok(())
     }
 
-    /// 关闭管理器后，只在偏好页已回到可写 clean Ready 时释放旧门禁；未知且未核对的提交继续锁住重试。
+    /// 关闭时释放局部确认版本；未知提交仍保留原恢复门禁，未完成请求期间不提前清理。
     ///
     /// @author kongweiguang
     pub(crate) fn release_agent_launcher_manager_after_close(&mut self) {
@@ -239,6 +286,7 @@ impl PreferencesPanel {
         {
             return;
         }
+        self.agent_launcher_manager.release_confirmed_baseline();
         if self.ensure_agent_launcher_manager_ready().is_ok() {
             self.agent_launcher_manager.recovery = None;
         }
@@ -347,7 +395,7 @@ impl PreferencesPanel {
         }
     }
 
-    /// 仅 CAS 成功确认后解除管理器恢复门禁，避免普通 SettingsSaved 被当成专属保存收据。
+    /// 仅专属 CAS 回执与已安装的 clean Settings/revision 一致时推进版本链，普通 SettingsSaved 不算收据。
     ///
     /// @author kongweiguang
     pub(super) fn finish_agent_launcher_save_succeeded(
@@ -355,13 +403,27 @@ impl PreferencesPanel {
         settings: AgentLauncherSettings,
         cx: &mut Context<Self>,
     ) {
-        if self.agent_launcher_manager.pending_save.take().is_some() {
+        if let Some(pending) = self.agent_launcher_manager.pending_save.take() {
+            let installed = self
+                .settings
+                .as_ref()
+                .filter(|draft| {
+                    draft.status() == DraftStatus::Ready
+                        && !draft.is_dirty()
+                        && draft.value().agent_launcher == settings
+                })
+                .map(|draft| VersionedSettings {
+                    settings: draft.value().clone(),
+                    revision: draft.revision().clone(),
+                });
+            self.agent_launcher_manager
+                .confirm_save_baseline(&pending, &settings, installed);
             self.agent_launcher_manager.recovery = None;
             cx.emit(PreferencesEvent::AgentLauncherSaved(settings));
         }
     }
 
-    /// 真实读回允许两种安全推进：管理器独占失败草稿，或未变化的 clean Ready 基线；并行草稿始终保留。
+    /// 真实读回只在精确确认管理器提交时推进版本链；安装共享草稿仍要求无并行编辑。
     ///
     /// @author kongweiguang
     fn finish_agent_launcher_readback(
@@ -428,6 +490,10 @@ impl PreferencesPanel {
                 let launcher_settings = versioned.settings.agent_launcher.clone();
                 let confirmed_submission =
                     agent_launcher_readback_confirms_write(&recovery, &launcher_settings);
+                if confirmed_submission && no_pending_write {
+                    self.agent_launcher_manager
+                        .confirm_baseline(versioned.clone());
+                }
                 let retry_allowed = !confirmed_submission
                     && agent_launcher_readback_preserves_baseline(&recovery, &launcher_settings)
                     && may_install_readback

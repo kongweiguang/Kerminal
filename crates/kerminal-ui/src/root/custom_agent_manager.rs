@@ -15,7 +15,8 @@ use gpui_kit::{
 };
 
 impl RootView {
-    /// 提交和读回共用打开时固定的 Settings 版本；立即撤销终端焦点意图，防止迟到回调抢焦点。
+    /// 提交和读回沿用管理器的版本链；只有已确认的自身写入推进版本，外部更新不能偷换基线。
+    /// 打开时撤销终端焦点意图，防止迟到回调抢焦点。
     ///
     /// @author kongweiguang
     pub(super) fn open_custom_agent_manager(
@@ -53,7 +54,8 @@ impl RootView {
                 &manager,
                 window,
                 move |root, _, event, window, cx| match event {
-                    CustomAgentManagerEvent::Save { settings, .. } => {
+                    CustomAgentManagerEvent::Save { settings, .. }
+                    | CustomAgentManagerEvent::SaveKeepOpen { settings, .. } => {
                         let result = root.preferences_panel.update(cx, |panel, cx| {
                             panel.apply_agent_launcher_change(&baseline, settings.clone(), cx)
                         });
@@ -100,22 +102,40 @@ impl RootView {
         }
     }
 
-    /// 仅确认回执或相同快照读回可关闭；失败与未知结果保留同一 Entity 和输入内容。
+    /// 确认保存刷新目录，删除后的确认保留管理器；失败与未知结果保留同一草稿等待核对。
     pub(super) fn apply_custom_agent_manager_outcome(
         &mut self,
         outcome: CustomAgentManagerWriteOutcome,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let confirmed = matches!(
+            &outcome,
+            CustomAgentManagerWriteOutcome::Confirmed(_)
+                | CustomAgentManagerWriteOutcome::ConfirmedKeepOpen(_)
+                | CustomAgentManagerWriteOutcome::ReadBack { .. }
+        );
         let close = self.custom_agent_manager.clone().is_some_and(|manager| {
-            manager.update(cx, |manager, cx| manager.apply_write_outcome(outcome, cx))
+            manager.update(cx, |manager, cx| {
+                let outcome = match outcome {
+                    CustomAgentManagerWriteOutcome::Confirmed(settings)
+                        if manager.pending_write_keeps_open() =>
+                    {
+                        CustomAgentManagerWriteOutcome::ConfirmedKeepOpen(settings)
+                    }
+                    other => other,
+                };
+                manager.apply_write_outcome(outcome, cx)
+            })
         });
+        if (confirmed || close)
+            && let Some(panel) = self.agents_panel.clone()
+        {
+            panel.update(cx, |panel, cx| {
+                panel.refresh_launcher_catalog_after_custom_settings_saved(cx)
+            });
+        }
         if close {
-            if let Some(panel) = self.agents_panel.clone() {
-                panel.update(cx, |panel, cx| {
-                    panel.refresh_launcher_catalog_after_custom_settings_saved(cx)
-                });
-            }
             self.close_custom_agent_manager(window, cx);
         }
     }
@@ -144,7 +164,7 @@ impl RootView {
     }
 }
 
-/// 采用旧版 672px 宽、最多 544px 高的编辑器尺寸；小视口受安全边距约束，焦点仍由全窗陷阱管理。
+/// 采用 main 的 672px 宽、544px 高和弹框外观；小视口受安全边距约束，焦点仍由全窗陷阱管理。
 ///
 /// @author kongweiguang
 pub(super) fn render_overlay(
@@ -162,7 +182,7 @@ pub(super) fn render_overlay(
     let manager = root.custom_agent_manager.clone()?;
     let focus = manager.read(cx).modal_focus_handle();
     let dialog_height = (window.viewport_size().height.as_f32() - 32.).clamp(0., 544.);
-    Some(
+    Some(crate::ui_backdrop::modal_backdrop(
         div()
             .id("custom-agent-manager-overlay")
             .absolute()
@@ -172,9 +192,9 @@ pub(super) fn render_overlay(
             .flex()
             .items_center()
             .justify_center()
-            .bg(theme.background.alpha(0.62))
+            .bg(theme.dialog_scrim)
             .on_click(cx.listener(|root, _, _, cx| root.request_close_custom_agent_manager(cx)))
-            .child(
+            .child(crate::ui_backdrop::floating_surface(
                 div()
                     .id("custom-agent-manager-surface")
                     .w_full()
@@ -187,14 +207,17 @@ pub(super) fn render_overlay(
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .rounded_lg()
+                    .rounded(theme.radius_dialog)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.panel)
+                    .bg(theme.floating_surface)
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .child(manager)
                     .focus_trap("custom-agent-manager-focus-trap", &focus),
-            )
+                theme,
+                theme.radius_dialog,
+            ))
             .into_any_element(),
-    )
+        theme,
+    ))
 }

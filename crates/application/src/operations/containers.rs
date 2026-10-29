@@ -44,6 +44,54 @@ pub struct ContainerRuntimeService {
 }
 
 impl ContainerRuntimeService {
+    /// 日志 PTY 在容器宿主运行，避免把 docker logs 误发进容器内部的 shell。
+    /// @author kongweiguang
+    pub async fn open_logs(
+        &self,
+        target: ContainerTarget,
+        owner: SessionOwner,
+        size: TerminalSize,
+        cancellation: CancellationToken,
+    ) -> AppResult<SessionInfo> {
+        validate_container_id(&target.container_id)?;
+        let program = runtime_program(target.runtime).to_owned();
+        let args = vec![
+            "logs".to_owned(),
+            "--tail".to_owned(),
+            "200".to_owned(),
+            "-f".to_owned(),
+            target.container_id,
+        ];
+        let target = if let Some(host_id) = target.host_id {
+            SessionTarget::Ssh(kerminal_domain::sessions::SshSessionTarget {
+                host_id,
+                working_directory: None,
+                command: Some(kerminal_domain::sessions::SshInitialCommand::Process {
+                    program,
+                    args,
+                }),
+            })
+        } else {
+            SessionTarget::Local(kerminal_domain::sessions::LocalSessionTarget {
+                program: program.into(),
+                args: args.into_iter().map(Into::into).collect(),
+                working_directory: None,
+                environment: Default::default(),
+            })
+        };
+        self.sessions
+            .create_cancellable(
+                CreateSessionRequest {
+                    target,
+                    owner,
+                    size,
+                    initial_palette: None,
+                },
+                cancellation,
+            )
+            .await
+    }
+
     /// 注入同一结构化命令端口和唯一会话 registry，避免容器终端另起读写循环。
     pub fn new(
         commands: Arc<dyn OperationsCommandExecutor>,
@@ -683,7 +731,7 @@ fn parse_podman_names(value: &Value) -> AppResult<String> {
     Ok(names.join(", "))
 }
 
-/// Podman 的 Labels 是 map；空 map 或 nil map 对应空标签，其余类型必须匹配。
+/// Podman 列表与两种 runtime 的 inspect 都以 map 返回标签；空 map 或 nil map 对应空标签。
 ///
 /// @author kongweiguang
 fn parse_podman_labels(value: &Value) -> AppResult<Vec<(String, String)>> {
@@ -798,6 +846,7 @@ fn parse_podman_port(value: &Value) -> AppResult<String> {
 }
 
 /// 从完整 inspect 结构映射 UI 所需字段，保留 command 数组而不合并成 shell 文本。
+/// 标签与其它详情共用本次 inspect 回执，避免从可能已过期的列表摘要拼接不同代次的数据。
 fn parse_container_inspect(value: &Value, target: ContainerTarget) -> AppResult<ContainerInspect> {
     let config = value.get("Config").unwrap_or(&Value::Null);
     let state = value.get("State").unwrap_or(&Value::Null);
@@ -834,6 +883,7 @@ fn parse_container_inspect(value: &Value, target: ContainerTarget) -> AppResult<
             .and_then(Value::as_object)
             .map(|networks| networks.keys().cloned().collect())
             .unwrap_or_default(),
+        labels: parse_podman_labels(config.get("Labels").unwrap_or(&Value::Null))?,
     })
 }
 
@@ -861,6 +911,7 @@ fn json_array_strings(value: &Value, key: &str) -> Vec<String> {
 }
 
 /// 从 Compose 标准标签构造管理投影，不依赖 Compose 进程的本地缓存。
+/// 标准 project.config_files 优先，旧标签只作为兼容回退，避免真实项目丢失 YAML 管理入口。
 fn compose_metadata(labels: &[(String, String)]) -> Option<ComposeMetadata> {
     let get = |key: &str| {
         labels
@@ -873,7 +924,8 @@ fn compose_metadata(labels: &[(String, String)]) -> Option<ComposeMetadata> {
     if project.is_none() && service.is_none() {
         return None;
     }
-    let config_files = get("com.docker.compose.config_files")
+    let config_files = get("com.docker.compose.project.config_files")
+        .or_else(|| get("com.docker.compose.config_files"))
         .map(|value| value.split(',').map(str::to_owned).collect::<Vec<String>>())
         .unwrap_or_default();
     let config_paths = config_files.clone();

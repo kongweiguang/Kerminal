@@ -2,14 +2,18 @@
 //!
 //! @author kongweiguang
 
-use std::{collections::VecDeque, future::Future};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+};
 
 use kerminal_application::ApplicationTaskExecutor;
 use kerminal_domain::{
     identity::HostId,
     operations::{
         ComposeProjectTarget, ContainerAction, ContainerRuntime, ContainerStatus, ContainerSummary,
-        ContainerTarget, ServerInfoProbeStatus, ServerInfoSnapshot, ServerInfoTarget, TmuxSession,
+        ContainerTarget, NetworkCounterSnapshot, NetworkRateSnapshot, ServerInfoProbeStatus,
+        ServerInfoSnapshot, ServerInfoTarget, TmuxSession,
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -42,20 +46,133 @@ pub(super) enum ServerInfoPanel {
     Processes,
 }
 
+/// 资源页和概览历史共享接口范围，默认聚焦主链路并保留显式扩展筛选。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::features::operations) enum ServerNetworkFilter {
+    #[default]
+    Primary,
+    All,
+    Virtual,
+}
+
+/// 网络接口按名称归类，未知命名保持为物理接口以免隐藏定制网卡。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ServerNetworkRole {
+    Bridge,
+    Loopback,
+    Physical,
+    Tunnel,
+    Virtual,
+}
+
+/// 将 Linux 常见桥接、回环、隧道和虚拟接口前缀映射到展示角色。
+///
+/// @author kongweiguang
+pub(super) fn network_interface_role(name: &str) -> ServerNetworkRole {
+    let name = name.to_ascii_lowercase();
+    if name == "lo" {
+        ServerNetworkRole::Loopback
+    } else if ["br-", "bridge", "docker", "virbr"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        ServerNetworkRole::Bridge
+    } else if ["tun", "tap", "tailscale", "wg", "zt"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        ServerNetworkRole::Tunnel
+    } else if ["veth", "cni", "flannel", "kube-ipvs", "dummy"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        ServerNetworkRole::Virtual
+    } else {
+        ServerNetworkRole::Physical
+    }
+}
+
+/// 先按 main 的速率或计数排名全部接口，再筛选角色；无物理接口时取排名最高的非回环接口。
+///
+/// @author kongweiguang
+pub(super) fn filtered_network_rates<'a>(
+    rates: &'a [NetworkRateSnapshot],
+    counters: &[NetworkCounterSnapshot],
+    filter: ServerNetworkFilter,
+) -> Vec<&'a NetworkRateSnapshot> {
+    let has_rate_sample = rates
+        .iter()
+        .any(|rate| rate.rx_bytes_per_second.is_some() || rate.tx_bytes_per_second.is_some());
+    let counter_totals = counters
+        .iter()
+        .map(|counter| {
+            (
+                counter.name.as_str(),
+                counter.rx_bytes as f64 + counter.tx_bytes as f64,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let score = |rate: &NetworkRateSnapshot| {
+        if has_rate_sample {
+            rate.rx_bytes_per_second.unwrap_or(0.0) + rate.tx_bytes_per_second.unwrap_or(0.0)
+        } else {
+            counter_totals
+                .get(rate.name.as_str())
+                .copied()
+                .unwrap_or(0.0)
+        }
+    };
+    let mut ranked = rates.iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        score(right)
+            .partial_cmp(&score(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    match filter {
+        ServerNetworkFilter::All => ranked,
+        ServerNetworkFilter::Virtual => ranked
+            .into_iter()
+            .filter(|rate| {
+                matches!(
+                    network_interface_role(&rate.name),
+                    ServerNetworkRole::Bridge
+                        | ServerNetworkRole::Tunnel
+                        | ServerNetworkRole::Virtual
+                )
+            })
+            .collect(),
+        ServerNetworkFilter::Primary => {
+            let physical = ranked
+                .iter()
+                .copied()
+                .filter(|rate| network_interface_role(&rate.name) == ServerNetworkRole::Physical)
+                .collect::<Vec<_>>();
+            if physical.is_empty() {
+                ranked
+                    .into_iter()
+                    .filter(|rate| {
+                        network_interface_role(&rate.name) != ServerNetworkRole::Loopback
+                    })
+                    .take(1)
+                    .collect()
+            } else {
+                physical
+            }
+        }
+    }
+}
+
 /// 容器状态筛选使用领域状态，不从本地化 status 文本推断运行态。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum ContainerStatusFilter {
     #[default]
     All,
     Running,
-    Stopped,
-}
-
-/// 删除确认把精确容器目标和可选 force 策略绑定，避免 force 在不同目标间残留。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ContainerRemoveIntent {
-    pub(super) target: ContainerTarget,
-    pub(super) force: bool,
 }
 
 /// 已确认的容器变更请求是 UI 与 Root live-context gate 之间的单一参数快照。
@@ -64,29 +181,6 @@ pub struct ContainerMutationRequest {
     pub(super) target: ContainerTarget,
     pub(super) action: ContainerAction,
     pub(super) force: bool,
-}
-
-impl ContainerRemoveIntent {
-    /// 新目标从普通删除开始，force 必须由用户在当前目标的确认区主动开启。
-    ///
-    /// @author kongweiguang
-    pub(super) fn new(target: ContainerTarget) -> Self {
-        Self {
-            target,
-            force: false,
-        }
-    }
-
-    /// 确认时将目标和 force 一起冻结为真实用例参数，避免重绘后读到另一行状态。
-    ///
-    /// @author kongweiguang
-    pub(super) fn confirm(self) -> ContainerMutationRequest {
-        ContainerMutationRequest {
-            target: self.target,
-            action: ContainerAction::Remove,
-            force: self.force,
-        }
-    }
 }
 
 /// 历史点只保存 Fast 层真实采样值；缺失字段保持 None，不能被画成零。
@@ -128,7 +222,7 @@ pub(super) struct ContainerProjectGroup {
 }
 
 impl ServerInfoHistory {
-    /// 各层级只在自身采样时间前进时新增点，避免快速刷新复制旧磁盘或 GPU 数据。
+    /// 各层级只在自身采样时间前进时新增点；概览网络曲线复用 Primary 接口及主分支回退规则。
     ///
     /// @author kongweiguang
     pub(super) fn record(&mut self, snapshot: &ServerInfoSnapshot) -> bool {
@@ -154,18 +248,8 @@ impl ServerInfoHistory {
                 }
                 _ => None,
             };
-            let receive_bytes_per_second = sum_complete_rate(
-                snapshot
-                    .network_rates
-                    .iter()
-                    .map(|rate| rate.rx_bytes_per_second),
-            );
-            let transmit_bytes_per_second = sum_complete_rate(
-                snapshot
-                    .network_rates
-                    .iter()
-                    .map(|rate| rate.tx_bytes_per_second),
-            );
+            let (receive_bytes_per_second, transmit_bytes_per_second) =
+                primary_network_rate_totals(&snapshot.network_rates, &snapshot.network_counters);
             self.samples.push_back(ServerInfoHistorySample {
                 sampled_at_unix_ms,
                 cpu_percent: bounded_percent(snapshot.cpu.usage_percent),
@@ -254,38 +338,11 @@ impl ServerInfoHistory {
         section.complete(ticket, Ok(snapshot))
     }
 
-    /// 清空某个目标的曲线；target 一并清除，下一次真实样本会重新绑定。
-    ///
-    /// @author kongweiguang
-    pub(super) fn reset(&mut self) {
-        self.target = None;
-        self.samples.clear();
-        self.disk_samples.clear();
-        self.gpu_samples.clear();
-        self.disk_mount = None;
-        self.last_disk_at_unix_ms = None;
-        self.last_gpu_at_unix_ms = None;
-    }
-
     /// 返回真实历史点，渲染层只负责呈现且不能改写采样时间。
     ///
     /// @author kongweiguang
     pub(super) fn samples(&self) -> &VecDeque<ServerInfoHistorySample> {
         &self.samples
-    }
-
-    /// 提供独立的慢速磁盘序列，不复制 Fast tick 间的旧容量读数。
-    ///
-    /// @author kongweiguang
-    pub(super) fn disk_samples(&self) -> &VecDeque<ServerInfoMetricSample> {
-        &self.disk_samples
-    }
-
-    /// 返回该磁盘曲线当前绑定的挂载点名称，避免挂载点变化时误读旧趋势。
-    ///
-    /// @author kongweiguang
-    pub(super) fn disk_mount(&self) -> Option<&str> {
-        self.disk_mount.as_deref()
     }
 }
 
@@ -296,17 +353,36 @@ fn bounded_percent(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
 }
 
-/// 汇总网卡速率时保留任何缺失/重置/非法读数带来的空隙。
+/// 汇总有限非负读数，跳过单接口缺测；该方向完全未知时保留趋势断点。
 ///
 /// @author kongweiguang
-fn sum_complete_rate(mut values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
-    values
-        .try_fold((0.0, 0usize), |(sum, count), value| {
-            value
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .map(|value| (sum + value, count + 1))
-        })
-        .and_then(|(sum, count)| (count > 0).then_some(sum))
+fn sum_network_rates(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut count = 0;
+    for value in values
+        .flatten()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        sum += value;
+        if !sum.is_finite() {
+            return None;
+        }
+        count += 1;
+    }
+    (count > 0).then_some(sum)
+}
+
+/// 只汇总 Primary 接口读数；某个方向缺测时保留空值，避免其它角色流量冒充主链路。
+///
+/// @author kongweiguang
+fn primary_network_rate_totals(
+    rates: &[NetworkRateSnapshot],
+    counters: &[NetworkCounterSnapshot],
+) -> (Option<f64>, Option<f64>) {
+    let primary = filtered_network_rates(rates, counters, ServerNetworkFilter::Primary);
+    let receive = sum_network_rates(primary.iter().map(|rate| rate.rx_bytes_per_second));
+    let transmit = sum_network_rates(primary.iter().map(|rate| rate.tx_bytes_per_second));
+    (receive, transmit)
 }
 
 /// 让各层级曲线共享有界窗口，不以循环刷新次数推导真实时间。
@@ -348,17 +424,24 @@ pub(super) fn time_series_position(
     Some((x.clamp(0.0, 1.0), y))
 }
 
-/// 速率以二进制单位展示，数值为未知时保持破折号而不是零。
+/// 速率沿用 main 的字节换算与单位标签；首个快照尚无差分时明确显示采样中。
 ///
 /// @author kongweiguang
 pub(super) fn network_rate_label(value: Option<f64>) -> String {
-    let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) else {
-        return "—".to_owned();
+    let Some(value) = value else {
+        return crate::locale::text("采样中", "Sampling…").to_string();
     };
-    if value >= 1_048_576.0 {
-        format!("{:.1} MiB/s", value / 1_048_576.0)
+    if !value.is_finite() || value < 0.0 {
+        return "—".to_owned();
+    }
+    if value >= 1_099_511_627_776.0 {
+        format!("{:.1} TB/s", value / 1_099_511_627_776.0)
+    } else if value >= 1_073_741_824.0 {
+        format!("{:.1} GB/s", value / 1_073_741_824.0)
+    } else if value >= 1_048_576.0 {
+        format!("{:.1} MB/s", value / 1_048_576.0)
     } else if value >= 1024.0 {
-        format!("{:.1} KiB/s", value / 1024.0)
+        format!("{:.1} KB/s", value / 1024.0)
     } else {
         format!("{value:.0} B/s")
     }
@@ -378,46 +461,41 @@ pub(super) fn filter_containers(
         .filter(|container| match status_filter {
             ContainerStatusFilter::All => true,
             ContainerStatusFilter::Running => container.status == ContainerStatus::Running,
-            ContainerStatusFilter::Stopped => matches!(
-                container.status,
-                ContainerStatus::Exited | ContainerStatus::Created | ContainerStatus::Dead
-            ),
         })
         .filter(|container| {
-            query.is_empty()
-                || [
-                    container.name.as_str(),
-                    container.short_id.as_str(),
-                    container.target.container_id.as_str(),
-                    container.image.as_str(),
-                    container.status_text.as_str(),
-                ]
-                .into_iter()
-                .chain(container.compose.iter().flat_map(|compose| {
+            if query.is_empty() {
+                return true;
+            }
+
+            let matches = |candidate: &str| candidate.to_lowercase().contains(&query);
+            let runtime = match container.target.runtime {
+                ContainerRuntime::Docker => "docker",
+                ContainerRuntime::Podman => "podman",
+            };
+            [
+                container.name.as_str(),
+                container.short_id.as_str(),
+                container.target.container_id.as_str(),
+                container.image.as_str(),
+                container.status_text.as_str(),
+                runtime,
+            ]
+            .into_iter()
+            .any(matches)
+                || container.ports.iter().any(|port| matches(port))
+                || container.compose.as_ref().is_some_and(|compose| {
                     compose
                         .project
                         .iter()
                         .chain(compose.service.iter())
-                        .map(String::as_str)
-                }))
-                .any(|candidate| candidate.to_lowercase().contains(&query))
+                        .chain(compose.working_dir.iter())
+                        .chain(compose.config_files.iter())
+                        .chain(compose.config_paths.iter())
+                        .any(|candidate| matches(candidate))
+                })
         })
         .cloned()
         .collect()
-}
-
-/// 只为运行时明确支持的状态提供 Start/Stop；暂停、过渡和未知态不伪装成可启动状态。
-///
-/// @author kongweiguang
-pub(super) fn container_primary_action(status: ContainerStatus) -> Option<ContainerAction> {
-    match status {
-        ContainerStatus::Running => Some(ContainerAction::Stop),
-        ContainerStatus::Exited | ContainerStatus::Created => Some(ContainerAction::Start),
-        ContainerStatus::Paused
-        | ContainerStatus::Restarting
-        | ContainerStatus::Dead
-        | ContainerStatus::Unknown => None,
-    }
 }
 
 /// 从同一行标签构造完整 Compose 目标；缺字段时不合并项目，也不合成执行范围。

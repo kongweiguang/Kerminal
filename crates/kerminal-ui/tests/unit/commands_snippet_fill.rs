@@ -2,7 +2,11 @@
 //!
 //! @author kongweiguang
 
+use std::sync::{Arc, Mutex};
+
+use futures::executor::block_on;
 use kerminal_application::sessions::UiSessionBinding;
+use kerminal_application::{AppError, ApplicationTaskExecutor};
 use kerminal_domain::{
     commands::{
         SnippetCatalogItem, SnippetCatalogOrigin, SnippetDefaultAction, SnippetRisk, SnippetScope,
@@ -13,7 +17,15 @@ use kerminal_domain::{
 use tokio_util::sync::CancellationToken;
 
 use super::snippet_definition_from_catalog;
-use super::snippet_fill::TerminalFillState;
+use super::snippet_fill::{TerminalFillState, record_snippet_usage_best_effort};
+
+/// 测试记录独立调用线程、service future 构造及执行阶段的 Tokio runtime 边界。
+#[derive(Clone, Default)]
+struct SnippetUsageRuntimeEvidence {
+    service_builder_has_tokio_runtime: bool,
+    service_has_tokio_runtime: bool,
+    blocking_result: Option<u8>,
+}
 
 /// 来源展示信息不能伪装为派生身份，否则保存或发送会错误改变片段的来源语义。
 ///
@@ -96,4 +108,55 @@ fn active_send_blocks_a_second_submission() {
         unknown_target: None,
     };
     assert!(state.blocks_new_send());
+}
+
+/// 无 Tokio 的调用线程等待 helper，由应用 runtime 构造并执行 service future；回写失败不影响调用方完成。
+///
+/// @author kongweiguang
+#[test]
+fn snippet_usage_follow_up_uses_application_runtime_and_ignores_failure() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("snippet follow-up runtime should start");
+    runtime.block_on(tokio::task::yield_now());
+    let executor = ApplicationTaskExecutor::new(runtime.handle().clone());
+    let evidence = Arc::new(Mutex::new(SnippetUsageRuntimeEvidence::default()));
+    assert!(tokio::runtime::Handle::try_current().is_err());
+
+    let builder_evidence = evidence.clone();
+    block_on(record_snippet_usage_best_effort(executor, move || {
+        let builder_has_tokio_runtime = tokio::runtime::Handle::try_current().is_ok();
+        builder_evidence
+            .lock()
+            .expect("test evidence lock remains available")
+            .service_builder_has_tokio_runtime = builder_has_tokio_runtime;
+
+        let service_evidence = builder_evidence;
+        async move {
+            let runtime_available = tokio::runtime::Handle::try_current().is_ok();
+            let blocking_result = if runtime_available {
+                tokio::task::spawn_blocking(|| 23_u8).await.ok()
+            } else {
+                None
+            };
+            let mut evidence = service_evidence
+                .lock()
+                .expect("test evidence lock remains available");
+            evidence.service_has_tokio_runtime = runtime_available;
+            evidence.blocking_result = blocking_result;
+            Err(AppError::infrastructure(
+                "simulated preference write failure",
+            ))
+        }
+    }));
+
+    let evidence = evidence
+        .lock()
+        .expect("test evidence lock remains available")
+        .clone();
+    assert!(evidence.service_builder_has_tokio_runtime);
+    assert!(evidence.service_has_tokio_runtime);
+    assert_eq!(evidence.blocking_result, Some(23));
 }

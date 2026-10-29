@@ -1731,12 +1731,12 @@ pub(super) struct WorkspaceTabTrackSection {
 /// 按标签实际固定宽度及组头保守预算设置内容轨道，避免后代溢出脱离 GPUI 的直接子项滚动测量。
 /// 普通态预算完整可见内容，`min_w_full` 负责视口下限；仅活动拖拽把末尾 72px 投放区计入预算。
 /// 组头预算按每 UTF-16 单元 16px 并含按钮/标记固定留量，覆盖宽字符且避免文本溢出截断末尾命中区。
+/// 组内已移除横向留白，预算同步去掉旧的 16px，防止末端出现没有对应内容的滚动空槽。
 ///
 /// @author kongweiguang
 pub(super) fn workspace_tab_track_width_budget(sections: &[WorkspaceTabTrackSection]) -> f32 {
     const TAB_WIDTH: usize = 180;
     const TAB_GAP: usize = 1;
-    const TAB_STRIP_PADDING: usize = 16;
     const SECTION_GAP: usize = 4;
     const HEADER_GAP: usize = 4;
     const HEADER_CHROME: usize = 72;
@@ -1759,8 +1759,9 @@ pub(super) fn workspace_tab_track_width_budget(sections: &[WorkspaceTabTrackSect
         let tabs_width = if section.visible_tab_count == 0 {
             0
         } else {
-            TAB_STRIP_PADDING
-                .saturating_add(section.visible_tab_count.saturating_mul(TAB_WIDTH))
+            section
+                .visible_tab_count
+                .saturating_mul(TAB_WIDTH)
                 .saturating_add(
                     section
                         .visible_tab_count

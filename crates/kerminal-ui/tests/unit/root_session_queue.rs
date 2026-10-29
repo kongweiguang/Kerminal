@@ -1003,102 +1003,11 @@ fn broadcast_event_keeps_fixed_ui_binding_in_ui_input_request() {
     );
 }
 
-/// 固定目标 one-shot 在总命令数或输入字节预算不足时整批拒绝，不留下部分 FIFO 项。
+/// Stop 只移除带 generation 的持续广播，普通 Direct 输入保留原 binding 并继续排队。
 ///
 /// @author kongweiguang
 #[test]
-fn broadcast_once_preflights_command_and_input_byte_budgets_atomically() {
-    let first = ui_binding(SessionId::new());
-    let second = ui_binding(SessionId::new());
-    let bindings = [first, second];
-    let event = TerminalInputEvent::Text("x".to_owned());
-
-    for queue_limits in [
-        SessionQueueLimits {
-            per_session_commands: 4,
-            total_commands: 1,
-            total_input_bytes: 64,
-            concurrent_sessions: 2,
-        },
-        SessionQueueLimits {
-            per_session_commands: 4,
-            total_commands: 4,
-            total_input_bytes: 1,
-            concurrent_sessions: 2,
-        },
-    ] {
-        let mut queues = SessionCommandQueues::with_limits(queue_limits);
-        assert_eq!(
-            queues.enqueue_broadcast_once(&bindings, event.clone()),
-            Err(SessionQueueError::QueueFull)
-        );
-        assert!(queues.take_ready().is_none());
-        assert_eq!((queues.queued_commands, queues.queued_input_bytes), (0, 0));
-    }
-}
-
-/// One-shot 使用调用时冻结的 UI binding，并在每个目标自己的 FIFO 中排于既有输入之后。
-///
-/// @author kongweiguang
-#[test]
-fn broadcast_once_keeps_fixed_bindings_and_per_session_fifo_order() {
-    let mut queues = SessionCommandQueues::with_limits(limits(1));
-    let first = ui_binding(SessionId::new());
-    let second = ui_binding(SessionId::new());
-    queues
-        .enqueue(
-            first.session_id.clone(),
-            SessionWork::Input {
-                event: TerminalInputEvent::Text("before".to_owned()),
-                origin: InputOrigin::Direct,
-            },
-        )
-        .unwrap();
-
-    assert_eq!(
-        queues.enqueue_broadcast_once(
-            &[first.clone(), second.clone()],
-            TerminalInputEvent::Text("once".to_owned()),
-        ),
-        Ok(2)
-    );
-
-    let prior = queues
-        .take_ready()
-        .expect("pre-existing FIFO item starts first");
-    assert_eq!(prior.session_id, first.session_id);
-    assert_eq!(
-        prior.work,
-        SessionWork::Input {
-            event: TerminalInputEvent::Text("before".to_owned()),
-            origin: InputOrigin::Direct,
-        }
-    );
-    assert!(queues.complete(&first.session_id));
-
-    // The second session was already ready; each one-shot request must retain its original owner.
-    for expected in [&second, &first] {
-        let ready = queues.take_ready().expect("one-shot target remains queued");
-        assert_eq!(&ready.session_id, &expected.session_id);
-        let SessionWork::UiInput(work) = ready.work else {
-            panic!("one-shot input must use the owner-bound UI CAS path");
-        };
-        assert_eq!(work.origin, InputOrigin::Direct);
-        assert_eq!(work.request.binding, *expected);
-        assert_eq!(
-            work.request.event,
-            TerminalInputEvent::Text("once".to_owned())
-        );
-        assert!(queues.complete(&ready.session_id));
-    }
-    assert!(queues.take_ready().is_none());
-}
-
-/// Stop 只移除带 generation 的持续广播；显式 one-shot 仍按原 binding 排队执行。
-///
-/// @author kongweiguang
-#[test]
-fn stop_broadcast_preserves_explicit_one_shot_input() {
+fn stop_broadcast_preserves_direct_ui_input() {
     let mut queues = SessionCommandQueues::with_limits(limits(1));
     let binding = ui_binding(SessionId::new());
     let (generation, _) = queues.begin_broadcast_start();
@@ -1110,13 +1019,20 @@ fn stop_broadcast_preserves_explicit_one_shot_input() {
         ),
         Ok(1)
     );
-    assert_eq!(
-        queues.enqueue_broadcast_once(
-            std::slice::from_ref(&binding),
-            TerminalInputEvent::Text("once".to_owned())
-        ),
-        Ok(1)
-    );
+    queues
+        .enqueue(
+            binding.session_id.clone(),
+            SessionWork::UiInput(Box::new(UiInputWork::new(
+                UiTerminalInputRequest {
+                    binding: binding.clone(),
+                    expected_context: None,
+                    projection: UiInputProjection::Invalidates,
+                    event: TerminalInputEvent::Text("once".to_owned()),
+                },
+                None,
+            ))),
+        )
+        .expect("direct UI input is admitted through the existing FIFO");
 
     let dropped = queues.stop_broadcast();
     assert_eq!(dropped.broadcast_events, 1);
@@ -1124,12 +1040,10 @@ fn stop_broadcast_preserves_explicit_one_shot_input() {
     assert_eq!(dropped.input_bytes, "continuous".len());
     assert_eq!((queues.queued_commands, queues.queued_input_bytes), (1, 4));
 
-    let ready = queues
-        .take_ready()
-        .expect("explicit one-shot survives Stop");
+    let ready = queues.take_ready().expect("direct UI input survives Stop");
     assert_eq!(ready.session_id, binding.session_id);
     let SessionWork::UiInput(work) = ready.work else {
-        panic!("one-shot input must remain an owner-bound UI request");
+        panic!("direct input must remain an owner-bound UI request");
     };
     assert_eq!(work.origin, InputOrigin::Direct);
     assert_eq!(work.request.binding, binding);

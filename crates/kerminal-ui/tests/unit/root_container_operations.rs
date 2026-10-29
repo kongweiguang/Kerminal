@@ -27,6 +27,11 @@ fn host_context() -> ContainerPanelContext {
     }
 }
 
+/// Workspace 文件宿主只冻结真实 tab/host，不构造终端 owner 或 SessionId。
+fn workspace_host_context(tab_id: TabId, host_id: HostId) -> ContainerPanelContext {
+    ContainerPanelContext::WorkspaceHost { tab_id, host_id }
+}
+
 /// 同一 SSH 主机的重连和不同 pane 也必须重新点击，不能只按 HostId 认定旧意图仍有效。
 #[test]
 fn stale_menu_cannot_cross_session_generation_or_owner() {
@@ -133,4 +138,33 @@ fn absent_or_unavailable_context_never_admits_panel_requests() {
         true
     ));
     assert!(!container_context_allows_request(None, None, &host, true));
+}
+
+/// 写操作和确认必须命中打开时的文件 Tab 与宿主，不能因相同 HostId 跨 Tab 沿用。
+#[test]
+fn workspace_host_request_gate_requires_exact_tab_and_host() {
+    let tab_id = TabId::new();
+    let host_id = HostId::new();
+    let original = workspace_host_context(tab_id.clone(), host_id.clone());
+
+    assert!(container_context_allows_request(
+        Some(&original),
+        Some(&original),
+        &original,
+        true
+    ));
+    let other_tab = workspace_host_context(TabId::new(), host_id.clone());
+    assert!(!container_context_allows_request(
+        Some(&original),
+        Some(&original),
+        &other_tab,
+        true
+    ));
+    let other_host = workspace_host_context(tab_id, HostId::new());
+    assert!(!container_context_allows_request(
+        Some(&original),
+        Some(&original),
+        &other_host,
+        true
+    ));
 }

@@ -2,8 +2,10 @@
 //!
 //! @author kongweiguang
 
+use kerminal_application::workspace::{WorkspacePinnedContainer, WorkspaceSessionDocument};
 use kerminal_domain::{
     identity::{HostId, PaneId, TabId},
+    operations::{ContainerRuntime, ContainerTarget},
     sessions::{SessionTarget, SshInitialCommand},
 };
 
@@ -11,11 +13,12 @@ use crate::features::connections::HostSessionStatus;
 use crate::root::{
     TerminalTargetRequest,
     connections::{
-        ExistingHostSessionTarget, PendingSftpHostCreation, SftpNavigationReceiptDisposition,
+        ExistingContainerSessionTarget, PendingSftpHostCreation, SftpNavigationReceiptDisposition,
         SftpNavigationRequest, consume_sftp_navigation_receipt, external_ssh_session_target,
-        local_profile_target_request, select_existing_host_session_target,
+        local_profile_target_request, remove_pinned_container_snapshot,
+        select_existing_container_session_target, select_pinned_container_snapshot,
         session_status_for_phase, sftp_host_creation_source_is_current,
-        sftp_transfer_tab_activation,
+        sftp_transfer_tab_activation, upsert_pinned_container_snapshot,
     },
     workspace_runtime::RuntimePanePhase,
 };
@@ -213,30 +216,75 @@ fn host_projection_does_not_report_closing_panes_as_ready() {
     assert_eq!(session_status_for_phase(RuntimePanePhase::Closing), None);
 }
 
-/// 自动跳转要求唯一 TabId/PaneId；同主机多个 pane 即使在同一标签也不猜焦点。
+/// 固定同一稳定容器身份会更新展示信息；选择和移除不会改动终端标签或焦点。
 /// @author kongweiguang
 #[test]
-fn existing_host_session_activation_requires_a_unique_target() {
+fn pinned_container_snapshot_updates_selection_without_switching_tabs() {
+    let host_id = HostId::new();
+    let target = ContainerTarget {
+        host_id: Some(host_id),
+        runtime: ContainerRuntime::Docker,
+        container_id: "container-1".to_owned(),
+    };
+    let mut snapshot = WorkspaceSessionDocument::empty_v3()
+        .workspace_snapshot()
+        .unwrap();
+    let pin = WorkspacePinnedContainer {
+        target: target.clone(),
+        name: "worker".to_owned(),
+        description: "image · running".to_owned(),
+        group_id: Some("production".to_owned()),
+    };
+    let stable_id = pin.stable_id();
+
+    assert!(upsert_pinned_container_snapshot(&mut snapshot, pin.clone()));
+    assert_eq!(snapshot.pinned_containers.len(), 1);
+    assert_eq!(
+        snapshot.selected_machine_id.as_deref(),
+        Some(stable_id.as_str())
+    );
+    assert_eq!(snapshot.active_tab_id, None);
+    assert_eq!(snapshot.focused_pane_id, None);
+
+    let mut renamed = pin;
+    renamed.name = "worker-new".to_owned();
+    assert!(upsert_pinned_container_snapshot(&mut snapshot, renamed));
+    assert_eq!(snapshot.pinned_containers.len(), 1);
+    assert_eq!(snapshot.pinned_containers[0].name, "worker-new");
+    assert!(!select_pinned_container_snapshot(&mut snapshot, &stable_id));
+
+    assert!(remove_pinned_container_snapshot(&mut snapshot, &stable_id));
+    assert!(snapshot.pinned_containers.is_empty());
+    assert_eq!(snapshot.selected_machine_id, None);
+    assert_eq!(snapshot.active_tab_id, None);
+    assert_eq!(snapshot.focused_pane_id, None);
+    assert!(!remove_pinned_container_snapshot(&mut snapshot, &stable_id));
+}
+
+/// 固定容器的自动跳转要求唯一 TabId/PaneId；多个匹配 pane 时不猜焦点。
+/// @author kongweiguang
+#[test]
+fn existing_container_session_activation_requires_a_unique_target() {
     let tab_id = TabId::new();
     let pane_id = PaneId::new();
 
     assert_eq!(
-        select_existing_host_session_target(Vec::new()),
-        ExistingHostSessionTarget::Missing
+        select_existing_container_session_target(Vec::new()),
+        ExistingContainerSessionTarget::Missing
     );
     assert_eq!(
-        select_existing_host_session_target(vec![(tab_id.clone(), pane_id.clone())]),
-        ExistingHostSessionTarget::Unique {
+        select_existing_container_session_target(vec![(tab_id.clone(), pane_id.clone())]),
+        ExistingContainerSessionTarget::Unique {
             tab_id: tab_id.clone(),
             pane_id: pane_id.clone(),
         }
     );
     assert_eq!(
-        select_existing_host_session_target(vec![
+        select_existing_container_session_target(vec![
             (tab_id.clone(), pane_id),
             (tab_id, PaneId::new())
         ]),
-        ExistingHostSessionTarget::Multiple
+        ExistingContainerSessionTarget::Multiple
     );
 }
 

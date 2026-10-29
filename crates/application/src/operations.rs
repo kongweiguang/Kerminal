@@ -670,6 +670,36 @@ pub struct OperationsService {
 }
 
 impl OperationsService {
+    /// 目录跟随安装使用显式受控脚本和独立 SSH exec；退出码确认后才可向用户报告配置完成。
+    /// @author kongweiguang
+    pub async fn configure_terminal_directory_follow(
+        &self,
+        host_id: HostId,
+        script: String,
+        cancel: CancellationToken,
+    ) -> AppResult<()> {
+        let result = execute_with_deadline(
+            self.command_executor.as_ref(),
+            CommandExecutionTarget::Host(host_id),
+            CommandInvocation::new("sh", vec!["-c".to_owned(), script]),
+            CommandExecutionLimits {
+                timeout: Duration::from_secs(20),
+                max_output_bytes: 64 * 1024,
+            },
+            cancel,
+        )
+        .await?;
+        if result.exit_code != Some(0) {
+            return Err(AppError::remote_exit(result.exit_code));
+        }
+        if result.truncated {
+            return Err(AppError::infrastructure(
+                "目录跟随配置输出超过限制，请检查目标主机",
+            ));
+        }
+        Ok(())
+    }
+
     /// 注入纯用例端口并建立唯一代理策略存储，避免 profile attach 偷读全局配置或另建会话 registry。
     pub fn new(
         commands: Arc<dyn OperationsCommandExecutor>,

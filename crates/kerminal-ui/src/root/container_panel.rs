@@ -50,49 +50,82 @@ struct ContainerPanelCandidate<'a> {
 }
 
 impl RootView {
-    /// 固定右栏继承 workspace 仍保留的精确活动 pane；中心页面可切换，不借用侧栏选择或标题推断目标。
+    /// 固定右栏优先解析活动文件 Tab 的冻结 SSH 宿主，否则沿用活动终端 pane；不借用侧栏选择或标题推断目标。
     ///
     /// @author kongweiguang
     pub(super) fn current_container_panel_context(&self) -> ContainerPanelContext {
+        self.current_container_panel_projection().0
+    }
+
+    /// 一次校验同时返回容器面板上下文和 Ports 可展示的容器身份，避免不同入口解析出不同 pane。
+    ///
+    /// @author kongweiguang
+    pub(super) fn current_container_panel_projection(
+        &self,
+    ) -> (ContainerPanelContext, Option<ContainerTarget>) {
         let Some(controller) = self.workspace_controller.as_ref() else {
-            return unavailable(ContainerPanelUnavailableReason::NoTerminal);
+            return (
+                unavailable(ContainerPanelUnavailableReason::NoTerminal),
+                None,
+            );
         };
         let snapshot = controller.snapshot();
         let Some(active_tab_id) = snapshot.active_tab_id.as_ref() else {
-            return unavailable(ContainerPanelUnavailableReason::NoTerminal);
+            return (
+                unavailable(ContainerPanelUnavailableReason::NoTerminal),
+                None,
+            );
         };
         let Some(active_tab) = snapshot
             .terminal_tabs
             .iter()
             .find(|tab| tab.id() == active_tab_id)
         else {
-            return unavailable(ContainerPanelUnavailableReason::NoTerminal);
+            return (
+                unavailable(ContainerPanelUnavailableReason::NoTerminal),
+                None,
+            );
         };
+        if let Some(context) = workspace_file_host_context(active_tab) {
+            return (context, None);
+        }
         let Some(layout) = active_tab.terminal_layout() else {
-            return unavailable(ContainerPanelUnavailableReason::NoTerminal);
+            return (
+                unavailable(ContainerPanelUnavailableReason::NoTerminal),
+                None,
+            );
         };
         let Some(focused_pane_id) = snapshot.focused_pane_id.as_ref() else {
-            return unavailable(ContainerPanelUnavailableReason::NoTerminal);
+            return (
+                unavailable(ContainerPanelUnavailableReason::NoTerminal),
+                None,
+            );
         };
         if !layout.contains_pane(focused_pane_id) {
-            return unavailable(ContainerPanelUnavailableReason::TargetMismatch);
+            return (
+                unavailable(ContainerPanelUnavailableReason::TargetMismatch),
+                None,
+            );
         }
 
         let Some(runtime_pane) = self.workspace_runtime.pane(focused_pane_id) else {
-            return unavailable(ContainerPanelUnavailableReason::NotReady);
+            return (unavailable(ContainerPanelUnavailableReason::NotReady), None);
         };
         let Some(snapshot_pane) = snapshot
             .terminal_panes
             .iter()
             .find(|pane| &pane.id == focused_pane_id)
         else {
-            return unavailable(ContainerPanelUnavailableReason::TargetMismatch);
+            return (
+                unavailable(ContainerPanelUnavailableReason::TargetMismatch),
+                None,
+            );
         };
         let Some(session_id) = runtime_pane.session_id.as_ref() else {
-            return unavailable(ContainerPanelUnavailableReason::NotReady);
+            return (unavailable(ContainerPanelUnavailableReason::NotReady), None);
         };
         let Some(target) = runtime_pane.target.as_ref() else {
-            return unavailable(ContainerPanelUnavailableReason::NotReady);
+            return (unavailable(ContainerPanelUnavailableReason::NotReady), None);
         };
         let observation = self.session_reconnect.panel_observation(
             focused_pane_id,
@@ -105,22 +138,89 @@ impl RootView {
             .get(session_id)
             .map(|registration| &registration.binding);
 
-        resolve_container_panel_context(ContainerPanelCandidate {
+        let pane = panel_pane(
+            runtime_pane,
+            snapshot_pane,
+            focused_pane_id,
+            session_id,
+            target,
+        );
+        let context = resolve_container_panel_context(ContainerPanelCandidate {
             center_panel: self.center_panel,
             active_tab_id: Some(active_tab_id),
             active_tab: Some(active_tab),
             focused_pane_id: Some(focused_pane_id),
-            pane: Some(panel_pane(
-                runtime_pane,
-                snapshot_pane,
-                focused_pane_id,
-                session_id,
-                target,
-            )),
+            pane: Some(pane),
             handler_binding,
             observation: observation.as_ref(),
-        })
+        });
+        let ports_target = container_target_for_validated_host_context(&context, pane);
+        (context, ports_target)
     }
+}
+
+/// WorkspaceFile 直接保留其文件宿主身份，不伪造终端 session binding 或依赖侧栏选择。
+///
+/// @author kongweiguang
+fn workspace_file_host_context(tab: &WorkspaceSessionTab) -> Option<ContainerPanelContext> {
+    let WorkspaceSessionTab::WorkspaceFile { id, target, .. } = tab else {
+        return None;
+    };
+    let host_id = match target {
+        WorkspaceTargetRef::Ssh { host_id }
+        | WorkspaceTargetRef::DockerContainer { host_id, .. } => host_id.clone(),
+        WorkspaceTargetRef::Local { .. }
+        | WorkspaceTargetRef::Telnet { .. }
+        | WorkspaceTargetRef::Serial { .. }
+        | WorkspaceTargetRef::Unavailable { .. } => return None,
+    };
+    Some(ContainerPanelContext::WorkspaceHost {
+        tab_id: id.clone(),
+        host_id,
+    })
+}
+
+/// 仅从刚经 Root resolver 校验的 Host binding 取同一 pane 的远程容器目标，并复核持久快照。
+///
+/// @author kongweiguang
+fn container_target_for_validated_host_context(
+    context: &ContainerPanelContext,
+    pane: ContainerPanelPane<'_>,
+) -> Option<ContainerTarget> {
+    let ContainerPanelContext::Host {
+        binding,
+        host_id: Some(host_id),
+    } = context
+    else {
+        return None;
+    };
+    let SessionOwner::Ui {
+        tab_id: bound_tab_id,
+        pane_id: bound_pane_id,
+    } = &binding.owner
+    else {
+        return None;
+    };
+    if pane.phase != RuntimePanePhase::Ready
+        || pane.tab_id != bound_tab_id
+        || pane.pane_id != bound_pane_id
+        || pane.session_id != &binding.session_id
+        || !persisted_target_identity_matches(pane.persisted, pane.snapshot_persisted)
+        || !persisted_target_matches(pane)
+    {
+        return None;
+    }
+    let SessionTarget::Container(target) = pane.target else {
+        return None;
+    };
+    if target.host_id.as_ref() != Some(host_id) {
+        return None;
+    }
+    Some(ContainerTarget {
+        host_id: target.host_id.clone(),
+        runtime: target.runtime,
+        container_id: target.container_id.clone(),
+    })
 }
 
 /// 将运行态 pane 转成借用快照；调用处先按活动 focused pane 查表，禁止退回布局首项。
@@ -146,7 +246,7 @@ fn panel_pane<'a>(
     }
 }
 
-/// 根据已定位的活动 pane 校验 session、workspace 目标和输入代次，再生成唯一容器面板上下文。
+/// 右栏只管理 main 支持的 SSH 宿主；校验 pane 与输入代次后也不把本机容器能力扩展成可见入口。
 ///
 /// @author kongweiguang
 fn resolve_container_panel_context(
@@ -218,7 +318,9 @@ fn resolve_container_panel_context(
                 return unavailable(ContainerPanelUnavailableReason::TargetMismatch);
             }
             let host_id = match pane.target {
-                SessionTarget::Local(_) => None,
+                SessionTarget::Local(_) => {
+                    return unavailable(ContainerPanelUnavailableReason::UnsupportedProtocol);
+                }
                 SessionTarget::Ssh(ssh) => Some(ssh.host_id.clone()),
                 _ => return unavailable(ContainerPanelUnavailableReason::TargetMismatch),
             };
@@ -254,14 +356,15 @@ fn resolve_container_panel_context(
                     return unavailable(ContainerPanelUnavailableReason::NotReady);
                 }
             };
-            ContainerPanelContext::ContainerInfo {
+            // 容器终端的右栏仍管理 SSH 宿主，与 main 的 focusedPane host 解析保持一致。
+            // 只读详情由列表导航负责，不因打开容器终端改换成第二种右栏页面。
+            let _terminal_running = running;
+            let Some(host_id) = container.host_id.as_ref() else {
+                return unavailable(ContainerPanelUnavailableReason::UnsupportedProtocol);
+            };
+            ContainerPanelContext::Host {
                 binding: observation.binding.clone(),
-                target: ContainerTarget {
-                    host_id: container.host_id.clone(),
-                    runtime: container.runtime,
-                    container_id: container.container_id.clone(),
-                },
-                terminal_running: running,
+                host_id: Some(host_id.clone()),
             }
         }
         SessionTarget::Telnet(_) | SessionTarget::Serial(_) => {

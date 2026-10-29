@@ -9,15 +9,28 @@ use super::PreferencesPanel;
 
 /// 协议变更方向作为 UI 回执使用，配置仍由 application 的 typed service 管理。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ExternalProtocolAction {
+pub(in crate::features::preferences) enum ExternalProtocolAction {
     Register,
     Unregister,
+}
+
+/// 操作异常后携带独立状态回读，避免把旧快照当成操作结果继续开放写入。
+enum ExternalProtocolChangeResult {
+    Confirmed(ExternalProtocolStatus),
+    Mismatch {
+        operation_status: ExternalProtocolStatus,
+        readback: Result<ExternalProtocolStatus, AppError>,
+    },
+    Failed {
+        error: AppError,
+        readback: Result<ExternalProtocolStatus, AppError>,
+    },
 }
 
 /// 注册/注销只在平台支持、状态已读且无未回读事务时开放，避免基于陈旧状态重试。
 ///
 /// @author kongweiguang
-pub(super) fn external_protocol_action(
+pub(in crate::features::preferences) fn external_protocol_action(
     service_available: bool,
     status: Option<ExternalProtocolStatus>,
     busy: bool,
@@ -43,7 +56,10 @@ impl PreferencesPanel {
     /// 通过受监督 application executor 读取协议关联，避免平台查询阻塞 GPUI 事件线程。
     ///
     /// @author kongweiguang
-    pub(super) fn refresh_external_protocol(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::features::preferences) fn refresh_external_protocol(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
         if self.external_protocol_loading {
             return;
         }
@@ -107,10 +123,10 @@ impl PreferencesPanel {
         .detach();
     }
 
-    /// 执行用户明确选择的注册或注销；失败后要求状态回读，避免依赖旧快照继续写系统设置。
+    /// 操作回执异常时先自动读取真实状态；只有读回成功才按新状态继续开放注册操作。
     ///
     /// @author kongweiguang
-    pub(super) fn change_external_protocol(
+    pub(in crate::features::preferences) fn change_external_protocol(
         &mut self,
         action: ExternalProtocolAction,
         cx: &mut Context<Self>,
@@ -128,6 +144,7 @@ impl PreferencesPanel {
             return;
         };
 
+        let prior_status = self.external_protocol_status;
         self.external_protocol_generation = self.external_protocol_generation.wrapping_add(1);
         let generation = self.external_protocol_generation;
         let executor = self.executor.clone();
@@ -147,12 +164,32 @@ impl PreferencesPanel {
                     if cancellation.is_cancelled() {
                         return Err(AppError::cancelled("协议关联变更已取消"));
                     }
-                    match action {
+                    let expected_registered = action == ExternalProtocolAction::Register;
+                    let operation = match action {
                         ExternalProtocolAction::Register => {
                             service.enable_for_current_user().await
                         }
                         ExternalProtocolAction::Unregister => {
                             service.disable_for_current_user().await
+                        }
+                    };
+                    match operation {
+                        Ok(status)
+                            if status.supported
+                                && status.registered == expected_registered =>
+                        {
+                            Ok(ExternalProtocolChangeResult::Confirmed(status))
+                        }
+                        Ok(operation_status) => {
+                            let readback = service.status().await;
+                            Ok(ExternalProtocolChangeResult::Mismatch {
+                                operation_status,
+                                readback,
+                            })
+                        }
+                        Err(error) => {
+                            let readback = service.status().await;
+                            Ok(ExternalProtocolChangeResult::Failed { error, readback })
                         }
                     }
                 })
@@ -164,30 +201,78 @@ impl PreferencesPanel {
                 panel.external_protocol_loading = false;
                 panel.external_protocol_operation = None;
                 match result {
-                    Ok(status) => {
-                        let expected_registered = action == ExternalProtocolAction::Register;
-                        let confirmed = status.supported && status.registered == expected_registered;
+                    Ok(ExternalProtocolChangeResult::Confirmed(status)) => {
                         panel.external_protocol_status = Some(status);
-                        panel.external_protocol_last_result = confirmed.then_some(action);
-                        panel.external_protocol_requires_refresh = !confirmed;
+                        panel.external_protocol_last_result = Some(action);
+                        panel.external_protocol_requires_refresh = false;
                         panel.external_protocol_outcome_unknown = false;
-                        panel.external_protocol_error_is_operation = !confirmed;
-                        panel.external_protocol_error = (!confirmed).then(|| {
+                        panel.external_protocol_error_is_operation = false;
+                        panel.external_protocol_error = None;
+                    }
+                    Ok(ExternalProtocolChangeResult::Mismatch {
+                        operation_status,
+                        readback,
+                    }) => {
+                        let (status, readback_error) = match readback {
+                            Ok(status) => (status, None),
+                            Err(error) => (operation_status, Some(super::localized_error(&error))),
+                        };
+                        panel.external_protocol_status = Some(status);
+                        panel.external_protocol_last_result = None;
+                        panel.external_protocol_requires_refresh = false;
+                        panel.external_protocol_outcome_unknown = false;
+                        panel.external_protocol_error_is_operation = true;
+                        panel.external_protocol_error = Some(readback_error.map_or_else(|| {
                             crate::locale::text(
-                                "操作后的系统回读与预期不符，请刷新状态后再操作。",
-                                "The system readback did not match the requested change. Refresh before trying again.",
+                                "操作后的系统状态与预期不符，已读取当前状态。",
+                                "The system state did not match the requested change; the current state has been read.",
                             )
                             .to_string()
-                        });
+                        }, |readback_error| {
+                            format!("{} {}", crate::locale::text(
+                                "操作后的系统回读与预期不符；再次读取失败，当前状态以操作回执为准。",
+                                "The system state did not match the requested change. A second read failed; the operation receipt is shown.",
+                            ), readback_error)
+                        }));
+                    }
+                    Ok(ExternalProtocolChangeResult::Failed { error, readback }) => {
+                        panel.external_protocol_outcome_unknown =
+                            error.public_code() == PublicErrorCode::OutcomeUnknown;
+                        panel.external_protocol_error_is_operation = true;
+                        panel.external_protocol_last_result = None;
+                        match readback {
+                            Ok(status) => {
+                                panel.external_protocol_status = Some(status);
+                                panel.external_protocol_requires_refresh = false;
+                                panel.external_protocol_error =
+                                    Some(localized_external_protocol_error(&error));
+                            }
+                            Err(readback_error) => {
+                                panel.external_protocol_status = None;
+                                panel.external_protocol_requires_refresh = true;
+                                panel.external_protocol_error = Some(format!(
+                                    "{} {} {} {}",
+                                    localized_external_protocol_error(&error),
+                                    crate::locale::text(
+                                        "重新读取状态也失败：",
+                                        "Reading the status again also failed:",
+                                    ),
+                                    super::localized_error(&readback_error),
+                                    crate::locale::text(
+                                        "请关闭并重新打开设置以再次读取状态。",
+                                        "Close and reopen Settings to read the status again.",
+                                    ),
+                                ));
+                            }
+                        }
                     }
                     Err(error) => {
-                        panel.external_protocol_status = None;
+                        panel.external_protocol_status = prior_status;
                         panel.external_protocol_error =
                             Some(localized_external_protocol_error(&error));
                         panel.external_protocol_error_is_operation = true;
-                        panel.external_protocol_outcome_unknown =
-                            error.public_code() == PublicErrorCode::OutcomeUnknown;
-                        panel.external_protocol_requires_refresh = true;
+                        panel.external_protocol_outcome_unknown = false;
+                        panel.external_protocol_requires_refresh = false;
                         panel.external_protocol_last_result = None;
                     }
                 }

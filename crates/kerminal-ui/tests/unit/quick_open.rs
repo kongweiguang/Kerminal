@@ -45,6 +45,7 @@ fn history_insertability_rejects_controls_and_unbounded_text() {
 fn workspace_search_returns_the_exact_open_tab_identity() {
     let tab_id = TabId::new();
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: None,
         selected_machine_id: Some("host-1".to_owned()),
@@ -88,6 +89,7 @@ fn workspace_subtitles_hide_machine_ids_and_omit_blank_cwd() {
     let tab_id = TabId::new();
     let pane_id = PaneId::new();
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: Some(pane_id.clone()),
         selected_machine_id: Some("machine-local".to_owned()),

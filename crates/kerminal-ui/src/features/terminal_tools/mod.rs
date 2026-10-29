@@ -12,6 +12,7 @@ pub mod selection;
 mod view;
 
 pub use broadcast::{BroadcastEvent, BroadcastTargetPicker, BroadcastTargetProjection};
+pub(crate) use command_blocks::LatestSubmittedCommandBlock;
 pub use command_blocks::{
     CommandBlockAction, CommandBlockContent, CommandBlockContentUnavailable, CommandBlockEvent,
     CommandBlockProjection, CommandBlockTimeline, TextHighlightRange, TextSegment,

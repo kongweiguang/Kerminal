@@ -31,7 +31,10 @@ use kerminal_application::{
         RuntimeHealthCollector,
     },
     executor::ApplicationTaskExecutor,
-    files::{FileAccessProvider, FileBookmarkRepository, FileService},
+    files::{
+        FileAccessProvider, FileBookmarkRepository, FileService,
+        clipboard_download::{FileClipboardDownloadService, FileClipboardPort},
+    },
     mcp_runtime::{McpRuntimeControl, McpRuntimeSnapshot},
     operations::{
         OperationsCommandExecutor, OperationsService, PortForwardRuntime, ServerInfoCollector,
@@ -43,10 +46,7 @@ use kerminal_application::{
     preferences::{
         ConfigurationRepository, ConfigurationValidationService, PreferencesService,
         ProfileRepository, ProfileService,
-        settings::{
-            DesktopNotificationSettings, ExternalLaunchSettings, SftpPerformanceSettings,
-            TerminalInlineSuggestionSettings,
-        },
+        settings::{DesktopNotificationSettings, ExternalLaunchSettings, SftpPerformanceSettings},
     },
     sessions::{
         SessionTransportFactory,
@@ -90,8 +90,8 @@ use kerminal_infrastructure::{
     platform::{
         configuration_directory::SystemConfigurationDirectoryOpener,
         default_shell::SystemDefaultLocalShellProvider,
-        external_launch::SystemExternalProtocolAdapter, local_shells::SystemLocalShellDiscovery,
-        notification::NotifyRustAdapter,
+        external_launch::SystemExternalProtocolAdapter, file_clipboard::SystemFileClipboard,
+        local_shells::SystemLocalShellDiscovery, notification::NotifyRustAdapter,
     },
     session_logs::SessionLogStore,
     sessions::{
@@ -114,6 +114,27 @@ mod notification_bridge;
 use notification_bridge::NotificationBridge;
 
 const STARTUP_CLEANUP_BUDGET: Duration = Duration::from_secs(12);
+
+/// PowerShell 单引号字面量以重复单引号转义，路径中的空格和元字符不会改变命令结构。
+///
+/// @author kongweiguang
+fn powershell_literal_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// 组合根无法解析当前可执行文件时隐藏 validator 复制入口，不生成可能运行错误程序的命令。
+///
+/// @author kongweiguang
+fn configuration_validator_command(executable: &Path, configuration_root: &Path) -> Option<String> {
+    let executable = executable.to_str()?;
+    let configuration_root = configuration_root.to_str()?;
+    Some(format!(
+        "& {} --validate-config {}",
+        powershell_literal_argument(executable),
+        powershell_literal_argument(configuration_root),
+    ))
+}
+
 /// 桌面唯一服务组合根；同一配置、会话、Vault、连接和 Tokio 执行器在各入口间共享。
 pub struct DesktopComposition {
     runtime: Handle,
@@ -407,6 +428,12 @@ impl DesktopComposition {
             )),
             Some(Arc::new(host_management.clone())),
         )?;
+        let file_clipboard_port: Arc<dyn FileClipboardPort> = Arc::new(SystemFileClipboard::new()?);
+        let file_clipboard_download = FileClipboardDownloadService::new(
+            files.clone(),
+            transfers.clone(),
+            file_clipboard_port,
+        );
 
         let workspace_storage = WorkspaceSessionStore::new(storage.clone(), writable);
         let workspace_repository: Arc<dyn WorkspaceSessionRepository> = Arc::new(workspace_storage);
@@ -452,7 +479,10 @@ impl DesktopComposition {
                 agent_workspace_repository,
                 Arc::new(preferences.clone()),
             )
-            .with_profile_service(Arc::new(profiles.clone())),
+            .with_profile_service(Arc::new(profiles.clone()))
+            .with_launcher_installation_probe(Arc::new(
+                kerminal_infrastructure::agents::PathAgentLauncherInstallationProbe,
+            )),
         );
         let agent_service: Arc<dyn AgentService> = agent_manager.clone();
 
@@ -493,7 +523,11 @@ impl DesktopComposition {
             profiles.clone(),
         )
         .with_vault_keys(vault_keys)
+        .with_screen_color_sampler(Arc::new(
+            kerminal_infrastructure::platform::color_sampler::PlatformScreenColorSampler,
+        ))
         .with_workspace_sessions(workspace_sessions)
+        .with_file_clipboard_download(file_clipboard_download)
         .with_files(
             files.clone(),
             transfers.clone(),
@@ -502,6 +536,12 @@ impl DesktopComposition {
             },
         )
         .with_commands(commands.clone())
+        .with_commands_configuration_actions(
+            Some(config_root.join("snippets").to_string_lossy().into_owned()),
+            std::env::current_exe()
+                .ok()
+                .and_then(|executable| configuration_validator_command(&executable, &config_root)),
+        )
         .with_configuration_directory(configuration_directory)
         .with_snippet_transfer_files(snippet_transfer_files)
         .with_configuration_validation(configuration_validation.clone())
@@ -757,9 +797,9 @@ fn create_serial_port_service() -> Arc<SerialPortService> {
     Arc::new(SerialPortService::new(repository))
 }
 
-/// 一次读取已验证的设置快照，为外部启动、通知和远端建议共享同一初始化结果。
+/// 一次读取已验证的设置快照；远端建议策略只映射配置仓储是否可用。
 ///
-/// 配置恢复态不读取可能损坏的设置来启动外部入口或远端 I/O，动态能力采用安全关闭策略。
+/// 用户来源偏好按 application 请求筛选，恢复态仍由 application、composition 和 provider 关闭远端 I/O。
 async fn initial_runtime_settings(
     preferences: &PreferencesService,
     writable: bool,
@@ -780,8 +820,7 @@ async fn initial_runtime_settings(
         ));
     }
     let settings = preferences.load_settings().await?.settings;
-    let remote_suggestion_policy =
-        remote_suggestion_policy_from_settings(&settings.terminal.inline_suggestion);
+    let remote_suggestion_policy = RemoteSuggestionPolicy::new(true);
     let sftp_settings = settings.sftp;
     let auto_reconnect_enabled = settings.terminal.auto_reconnect;
     Ok((
@@ -808,24 +847,9 @@ fn disabled_notification_settings() -> DesktopNotificationSettings {
     DesktopNotificationSettings::default()
 }
 
-/// 根据同一份有效设置构造远端补全门禁，不在补全 provider 中重复解释配置文件。
-fn remote_suggestion_policy_from_settings(
-    settings: &TerminalInlineSuggestionSettings,
-) -> RemoteSuggestionPolicy {
-    let policy = RemoteSuggestionPolicy::new(settings.remote_probe_enabled);
-    policy.set_remote_path_enabled(settings.providers.remote_path);
-    policy.set_remote_command_enabled(settings.providers.remote_command);
-    policy.set_git_enabled(settings.providers.git);
-    policy
-}
-
 /// 配置恢复或校验失败时关闭远端补全，避免损坏配置继续触发 SSH/SFTP 探测。
 fn disabled_remote_suggestion_policy() -> RemoteSuggestionPolicy {
-    let policy = RemoteSuggestionPolicy::new(false);
-    policy.set_remote_path_enabled(false);
-    policy.set_remote_command_enabled(false);
-    policy.set_git_enabled(false);
-    policy
+    RemoteSuggestionPolicy::new(false)
 }
 
 /// 配置刷新 worker 共享同一份依赖快照，避免函数参数列表掩盖这些策略的协同关系。
@@ -947,8 +971,8 @@ async fn reload_runtime_settings(
             );
             update_remote_suggestion_policy_safely(
                 remote_suggestion_policy,
-                remote_suggestion_policy_from_settings(
-                    &snapshot.settings.terminal.inline_suggestion,
+                RemoteSuggestionPolicy::new(
+                    preferences.recovery_state().mode == ConfigurationMode::ReadWrite,
                 ),
             );
             update_sftp_transfer_policy_safely(sftp_transfer_policy, snapshot.settings.sftp);
@@ -996,15 +1020,12 @@ async fn update_auto_reconnect_safely(sessions: &dyn SessionService, enabled: bo
     }
 }
 
-/// 将新的策略值复制到 provider 持有的共享原子门禁，保证更新不重建活跃服务。
+/// 将新的恢复态硬门禁复制到 provider 持有的共享原子值，不改写用户来源偏好。
 fn update_remote_suggestion_policy_safely(
     policy: &RemoteSuggestionPolicy,
     updated: RemoteSuggestionPolicy,
 ) {
-    policy.set_remote_probe_enabled(updated.remote_probe_enabled());
-    policy.set_remote_path_enabled(updated.remote_path_enabled());
-    policy.set_remote_command_enabled(updated.remote_command_enabled());
-    policy.set_git_enabled(updated.git_enabled());
+    policy.set_runtime_available(updated.runtime_available());
 }
 
 /// 将有效通知策略应用到同一个服务实例；同步锁错误通过诊断显式保留。

@@ -4,17 +4,18 @@
 
 use super::{
     ContainerStatusFilter, DirtyOperationTargets, LatestRequestState, SectionPhase,
-    SectionSelection, SectionState, ServerInfoHistory, container_primary_action, filter_containers,
-    group_container_projects, group_container_projects_with_retained, network_rate_label,
-    time_series_position, tmux_confirmation_session_matches,
+    SectionSelection, SectionState, ServerInfoHistory, ServerNetworkFilter, filter_containers,
+    filtered_network_rates, group_container_projects, group_container_projects_with_retained,
+    network_rate_label, time_series_position, tmux_confirmation_session_matches,
 };
 use crate::features::operations::{
     ActiveOperationsPaneTarget, ContainerOutputKind, ContainerOutputTarget, DetailReadPhase,
-    DetailReadState, OperationsSection, TmuxAttachIntent, TmuxAttachTarget,
-    TmuxAttachTerminalBinding, TmuxDetailState, ToolRailOperationTarget, forward_form_can_save,
-    resolve_forward_add_host, resolve_forward_form_host, resolve_tool_rail_operation_target,
-    tmux_attach_binding_matches_target, tmux_attach_intent_can_detach,
-    tmux_attach_intent_matches_current,
+    DetailReadState, OperationsSection, TmuxAttachTarget, TmuxAttachTerminalBinding,
+    TmuxDetachIntent, TmuxDetailState, ToolRailOperationTarget, forward_form_can_save,
+    forward_unavailable_hint, resolve_forward_add_host, resolve_forward_form_host,
+    resolve_ports_panel_target, resolve_tool_rail_operation_target,
+    tmux_attach_binding_matches_target, tmux_detach_intent_can_send,
+    tmux_detach_intent_matches_current,
 };
 use kerminal_application::sessions::UiSessionBinding;
 use kerminal_domain::{
@@ -23,8 +24,9 @@ use kerminal_domain::{
     operations::{
         ComposeMetadata, ComposeProjectTarget, ContainerRuntime as OperationsContainerRuntime,
         ContainerStatus, ContainerSummary, ContainerTarget, CpuSnapshot, DiskSnapshot, GpuSnapshot,
-        MemorySnapshot, ServerInfoProbeFailure, ServerInfoProbeStatus, ServerInfoSampleTimes,
-        ServerInfoSnapshot, ServerInfoTarget, TmuxSession, TmuxTarget,
+        MemorySnapshot, NetworkCounterSnapshot, NetworkRateSnapshot, ServerInfoProbeFailure,
+        ServerInfoProbeStatus, ServerInfoSampleTimes, ServerInfoSnapshot, ServerInfoTarget,
+        TmuxSession, TmuxTarget,
     },
     sessions::SessionOwner,
 };
@@ -287,6 +289,36 @@ fn forward_add_target_requires_an_explicit_ssh_target() {
     );
 }
 
+/// 容器 pane 即使带有 SSH 宿主也只显示专用说明，不能借侧栏选择主机创建隧道。
+///
+/// @author kongweiguang
+#[test]
+fn container_forwarding_context_shows_hint_without_host_fallback() {
+    let container_host = HostId::parse("container-host").unwrap();
+    let selected_host = HostId::parse("selected-host").unwrap();
+    let container_target = ContainerTarget {
+        host_id: Some(container_host.clone()),
+        runtime: OperationsContainerRuntime::Docker,
+        container_id: "container-1".to_owned(),
+    };
+    let target = resolve_ports_panel_target(
+        ToolRailOperationTarget::Ssh {
+            host_id: container_host,
+        },
+        Some(&container_target),
+    );
+
+    assert_eq!(target, ToolRailOperationTarget::Unavailable);
+    assert_eq!(
+        forward_unavailable_hint(Some(&container_target)).0,
+        "当前容器目标不支持直接创建 SSH 隧道。请切回宿主 SSH 主机管理端口转发。"
+    );
+    assert_eq!(
+        resolve_forward_add_host(Some(&target), Some(&selected_host)),
+        None
+    );
+}
+
 /// Add 保存持续使用打开时冻结的 HostId，编辑优先绑定原定义且无快照时保持无目标。
 ///
 /// @author kongweiguang
@@ -363,7 +395,7 @@ fn selected_host_tmux_query_does_not_enable_unbound_attach() {
 /// 给纯身份比较测试构造真实 UI owner，使 pane 与重连 generation 都参与完全相等校验。
 ///
 /// @author kongweiguang
-fn tmux_attach_intent_fixture() -> (TmuxAttachIntent, TmuxTarget, TmuxAttachTerminalBinding) {
+fn tmux_detach_intent_fixture() -> (TmuxDetachIntent, TmuxTarget, TmuxAttachTerminalBinding) {
     let host_id = HostId::new();
     let pane_id = PaneId::new();
     let terminal = TmuxAttachTerminalBinding {
@@ -386,68 +418,63 @@ fn tmux_attach_intent_fixture() -> (TmuxAttachIntent, TmuxTarget, TmuxAttachTerm
         socket_name: Some("work".to_owned()),
         ..TmuxTarget::default()
     };
-    let intent = TmuxAttachIntent {
+    let intent = TmuxDetachIntent {
         target: target.clone(),
-        session_id: "$7".to_owned(),
         terminal: terminal.clone(),
     };
     (intent, target, terminal)
 }
 
-/// Attach 入队意图仅可用于完全相同的 tmux socket/session 和 pane owner/generation。
+/// Header detach 不依赖先前 attach 或 session 快照，但仍绑定 tmux target 与 pane owner/generation。
 ///
 /// @author kongweiguang
 #[test]
-fn tmux_detach_intent_rejects_stale_target_session_and_terminal_binding() {
-    let (intent, target, terminal) = tmux_attach_intent_fixture();
-    assert!(tmux_attach_intent_matches_current(
-        &intent, &target, "$7", &terminal
+fn tmux_detach_intent_rejects_stale_target_and_terminal_binding() {
+    let (intent, target, terminal) = tmux_detach_intent_fixture();
+    assert!(tmux_detach_intent_matches_current(
+        &intent, &target, &terminal
     ));
-    assert!(tmux_attach_intent_can_detach(
-        &intent, &target, "$7", &terminal, true, true, false, false
+    assert!(tmux_detach_intent_can_send(
+        &intent, &target, &terminal, false, false
     ));
-    assert!(!tmux_attach_intent_can_detach(
-        &intent, &target, "$7", &terminal, false, true, false, false
+    assert!(!tmux_detach_intent_can_send(
+        &intent, &target, &terminal, true, false
     ));
-    assert!(!tmux_attach_intent_can_detach(
-        &intent, &target, "$7", &terminal, true, false, false, false
-    ));
-    assert!(!tmux_attach_intent_can_detach(
-        &intent, &target, "$7", &terminal, true, true, false, true
-    ));
-    assert!(!tmux_attach_intent_can_detach(
-        &intent, &target, "$7", &terminal, true, true, true, false
+    assert!(!tmux_detach_intent_can_send(
+        &intent, &target, &terminal, false, true
     ));
 
     let other_socket = TmuxTarget {
         socket_name: Some("other".to_owned()),
         ..target.clone()
     };
-    assert!(!tmux_attach_intent_matches_current(
+    assert!(!tmux_detach_intent_matches_current(
         &intent,
         &other_socket,
-        "$7",
-        &terminal,
-    ));
-    assert!(!tmux_attach_intent_matches_current(
-        &intent, &target, "$8", &terminal
+        &terminal
     ));
 
     let mut reconnected_terminal = terminal.clone();
     reconnected_terminal.binding.session_generation += 1;
-    assert!(!tmux_attach_intent_matches_current(
+    assert!(!tmux_detach_intent_matches_current(
         &intent,
         &target,
-        "$7",
         &reconnected_terminal,
+    ));
+
+    let mut changed_working_directory = terminal.clone();
+    changed_working_directory.working_directory = Some("/srv/other".to_owned());
+    assert!(tmux_detach_intent_matches_current(
+        &intent,
+        &target,
+        &changed_working_directory,
     ));
 
     let mut other_pane = terminal.clone();
     other_pane.pane_id = PaneId::new();
-    assert!(!tmux_attach_intent_matches_current(
+    assert!(!tmux_detach_intent_matches_current(
         &intent,
         &target,
-        "$7",
         &other_pane
     ));
 }
@@ -585,6 +612,139 @@ fn server_history_deduplicates_and_bounds_fast_samples() {
     assert_eq!(history.samples().back().unwrap().sampled_at_unix_ms, 65);
 }
 
+/// 主版先按有效速率排名再筛选，且相同流量保留采集顺序。
+///
+/// @author kongweiguang
+#[test]
+fn network_interfaces_rank_sampled_rates_before_filtering() {
+    let rates = vec![
+        network_rate("lo", Some(0.5), Some(0.5)),
+        network_rate("enp0s1", Some(2.0), Some(3.0)),
+        network_rate("enp0s2", Some(40.0), Some(10.0)),
+        network_rate("enp0s3", Some(20.0), Some(30.0)),
+        network_rate("docker0", Some(100.0), Some(100.0)),
+    ];
+    let counters = Vec::new();
+
+    let all = filtered_network_rates(&rates, &counters, ServerNetworkFilter::All);
+    assert_eq!(
+        all.iter()
+            .map(|rate| rate.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["docker0", "enp0s2", "enp0s3", "enp0s1", "lo"]
+    );
+
+    let primary = filtered_network_rates(&rates, &counters, ServerNetworkFilter::Primary);
+    assert_eq!(
+        primary
+            .iter()
+            .map(|rate| rate.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["enp0s2", "enp0s3", "enp0s1"]
+    );
+
+    let virtual_rates = filtered_network_rates(&rates, &counters, ServerNetworkFilter::Virtual);
+    assert_eq!(
+        virtual_rates
+            .iter()
+            .map(|rate| rate.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["docker0"]
+    );
+}
+
+/// 首次速率样本缺失时按当前收发计数排名，再从非回环接口选择 Primary 回退目标。
+///
+/// @author kongweiguang
+#[test]
+fn network_interfaces_rank_counters_before_primary_fallback() {
+    let rates = vec![
+        network_rate("lo", None, None),
+        network_rate("docker0", None, None),
+        network_rate("tun0", None, None),
+        network_rate("cni0", None, None),
+    ];
+    let counters = vec![
+        NetworkCounterSnapshot {
+            name: "lo".to_owned(),
+            rx_bytes: 1_000,
+            tx_bytes: 0,
+        },
+        NetworkCounterSnapshot {
+            name: "docker0".to_owned(),
+            rx_bytes: 100,
+            tx_bytes: 0,
+        },
+        NetworkCounterSnapshot {
+            name: "tun0".to_owned(),
+            rx_bytes: 101,
+            tx_bytes: 0,
+        },
+        NetworkCounterSnapshot {
+            name: "cni0".to_owned(),
+            rx_bytes: 10,
+            tx_bytes: 0,
+        },
+    ];
+
+    let all = filtered_network_rates(&rates, &counters, ServerNetworkFilter::All);
+    assert_eq!(
+        all.iter()
+            .map(|rate| rate.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["lo", "tun0", "docker0", "cni0"]
+    );
+    let primary = filtered_network_rates(&rates, &counters, ServerNetworkFilter::Primary);
+    assert_eq!(
+        primary
+            .iter()
+            .map(|rate| rate.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tun0"]
+    );
+}
+
+/// 概览历史只汇总 Primary 接口；缺测方向保留断点，无物理接口时按 main 选择流量最高的非回环接口。
+///
+/// @author kongweiguang
+#[test]
+fn server_history_keeps_primary_network_rate_gaps_without_cross_role_fallback() {
+    let mut history = ServerInfoHistory::default();
+    let mut primary = server_snapshot(ServerInfoTarget::Local, 100);
+    primary.network_rates = vec![
+        network_rate("lo", Some(1_000.0), Some(1_000.0)),
+        network_rate("enp0s1", Some(100.0), None),
+        network_rate("enp0s2", None, Some(200.0)),
+        network_rate("docker0", Some(500.0), Some(700.0)),
+    ];
+    assert!(history.record(&primary));
+    let sample = history.samples().back().unwrap();
+    assert_eq!(sample.receive_bytes_per_second, Some(100.0));
+    assert_eq!(sample.transmit_bytes_per_second, Some(200.0));
+
+    let mut partial = server_snapshot(ServerInfoTarget::Local, 200);
+    partial.network_rates = vec![
+        network_rate("lo", Some(1.0), Some(2.0)),
+        network_rate("enp0s1", None, Some(7.0)),
+        network_rate("docker0", Some(50.0), Some(60.0)),
+    ];
+    assert!(history.record(&partial));
+    let sample = history.samples().back().unwrap();
+    assert_eq!(sample.receive_bytes_per_second, None);
+    assert_eq!(sample.transmit_bytes_per_second, Some(7.0));
+
+    let mut virtual_only = server_snapshot(ServerInfoTarget::Local, 300);
+    virtual_only.network_rates = vec![
+        network_rate("lo", Some(1.0), Some(2.0)),
+        network_rate("docker0", Some(20.0), Some(30.0)),
+        network_rate("tun0", Some(40.0), Some(50.0)),
+    ];
+    assert!(history.record(&virtual_only));
+    let sample = history.samples().back().unwrap();
+    assert_eq!(sample.receive_bytes_per_second, Some(40.0));
+    assert_eq!(sample.transmit_bytes_per_second, Some(50.0));
+}
+
 /// 目标切换时不把旧主机曲线展示给新容器，缺失 Fast 时间也不会制造样本点。
 #[test]
 fn server_history_resets_on_target_change_and_requires_fast_sample_time() {
@@ -614,8 +774,17 @@ fn server_history_resets_on_target_change_and_requires_fast_sample_time() {
 /// 搜索同时覆盖容器身份和 Compose 名称，状态筛选只看领域枚举。
 #[test]
 fn container_search_and_status_filters_use_real_summary_fields() {
+    let mut api = container_summary("api", "a1", ContainerStatus::Running, Some("shop"));
+    api.target.runtime = ContainerRuntime::Docker;
+    api.image = "node:24".to_owned();
+    api.ports.push("8080:80/tcp".to_owned());
+    let compose = api.compose.as_mut().unwrap();
+    compose.service = Some("web".to_owned());
+    compose.working_dir = Some("/srv/shop".to_owned());
+    compose.config_paths = vec!["/srv/shop/compose.yaml".to_owned()];
+
     let rows = vec![
-        container_summary("api", "a1", ContainerStatus::Running, Some("shop")),
+        api,
         container_summary("worker", "b2", ContainerStatus::Exited, Some("shop")),
         container_summary("cache", "c3", ContainerStatus::Running, None),
     ];
@@ -627,14 +796,6 @@ fn container_search_and_status_filters_use_real_summary_fields() {
             .map(|row| row.name.as_str())
             .collect::<Vec<_>>(),
         ["api", "cache"]
-    );
-    let stopped = filter_containers(&rows, "", ContainerStatusFilter::Stopped);
-    assert_eq!(
-        stopped
-            .iter()
-            .map(|row| row.name.as_str())
-            .collect::<Vec<_>>(),
-        ["worker"]
     );
     let project = filter_containers(&rows, "SHOP", ContainerStatusFilter::All);
     assert_eq!(
@@ -652,53 +813,24 @@ fn container_search_and_status_filters_use_real_summary_fields() {
             .collect::<Vec<_>>(),
         ["cache"]
     );
-}
 
-/// Stopped 仅覆盖已退出、未启动和终止态；过渡/暂停/未知状态不显示错误的 Start。
-///
-/// @author kongweiguang
-#[test]
-fn stopped_filter_and_primary_actions_match_container_lifecycle_states() {
-    let rows = [
-        ("running", ContainerStatus::Running),
-        ("exited", ContainerStatus::Exited),
-        ("created", ContainerStatus::Created),
-        ("dead", ContainerStatus::Dead),
-        ("paused", ContainerStatus::Paused),
-        ("restarting", ContainerStatus::Restarting),
-        ("unknown", ContainerStatus::Unknown),
-    ]
-    .into_iter()
-    .map(|(name, status)| container_summary(name, name, status, None))
-    .collect::<Vec<_>>();
-
-    let stopped = filter_containers(&rows, "", ContainerStatusFilter::Stopped);
-    assert_eq!(
-        stopped
-            .iter()
-            .map(|row| row.name.as_str())
-            .collect::<Vec<_>>(),
-        ["exited", "created", "dead"]
-    );
-    assert_eq!(
-        container_primary_action(ContainerStatus::Running),
-        Some(kerminal_domain::operations::ContainerAction::Stop)
-    );
-    assert_eq!(
-        container_primary_action(ContainerStatus::Exited),
-        Some(kerminal_domain::operations::ContainerAction::Start)
-    );
-    assert_eq!(
-        container_primary_action(ContainerStatus::Created),
-        Some(kerminal_domain::operations::ContainerAction::Start)
-    );
-    for status in [
-        ContainerStatus::Paused,
-        ContainerStatus::Restarting,
-        ContainerStatus::Dead,
-        ContainerStatus::Unknown,
+    for query in [
+        "node:24",
+        "web",
+        "8080:80/tcp",
+        "/srv/shop",
+        "compose.yaml",
+        "docker",
     ] {
-        assert_eq!(container_primary_action(status), None);
+        let matches = filter_containers(&rows, query, ContainerStatusFilter::All);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["api"],
+            "query {query:?} should match the container's searchable metadata"
+        );
     }
 }
 
@@ -830,17 +962,25 @@ fn metric_plot_uses_real_time_and_absolute_percentage_scale() {
     assert_eq!(time_series_position(150, 101.0, 100, 200, 0.0, 100.0), None);
 }
 
-/// 网络速率使用可读二进制单位，缺失与非法值均保持未知。
+/// 网络速率沿用 main 的 KB/MB 标签，未建立差分基线时显示采样中。
+///
+/// @author kongweiguang
 #[test]
 fn network_rate_labels_keep_units_and_unknown_state() {
     assert_eq!(network_rate_label(Some(512.0)), "512 B/s");
-    assert_eq!(network_rate_label(Some(1536.0)), "1.5 KiB/s");
-    assert_eq!(network_rate_label(Some(1_572_864.0)), "1.5 MiB/s");
-    assert_eq!(network_rate_label(None), "—");
+    assert_eq!(network_rate_label(Some(1536.0)), "1.5 KB/s");
+    assert_eq!(network_rate_label(Some(1_572_864.0)), "1.5 MB/s");
+    assert_eq!(network_rate_label(Some(1_610_612_736.0)), "1.5 GB/s");
+    assert_eq!(network_rate_label(Some(1_649_267_441_664.0)), "1.5 TB/s");
+    assert_eq!(
+        network_rate_label(None),
+        crate::locale::text("采样中", "Sampling…").to_string()
+    );
     assert_eq!(network_rate_label(Some(f64::NAN)), "—");
 }
 
 /// 慢速曲线只追加新层级回执，并在探针不可用时保留真实断点。
+/// 测试直接读取子模块可见的私有状态，避免只供测试的访问器进入生产 API。
 #[test]
 fn server_history_keeps_slow_tiers_independent_and_gaps_missing_reads() {
     let mut history = ServerInfoHistory::default();
@@ -861,15 +1001,15 @@ fn server_history_keeps_slow_tiers_independent_and_gaps_missing_reads() {
         gpu_snapshot("gpu-1", Some(70.0)),
     ];
     assert!(history.record(&first));
-    assert_eq!(history.disk_mount(), Some("/"));
-    assert_eq!(history.disk_samples().back().unwrap().value, Some(40.0));
+    assert_eq!(history.disk_mount.as_deref(), Some("/"));
+    assert_eq!(history.disk_samples.back().unwrap().value, Some(40.0));
     assert_eq!(history.gpu_samples.back().unwrap().value, Some(50.0));
 
     let mut fast_only = server_snapshot(ServerInfoTarget::Local, 200);
     fast_only.sample_times.slow_at_unix_ms = Some(80);
     fast_only.sample_times.gpu_at_unix_ms = Some(70);
     assert!(history.record(&fast_only));
-    assert_eq!(history.disk_samples().len(), 1);
+    assert_eq!(history.disk_samples.len(), 1);
     assert_eq!(history.gpu_samples.len(), 1);
 
     let mut missing = server_snapshot(ServerInfoTarget::Local, 300);
@@ -879,11 +1019,12 @@ fn server_history_keeps_slow_tiers_independent_and_gaps_missing_reads() {
         ServerInfoProbeStatus::Unavailable(ServerInfoProbeFailure::PermissionDenied);
     missing.gpu_probe_status = ServerInfoProbeStatus::Unavailable(ServerInfoProbeFailure::NotFound);
     assert!(history.record(&missing));
-    assert_eq!(history.disk_samples().back().unwrap().value, None);
+    assert_eq!(history.disk_samples.back().unwrap().value, None);
     assert_eq!(history.gpu_samples.back().unwrap().value, None);
 }
 
 /// 越界百分比不被夹为 0 或 100，趋势中的该点应保留为缺口。
+/// 测试直接读取子模块可见的私有状态，避免只供测试的访问器进入生产 API。
 ///
 /// @author kongweiguang
 #[test]
@@ -906,7 +1047,7 @@ fn server_history_rejects_out_of_range_percentage_samples() {
     let mut history = ServerInfoHistory::default();
     assert!(history.record(&snapshot));
     assert_eq!(history.samples().back().unwrap().cpu_percent, None);
-    assert_eq!(history.disk_samples().back().unwrap().value, None);
+    assert_eq!(history.disk_samples.back().unwrap().value, None);
     assert_eq!(history.gpu_samples.back().unwrap().value, None);
 }
 
@@ -963,6 +1104,22 @@ fn gpu_snapshot(id: &str, utilization_percent: Option<f64>) -> GpuSnapshot {
         memory_used_bytes: None,
         temperature_celsius: None,
         power_watts: None,
+    }
+}
+
+/// 为网络历史回归构造单个接口读数，并允许独立模拟收发缺测。
+///
+/// @author kongweiguang
+fn network_rate(
+    name: &str,
+    rx_bytes_per_second: Option<f64>,
+    tx_bytes_per_second: Option<f64>,
+) -> NetworkRateSnapshot {
+    NetworkRateSnapshot {
+        name: name.to_owned(),
+        rx_bytes_per_second,
+        tx_bytes_per_second,
+        counter_reset: false,
     }
 }
 

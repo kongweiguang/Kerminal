@@ -72,7 +72,7 @@ pub(super) fn render_compact_host_drawer(
         .right(px(right_inset))
         .occlude()
         .flex()
-        .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.22))
+        .bg(theme.scrim)
         .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
             root.dismiss_compact_drawer(None, window, cx);
         }))
@@ -126,7 +126,8 @@ pub(super) fn render_compact_host_drawer(
 }
 
 /// 抽屉以原 ToolId 约束 X、遮罩和 Escape 的关闭 owner；只接冒泡按键，Agent PTY 和子输入优先消费。
-/// 宽度夹紧到可用区域并贴右边缘，不把窄窗工具误画成占满中央区的弹框；用户保存的宽度不改写。
+/// 遮罩覆盖标题栏下方整个 body；仅面板留 8px 间距，避免把 Rail 或边缘露成可操作区域。
+/// 验收 feature 单独记录实际表面边界，普通元素 id 不承担原生绘制可观测性的契约。
 ///
 /// @author kongweiguang
 pub(super) fn render_compact_tool_drawer(
@@ -134,74 +135,98 @@ pub(super) fn render_compact_tool_drawer(
     tool: ToolRailToolId,
     layout: ToolDrawerLayout,
     theme: ThemeTokens,
-    panel_background: gpui_kit::Hsla,
+    _panel_background: gpui_kit::Hsla,
     focus_handle: &FocusHandle,
     cx: &mut Context<RootView>,
 ) -> AnyElement {
     let close_label = crate::locale::text("关闭工具面板", "Close tool panel");
-    div()
-        .id("workbench-compact-tool-drawer-overlay")
-        .absolute()
-        .top_0()
-        .bottom_0()
-        .left(px(layout.left))
-        .right(px(layout.right))
-        .occlude()
-        .flex()
-        .justify_end()
-        .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.22))
-        .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
-            root.dismiss_compact_drawer(Some(tool), window, cx);
-        }))
-        .child(
-            div()
-                .id("workbench-compact-tool-drawer-surface")
-                .on_key_down(cx.listener(move |root, event, window, cx| {
-                    root.handle_compact_drawer_key_down(Some(tool), event, window, cx);
-                }))
-                .w(px(layout.width))
-                .h_full()
-                .min_w(px(0.))
-                .min_h(px(0.))
-                .occlude()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .border_l_1()
-                .border_color(theme.border)
-                .bg(panel_background)
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .id("workbench-compact-tool-drawer-header")
-                        .w_full()
-                        .h(px(40.))
-                        .flex_shrink_0()
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .text_color(theme.foreground)
-                        .child(tool_rail_label(tool))
-                        .child(
-                            Button::new("workbench-close-compact-tool-drawer")
-                                .compact()
-                                .ghost()
-                                .icon(IconName::X)
-                                .accessibility_label(close_label.clone())
-                                .tooltip(close_label)
-                                .tab_stop(true)
-                                .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
-                                    root.dismiss_compact_drawer(Some(tool), window, cx);
-                                })),
-                        ),
-                )
-                .child(content)
-                .focus_trap("workbench-compact-tool-drawer-focus-trap", focus_handle),
-        )
-        .into_any_element()
+    crate::ui_backdrop::compact_backdrop(
+        div()
+            .id("workbench-compact-tool-drawer-overlay")
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .left(px(layout.left))
+            .right(px(layout.right))
+            .occlude()
+            .flex()
+            .justify_end()
+            .pr(px(8.))
+            .py(px(8.))
+            .bg(theme.tool_drawer_scrim)
+            .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
+                root.dismiss_compact_drawer(Some(tool), window, cx);
+            }))
+            .child(crate::ui_backdrop::floating_surface(
+                div()
+                    .id("workbench-compact-tool-drawer-surface")
+                    .when(cfg!(feature = "right-rail-acceptance"), |surface| {
+                        surface.debug_selector(|| "workbench-compact-tool-drawer-surface".into())
+                    })
+                    .on_key_down(cx.listener(move |root, event, window, cx| {
+                        root.handle_compact_drawer_key_down(Some(tool), event, window, cx);
+                    }))
+                    .w(px(layout.width))
+                    .h_full()
+                    .min_w(px(0.))
+                    .min_h(px(0.))
+                    .occlude()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .rounded(theme.radius_panel)
+                    .shadow_lg()
+                    .border_1()
+                    .border_color(theme.tool_panel_border)
+                    .bg(theme.floating_surface)
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .id("workbench-compact-tool-drawer-header")
+                            .w_full()
+                            .h(px(40.))
+                            .flex_shrink_0()
+                            .px(px(8.))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(theme.tool_panel_border)
+                            .text_color(theme.muted)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .px(px(8.))
+                                    .text_size(px(12.))
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .overflow_hidden()
+                                    .child(tool_rail_label(tool)),
+                            )
+                            .child(
+                                Button::new("workbench-close-compact-tool-drawer")
+                                    .compact()
+                                    .ghost()
+                                    .w(px(32.))
+                                    .h(px(32.))
+                                    .icon(IconName::X)
+                                    .accessibility_label(close_label.clone())
+                                    .tooltip(crate::locale::text("关闭", "Close"))
+                                    .tab_stop(true)
+                                    .on_click(cx.listener(
+                                        move |root, _: &ClickEvent, window, cx| {
+                                            root.dismiss_compact_drawer(Some(tool), window, cx);
+                                        },
+                                    )),
+                            ),
+                    )
+                    .child(content)
+                    .focus_trap("workbench-compact-tool-drawer-focus-trap", focus_handle),
+                theme,
+                theme.radius_panel,
+            )),
+        theme,
+    )
 }
 
 /// 抽屉复用右栏共享宽度并夹紧到真实剩余视口，非有限测量不进入用户布局偏好。
@@ -215,7 +240,7 @@ pub(super) fn tool_drawer_width(
 ) -> f32 {
     let available = (viewport_width - left_inset - right_inset).max(0.0);
     let preferred = if preferred_width.is_finite() {
-        preferred_width.clamp(134.0, 1_364.0)
+        preferred_width.clamp(134.0, 440.0)
     } else {
         364.0
     };

@@ -2,12 +2,15 @@
 //!
 //! @author kongweiguang
 
-use std::{ffi::OsString, sync::Arc};
+use std::{
+    ffi::OsString,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult, PreferencesService, ProfileService,
-    agents::{AgentLaunchResolver, resolve_agent_launcher},
+    agents::{AgentLaunchResolver, AgentLauncherInstallationProbe, resolve_agent_launcher},
     preferences::{
         AgentLauncherSettings, ConfigurationGuideStatus, ConfigurationRepository,
         CustomAgentDefinition, DefaultLocalShellProvider, ProfileDraft, ProfileRepository,
@@ -15,7 +18,7 @@ use kerminal_application::{
     },
 };
 use kerminal_domain::{
-    agents::{AgentLauncherKey, AgentProvider},
+    agents::{AgentLauncherKey, AgentProvider, AgentSessionLaunch},
     preferences::{
         ConfigDocument, ConfigDocumentPath, ConfigRevision, ConfigurationMode,
         ConfigurationRecoveryState, TerminalProfile,
@@ -470,7 +473,7 @@ async fn launch_resolver_observes_latest_settings_without_caching() {
     assert_eq!(second.args, ["--two"]);
 }
 
-/// Launcher catalog 只列可选身份与显示名，不泄漏自定义命令或声称 CLI 已安装。
+/// 普通选项和 Debug 不带自定义命令；只有本地展示读取器按精确 key 返回原文。
 ///
 /// @author kongweiguang
 #[tokio::test]
@@ -503,6 +506,102 @@ async fn launcher_catalog_contains_safe_configured_options() {
     let projection = format!("{catalog:?}");
     assert!(!projection.contains("review-cli"));
     assert!(!projection.contains("embedded-value"));
+    assert_eq!(
+        catalog.custom_command_for_display(&catalog.selected_key),
+        Some("review-cli --token embedded-value")
+    );
+    assert_eq!(
+        catalog.custom_command_for_display(
+            &AgentLauncherKey::builtin(AgentProvider::Codex).expect("builtin key")
+        ),
+        None
+    );
+
+    let (shell, args) = if cfg!(windows) {
+        (
+            "pwsh.exe".to_owned(),
+            vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                "review-cli --token embedded-value".to_owned(),
+            ],
+        )
+    } else {
+        (
+            "review-cli".to_owned(),
+            vec!["--token".to_owned(), "embedded-value".to_owned()],
+        )
+    };
+    let legacy_launch = AgentSessionLaunch {
+        command_label: "Renamed review launcher".to_owned(),
+        shell,
+        args,
+        cwd: "C:\\Users\\test\\.kerminal\\agents\\session".to_owned(),
+    };
+    assert!(catalog.matches_legacy_custom_launch(&catalog.selected_key, &legacy_launch));
+    let mut changed_launch = legacy_launch;
+    changed_launch.args.push("different-command".to_owned());
+    assert!(!catalog.matches_legacy_custom_launch(&catalog.selected_key, &changed_launch));
+    assert!(!catalog.matches_legacy_custom_launch(
+        &AgentLauncherKey::builtin(AgentProvider::Codex).expect("builtin key"),
+        &changed_launch,
+    ));
+}
+
+/// 记录固定 builtin 的探测调用，确认目录快照不会为 Custom 伪造安装状态。
+#[derive(Default)]
+struct RecordingLauncherInstallationProbe {
+    checked_commands: Mutex<Vec<String>>,
+}
+
+impl AgentLauncherInstallationProbe for RecordingLauncherInstallationProbe {
+    /// 测试探测器只回报预设存在的 Codex 命令，不启动任何外部进程。
+    fn is_installed(&self, command: &str, _cancellation: &CancellationToken) -> AppResult<bool> {
+        self.checked_commands
+            .lock()
+            .expect("probe call lock")
+            .push(command.to_owned());
+        Ok(command == "codex")
+    }
+}
+
+/// 安装快照映射固定 builtin 结果，且 Custom 始终没有可推断的安装状态。
+#[tokio::test]
+async fn launcher_catalog_reports_builtin_installation_only() {
+    let repository = Arc::new(MemoryConfigurationRepository::default());
+    repository
+        .replace_settings(&selected_custom(
+            "11111111-1111-4111-8111-111111111111",
+            "Private Review Bot",
+            "review-cli --token embedded-value",
+        ))
+        .await;
+    let probe = Arc::new(RecordingLauncherInstallationProbe::default());
+    let resolver = AgentLaunchResolver::new(Arc::new(PreferencesService::new(repository)))
+        .with_installation_probe(probe.clone());
+
+    let catalog = resolver
+        .launcher_catalog(&CancellationToken::new())
+        .await
+        .expect("launcher installation snapshot is readable");
+
+    assert_eq!(catalog.installation_for(AgentProvider::Codex), Some(true));
+    assert_eq!(catalog.installation_for(AgentProvider::Claude), Some(false));
+    assert_eq!(catalog.installation_for(AgentProvider::Pi), Some(false));
+    assert_eq!(catalog.installation_for(AgentProvider::Custom), None);
+    let checked_commands = probe
+        .checked_commands
+        .lock()
+        .expect("probe call lock")
+        .clone();
+    assert_eq!(
+        checked_commands
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["codex", "claude", "pi"]
+    );
 }
 
 /// 保存 Launcher 选择时只改一个字段，并将已读取的设置 revision 用作 CAS token。

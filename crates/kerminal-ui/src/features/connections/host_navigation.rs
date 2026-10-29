@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, EventEmitter, Focusable as _, IntoElement,
-    Render, StatefulInteractiveElement, Subscription, Window,
+    KeyDownEvent, Render, StatefulInteractiveElement, Subscription, Window,
     component::{
         Disableable, Icon, IconName,
         button::{Button, ButtonCustomVariant, ButtonVariants as _},
@@ -25,7 +25,7 @@ use kerminal_application::{
         HostDraft, HostGroup, HostGroupDraft, HostManagementService, ManagedHost,
     },
     preferences::{InterfaceDensity, ProfileService, VersionedProfile},
-    workspace::WorkspaceTargetRef,
+    workspace::{WorkspacePinnedContainer, WorkspaceTargetRef},
 };
 use kerminal_domain::{
     connections::RemoteProtocol,
@@ -44,41 +44,69 @@ const UNGROUPED_GROUP_ID: &str = "__ungrouped";
 /// @author kongweiguang
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HostNavigationLayoutMetrics {
+    control_height: f32,
+    header_gap: f32,
+    header_padding_x: f32,
+    header_padding_y: f32,
     row_height: f32,
     group_header_height: f32,
-    content_gap: f32,
     tree_gap: f32,
     section_gap: f32,
-    sidebar_padding: f32,
+    list_padding_x: f32,
+    list_padding_bottom: f32,
+    row_padding_x: f32,
+    row_gap: f32,
+    icon_size: f32,
 }
 
-/// 密度映射保持两行文案可读，并让 compact/comfortable/spacious 都有真实布局差异。
+/// 密度映射复用 main 侧栏的控件、列表和行几何，避免 GPUI 侧栏出现另一套节奏。
 /// @author kongweiguang
 fn host_navigation_layout_metrics(density: InterfaceDensity) -> HostNavigationLayoutMetrics {
     match density {
         InterfaceDensity::Compact => HostNavigationLayoutMetrics {
-            row_height: 46.,
-            group_header_height: 24.,
-            content_gap: 4.,
-            tree_gap: 2.,
-            section_gap: 2.,
-            sidebar_padding: 4.,
+            control_height: 28.,
+            header_gap: 8.,
+            header_padding_x: 12.,
+            header_padding_y: 10.,
+            row_height: 40.,
+            group_header_height: 32.,
+            tree_gap: 7.,
+            section_gap: 4.,
+            list_padding_x: 10.,
+            list_padding_bottom: 10.,
+            row_padding_x: 9.,
+            row_gap: 8.,
+            icon_size: 28.,
         },
         InterfaceDensity::Comfortable => HostNavigationLayoutMetrics {
-            row_height: 50.,
-            group_header_height: 26.,
-            content_gap: 6.,
-            tree_gap: 4.,
+            control_height: 32.,
+            header_gap: 12.,
+            header_padding_x: 14.,
+            header_padding_y: 14.,
+            row_height: 48.,
+            group_header_height: 32.,
+            tree_gap: 10.,
             section_gap: 4.,
-            sidebar_padding: 5.,
+            list_padding_x: 12.,
+            list_padding_bottom: 12.,
+            row_padding_x: 10.,
+            row_gap: 10.,
+            icon_size: 30.,
         },
         InterfaceDensity::Spacious => HostNavigationLayoutMetrics {
+            control_height: 36.,
+            header_gap: 14.,
+            header_padding_x: 16.,
+            header_padding_y: 16.,
             row_height: 54.,
-            group_header_height: 28.,
-            content_gap: 8.,
-            tree_gap: 6.,
-            section_gap: 6.,
-            sidebar_padding: 6.,
+            group_header_height: 32.,
+            tree_gap: 12.,
+            section_gap: 4.,
+            list_padding_x: 14.,
+            list_padding_bottom: 14.,
+            row_padding_x: 12.,
+            row_gap: 12.,
+            icon_size: 32.,
         },
     }
 }
@@ -98,9 +126,11 @@ pub enum HostNavigationEvent {
     CopyHostRequested { host_id: HostId },
     DeleteHostRequested { host_id: HostId },
     ConnectRequested { host_id: HostId },
-    ActivateExistingSessionRequested { host_id: HostId },
     OpenSftpRequested { host_id: HostId },
     CreateSftpTransferTabRequested { host_id: HostId },
+    PinnedContainerSelected { stable_id: String },
+    PinnedContainerOpenRequested { stable_id: String },
+    PinnedContainerRemoveRequested { stable_id: String },
     OpenSftpWorkbenchRequested,
     CreateHostInGroupRequested { group_id: String },
     CreateGroupRequested,
@@ -196,12 +226,13 @@ pub struct HostNavigation {
     group_revision: Option<ConfigRevision>,
     selected_host: Option<HostId>,
     selected_profile: Option<String>,
+    pinned_containers: Vec<WorkspacePinnedContainer>,
+    selected_machine_id: Option<String>,
     session_projection: HashMap<HostId, HostSessionStatus>,
     collapsed_groups: HashSet<String>,
     pending_host_moves: HashSet<HostId>,
     pending_group_pins: HashSet<String>,
     last_open_request: Option<(HostId, Instant)>,
-    last_profile_open_request: Option<(String, Instant)>,
     feedback: Option<NavigationFeedback>,
     loading: bool,
     status: Option<String>,
@@ -255,12 +286,13 @@ impl HostNavigation {
             group_revision: None,
             selected_host: None,
             selected_profile: None,
+            pinned_containers: Vec::new(),
+            selected_machine_id: None,
             session_projection: HashMap::new(),
             collapsed_groups: HashSet::new(),
             pending_host_moves: HashSet::new(),
             pending_group_pins: HashSet::new(),
             last_open_request: None,
-            last_profile_open_request: None,
             feedback: None,
             loading: false,
             status: None,
@@ -434,6 +466,27 @@ impl HostNavigation {
             .collect()
     }
 
+    /// 端点副标题只来自已加载主机配置，不把凭据或当前左栏选择带入工具的目标解析。
+    /// @author kongweiguang
+    pub(crate) fn endpoint_subtitles(&self) -> HashMap<HostId, gpui_kit::SharedString> {
+        self.rows
+            .iter()
+            .map(|host| {
+                let protocol = match host.protocol {
+                    RemoteProtocol::Ssh => "SSH",
+                    RemoteProtocol::Sftp => "SFTP",
+                    RemoteProtocol::Telnet => "Telnet",
+                    RemoteProtocol::Serial => "Serial",
+                    RemoteProtocol::Rdp => "RDP",
+                };
+                (
+                    host.id.clone(),
+                    format!("{} · {protocol}", host_endpoint_label(host)).into(),
+                )
+            })
+            .collect()
+    }
+
     /// 仅从已加载的 Profile 投影取可读标题，缺失项由恢复用例显式报错。
     /// @author kongweiguang
     pub fn display_profile_name_for(&self, profile_id: &str) -> Option<gpui_kit::SharedString> {
@@ -530,6 +583,8 @@ impl HostNavigation {
 
     /// 把稳定本地主机 ID 交给 Root 的工作区恢复路径，不在导航中复制启动参数。
     /// @author kongweiguang
+    /// 复核当前本地主机快照后逐次发出打开意图，允许同一 Profile 创建多个独立标签。
+    /// @author kongweiguang
     fn request_local_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
         if !self
             .profile_rows
@@ -546,16 +601,6 @@ impl HostNavigation {
             cx.notify();
             return;
         }
-        if self
-            .last_profile_open_request
-            .as_ref()
-            .is_some_and(|(last_id, at)| {
-                last_id == &profile_id && at.elapsed() < DUPLICATE_OPEN_GUARD
-            })
-        {
-            return;
-        }
-        self.last_profile_open_request = Some((profile_id.clone(), Instant::now()));
         cx.emit(HostNavigationEvent::LocalProfileConnectRequested { profile_id });
     }
 
@@ -574,6 +619,52 @@ impl HostNavigation {
         self.feedback = None;
         cx.emit(HostNavigationEvent::LocalProfileSelected { profile_id });
         cx.notify();
+    }
+
+    /// 单击容器行只保存稳定选择身份，不切换活动终端或创建会话。
+    /// @author kongweiguang
+    fn select_pinned_container(&mut self, stable_id: String, cx: &mut Context<Self>) {
+        if !self
+            .pinned_containers
+            .iter()
+            .any(|container| container.stable_id() == stable_id)
+        {
+            return;
+        }
+        self.selected_machine_id = Some(stable_id.clone());
+        self.selected_host = None;
+        self.selected_profile = None;
+        cx.emit(HostNavigationEvent::PinnedContainerSelected { stable_id });
+        cx.notify();
+    }
+
+    /// 双击或 Enter 仅对当前 projection 中仍存在的 pin 发出打开请求。
+    /// @author kongweiguang
+    fn request_open_pinned_container(&mut self, stable_id: String, cx: &mut Context<Self>) {
+        if !self
+            .pinned_containers
+            .iter()
+            .any(|container| container.stable_id() == stable_id)
+        {
+            return;
+        }
+        self.selected_machine_id = Some(stable_id.clone());
+        self.selected_host = None;
+        self.selected_profile = None;
+        cx.emit(HostNavigationEvent::PinnedContainerOpenRequested { stable_id });
+        cx.notify();
+    }
+
+    /// 右键菜单只允许移除仍投影的 pin，避免过期菜单删除后续重加的目标。
+    /// @author kongweiguang
+    fn request_remove_pinned_container(&mut self, stable_id: String, cx: &mut Context<Self>) {
+        if self
+            .pinned_containers
+            .iter()
+            .any(|container| container.stable_id() == stable_id)
+        {
+            cx.emit(HostNavigationEvent::PinnedContainerRemoveRequested { stable_id });
+        }
     }
 
     /// 在指定分组新建本地主机；Root 将其路由到统一连接表单而非偏好页。
@@ -667,6 +758,33 @@ impl HostNavigation {
         cx.notify();
     }
 
+    /// Root 只投影已验证的 workspace pins 与机器选择；导航视图不另存业务状态。
+    /// @author kongweiguang
+    pub(crate) fn set_pinned_container_projection(
+        &mut self,
+        pinned_containers: Vec<WorkspacePinnedContainer>,
+        selected_machine_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pinned_containers == pinned_containers
+            && self.selected_machine_id == selected_machine_id
+        {
+            return;
+        }
+        self.pinned_containers = pinned_containers;
+        self.selected_machine_id = selected_machine_id;
+        cx.notify();
+    }
+
+    /// 将 pin 操作绑定到仍存在的 SSH 主机，并返回该主机当前所属分组供 Root 持久化。
+    /// @author kongweiguang
+    pub(crate) fn ssh_host_group_id(&self, host_id: &HostId) -> Option<Option<String>> {
+        self.rows
+            .iter()
+            .find(|host| &host.id == host_id && host.protocol == RemoteProtocol::Ssh)
+            .map(|host| host.group_id.clone())
+    }
+
     /// 选择主机时同步本地焦点和运维目标，事件只包含显式主机身份。
     fn select_host(&mut self, host_id: HostId, cx: &mut Context<Self>) {
         self.selected_host = Some(host_id.clone());
@@ -702,33 +820,21 @@ impl HostNavigation {
         cx.notify();
     }
 
-    /// 双击先复用活动会话，否则才进入连接面板预检；稳定身份和节流避免误建重复资源。
+    /// 每次显式打开都进入原连接面板预检；会话是否已存在不改变新标签的创建意图。
     /// @author kongweiguang
     fn request_connect(&mut self, host_id: HostId, cx: &mut Context<Self>) {
-        if self.suppress_duplicate_open(&host_id) {
-            return;
-        }
-        self.select_host(host_id.clone(), cx);
-        if matches!(
-            self.session_projection.get(&host_id),
-            Some(HostSessionStatus::Ready | HostSessionStatus::Opening)
-        ) {
-            cx.emit(HostNavigationEvent::ActivateExistingSessionRequested { host_id });
-            return;
-        }
-        match primary_host_action(
-            self.rows
-                .iter()
-                .find(|host| host.id == host_id)
-                .map(|host| host.protocol)
-                .unwrap_or(RemoteProtocol::Ssh),
-        ) {
+        let protocol = self
+            .rows
+            .iter()
+            .find(|host| host.id == host_id)
+            .map(|host| host.protocol)
+            .unwrap_or(RemoteProtocol::Ssh);
+        match primary_host_action(protocol) {
             HostPrimaryAction::Connect => {
-                cx.emit(HostNavigationEvent::ConnectRequested { host_id })
+                self.select_host(host_id.clone(), cx);
+                cx.emit(HostNavigationEvent::ConnectRequested { host_id });
             }
-            HostPrimaryAction::OpenSftp => {
-                cx.emit(HostNavigationEvent::OpenSftpRequested { host_id })
-            }
+            HostPrimaryAction::OpenSftp => self.request_open_sftp(host_id, cx),
         }
     }
 
@@ -1161,11 +1267,11 @@ impl HostNavigation {
 }
 
 impl Render for HostNavigation {
-    /// 搜索框由外层主题 frame 独占边界并关闭 Kit 内框，避免焦点时内外双重描边；容器目标仍绑定活动终端。
+    /// 侧栏使用 main 的工作台主题与单行搜索工具栏；选择主机仍只改变详情，不绑定终端目标。
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.start_configuration_watch(cx);
-        let theme = ThemeTokens::current(window, cx);
+        let theme = ThemeTokens::current(window, cx).for_workbench();
         let metrics = host_navigation_layout_metrics(self.density);
         let search_focused = self
             .search_input
@@ -1178,50 +1284,38 @@ impl Render for HostNavigation {
             .h_full()
             .flex()
             .flex_col()
-            .gap(px(metrics.content_gap))
-            .p(px(metrics.sidebar_padding))
             .overflow_hidden()
             .bg(theme.materials.chrome)
             .text_color(theme.foreground)
-            .child(render_navigation_header(self, theme, cx));
+            .child(render_navigation_header(
+                self,
+                theme,
+                search_focused,
+                metrics,
+                cx,
+            ));
 
-        let filtered = filtered_hosts(&self.rows, &self.groups, self.search.as_str());
+        let mut filtered = filtered_hosts(&self.rows, &self.groups, self.search.as_str());
+        for container in &self.pinned_containers {
+            if !pinned_container_matches_query(container, self.search.as_str()) {
+                continue;
+            }
+            let Some(host_id) = container.target.host_id.as_ref() else {
+                continue;
+            };
+            if filtered.iter().any(|host| &host.id == host_id) {
+                continue;
+            }
+            if let Some(host) = self
+                .rows
+                .iter()
+                .find(|host| &host.id == host_id && host.protocol == RemoteProtocol::Ssh)
+            {
+                filtered.push(host.clone());
+            }
+        }
         let filtered_profiles =
             filtered_profiles(&self.profile_rows, &self.groups, self.search.as_str());
-        content = content.child(
-            div()
-                .id("host-navigation-search-frame")
-                .w_full()
-                .h(px(34.))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .px_2()
-                .rounded_lg()
-                .border_1()
-                .border_color(if search_focused {
-                    theme.accent
-                } else {
-                    theme.border
-                })
-                .bg(if search_focused {
-                    theme.panel
-                } else {
-                    theme.secondary.opacity(0.18)
-                })
-                .hover(|style| {
-                    style
-                        .border_color(theme.accent.opacity(0.55))
-                        .bg(theme.panel)
-                })
-                .child(
-                    Input::new(&self.search_input)
-                        .appearance(false)
-                        .w_full()
-                        .min_w(px(0.))
-                        .prefix(div().text_color(theme.subtle).child(IconName::Search)),
-                ),
-        );
         // 空分组是用户保存的导航对象；无成员时仍须保留可右键管理的入口。
         let has_visible_saved_group = self.groups.iter().any(|group| {
             should_render_saved_group_header(&group.name, self.search.as_str(), false)
@@ -1250,6 +1344,8 @@ impl Render for HostNavigation {
             .flex()
             .flex_col()
             .gap(px(metrics.tree_gap))
+            .px(px(metrics.list_padding_x))
+            .pb(px(metrics.list_padding_bottom))
             .overflow_y_scroll();
 
         if self.loading && self.rows.is_empty() && self.profile_rows.is_empty() {
@@ -1295,10 +1391,10 @@ impl Render for HostNavigation {
         } else {
             host_tree = render_tree_groups(
                 self,
-                &filtered,
-                &filtered_profiles,
+                (&filtered, &filtered_profiles),
                 theme,
                 metrics,
+                window,
                 cx,
                 host_tree,
             );
@@ -1326,7 +1422,45 @@ impl Render for HostNavigation {
         }
         content = content.child(host_tree);
 
-        content
+        let entity = cx.entity().clone();
+        let local_entity = entity.clone();
+        let group_entity = entity.clone();
+        let readonly = self.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
+        content.context_menu(move |menu, _, _| {
+            let refresh_entity = entity.clone();
+            let mut menu = menu.item(
+                PopupMenuItem::new(crate::locale::text("刷新主机列表", "Refresh hosts"))
+                    .icon(gpui_kit::assets::IconName::RefreshCw)
+                    .on_click(move |_, _, app| {
+                        refresh_entity.update(app, |navigation, cx| navigation.reload(cx));
+                    }),
+            );
+            if !readonly {
+                let create_group_entity = group_entity.clone();
+                let create_local_entity = local_entity.clone();
+                menu = menu
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(crate::locale::text("新建分组…", "New group…"))
+                            .icon(gpui_kit::assets::IconName::FolderPlus)
+                            .on_click(move |_, _, app| {
+                                create_group_entity.update(app, |_, cx| {
+                                    cx.emit(HostNavigationEvent::CreateGroupRequested);
+                                });
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(crate::locale::text("新建本地主机…", "New local host…"))
+                            .icon(gpui_kit::assets::IconName::Terminal)
+                            .on_click(move |_, _, app| {
+                                create_local_entity.update(app, |navigation, cx| {
+                                    navigation.request_create_local_profile(None, cx);
+                                });
+                            }),
+                    );
+            }
+            menu
+        })
     }
 }
 
@@ -1421,6 +1555,7 @@ fn filtered_profiles(
 enum GroupNavigationItem {
     RemoteHost(Box<ManagedHost>),
     LocalHost(Box<VersionedProfile>),
+    PinnedContainer(Box<WorkspacePinnedContainer>),
 }
 
 /// 主机和本地主机按相同的 order/name 排序，快照装箱以控制枚举体积，再以稳定身份消除并列。
@@ -1428,6 +1563,8 @@ enum GroupNavigationItem {
 fn group_navigation_items(
     hosts: &[ManagedHost],
     profiles: &[VersionedProfile],
+    pinned_containers: &[WorkspacePinnedContainer],
+    query: &str,
 ) -> Vec<GroupNavigationItem> {
     let mut items = hosts
         .iter()
@@ -1451,6 +1588,12 @@ fn group_navigation_items(
                 0_u8,
                 profile.profile.id.as_str(),
             ),
+            GroupNavigationItem::PinnedContainer(container) => (
+                0,
+                container.name.as_str(),
+                2_u8,
+                container.target.container_id.as_str(),
+            ),
         };
         let (right_order, right_name, right_kind, right_id) = match right {
             GroupNavigationItem::RemoteHost(host) => {
@@ -1462,6 +1605,12 @@ fn group_navigation_items(
                 0_u8,
                 profile.profile.id.as_str(),
             ),
+            GroupNavigationItem::PinnedContainer(container) => (
+                0,
+                container.name.as_str(),
+                2_u8,
+                container.target.container_id.as_str(),
+            ),
         };
         left_order
             .cmp(&right_order)
@@ -1469,15 +1618,52 @@ fn group_navigation_items(
             .then_with(|| left_kind.cmp(&right_kind))
             .then_with(|| left_id.cmp(right_id))
     });
-    items
+    let mut projected = Vec::with_capacity(items.len() + pinned_containers.len());
+    for item in items {
+        let parent_host_id = match &item {
+            GroupNavigationItem::RemoteHost(host) if host.protocol == RemoteProtocol::Ssh => {
+                Some(host.id.clone())
+            }
+            _ => None,
+        };
+        projected.push(item);
+        if let Some(host_id) = parent_host_id {
+            projected.extend(
+                pinned_containers
+                    .iter()
+                    .filter(|container| {
+                        container.target.host_id.as_ref() == Some(&host_id)
+                            && pinned_container_matches_query(container, query)
+                    })
+                    .cloned()
+                    .map(Box::new)
+                    .map(GroupNavigationItem::PinnedContainer),
+            );
+        }
+    }
+    projected
+}
+
+/// 容器名称、说明和完整 ID 共用导航搜索语义，命中容器时其 SSH 父行也会投影出来。
+/// @author kongweiguang
+fn pinned_container_matches_query(container: &WorkspacePinnedContainer, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || container.name.to_lowercase().contains(&query)
+        || container.description.to_lowercase().contains(&query)
+        || container
+            .target
+            .container_id
+            .to_lowercase()
+            .contains(&query)
 }
 
 /// 无障碍名称使用“本地主机”而不是内部配置类型，确保语音与屏幕阅读器保持产品术语一致。
 /// @author kongweiguang
 fn local_host_accessibility_label(name: &str) -> gpui_kit::SharedString {
     crate::locale::text(
-        format!("本地主机：{name}，双击打开"),
-        format!("Local host: {name}; double-click to open"),
+        format!("本地主机：{name}，双击或按 Enter 打开"),
+        format!("Local host: {name}; double-click or press Enter to open"),
     )
 }
 
@@ -1530,10 +1716,11 @@ fn host_context_menu_actions(host: &ManagedHost) -> HostContextMenuActions {
     }
 }
 
-/// Only the second click opens a connection; later clicks in a multi-click sequence never replay the action.
+/// Kit 将 Enter/Space 确认投影成单次 Keyboard click，必须与只选择详情的鼠标单击区分。
+/// 鼠标仅第二击连接，后续三击不重放，避免一次连击创建多个会话。
 /// @author kongweiguang
-fn is_open_gesture(click_count: usize) -> bool {
-    click_count == 2
+fn is_open_gesture(event: &ClickEvent) -> bool {
+    event.is_keyboard() || event.click_count() == 2
 }
 
 /// 空组在无搜索时始终可达；搜索时仅保留名称命中或仍含筛选结果的组。
@@ -1652,85 +1839,70 @@ fn host_draft_for_group(host: &ManagedHost, group_id: Option<String>) -> HostDra
     }
 }
 
-/// 标题右键只保留分组和本地主机创建；侧栏开关统一由顶栏入口负责，避免重复导航入口。
+/// main 的单行搜索工具栏保留常用的传输与分组操作，目录管理放在侧栏上下文菜单中。
 /// @author kongweiguang
 fn render_navigation_header(
     navigation: &mut HostNavigation,
     theme: ThemeTokens,
+    search_focused: bool,
+    metrics: HostNavigationLayoutMetrics,
     cx: &mut Context<HostNavigation>,
 ) -> impl IntoElement {
-    let loading = navigation.loading;
-    let readonly = navigation.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
     let group_ids = navigation_group_ids(
         &navigation.rows,
         &navigation.profile_rows,
         &navigation.groups,
     );
     let all_collapsed = all_groups_are_collapsed(&group_ids, &navigation.collapsed_groups);
-    let entity = cx.entity().clone();
-    let title = div()
+    let search = div()
+        .id("host-navigation-search-frame")
         .flex_1()
+        .min_w(px(0.))
+        .h(px(metrics.control_height))
         .flex()
         .items_center()
-        .gap_2()
-        .pl_2()
+        .px_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(if search_focused {
+            theme.accent
+        } else {
+            theme.border
+        })
+        .bg(if search_focused {
+            theme.panel
+        } else {
+            theme.secondary.opacity(0.18)
+        })
+        .hover(|style| {
+            style
+                .border_color(theme.accent.opacity(0.55))
+                .bg(theme.panel)
+        })
         .child(
-            div()
-                .text_color(theme.accent)
-                .child(Icon::new(gpui_kit::assets::IconName::Server)),
-        )
-        .child(
-            div()
-                .text_size(theme.text_sm)
-                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                .child(crate::locale::text("主机", "Hosts")),
+            Input::new(&navigation.search_input)
+                .appearance(false)
+                .w_full()
+                .min_w(px(0.))
+                .prefix(div().text_color(theme.subtle).child(IconName::Search)),
         );
-    let title = if readonly {
-        title.into_any_element()
-    } else {
-        title
-            .context_menu(move |menu, _, _| {
-                let profile_entity = entity.clone();
-                let group_entity = entity.clone();
-                menu.item(
-                    PopupMenuItem::new(crate::locale::text("新建分组…", "New group…"))
-                        .icon(gpui_kit::assets::IconName::FolderPlus)
-                        .on_click(move |_, _, app| {
-                            group_entity.update(app, |_, cx| {
-                                cx.emit(HostNavigationEvent::CreateGroupRequested);
-                            });
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new(crate::locale::text("新建本地主机…", "New local host…"))
-                        .icon(gpui_kit::assets::IconName::Terminal)
-                        .on_click(move |_, _, app| {
-                            profile_entity.update(app, |navigation, cx| {
-                                navigation.request_create_local_profile(None, cx)
-                            });
-                        }),
-                )
-            })
-            .into_any_element()
-    };
-    let header = div()
-        .id("host-navigation-header")
-        .w_full()
-        .h(px(36.))
+    let actions = div()
+        .w(px(68.))
         .flex_shrink_0()
         .flex()
-        .items_center()
-        .gap_1()
-        .child(title);
-    let header = header.child(
+        .gap(px(4.))
+        .items_center();
+    let actions = actions.child(
         Button::new("host-navigation-sftp-workbench")
             .compact()
             .ghost()
+            .w(px(metrics.control_height))
+            .h(px(metrics.control_height))
             .icon(gpui_kit::assets::IconName::ArrowLeftRight)
             .custom(
                 ButtonCustomVariant::new(cx)
                     .color(theme.sidebar.opacity(0.))
-                    .foreground(theme.muted)
+                    .foreground(theme.accent)
                     .hover(theme.hover)
                     .active(theme.selected),
             )
@@ -1743,10 +1915,12 @@ fn render_navigation_header(
                 cx.emit(HostNavigationEvent::OpenSftpWorkbenchRequested)
             })),
     );
-    let header = header.child(
+    let actions = actions.child(
         Button::new("host-navigation-toggle-groups")
             .compact()
             .ghost()
+            .w(px(metrics.control_height))
+            .h(px(metrics.control_height))
             .icon(if all_collapsed {
                 gpui_kit::assets::IconName::ChevronsUpDown
             } else {
@@ -1774,42 +1948,33 @@ fn render_navigation_header(
                 cx.listener(|navigation, _: &ClickEvent, _, cx| navigation.toggle_all_groups(cx)),
             ),
     );
-    let header = header.child(
-        Button::new("host-navigation-reload")
-            .compact()
-            .ghost()
-            .icon(gpui_kit::assets::IconName::RefreshCw)
-            .custom(
-                ButtonCustomVariant::new(cx)
-                    .color(theme.sidebar.opacity(0.))
-                    .foreground(theme.muted)
-                    .hover(theme.hover)
-                    .active(theme.selected),
-            )
-            .accessibility_label(crate::locale::text("刷新主机列表", "Refresh hosts"))
-            .tooltip(if loading {
-                crate::locale::text("正在读取主机", "Loading hosts")
-            } else {
-                crate::locale::text("刷新主机列表", "Refresh hosts")
-            })
-            .loading(loading)
-            .disabled(loading)
-            .on_click(cx.listener(|navigation, _: &ClickEvent, _, cx| navigation.reload(cx))),
-    );
-    header.into_any_element()
+    div()
+        .id("host-navigation-header")
+        .w_full()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px(metrics.header_gap))
+        .px(px(metrics.header_padding_x))
+        .pt(px(metrics.header_padding_y))
+        .pb(px(metrics.header_padding_y - 2.))
+        .child(search)
+        .child(actions)
 }
 
 /// 无搜索时保留完整分组树（含空组）；搜索时仅保留命中组名或仍有命中条目的组，并在每组内统一排序两类主机。
+/// Window 只用于稳定行焦点，不把键盘身份混入业务导航状态。
 /// @author kongweiguang
 fn render_tree_groups(
     navigation: &mut HostNavigation,
-    filtered: &[ManagedHost],
-    filtered_profiles: &[VersionedProfile],
+    filtered_items: (&[ManagedHost], &[VersionedProfile]),
     theme: ThemeTokens,
     metrics: HostNavigationLayoutMetrics,
+    window: &mut Window,
     cx: &mut Context<HostNavigation>,
     mut tree: gpui_kit::Stateful<gpui_kit::Div>,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let (filtered, filtered_profiles) = filtered_items;
     for group in navigation.groups.clone() {
         let hosts = filtered
             .iter()
@@ -1821,7 +1986,12 @@ fn render_tree_groups(
             .filter(|row| row.profile.sidebar_group_id.as_deref() == Some(&group.id))
             .cloned()
             .collect::<Vec<_>>();
-        let items = group_navigation_items(&hosts, &profiles);
+        let items = group_navigation_items(
+            &hosts,
+            &profiles,
+            &navigation.pinned_containers,
+            navigation.search.as_str(),
+        );
         let has_filtered_items = !items.is_empty();
         if !should_render_saved_group_header(
             &group.name,
@@ -1839,6 +2009,7 @@ fn render_tree_groups(
             },
             theme,
             metrics,
+            window,
             cx,
             tree,
         );
@@ -1862,7 +2033,12 @@ fn render_tree_groups(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let ungrouped_items = group_navigation_items(&ungrouped, &ungrouped_profiles);
+    let ungrouped_items = group_navigation_items(
+        &ungrouped,
+        &ungrouped_profiles,
+        &navigation.pinned_containers,
+        navigation.search.as_str(),
+    );
     if !ungrouped_items.is_empty() {
         tree = render_host_group(
             navigation,
@@ -1873,6 +2049,7 @@ fn render_tree_groups(
             },
             theme,
             metrics,
+            window,
             cx,
             tree,
         );
@@ -1927,12 +2104,14 @@ struct HostGroupRenderItems {
 /// 分组标题保持紧凑并使用单一全行按钮，让 chevron、名称和计数共享圆角 hover、点击及键盘焦点。
 /// 右键菜单仍捕获稳定组 ID；行内容来自一个已按 order/name 合并的序列，不先分种类渲染。
 /// 点击任意行内位置只切换折叠状态，不增加行高或分拆命中区。
+/// 子行从同一 Window 获取 keyed focus，重绘或显示中央详情不会丢失键盘连接入口。
 /// @author kongweiguang
 fn render_host_group(
     navigation: &mut HostNavigation,
     items: HostGroupRenderItems,
     theme: ThemeTokens,
     metrics: HostNavigationLayoutMetrics,
+    window: &mut Window,
     cx: &mut Context<HostNavigation>,
     mut tree: gpui_kit::Stateful<gpui_kit::Div>,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
@@ -1957,7 +2136,7 @@ fn render_host_group(
         .flex()
         .items_center()
         .gap_1()
-        .rounded_md()
+        .rounded_lg()
         .border_1()
         .border_color(theme.sidebar.opacity(0.))
         .bg(theme.sidebar.opacity(0.))
@@ -2047,6 +2226,7 @@ fn render_host_group(
     let mut section = div()
         .id(format!("host-navigation-section-{group_id}"))
         .w_full()
+        .rounded_lg()
         .flex()
         .flex_col()
         .gap(px(metrics.section_gap))
@@ -2063,12 +2243,17 @@ fn render_host_group(
                         navigation.recovery.mode == ConfigurationMode::ReadOnlyRecovery,
                         theme,
                         metrics,
+                        window,
                         cx,
                     )
                     .into_any_element()
                 }
                 GroupNavigationItem::RemoteHost(host) => {
-                    host_row(navigation, *host, theme, metrics, cx).into_any_element()
+                    host_row(navigation, *host, theme, metrics, window, cx).into_any_element()
+                }
+                GroupNavigationItem::PinnedContainer(container) => {
+                    pinned_container_row(navigation, *container, theme, metrics, window, cx)
+                        .into_any_element()
                 }
             });
         }
@@ -2077,7 +2262,7 @@ fn render_host_group(
     tree
 }
 
-/// 导航行复用 Kit 按钮的键盘与交互样式；这里不能设置 hover/active，
+/// 导航行复用 Kit 按钮的键盘与交互样式，并集中使用 main 对齐的行几何；这里不能设置 hover/active，
 /// Kit render 会在同一底层 Div 安装它们，重复安装会触发 GPUI 启动断言。
 /// @author kongweiguang
 fn navigation_row_button(
@@ -2090,12 +2275,12 @@ fn navigation_row_button(
         .ghost()
         .w_full()
         .h(px(metrics.row_height))
-        .px_2()
+        .px(px(metrics.row_padding_x))
         .flex_shrink_0()
         .flex()
         .items_center()
-        .gap_2()
-        .rounded_md()
+        .gap(px(metrics.row_gap))
+        .rounded_lg()
         .border_1()
         .border_color(if selected {
             theme.accent
@@ -2110,7 +2295,8 @@ fn navigation_row_button(
         .text_color(theme.foreground)
 }
 
-/// 本地主机整行可选择，双击才打开；右键只展示菜单，选择具体菜单项后才发送稳定 ID 动作。
+/// 本地主机鼠标单击选择、双击或键盘确认打开；右键只展示菜单，避免浏览菜单便建立会话。
+/// Kit 按钮默认不在鼠标点击时聚焦，因此显式绑定稳定行焦点，支持先单击再按 Enter。
 /// @author kongweiguang
 fn local_profile_row(
     row: VersionedProfile,
@@ -2118,10 +2304,19 @@ fn local_profile_row(
     readonly: bool,
     theme: ThemeTokens,
     metrics: HostNavigationLayoutMetrics,
+    window: &mut Window,
     cx: &mut Context<HostNavigation>,
 ) -> impl IntoElement + 'static {
     let id = row.profile.id.clone();
     let dom_id = id.clone();
+    let focus_handle = window
+        .use_keyed_state(
+            format!("host-navigation-profile-focus-{dom_id}"),
+            cx,
+            |_, cx| cx.focus_handle(),
+        )
+        .read(cx)
+        .clone();
     let name = row.profile.name.clone();
     let accessible_name = name.clone();
     let shell = row.profile.shell.clone();
@@ -2133,16 +2328,17 @@ fn local_profile_row(
         theme,
         metrics,
     )
+    .focus_handle(&focus_handle)
     .child(
         div()
-            .size(px(28.))
+            .size(px(metrics.icon_size))
             .flex_shrink_0()
             .flex()
             .items_center()
             .justify_center()
-            .rounded_md()
-            .bg(theme.selected)
-            .text_color(theme.accent)
+            .rounded_lg()
+            .bg(theme.success.opacity(0.12))
+            .text_color(theme.success)
             .child(Icon::new(IconName::SquareTerminal).size(px(15.))),
     )
     .child(
@@ -2176,13 +2372,16 @@ fn local_profile_row(
             ),
     )
     .accessibility_label(local_host_accessibility_label(&accessible_name))
-    .on_click(cx.listener(move |navigation, event: &ClickEvent, _, cx| {
-        if is_open_gesture(event.click_count()) {
-            navigation.request_local_profile(click_id.clone(), cx);
-        } else if event.click_count() == 1 {
-            navigation.select_local_profile(click_id.clone(), cx);
-        }
-    }))
+    .on_click(
+        cx.listener(move |navigation, event: &ClickEvent, window, cx| {
+            if is_open_gesture(event) {
+                navigation.request_local_profile(click_id.clone(), cx);
+            } else if event.click_count() == 1 {
+                window.focus(&focus_handle, cx);
+                navigation.select_local_profile(click_id.clone(), cx);
+            }
+        }),
+    )
     .context_menu(move |menu, _, _| {
         let open_entity = entity.clone();
         let open_id = id.clone();
@@ -2339,18 +2538,162 @@ fn group_context_menu(
     })
 }
 
+/// 固定容器沿用主机行密度并缩进到 SSH 父行下，选择和打开通过稳定 pin ID 分开发出。
+/// 鼠标选择保留在同一行的键盘焦点，不能让 Enter 落入此前活动终端。
+/// @author kongweiguang
+fn pinned_container_row(
+    navigation: &mut HostNavigation,
+    container: WorkspacePinnedContainer,
+    theme: ThemeTokens,
+    metrics: HostNavigationLayoutMetrics,
+    window: &mut Window,
+    cx: &mut Context<HostNavigation>,
+) -> impl IntoElement + 'static {
+    let stable_id = container.stable_id();
+    let focus_handle = window
+        .use_keyed_state(
+            format!("host-navigation-container-focus-{stable_id}"),
+            cx,
+            |_, cx| cx.focus_handle(),
+        )
+        .read(cx)
+        .clone();
+    let name = container.name.clone();
+    let description = container.description.clone();
+    let selected = navigation.selected_machine_id.as_deref() == Some(stable_id.as_str());
+    let click_id = stable_id.clone();
+    let keyboard_id = stable_id.clone();
+    let open_entity = cx.entity().clone();
+    let open_id = stable_id.clone();
+    let remove_entity = cx.entity().clone();
+    let remove_id = stable_id.clone();
+    let row = navigation_row_button(
+        format!("host-navigation-container-{stable_id}"),
+        selected,
+        theme,
+        metrics,
+    )
+    .focus_handle(&focus_handle)
+    .child(
+        div()
+            .size(px(metrics.icon_size))
+            .flex_shrink_0()
+            .rounded_lg()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme.selected)
+            .text_color(theme.accent)
+            .child(Icon::new(gpui_kit::assets::IconName::Box).size(px(14.))),
+    )
+    .child(
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(px(1.))
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(theme.text_sm)
+                    .text_color(theme.foreground)
+                    .child(name.clone()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(theme.text_xs)
+                    .text_color(theme.subtle)
+                    .child(description),
+            ),
+    )
+    .accessibility_label(crate::locale::text(
+        format!("容器：{name}，单击选择，按 Enter 或双击打开终端"),
+        format!(
+            "Container: {name}; click to select, press Enter or double-click to open a terminal"
+        ),
+    ))
+    .on_click(
+        cx.listener(move |navigation, event: &ClickEvent, window, cx| {
+            if is_open_gesture(event) {
+                navigation.request_open_pinned_container(click_id.clone(), cx);
+            } else if event.click_count() == 1 {
+                window.focus(&focus_handle, cx);
+                navigation.select_pinned_container(click_id.clone(), cx);
+            }
+        }),
+    )
+    .on_key_down(
+        cx.listener(move |navigation, event: &KeyDownEvent, window, cx| {
+            if event.keystroke.key.eq_ignore_ascii_case("enter")
+                && !event.keystroke.modifiers.modified()
+            {
+                window.prevent_default();
+                cx.stop_propagation();
+                navigation.request_open_pinned_container(keyboard_id.clone(), cx);
+            }
+        }),
+    )
+    .context_menu(move |menu, _, _| {
+        let open_entity = open_entity.clone();
+        let open_id = open_id.clone();
+        let remove_entity = remove_entity.clone();
+        let remove_id = remove_id.clone();
+        let menu = menu.item(
+            PopupMenuItem::new(crate::locale::text(
+                "打开容器终端",
+                "Open container terminal",
+            ))
+            .icon(IconName::SquareTerminal)
+            .on_click(move |_, _, app| {
+                open_entity.update(app, |navigation, cx| {
+                    navigation.request_open_pinned_container(open_id.clone(), cx)
+                });
+            }),
+        );
+        menu.separator().item(
+            PopupMenuItem::new(crate::locale::text("从侧栏移除", "Remove from sidebar"))
+                .icon(gpui_kit::assets::IconName::Trash)
+                .on_click(move |_, _, app| {
+                    remove_entity.update(app, |navigation, cx| {
+                        navigation.request_remove_pinned_container(remove_id.clone(), cx)
+                    });
+                }),
+        )
+    });
+
+    div().w_full().pl_4().child(row)
+}
+
 /// 整行一次性构造连接行；右键只保留主机与传输动作，容器目标始终由活动终端确定。
 /// 外层按钮占满可用宽度，选中与悬停色沿用主题令牌，协议动作仍绑定稳定 HostId。
+/// 键盘确认与鼠标双击共享明确连接意图，鼠标单击保持只展示详情。
+/// 行焦点按 HostId 保持，点击后的 Enter 不依赖 Kit 默认禁止的鼠标聚焦行为。
 /// @author kongweiguang
 fn host_row(
     navigation: &mut HostNavigation,
     host: ManagedHost,
     theme: ThemeTokens,
     metrics: HostNavigationLayoutMetrics,
+    window: &mut Window,
     cx: &mut Context<HostNavigation>,
 ) -> impl IntoElement + 'static {
     let host_id = host.id.clone();
     let dom_id = host_id.as_str().to_owned();
+    let focus_handle = window
+        .use_keyed_state(
+            format!("host-navigation-host-focus-{dom_id}"),
+            cx,
+            |_, cx| cx.focus_handle(),
+        )
+        .read(cx)
+        .clone();
     let protocol = host.protocol;
     let menu_actions = host_context_menu_actions(&host);
     let can_copy_network_address =
@@ -2381,6 +2724,7 @@ fn host_row(
         theme,
         metrics,
     )
+    .focus_handle(&focus_handle)
     .min_w(px(0.))
     .custom(
         ButtonCustomVariant::new(cx)
@@ -2399,9 +2743,9 @@ fn host_row(
     )
     .child(
         div()
-            .size(px(28.))
+            .size(px(metrics.icon_size))
             .flex_shrink_0()
-            .rounded_md()
+            .rounded_lg()
             .flex()
             .items_center()
             .justify_center()
@@ -2449,8 +2793,8 @@ fn host_row(
     })
     .accessibility_label(if menu_actions.show_primary {
         crate::locale::text(
-            format!("{name}，单击选择，双击{open_label}"),
-            format!("{name}; click to select, double-click to {open_label}"),
+            format!("{name}，单击选择，双击或按 Enter {open_label}"),
+            format!("{name}; click to select, double-click or press Enter to {open_label}"),
         )
     } else {
         crate::locale::text(
@@ -2461,13 +2805,16 @@ fn host_row(
     .when_some(session_status, |row, status| {
         row.tooltip(session_status_label(status))
     })
-    .on_click(cx.listener(move |navigation, event: &ClickEvent, _, cx| {
-        if is_open_gesture(event.click_count()) {
-            navigation.request_connect(click_id.clone(), cx);
-        } else if event.click_count() == 1 {
-            navigation.select_host(click_id.clone(), cx);
-        }
-    }))
+    .on_click(
+        cx.listener(move |navigation, event: &ClickEvent, window, cx| {
+            if is_open_gesture(event) {
+                navigation.request_connect(click_id.clone(), cx);
+            } else if event.click_count() == 1 {
+                window.focus(&focus_handle, cx);
+                navigation.select_host(click_id.clone(), cx);
+            }
+        }),
+    )
     .context_menu(move |menu, window, cx| {
         let mut menu = menu;
         if menu_actions.show_primary {

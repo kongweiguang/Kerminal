@@ -6,7 +6,7 @@ use super::{
     GroupTitleError, PendingTabReveal, TabDropPlacement, TabRevealReason,
     WorkspaceCloseBatchIntent, WorkspaceFileTabAction, WorkspaceNameEditKeyAction,
     WorkspaceNameEditTarget, WorkspaceTabEvent, WorkspaceTabGroupProjection, WorkspaceTabKind,
-    WorkspaceTabProjection, WorkspaceTabTrackSection, WorkspaceTabs,
+    WorkspaceTabProjection, WorkspaceTabTrackSection, WorkspaceTabs, WorkspaceTabsCreateEvent,
     append_shared_sftp_workbench_projection, capture_workspace_name_edit_key, group_color_actions,
     group_drop_before_id, invalidate_tab_reveal_for_group_change, minimal_active_tab_reveal_offset,
     next_tab_drag_scroll_offset, partition_shared_sftp_workbench_close_batch,
@@ -636,7 +636,7 @@ fn wide_workspace_track_budget_keeps_trailing_ungrouped_target_scrollable() {
     let track_width = workspace_tab_track_width_budget(&visible_sections);
 
     assert!(content_width > 1_000.);
-    assert_eq!(track_width, 1_431.);
+    assert_eq!(track_width, 1_399.);
     assert_eq!(track_width, content_width + 72.);
 }
 
@@ -662,7 +662,7 @@ fn wide_workspace_track_budget_keeps_normal_tabs_scrollable_without_drop_target(
 
     let track_width = workspace_tab_track_width_budget(&sections);
 
-    assert_eq!(track_width, 1_235.);
+    assert_eq!(track_width, 1_203.);
 }
 
 /// 序号跟随全局投影索引，不因标签组或滚动窗口变化而重排。
@@ -1471,8 +1471,9 @@ mod close_confirmation_gpui {
 mod workspace_tabs_gpui_chrome {
     use super::*;
     use gpui::{
-        AppContext as _, Context, Entity, IntoElement, Modifiers, ParentElement as _, Render,
-        Styled as _, Subscription, TestAppContext, VisualTestContext, Window, div, point, size,
+        AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, Modifiers,
+        ParentElement as _, Render, Styled as _, Subscription, TestAppContext, VisualTestContext,
+        Window, div, point, size,
     };
     use gpui_kit as gpui;
     use std::{cell::RefCell, rc::Rc};
@@ -1480,8 +1481,10 @@ mod workspace_tabs_gpui_chrome {
     struct ChromeHarness {
         tabs: Entity<WorkspaceTabs>,
         events: Rc<RefCell<Vec<WorkspaceTabEvent>>>,
+        create_events: Rc<RefCell<Vec<WorkspaceTabsCreateEvent>>>,
         tab_ids: Vec<TabId>,
         _event_subscription: Subscription,
+        _create_event_subscription: Subscription,
     }
 
     impl ChromeHarness {
@@ -1522,19 +1525,35 @@ mod workspace_tabs_gpui_chrome {
                 cx.subscribe(&tabs, move |_, _, event: &WorkspaceTabEvent, _| {
                     recorded_events.borrow_mut().push(event.clone());
                 });
+            let create_events = Rc::new(RefCell::new(Vec::new()));
+            let recorded_create_events = create_events.clone();
+            let create_event_subscription =
+                cx.subscribe(&tabs, move |_, _, event: &WorkspaceTabsCreateEvent, _| {
+                    recorded_create_events.borrow_mut().push(event.clone());
+                });
             Self {
                 tabs,
                 events,
+                create_events,
                 tab_ids,
                 _event_subscription: event_subscription,
+                _create_event_subscription: create_event_subscription,
             }
         }
     }
 
     impl Render for ChromeHarness {
         /// The actual WorkspaceTabs entity is mounted so element hitboxes and click bubbling are exercised.
+        /// Harness mirrors the workbench title bar's shared 4px leading inset.
+        ///
+        /// @author kongweiguang
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(self.tabs.clone())
+            div()
+                .id("workspace-tabs-chrome-harness")
+                .debug_selector(|| "workspace-tabs-chrome-harness".to_owned())
+                .size_full()
+                .pl_1()
+                .child(self.tabs.clone())
         }
     }
 
@@ -1818,7 +1837,7 @@ mod workspace_tabs_gpui_chrome {
         );
     }
 
-    /// A click at the measured label center activates that TabId; the inset active face does not expand the label or overlap sibling hitboxes.
+    /// A click at the measured label center activates that TabId; the rounded active face stays within the label box without overlapping siblings.
     ///
     /// @author kongweiguang
     #[gpui::test]
@@ -1839,6 +1858,12 @@ mod workspace_tabs_gpui_chrome {
         let target_close = visual
             .debug_bounds("workspace-tab-close-tab-chrome-second")
             .expect("inactive close button has a stable hitbox");
+        let tabs_bounds = visual
+            .debug_bounds("workspace-tabs-view")
+            .expect("workspace tab view has a stable measured region");
+        let harness_bounds = visual
+            .debug_bounds("workspace-tabs-chrome-harness")
+            .expect("title bar inset has a stable measured region");
         let create_button = visual
             .debug_bounds("workspace-tabs-create-terminal")
             .expect("new tab button is measured");
@@ -1848,12 +1873,34 @@ mod workspace_tabs_gpui_chrome {
 
         assert_eq!(active_box.size.width.as_f32(), 180.);
         assert!(
-            (7.0..=10.0).contains(&(active_body.origin.x - active_box.origin.x).as_f32()),
-            "the active face must remain inset within the label hitbox"
+            (active_box.origin.x - tabs_bounds.origin.x).as_f32().abs() < 0.5,
+            "the first tab must not add an inset inside the workspace tab view"
         );
         assert!(
-            (160.0..=166.0).contains(&active_body.size.width.as_f32()),
-            "the active face must be inset without shrinking the 180px tab hitbox"
+            ((active_box.origin.x - harness_bounds.origin.x) - px(4.))
+                .as_f32()
+                .abs()
+                < 0.5,
+            "the first tab must align to the title bar's shared 4px leading inset"
+        );
+        assert!(
+            ((active_body.origin.x - active_box.origin.x) - px(1.))
+                .as_f32()
+                .abs()
+                < 0.5
+                && ((active_body.origin.y - active_box.origin.y) - px(1.))
+                    .as_f32()
+                    .abs()
+                    < 0.5
+                && ((active_body.size.width + px(2.)) - active_box.size.width)
+                    .as_f32()
+                    .abs()
+                    < 0.5
+                && ((active_body.size.height + px(2.)) - active_box.size.height)
+                    .as_f32()
+                    .abs()
+                    < 0.5,
+            "the full rounded active face must sit one border pixel inside the tab bounds"
         );
         let active_close_trailing_inset = active_box.origin.x + active_box.size.width
             - active_close.origin.x
@@ -1867,6 +1914,10 @@ mod workspace_tabs_gpui_chrome {
                 .abs()
                 < 0.5,
             "active state must not shift the stable close-button target"
+        );
+        assert!(
+            (active_close_trailing_inset - px(11.)).as_f32().abs() < 0.5,
+            "the close target must include the shared 10px inset and 1px tab border"
         );
         assert!(trailing_drag_space.size.width > px(0.));
         assert!(
@@ -1888,6 +1939,21 @@ mod workspace_tabs_gpui_chrome {
                     vec![WorkspaceTabEvent::Activate(
                         TabId::parse("tab-chrome-second").unwrap()
                     )]
+                );
+            });
+        });
+
+        let create_button_center = point(
+            create_button.origin.x + create_button.size.width / 2.,
+            create_button.origin.y + create_button.size.height / 2.,
+        );
+        visual.simulate_click(create_button_center, Modifiers::default());
+        visual.run_until_parked();
+        visual.update(|_, app| {
+            harness.read_with(app, |harness, _| {
+                assert_eq!(
+                    *harness.create_events.borrow(),
+                    vec![WorkspaceTabsCreateEvent::Local]
                 );
             });
         });

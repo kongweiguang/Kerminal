@@ -13,12 +13,14 @@ path = "src/lib.rs"
 
 [features]
 acceptance-metrics = ["gpui_kit/profiler"]
+right-rail-acceptance = ["gpui_pre/test-support", "dep:gpui_component", "gpui_component/test-support"]
 
 [dependencies]
 zeroize.workspace = true
-chrono.workspace = true
+chrono = { workspace = true, features = ["clock"] }
 gpui_kit = { workspace = true, features = ["tree-sitter-languages"] }
 gpui_pre.workspace = true
+gpui_component = { package = "gpui-component", version = "=0.7.3", optional = true }
 image.workspace = true
 linkify.workspace = true
 kerminal-application.workspace = true
@@ -36,6 +38,9 @@ unicode_width.workspace = true
 
 [dev-dependencies]
 # Headless tests exercise the selected GPUI backend without resolving Kit's optional fast backend.
+async-trait.workspace = true
+futures = { version = "0.3", default-features = false, features = ["executor"] }
 gpui_pre = { workspace = true, features = ["test-support"] }
+gpui_component = { package = "gpui-component", version = "=0.7.3", features = ["test-support"] }
 tokio.workspace = true
 

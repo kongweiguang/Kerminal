@@ -45,3 +45,46 @@ fn quickref_shortcuts_preserve_tmux_prefix_bytes() {
             .all(|item| !item.display.chars().any(char::is_control))
     );
 }
+
+/// 固定速查项的中文说明和顺序与 main 工具栏相同，防止两套面板文案逐渐漂移。
+///
+/// @author kongweiguang
+#[test]
+fn quickref_labels_match_main_tool_panel_order() {
+    assert_eq!(
+        commands()
+            .iter()
+            .map(|item| item.label_zh)
+            .collect::<Vec<_>>(),
+        vec![
+            "列出所有会话",
+            "新建名为 work 的会话",
+            "连接到 work 会话",
+            "命令方式退出当前连接",
+            "在 tmux 内切换会话",
+            "新建名为 logs 的窗口",
+            "左右分屏",
+            "上下分屏",
+            "查看 work 会话窗口",
+            "重新加载 tmux 配置",
+        ]
+    );
+    assert_eq!(
+        shortcuts()
+            .iter()
+            .map(|item| item.label_zh)
+            .collect::<Vec<_>>(),
+        vec![
+            "快捷键退出当前 tmux 连接",
+            "新建窗口",
+            "切到下一个窗口",
+            "切到上一个窗口",
+            "左右分屏",
+            "上下分屏",
+            "切换到下一个分屏",
+            "关闭当前分屏，tmux 会确认",
+            "进入复制模式",
+            "查看 tmux 快捷键列表",
+        ]
+    );
+}

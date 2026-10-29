@@ -6,26 +6,16 @@ use std::collections::{BTreeSet, HashMap};
 
 use gpui_kit::{AnyElement, AppContext as _, Context, Entity, IntoElement, Subscription, Window};
 use kerminal_application::{
-    commands::{
-        BroadcastDeliveryResult, BroadcastSessionBinding, SnippetRenderResult,
-        direct_snippet_catalog_command,
-    },
+    commands::{BroadcastDeliveryResult, BroadcastSessionBinding},
     sessions::UiSessionBinding,
     workspace::{WorkspaceSessionSnapshot, WorkspaceSessionTab},
 };
 use kerminal_domain::{
-    commands::{
-        BroadcastAnalysis, BroadcastTarget, CommandHistoryTarget, SnippetCatalogListRequest,
-        SnippetCatalogOrigin, SnippetPreferenceKey,
-    },
+    commands::{BroadcastAnalysis, BroadcastTarget, CommandHistoryTarget},
     identity::{PaneId, TabId},
     sessions::{SessionOwner, SessionTarget},
     workspace::TerminalLayoutNode,
 };
-use kerminal_terminal::input::{
-    InputModifiers, KeyPhase, TerminalInputEvent, TerminalKey, TerminalKeyEvent,
-};
-use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -33,15 +23,13 @@ use crate::{
         workspace_broadcast::{
             PaneBroadcastProjection, WorkspaceBroadcastBar, WorkspaceBroadcastBarEvent,
             WorkspaceBroadcastBarProjection, WorkspaceBroadcastDeliveryProjection,
-            WorkspaceBroadcastSnippetProjection, WorkspaceBroadcastTargetMode,
-            WorkspaceBroadcastTargetProjection,
+            WorkspaceBroadcastTargetMode, WorkspaceBroadcastTargetProjection,
+            broadcast_draft_error,
         },
         workspace_panes::WorkspacePaneEvent,
     },
-    root::{CenterPanel, RootView, session_queue, terminal_tool_actions},
+    root::{CenterPanel, RootView, terminal_tool_actions},
 };
-
-const MAX_BROADCAST_COMMAND_BYTES: usize = 16 * 1024;
 
 /// 共享工具栏只持有各 Tab 的交互状态，不拥有可见 UI pane 之外的会话。
 pub(super) struct WorkspaceBroadcastRuntime {
@@ -62,20 +50,9 @@ struct WorkspaceBroadcastTabState {
     previous_view_pane_count: usize,
     sync_enabled: bool,
     status: Option<String>,
-    results_open: bool,
+    status_is_error: bool,
     command_request_id: Option<u64>,
-    confirmation: Option<FrozenBroadcastRequest>,
     last_result: Option<WorkspaceBroadcastResult>,
-    snippets_open: bool,
-    snippets: Vec<SnippetChoice>,
-    snippet_generation: u64,
-}
-
-#[derive(Clone)]
-struct SnippetChoice {
-    key: SnippetPreferenceKey,
-    title: String,
-    command: SnippetRenderResult,
 }
 
 #[derive(Clone)]
@@ -86,14 +63,6 @@ struct FrozenBroadcastRequest {
     targets: Vec<BroadcastTarget>,
     ui_bindings: Vec<UiSessionBinding>,
     api_bindings: Vec<BroadcastSessionBinding>,
-    analysis: BroadcastAnalysis,
-    snippet: Option<SnippetRenderResult>,
-}
-
-struct BroadcastPlan {
-    execute: FrozenBroadcastRequest,
-    full: FrozenBroadcastRequest,
-    prior_deliveries: Vec<BroadcastDeliveryResult>,
 }
 
 #[derive(Clone)]
@@ -118,6 +87,8 @@ struct ActiveWorkspaceCommand {
 
 impl WorkspaceBroadcastTabState {
     /// 默认全选以自然纳入新分屏；用户改选时再转为固定的自选集合。
+    ///
+    /// @author kongweiguang
     fn default() -> Self {
         Self {
             mode: WorkspaceBroadcastTargetMode::All,
@@ -127,13 +98,133 @@ impl WorkspaceBroadcastTabState {
             previous_view_pane_count: 0,
             sync_enabled: false,
             status: None,
-            results_open: false,
+            status_is_error: false,
             command_request_id: None,
-            confirmation: None,
             last_result: None,
-            snippets_open: false,
-            snippets: Vec::new(),
-            snippet_generation: 0,
+        }
+    }
+
+    /// 短暂操作状态与发送回执分开保存，避免同步提示或输入校验覆盖仍可追溯的结果。
+    ///
+    /// @author kongweiguang
+    fn set_status(&mut self, message: impl Into<String>, is_error: bool) {
+        self.status = Some(message.into());
+        self.status_is_error = is_error;
+    }
+
+    /// 清除短暂状态时保留发送回执，结果只在下一次发送真正开始时失效。
+    ///
+    /// @author kongweiguang
+    fn clear_status(&mut self) {
+        self.status = None;
+        self.status_is_error = false;
+    }
+
+    /// 新发送开始时原子更新请求代次并清除旧回执，避免迟到结果或编辑状态混淆当前发送。
+    ///
+    /// @author kongweiguang
+    fn begin_command(&mut self, request_id: u64, progress: &str) {
+        self.command_request_id = Some(request_id);
+        self.last_result = None;
+        self.set_status(progress, false);
+    }
+
+    /// 超限粘贴保留原文供修正；合法编辑结束短暂错误，但保留上次发送结果供用户复查。
+    ///
+    /// @author kongweiguang
+    fn replace_draft(&mut self, draft: String, progress: Option<&str>) {
+        self.draft = draft;
+        self.clear_status();
+        if let Some(error) = broadcast_draft_error(&self.draft) {
+            self.set_status(error.to_string(), true);
+        } else if let Some(progress) = progress {
+            self.set_status(progress, false);
+        }
+    }
+}
+
+/// 外层执行失败也保留冻结目标；空回执代表结果未知，编辑状态不能清除它。
+///
+/// @author kongweiguang
+fn finish_workspace_broadcast_error(
+    state: &mut WorkspaceBroadcastTabState,
+    request: FrozenBroadcastRequest,
+    message: &str,
+) {
+    state.last_result = Some(WorkspaceBroadcastResult {
+        request,
+        deliveries: Vec::new(),
+    });
+    state.set_status(message, true);
+}
+
+impl WorkspaceBroadcastResult {
+    /// 按发送时冻结的目标集合统计回执；缺失、重复或外来回执都不能伪装成完整成功。
+    ///
+    /// @author kongweiguang
+    fn summary(&self) -> Option<String> {
+        let mut sent = 0;
+        let mut attempted_failed = 0;
+        let mut not_sent = 0;
+        let mut receipt_unconfirmed = 0;
+        let mut history_unconfirmed = 0;
+        for target in &self.request.targets {
+            let Some(delivery) = unique_broadcast_delivery(target, &self.deliveries) else {
+                receipt_unconfirmed += 1;
+                continue;
+            };
+            if delivery.sent {
+                sent += 1;
+            } else if delivery.attempted {
+                attempted_failed += 1;
+            } else {
+                not_sent += 1;
+            }
+            if delivery.history_error_code.is_some() {
+                history_unconfirmed += 1;
+            }
+        }
+        receipt_unconfirmed += self
+            .deliveries
+            .iter()
+            .filter(|delivery| {
+                !self
+                    .request
+                    .targets
+                    .iter()
+                    .any(|target| target.pane_id == delivery.pane_id)
+            })
+            .count();
+        let all_sent = result_all_targets_sent(&self.request.targets, &self.deliveries);
+        if all_sent && history_unconfirmed == 0 && receipt_unconfirmed == 0 {
+            return None;
+        }
+
+        Some(
+            crate::locale::text(
+                format!(
+                    "已发送 {sent}/{}；结果未知或失败 {attempted_failed}，未发送 {not_sent}，回执未确认 {receipt_unconfirmed}，历史记录未确认 {history_unconfirmed}。",
+                    self.request.targets.len()
+                ),
+                format!(
+                    "Sent {sent}/{}; {attempted_failed} outcomes failed or are unknown, {not_sent} were not sent, {receipt_unconfirmed} delivery receipts were unconfirmed, and {history_unconfirmed} history records were not confirmed.",
+                    self.request.targets.len()
+                ),
+            )
+            .to_string(),
+        )
+    }
+}
+
+impl PendingSyncValidation {
+    /// 撤销校验同时结束对应 Tab 的进度反馈；迟到回执不会再负责替用户收敛状态。
+    ///
+    /// @author kongweiguang
+    fn cancel(self, state: Option<&mut WorkspaceBroadcastTabState>) {
+        self.cancellation.cancel();
+        if let Some(state) = state {
+            state.sync_enabled = false;
+            state.set_status("同步按键已关闭。", false);
         }
     }
 }
@@ -261,11 +352,6 @@ impl RootView {
 
         let switched = self.workspace_broadcast.last_active_tab_id != active_tab;
         if switched {
-            if let Some(previous_tab_id) = self.workspace_broadcast.last_active_tab_id.as_ref()
-                && let Some(state) = self.workspace_broadcast.tabs.get_mut(previous_tab_id)
-            {
-                invalidate_snippet_picker(state);
-            }
             if self.broadcast_session_ids.is_some() || self.pending_broadcast_generation.is_some() {
                 let _ = self.stop_broadcast();
             }
@@ -368,13 +454,15 @@ impl RootView {
                 "群发目标连接或选择已变化，同步输入已停止。",
             );
             if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                state.status = Some("群发目标连接或选择已变化，同步输入已停止。".to_owned());
+                state.set_status("群发目标连接或选择已变化，同步输入已停止。", true);
             }
         }
         self.sync_bar_projection(&snapshot, active_tab.as_ref(), _window, cx);
     }
 
     /// 首次绘制前复用候选布局决定工具栏显隐，保证测量时已包含其占用空间。
+    ///
+    /// @author kongweiguang
     fn workspace_broadcast_view_layout(
         &self,
         snapshot: &WorkspaceSessionSnapshot,
@@ -456,7 +544,7 @@ impl RootView {
                 );
                 if can_reopen && let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
                     state.bar_visible = true;
-                    state.status = None;
+                    state.clear_status();
                 }
                 let is_active = can_reopen
                     && self
@@ -486,7 +574,7 @@ impl RootView {
         }
     }
 
-    /// 菜单与页头共用精确绑定下的选中集合，标题只供阅读，不参与目标路由。
+    /// 菜单与页头共用精确绑定下的选中集合；结果异常与短暂状态分别投影。
     ///
     /// @author kongweiguang
     fn bar_projection(
@@ -548,51 +636,18 @@ impl RootView {
                 .active_command
                 .as_ref()
                 .is_some_and(|active| active.tab_id == *tab_id),
-            confirmation_required: state.confirmation.is_some(),
-            can_cancel: self
-                .workspace_broadcast
-                .active_command
-                .as_ref()
-                .is_some_and(|active| active.tab_id == *tab_id),
             execution_busy: self.workspace_broadcast.active_command.is_some(),
-            can_retry_safe: state
+            result_summary: state
                 .last_result
                 .as_ref()
-                .is_some_and(WorkspaceBroadcastResult::has_safe_retry),
+                .and_then(WorkspaceBroadcastResult::summary),
             result_details: state
                 .last_result
                 .as_ref()
-                .map(|result| {
-                    result
-                        .deliveries
-                        .iter()
-                        .map(|delivery| {
-                            let title = result
-                                .request
-                                .targets
-                                .iter()
-                                .find(|target| target.pane_id == delivery.pane_id)
-                                .map(|target| target.title.clone())
-                                .unwrap_or_else(|| delivery.pane_id.to_string());
-                            WorkspaceBroadcastDeliveryProjection {
-                                title,
-                                state: delivery_state_label(delivery),
-                            }
-                        })
-                        .collect()
-                })
+                .map(result_delivery_details)
                 .unwrap_or_default(),
-            results_open: state.results_open,
-            snippets_open: state.snippets_open,
-            snippets: state
-                .snippets
-                .iter()
-                .map(|snippet| WorkspaceBroadcastSnippetProjection {
-                    id: snippet_choice_id(&snippet.key),
-                    title: snippet.title.clone(),
-                })
-                .collect(),
             status: state.status.clone(),
+            status_is_error: state.status_is_error,
         }
     }
 
@@ -661,7 +716,6 @@ impl RootView {
         } else if input_enabled {
             state.custom_panes.insert(pane_id.clone());
         }
-        state.confirmation = None;
         self.stop_workspace_broadcast_for_selection_change(tab_id);
         cx.notify();
     }
@@ -698,17 +752,17 @@ impl RootView {
         if let Some(active) = self.workspace_broadcast.active_command.as_ref() {
             active.cancellation.cancel();
             if let Some(state) = self.workspace_broadcast.tabs.get_mut(&active.tab_id) {
-                state.status = Some(message.to_owned());
+                state.set_status(message, true);
             }
         }
     }
 
-    /// 忙碌提示保留每个 Tab 的确认和失败结果，等待当前逐目标回执收敛后再操作。
+    /// 忙碌提示保留每个 Tab 的草稿，等待当前逐目标回执收敛后再操作。
     ///
     /// @author kongweiguang
     fn report_workspace_broadcast_busy(&mut self, tab_id: &TabId) {
         if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-            state.status = Some("另一项群发仍在收尾，请稍后重试。".to_owned());
+            state.set_status("另一项群发仍在收尾，请稍后重试。", false);
         }
     }
 
@@ -730,7 +784,7 @@ impl RootView {
             let _ = self.stop_broadcast();
         }
         if let Some(state) = self.workspace_broadcast.tabs.get_mut(&tab_id) {
-            state.status = Some(message.to_owned());
+            state.set_status(message, true);
         }
     }
 
@@ -804,7 +858,9 @@ impl RootView {
         });
     }
 
-    /// 工具栏事件先校验捕获的 Tab，再更新状态或启动异步操作。
+    /// 工具栏事件先校验捕获的 Tab，再更新状态或启动异步操作，防止旧投影写入当前 Tab。
+    ///
+    /// @author kongweiguang
     fn handle_workspace_broadcast_bar_event(
         &mut self,
         event: WorkspaceBroadcastBarEvent,
@@ -816,27 +872,32 @@ impl RootView {
             | WorkspaceBroadcastBarEvent::SetMode { tab_id, .. }
             | WorkspaceBroadcastBarEvent::ToggleTarget { tab_id, .. }
             | WorkspaceBroadcastBarEvent::ToggleSync { tab_id }
-            | WorkspaceBroadcastBarEvent::SendCommand { tab_id }
-            | WorkspaceBroadcastBarEvent::ConfirmSend { tab_id }
-            | WorkspaceBroadcastBarEvent::Interrupt { tab_id }
-            | WorkspaceBroadcastBarEvent::CancelCommand { tab_id }
-            | WorkspaceBroadcastBarEvent::RetrySafeFailures { tab_id }
-            | WorkspaceBroadcastBarEvent::ToggleResults { tab_id }
-            | WorkspaceBroadcastBarEvent::OpenSnippets { tab_id }
-            | WorkspaceBroadcastBarEvent::CloseSnippets { tab_id }
-            | WorkspaceBroadcastBarEvent::ChooseSnippet { tab_id, .. } => tab_id.clone(),
+            | WorkspaceBroadcastBarEvent::SendCommand { tab_id } => tab_id.clone(),
         };
         if self.workspace_broadcast.last_active_tab_id.as_ref() != Some(&tab_id) {
             return;
         }
         match event {
             WorkspaceBroadcastBarEvent::DraftChanged { draft, .. } => {
-                if draft.len() <= MAX_BROADCAST_COMMAND_BYTES
-                    && let Some(state) = self.workspace_broadcast.tabs.get_mut(&tab_id)
+                let progress = if self
+                    .workspace_broadcast
+                    .sync_validation
+                    .as_ref()
+                    .is_some_and(|pending| pending.tab_id == tab_id)
                 {
-                    state.draft = draft;
-                    state.confirmation = None;
-                    state.status = None;
+                    Some("正在校验同步目标…")
+                } else if self
+                    .workspace_broadcast
+                    .active_command
+                    .as_ref()
+                    .is_some_and(|active| active.tab_id == tab_id)
+                {
+                    Some("群发处理中…")
+                } else {
+                    None
+                };
+                if let Some(state) = self.workspace_broadcast.tabs.get_mut(&tab_id) {
+                    state.replace_draft(draft, progress);
                 }
             }
             WorkspaceBroadcastBarEvent::SetMode { mode, .. } => {
@@ -850,71 +911,6 @@ impl RootView {
             }
             WorkspaceBroadcastBarEvent::SendCommand { .. } => {
                 self.send_workspace_broadcast_command(&tab_id, cx);
-            }
-            WorkspaceBroadcastBarEvent::ConfirmSend { .. } => {
-                if self.workspace_broadcast.active_command.is_some() {
-                    self.report_workspace_broadcast_busy(&tab_id);
-                } else if let Some(request) = self
-                    .workspace_broadcast
-                    .tabs
-                    .get_mut(&tab_id)
-                    .and_then(|state| state.confirmation.take())
-                {
-                    let draft_matches = self
-                        .workspace_broadcast
-                        .tabs
-                        .get(&tab_id)
-                        .is_some_and(|state| state.draft.trim() == request.command);
-                    if draft_matches {
-                        self.execute_workspace_broadcast_plan(
-                            BroadcastPlan {
-                                full: request.clone(),
-                                execute: request,
-                                prior_deliveries: Vec::new(),
-                            },
-                            true,
-                            cx,
-                        );
-                    } else if let Some(state) = self.workspace_broadcast.tabs.get_mut(&tab_id) {
-                        state.status = Some("草稿已变化，请重新发送当前内容。".to_owned());
-                    }
-                }
-            }
-            WorkspaceBroadcastBarEvent::Interrupt { .. } => {
-                self.interrupt_workspace_broadcast_targets(&tab_id, cx);
-            }
-            WorkspaceBroadcastBarEvent::CancelCommand { .. } => {
-                if let Some(active) = self.workspace_broadcast.active_command.as_ref()
-                    && active.tab_id == tab_id
-                {
-                    active.cancellation.cancel();
-                    if let Some(state) = self.workspace_broadcast.tabs.get_mut(&tab_id) {
-                        state.status = Some("正在取消后续目标；当前写入完成后收尾。".to_owned());
-                    }
-                }
-            }
-            WorkspaceBroadcastBarEvent::RetrySafeFailures { .. } => {
-                if self.workspace_broadcast.active_command.is_some() {
-                    self.report_workspace_broadcast_busy(&tab_id);
-                } else {
-                    self.retry_safe_workspace_broadcast_targets(&tab_id, cx);
-                }
-            }
-            WorkspaceBroadcastBarEvent::ToggleResults { .. } => {
-                if let Some(state) = self.workspace_broadcast.tabs.get_mut(&tab_id) {
-                    state.results_open = !state.results_open;
-                }
-            }
-            WorkspaceBroadcastBarEvent::OpenSnippets { .. } => {
-                self.open_workspace_broadcast_snippets(&tab_id, cx);
-            }
-            WorkspaceBroadcastBarEvent::CloseSnippets { .. } => {
-                if let Some(state) = self.workspace_broadcast.tabs.get_mut(&tab_id) {
-                    invalidate_snippet_picker(state);
-                }
-            }
-            WorkspaceBroadcastBarEvent::ChooseSnippet { snippet_id, .. } => {
-                self.choose_workspace_broadcast_snippet(&tab_id, &snippet_id, cx);
             }
         }
         self.sync_bar_projection_for_current_tab(window, cx);
@@ -960,7 +956,6 @@ impl RootView {
             state.custom_panes = current;
         }
         state.mode = mode;
-        state.confirmation = None;
         self.stop_workspace_broadcast_for_selection_change(tab_id);
     }
 
@@ -1067,140 +1062,10 @@ impl RootView {
             targets,
             ui_bindings,
             api_bindings,
-            analysis,
-            snippet: None,
         })
     }
 
-    /// 打开片段列表只读取既有目录服务，加载回执以 per-Tab 代次防止覆盖更新状态。
-    ///
-    /// @author kongweiguang
-    fn open_workspace_broadcast_snippets(&mut self, tab_id: &TabId, cx: &mut Context<Self>) {
-        let Some(commands) = self.services.commands.clone() else {
-            if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                state.status = Some("命令片段服务当前不可用。".to_owned());
-            }
-            return;
-        };
-        let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) else {
-            return;
-        };
-        state.snippets_open = true;
-        state.snippet_generation = state.snippet_generation.wrapping_add(1).max(1);
-        let generation = state.snippet_generation;
-        state.status = Some("正在读取命令片段…".to_owned());
-        let executor = self.services.executor.clone();
-        let callback_tab = tab_id.clone();
-        let request = SnippetCatalogListRequest {
-            query: None,
-            origin: None,
-            scope: None,
-            limit: None,
-        };
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(move |_cancellation| async move { commands.list_snippets(request).await })
-                .await;
-            let _ = this.update(cx, |root, cx| {
-                let Some(state) = root.workspace_broadcast.tabs.get_mut(&callback_tab) else {
-                    return;
-                };
-                if !is_current_snippet_request(state, generation) {
-                    return;
-                }
-                match result {
-                    Ok(items) => {
-                        state.snippets = items
-                            .into_iter()
-                            .map(|item| SnippetChoice {
-                                command: direct_snippet_catalog_command(&item, &BTreeMap::new()),
-                                key: SnippetPreferenceKey {
-                                    origin: item.origin,
-                                    snippet_id: item.id,
-                                },
-                                title: item.title,
-                            })
-                            .collect();
-                        state.status = if state.snippets.is_empty() {
-                            Some("当前没有可用的命令片段。".to_owned())
-                        } else {
-                            None
-                        };
-                    }
-                    Err(error) => state.status = Some(error.public_message().to_owned()),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// 点击即发送当前展示的片段快照；关闭弹层只影响目录，不撤销已明确发起的发送。
-    /// 目标仍固定为点击时的完整 binding，命令不覆盖输入草稿，也不依赖平台探测或 Shell marker。
-    ///
-    /// @author kongweiguang
-    fn choose_workspace_broadcast_snippet(
-        &mut self,
-        tab_id: &TabId,
-        choice_id: &str,
-        cx: &mut Context<Self>,
-    ) {
-        if self.workspace_broadcast.active_command.is_some() {
-            self.report_workspace_broadcast_busy(tab_id);
-            return;
-        }
-        let Some(choice) = self.workspace_broadcast.tabs.get(tab_id).and_then(|state| {
-            state
-                .snippets
-                .iter()
-                .find(|snippet| snippet_choice_id(&snippet.key) == choice_id)
-                .cloned()
-        }) else {
-            return;
-        };
-        let Some((layout, _)) = self.workspace_controller.as_ref().and_then(|controller| {
-            self.workspace_broadcast_view_layout(controller.snapshot(), tab_id, cx)
-        }) else {
-            return;
-        };
-        let bindings = self.selected_workspace_bindings(tab_id, &layout);
-        let draft_snapshot = self
-            .workspace_broadcast
-            .tabs
-            .get(tab_id)
-            .map(|state| state.draft.clone())
-            .unwrap_or_default();
-        let Some(mut request) = self.freeze_workspace_broadcast_request(
-            tab_id,
-            choice.command.command.clone(),
-            draft_snapshot,
-            bindings,
-            cx,
-        ) else {
-            if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                state.status = Some("请选择仍可输入的分屏后发送片段。".to_owned());
-            }
-            return;
-        };
-        request.snippet = Some(choice.command);
-        if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-            invalidate_snippet_picker(state);
-            state.confirmation = None;
-            state.last_result = None;
-            state.results_open = false;
-        }
-        self.execute_workspace_broadcast_plan(
-            BroadcastPlan {
-                full: request.clone(),
-                execute: request,
-                prior_deliveries: Vec::new(),
-            },
-            true,
-            cx,
-        );
-    }
-
-    /// 发送时冻结命令和目标集合；只有 CommandsService 的风险门禁要求时才二次确认。
+    /// 新发送开始时清除旧回执并冻结命令和目标，校验 owner/generation 后才允许进入服务发送流程。
     ///
     /// @author kongweiguang
     fn send_workspace_broadcast_command(&mut self, tab_id: &TabId, cx: &mut Context<Self>) {
@@ -1213,9 +1078,7 @@ impl RootView {
             .tabs
             .get(tab_id)
             .map(|state| (state.draft.clone(), state.draft.trim().to_owned()))
-            .filter(|(_, command)| {
-                !command.is_empty() && command.len() <= MAX_BROADCAST_COMMAND_BYTES
-            })
+            .filter(|(_, command)| !command.is_empty())
         else {
             return;
         };
@@ -1224,6 +1087,12 @@ impl RootView {
         }) else {
             return;
         };
+        if let Some(error) = broadcast_draft_error(&draft_snapshot) {
+            if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
+                state.set_status(error.to_string(), true);
+            }
+            return;
+        }
         let bindings = self.selected_workspace_bindings(tab_id, &layout);
         let Some(request) = self.freeze_workspace_broadcast_request(
             tab_id,
@@ -1233,7 +1102,7 @@ impl RootView {
             cx,
         ) else {
             if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                state.status = Some("所选目标已不可用，请重新选择后再发送。".to_owned());
+                state.set_status("所选目标已不可用，请重新选择后再发送。", true);
             }
             return;
         };
@@ -1246,17 +1115,13 @@ impl RootView {
             request: request.clone(),
         });
         if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-            state.command_request_id = Some(request_id);
-            state.confirmation = None;
-            state.last_result = None;
-            state.results_open = false;
-            state.status = Some("正在校验所选终端…".to_owned());
+            state.begin_command(request_id, "正在校验所选终端…");
         }
         let sessions = self.services.sessions.clone();
         let executor = self.services.executor.clone();
         let validation_bindings = bindings;
         let validation_cancellation = cancellation.clone();
-        let callback_request = request.clone();
+        let callback_request = request;
         let callback_tab = tab_id.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
@@ -1279,7 +1144,7 @@ impl RootView {
                             "一个或多个终端目标已变化或不可用",
                         ));
                     }
-                    Ok(callback_request)
+                    Ok(())
                 })
                 .await;
             let _ = this.update(cx, |root, cx| {
@@ -1309,53 +1174,38 @@ impl RootView {
                 }
                 if cancelled {
                     if let Some(state) = root.workspace_broadcast.tabs.get_mut(&callback_tab) {
-                        state.status = Some("发送校验已取消。".to_owned());
+                        state.set_status("发送校验已取消。", true);
                     }
                     cx.notify();
                     return;
                 }
                 match result {
-                    Ok(request) => {
-                        if !root.workspace_broadcast_request_bindings_are_current(&request) {
+                    Ok(()) => {
+                        if !root.workspace_broadcast_request_bindings_are_current(&callback_request)
+                        {
                             if let Some(state) =
                                 root.workspace_broadcast.tabs.get_mut(&callback_tab)
                             {
-                                state.status =
-                                    Some("发送目标已变化，请重新选择后重试。".to_owned());
+                                state.set_status("发送目标已变化，请重新选择后重试。", true);
                             }
                         } else if root
                             .workspace_broadcast
                             .tabs
                             .get(&callback_tab)
-                            .is_none_or(|state| state.draft.trim() != request.command)
+                            .is_none_or(|state| state.draft.trim() != callback_request.command)
                         {
                             if let Some(state) =
                                 root.workspace_broadcast.tabs.get_mut(&callback_tab)
                             {
-                                state.status = Some("草稿已变化，请重新发送当前内容。".to_owned());
-                            }
-                        } else if request.analysis.requires_confirmation {
-                            if let Some(state) =
-                                root.workspace_broadcast.tabs.get_mut(&callback_tab)
-                            {
-                                state.confirmation = Some(request);
-                                state.status = Some("该命令需要确认后才会发送。".to_owned());
+                                state.set_status("草稿已变化，请重新发送当前内容。", true);
                             }
                         } else {
-                            root.execute_workspace_broadcast_plan(
-                                BroadcastPlan {
-                                    full: request.clone(),
-                                    execute: request,
-                                    prior_deliveries: Vec::new(),
-                                },
-                                false,
-                                cx,
-                            );
+                            root.execute_workspace_broadcast_request(callback_request, cx);
                         }
                     }
                     Err(error) => {
                         if let Some(state) = root.workspace_broadcast.tabs.get_mut(&callback_tab) {
-                            state.status = Some(error.public_message().to_owned());
+                            state.set_status(error.public_message(), true);
                         }
                     }
                 }
@@ -1365,81 +1215,72 @@ impl RootView {
         .detach();
     }
 
-    /// 共享逐目标回执与取消流程；片段直接提交完整 binding，普通草稿保留既有确认策略。
+    /// 校验通过后按冻结目标顺序发送，并保留每个目标的确定性回执与取消状态。
     ///
     /// @author kongweiguang
-    fn execute_workspace_broadcast_plan(
+    fn execute_workspace_broadcast_request(
         &mut self,
-        plan: BroadcastPlan,
-        confirmed: bool,
+        request: FrozenBroadcastRequest,
         cx: &mut Context<Self>,
     ) {
         if self.workspace_broadcast.active_command.is_some() {
-            self.report_workspace_broadcast_busy(&plan.full.tab_id);
+            self.report_workspace_broadcast_busy(&request.tab_id);
             return;
         }
-        if !self.workspace_broadcast_request_bindings_are_current(&plan.execute) {
-            if let Some(state) = self.workspace_broadcast.tabs.get_mut(&plan.full.tab_id) {
-                state.status = Some("发送目标已变化，请重新选择后重试。".to_owned());
+        if !self.workspace_broadcast_request_bindings_are_current(&request) {
+            if let Some(state) = self.workspace_broadcast.tabs.get_mut(&request.tab_id) {
+                state.set_status("发送目标已变化，请重新选择后重试。", true);
             }
             cx.notify();
             return;
         }
         let request_id = self.next_workspace_broadcast_request_id();
-        let tab_id = plan.full.tab_id.clone();
+        let tab_id = request.tab_id.clone();
         let cancellation = CancellationToken::new();
         self.workspace_broadcast.active_command = Some(ActiveWorkspaceCommand {
             request_id,
             tab_id: tab_id.clone(),
             cancellation: cancellation.clone(),
-            request: plan.execute.clone(),
+            request: request.clone(),
         });
         if let Some(state) = self.workspace_broadcast.tabs.get_mut(&tab_id) {
-            state.command_request_id = Some(request_id);
-            state.status = Some("正在向所选终端发送…".to_owned());
+            state.begin_command(request_id, "正在向所选终端发送…");
         }
         let Some(commands) = self.services.commands.clone() else {
             self.workspace_broadcast.active_command = None;
             if let Some(state) = self.workspace_broadcast.tabs.get_mut(&tab_id) {
-                state.status = Some("命令服务当前不可用。".to_owned());
+                state.set_status("命令服务当前不可用。", true);
             }
             return;
         };
         let executor = self.services.executor.clone();
         let user_cancellation = cancellation.clone();
-        let execute_request = plan.execute.clone();
-        let callback_plan = plan;
+        let execute_request = request.clone();
+        let callback_request = request;
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run_cancellable(cancellation, move |application_cancellation| async move {
-                    if let Some(snippet) = execute_request.snippet {
-                        commands
-                            .broadcast_snippet_with_cancellation(
-                                snippet,
-                                execute_request.targets,
-                                execute_request.ui_bindings,
-                                user_cancellation,
-                                application_cancellation,
-                            )
-                            .await
-                    } else {
-                        commands
-                            .broadcast_with_cancellation(
-                                execute_request.command,
-                                execute_request.targets,
-                                execute_request.api_bindings,
-                                confirmed,
-                                user_cancellation,
-                                application_cancellation,
-                            )
-                            .await
-                    }
+                    commands
+                        .broadcast_with_cancellation(
+                            execute_request.command,
+                            execute_request.targets,
+                            execute_request.api_bindings,
+                            true,
+                            user_cancellation,
+                            application_cancellation,
+                        )
+                        .await
                 })
                 .await;
             let _ = this.update(cx, |root, cx| {
-                if !root.workspace_broadcast.active_command.as_ref().is_some_and(|active| {
-                    active.request_id == request_id && active.tab_id == tab_id
-                }) {
+                if !root
+                    .workspace_broadcast
+                    .active_command
+                    .as_ref()
+                    .is_some_and(|active| {
+                        active.request_id == request_id && active.tab_id == tab_id
+                    })
+                {
                     return;
                 }
                 root.workspace_broadcast.active_command = None;
@@ -1451,149 +1292,35 @@ impl RootView {
                 }
                 match result {
                     Ok(result) => {
-                        let mut deliveries = callback_plan.prior_deliveries.clone();
-                        for delivery in result.deliveries {
-                            if let Some(previous) = deliveries
-                                .iter_mut()
-                                .find(|previous| previous.pane_id == delivery.pane_id)
-                            {
-                                *previous = delivery;
-                            } else {
-                                deliveries.push(delivery);
-                            }
-                        }
-                        deliveries.sort_by_key(|delivery| {
-                            callback_plan
-                                .full
-                                .targets
-                                .iter()
-                                .position(|target| target.pane_id == delivery.pane_id)
-                                .unwrap_or(usize::MAX)
-                        });
-                        let sent = deliveries.iter().filter(|delivery| delivery.sent).count();
-                        let all_sent = result_all_targets_sent(
-                            &callback_plan.full.targets,
-                            &deliveries,
-                        );
-                        let attempted_failed = deliveries
-                            .iter()
-                            .filter(|delivery| delivery.attempted && !delivery.sent)
-                            .count();
-                        let not_sent = deliveries
-                            .iter()
-                            .filter(|delivery| !delivery.attempted && !delivery.sent)
-                            .count();
+                        let deliveries = result.deliveries;
+                        let all_sent =
+                            result_all_targets_sent(&callback_request.targets, &deliveries);
                         let result = WorkspaceBroadcastResult {
-                            request: callback_plan.full.clone(),
+                            request: callback_request.clone(),
                             deliveries,
                         };
-                        state.results_open = attempted_failed > 0 || not_sent > 0;
-                        state.status = Some(format!(
-                            "已发送 {sent}/{}；结果未知/失败 {attempted_failed}，未发送 {not_sent}。",
-                            result.request.targets.len()
-                        ));
-                        if callback_plan.full.snippet.is_none() && should_clear_workspace_broadcast_draft(
+                        state.clear_status();
+                        if should_clear_workspace_broadcast_draft(
                             all_sent,
                             &state.draft,
-                            &callback_plan.full.draft_snapshot,
+                            &callback_request.draft_snapshot,
                         ) {
                             state.draft.clear();
                         }
-                        state.confirmation = None;
                         state.last_result = Some(result);
                     }
                     Err(error) => {
-                        state.status = Some(error.public_message().to_owned());
-                        state.confirmation = None;
+                        finish_workspace_broadcast_error(
+                            state,
+                            callback_request.clone(),
+                            error.public_message(),
+                        );
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
-    }
-
-    /// 只重试明确未开始写入的取消项；成功或结果未知的目标不会重复执行。
-    ///
-    /// @author kongweiguang
-    fn retry_safe_workspace_broadcast_targets(&mut self, tab_id: &TabId, cx: &mut Context<Self>) {
-        let Some(previous) = self
-            .workspace_broadcast
-            .tabs
-            .get(tab_id)
-            .and_then(|state| state.last_result.as_ref())
-            .filter(|result| result.has_safe_retry())
-            .cloned()
-        else {
-            return;
-        };
-        let safe_panes = previous
-            .deliveries
-            .iter()
-            .filter(|delivery| is_safe_broadcast_retry(delivery))
-            .map(|delivery| delivery.pane_id.clone())
-            .collect::<BTreeSet<_>>();
-        let mut execute = previous.request.clone();
-        execute
-            .targets
-            .retain(|target| safe_panes.contains(&target.pane_id));
-        execute
-            .api_bindings
-            .retain(|binding| safe_panes.contains(&binding.pane_id));
-        execute
-            .ui_bindings
-            .retain(|binding| matches!(&binding.owner, SessionOwner::Ui { pane_id, .. } if safe_panes.contains(pane_id)));
-        if execute.targets.is_empty() || execute.api_bindings.len() != execute.targets.len() {
-            return;
-        }
-        execute.analysis = BroadcastAnalysis::analyze(&execute.command, execute.targets.clone());
-        if !self.workspace_broadcast_request_bindings_are_current(&execute) {
-            if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                state.status = Some("原失败目标已变化，未自动换目标重试。".to_owned());
-            }
-            return;
-        }
-        self.execute_workspace_broadcast_plan(
-            BroadcastPlan {
-                execute,
-                full: previous.request,
-                prior_deliveries: previous.deliveries,
-            },
-            true,
-            cx,
-        );
-    }
-
-    /// 一次性 Ctrl+C 使用当前选中的精确 binding 进入各会话 FIFO，不借用或改变同步广播状态。
-    ///
-    /// @author kongweiguang
-    fn interrupt_workspace_broadcast_targets(&mut self, tab_id: &TabId, cx: &mut Context<Self>) {
-        let Some((layout, _)) = self.workspace_controller.as_ref().and_then(|controller| {
-            self.workspace_broadcast_view_layout(controller.snapshot(), tab_id, cx)
-        }) else {
-            return;
-        };
-        let bindings = self.selected_workspace_bindings(tab_id, &layout);
-        let event = TerminalInputEvent::Key(TerminalKeyEvent {
-            key: TerminalKey::Character('c'),
-            phase: KeyPhase::Press,
-            modifiers: InputModifiers {
-                control: true,
-                ..InputModifiers::default()
-            },
-        });
-        match self.enqueue_terminal_input_once(&bindings, event, cx) {
-            Ok(count) => {
-                if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                    state.status = Some(format!("Ctrl+C 已加入 {count} 个终端的输入队列。"));
-                }
-            }
-            Err(error) => {
-                if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                    state.status = Some(format!("Ctrl+C 未发送：{}。", queue_error_label(error)));
-                }
-            }
-        }
     }
 
     /// 默认关闭同步路由；启动时复用既有 owner/generation 校验并等待 UI 路由激活成功。
@@ -1608,7 +1335,7 @@ impl RootView {
         {
             let _ = self.stop_broadcast();
             if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                state.status = Some("同步按键已关闭。".to_owned());
+                state.set_status("同步按键已关闭。", false);
             }
             return;
         }
@@ -1628,7 +1355,7 @@ impl RootView {
         let bindings = self.selected_workspace_bindings(tab_id, &layout);
         if bindings.len() < 2 {
             if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                state.status = Some("同步按键至少需要两个可输入目标。".to_owned());
+                state.set_status("同步按键至少需要两个可输入目标。", true);
             }
             return;
         }
@@ -1640,7 +1367,7 @@ impl RootView {
             Ok(captured) if captured == bindings => captured,
             _ => {
                 if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-                    state.status = Some("同步目标绑定已变化，请重新选择。".to_owned());
+                    state.set_status("同步目标绑定已变化，请重新选择。", true);
                 }
                 return;
             }
@@ -1654,7 +1381,7 @@ impl RootView {
             cancellation: cancellation.clone(),
         });
         if let Some(state) = self.workspace_broadcast.tabs.get_mut(tab_id) {
-            state.status = Some("正在校验同步目标…".to_owned());
+            state.set_status("正在校验同步目标…", false);
         }
         let sessions = self.services.sessions.clone();
         let executor = self.services.executor.clone();
@@ -1775,28 +1502,27 @@ impl RootView {
                                 root.workspace_broadcast.tabs.get_mut(&callback_tab)
                             {
                                 state.sync_enabled = true;
-                                state.status = Some("同步按键已开启。".to_owned());
+                                state.set_status("同步按键已开启。", false);
                             }
                         } else {
                             let _ = root.stop_broadcast();
                             if let Some(state) =
                                 root.workspace_broadcast.tabs.get_mut(&callback_tab)
                             {
-                                state.status = Some("同步目标已变化，未开启同步按键。".to_owned());
+                                state.set_status("同步目标已变化，未开启同步按键。", true);
                             }
                         }
                     }
                     Ok(_) => {
                         let _ = root.stop_broadcast();
                         if let Some(state) = root.workspace_broadcast.tabs.get_mut(&callback_tab) {
-                            state.status =
-                                Some("同步目标不可用或已变化，未开启同步按键。".to_owned());
+                            state.set_status("同步目标不可用或已变化，未开启同步按键。", true);
                         }
                     }
                     Err(error) => {
                         let _ = root.stop_broadcast();
                         if let Some(state) = root.workspace_broadcast.tabs.get_mut(&callback_tab) {
-                            state.status = Some(error.public_message().to_owned());
+                            state.set_status(error.public_message(), true);
                         }
                     }
                 }
@@ -1806,7 +1532,7 @@ impl RootView {
         .detach();
     }
 
-    /// 只有仍然注册在同一个 pane 的 UI owner 才能继续用于确认、执行或安全重试。
+    /// 只有仍然注册在同一个 pane 的 UI owner 才能继续用于校验后的发送。
     ///
     /// @author kongweiguang
     fn workspace_broadcast_request_bindings_are_current(
@@ -1841,7 +1567,8 @@ impl RootView {
     /// @author kongweiguang
     fn cancel_pending_sync_validation(&mut self) {
         if let Some(pending) = self.workspace_broadcast.sync_validation.take() {
-            pending.cancellation.cancel();
+            let state = self.workspace_broadcast.tabs.get_mut(&pending.tab_id);
+            pending.cancel(state);
         }
     }
 
@@ -1857,7 +1584,7 @@ impl RootView {
         }
         active.cancellation.cancel();
         if let Some(state) = self.workspace_broadcast.tabs.get_mut(&active.tab_id) {
-            state.status = Some(message.to_owned());
+            state.set_status(message, true);
         }
     }
 
@@ -1869,13 +1596,6 @@ impl RootView {
             .wrapping_add(1)
             .max(1);
         self.workspace_broadcast.next_request_id
-    }
-}
-
-impl WorkspaceBroadcastResult {
-    /// 安全重试只包含明确未尝试的取消项；失败写入的状态可能未知，不能重放。
-    fn has_safe_retry(&self) -> bool {
-        self.deliveries.iter().any(is_safe_broadcast_retry)
     }
 }
 
@@ -1893,7 +1613,7 @@ impl Drop for WorkspaceBroadcastRuntime {
     }
 }
 
-/// 同一目标枚举映射给历史 DTO 与 CommandsService 的风险分析，避免分屏功能复制目标含义。
+/// 同一目标枚举映射给历史 DTO 与 CommandsService，避免分屏功能复制目标含义。
 ///
 /// @author kongweiguang
 fn history_target_for_session(target: &SessionTarget) -> CommandHistoryTarget {
@@ -1904,17 +1624,6 @@ fn history_target_for_session(target: &SessionTarget) -> CommandHistoryTarget {
         SessionTarget::Serial(_) => CommandHistoryTarget::Serial,
         SessionTarget::Container(_) => CommandHistoryTarget::Container,
     }
-}
-
-/// 把来源和片段 ID 合成稳定的 UI 键，防止内置与用户目录同名时选错定义。
-///
-/// @author kongweiguang
-fn snippet_choice_id(key: &SnippetPreferenceKey) -> String {
-    let origin = match key.origin {
-        SnippetCatalogOrigin::Builtin => "builtin",
-        SnippetCatalogOrigin::User => "user",
-    };
-    format!("{origin}:{}", key.snippet_id)
 }
 
 /// 逐目标回执区分确定送达、未尝试取消和已经尝试但状态未知的写入。
@@ -1936,7 +1645,49 @@ fn delivery_state_label(delivery: &BroadcastDeliveryResult) -> String {
     }
 }
 
-/// 只有每个冻结目标都有明确成功回执时才允许清空草稿。
+/// 只把唯一匹配的回执当作目标结果，重复回执对该目标保持未知状态。
+///
+/// @author kongweiguang
+fn unique_broadcast_delivery<'a>(
+    target: &BroadcastTarget,
+    deliveries: &'a [BroadcastDeliveryResult],
+) -> Option<&'a BroadcastDeliveryResult> {
+    let mut matching = deliveries
+        .iter()
+        .filter(|delivery| delivery.pane_id == target.pane_id);
+    let delivery = matching.next()?;
+    matching.next().is_none().then_some(delivery)
+}
+
+/// 结果明细始终按发送时冻结的目标顺序生成；不完整或重复回执显示为未确认。
+///
+/// @author kongweiguang
+fn result_delivery_details(
+    result: &WorkspaceBroadcastResult,
+) -> Vec<WorkspaceBroadcastDeliveryProjection> {
+    result
+        .request
+        .targets
+        .iter()
+        .filter_map(|target| {
+            let delivery = unique_broadcast_delivery(target, &result.deliveries);
+            if delivery
+                .is_some_and(|delivery| delivery.sent && delivery.history_error_code.is_none())
+            {
+                return None;
+            }
+            let state = delivery.map(delivery_state_label).unwrap_or_else(|| {
+                crate::locale::text("结果未确认", "Outcome unconfirmed").to_string()
+            });
+            Some(WorkspaceBroadcastDeliveryProjection {
+                title: target.title.clone(),
+                state,
+            })
+        })
+        .collect()
+}
+
+/// 只有每个冻结目标恰有一条成功回执且没有外来回执时才允许清空草稿。
 ///
 /// @author kongweiguang
 fn result_all_targets_sent(
@@ -1944,24 +1695,15 @@ fn result_all_targets_sent(
     deliveries: &[BroadcastDeliveryResult],
 ) -> bool {
     !targets.is_empty()
+        && deliveries.len() == targets.len()
         && targets.iter().all(|target| {
-            deliveries
-                .iter()
-                .find(|delivery| delivery.pane_id == target.pane_id)
-                .is_some_and(|delivery| delivery.sent)
+            unique_broadcast_delivery(target, deliveries).is_some_and(|delivery| delivery.sent)
         })
-}
-
-/// 将受限队列拒绝解释成可操作的简短反馈，不向工具栏泄露内部错误细节。
-///
-/// @author kongweiguang
-fn queue_error_label(error: session_queue::SessionQueueError) -> &'static str {
-    match error {
-        session_queue::SessionQueueError::SessionUnavailable => "目标会话已关闭或发生变化",
-        session_queue::SessionQueueError::QueueFull => "终端输入队列已满",
-        session_queue::SessionQueueError::BroadcastInactive => "目标路由已停止",
-        session_queue::SessionQueueError::BroadcastInputNotSupported => "该输入类型不支持广播",
-    }
+        && deliveries.iter().all(|delivery| {
+            targets
+                .iter()
+                .any(|target| target.pane_id == delivery.pane_id)
+        })
 }
 
 /// 按布局顺序应用全选、当前和自选模式；是否可输入仍由调用方的 exact binding 过滤。
@@ -2008,29 +1750,11 @@ fn reconcile_workspace_broadcast_tab_state(
     if pane_count >= 2 && previous_count < 2 {
         state.bar_visible = true;
     }
-    if pane_count < 2 && previous_count >= 2 {
-        invalidate_snippet_picker(state);
-    }
     let current_panes = view_panes.iter().cloned().collect::<BTreeSet<_>>();
     state
         .custom_panes
         .retain(|pane_id| current_panes.contains(pane_id));
     state.previous_view_pane_count = pane_count;
-}
-
-/// 关闭片段弹层只撤销目录查询回执；已点击发起的发送由独立冻结请求继续收敛。
-///
-/// @author kongweiguang
-fn invalidate_snippet_picker(state: &mut WorkspaceBroadcastTabState) {
-    state.snippets_open = false;
-    state.snippet_generation = state.snippet_generation.wrapping_add(1).max(1);
-}
-
-/// 迟到的片段回执只允许更新仍打开且代次匹配的当前 picker。
-///
-/// @author kongweiguang
-fn is_current_snippet_request(state: &WorkspaceBroadcastTabState, generation: u64) -> bool {
-    state.snippets_open && state.snippet_generation == generation
 }
 
 /// Tab 改变、工具栏收起或目标绑定失效时取消命令的后续目标。
@@ -2055,13 +1779,6 @@ fn should_cancel_pending_sync_validation(
     bindings_current: bool,
 ) -> bool {
     active_tab != Some(validation_tab) || !bar_visible || !bindings_current
-}
-
-/// 只有明确在写入前取消的目标可以安全重试，任何尝试过的写入都视为结果可能未知。
-///
-/// @author kongweiguang
-fn is_safe_broadcast_retry(delivery: &BroadcastDeliveryResult) -> bool {
-    !delivery.attempted && delivery.cancelled && !delivery.sent
 }
 
 /// 只有全部冻结目标成功且草稿仍保持发送时快照，回执才能清空当前输入。

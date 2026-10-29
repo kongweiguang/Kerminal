@@ -8,18 +8,21 @@ use kerminal_application::connections::management::{
 use kerminal_domain::{
     connections::{HostEndpoint, RemoteProtocol},
     identity::HostId,
+    operations::{ContainerRuntime, ContainerTarget},
     preferences::{ConfigRevision, TerminalProfile},
 };
 
 use kerminal_application::preferences::VersionedProfile;
+use kerminal_application::workspace::WorkspacePinnedContainer;
 
 use super::{
     GroupNavigationItem, HostContextMenuActions, HostNavigationEvent, HostPrimaryAction,
     SavedNavigationTarget, all_groups_are_collapsed, apply_saved_navigation_target, filtered_hosts,
     filtered_profiles, group_navigation_items, group_sort_order_after_pin,
     host_context_menu_actions, host_draft_for_group, host_group_accessibility_label,
-    is_group_pinned, is_open_gesture, local_host_accessibility_label, merge_session_status,
-    navigation_group_ids, primary_host_action, profile_group_is_ungrouped,
+    host_navigation_layout_metrics, is_group_pinned, is_open_gesture,
+    local_host_accessibility_label, merge_session_status, navigation_group_ids,
+    pinned_container_matches_query, primary_host_action, profile_group_is_ungrouped,
     should_render_saved_group_header, split_target_hosts, unique_default_profile_name,
 };
 use crate::features::connections::HostSessionStatus;
@@ -67,6 +70,52 @@ fn navigation_rows_leave_hover_style_to_kit_render() {
                     .hover(|style| style);
         }
     }
+}
+
+/// 三档 GPUI 侧栏密度跟随 main 的控件高度、列表节奏、行高和主机图标尺寸。
+/// @author kongweiguang
+#[test]
+fn sidebar_density_matches_main_navigation_geometry() {
+    use kerminal_application::preferences::InterfaceDensity;
+
+    let compact = host_navigation_layout_metrics(InterfaceDensity::Compact);
+    assert_eq!(
+        (
+            compact.control_height,
+            compact.row_height,
+            compact.group_header_height,
+            compact.tree_gap,
+            compact.row_gap,
+            compact.icon_size,
+        ),
+        (28., 40., 32., 7., 8., 28.)
+    );
+
+    let comfortable = host_navigation_layout_metrics(InterfaceDensity::Comfortable);
+    assert_eq!(
+        (
+            comfortable.control_height,
+            comfortable.row_height,
+            comfortable.group_header_height,
+            comfortable.tree_gap,
+            comfortable.row_gap,
+            comfortable.icon_size,
+        ),
+        (32., 48., 32., 10., 10., 30.)
+    );
+
+    let spacious = host_navigation_layout_metrics(InterfaceDensity::Spacious);
+    assert_eq!(
+        (
+            spacious.control_height,
+            spacious.row_height,
+            spacious.group_header_height,
+            spacious.tree_gap,
+            spacious.row_gap,
+            spacious.icon_size,
+        ),
+        (36., 54., 32., 12., 12., 32.)
+    );
 }
 
 /// 只构造导航筛选所需的完整 managed host 快照，备注为空以保持筛选样例不含额外语义。
@@ -273,22 +322,22 @@ fn global_group_toggle_projects_saved_and_ungrouped_sections() {
     ));
 }
 
-/// 分组全行按钮仍使用密度专属的紧凑标题高度，不因扩大命中区挤占主机列表。
+/// main 的分组行保持固定紧凑高度，密度只调整主机行与间距，整行命中不增加隐形高度。
 /// @author kongweiguang
 #[test]
 fn group_row_hit_area_does_not_increase_navigation_density() {
     for (density, expected_group_height) in [
         (
             kerminal_application::preferences::InterfaceDensity::Compact,
-            24.0,
+            32.0,
         ),
         (
             kerminal_application::preferences::InterfaceDensity::Comfortable,
-            26.0,
+            32.0,
         ),
         (
             kerminal_application::preferences::InterfaceDensity::Spacious,
-            28.0,
+            32.0,
         ),
     ] {
         let metrics = super::host_navigation_layout_metrics(density);
@@ -391,12 +440,15 @@ fn local_and_remote_hosts_interleave_by_order_and_name() {
     let items = group_navigation_items(
         &[remote_charlie, remote_equal],
         &[local_alpha, local_bravo, local_equal],
+        &[],
+        "",
     );
     let displayed = items
         .iter()
         .map(|item| match item {
             GroupNavigationItem::RemoteHost(host) => host.name.as_str(),
             GroupNavigationItem::LocalHost(profile) => profile.profile.name.as_str(),
+            GroupNavigationItem::PinnedContainer(_) => panic!("no pins were projected"),
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -407,6 +459,40 @@ fn local_and_remote_hosts_interleave_by_order_and_name() {
     assert!(matches!(&items[2], &GroupNavigationItem::RemoteHost(_)));
     assert!(matches!(&items[3], &GroupNavigationItem::LocalHost(_)));
     assert!(matches!(&items[4], &GroupNavigationItem::RemoteHost(_)));
+}
+
+/// 固定容器排在父 SSH 主机之后，名称或容器 ID 命中搜索时仍保留父行。
+/// @author kongweiguang
+#[test]
+fn pinned_container_is_nested_after_its_parent_and_searchable() {
+    let parent = host("Production", "prod.internal", Some("group"), false, &[]);
+    let pin = WorkspacePinnedContainer {
+        target: ContainerTarget {
+            host_id: Some(parent.id.clone()),
+            runtime: ContainerRuntime::Podman,
+            container_id: "long-container-id-123".to_owned(),
+        },
+        name: "api-worker".to_owned(),
+        description: "registry/api · running".to_owned(),
+        group_id: Some("group".to_owned()),
+    };
+
+    let items = group_navigation_items(
+        std::slice::from_ref(&parent),
+        &[],
+        std::slice::from_ref(&pin),
+        "",
+    );
+    assert!(matches!(
+        items.as_slice(),
+        [
+            GroupNavigationItem::RemoteHost(_),
+            GroupNavigationItem::PinnedContainer(_)
+        ]
+    ));
+    assert!(pinned_container_matches_query(&pin, "api-worker"));
+    assert!(pinned_container_matches_query(&pin, "long-container-id"));
+    assert!(!pinned_container_matches_query(&pin, "unrelated"));
 }
 
 /// 导航朗读本地主机术语，不把内部 Profile 命名泄露到用户可见的辅助技术文案。
@@ -459,12 +545,30 @@ fn local_host_context_actions_preserve_identity_without_selecting_row() {
     ));
 }
 
-/// 双击只在第二次点击触发打开；三击中的后续点击不会重复创建连接。
+/// 鼠标单击仍只选择，双击只连接一次；Kit 的 Enter/Space 确认不能因 click_count 为 1 被降级为选择。
+/// @author kongweiguang
 #[test]
 fn only_second_click_in_a_click_sequence_opens_the_target() {
-    assert!(!is_open_gesture(1));
-    assert!(is_open_gesture(2));
-    assert!(!is_open_gesture(3));
+    use gpui_kit::{ClickEvent, KeyboardButton, KeyboardClickEvent, MouseClickEvent, MouseUpEvent};
+
+    for (click_count, opens) in [(1, false), (2, true), (3, false)] {
+        let event = ClickEvent::Mouse(MouseClickEvent {
+            up: MouseUpEvent {
+                click_count,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(is_open_gesture(&event), opens);
+    }
+    for button in [KeyboardButton::Enter, KeyboardButton::Space] {
+        let event = ClickEvent::Keyboard(KeyboardClickEvent {
+            button,
+            ..Default::default()
+        });
+        assert_eq!(event.click_count(), 1);
+        assert!(is_open_gesture(&event));
+    }
 }
 
 /// SFTP-only 主机双击进入文件工作区，其它协议走原连接映射。

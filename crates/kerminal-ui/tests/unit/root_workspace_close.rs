@@ -1229,6 +1229,7 @@ fn close_fixture() -> (WorkspaceSessionSnapshot, TabId, Vec<PaneId>) {
     }
     let pane_ids = panes.iter().map(|pane| pane.id.clone()).collect();
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: panes.first().map(|pane| pane.id.clone()),
         selected_machine_id: Some("local".to_owned()),

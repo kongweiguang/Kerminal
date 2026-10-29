@@ -20,20 +20,30 @@ use crate::theme::ThemeTokens;
 
 use super::{
     OperationsSection, OperationsView,
-    state::{ContainerStatusFilter, SectionPhase, SectionState},
+    state::{SectionPhase, SectionState},
 };
 
-mod container_panel;
+mod compose_yaml;
+pub(super) mod container_panel;
 mod forwarding;
 pub(super) mod server;
-mod tmux;
+pub(super) mod tmux;
 
 impl Render for OperationsView {
-    /// 完整工作台和固定 Rail 面板共享绘制逻辑；Compose 组头显示实际目录与配置序列，避免同名项目目标难以区分。
+    /// 固定 Rail 工具使用各自的 main 页头，避免容器宿主卡片上重复绘制完整运维工作台标题。
+    /// 完整工作台保留公共导航与材质；紧凑工具使用 main 的独立面板表面，不能覆盖宿主为工作台底色。
+    /// 两种宿主共享数据与请求生命周期；中性右栏配色只使用局部令牌副本，不修改全局主题。
+    /// 紧凑容器详情已消费结构化回执，不再追加完整工作台的同一份原始输出卡。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_inputs(window, cx);
+        if self.proxy_panel_observer.is_none()
+            && let Some(panel) = self.proxy_panel.clone()
+        {
+            // 行内代理按钮读取子实体快照；父视图需随真实回执重绘以更新资格和状态。
+            self.proxy_panel_observer = Some(cx.observe(&panel, |_, _, cx| cx.notify()));
+        }
         if !self.initialized {
             self.initialized = true;
             if self.active {
@@ -42,8 +52,12 @@ impl Render for OperationsView {
             }
         }
         let theme = ThemeTokens::current(window, cx);
-        let dedicated_header = self.section_selection.is_fixed()
-            && self.section_selection.active() != OperationsSection::Containers;
+        let theme = if self.compact_layout {
+            theme.for_tool_panel()
+        } else {
+            theme
+        };
+        let dedicated_header = self.section_selection.is_fixed();
         let mut section_content = div()
             .w_full()
             .flex()
@@ -73,36 +87,22 @@ impl Render for OperationsView {
             .when(self.compact_layout, |body| {
                 body.flex_1().overflow_y_scroll().gap_2()
             })
-            .when(
-                dedicated_header && self.mutation_cancellation.is_some(),
-                |body| {
-                    body.child(
-                        Button::new("operations-dedicated-cancel")
-                            .compact()
-                            .ghost()
-                            .label(crate::locale::text("取消操作", "Cancel operation"))
-                            .disabled(
-                                self.mutation_cancellation
-                                    .as_ref()
-                                    .is_some_and(|token| token.is_cancelled()),
-                            )
-                            .on_click(
-                                cx.listener(|view, _, _, cx| view.cancel_operation_mutation(cx)),
-                            ),
-                    )
+            .child(section_content)
+            .when_some(
+                self.status.clone().filter(|_| !self.compact_layout),
+                |view, message| {
+                    view.child(section(
+                        crate::locale::text("操作结果", "Action result"),
+                        div().text_size(px(12.)).child(message),
+                        theme,
+                        self.compact_layout,
+                    ))
                 },
             )
-            .child(section_content)
-            .when_some(self.status.clone(), |view, message| {
-                view.child(section(
-                    crate::locale::text("操作结果", "Action result"),
-                    div().text_size(px(12.)).child(message),
-                    theme,
-                    self.compact_layout,
-                ))
-            })
             .when(
                 self.container_output.has_state()
+                    && !(self.compact_layout
+                        && self.section_selection.active() == OperationsSection::Containers)
                     && !matches!(
                         self.container_panel_context,
                         Some(super::ContainerPanelContext::ContainerInfo { .. })
@@ -121,8 +121,12 @@ impl Render for OperationsView {
                         output = output.child(error_row(message, theme));
                     }
                     if let Some(snapshot) = self.container_output.data() {
-                        output =
-                            output.child(div().w_full().text_size(px(12.)).child(snapshot.clone()));
+                        output = output.child(
+                            div()
+                                .w_full()
+                                .text_size(px(12.))
+                                .child(snapshot.display_text()),
+                        );
                     }
                     let title = self
                         .container_output_target_label
@@ -136,7 +140,11 @@ impl Render for OperationsView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme.materials.shell)
+            .bg(if self.compact_layout {
+                theme.tool_panel_surface
+            } else {
+                theme.materials.shell
+            })
             .text_color(theme.foreground);
         if self.compact_layout {
             root = root
@@ -168,6 +176,16 @@ impl Render for OperationsView {
 }
 
 impl OperationsView {
+    /// 右栏反馈属于当前工具正文，不另加 main 没有的结果卡；错误和待核验消息始终保留。
+    fn compact_operation_feedback(&self, theme: ThemeTokens) -> Option<gpui_kit::AnyElement> {
+        if !self.compact_layout {
+            return None;
+        }
+        self.status
+            .as_ref()
+            .map(|message| error_row(message, theme).into_any_element())
+    }
+
     /// 将各领域区块作为明确导航项展示，活动状态不影响其共享的请求与连接生命周期。
     fn render_section_navigation(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let server_info = Button::new("operations-section-server-info")
@@ -372,44 +390,6 @@ impl OperationsView {
         );
         container_panel::render(self, &context, theme, cx)
     }
-    /// 按领域状态筛选，不通过本地化状态文案推断容器是否运行。
-    ///
-    /// @author kongweiguang
-    fn render_container_status_filters(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut row = div().w_full().flex().flex_wrap().gap_1();
-        for (filter, zh, en, id) in [
-            (ContainerStatusFilter::All, "全部", "All", "all"),
-            (
-                ContainerStatusFilter::Running,
-                "运行中",
-                "Running",
-                "running",
-            ),
-            (
-                ContainerStatusFilter::Stopped,
-                "已停止",
-                "Stopped",
-                "stopped",
-            ),
-        ] {
-            let button = Button::new(format!("operations-container-filter-{id}"))
-                .compact()
-                .label(crate::locale::text(zh, en))
-                .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                    if view.container_status_filter != filter {
-                        view.container_status_filter = filter;
-                        cx.notify();
-                    }
-                }));
-            row = row.child(if self.container_status_filter == filter {
-                button.primary()
-            } else {
-                button.ghost()
-            });
-        }
-        row
-    }
-
     /// 紧凑面板将键值纵向排列；中心视图继续使用固定标签列，避免改变原有信息密度。
     ///
     /// @author kongweiguang
@@ -461,30 +441,23 @@ fn section_feedback<T>(
     })
 }
 
-/// 只抑制转发列表的 Ready 空结果提示；失败、取消、加载和未读取仍由共享反馈决定。
-///
-/// @author kongweiguang
-fn should_suppress_ready_empty_feedback(
-    phase: SectionPhase,
-    has_data: bool,
-    rows_empty: bool,
-) -> bool {
-    matches!(phase, SectionPhase::Ready) && has_data && rows_empty
-}
-
-/// 概览字段在窄右栏纵向排列，并显式折开长值，避免 GPUI 单行文本裁切掉目标细节。
+/// 详情按 main 的普通字段与独立 chip 分组；本次 inspect 的标签不从其它代次列表拼接。
 ///
 /// @author kongweiguang
 fn container_inspect(
     details: &kerminal_domain::operations::ContainerInspect,
     theme: ThemeTokens,
 ) -> impl IntoElement {
-    let arrays = |values: &[String]| {
-        if values.is_empty() {
-            "—".to_owned()
-        } else {
-            values.join(" · ")
-        }
+    let theme = theme.for_inspector();
+    let command = details
+        .entrypoint
+        .iter()
+        .chain(details.command.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let runtime = match details.target.runtime {
+        kerminal_domain::operations::ContainerRuntime::Docker => "docker",
+        kerminal_domain::operations::ContainerRuntime::Podman => "podman",
     };
     let container_id = details.id.clone();
     div()
@@ -492,72 +465,88 @@ fn container_inspect(
         .min_w_0()
         .flex()
         .flex_col()
-        .gap_2()
-        .p_2()
-        .rounded_md()
-        .bg(theme.sidebar)
-        .child(container_detail_row(
-            &localized_text("容器详情", "Container details"),
-            format!("{} · {}", details.name, details.status),
-            theme,
-        ))
-        .child(container_detail_row(
-            &localized_text("容器 ID", "Container ID"),
-            container_id,
-            theme,
-        ))
-        .child(container_detail_row(
-            &localized_text("镜像", "Image"),
-            details.image.clone(),
-            theme,
-        ))
-        .child(container_detail_row(
-            &localized_text("入口程序", "Entrypoint"),
-            arrays(&details.entrypoint),
-            theme,
-        ))
-        .child(container_detail_row(
-            &localized_text("命令", "Command"),
-            arrays(&details.command),
-            theme,
-        ))
-        .child(container_detail_row(
-            &localized_text("工作目录 / 用户", "Working directory / User"),
-            format!(
-                "{} · {}",
-                details.working_dir.as_deref().unwrap_or("—"),
-                details.user.as_deref().unwrap_or("—")
-            ),
-            theme,
-        ))
-        .child(container_detail_row(
+        .gap_3()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(container_detail_row(
+                    &localized_text("镜像", "Image"),
+                    details.image.clone(),
+                    theme,
+                ))
+                .child(container_detail_row(
+                    &localized_text("状态", "Status"),
+                    details.status.clone(),
+                    theme,
+                ))
+                .child(container_detail_row(
+                    &localized_text("运行时", "Runtime"),
+                    runtime,
+                    theme,
+                ))
+                .child(container_detail_value(
+                    &localized_text("完整 ID", "Full ID"),
+                    container_id,
+                    true,
+                    theme,
+                ))
+                .child(container_detail_row(
+                    &localized_text("工作目录", "Working directory"),
+                    details.working_dir.as_deref().unwrap_or("-"),
+                    theme,
+                ))
+                .child(container_detail_row(
+                    &localized_text("用户", "User"),
+                    details.user.as_deref().unwrap_or("-"),
+                    theme,
+                )),
+        )
+        .child(container_detail_chips(
             &localized_text("端口", "Ports"),
-            arrays(&details.ports),
+            &details.ports,
             theme,
         ))
-        .child(container_detail_row(
+        .child(container_detail_chips(
             &localized_text("网络", "Networks"),
-            arrays(&details.networks),
+            &details.networks,
             theme,
         ))
-        .child(container_detail_row(
-            &localized_text("创建 / 启动 / 结束", "Created / Started / Finished"),
-            format!(
-                "{} · {} · {}",
-                details.created.as_deref().unwrap_or("—"),
-                details.started_at.as_deref().unwrap_or("—"),
-                details.finished_at.as_deref().unwrap_or("—")
-            ),
+        .child(container_detail_chips(
+            &localized_text("命令", "Command"),
+            &command,
             theme,
         ))
+        .when(!details.labels.is_empty(), |view| {
+            let values = details
+                .labels
+                .iter()
+                .take(6)
+                .map(|(key, value)| format!("{key} = {value}"))
+                .collect::<Vec<_>>();
+            view.child(container_detail_chips("Labels", &values, theme))
+        })
 }
 
-/// 概览标签保持低对比层级、值使用前景色；软断点让换行由实际栏宽决定。
+/// 普通字段沿用 main 的 11px 标签与 12px 值，资源页也复用同一间距契约。
 ///
 /// @author kongweiguang
 fn container_detail_row(
     label: impl Into<String>,
     value: impl Into<String>,
+    theme: ThemeTokens,
+) -> impl IntoElement + 'static {
+    container_detail_value(label, value, false, theme.for_inspector())
+}
+
+/// 完整 ID 单独使用等宽字族；其它值不因技术内容而改变 main 的正文排版。
+///
+/// @author kongweiguang
+fn container_detail_value(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    mono: bool,
     theme: ThemeTokens,
 ) -> impl IntoElement + 'static {
     let label = label.into();
@@ -568,12 +557,14 @@ fn container_detail_row(
         .min_w_0()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap(px(2.))
         .child(
             div()
                 .w_full()
                 .min_w_0()
-                .text_size(theme.text_xs)
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
                 .text_color(theme.muted)
                 .child(label),
         )
@@ -582,8 +573,65 @@ fn container_detail_row(
                 .w_full()
                 .min_w_0()
                 .text_size(px(12.))
+                .line_height(px(16.))
+                .when(mono, |value| {
+                    value.font_family("monospace").text_size(px(11.))
+                })
                 .text_color(theme.foreground)
                 .child(display_value),
+        )
+}
+
+/// 多值字段各自保留 chip 和换行边界，避免把端口、argv 或标签合成不可辨识的一条文本。
+///
+/// @author kongweiguang
+fn container_detail_chips(
+    label: impl Into<String>,
+    values: &[String],
+    theme: ThemeTokens,
+) -> impl IntoElement + 'static {
+    let chips = values
+        .iter()
+        .map(|value| {
+            div()
+                .min_w_0()
+                .max_w_full()
+                .rounded_lg()
+                .bg(theme.secondary)
+                .px_2()
+                .py_1()
+                .font_family("monospace")
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(theme.subtle)
+                .child(add_container_detail_soft_breaks(value))
+        })
+        .collect::<Vec<_>>();
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(
+            div()
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(theme.muted)
+                .child(label.into()),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .children(chips)
+                .when(values.is_empty(), |view| {
+                    view.text_size(px(12.)).text_color(theme.muted).child("-")
+                }),
         )
 }
 
@@ -799,7 +847,3 @@ pub(super) fn bounded_text(value: &str, limit: usize) -> String {
 #[cfg(test)]
 #[path = "../../../tests/unit/operations_render_tmux.rs"]
 mod tmux_tests;
-
-#[cfg(test)]
-#[path = "../../../tests/unit/operations_render_container.rs"]
-mod container_render_tests;

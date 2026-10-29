@@ -11,7 +11,6 @@ use gpui_kit::{
     div,
     prelude::*,
 };
-use kerminal_application::operations::PortForwardDefinition;
 use kerminal_domain::operations::ComposeAction;
 
 use super::forms::{ForwardFormTransition, next_forward_form_open};
@@ -19,9 +18,9 @@ use super::{ContainerPanelContext, OperationsEvent, OperationsView};
 use crate::theme::ThemeTokens;
 
 impl OperationsView {
-    /// 新建入口冻结已探测目标并提供可改的时间名称；同秒名称按真实快照避重，失败期间不重建草稿。
+    /// 打开时一次性冻结目标与 pane cwd，并按 main 的目录/目标名和时间戳生成可编辑名称。
     /// @author kongweiguang
-    pub(super) fn request_tmux_create_dialog(
+    pub(crate) fn request_tmux_create_dialog(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -37,26 +36,54 @@ impl OperationsView {
             return;
         }
         self.ensure_inputs(window, cx);
-        let base = format!("tmux-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
-        let mut name = base.clone();
-        let mut suffix = 2;
-        while self
+        let target = self.tmux_target();
+        let frozen_working_directory = self
+            .tmux_attach_binding
+            .as_ref()
+            .filter(|binding| binding.target.matches_tmux_target(&target))
+            .and_then(|binding| binding.working_directory.clone());
+        let target_label = target
+            .host_id
+            .as_ref()
+            .map(|host_id| {
+                self.host_display_names
+                    .get(host_id)
+                    .map(|name| name.to_string())
+                    .unwrap_or_else(|| host_id.as_str().to_owned())
+            })
+            .unwrap_or_else(|| crate::locale::text("本机", "Local").to_string());
+        let existing_names = self
             .tmux
             .data()
-            .is_some_and(|snapshot| snapshot.sessions.iter().any(|session| session.name == name))
-        {
-            name = format!("{base}-{suffix}");
-            suffix += 1;
-        }
+            .map(|snapshot| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .map(|session| session.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let name = super::render::tmux::default_tmux_session_name(
+            frozen_working_directory.as_deref(),
+            &target_label,
+            &timestamp,
+            &existing_names,
+        );
+        self.tmux_create_cwd_snapshot = Some(frozen_working_directory.clone());
         if let Some(inputs) = self.inputs.as_ref() {
             inputs
                 .tmux_name
                 .update(cx, |state, cx| state.set_value(name, window, cx));
             inputs.tmux_working_directory.update(cx, |state, cx| {
-                state.set_value(String::new(), window, cx);
+                state.set_value(
+                    frozen_working_directory.clone().unwrap_or_default(),
+                    window,
+                    cx,
+                );
             });
         }
-        self.tmux_dialog_context = Some((self.tmux_target(), self.tmux_view_generation));
+        self.tmux_dialog_context = Some((target, self.tmux_view_generation));
         self.tmux_create_form_open = true;
         self.status = None;
         cx.emit(OperationsEvent::RootConfirmationChanged);
@@ -209,15 +236,16 @@ impl OperationsView {
 
     /// 三类 tmux 弹窗互斥地退出，连同冻结目标清空，避免残余意图重新占用根弹层。
     /// @author kongweiguang
-    pub(super) fn clear_tmux_dialog(&mut self) {
+    pub(crate) fn clear_tmux_dialog(&mut self) {
         self.tmux_create_form_open = false;
         self.tmux_rename_target = None;
         self.tmux_pending_kill = None;
         self.tmux_dialog_context = None;
+        self.tmux_create_cwd_snapshot = None;
         self.tmux_dialog_session = None;
     }
 
-    /// tmux 只编辑少量字段；隧道双端点需要并排阅读，避免从窄栏继承不适合的宽度。
+    /// 复用 main 各弹框宽度；容器提示使用 max-w-xl，隧道端点保留并排阅读空间。
     /// @author kongweiguang
     pub(crate) fn root_confirmation_max_width(&self) -> f32 {
         if self
@@ -225,9 +253,10 @@ impl OperationsView {
             .as_ref()
             .is_some_and(|inputs| inputs.forward_form_open)
         {
-            960.
-        } else if self.tmux_dialog_context.is_some() {
-            448.
+            1024.
+        } else if self.container_delete_confirmation.is_some() || self.tmux_dialog_context.is_some()
+        {
+            576.
         } else {
             680.
         }
@@ -237,6 +266,7 @@ impl OperationsView {
     /// @author kongweiguang
     pub(crate) fn root_confirmation_active(&self) -> bool {
         self.compose_pending_down.is_some()
+            || self.container_delete_confirmation.is_some()
             || self.forward_pending_delete.is_some()
             || self.tmux_dialog_context.is_some()
             || self
@@ -248,6 +278,9 @@ impl OperationsView {
     /// 表单直接聚焦首字段；结束 tmux 保留 Root trap 焦点，避免焦点落到未挂载的叶子句柄。
     /// @author kongweiguang
     pub(crate) fn focus_root_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_container_delete(window, cx) {
+            return;
+        }
         let input = self.inputs.as_ref().and_then(|inputs| {
             if self.tmux_create_form_open {
                 Some(inputs.tmux_name.clone())
@@ -272,13 +305,37 @@ impl OperationsView {
         window.focus(focus, cx);
     }
 
+    /// 只为仍打开的转发表单提供同一取消路径，避免验收入口误清其它根层确认状态。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn cancel_forward_form(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.forward_form_open)
+        {
+            return;
+        }
+        self.cancel_root_confirmation(cx);
+    }
+
     /// Esc 和取消按钮都只撤销尚未发出的请求，不假装能撤销已经提交的远端变更。
+    /// 容器 ModalShell 的关闭规则与 X 一致，忙碌时只释放其草稿，不取消原对象的在途操作。
     /// @author kongweiguang
     pub(crate) fn cancel_root_confirmation(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.forward_save_pending.is_some() {
+        if self.container_delete_confirmation.is_some() {
+            self.dismiss_container_delete_confirmation(cx);
+            return;
+        }
+        if self.busy {
+            return;
+        }
+        if self.forward_save_pending.is_some() {
+            self.archive_forward_save_review(cx);
             return;
         }
         self.compose_pending_down = None;
+        self.container_delete_confirmation = None;
         self.compose_pending_context = None;
         self.confirmed_compose_down = None;
         self.forward_pending_delete = None;
@@ -288,6 +345,7 @@ impl OperationsView {
                 next_forward_form_open(inputs.forward_form_open, ForwardFormTransition::Cancel);
         }
         self.forward_edit_expected = None;
+        self.forward_edit_transient_id = None;
         self.forward_add_host_expected = None;
         self.status = None;
         cx.emit(OperationsEvent::RootConfirmationChanged);
@@ -298,6 +356,10 @@ impl OperationsView {
     /// @author kongweiguang
     pub(crate) fn confirm_root_confirmation(&mut self, cx: &mut Context<Self>) {
         if self.busy || self.forward_save_pending.is_some() {
+            return;
+        }
+        if self.container_delete_confirmation.is_some() {
+            self.confirm_container_delete(cx);
             return;
         }
         if self.tmux_dialog_context.is_some() {
@@ -317,7 +379,11 @@ impl OperationsView {
             if let Some(context) = context {
                 if self.active
                     && self.container_panel_context.as_ref() == Some(&context)
-                    && matches!(context, ContainerPanelContext::Host { .. })
+                    && matches!(
+                        context,
+                        ContainerPanelContext::Host { .. }
+                            | ContainerPanelContext::WorkspaceHost { .. }
+                    )
                     && self.host_target == target.host_id
                     && self.runtime == target.runtime
                 {
@@ -336,28 +402,6 @@ impl OperationsView {
         }
     }
 
-    /// 请求确认时保存用户看见的配置基线，刷新或其它窗口修改不能令确认转向新配置。
-    /// @author kongweiguang
-    pub(super) fn request_forward_delete(
-        &mut self,
-        expected: PortForwardDefinition,
-        cx: &mut Context<Self>,
-    ) {
-        if self.busy || self.forward_save_pending.is_some() {
-            return;
-        }
-        self.compose_pending_down = None;
-        self.compose_pending_context = None;
-        self.confirmed_compose_down = None;
-        if let Some(inputs) = self.inputs.as_mut() {
-            inputs.forward_form_open = false;
-        }
-        self.forward_edit_expected = None;
-        self.forward_pending_delete = Some(expected);
-        cx.emit(OperationsEvent::RootConfirmationChanged);
-        cx.notify();
-    }
-
     /// 表单使用宿主内框的宽高预算，避免继承窄右栏布局或把操作栏挤出可视区域。
     /// @author kongweiguang
     pub(crate) fn render_root_confirmation(
@@ -367,6 +411,14 @@ impl OperationsView {
         available_height: f32,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let theme = if self.compact_layout {
+            theme.for_tool_panel()
+        } else {
+            theme
+        };
+        if self.container_delete_confirmation.is_some() {
+            return self.render_container_delete(theme, cx);
+        }
         if self.tmux_dialog_context.is_some() {
             return self.render_tmux_dialog(theme, available_width, cx);
         }

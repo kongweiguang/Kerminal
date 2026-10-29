@@ -51,6 +51,7 @@ pub struct SnippetRenderResult {
 /// 直接发送按定义名替换的变量；未知或未提供的占位符保留原文，避免把不完整模板改写成别的命令。
 ///
 /// 此路径刻意不推断目标平台、shell、scope 或变量类型，也不做 shell quoting；调用方负责把结果送入用户选定的终端。
+/// 占位符名称两侧空白与 main 保持一致；替换值不再扫描，避免用户值中的花括号触发递归展开。
 ///
 /// @author kongweiguang
 pub fn direct_snippet_command(
@@ -72,7 +73,7 @@ pub fn direct_snippet_command(
 
         let placeholder_end = open + 2 + close + 2;
         let placeholder = &remaining[open..placeholder_end];
-        let name = &after_open[..close];
+        let name = after_open[..close].trim();
         let variable = definition
             .variables
             .iter()

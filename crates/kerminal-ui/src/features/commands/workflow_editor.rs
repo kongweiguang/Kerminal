@@ -159,7 +159,9 @@ impl CommandsView {
         match transition {
             EditorTransition::New => self.install_new_workflow(window, cx),
             EditorTransition::Open(id) => self.load_workflow(id, window, cx),
-            EditorTransition::OpenKey(_) | EditorTransition::PreviewKey(_) => {
+            EditorTransition::NewFromCommand(_)
+            | EditorTransition::OpenKey(_)
+            | EditorTransition::PreviewKey(_) => {
                 // 片段的来源 key 不属于工作流导航，防止共享 intent 被错误转成工作流 ID 查找。
                 self.status = Some(super::command_message(
                     "片段导航不能应用于工作流",

@@ -604,10 +604,14 @@ fn validation_directory_files(
 }
 
 /// 保持旧配置校验要求的敏感 key 文件忽略规则，避免密钥被错误加入仓库。
+/// 尚不存在的根没有密钥或仓库，沿用离线校验的缺省语义且不创建目录；已存在的根仍必须有忽略规则。
 ///
 /// @author kongweiguang
 fn validate_host_secret_ignore_rule(root: &Path, report: &mut ConfigurationValidationReport) {
     const REQUIRED_RULE: &str = "secrets/vault-key.toml";
+    if fs::symlink_metadata(root).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
+        return;
+    }
     let path = root.join(".gitignore");
     let source = match fs::read_to_string(&path) {
         Ok(source) => source,

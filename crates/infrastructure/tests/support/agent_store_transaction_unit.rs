@@ -39,6 +39,49 @@ impl Drop for TestRoot {
     }
 }
 
+/// 新 session 显式保存权限兼容字段；旧 session 缺字段时从 CLI argv 恢复相同模式。
+///
+/// @author kongweiguang
+#[test]
+fn permission_mode_round_trips_and_legacy_files_infer_from_launch_args() {
+    use kerminal_domain::agents::{
+        AgentLaunchPermissionMode, AgentProvider, AgentSession, AgentSessionLaunch,
+        AgentSessionScope,
+    };
+
+    let session = AgentSession::new(
+        AgentSessionId::new(),
+        AgentProvider::Codex,
+        None,
+        "Codex".to_owned(),
+        "2026-10-27T00:00:00Z".to_owned(),
+        "C:\\Users\\test\\.kerminal".to_owned(),
+        "C:\\Users\\test\\.kerminal\\agents\\session".to_owned(),
+        AgentSessionLaunch {
+            command_label: "Codex".to_owned(),
+            shell: "codex".to_owned(),
+            args: vec!["--dangerously-bypass-approvals-and-sandbox".to_owned()],
+            cwd: "C:\\Users\\test\\.kerminal\\agents\\session".to_owned(),
+        },
+        Some(AgentSessionScope::Global),
+        None,
+    )
+    .expect("session launch snapshot is valid");
+    let encoded = encode_agent_session_document(&session).expect("session encodes");
+    let encoded_text = String::from_utf8(encoded).expect("TOML is UTF-8");
+    assert!(encoded_text.contains("permission_mode = \"skipPermissions\""));
+
+    let old_text = encoded_text.replace("permission_mode = \"skipPermissions\"\n", "");
+    let restored = toml::from_str::<AgentSessionFile>(&old_text)
+        .expect("legacy session without compatibility field decodes")
+        .restore()
+        .expect("legacy session restores from launch argv");
+    assert_eq!(
+        restored.permission_mode,
+        AgentLaunchPermissionMode::SkipPermissions
+    );
+}
+
 /// 建立 store 与 session 目录并返回 canonical 根，journal 路径仍由实现固定生成。
 async fn prepare_store() -> (
     TestRoot,

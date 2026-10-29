@@ -1432,42 +1432,6 @@ impl RootView {
         )
     }
 
-    /// 将一次性固定目标输入原子准入现有 FIFO；每个 binding 都须仍是原 pane 的 live UI owner。
-    ///
-    /// @author kongweiguang
-    pub(super) fn enqueue_terminal_input_once(
-        &mut self,
-        bindings: &[UiSessionBinding],
-        event: TerminalInputEvent,
-        cx: &mut Context<Self>,
-    ) -> Result<usize, session_queue::SessionQueueError> {
-        if bindings.is_empty()
-            || bindings.iter().any(|binding| {
-                let SessionOwner::Ui { tab_id, pane_id } = &binding.owner else {
-                    return true;
-                };
-                !self.workspace_runtime.pane(pane_id).is_some_and(|pane| {
-                    pane.phase == RuntimePanePhase::Ready
-                        && pane.tab_id == *tab_id
-                        && pane.session_id.as_ref() == Some(&binding.session_id)
-                }) || !self
-                    .pane_input_handlers
-                    .get(&binding.session_id)
-                    .is_some_and(|registration| registration.binding == *binding)
-            })
-        {
-            return Err(session_queue::SessionQueueError::SessionUnavailable);
-        }
-        for binding in bindings {
-            self.command_line_projection.invalidate_binding(binding);
-        }
-        let accepted = self
-            .session_commands
-            .enqueue_broadcast_once(bindings, event)?;
-        self.start_session_command_pump(cx);
-        Ok(accepted)
-    }
-
     /// 将输入和控制项放入唯一 session FIFO；准入覆盖来源与票据后移动同一 work Box，正文仅在 ACK 后推进。
     /// 只接收仍由明确 owner 持有的会话，避免已经移除的 pane 使旧焦点或 resize 绕过关闭门禁。
     /// 滚动/SelectionScroll/HistoryResize 只需精确只读 view binding；运行态 resize 要求 live 与 view binding 同代。
@@ -1591,11 +1555,7 @@ impl RootView {
                     },
                 ),
                 SessionCommand::UiInput(mut work) => {
-                    let ticket = if work.acceptance.is_some() {
-                        self.command_line_projection
-                            .invalidate_binding(&work.request.binding);
-                        None
-                    } else if work.wheel_input {
+                    let ticket = if work.acceptance.is_some() || work.wheel_input {
                         self.command_line_projection
                             .invalidate_binding(&work.request.binding);
                         None

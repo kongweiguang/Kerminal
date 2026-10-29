@@ -109,6 +109,7 @@ fn git(root: &PathBuf, arguments: &[&str]) -> Output {
 }
 
 /// 端到端确认提交保留用户 ignore，并排除密钥、运行态及即使 force-add 的本地迁移材料。
+/// 提交后读取真实根目录状态，覆盖 Git show-prefix 返回换行时仍应识别仓库的边界。
 #[tokio::test]
 async fn commit_includes_sync_assets_and_excludes_local_only_state() {
     if Command::new("git").arg("--version").output().is_err() {
@@ -216,6 +217,15 @@ async fn commit_includes_sync_assets_and_excludes_local_only_state() {
         .await
         .expect("提交隔离配置变更");
     assert_eq!(outcome.outcome, ConfigurationSyncOutcome::Succeeded);
+    let status = service
+        .status()
+        .await
+        .expect("根目录的换行输出不应误判为子目录");
+    assert!(status.git_available);
+    assert_eq!(
+        status.repository,
+        kerminal_application::configuration_sync::SyncRepositoryState::NoUpstream,
+    );
     assert!(
         outcome
             .commit_hash

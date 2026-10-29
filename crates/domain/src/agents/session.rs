@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::identity::AgentSessionId;
 
 use super::{
-    AgentDomainError, AgentLauncherKey, AgentProvider, AgentSessionScope, AgentTargetBinding,
-    AgentTargetLiveStatus,
+    AgentDomainError, AgentLaunchPermissionMode, AgentLauncherKey, AgentProvider,
+    AgentSessionScope, AgentTargetBinding, AgentTargetLiveStatus,
 };
 
 /// 归档状态不会删除历史文件，恢复动作会重新产生运行时 terminal session。
@@ -78,6 +78,8 @@ pub struct AgentSession {
     /// 区分同 provider 的不同 Custom 定义。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launcher_key: Option<AgentLauncherKey>,
+    /// 权限模式兼容字段；旧 schema 由实际 launch argv 推断，避免权限升级误复用。
+    pub permission_mode: AgentLaunchPermissionMode,
     /// 用户可见标题。
     pub title: String,
     /// 创建时间。
@@ -131,11 +133,13 @@ impl AgentSession {
         if let Some(key) = &launcher_key {
             AgentLauncherKey::new(key.as_str(), agent_id)?;
         }
+        let permission_mode = AgentLaunchPermissionMode::from_launch(agent_id, &launch);
         Ok(Self {
             schema_version: 1,
             agent_session_id,
             agent_id,
             launcher_key,
+            permission_mode,
             title: title.trim().to_owned(),
             created_at: created_at.clone(),
             updated_at: created_at,
@@ -260,6 +264,7 @@ impl AgentSession {
         updated_at: String,
     ) -> Result<(), AgentDomainError> {
         launch.validate()?;
+        self.permission_mode = AgentLaunchPermissionMode::from_launch(self.agent_id, &launch);
         self.launch = launch;
         self.updated_at = updated_at;
         self.status = AgentSessionStatus::Active;

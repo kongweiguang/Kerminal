@@ -3,7 +3,8 @@
 //! @author kongweiguang
 
 use super::{
-    AgentLauncherReadBackReceipt, AgentLauncherRecovery, agent_launcher_readback_confirms_write,
+    AgentLauncherManagerState, AgentLauncherPendingSave, AgentLauncherReadBackReceipt,
+    AgentLauncherRecovery, agent_launcher_readback_confirms_write,
     agent_launcher_readback_preserves_baseline, agent_launcher_readback_recovery,
     readback_matches_clean_preferences, stale_agent_launcher_change,
 };
@@ -322,4 +323,63 @@ fn existing_unknown_write_recovery_is_preserved_verbatim() {
         .expect("existing recovery readback receipt must remain available");
     assert_eq!(preserved_readback.versioned, readback.versioned);
     assert_eq!(preserved_readback.retry_allowed, readback.retry_allowed);
+}
+
+/// 自有 CAS 结果可推进管理器的版本链，watcher 的后续 revision 仍与该确认基线冲突。
+///
+/// @author kongweiguang
+#[test]
+fn confirmed_manager_baseline_advances_without_following_external_revisions() {
+    let opening = VersionedSettings {
+        settings: SettingsSnapshot::default(),
+        revision: Some(ConfigRevision::from_sha256("opening".to_owned())),
+    };
+    let mut confirmed_settings = opening.settings.clone();
+    confirmed_settings.agent_launcher.selected_agent_key = "builtin:claude".to_owned();
+    let confirmed = VersionedSettings {
+        settings: confirmed_settings,
+        revision: Some(ConfigRevision::from_sha256("manager-cas".to_owned())),
+    };
+    let mut requested = confirmed.settings.agent_launcher.clone();
+    requested.selected_agent_key = "builtin:pi".to_owned();
+    let pending = AgentLauncherPendingSave {
+        baseline: opening.settings.clone(),
+        baseline_revision: opening.revision.clone(),
+        submitted: confirmed.settings.clone(),
+    };
+    let mut manager = AgentLauncherManagerState::default();
+
+    assert_eq!(manager.baseline_for(&opening), &opening);
+    let mut mismatched = confirmed.clone();
+    mismatched.settings.agent_launcher = requested.clone();
+    manager.confirm_save_baseline(
+        &pending,
+        &confirmed.settings.agent_launcher,
+        Some(mismatched),
+    );
+    assert_eq!(manager.baseline_for(&opening), &opening);
+
+    manager.confirm_save_baseline(
+        &pending,
+        &confirmed.settings.agent_launcher,
+        Some(confirmed.clone()),
+    );
+    assert_eq!(manager.baseline_for(&opening), &confirmed);
+    assert!(
+        stale_agent_launcher_change(manager.baseline_for(&opening), &confirmed, &requested,)
+            .is_none()
+    );
+
+    let external = VersionedSettings {
+        settings: confirmed.settings.clone(),
+        revision: Some(ConfigRevision::from_sha256("watcher-revision".to_owned())),
+    };
+    let conflict =
+        stale_agent_launcher_change(manager.baseline_for(&opening), &external, &requested)
+            .expect("watcher revision must not silently replace the manager CAS baseline");
+    assert_eq!(conflict.baseline, confirmed.settings);
+    assert_eq!(conflict.baseline_revision, confirmed.revision);
+
+    manager.release_confirmed_baseline();
+    assert_eq!(manager.baseline_for(&opening), &opening);
 }

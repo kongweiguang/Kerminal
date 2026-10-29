@@ -443,64 +443,6 @@ impl SessionCommandQueues {
         Ok(targets.len())
     }
 
-    /// 对一次明确的固定目标动作做全量预算预检，并以 Direct origin 原子排入各自 FIFO。
-    ///
-    /// @author kongweiguang
-    pub fn enqueue_broadcast_once(
-        &mut self,
-        bindings: &[UiSessionBinding],
-        event: TerminalInputEvent,
-    ) -> Result<usize, SessionQueueError> {
-        if !is_broadcastable_input(&event) {
-            return Err(SessionQueueError::BroadcastInputNotSupported);
-        }
-        if bindings.is_empty() || bindings.len() > 64 {
-            return Err(SessionQueueError::SessionUnavailable);
-        }
-        let mut unique = HashSet::with_capacity(bindings.len());
-        if bindings.iter().any(|binding| {
-            !matches!(&binding.owner, SessionOwner::Ui { .. })
-                || !unique.insert(binding.session_id.clone())
-        }) {
-            return Err(SessionQueueError::SessionUnavailable);
-        }
-        let event_bytes = input_size(&event);
-        let additional_bytes = event_bytes.saturating_mul(bindings.len());
-        if self.queued_commands.saturating_add(bindings.len()) > self.limits.total_commands
-            || self.queued_input_bytes.saturating_add(additional_bytes)
-                > self.limits.total_input_bytes
-            || bindings.iter().any(|binding| {
-                self.lanes
-                    .get(&binding.session_id)
-                    .is_some_and(|lane| lane.pending.len() >= self.limits.per_session_commands)
-            })
-        {
-            return Err(SessionQueueError::QueueFull);
-        }
-
-        for binding in bindings {
-            let session_id = &binding.session_id;
-            let lane = self
-                .lanes
-                .entry(session_id.clone())
-                .or_insert_with(SessionLane::new);
-            lane.pending
-                .push_back(SessionWork::UiInput(Box::new(UiInputWork::new(
-                    UiTerminalInputRequest {
-                        binding: binding.clone(),
-                        expected_context: None,
-                        projection: UiInputProjection::Invalidates,
-                        event: event.clone(),
-                    },
-                    None,
-                ))));
-            self.queued_commands = self.queued_commands.saturating_add(1);
-            self.queued_input_bytes = self.queued_input_bytes.saturating_add(event_bytes);
-            self.schedule_if_ready(session_id);
-        }
-        Ok(bindings.len())
-    }
-
     /// 为连接检查创建单调递增 token；新 Start 同时使旧验证回执与旧广播输入失效。
     pub fn begin_broadcast_start(&mut self) -> (u64, QueueDropSummary) {
         self.broadcast_generation = self.broadcast_generation.wrapping_add(1);

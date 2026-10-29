@@ -22,15 +22,14 @@ fn visible_order_moves_only_within_its_zone_across_hidden_entries() {
     assert_eq!(
         settings.order,
         vec![
-            ToolRailToolId::Context,
-            ToolRailToolId::Containers,
-            ToolRailToolId::Sftp,
-            ToolRailToolId::AgentLauncher,
-            ToolRailToolId::Snippets,
             ToolRailToolId::Tmux,
+            ToolRailToolId::Sftp,
+            ToolRailToolId::Snippets,
+            ToolRailToolId::AgentLauncher,
             ToolRailToolId::Ports,
             ToolRailToolId::System,
             ToolRailToolId::Logs,
+            ToolRailToolId::Containers,
         ]
     );
     assert!(move_visible_tool_rail_item(

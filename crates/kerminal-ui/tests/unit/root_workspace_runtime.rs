@@ -59,6 +59,7 @@ fn pane(id: PaneId) -> WorkspaceSessionPane {
 
 fn snapshot(pane: WorkspaceSessionPane, tab_id: TabId) -> WorkspaceSessionSnapshot {
     WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: Some(pane.id.clone()),
         selected_machine_id: None,

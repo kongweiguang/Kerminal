@@ -80,6 +80,7 @@ fn terminal_tab(id: &str, title: &str, pane: &PaneId) -> WorkspaceSessionTab {
 fn one_terminal_snapshot() -> WorkspaceSessionSnapshot {
     let pane = local_pane("pane-a");
     WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id("tab-a")),
         focused_pane_id: Some(pane.id.clone()),
         selected_machine_id: Some("machine-local".to_owned()),
@@ -121,6 +122,7 @@ fn mixed_split_snapshots() -> (WorkspaceSessionSnapshot, WorkspaceSessionSnapsho
         )
         .expect("valid split layout");
     let full = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id("tab-a")),
         focused_pane_id: Some(external_pane.id.clone()),
         selected_machine_id: Some(external_host.as_str().to_owned()),
@@ -955,6 +957,7 @@ fn restore_plan_and_projection_preserve_all_supported_tab_kinds() {
         source: WorkspaceFileSource::Local,
     };
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id("tab-terminal")),
         focused_pane_id: Some(pane_a.id.clone()),
         selected_machine_id: Some("machine-local".to_owned()),

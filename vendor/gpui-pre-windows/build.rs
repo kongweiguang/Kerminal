@@ -1,5 +1,7 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
+// @author kongweiguang
+
 fn main() {
     #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
     println!("cargo:rerun-if-changed=build.rs");
@@ -20,6 +22,7 @@ mod shader_compilation {
         process::{self, Command},
     };
 
+    /// Compile every runtime module so release and debug use the same HLSL entrypoints.
     pub fn compile_shaders() {
         let shader_path =
             PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/shaders.hlsl");
@@ -33,6 +36,7 @@ mod shader_compilation {
         // Define all modules
         let modules = [
             "quad",
+            "backdrop_filter",
             "shadow",
             "path_rasterization",
             "path_sprite",

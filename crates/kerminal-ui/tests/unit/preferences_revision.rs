@@ -2,8 +2,12 @@
 //!
 //! @author kongweiguang
 
-use super::{PreferencesPanel, SettingsRevisionAction};
+use super::{
+    PreferencesPanel, SettingsRevisionAction, merge_json_value, merge_settings_snapshot,
+    unknown_settings_readback_matches,
+};
 use crate::features::preferences::{ConfigDraft, DraftSnapshot, DraftStatus};
+use kerminal_application::preferences::SettingsSnapshot;
 use kerminal_domain::preferences::ConfigRevision;
 
 /// 同 revision 自通知不覆盖后续编辑；新 revision 则保留草稿并进入显式冲突。
@@ -89,4 +93,72 @@ fn settings_watcher_preserves_inflight_unknown_and_read_only_snapshots() {
         Some(&changed_revision),
     );
     assert_eq!(readonly, SettingsRevisionAction::ReadOnlyChanged);
+}
+
+/// 三方合并吸收未编辑远端字段，保留本地字段以及双方并发修改的数组字段。
+#[test]
+fn settings_three_way_merge_rebases_remote_fields_and_keeps_local_conflicts() {
+    let baseline = serde_json::json!({
+        "theme": "dark",
+        "terminal": {"font": "A", "size": 14},
+        "rules": [{"pattern": "old"}]
+    });
+    let local = serde_json::json!({
+        "theme": "dark",
+        "terminal": {"font": "B", "size": 14},
+        "rules": [{"pattern": "local"}]
+    });
+    let remote = serde_json::json!({
+        "theme": "light",
+        "terminal": {"font": "remote", "size": 16},
+        "rules": [{"pattern": "remote"}]
+    });
+
+    assert_eq!(
+        merge_json_value(&baseline, &local, &remote),
+        serde_json::json!({
+            "theme": "light",
+            "terminal": {"font": "B", "size": 16},
+            "rules": [{"pattern": "local"}]
+        })
+    );
+}
+
+/// 只有远端变化的数组字段整体刷新，不误保留本地基线内容。
+#[test]
+fn settings_three_way_merge_takes_remote_for_untouched_arrays() {
+    let baseline = serde_json::json!({"rules": ["old"]});
+    let local = baseline.clone();
+    let remote = serde_json::json!({"rules": ["new"]});
+
+    assert_eq!(merge_json_value(&baseline, &local, &remote), remote);
+}
+
+/// typed SettingsSnapshot 经 serde 三方合并后保留字段类型与默认完整结构。
+#[test]
+fn settings_snapshot_three_way_merge_preserves_independent_typed_edits() {
+    let baseline = SettingsSnapshot::default();
+    let mut local = baseline.clone();
+    local.terminal.font_family = "Cascadia Mono".to_owned();
+    let mut remote = baseline.clone();
+    remote.theme_mode = crate::features::preferences::ThemeMode::Light;
+
+    let merged = merge_settings_snapshot(&baseline, &local, &remote)
+        .expect("typed settings should serialize and deserialize for field merging");
+    assert_eq!(merged.theme_mode, remote.theme_mode);
+    assert_eq!(merged.terminal.font_family, local.terminal.font_family);
+}
+
+/// 未知提交只接受完整快照相等的读回，远端多字段变化不能被当作成功回执。
+#[test]
+fn unknown_settings_readback_requires_full_snapshot_equality() {
+    let submitted = SettingsSnapshot::default();
+    assert!(unknown_settings_readback_matches(
+        &submitted,
+        &submitted.clone()
+    ));
+
+    let mut changed = submitted.clone();
+    changed.background_enabled = true;
+    assert!(!unknown_settings_readback_matches(&submitted, &changed));
 }

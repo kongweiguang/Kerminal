@@ -33,8 +33,8 @@ use super::{
     keybindings::KeybindingFocusScope,
     logical_input_modal_blocked,
     workbench::{
-        ToolRailContextAction, ToolRailPanelSlots, WorkbenchToolPanelRenderers,
-        WorkbenchToolPanels, attached_dock_default_width, focused_workspace_pane,
+        ToolRailPanelSlots, WorkbenchToolPanelRenderers, WorkbenchToolPanels,
+        attached_dock_default_width, focused_workspace_pane,
     },
     workspace_runtime::RuntimePanePhase,
 };
@@ -76,7 +76,7 @@ impl RootView {
         }
         match self
             .active_terminal_files_target()
-            .map(|(endpoint, _)| endpoint)
+            .map(|(endpoint, _, _)| endpoint)
         {
             Some(FileEndpoint::Local { .. }) => ActiveOperationsPaneTarget::Local,
             Some(FileEndpoint::Remote { host_id, .. }) => ActiveOperationsPaneTarget::Ssh(host_id),
@@ -92,61 +92,6 @@ impl RootView {
             self.active_operations_pane_target(),
             self.selected_host_id.clone(),
         )
-    }
-
-    /// Rail 快捷项复用偏好草稿 CAS；仅真实可见工具的非居中到居中变更保留一次成功后的焦点来源。
-    /// 拒绝时保留当前布局并打开原草稿；不提前聚焦，也不把配置重投影当作新的打开意图。
-    ///
-    /// @author kongweiguang
-    pub(super) fn apply_tool_rail_context_action(
-        &mut self,
-        tool: ToolRailToolId,
-        action: ToolRailContextAction,
-        source_visible: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.pending_tool_rail_placement_focus = None;
-        let settings = self.current_tool_rail_settings();
-        let before = self.tool_rail_state.project(&settings).panels;
-        let previous_placement =
-            self.preferences_panel
-                .read(cx)
-                .settings_snapshot()
-                .map(|settings| {
-                    settings
-                        .tool_rail
-                        .panel_placements
-                        .get(&tool)
-                        .copied()
-                        .unwrap_or_default()
-                });
-        let result = self.preferences_panel.update(cx, |panel, cx| match action {
-            ToolRailContextAction::MoveUp => panel.apply_tool_rail_order_change(tool, -1, cx),
-            ToolRailContextAction::MoveDown => panel.apply_tool_rail_order_change(tool, 1, cx),
-            ToolRailContextAction::PinToBottom => {
-                panel.apply_tool_rail_bottom_change(tool, true, cx)
-            }
-            ToolRailContextAction::MoveToTop => {
-                panel.apply_tool_rail_bottom_change(tool, false, cx)
-            }
-            ToolRailContextAction::Dock(placement) => {
-                panel.apply_tool_rail_placement_change(tool, placement, cx)
-            }
-        });
-        let request_focus = center_tool_placement_focus_is_requested(
-            action,
-            previous_placement,
-            source_visible && contains_tool(before, tool) && before.center != Some(tool),
-            result.is_ok(),
-        );
-        if let Err(message) = result {
-            self.status = Some(message.into());
-            self.open_preferences_modal(window, cx);
-            cx.notify();
-        } else if request_focus {
-            self.remember_tool_rail_placement_focus(tool, window, cx);
-        }
     }
 
     /// 菜单 handler 先于 PopupMenu.dismiss 执行；同 effect-cycle 末再捕获恢复后的焦点，不能保存菜单句柄。
@@ -285,8 +230,15 @@ impl RootView {
             services.hosts.clone(),
             services.operations.clone(),
         );
-        Some(cx.new(|_| {
-            crate::features::files::FilesPane::new(files, transfers, executor, targets, endpoint)
+        Some(cx.new(|cx| {
+            let mut panel = crate::features::files::FilesPane::new(
+                files, transfers, executor, targets, endpoint,
+            );
+            panel.set_interface_density(
+                kerminal_application::preferences::InterfaceDensity::Compact,
+                cx,
+            );
+            panel
         }))
     }
 
@@ -402,7 +354,11 @@ impl RootView {
                         .snippet_editor_modal_focus_handle
                         .contains(&focused, window)
             });
-        !window.is_window_active()
+        // 隐藏原生验收只替代 OS 活动状态，仍保留生产路径全部模态与目标失效门禁。
+        let window_active = window.is_window_active();
+        #[cfg(feature = "right-rail-acceptance")]
+        let window_active = window_active || self.right_rail_acceptance_active_override;
+        !window_active
             || window.has_active_prompt()
             || self.host_shutdown_requested
             || self.connection_prompt_modal_open
@@ -511,6 +467,33 @@ impl RootView {
         }
     }
 
+    /// 左、右、底部宿主只接收其子树冒泡的未消费 Escape；先复核槽位 owner 和折叠状态，避免迟到事件关闭替换面板。
+    ///
+    /// @author kongweiguang
+    pub(super) fn handle_docked_tool_panel_key_down(
+        &mut self,
+        placement: ToolRailPanelPlacement,
+        rendered_tool: ToolRailToolId,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = self.current_tool_rail_settings();
+        let panels = self.tool_rail_state.project(&settings).panels;
+        if let Some(tool) = docked_tool_panel_escape_target(
+            &event.keystroke.key,
+            rendered_tool,
+            placement,
+            panels,
+            self.tool_rail_rendered_compact.0,
+            self.right_dock_collapsed,
+            self.tool_panel_overlay_focus_is_blocked(window, cx),
+        ) {
+            cx.stop_propagation();
+            self.toggle_tool_rail_panel(tool, window, cx);
+        }
+    }
+
     /// 只关闭当前真实 compact 宿主；None 固定代表主机，Some 固定代表绘制时捕获的工具，不猜活动目标。
     /// 冒泡保证子控件先消费 Escape；显式工具关闭移除运行时打开项，自动收缩仍保留原状态与保存布局。
     ///
@@ -588,11 +571,13 @@ impl RootView {
         self.cancel_unfocused_pane_compositions(window, cx);
     }
 
-    /// 仅投影当前 Ready、精确 UI owner 的终端/编辑器来源 pane；有效 OSC7 目录优先于启动默认值。
+    /// 仅投影当前 Ready、精确 UI owner 的 pane 与完整 binding；有效 OSC7 目录优先于启动默认值。
     /// 目录只来自通过 session/revision 门禁的缓存，resize 清画面不使文件面板跳回旧目录。
     ///
     /// @author kongweiguang
-    fn active_terminal_files_target(&self) -> Option<(FileEndpoint, Option<ExternalTargetLease>)> {
+    fn active_terminal_files_target(
+        &self,
+    ) -> Option<(FileEndpoint, Option<ExternalTargetLease>, UiSessionBinding)> {
         if !center_preserves_terminal_file_context(self.center_panel) {
             return None;
         }
@@ -650,7 +635,7 @@ impl RootView {
             _ => return None,
         };
         let lease = pane.external_lease.clone();
-        Some((endpoint, lease))
+        Some((endpoint, lease, binding.clone()))
     }
 
     /// 同步同标签文件面板的可信 pane；切换过渡期间不把新目标写进旧实体，也不触碰 Agent 绑定。
@@ -660,12 +645,13 @@ impl RootView {
         if !self.tab_tool_contents_are_current() {
             return;
         }
-        let (endpoint, lease) = self
+        let (endpoint, lease, binding) = self
             .active_terminal_files_target()
-            .map(|(endpoint, lease)| (Some(endpoint), lease))
-            .unwrap_or((None, None));
+            .map(|(endpoint, lease, binding)| (Some(endpoint), lease, Some(binding)))
+            .unwrap_or((None, None, None));
         if let Some(files) = self.sftp_panel.clone() {
             files.update(cx, move |files, cx| {
+                files.set_current_terminal_binding(binding, cx);
                 files.set_current_terminal_target(endpoint, lease, cx);
             });
         }
@@ -739,8 +725,8 @@ impl RootView {
     /// 所有右栏工具共享一个默认宽度，Agent 运行态变化也不触发尺寸切换。
     ///
     /// @author kongweiguang
-    pub(super) fn current_attached_default_width(&self, tool: ToolRailToolId) -> gpui_kit::Pixels {
-        attached_dock_default_width(tool, self.agent_terminal_content_available())
+    pub(super) fn current_attached_default_width(&self, _tool: ToolRailToolId) -> gpui_kit::Pixels {
+        attached_dock_default_width(self.tool_rail_state.viewport_width())
     }
 
     /// 为下一帧登记当前工具目标并增加 generation，使快速切换时过期 resize 回调失效。
@@ -760,17 +746,7 @@ impl RootView {
         }
     }
 
-    /// 与工作台 Agent 终端装配使用相同的四项绑定条件，避免用过期 Agent 选择推导运行态默认宽度。
-    ///
-    /// @author kongweiguang
-    fn agent_terminal_content_available(&self) -> bool {
-        self.agent_terminal_session_id.is_some()
-            && self.agent_terminal_snapshot.is_some()
-            && self.agent_terminal_tools.is_some()
-            && self.selected_agent_session_id.is_some()
-    }
-
-    /// 工具打开顺序和内容 Entity 都按活动标签恢复，右栏尺寸仍由共享 settings 控制。
+    /// 工具打开顺序和内容 Entity 都按活动标签恢复；窄屏抽屉稍后从恢复后的活动工具派生，不重置显隐事实。
     ///
     /// @author kongweiguang
     pub(super) fn workbench_tool_panels(
@@ -800,7 +776,6 @@ impl RootView {
             self.right_dock_collapsed,
         ) {
             self.right_dock_collapsed = collapsed;
-            self.compact_tool_drawer_open = false;
         }
         let previous_tool = self.tool_rail_state.attached_tool();
         let layout = self.tool_rail_state.project(&settings);
@@ -815,6 +790,8 @@ impl RootView {
         }
         let theme = ThemeTokens::current(window, cx);
         let window_active = window.is_window_active();
+        #[cfg(feature = "right-rail-acceptance")]
+        let window_active = window_active || self.right_rail_acceptance_active_override;
 
         let active_operations = self.active_operations_tools(layout.panels);
         for (tool, section) in active_operations {
@@ -822,8 +799,6 @@ impl RootView {
         }
         self.refresh_operations_panel_targets(cx);
         self.sync_shared_panel_activity(layout.panels, window_active, cx);
-        let is_compact_slot =
-            |tool| layout.panels.attached == Some(tool) || layout.panels.left == Some(tool);
         if let Some(files_pane) = self.sftp_panel.clone() {
             files_pane.update(cx, |files_pane, cx| {
                 // 此实体始终表示当前终端的单端 SFTP；停靠位置不应把它变成完整双端工作区。
@@ -834,10 +809,10 @@ impl RootView {
             self.ensure_sftp_panel(window, cx);
             self.try_bind_files_from_active_terminal(cx);
         }
-        let snippets_compact = is_compact_slot(ToolRailToolId::Snippets);
+        let snippets_compact = contains_tool(layout.panels, ToolRailToolId::Snippets);
         if let Some(commands_view) = self.commands_view.clone() {
             commands_view.update(cx, |commands_view, cx| {
-                commands_view.set_compact_layout(snippets_compact, cx);
+                commands_view.set_compact_layout(snippets_compact, window, cx);
             });
         }
 
@@ -903,6 +878,10 @@ impl RootView {
             return;
         }
         let panel = Self::new_files_panel(&self.services, cx);
+        if let Some(panel) = panel.as_ref() {
+            let density = super::preferences::current_interface_density(self);
+            panel.update(cx, |panel, cx| panel.set_interface_density(density, cx));
+        }
         let subscriptions = panel
             .as_ref()
             .map(|panel| Self::subscribe_files_pane_events(panel, window, cx));
@@ -957,7 +936,7 @@ impl RootView {
         }
     }
 
-    /// 按需建立当前标签的工具视图；容器从真实 pane 初始化，确认事件只更新当前实体。
+    /// 按需建立当前标签的工具视图；容器和 Ports 从真实 pane 初始化，确认事件只更新当前实体。
     ///
     /// @author kongweiguang
     fn ensure_operations_panel(
@@ -973,8 +952,18 @@ impl RootView {
         let operations = self.services.operations.clone()?;
         let executor = self.services.executor.clone();
         let initial_tool_target = self.tool_rail_operation_target();
-        let initial_container_context =
-            (tool == ToolRailToolId::Containers).then(|| self.current_container_panel_context());
+        let (initial_container_context, initial_ports_container_target) =
+            if tool == ToolRailToolId::Containers || tool == ToolRailToolId::Ports {
+                let (context, ports_target) = self.current_container_panel_projection();
+                (
+                    Some(context),
+                    (tool == ToolRailToolId::Ports)
+                        .then_some(ports_target)
+                        .flatten(),
+                )
+            } else {
+                (None, None)
+            };
         let proxy_panel = (tool == ToolRailToolId::Ports && operations.terminal_proxy().is_some())
             .then(|| {
                 cx.new(|_| {
@@ -990,9 +979,18 @@ impl RootView {
         });
         let view = cx.new(|_| {
             let view = OperationsView::new_panel(operations, executor, section);
-            let view = match initial_container_context {
-                Some(context) => view.with_initial_container_panel_context(context),
-                None => view.with_initial_tool_rail_target(initial_tool_target),
+            let view = match (
+                tool,
+                initial_container_context,
+                initial_ports_container_target,
+            ) {
+                (ToolRailToolId::Containers, Some(context), _) => {
+                    view.with_initial_container_panel_context(context)
+                }
+                (ToolRailToolId::Ports, _, Some(target)) => {
+                    view.with_initial_ports_container_target(initial_tool_target, target)
+                }
+                _ => view.with_initial_tool_rail_target(initial_tool_target),
             };
             match proxy_panel.clone() {
                 Some(panel) => view.with_proxy_panel(panel),
@@ -1071,20 +1069,27 @@ impl RootView {
             )
     }
 
-    /// 容器使用精确 session 上下文，其它工具保留各自目标规则；侧栏选择不能改写容器宿主。
-    /// 同源名称只用于展示；标签换挂前只更新主运维页，不覆盖旧标签工具的绑定与草稿。
+    /// 容器使用精确 session 上下文，Ports 只借它提示容器目标且阻止宿主回退；侧栏选择不能改写目标。
+    /// 同源名称、副标题和 tmux 当前会话只作展示/快捷操作上下文，不覆盖旧标签工具的绑定与草稿。
     ///
     /// @author kongweiguang
     pub(super) fn refresh_operations_panel_targets(&mut self, cx: &mut Context<Self>) {
         let tools_current = self.tab_tool_contents_are_current();
         let tmux_binding = super::operations::focused_tmux_quickref_binding(self);
         let tmux_attach_binding = super::operations::focused_tmux_attach_binding(self);
+        let tmux_current_session_id = super::operations::focused_tmux_current_session_id(self);
+        let tmux_current_session_name = super::operations::focused_tmux_current_session_name(self);
         let fixed_target = self.tool_rail_operation_target();
-        let container_context = self.current_container_panel_context();
+        let (container_context, ports_container_target) = self.current_container_panel_projection();
         let host_display_names = self
             .host_navigation
             .as_ref()
             .map(|navigation| navigation.read(cx).display_names())
+            .unwrap_or_default();
+        let host_subtitles = self
+            .host_navigation
+            .as_ref()
+            .map(|navigation| navigation.read(cx).endpoint_subtitles())
             .unwrap_or_default();
         if let Some(view) = self.logs_view.clone() {
             view.update(cx, |view, cx| {
@@ -1095,38 +1100,43 @@ impl RootView {
             .tool_rail_operations_views
             .iter()
             .filter(|_| tools_current)
-            .map(|(tool, view)| {
-                (
-                    view.clone(),
-                    Some(fixed_target.clone()),
-                    *tool == ToolRailToolId::Containers,
-                )
-            })
+            .map(|(tool, view)| (view.clone(), Some(fixed_target.clone()), Some(*tool)))
             .chain(
                 self.operations_view
                     .iter()
                     .cloned()
-                    .map(|view| (view, None, false)),
+                    .map(|view| (view, None, None)),
             )
             .collect::<Vec<_>>();
         let selected_host_id = self.selected_host_id.clone();
-        for (view, fixed_target, is_container) in views {
+        for (view, fixed_target, tool) in views {
             view.update(cx, |view, cx| {
                 view.set_host_display_names(host_display_names.clone(), cx);
-                if is_container {
+                view.set_host_subtitles(host_subtitles.clone(), cx);
+                if tool == Some(ToolRailToolId::Containers) {
                     view.set_container_panel_context(container_context.clone(), cx);
                 } else if let Some(target) = fixed_target {
-                    view.set_tool_rail_target(target, cx);
+                    if tool == Some(ToolRailToolId::Ports) {
+                        view.set_tool_rail_target_with_container_target(
+                            target,
+                            ports_container_target.clone(),
+                            cx,
+                        );
+                    } else {
+                        view.set_tool_rail_target(target, cx);
+                    }
                 } else {
                     view.set_host_target(selected_host_id.clone(), cx);
                 }
                 view.set_tmux_quickref_binding(tmux_binding.clone(), cx);
                 view.set_tmux_attach_binding(tmux_attach_binding.clone(), cx);
+                view.set_tmux_current_session_id(tmux_current_session_id.clone(), cx);
+                view.set_tmux_current_session_name(tmux_current_session_name.clone(), cx);
             });
         }
     }
 
-    /// 按真实槽位同步运维、Context 和 Logs 面板的可见状态，运维紧凑度仅由 Attached/Left 决定。
+    /// 同步右栏专属面板的活动状态；它们在四种停靠宿主中都保持面板布局，中心运维工作区仍独立使用完整布局。
     ///
     /// @author kongweiguang
     fn sync_shared_panel_activity(
@@ -1143,9 +1153,8 @@ impl RootView {
         for (tool, view) in operation_views {
             let active =
                 tool_rail_panel_is_active(panels, self.right_dock_collapsed, window_active, tool);
-            let compact = panels.attached == Some(tool) || panels.left == Some(tool);
             view.update(cx, |view, cx| {
-                view.set_compact_layout(compact, cx);
+                view.set_compact_layout(true, cx);
                 view.set_active(active, cx);
             });
         }
@@ -1166,13 +1175,46 @@ impl RootView {
             window_active,
             ToolRailToolId::Logs,
         );
-        let current_target = self.current_logs_target(cx);
+        let current_target = self.current_logs_target(cx).map(|target| {
+            let Some(controller) = self.workspace_controller.as_ref() else {
+                return target;
+            };
+            let Some(pane_id) = controller.snapshot().focused_pane_id.as_ref() else {
+                return target;
+            };
+            if self.workspace_runtime.pane(pane_id).is_none() {
+                return target;
+            }
+            target.with_pane_detail(pane_id, self.workspace_pane_title(pane_id, cx).to_string())
+        });
+        let snippet_command_source = current_target.as_ref().and_then(|target| {
+            let binding = target.binding();
+            let tools = self.workspace_tools.get(&binding.session_id)?;
+            let block = tools
+                .read(cx)
+                .latest_submitted_command_block(&binding.session_id, cx)?;
+            Some(crate::features::commands::SnippetCommandBlockSource {
+                binding: binding.clone(),
+                block_id: block.id,
+                session_generation: block.session_generation,
+                capture_revision: block.capture_revision,
+                command: block.command,
+            })
+        });
         let theme_mode = self.theme_mode;
         if let Some(view) = self.logs_view.clone() {
             view.update(cx, |view, cx| {
-                view.set_target(current_target, cx);
+                view.set_target(current_target.clone(), cx);
                 view.set_theme_mode(theme_mode, cx);
                 view.set_active(logs_active, cx);
+            });
+        }
+        if let Some(view) = self.commands_view.clone() {
+            let configuration_actions = self.services.commands_configuration_actions();
+            view.update(cx, |view, cx| {
+                view.set_snippet_history_target(current_target, cx);
+                view.set_snippet_command_source(snippet_command_source, cx);
+                view.set_configuration_actions(configuration_actions, cx);
             });
         }
     }
@@ -1391,24 +1433,6 @@ fn center_tool_panel_focus_on_open(
     !focus_blocked && after.center == Some(tool) && before.center != after.center
 }
 
-/// 保存受理不能等同焦点提交；只允许真实可见且确实从其它位置显式改到 Center 的原工具登记来源。
-///
-/// @author kongweiguang
-fn center_tool_placement_focus_is_requested(
-    action: ToolRailContextAction,
-    previous_placement: Option<ToolRailPanelPlacement>,
-    source_visible: bool,
-    save_accepted: bool,
-) -> bool {
-    save_accepted
-        && source_visible
-        && matches!(
-            action,
-            ToolRailContextAction::Dock(ToolRailPanelPlacement::Center)
-        )
-        && previous_placement.is_some_and(|placement| placement != ToolRailPanelPlacement::Center)
-}
-
 /// 成功回执只允许一次原来源交接；后来的导航/物理焦点、更高模态、替换 owner 或未挂载宿主一律拒绝。
 ///
 /// @author kongweiguang
@@ -1492,6 +1516,39 @@ fn center_tool_panel_escape_target(
     (key.eq_ignore_ascii_case("escape")
         && panels.center == Some(rendered_tool)
         && focus_in_surface
+        && !focus_blocked)
+        .then_some(rendered_tool)
+}
+
+/// Docked Escape 必须来自可见的原方向宿主；容器折叠、compact 转换、菜单/模态及替换工具都不接受旧回调。
+///
+/// @author kongweiguang
+fn docked_tool_panel_escape_target(
+    key: &str,
+    rendered_tool: ToolRailToolId,
+    placement: ToolRailPanelPlacement,
+    panels: ToolRailPanelSlots,
+    compact_panels: bool,
+    attached_dock_collapsed: bool,
+    focus_blocked: bool,
+) -> Option<ToolRailToolId> {
+    let current_owner = match placement {
+        ToolRailPanelPlacement::Attached => panels.attached,
+        ToolRailPanelPlacement::Left => panels.left,
+        ToolRailPanelPlacement::Bottom => panels.bottom,
+        ToolRailPanelPlacement::Center => panels.center,
+    };
+    let placement_is_docked = matches!(
+        placement,
+        ToolRailPanelPlacement::Attached
+            | ToolRailPanelPlacement::Left
+            | ToolRailPanelPlacement::Bottom
+    );
+    (key.eq_ignore_ascii_case("escape")
+        && placement_is_docked
+        && !compact_panels
+        && !(placement == ToolRailPanelPlacement::Attached && attached_dock_collapsed)
+        && current_owner == Some(rendered_tool)
         && !focus_blocked)
         .then_some(rendered_tool)
 }

@@ -2,7 +2,11 @@
 //!
 //! @author kongweiguang
 
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ffi::OsString,
+    path::PathBuf,
+};
 
 use gpui_kit::SharedString;
 use kerminal_application::{
@@ -15,6 +19,7 @@ use kerminal_application::{
         WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTargetRef, WorkspaceTmuxBinding,
     },
 };
+use tokio_util::sync::CancellationToken;
 
 use kerminal_domain::{
     files::ContainerRuntime,
@@ -39,8 +44,10 @@ use crate::{
         workspace_tabs::{WorkspaceTabEvent, WorkspaceTabKind},
     },
     root::{
-        CenterPanel, PendingPaneFocusIntent, WorkspaceTerminalOpenKind,
+        CenterPanel, PendingPaneFocusIntent, PendingTerminalCreationOwner,
+        WorkspaceTerminalOpenKind,
         pane_input_runtime::advance_new_workspace_pane_focus_restore_generation,
+        rollback_unpublished_terminal_creation_state,
         terminal_open::{
             can_discard_unpublished_transient_local_container_reservation,
             discard_unpublished_transient_local_container_reservation,
@@ -56,6 +63,317 @@ use crate::{
         workspace_transient::without_transient_resources,
     },
 };
+
+/// 新终端 owner 必须完整匹配，旧恢复代次不得解除后续创建请求的忙状态。
+///
+/// @author kongweiguang
+#[test]
+fn pending_terminal_creation_owner_rejects_stale_generation() {
+    let tab_id = TabId::new();
+    let pane_id = PaneId::new();
+    let owner = PendingTerminalCreationOwner {
+        tab_id: tab_id.clone(),
+        pane_id: pane_id.clone(),
+        generation: 7,
+    };
+
+    assert!(owner.matches(&tab_id, &pane_id, 7));
+    assert!(!owner.matches(&tab_id, &pane_id, 6));
+    assert!(!owner.matches(&tab_id, &PaneId::new(), 7));
+    assert!(!owner.matches(&TabId::new(), &pane_id, 7));
+}
+
+/// 失败新建 reservation 只清理当前 owner；旧代次回执不能删除后续复用同身份的 pane。
+///
+/// @author kongweiguang
+#[test]
+fn unpublished_terminal_creation_rollback_removes_ghost_and_rejects_stale_generation() {
+    let mut runtime = WorkspaceRuntime::default();
+    let (pane, _) = workspace_pane_for_terminal_target(None, "local", None);
+    let tab_id = TabId::new();
+    let pane_id = pane.id.clone();
+    runtime
+        .register_pending_pane(tab_id.clone(), pane.clone())
+        .expect("reservation pane is registered");
+    runtime.register_tab_layout(tab_id.clone(), TerminalLayoutNode::pane(pane_id.clone()));
+    runtime
+        .mark_restore_failed(&pane_id)
+        .expect("a failed empty reservation can be removed");
+
+    let controller = WorkspaceController::from_missing().expect("empty controller");
+    let mut generations = HashMap::from([(pane_id.clone(), 11)]);
+    let cancellation = CancellationToken::new();
+    let mut cancellations = HashMap::from([(pane_id.clone(), cancellation.clone())]);
+    let mut owner = Some(PendingTerminalCreationOwner {
+        tab_id: tab_id.clone(),
+        pane_id: pane_id.clone(),
+        generation: 11,
+    });
+    let mut is_creating = true;
+    let mut pending_focus = Some(PendingPaneFocusIntent {
+        generation: 1,
+        tab_id: tab_id.clone(),
+        pane_id: pane_id.clone(),
+        session_id: None,
+        restore_generation: Some(11),
+        expected_focus: None,
+    });
+    #[cfg(feature = "acceptance-metrics")]
+    let mut probes = HashMap::from([(pane_id.clone(), 11)]);
+
+    assert!(rollback_unpublished_terminal_creation_state(
+        &mut runtime,
+        Some(&controller),
+        false,
+        &mut generations,
+        &mut cancellations,
+        &mut owner,
+        &mut is_creating,
+        &mut pending_focus,
+        #[cfg(feature = "acceptance-metrics")]
+        &mut probes,
+        &tab_id,
+        &pane_id,
+        11,
+    ));
+    assert!(runtime.pane(&pane_id).is_none());
+    assert!(runtime.tab_layout(&tab_id).is_none());
+    assert!(cancellation.is_cancelled());
+    assert!(!cancellations.contains_key(&pane_id));
+    assert!(!generations.contains_key(&pane_id));
+    assert!(owner.is_none());
+    assert!(!is_creating);
+    assert!(pending_focus.is_none());
+    #[cfg(feature = "acceptance-metrics")]
+    assert!(!probes.contains_key(&pane_id));
+
+    runtime
+        .register_pending_pane(tab_id.clone(), pane)
+        .expect("the same stable identity can model a newer restore generation");
+    runtime.register_tab_layout(tab_id.clone(), TerminalLayoutNode::pane(pane_id.clone()));
+    runtime
+        .mark_restore_failed(&pane_id)
+        .expect("the newer reservation is failed independently");
+    generations.insert(pane_id.clone(), 12);
+    let newer_cancellation = CancellationToken::new();
+    cancellations.insert(pane_id.clone(), newer_cancellation.clone());
+    owner = Some(PendingTerminalCreationOwner {
+        tab_id: tab_id.clone(),
+        pane_id: pane_id.clone(),
+        generation: 12,
+    });
+    is_creating = true;
+    pending_focus = Some(PendingPaneFocusIntent {
+        generation: 2,
+        tab_id: tab_id.clone(),
+        pane_id: pane_id.clone(),
+        session_id: None,
+        restore_generation: Some(12),
+        expected_focus: None,
+    });
+
+    assert!(!rollback_unpublished_terminal_creation_state(
+        &mut runtime,
+        Some(&controller),
+        false,
+        &mut generations,
+        &mut cancellations,
+        &mut owner,
+        &mut is_creating,
+        &mut pending_focus,
+        #[cfg(feature = "acceptance-metrics")]
+        &mut probes,
+        &tab_id,
+        &pane_id,
+        11,
+    ));
+    assert!(runtime.pane(&pane_id).is_some());
+    assert!(runtime.tab_layout(&tab_id).is_some());
+    assert!(!newer_cancellation.is_cancelled());
+    assert_eq!(generations.get(&pane_id), Some(&12));
+    assert_eq!(owner.as_ref().map(|owner| owner.generation), Some(12));
+    assert!(is_creating);
+    assert!(pending_focus.is_some());
+}
+
+/// 回滚拒绝已发布 tab、分屏布局、session 与 orphan cleanup owner，避免把真实工作区资源误删。
+///
+/// @author kongweiguang
+#[test]
+fn unpublished_terminal_rollback_preserves_published_split_and_cleanup_resources() {
+    let (pane, _) = workspace_pane_for_terminal_target(None, "local", None);
+    let pane_id = pane.id.clone();
+    let (tab_id, snapshot) = workspace_snapshot_from_pane(pane.clone());
+    let mut published_controller = WorkspaceController::from_missing().expect("empty controller");
+    published_controller
+        .synchronize_snapshot(snapshot)
+        .expect("fixture is a valid published terminal tab");
+    let mut published_runtime = WorkspaceRuntime::default();
+    published_runtime
+        .register_pending_pane(tab_id.clone(), pane.clone())
+        .expect("published pane runtime can be constructed");
+    published_runtime
+        .register_tab_layout(tab_id.clone(), TerminalLayoutNode::pane(pane_id.clone()));
+    published_runtime
+        .mark_restore_failed(&pane_id)
+        .expect("published pane is failed for retry");
+    let mut generations = HashMap::from([(pane_id.clone(), 3)]);
+    let token = CancellationToken::new();
+    let mut cancellations = HashMap::from([(pane_id.clone(), token.clone())]);
+    let mut owner = Some(PendingTerminalCreationOwner {
+        tab_id: tab_id.clone(),
+        pane_id: pane_id.clone(),
+        generation: 3,
+    });
+    let mut is_creating = true;
+    let mut pending_focus = None;
+    #[cfg(feature = "acceptance-metrics")]
+    let mut probes = HashMap::new();
+
+    assert!(!rollback_unpublished_terminal_creation_state(
+        &mut published_runtime,
+        Some(&published_controller),
+        false,
+        &mut generations,
+        &mut cancellations,
+        &mut owner,
+        &mut is_creating,
+        &mut pending_focus,
+        #[cfg(feature = "acceptance-metrics")]
+        &mut probes,
+        &tab_id,
+        &pane_id,
+        3,
+    ));
+    assert!(published_runtime.pane(&pane_id).is_some());
+    assert!(published_runtime.tab_layout(&tab_id).is_some());
+    assert!(!token.is_cancelled());
+
+    let mut split_runtime = WorkspaceRuntime::default();
+    let (split_pane, _) = workspace_pane_for_terminal_target(None, "split", None);
+    let split_pane_id = split_pane.id.clone();
+    let (sibling_pane, _) = workspace_pane_for_terminal_target(None, "sibling", None);
+    let sibling_pane_id = sibling_pane.id.clone();
+    let split_tab_id = TabId::new();
+    split_runtime
+        .register_pending_pane(split_tab_id.clone(), split_pane)
+        .expect("split candidate pane is registered");
+    split_runtime
+        .register_pending_pane(split_tab_id.clone(), sibling_pane)
+        .expect("sibling pane is registered");
+    split_runtime.register_tab_layout(
+        split_tab_id.clone(),
+        TerminalLayoutNode::Split {
+            id: "failed-split".to_owned(),
+            direction: SplitDirection::Horizontal,
+            children: vec![
+                TerminalLayoutNode::pane(split_pane_id.clone()),
+                TerminalLayoutNode::pane(sibling_pane_id),
+            ],
+            sizes: None,
+        },
+    );
+    split_runtime
+        .mark_restore_failed(&split_pane_id)
+        .expect("split candidate failure is retained for the split owner");
+    let split_controller = WorkspaceController::from_missing().expect("empty controller");
+    let mut split_generations = HashMap::from([(split_pane_id.clone(), 4)]);
+    let split_token = CancellationToken::new();
+    let mut split_cancellations = HashMap::from([(split_pane_id.clone(), split_token.clone())]);
+    let mut split_owner = Some(PendingTerminalCreationOwner {
+        tab_id: split_tab_id.clone(),
+        pane_id: split_pane_id.clone(),
+        generation: 4,
+    });
+    let mut split_is_creating = true;
+    let mut split_focus = None;
+    #[cfg(feature = "acceptance-metrics")]
+    let mut split_probes = HashMap::new();
+
+    assert!(!rollback_unpublished_terminal_creation_state(
+        &mut split_runtime,
+        Some(&split_controller),
+        false,
+        &mut split_generations,
+        &mut split_cancellations,
+        &mut split_owner,
+        &mut split_is_creating,
+        &mut split_focus,
+        #[cfg(feature = "acceptance-metrics")]
+        &mut split_probes,
+        &split_tab_id,
+        &split_pane_id,
+        4,
+    ));
+    assert!(split_runtime.pane(&split_pane_id).is_some());
+    assert!(split_runtime.tab_layout(&split_tab_id).is_some());
+    assert!(!split_token.is_cancelled());
+
+    let mut cleanup_runtime = WorkspaceRuntime::default();
+    let (cleanup_pane, _) = workspace_pane_for_terminal_target(None, "cleanup", None);
+    let cleanup_pane_id = cleanup_pane.id.clone();
+    let cleanup_tab_id = TabId::new();
+    cleanup_runtime
+        .register_pending_pane(cleanup_tab_id.clone(), cleanup_pane)
+        .expect("cleanup-owned pane is registered");
+    cleanup_runtime.register_tab_layout(
+        cleanup_tab_id.clone(),
+        TerminalLayoutNode::pane(cleanup_pane_id.clone()),
+    );
+    let cleanup_session_id = SessionId::new();
+    let cleanup_target = SessionTarget::Local(LocalSessionTarget {
+        program: OsString::from("shell"),
+        args: Vec::new(),
+        working_directory: None,
+        environment: BTreeMap::new(),
+    });
+    cleanup_runtime
+        .retain_cleanup_session(
+            &cleanup_pane_id,
+            cleanup_session_id.clone(),
+            cleanup_target,
+            TerminalSize::default(),
+            None,
+            SharedString::from("cleanup pending"),
+        )
+        .expect("cleanup session remains bound to its pane");
+    let cleanup_controller = WorkspaceController::from_missing().expect("empty controller");
+    let mut cleanup_generations = HashMap::from([(cleanup_pane_id.clone(), 5)]);
+    let cleanup_token = CancellationToken::new();
+    let mut cleanup_cancellations =
+        HashMap::from([(cleanup_pane_id.clone(), cleanup_token.clone())]);
+    let mut cleanup_owner = Some(PendingTerminalCreationOwner {
+        tab_id: cleanup_tab_id.clone(),
+        pane_id: cleanup_pane_id.clone(),
+        generation: 5,
+    });
+    let mut cleanup_is_creating = true;
+    let mut cleanup_focus = None;
+    #[cfg(feature = "acceptance-metrics")]
+    let mut cleanup_probes = HashMap::new();
+
+    assert!(!rollback_unpublished_terminal_creation_state(
+        &mut cleanup_runtime,
+        Some(&cleanup_controller),
+        false,
+        &mut cleanup_generations,
+        &mut cleanup_cancellations,
+        &mut cleanup_owner,
+        &mut cleanup_is_creating,
+        &mut cleanup_focus,
+        #[cfg(feature = "acceptance-metrics")]
+        &mut cleanup_probes,
+        &cleanup_tab_id,
+        &cleanup_pane_id,
+        5,
+    ));
+    assert_eq!(
+        cleanup_runtime.session_for_pane(&cleanup_pane_id),
+        Some(&cleanup_session_id)
+    );
+    assert!(cleanup_runtime.tab_layout(&cleanup_tab_id).is_some());
+    assert!(!cleanup_token.is_cancelled());
+}
 
 /// 恢复活动文件标签时选中其中央工作区，并尊重既有启动用户导航代次。
 ///
@@ -616,6 +934,7 @@ fn mixed_ssh_split_ready_sync_matches_pane_identity_and_preserves_tab_metadata()
         layout: layout.clone(),
     };
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: Some(pane_b_id.clone()),
         selected_machine_id: Some(host_b.as_str().to_owned()),
@@ -701,6 +1020,7 @@ fn workspace_snapshot_from_pane(pane: WorkspaceSessionPane) -> (TabId, Workspace
     let tab_id = TabId::new();
     let layout = TerminalLayoutNode::pane(pane.id.clone());
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: Some(pane.id.clone()),
         selected_machine_id: Some(pane.machine_id.clone()),
@@ -1092,6 +1412,7 @@ fn transient_terminal_ack_stays_visible_but_is_filtered_from_saved_snapshot() {
     };
     let layout = TerminalLayoutNode::pane(pane_id.clone());
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: Some(pane_id.clone()),
         selected_machine_id: None,
@@ -1181,6 +1502,7 @@ fn local_transient_container_snapshot() -> (TabId, PaneId, WorkspaceSessionSnaps
         output_history: None,
     };
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: Some(pane_id.clone()),
         selected_machine_id: Some(pane.machine_id.clone()),

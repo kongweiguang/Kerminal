@@ -72,6 +72,13 @@ impl ResolvedAgentLauncher {
 pub struct AgentLaunchResolver {
     preferences: Arc<PreferencesService>,
     profile_service: Option<Arc<ProfileService>>,
+    installation_probe: Option<Arc<dyn AgentLauncherInstallationProbe>>,
+}
+
+/// Application 的只读端口；adapter 只判断固定 CLI 是否存在，不启动命令。
+pub trait AgentLauncherInstallationProbe: Send + Sync {
+    /// 在当前进程 PATH 中检查一个 builtin 命令，并让调用方取消长目录扫描。
+    fn is_installed(&self, command: &str, cancellation: &CancellationToken) -> AppResult<bool>;
 }
 
 impl AgentLaunchResolver {
@@ -80,6 +87,7 @@ impl AgentLaunchResolver {
         Self {
             preferences,
             profile_service: None,
+            installation_probe: None,
         }
     }
 
@@ -89,7 +97,18 @@ impl AgentLaunchResolver {
         self
     }
 
-    /// 从每次读取的已验证设置生成无命令内容的 launcher 目录，不探测本机是否安装 CLI。
+    /// 注入只读可执行项探测器；未装配的测试与非桌面调用保持未知状态。
+    ///
+    /// @author kongweiguang
+    pub fn with_installation_probe(
+        mut self,
+        installation_probe: Arc<dyn AgentLauncherInstallationProbe>,
+    ) -> Self {
+        self.installation_probe = Some(installation_probe);
+        self
+    }
+
+    /// 从已验证设置与可选只读探测器生成目录；不把命令内容或执行结果写入配置。
     ///
     /// @author kongweiguang
     pub async fn launcher_catalog(
@@ -103,7 +122,7 @@ impl AgentLaunchResolver {
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("Agent launcher catalog was cancelled"));
         }
-        launcher_catalog_from_settings(&settings.settings)
+        self.catalog_with_installations(&settings.settings, cancellation)
     }
 
     /// 仅修改 selected key，并把读取时的 revision 原样用于 CAS，避免覆盖并发设置编辑。
@@ -125,7 +144,7 @@ impl AgentLaunchResolver {
                 "Agent launcher selection was cancelled",
             ));
         }
-        let current_catalog = launcher_catalog_from_settings(&current.settings)?;
+        let current_catalog = self.catalog_with_installations(&current.settings, cancellation)?;
         if !current_catalog
             .options
             .iter()
@@ -150,7 +169,39 @@ impl AgentLaunchResolver {
             .preferences
             .save_settings(settings, current.revision)
             .await?;
-        launcher_catalog_from_settings(&saved.settings)
+        let mut catalog = launcher_catalog_from_settings(&saved.settings)?;
+        catalog.installations = current_catalog.installations;
+        Ok(catalog)
+    }
+
+    /// 状态探测只针对固定 builtin 命令，并在任何设置写入前完成以保留提交语义。
+    ///
+    /// @author kongweiguang
+    fn catalog_with_installations(
+        &self,
+        settings: &SettingsSnapshot,
+        cancellation: &CancellationToken,
+    ) -> AppResult<AgentLauncherCatalog> {
+        let mut catalog = launcher_catalog_from_settings(settings)?;
+        let Some(probe) = self.installation_probe.as_ref() else {
+            return Ok(catalog);
+        };
+        let mut installations = Vec::with_capacity(3);
+        for (provider, command) in [
+            (AgentProvider::Codex, "codex"),
+            (AgentProvider::Claude, "claude"),
+            (AgentProvider::Pi, "pi"),
+        ] {
+            if cancellation.is_cancelled() {
+                return Err(AppError::cancelled("Agent launcher probe was cancelled"));
+            }
+            installations.push(crate::agents::AgentLauncherInstallation {
+                provider,
+                installed: probe.is_installed(command, cancellation)?,
+            });
+        }
+        catalog.installations = Some(installations);
+        Ok(catalog)
     }
 
     /// 读取并验证当前选择，外部修改会影响后续新建，但不会重启活动 CLI。
@@ -262,15 +313,16 @@ impl AgentLaunchResolver {
     }
 }
 
-/// 将已验证设置投影为允许展示的启动器选项；自定义命令和其它定义字段不离开应用层。
+/// 将已验证设置投影为启动器选项；内置展示名与 main 选择器一致，命令身份仍由稳定 key 决定。
+/// 自定义命令仅存于私有目录字段，供精确匹配和显式本地提示读取。
 ///
 /// @author kongweiguang
 fn launcher_catalog_from_settings(settings: &SettingsSnapshot) -> AppResult<AgentLauncherCatalog> {
     let settings = settings.clone().validated()?;
     let builtins = [
         (AgentProvider::Codex, "Codex"),
-        (AgentProvider::Claude, "Claude Code"),
-        (AgentProvider::Pi, "Pi"),
+        (AgentProvider::Claude, "Claude"),
+        (AgentProvider::Pi, "PI Agent"),
     ];
     let mut options = builtins
         .into_iter()
@@ -285,12 +337,15 @@ fn launcher_catalog_from_settings(settings: &SettingsSnapshot) -> AppResult<Agen
             })
         })
         .collect::<AppResult<Vec<_>>>()?;
+    let mut legacy_custom_commands =
+        Vec::with_capacity(settings.agent_launcher.custom_agents.len());
 
     for definition in &settings.agent_launcher.custom_agents {
         let key = AgentLauncherKey::new(format!("custom:{}", definition.id), AgentProvider::Custom)
             .map_err(|error| {
                 AppError::invalid("Custom Agent launcher is invalid").with_source(error)
             })?;
+        legacy_custom_commands.push((key.clone(), definition.command.clone()));
         options.push(AgentLauncherOption {
             key,
             provider: AgentProvider::Custom,
@@ -306,7 +361,48 @@ fn launcher_catalog_from_settings(settings: &SettingsSnapshot) -> AppResult<Agen
     Ok(AgentLauncherCatalog {
         selected_key,
         options,
+        installations: None,
+        legacy_custom_commands,
     })
+}
+
+/// 按当前操作系统实际使用的命令解析边界比较旧版 Custom 启动快照。
+///
+/// @author kongweiguang
+pub(super) fn legacy_custom_command_matches_launch(
+    configured_command: &str,
+    launch: &AgentSessionLaunch,
+) -> bool {
+    let configured_command = configured_command.trim();
+    if configured_command.is_empty() {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        let Some(snapshot_command) = launch.args.last() else {
+            return false;
+        };
+        snapshot_command.trim() == configured_command
+            && launch.args[..launch.args.len() - 1].iter().any(|argument| {
+                matches!(
+                    argument.to_ascii_lowercase().as_str(),
+                    "-command" | "-c" | "/c"
+                )
+            })
+    }
+
+    #[cfg(not(windows))]
+    {
+        let Ok(mut arguments) = split_command_line(configured_command) else {
+            return false;
+        };
+        if arguments.is_empty() {
+            return false;
+        }
+        let program = arguments.remove(0);
+        launch.shell == program && launch.args == arguments
+    }
 }
 
 /// 构造当前 provider 初始元数据；调用方先通过 AgentSession 领域校验再传入 provider。

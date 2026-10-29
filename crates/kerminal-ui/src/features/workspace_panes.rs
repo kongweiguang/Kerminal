@@ -288,7 +288,7 @@ impl WorkspacePanes {
     }
 
     /// 递归绘制 split 树并在候选分支逐层累加同帧探针；只测实际祖先路径，避免猜测 Kit 几何。
-    /// 子容器保持纵向 flex，避免终端正文在分屏时塌缩。
+    /// 子容器只在相邻分屏之间留半个间距；嵌套布局不叠加外边距，确保与上方工具栏对齐。
     ///
     /// @author kongweiguang
     fn render_node(
@@ -410,7 +410,13 @@ impl WorkspacePanes {
                                 (ratio * 1_000.0).max(120.0) as f32
                             })
                         });
-                    let mut panel_slot = div().size_full().p(px(4.)).flex().flex_col();
+                    let before = if index == 0 { 0. } else { 4. };
+                    let after = if index + 1 == children.len() { 0. } else { 4. };
+                    let mut panel_slot = div().size_full().flex().flex_col();
+                    panel_slot = match direction {
+                        SplitDirection::Horizontal => panel_slot.pl(px(before)).pr(px(after)),
+                        SplitDirection::Vertical => panel_slot.pt(px(before)).pb(px(after)),
+                    };
                     if let Some(frame) = measure_frame.as_ref() {
                         let bounds = frame.child_bounds.clone();
                         panel_slot = panel_slot.on_prepaint(move |slot, _, _| {
@@ -605,7 +611,7 @@ impl WorkspacePanes {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .rounded_lg()
+            .rounded(theme.radius_panel)
             .border_1()
             .border_color(border)
             .bg(background)
@@ -704,11 +710,11 @@ fn pane_broadcast_control(
 }
 
 impl Render for WorkspacePanes {
-    /// 无效恢复布局展示可见错误；pending candidate 用局部透明盾拦截分隔线按下，失败态会移除。
+    /// 无效恢复布局展示可见错误；候选局部透明盾拦截分隔线，配色与工作台共享 main 投影。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ThemeTokens::current(window, cx);
+        let theme = ThemeTokens::current(window, cx).for_workbench();
         if self.layout.validate().is_err() {
             return div()
                 .id("workspace-invalid-layout")
@@ -1097,7 +1103,7 @@ struct PaneDragPreview {
 impl Render for PaneDragPreview {
     /// 拖动卡片同步主窗口主题，拖拽不会闪烁到组件库默认配色。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ThemeTokens::current(window, cx);
+        let theme = ThemeTokens::current(window, cx).for_workbench();
         div()
             .px_3()
             .py_2()

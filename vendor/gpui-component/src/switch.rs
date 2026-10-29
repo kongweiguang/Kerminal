@@ -3,7 +3,7 @@ use crate::{
     ThemeStyled as _, text::Text, tooltip::ComponentTooltip,
 };
 use gpui::{
-    App, Background, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement as _,
+    App, Background, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement as _, Pixels,
     RenderOnce, SharedString, StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _,
     px,
 };
@@ -23,6 +23,7 @@ pub struct Switch {
     label_side: Side,
     on_click: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
     size: Size,
+    track_size: Option<(Pixels, Pixels)>,
     color: Option<Hsla>,
     tooltip: ComponentTooltip,
     tab_stop: bool,
@@ -31,7 +32,10 @@ pub struct Switch {
 }
 
 impl Switch {
-    /// Create a new Switch element.
+    /// Create a Switch with the component's standard size presets by default.
+    ///
+    /// Custom track dimensions remain opt-in so existing `Size` callers keep
+    /// their established geometry.
     pub fn new(id: impl Into<ElementId>) -> Self {
         let id: ElementId = id.into();
         Self {
@@ -44,6 +48,7 @@ impl Switch {
             on_click: None,
             label_side: Side::Right,
             size: Size::Medium,
+            track_size: None,
             color: None,
             tooltip: ComponentTooltip::default(),
             tab_stop: true,
@@ -61,6 +66,34 @@ impl Switch {
     /// Set the label of the switch.
     pub fn label(mut self, label: impl Into<Text>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    /// Exposes the existing label placement without rebuilding the switch's focus and activation behavior.
+    ///
+    /// @author kongweiguang
+    pub fn label_side(mut self, side: Side) -> Self {
+        self.label_side = side;
+        self
+    }
+
+    /// Set custom track dimensions while keeping the thumb sized to the track
+    /// height.
+    ///
+    /// Height is constrained to at least `4px`, width to at least the height;
+    /// non-finite dimensions fall back to a safe medium track. This prevents
+    /// invalid geometry without changing the standard `Size` presets.
+    ///
+    /// @author kongweiguang
+    pub fn track_size(mut self, width: Pixels, height: Pixels) -> Self {
+        let (width, height) = if width.as_f32().is_finite() && height.as_f32().is_finite() {
+            let height = height.max(px(4.));
+            (width.max(height), height)
+        } else {
+            (px(36.), px(20.))
+        };
+
+        self.track_size = Some((width, height));
         self
     }
 
@@ -164,6 +197,8 @@ impl FocusableExt for Switch {
 }
 
 impl RenderOnce for Switch {
+    /// Keeps preset geometry intact unless the caller supplies a validated
+    /// track size.
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let checked = self.checked;
         let on_click = self.on_click.clone();
@@ -190,16 +225,15 @@ impl RenderOnce for Switch {
         let toggle_bg: Background = cx.theme().tokens.switch_thumb.into();
         let disabled_label_color = cx.theme().muted_foreground;
 
-        let (bg_width, bg_height) = match self.size {
-            Size::XSmall | Size::Small => (px(28.), px(16.)),
-            Size::Large => (px(44.), px(24.)),
-            _ => (px(36.), px(20.)),
+        let (bg_width, bg_height) = match self.track_size {
+            Some(track_size) => track_size,
+            None => match self.size {
+                Size::XSmall | Size::Small => (px(28.), px(16.)),
+                Size::Large => (px(44.), px(24.)),
+                _ => (px(36.), px(20.)),
+            },
         };
-        let bar_width = match self.size {
-            Size::XSmall | Size::Small => px(12.),
-            Size::Large => px(20.),
-            _ => px(16.),
-        };
+        let thumb_size = bg_height - px(4.);
         let inset = px(2.);
         let radius = if cx.theme().radius >= px(4.) {
             bg_height
@@ -215,7 +249,7 @@ impl RenderOnce for Switch {
         let thumb_x = spring(
             (self.id.clone(), "thumb"),
             if checked {
-                bg_width - bar_width - inset * 2
+                bg_width - thumb_size - inset * 2
             } else {
                 px(0.)
             },
@@ -285,7 +319,7 @@ impl RenderOnce for Switch {
                             // Switch Toggle
                             SwitchThumb::new(checked)
                                 .rounded(radius)
-                                .size(bar_width)
+                                .size(thumb_size)
                                 .left(thumb_x)
                                 .bg(toggle_bg),
                         ),
@@ -344,6 +378,20 @@ mod tests {
             ),
             "and must not change what is drawn"
         );
+    }
+
+    /// Verifies custom track dimensions cannot produce a negative or non-finite
+    /// layout.
+    #[test]
+    fn custom_track_size_normalizes_invalid_dimensions() {
+        let constrained = Switch::new("small-track").track_size(px(2.), px(3.));
+        assert_eq!(constrained.track_size, Some((px(4.), px(4.))));
+
+        let width_below_height = Switch::new("narrow-track").track_size(px(30.), px(36.));
+        assert_eq!(width_below_height.track_size, Some((px(36.), px(36.))));
+
+        let invalid = Switch::new("invalid-track").track_size(px(f32::NAN), px(f32::INFINITY));
+        assert_eq!(invalid.track_size, Some((px(36.), px(20.))));
     }
 
     struct SwitchHarness {
@@ -563,6 +611,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Confirms caller-supplied track dimensions reach the rendered control.
+    #[gpui::test]
+    fn custom_track_size_controls_rendered_geometry(cx: &mut TestAppContext) {
+        struct CustomTrackHarness;
+
+        impl Render for CustomTrackHarness {
+            /// Uses a checked switch to exercise custom geometry with the thumb
+            /// at its end stop.
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().child(
+                    Switch::new("custom-track")
+                        .track_size(px(40.), px(24.))
+                        .checked(true),
+                )
+            }
+        }
+
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|_, _| CustomTrackHarness);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let track = cx
+            .debug_bounds("switch-bar")
+            .expect("the custom Switch track must participate in prepaint");
+        assert_eq!(track.size.width, px(40.));
+        assert_eq!(track.size.height, px(24.));
     }
 
     #[gpui::test]

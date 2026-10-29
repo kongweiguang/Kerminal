@@ -1007,7 +1007,7 @@ impl PreferencesPanel {
         )
     }
 
-    /// Root 右键菜单通过同一配置草稿保存停靠位置；Files 与 Containers 固定右侧并拒绝迟到位置写入。
+    /// 工具位置通过设置草稿与 CAS 保存；每项都允许四种宿主并拒绝迟到的无效写入。
     ///
     /// @author kongweiguang
     pub fn apply_tool_rail_placement_change(
@@ -1016,14 +1016,6 @@ impl PreferencesPanel {
         placement: ToolRailPanelPlacement,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if !can_change_tool_rail_placement(tool) {
-            return Err(crate::locale::text(
-                "文件与容器面板固定显示在右侧抽屉",
-                "The Files and Containers panels are fixed to the right drawer",
-            )
-            .to_string());
-        }
-
         self.apply_tool_rail_change(
             tool,
             move |settings| {
@@ -1031,6 +1023,124 @@ impl PreferencesPanel {
             },
             cx,
         )
+    }
+
+    /// 自定义器把整套可见 rail 草稿交给同一次 CAS；退役 Context 字段严格沿用已读取值。
+    ///
+    /// @author kongweiguang
+    pub fn apply_tool_rail_settings_change(
+        &mut self,
+        requested: ToolRailSettings,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if let Some(message) = tool_rail_edit_readiness_error(self) {
+            return Err(message);
+        }
+        let Some(original) = self.settings.as_ref().map(|draft| draft.value().clone()) else {
+            return Err(
+                crate::locale::text("设置尚未读取，请重试。", "Settings are not loaded.")
+                    .to_string(),
+            );
+        };
+
+        let mut accepted = requested;
+        let current = &original.tool_rail;
+        let default_order = ToolRailSettings::default().order;
+        let context_order_index = current
+            .order
+            .iter()
+            .position(|tool| *tool == ToolRailToolId::Context);
+        accepted
+            .order
+            .retain(|tool| *tool != ToolRailToolId::Context);
+        let mut order = Vec::new();
+        for tool in accepted.order {
+            if is_customizable_tool_rail_tool(tool) && !order.contains(&tool) {
+                order.push(tool);
+            }
+        }
+        for tool in default_order.iter().copied() {
+            if !order.contains(&tool) {
+                order.push(tool);
+            }
+        }
+        if !order.is_empty()
+            && order.iter().all(|tool| accepted.hidden.contains(tool))
+            && let Some(first) = order.first()
+        {
+            accepted.hidden.retain(|tool| tool != first);
+        }
+        if let Some(index) = context_order_index {
+            order.insert(index.min(order.len()), ToolRailToolId::Context);
+        }
+        accepted.order = order;
+
+        accepted
+            .hidden
+            .retain(|tool| is_customizable_tool_rail_tool(*tool));
+        if current.hidden.contains(&ToolRailToolId::Context) {
+            accepted.hidden.push(ToolRailToolId::Context);
+        }
+        accepted
+            .bottom
+            .retain(|tool| is_customizable_tool_rail_tool(*tool));
+        if current.bottom.contains(&ToolRailToolId::Context) {
+            accepted.bottom.push(ToolRailToolId::Context);
+        }
+        accepted
+            .panel_placements
+            .retain(|tool, _| is_customizable_tool_rail_tool(*tool));
+        for tool in default_order {
+            accepted.panel_placements.entry(tool).or_default();
+        }
+        if let Some(placement) = current.panel_placements.get(&ToolRailToolId::Context) {
+            accepted
+                .panel_placements
+                .insert(ToolRailToolId::Context, *placement);
+        }
+
+        let mut candidate = original.clone();
+        candidate.tool_rail = accepted;
+        if candidate == original {
+            return Ok(());
+        }
+        let issues = super::super::validate_settings(&candidate, super::keyboard_platform());
+        if let Some(issue) = issues.iter().find(|issue| issue.blocks_save()) {
+            return Err(issue.message.clone());
+        }
+        let Some(draft) = self.settings.as_mut() else {
+            return Err(crate::locale::text(
+                "设置已失效，请重新读取后重试。",
+                "Settings are unavailable. Reload them before retrying.",
+            )
+            .to_string());
+        };
+        if draft.replace_value(candidate.clone()).is_err() {
+            return Err(crate::locale::text(
+                "设置状态已变化，请打开设置核对后重试。",
+                "Settings changed while applying the tool rail update. Review them before retrying.",
+            )
+            .to_string());
+        }
+        self.settings_issues = issues;
+        self.status = None;
+        self.settings_success_status = None;
+        self.pending_tool_rail_save = true;
+        if !self.save_settings(cx) {
+            self.pending_tool_rail_save = false;
+            if let Some(draft) = self.settings.as_mut() {
+                let _ = draft.replace_value(original);
+            }
+            self.refresh_settings_issues();
+            return Err(self.status.clone().unwrap_or_else(|| {
+                crate::locale::text(
+                    "工具栏设置未能提交，请打开设置检查。",
+                    "The tool rail change was not submitted. Open Settings to review it.",
+                )
+                .to_string()
+            }));
+        }
+        Ok(())
     }
 
     /// Agent 创建入口进入现有设置锚点，不重建草稿或改变其 revision。
@@ -1257,22 +1367,12 @@ fn tool_rail_label(tool: ToolRailToolId) -> gpui_kit::SharedString {
     }
 }
 
-/// Files 与 Containers 显示固定的右侧抽屉状态，其他工具仍保留四种可选停靠方式。
-///
-/// 存量 Files 位置仍留在配置中，因此界面必须展示有效位置而非直接照搬旧值。
+/// 每个可配置工具都显示四种打开位置，与右栏自定义器保持一致。
 ///
 /// @author kongweiguang
 fn placement_options(
-    tool: ToolRailToolId,
+    _tool: ToolRailToolId,
 ) -> Vec<(&'static str, gpui_kit::SharedString, ToolRailPanelPlacement)> {
-    if matches!(tool, ToolRailToolId::Sftp | ToolRailToolId::Containers) {
-        return vec![(
-            "attached",
-            crate::locale::text("右侧抽屉（固定）", "Right drawer (fixed)"),
-            ToolRailPanelPlacement::Attached,
-        )];
-    }
-
     vec![
         (
             "attached",
@@ -1300,8 +1400,15 @@ fn placement_options(
 /// 固定工具拒绝迟到 UI 回调，避免重写仍需兼容读取的存量位置配置。
 ///
 /// @author kongweiguang
-fn can_change_tool_rail_placement(tool: ToolRailToolId) -> bool {
-    !matches!(tool, ToolRailToolId::Sftp | ToolRailToolId::Containers)
+fn can_change_tool_rail_placement(_tool: ToolRailToolId) -> bool {
+    true
+}
+
+/// 批量草稿只接受本次八项，退役 Context 由已读配置单独恢复。
+///
+/// @author kongweiguang
+fn is_customizable_tool_rail_tool(tool: ToolRailToolId) -> bool {
+    tool != ToolRailToolId::Context
 }
 
 #[cfg(test)]

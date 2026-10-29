@@ -2,11 +2,16 @@
 //!
 //! @author kongweiguang
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 use gpui_kit::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
 use kerminal_application::{
     AppError, AppResult,
+    files::clipboard_download::RemoteClipboardSource,
     workspace::{
         WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTargetRef,
         WorkspaceTargetUnavailableReason,
@@ -20,12 +25,14 @@ use kerminal_domain::{
 use crate::features::{
     editor::EditorWorkspaceProjection,
     files::{
-        ActivateEditorFileRequested, CreateSftpHostRequested, FilesPane, OpenFileRequested,
-        SftpHostRequested, WorkspaceOverviewRequested,
+        ActivateEditorFileRequested, CreateSftpHostRequested, FilesPane, FilesPaneEvent,
+        OpenFileRequested, SftpHostKeyTrustRequested, SftpHostRequested,
+        WorkspaceOverviewRequested,
     },
     workspace_controller::{WorkspaceRestoreFailure, WorkspaceRestoreItemId},
     workspace_tabs::WorkspaceFileTabAction,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{CenterPanel, RootView};
 
@@ -87,8 +94,37 @@ pub(super) struct FilesPaneSubscriptions {
     _workspace_overview: Subscription,
     _activate_editor_file: Subscription,
     _sftp_host: Subscription,
+    _sftp_host_key_trust: Subscription,
     _create_sftp_host: Subscription,
     _delete_confirmation_observer: Subscription,
+    _pane_events: Subscription,
+    clipboard_download_tasks: FilesPaneTaskRegistry,
+    host_key_trust_tasks: FilesPaneTaskRegistry,
+}
+
+type FilesPaneTaskRegistry = Arc<Mutex<HashMap<u64, CancellationToken>>>;
+
+impl Drop for FilesPaneSubscriptions {
+    /// 释放桥接时取消该 pane 的读取与未提交信任；已开始写入的信任用例仍须完成原端点回读。
+    fn drop(&mut self) {
+        for cancellation in lock_files_pane_tasks(&self.clipboard_download_tasks).values() {
+            cancellation.cancel();
+        }
+        for cancellation in lock_files_pane_tasks(&self.host_key_trust_tasks).values() {
+            cancellation.cancel();
+        }
+    }
+}
+
+/// 短暂锁住每个 pane 的请求表；锁中不等待传输，也从不持有 GPUI 更新回调。
+///
+/// @author kongweiguang
+fn lock_files_pane_tasks(
+    tasks: &FilesPaneTaskRegistry,
+) -> MutexGuard<'_, HashMap<u64, CancellationToken>> {
+    tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// 显式区分尚未打开、可用和失败；失败的原始 typed tab 仍留在 runtime/snapshot。
@@ -150,16 +186,40 @@ impl WorkspaceFileRuntime {
     ///
     /// @author kongweiguang
     pub(super) fn register_pending_sftp_transfer_tab(&mut self, tab: WorkspaceSessionTab) -> bool {
-        if !self.snapshot_installed
-            || !matches!(
-                &tab,
-                WorkspaceSessionTab::SftpTransfer {
-                    external_launch_id: None,
-                    ..
-                }
-            )
-            || self.tabs.contains_key(tab.id())
-        {
+        if !matches!(
+            &tab,
+            WorkspaceSessionTab::SftpTransfer {
+                external_launch_id: None,
+                ..
+            }
+        ) {
+            return false;
+        }
+        self.register_pending_file_tab(tab)
+    }
+
+    /// Compose 入口只登记明确只读的文件描述，实际加载和失败重试复用恢复链路。
+    ///
+    /// @author kongweiguang
+    pub(super) fn register_pending_compose_yaml_tab(&mut self, tab: WorkspaceSessionTab) -> bool {
+        if !matches!(
+            &tab,
+            WorkspaceSessionTab::WorkspaceFile {
+                access: kerminal_application::workspace::WorkspaceFileAccess::Readonly,
+                source: kerminal_application::workspace::WorkspaceFileSource::ComposeYaml,
+                ..
+            }
+        ) {
+            return false;
+        }
+        self.register_pending_file_tab(tab)
+    }
+
+    /// 登记与快照提交分开，允许 Root 在 CAS 失败时撤销本轮描述而不重建已有文件面板。
+    ///
+    /// @author kongweiguang
+    fn register_pending_file_tab(&mut self, tab: WorkspaceSessionTab) -> bool {
+        if !self.snapshot_installed || self.tabs.contains_key(tab.id()) {
             return false;
         }
         let tab_id = tab.id().clone();
@@ -315,6 +375,10 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> FilesPaneSubscriptions {
+        let clipboard_download_tasks = Arc::new(Mutex::new(HashMap::new()));
+        let event_download_tasks = clipboard_download_tasks.clone();
+        let host_key_trust_tasks = Arc::new(Mutex::new(HashMap::new()));
+        let event_trust_tasks = host_key_trust_tasks.clone();
         let open_file = cx.subscribe_in(
             pane,
             window,
@@ -372,22 +436,259 @@ impl RootView {
                 root.begin_create_sftp_host_from_workbench(window, cx);
             },
         );
+        let sftp_host_key_trust = cx.subscribe_in(
+            pane,
+            window,
+            move |root, source, event: &SftpHostKeyTrustRequested, _, cx| {
+                if root.is_cached_sftp_panel(source)
+                    || source.read(cx).current_host_key_trust_request().as_ref() != Some(event)
+                {
+                    return;
+                }
+                root.start_file_host_key_trust(
+                    source.clone(),
+                    event.clone(),
+                    event_trust_tasks.clone(),
+                    cx,
+                );
+            },
+        );
         let delete_confirmation_observer =
             cx.observe_in(pane, window, |root, source, window, cx| {
-                let active = source.read(cx).pending_delete_confirmation().is_some();
+                let active = source.read(cx).pending_global_dialog();
                 if active && root.is_cached_sftp_panel(&source) {
                     return;
                 }
                 root.sync_file_delete_root_confirmation(source.clone(), active, window, cx);
             });
+        let pane_events = cx.subscribe_in(
+            pane,
+            window,
+            move |root, source, event: &FilesPaneEvent, _, cx| {
+                if root.is_cached_sftp_panel(source) {
+                    return;
+                }
+                match event {
+                    FilesPaneEvent::SetupTerminalDirectoryFollow { binding } => {
+                        root.setup_terminal_directory_follow(source.clone(), binding.clone(), cx);
+                    }
+                    FilesPaneEvent::CopyRemoteFilesToClipboard {
+                        request_id,
+                        sources,
+                    } => {
+                        root.start_clipboard_download(
+                            source.clone(),
+                            *request_id,
+                            sources.clone(),
+                            event_download_tasks.clone(),
+                            cx,
+                        );
+                    }
+                    FilesPaneEvent::CancelClipboardDownload { request_id } => {
+                        root.cancel_clipboard_download(*request_id, &event_download_tasks);
+                    }
+                }
+            },
+        );
         FilesPaneSubscriptions {
             _open_file: open_file,
             _workspace_overview: workspace_overview,
             _activate_editor_file: activate_editor_file,
             _sftp_host: sftp_host,
+            _sftp_host_key_trust: sftp_host_key_trust,
             _create_sftp_host: create_sftp_host,
             _delete_confirmation_observer: delete_confirmation_observer,
+            _pane_events: pane_events,
+            clipboard_download_tasks,
+            host_key_trust_tasks,
         }
+    }
+
+    /// 只提交文件栏冻结的主机信任意图；应用用例负责逐跳绑定与未知结果回读，回执仍交还原 pane。
+    /// 不导航到连接页或打开新终端，避免信任动作改变用户正在浏览的工作区。
+    ///
+    /// @author kongweiguang
+    fn start_file_host_key_trust(
+        &mut self,
+        source: Entity<FilesPane>,
+        request: SftpHostKeyTrustRequested,
+        tasks: FilesPaneTaskRegistry,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((hosts, remote)) = self
+            .services
+            .hosts
+            .clone()
+            .zip(self.services.remote_connections.clone())
+        else {
+            source.update(cx, |pane, cx| {
+                pane.report_host_key_trust(
+                    request.request_id,
+                    request.host_id,
+                    Err(crate::locale::text(
+                        "主机密钥服务不可用。",
+                        "Host key services are unavailable.",
+                    )
+                    .to_string()),
+                    cx,
+                )
+            });
+            return;
+        };
+        let cancellation = CancellationToken::new();
+        {
+            let mut active = lock_files_pane_tasks(&tasks);
+            for previous in active.values() {
+                previous.cancel();
+            }
+            active.clear();
+            active.insert(request.request_id, cancellation.clone());
+        }
+        let executor = self.services.executor.clone();
+        cx.spawn(async move |_, cx| {
+            let host_id = request.host_id.clone();
+            let result = executor
+                .run_cancellable(cancellation, move |cancel| async move {
+                    kerminal_application::connections::file_host_key::trust_file_host_route_keys(
+                        &hosts, remote, host_id, cancel,
+                    )
+                    .await
+                })
+                .await
+                .map_err(|error| error.public_message().to_owned());
+            cx.update(|app| {
+                source.update(app, |pane, cx| {
+                    pane.report_host_key_trust(request.request_id, request.host_id, result, cx);
+                });
+            });
+            lock_files_pane_tasks(&tasks).remove(&request.request_id);
+        })
+        .detach();
+    }
+
+    /// 用事件冻结的远端来源启动唯一 clipboard 用例；完成永远回写同一 pane 和 request id。
+    ///
+    /// @author kongweiguang
+    fn start_clipboard_download(
+        &mut self,
+        source: Entity<FilesPane>,
+        request_id: u64,
+        sources: Vec<RemoteClipboardSource>,
+        tasks: FilesPaneTaskRegistry,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(service) = self.services.file_clipboard_download.clone() else {
+            let error = crate::locale::text(
+                "系统文件剪贴板服务不可用。",
+                "The system file clipboard service is unavailable.",
+            )
+            .to_string();
+            source.update(cx, |pane, cx| {
+                pane.complete_clipboard_download(request_id, Err(error), cx);
+            });
+            return;
+        };
+
+        let cancellation = CancellationToken::new();
+        {
+            let mut active = lock_files_pane_tasks(&tasks);
+            for previous in active.values() {
+                previous.cancel();
+            }
+            active.clear();
+            active.insert(request_id, cancellation.clone());
+        }
+
+        let executor = self.services.executor.clone();
+        cx.spawn(async move |_, cx| {
+            let result = executor
+                .run_cancellable(cancellation, move |operation_cancellation| async move {
+                    service
+                        .copy_remote_files_to_clipboard(operation_cancellation, sources)
+                        .await
+                })
+                .await
+                .map_err(|_| {
+                    crate::locale::text(
+                        "无法将远程项目复制到系统剪贴板。请确认连接后重试。",
+                        "Unable to copy remote items to the system clipboard. Check the connection and retry.",
+                    )
+                    .to_string()
+                });
+            cx.update(|app| {
+                source.update(app, |pane, cx| {
+                    pane.complete_clipboard_download(request_id, result, cx);
+                })
+            });
+            lock_files_pane_tasks(&tasks).remove(&request_id);
+        })
+        .detach();
+    }
+
+    /// 取消指定 pane/request 的传输；请求票据不会影响同 pane 的新任务或其它 FilesPane。
+    ///
+    /// @author kongweiguang
+    fn cancel_clipboard_download(&mut self, request_id: u64, tasks: &FilesPaneTaskRegistry) {
+        if let Some(cancellation) = lock_files_pane_tasks(tasks).get(&request_id) {
+            cancellation.cancel();
+        }
+    }
+
+    /// 安装只使用按钮点击时冻结的 SSH binding；切 Tab 后仍完成原主机请求，不改投当前选择。
+    /// @author kongweiguang
+    fn setup_terminal_directory_follow(
+        &mut self,
+        source: Entity<FilesPane>,
+        binding: kerminal_application::sessions::UiSessionBinding,
+        cx: &mut Context<Self>,
+    ) {
+        let host_id = self
+            .pane_input_handlers
+            .get(&binding.session_id)
+            .filter(|registration| registration.binding == binding)
+            .and_then(|_| match &binding.owner {
+                kerminal_domain::sessions::SessionOwner::Ui { pane_id, .. } => {
+                    self.workspace_runtime.pane(pane_id)
+                }
+                _ => None,
+            })
+            .and_then(|pane| match pane.target.as_ref()? {
+                kerminal_domain::sessions::SessionTarget::Ssh(target) => {
+                    Some(target.host_id.clone())
+                }
+                _ => None,
+            });
+        let Some((operations, host_id)) = self.services.operations.clone().zip(host_id) else {
+            source.update(cx, |files, cx| {
+                files.report_directory_follow_setup(
+                    binding.clone(),
+                    Err("终端目标已失效或不是 SSH 终端。".to_owned()),
+                    cx,
+                )
+            });
+            return;
+        };
+        let executor = self.services.executor.clone();
+        cx.spawn(async move |_, cx| {
+            let result = executor
+                .run(move |cancel| async move {
+                    operations
+                        .configure_terminal_directory_follow(
+                            host_id,
+                            crate::features::files::build_terminal_directory_follow_setup_script(),
+                            cancel,
+                        )
+                        .await
+                })
+                .await
+                .map_err(|error| error.public_message().to_owned());
+            cx.update(|app| {
+                source.update(app, |files, cx| {
+                    files.report_directory_follow_setup(binding, result, cx)
+                })
+            });
+        })
+        .detach();
     }
 
     /// 只读复制当前 Editor 投影并原样回带 request generation，Files 会丢弃过期响应。
@@ -752,7 +1053,9 @@ impl RootView {
                 right_endpoint.clone(),
             )
         });
+        let density = super::preferences::current_interface_density(self);
         let open_result = pane.update(cx, |files, cx| {
+            files.set_interface_density(density, cx);
             files.open_workspace_transfer(
                 endpoints.left.clone(),
                 right_endpoint,

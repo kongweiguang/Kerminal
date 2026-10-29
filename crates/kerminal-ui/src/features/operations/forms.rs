@@ -3,8 +3,12 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, Subscription, Window,
-    component::input::{InputEvent, InputState, TextareaState},
+    AppContext as _, Context, Entity, SharedString, Subscription, Window,
+    component::{
+        input::{InputEvent, InputState, TextareaState},
+        searchable_list::SearchableListItem,
+        select::{SelectEvent, SelectState},
+    },
 };
 use kerminal_application::operations::{ManagedPortForwardSnapshot, PortForwardDefinition};
 use kerminal_domain::{
@@ -18,6 +22,144 @@ use std::net::IpAddr;
 
 use super::OperationsView;
 
+/// 监听范围保存语义选项，输入文本只承载自定义地址，避免下拉标签与请求地址漂移。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ForwardBindScope {
+    Loopback,
+    AllInterfaces,
+    Custom,
+}
+
+impl ForwardBindScope {
+    /// 已知回环和未指定地址归入固定选项；其它内容作为用户显式指定的地址保留。
+    ///
+    /// @author kongweiguang
+    pub(super) fn from_host(host: &str) -> Self {
+        let host = host.trim();
+        if host.eq_ignore_ascii_case("localhost") {
+            return Self::Loopback;
+        }
+        match host.parse::<IpAddr>() {
+            Ok(address) if address.is_loopback() => Self::Loopback,
+            Ok(address) if address.is_unspecified() => Self::AllInterfaces,
+            _ => Self::Custom,
+        }
+    }
+
+    /// 固定范围映射为规范地址；空的自定义草稿沿用 main 的 loopback 安全默认值。
+    ///
+    /// @author kongweiguang
+    pub(super) fn resolve_host(self, custom_host: &str) -> String {
+        match self {
+            Self::Loopback => "127.0.0.1".to_owned(),
+            Self::AllInterfaces => "0.0.0.0".to_owned(),
+            Self::Custom => {
+                let host = custom_host.trim();
+                if host.is_empty() {
+                    "127.0.0.1".to_owned()
+                } else {
+                    host.to_owned()
+                }
+            }
+        }
+    }
+}
+
+/// 保留 main 中互相独立的本机、主机和 SOCKS 端点草稿，切换场景时不覆盖用户输入。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ForwardFormDrafts {
+    local_bind_host: String,
+    local_custom_bind_host: String,
+    local_bind_scope: ForwardBindScope,
+    local_listen_port: String,
+    remote_bind_host: String,
+    remote_custom_bind_host: String,
+    remote_bind_scope: ForwardBindScope,
+    remote_listen_port: String,
+    host_target_host: String,
+    host_target_port: String,
+    local_target_host: String,
+    local_target_port: String,
+    local_socks_port: String,
+}
+
+impl ForwardFormDrafts {
+    /// 端口和目标初值与 main 的表单一致；远端 SOCKS 与远端服务共用主机监听状态。
+    ///
+    /// @author kongweiguang
+    fn main_defaults() -> Self {
+        Self {
+            local_bind_host: "127.0.0.1".to_owned(),
+            local_custom_bind_host: "127.0.0.1".to_owned(),
+            local_bind_scope: ForwardBindScope::Loopback,
+            local_listen_port: "15432".to_owned(),
+            remote_bind_host: "127.0.0.1".to_owned(),
+            remote_custom_bind_host: "127.0.0.1".to_owned(),
+            remote_bind_scope: ForwardBindScope::Loopback,
+            remote_listen_port: "18080".to_owned(),
+            host_target_host: "127.0.0.1".to_owned(),
+            host_target_port: "5432".to_owned(),
+            local_target_host: "127.0.0.1".to_owned(),
+            local_target_port: "3000".to_owned(),
+            local_socks_port: "1080".to_owned(),
+        }
+    }
+}
+
+/// 下拉项携带稳定语义值，显示标签只负责中英文展示和搜索。
+///
+/// @author kongweiguang
+#[derive(Clone)]
+pub(super) struct ForwardBindScopeOption {
+    scope: ForwardBindScope,
+    label: SharedString,
+}
+
+impl SearchableListItem for ForwardBindScopeOption {
+    type Value = ForwardBindScope;
+
+    /// 搜索和辅助技术使用完整范围说明，避免单独的地址数字难以辨认。
+    ///
+    /// @author kongweiguang
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    /// 选择器把范围枚举交给表单，不从本地化文字反解析状态。
+    ///
+    /// @author kongweiguang
+    fn value(&self) -> &Self::Value {
+        &self.scope
+    }
+}
+
+/// 监听范围选项与 main 的表单一致，固定选项使用安全且可预测的绑定地址。
+///
+/// @author kongweiguang
+fn forward_bind_scope_options() -> Vec<ForwardBindScopeOption> {
+    [
+        (
+            ForwardBindScope::Loopback,
+            crate::locale::text("仅本机 (127.0.0.1)", "Local only (127.0.0.1)"),
+        ),
+        (
+            ForwardBindScope::AllInterfaces,
+            crate::locale::text("全部接口 (0.0.0.0)", "All interfaces (0.0.0.0)"),
+        ),
+        (
+            ForwardBindScope::Custom,
+            crate::locale::text("自定义地址", "Custom address"),
+        ),
+    ]
+    .into_iter()
+    .map(|(scope, label)| ForwardBindScopeOption { scope, label })
+    .collect()
+}
+
 /// 输入控件在首次绘制后持久化，避免重绘时丢失正在编辑的端口或 session 名称。
 pub(super) struct OperationsInputs {
     pub(super) container_search: Entity<InputState>,
@@ -28,10 +170,12 @@ pub(super) struct OperationsInputs {
     pub(super) exec_program: Entity<InputState>,
     pub(super) exec_arguments: Entity<TextareaState>,
     pub(super) forward_name: Entity<InputState>,
+    pub(super) forward_bind_scope: Entity<SelectState<Vec<ForwardBindScopeOption>>>,
     pub(super) forward_bind_host: Entity<InputState>,
     pub(super) forward_bind_port: Entity<InputState>,
     pub(super) forward_destination_host: Entity<InputState>,
     pub(super) forward_destination_port: Entity<InputState>,
+    forward_drafts: ForwardFormDrafts,
     pub(super) forward_form_open: bool,
 }
 
@@ -40,6 +184,16 @@ impl OperationsInputs {
     ///
     /// @author kongweiguang
     pub(super) fn refresh_locale(&self, window: &mut Window, cx: &mut Context<OperationsView>) {
+        let bind_scope = self
+            .forward_bind_scope
+            .read(cx)
+            .selected_value()
+            .copied()
+            .unwrap_or(ForwardBindScope::Loopback);
+        self.forward_bind_scope.update(cx, |select, cx| {
+            select.set_items(forward_bind_scope_options(), window, cx);
+            select.set_selected_value(&bind_scope, window, cx);
+        });
         self.container_search.update(cx, |state, cx| {
             state.set_placeholder(
                 crate::locale::text(
@@ -89,30 +243,8 @@ impl OperationsInputs {
             );
         });
         self.forward_name.update(cx, |state, cx| {
-            state.set_placeholder(crate::locale::text("转发名称", "Forward name"), window, cx);
-        });
-        self.forward_bind_host.update(cx, |state, cx| {
-            state.set_placeholder(crate::locale::text("监听地址", "Bind address"), window, cx);
-        });
-        self.forward_bind_port.update(cx, |state, cx| {
-            state.set_placeholder(crate::locale::text("监听端口", "Bind port"), window, cx);
-        });
-        self.forward_destination_host.update(cx, |state, cx| {
             state.set_placeholder(
-                crate::locale::text(
-                    "目标地址（动态代理留空）",
-                    "Destination address (leave blank for dynamic proxy)",
-                ),
-                window,
-                cx,
-            );
-        });
-        self.forward_destination_port.update(cx, |state, cx| {
-            state.set_placeholder(
-                crate::locale::text(
-                    "目标端口（动态代理留空）",
-                    "Destination port (leave blank for dynamic proxy)",
-                ),
+                crate::locale::text("例如 PostgreSQL 隧道", "e.g. PostgreSQL tunnel"),
                 window,
                 cx,
             );
@@ -204,8 +336,8 @@ impl OperationsView {
         }
         let container_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::locale::text(
-                "搜索名称、镜像或 Compose 项目",
-                "Search name, image, or Compose project",
+                "搜索应用、服务、镜像、端口或 ID",
+                "Search projects, services, images, ports, or IDs",
             ))
         });
         let search_subscription = cx.subscribe(&container_search, |view, input, event, cx| {
@@ -214,9 +346,79 @@ impl OperationsView {
                 cx.notify();
             }
         });
+        let forward_bind_host = cx.new(|cx| InputState::new(window, cx));
+        let bind_host_change_subscription =
+            cx.subscribe(&forward_bind_host, |view, input, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let custom_scope = view.inputs.as_ref().is_some_and(|inputs| {
+                        inputs
+                            .forward_bind_scope
+                            .read(cx)
+                            .selected_value()
+                            .is_some_and(|scope| *scope == ForwardBindScope::Custom)
+                    });
+                    if custom_scope {
+                        let host = input.read(cx).value().to_string();
+                        if let Some(inputs) = view.inputs.as_mut() {
+                            match view.forward_kind {
+                                ForwardKind::Local | ForwardKind::Dynamic => {
+                                    inputs.forward_drafts.local_custom_bind_host = host;
+                                }
+                                ForwardKind::Remote | ForwardKind::RemoteDynamic => {
+                                    inputs.forward_drafts.remote_custom_bind_host = host;
+                                }
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        let forward_bind_scope = cx.new(|cx| {
+            SelectState::new(
+                forward_bind_scope_options(),
+                Some(gpui_kit::component::IndexPath::new(0)),
+                window,
+                cx,
+            )
+        });
+        let bind_scope_subscription = cx.subscribe_in(
+            &forward_bind_scope,
+            window,
+            |view, _, event: &SelectEvent<Vec<ForwardBindScopeOption>>, window, cx| {
+                let SelectEvent::Confirm(Some(scope)) = event else {
+                    return;
+                };
+                let Some(inputs) = view.inputs.as_ref() else {
+                    return;
+                };
+                let current_host = inputs
+                    .forward_bind_host
+                    .update(cx, |state, _| state.value().to_string());
+                let next_host = if *scope == ForwardBindScope::Custom {
+                    match view.forward_kind {
+                        ForwardKind::Local | ForwardKind::Dynamic => {
+                            inputs.forward_drafts.local_custom_bind_host.clone()
+                        }
+                        ForwardKind::Remote | ForwardKind::RemoteDynamic => {
+                            inputs.forward_drafts.remote_custom_bind_host.clone()
+                        }
+                    }
+                } else {
+                    scope.resolve_host(&current_host)
+                };
+                inputs
+                    .forward_bind_host
+                    .update(cx, |state, cx| state.set_value(next_host, window, cx));
+                cx.notify();
+            },
+        );
         let mut inputs = OperationsInputs {
             container_search,
-            _subscriptions: vec![search_subscription],
+            _subscriptions: vec![
+                search_subscription,
+                bind_scope_subscription,
+                bind_host_change_subscription,
+            ],
             tmux_name: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(crate::locale::text(
                     "tmux session 名称",
@@ -248,27 +450,17 @@ impl OperationsView {
                     .auto_grow(2, 5)
             }),
             forward_name: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(crate::locale::text("转发名称", "Forward name"))
-            }),
-            forward_bind_host: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(crate::locale::text("监听地址", "Bind address"))
-            }),
-            forward_bind_port: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(crate::locale::text("监听端口", "Bind port"))
-            }),
-            forward_destination_host: cx.new(|cx| {
                 InputState::new(window, cx).placeholder(crate::locale::text(
-                    "目标地址（动态代理留空）",
-                    "Destination address (leave blank for dynamic proxy)",
+                    "例如 PostgreSQL 隧道",
+                    "e.g. PostgreSQL tunnel",
                 ))
             }),
-            forward_destination_port: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(crate::locale::text("目标端口", "Destination port"))
-            }),
+            forward_bind_scope,
+            forward_bind_host,
+            forward_bind_port: cx.new(|cx| InputState::new(window, cx)),
+            forward_destination_host: cx.new(|cx| InputState::new(window, cx)),
+            forward_destination_port: cx.new(|cx| InputState::new(window, cx)),
+            forward_drafts: ForwardFormDrafts::main_defaults(),
             forward_form_open: false,
         };
         for input in [
@@ -328,7 +520,7 @@ impl OperationsView {
     /// 新建表单清空旧草稿并冻结打开时的 SSH HostId，目标栏随后切换也不改变定义归属。
     ///
     /// @author kongweiguang
-    pub(super) fn prepare_forward_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn prepare_forward_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy || self.forward_save_pending.is_some() {
             return;
         }
@@ -340,28 +532,19 @@ impl OperationsView {
         };
         self.ensure_inputs(window, cx);
         if let Some(inputs) = self.inputs.as_ref() {
-            for input in [
-                &inputs.forward_name,
-                &inputs.forward_bind_host,
-                &inputs.forward_bind_port,
-                &inputs.forward_destination_host,
-                &inputs.forward_destination_port,
-            ] {
-                input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
-            }
-            // 安全 loopback 是常见转发起点，端口仍要求明确输入，避免默认暴露到所有网卡。
-            for input in [&inputs.forward_bind_host, &inputs.forward_destination_host] {
-                input.update(cx, |state, cx| {
-                    state.set_value("127.0.0.1".to_owned(), window, cx)
-                });
-            }
+            inputs
+                .forward_name
+                .update(cx, |state, cx| state.set_value(String::new(), window, cx));
             if let Some(inputs) = self.inputs.as_mut() {
+                inputs.forward_drafts = ForwardFormDrafts::main_defaults();
                 inputs.forward_form_open =
                     next_forward_form_open(inputs.forward_form_open, ForwardFormTransition::Add);
             }
         }
         self.forward_kind = ForwardKind::Local;
+        self.restore_forward_form_draft(ForwardKind::Local, window, cx);
         self.forward_edit_expected = None;
+        self.forward_edit_transient_id = None;
         self.forward_add_host_expected = Some(add_host_expected);
         self.forward_save_pending = None;
         self.compose_pending_down = None;
@@ -382,11 +565,7 @@ impl OperationsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy
-            || self.forward_save_pending.is_some()
-            || !forward.persistent
-            || forward.forward.state != kerminal_domain::operations::ForwardState::Stopped
-        {
+        if self.busy || self.forward_save_pending.is_some() {
             return;
         }
         self.ensure_inputs(window, cx);
@@ -397,6 +576,13 @@ impl OperationsView {
             });
             inputs.forward_bind_host.update(cx, |state, cx| {
                 state.set_value(config.bind.host.clone(), window, cx)
+            });
+            inputs.forward_bind_scope.update(cx, |select, cx| {
+                select.set_selected_value(
+                    &ForwardBindScope::from_host(&config.bind.host),
+                    window,
+                    cx,
+                );
             });
             inputs.forward_bind_port.update(cx, |state, cx| {
                 state.set_value(config.bind.port.get().to_string(), window, cx)
@@ -415,6 +601,8 @@ impl OperationsView {
                 inputs.forward_form_open = true;
             }
             self.forward_kind = config.kind;
+            self.forward_edit_transient_id =
+                (!forward.persistent).then(|| forward.forward.id.clone());
             self.forward_edit_expected = Some(PortForwardDefinition {
                 id: forward.forward.id.clone(),
                 config: config.clone(),
@@ -429,11 +617,189 @@ impl OperationsView {
             cx.emit(super::OperationsEvent::RootConfirmationChanged);
             cx.notify();
         }
+        self.capture_forward_form_draft(forward.forward.config.kind, cx);
     }
 
-    /// 读取单行输入时复制为拥有值，使异步任务不借用 GPUI Entity 或 Context。
+    /// 监听范围下拉是请求语义的唯一来源；空名称仅在提交时映射为 main 的主机名和 SSH flag。
+    ///
+    /// @author kongweiguang
     pub(super) fn input_value(&self, input: &Entity<InputState>, cx: &mut Context<Self>) -> String {
-        input.update(cx, |state, _| state.value().to_string())
+        let value = input.update(cx, |state, _| state.value().to_string());
+        let Some(inputs) = self.inputs.as_ref().filter(|inputs| {
+            inputs.forward_bind_host.entity_id() == input.entity_id()
+                || inputs.forward_name.entity_id() == input.entity_id()
+        }) else {
+            return value;
+        };
+        if inputs.forward_name.entity_id() == input.entity_id() {
+            if value.trim().is_empty() {
+                let Some(host_id) = self.forward_form_host_id() else {
+                    return value;
+                };
+                let host_name = self
+                    .host_display_names
+                    .get(&host_id)
+                    .map(|name| name.to_string())
+                    .unwrap_or_else(|| host_id.as_str().to_owned());
+                return default_forward_name(&host_name, self.forward_kind);
+            }
+            return value;
+        }
+        let scope = inputs
+            .forward_bind_scope
+            .read(cx)
+            .selected_value()
+            .copied()
+            .unwrap_or_else(|| ForwardBindScope::from_host(&value));
+        scope.resolve_host(&value)
+    }
+
+    /// 切换转发类型前保存当前端点，目标类型恢复自己的 main 默认值或尚未提交的草稿。
+    ///
+    /// @author kongweiguang
+    pub(super) fn switch_forward_kind(
+        &mut self,
+        next_kind: ForwardKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.forward_kind == next_kind {
+            return;
+        }
+        self.capture_forward_form_draft(self.forward_kind, cx);
+        self.forward_kind = next_kind;
+        self.restore_forward_form_draft(next_kind, window, cx);
+        cx.notify();
+    }
+
+    /// 只在每种转发共用同一组端点时同步草稿，远端 -R/SOCKS 共用主机监听值。
+    ///
+    /// @author kongweiguang
+    fn capture_forward_form_draft(&mut self, kind: ForwardKind, cx: &mut Context<Self>) {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return;
+        };
+        let bind_host = inputs
+            .forward_bind_host
+            .update(cx, |state, _| state.value().to_string());
+        let bind_port = inputs
+            .forward_bind_port
+            .update(cx, |state, _| state.value().to_string());
+        let bind_scope = inputs
+            .forward_bind_scope
+            .read(cx)
+            .selected_value()
+            .copied()
+            .unwrap_or(ForwardBindScope::from_host(&bind_host));
+        let destination_host = inputs
+            .forward_destination_host
+            .update(cx, |state, _| state.value().to_string());
+        let destination_port = inputs
+            .forward_destination_port
+            .update(cx, |state, _| state.value().to_string());
+        let Some(inputs) = self.inputs.as_mut() else {
+            return;
+        };
+        let drafts = &mut inputs.forward_drafts;
+
+        match kind {
+            ForwardKind::Local => {
+                drafts.local_bind_host = bind_host;
+                if bind_scope == ForwardBindScope::Custom {
+                    drafts.local_custom_bind_host = drafts.local_bind_host.clone();
+                }
+                drafts.local_bind_scope = bind_scope;
+                drafts.local_listen_port = bind_port;
+                drafts.host_target_host = destination_host;
+                drafts.host_target_port = destination_port;
+            }
+            ForwardKind::Remote => {
+                drafts.remote_bind_host = bind_host;
+                if bind_scope == ForwardBindScope::Custom {
+                    drafts.remote_custom_bind_host = drafts.remote_bind_host.clone();
+                }
+                drafts.remote_bind_scope = bind_scope;
+                drafts.remote_listen_port = bind_port;
+                drafts.local_target_host = destination_host;
+                drafts.local_target_port = destination_port;
+            }
+            ForwardKind::Dynamic => {
+                drafts.local_bind_host = bind_host;
+                if bind_scope == ForwardBindScope::Custom {
+                    drafts.local_custom_bind_host = drafts.local_bind_host.clone();
+                }
+                drafts.local_bind_scope = bind_scope;
+                drafts.local_socks_port = bind_port;
+            }
+            ForwardKind::RemoteDynamic => {
+                drafts.remote_bind_host = bind_host;
+                if bind_scope == ForwardBindScope::Custom {
+                    drafts.remote_custom_bind_host = drafts.remote_bind_host.clone();
+                }
+                drafts.remote_bind_scope = bind_scope;
+                drafts.remote_listen_port = bind_port;
+            }
+        }
+    }
+
+    /// 恢复当前类型对应的独立草稿；共享的远端 listener 保持 -R 与远端 SOCKS 一致。
+    ///
+    /// @author kongweiguang
+    fn restore_forward_form_draft(
+        &mut self,
+        kind: ForwardKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return;
+        };
+        let drafts = inputs.forward_drafts.clone();
+        let (bind_host, bind_scope, bind_port, destination_host, destination_port) = match kind {
+            ForwardKind::Local => (
+                drafts.local_bind_host,
+                drafts.local_bind_scope,
+                drafts.local_listen_port,
+                drafts.host_target_host,
+                drafts.host_target_port,
+            ),
+            ForwardKind::Remote => (
+                drafts.remote_bind_host,
+                drafts.remote_bind_scope,
+                drafts.remote_listen_port,
+                drafts.local_target_host,
+                drafts.local_target_port,
+            ),
+            ForwardKind::Dynamic => (
+                drafts.local_bind_host,
+                drafts.local_bind_scope,
+                drafts.local_socks_port,
+                String::new(),
+                String::new(),
+            ),
+            ForwardKind::RemoteDynamic => (
+                drafts.remote_bind_host,
+                drafts.remote_bind_scope,
+                drafts.remote_listen_port,
+                String::new(),
+                String::new(),
+            ),
+        };
+        inputs
+            .forward_bind_host
+            .update(cx, |state, cx| state.set_value(bind_host, window, cx));
+        inputs
+            .forward_bind_port
+            .update(cx, |state, cx| state.set_value(bind_port, window, cx));
+        inputs.forward_bind_scope.update(cx, |select, cx| {
+            select.set_selected_value(&bind_scope, window, cx)
+        });
+        inputs.forward_destination_host.update(cx, |state, cx| {
+            state.set_value(destination_host, window, cx)
+        });
+        inputs.forward_destination_port.update(cx, |state, cx| {
+            state.set_value(destination_port, window, cx)
+        });
     }
 
     /// 小型表单输入转为拥有字符串后按行拆分，避开 Ropey beta 的迭代差异且不解析 shell。
@@ -451,6 +817,18 @@ impl OperationsView {
             })
             .unwrap_or_default()
     }
+}
+
+/// 空名称沿用 main 的后端命名约定，远端动态 SOCKS 使用 OpenSSH 的 `-R` 标识。
+///
+/// @author kongweiguang
+pub(super) fn default_forward_name(host_name: &str, kind: ForwardKind) -> String {
+    let flag = match kind {
+        ForwardKind::Local => "-L",
+        ForwardKind::Remote | ForwardKind::RemoteDynamic => "-R",
+        ForwardKind::Dynamic => "-D",
+    };
+    format!("{} {flag}", host_name.trim())
 }
 
 /// 校验容器程序与 argv 的边界，避免把整行用户文本误当成 shell command。

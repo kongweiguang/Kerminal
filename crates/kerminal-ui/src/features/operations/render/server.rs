@@ -2,9 +2,10 @@
 //!
 //! @author kongweiguang
 
+pub(in crate::features::operations) use super::super::state::ServerNetworkFilter;
 use super::super::state::{
-    SectionPhase, SectionState, ServerInfoMetricSample, ServerInfoPanel, network_rate_label,
-    time_series_position,
+    SectionPhase, SectionState, ServerInfoMetricSample, ServerInfoPanel, ServerNetworkRole,
+    filtered_network_rates, network_interface_role, network_rate_label, time_series_position,
 };
 use super::super::{OperationsView, ServerInfoRefreshInterval};
 use super::{localized_text, section_feedback};
@@ -14,7 +15,7 @@ use gpui_kit::{
     App, Bounds, ClickEvent, Context, Hsla, IntoElement, PathBuilder, Pixels, Window,
     assets::IconName,
     component::{
-        Disableable, Selectable,
+        ActiveTheme, Disableable, Selectable,
         button::{Button, ButtonVariants},
         menu::{DropdownMenu as _, PopupMenuItem},
         plot::{Plot, PlotElement},
@@ -30,18 +31,71 @@ use kerminal_domain::operations::{
 };
 use std::collections::HashMap;
 
-const SERVER_METRIC_PLOT_HEIGHT_PX: f32 = 48.0;
-const SERVER_OVERVIEW_METRIC_MIN_COLUMN_WIDTH: f32 = 136.0;
+const SERVER_METRIC_PLOT_HEIGHT_PX: f32 = 28.0;
+const SERVER_PROCESS_DISPLAY_LIMIT: usize = 5;
 
-/// 资源页保留用户选择的接口范围；默认只看真实物理接口以避免虚拟流量淹没主链路。
+#[derive(Clone, Copy)]
+struct ServerControlTypography {
+    font_size: Pixels,
+    line_height: Pixels,
+    font_weight: gpui_kit::FontWeight,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerControlLabelMode {
+    NativeButtonLabel,
+    StyledChild,
+}
+
+/// 固定右栏给 Kit Button 使用显式标签子节点；完整工作台保留 Kit 原生标签排版。
 ///
 /// @author kongweiguang
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::features::operations) enum ServerNetworkFilter {
-    #[default]
-    Primary,
-    All,
-    Virtual,
+fn server_control_label_mode(compact: bool) -> ServerControlLabelMode {
+    if compact {
+        ServerControlLabelMode::StyledChild
+    } else {
+        ServerControlLabelMode::NativeButtonLabel
+    }
+}
+
+/// 仅紧凑右栏覆盖 Kit 的紧凑按钮字号，以匹配 main WebView 的计算样式；完整工作台沿用原控件默认值。
+///
+/// @author kongweiguang
+fn server_control_typography() -> ServerControlTypography {
+    ServerControlTypography {
+        font_size: px(16.),
+        line_height: px(24.),
+        font_weight: gpui_kit::FontWeight::NORMAL,
+    }
+}
+
+/// 显式子节点抵消 Button 内容容器的紧凑字号覆盖，并保留读屏器可见名称。
+///
+/// @author kongweiguang
+fn apply_server_control_label(button: Button, label: SharedString, compact: bool) -> Button {
+    match server_control_label_mode(compact) {
+        ServerControlLabelMode::NativeButtonLabel => button.label(label),
+        ServerControlLabelMode::StyledChild => {
+            let typography = server_control_typography();
+            button.accessibility_label(label.clone()).child(
+                div()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(typography.font_size)
+                    .line_height(typography.line_height)
+                    .font_weight(typography.font_weight)
+                    .child(label),
+            )
+        }
+    }
+}
+
+/// 右栏标签高度复刻 main，完整工作区保留现有紧凑按钮尺寸。
+///
+/// @author kongweiguang
+fn server_tab_height(compact: bool) -> Pixels {
+    px(if compact { 36. } else { 28. })
 }
 
 /// 进程排序只影响当前投影；CPU 是传统默认顺序，内存列可随时恢复原排序。
@@ -75,6 +129,7 @@ impl OperationsView {
             .flex_col()
             .gap_3()
             .child(self.render_server_header(snapshot.as_ref(), target, theme, cx))
+            .children(self.compact_operation_feedback(theme))
             .when(show_feedback, |body| {
                 body.child(section_feedback(
                     &self.server,
@@ -118,7 +173,13 @@ impl OperationsView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let phase = self.server.phase();
-        let target_label = if self.operation_target_available() {
+        let target_available = self.operation_target_available();
+        let presentation_target = if target_available {
+            Some(target)
+        } else {
+            snapshot.map(|snapshot| &snapshot.target)
+        };
+        let target_label = if target_available {
             let host_id = server_target_host_id(target);
             let display_name = host_id
                 .and_then(|host_id| saved_host_display_name(host_id, &self.host_display_names));
@@ -139,16 +200,15 @@ impl OperationsView {
             )
             .to_string()
         };
-        let target_available = self.operation_target_available();
         let sampling_status = if target_available {
             server_sampling_status(phase, self.server_refresh_interval)
         } else {
             crate::locale::text("当前目标不可用", "Current target unavailable")
         };
-        let status_color = if target_available {
-            server_sampling_color(theme, phase)
+        let status_indicator_color = if target_available {
+            server_sampling_color(theme, phase, self.server_refresh_interval)
         } else {
-            theme.warning
+            theme.monitor_error
         };
         let last_updated = snapshot
             .and_then(|snapshot| snapshot.sample_times.fast_at_unix_ms)
@@ -158,7 +218,7 @@ impl OperationsView {
                     format!(
                         "{} {}",
                         localized_text("更新于", "Updated"),
-                        sample_age_label(sampled_at),
+                        server_timestamp_label(Some(sampled_at)),
                     )
                 },
             );
@@ -167,16 +227,23 @@ impl OperationsView {
         } else {
             server_page_title(target)
         };
-        let target_host_id = server_target_host_id(target).map(|host_id| host_id.as_str());
-        let full_target_label = target_label.clone();
+        let target_subtitle = presentation_target.map_or_else(
+            || target_label.clone(),
+            |target| server_target_subtitle(target, &self.host_subtitles, &target_label),
+        );
+        let target_host_id = presentation_target
+            .and_then(server_target_host_id)
+            .map(HostId::as_str);
+        let full_target_label = target_subtitle.clone();
         let mut target_row = div()
             .id("operations-server-target-label")
             .min_w_0()
             .flex_1()
-            .text_size(theme.text_sm)
+            .text_size(theme.text_xs)
+            .line_height(px(16.))
             .text_color(theme.muted)
             .truncate()
-            .child(target_label);
+            .child(target_subtitle);
         if let Some(host_id) = target_host_id {
             let target_tooltip = crate::locale::text(
                 format!("目标：{full_target_label} · 主机 ID：{host_id}"),
@@ -188,92 +255,99 @@ impl OperationsView {
                 .aria_label(target_accessible_label);
         }
 
-        let mut actions = div().flex().items_center().gap_1();
-        if matches!(self.server_info_target, ServerInfoTarget::Container { .. }) {
-            actions = actions.child(
-                Button::new("operations-server-host-target")
-                    .compact()
-                    .label(crate::locale::text("返回主机", "Host"))
-                    .disabled(server_refresh_disabled(phase, target_available))
-                    .on_click(
-                        cx.listener(|view, _: &ClickEvent, _, cx| view.show_host_server_info(cx)),
-                    ),
-            );
-        }
-        actions = actions.child(
-            Button::new("operations-server-refresh")
-                .compact()
-                .ghost()
-                .icon(IconName::RefreshCw)
-                .accessibility_label(crate::locale::text("刷新服务器信息", "Refresh server info"))
-                .tooltip(crate::locale::text("刷新服务器信息", "Refresh server info"))
-                .disabled(server_refresh_disabled(phase, target_available))
-                .on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.load_server(cx))),
-        );
+        let refresh = Button::new("operations-server-refresh")
+            .compact()
+            .ghost()
+            .icon(IconName::RefreshCw)
+            .accessibility_label(crate::locale::text("刷新服务器信息", "Refresh server info"))
+            .tooltip(crate::locale::text("刷新服务器信息", "Refresh server info"))
+            .disabled(server_refresh_disabled(phase, target_available))
+            .on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.load_server(cx)));
 
         div()
             .id("operations-server-header")
             .w_full()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
-            .rounded_lg()
-            .bg(theme.panel)
+            .gap_0()
+            .px_3()
+            .pt_2()
+            .pb_3()
+            .border_b_1()
+            .border_color(theme.tool_panel_border)
             .child(
                 div()
                     .w_full()
                     .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        gpui_kit::component::Icon::new(IconName::Server).text_color(theme.accent),
-                    )
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
                     .child(
                         div()
                             .min_w_0()
                             .flex_1()
-                            .text_size(theme.text_title)
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .truncate()
-                            .child(target_title),
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        gpui_kit::component::Icon::new(IconName::Server)
+                                            .text_color(theme.accent)
+                                            .size(px(16.)),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_size(theme.text_sm)
+                                            .line_height(px(20.))
+                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
+                                            .truncate()
+                                            .child(target_title),
+                                    )
+                                    .child(
+                                        div()
+                                            .size(px(8.))
+                                            .flex_shrink_0()
+                                            .rounded_full()
+                                            .bg(status_indicator_color),
+                                    ),
+                            )
+                            .child(target_row),
                     )
-                    .child(
-                        div()
-                            .size(px(8.))
-                            .flex_shrink_0()
-                            .rounded_full()
-                            .bg(status_color),
-                    )
-                    .child(actions),
+                    .child(refresh),
             )
-            .child(div().w_full().flex().items_center().child(target_row))
             .child(
                 div()
                     .w_full()
+                    .mt_3()
                     .flex()
-                    .flex_wrap()
                     .items_center()
-                    .gap_1()
+                    .gap_2()
                     .child(self.render_server_tabs(theme, cx))
-                    .child(self.render_server_refresh_intervals(cx)),
+                    .child(self.render_server_refresh_intervals(theme, cx)),
             )
             .child(
                 div()
                     .w_full()
+                    .mt_2()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .text_size(theme.text_xs)
+                    .text_size(px(11.))
+                    .line_height(px(16.5))
                     .child(
                         div()
                             .min_w_0()
                             .flex_1()
                             .truncate()
-                            .text_color(status_color)
+                            .text_color(theme.muted)
                             .child(sampling_status),
                     )
                     .child(
@@ -360,13 +434,26 @@ impl OperationsView {
                 theme,
             ));
         let mut cpu_body = cpu_body;
-        if !snapshot.cpu.per_core_percent.is_empty() {
-            let mut cores = div().w_full().flex().flex_row().flex_wrap().gap_2().pt_2();
-            for (index, usage) in snapshot.cpu.per_core_percent.iter().copied().enumerate() {
+        let core_usages = snapshot
+            .cpu
+            .per_core_percent
+            .iter()
+            .filter_map(|usage| *usage)
+            .filter(|usage| usage.is_finite())
+            .collect::<Vec<_>>();
+        if !core_usages.is_empty() {
+            let mono_font_family = cx.theme().mono_font_family.clone();
+            let mut cores = div()
+                .w_full()
+                .grid()
+                .grid_cols(4)
+                .gap_x(px(12.))
+                .gap_y_2()
+                .py_3();
+            for (index, usage) in core_usages.iter().copied().enumerate() {
                 cores = cores.child(
                     div()
-                        .min_w(px(68.))
-                        .flex_1()
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -376,17 +463,22 @@ impl OperationsView {
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .text_size(theme.text_xs)
+                                .font_family(mono_font_family.clone())
+                                .text_size(px(10.))
                                 .text_color(theme.muted)
                                 .child(format!("C{index}"))
-                                .child(percent(usage)),
+                                .child(format!("{}%", usage.round())),
                         )
-                        .child(server_percentage_meter(usage, theme)),
+                        .child(server_percentage_meter(
+                            Some(usage.clamp(0.0, 100.0)),
+                            theme,
+                        )),
                 );
             }
             cpu_body = cpu_body.child(cores);
         }
         let cpu = server_resource_card(
+            IconName::Cpu,
             localized_text("CPU", "CPU"),
             percentage_label(snapshot.cpu.usage_percent),
             cpu_body,
@@ -396,19 +488,14 @@ impl OperationsView {
         let mut gpu_body = div().w_full().flex().flex_col();
         for gpu in &snapshot.gpus {
             gpu_body = gpu_body.child(server_resource_line(
+                gpu.model.as_deref().unwrap_or(&gpu.id).to_owned(),
                 format!(
-                    "{} · {}",
-                    gpu.model.as_deref().unwrap_or(&gpu.id),
-                    gpu.vendor.as_deref().unwrap_or("—"),
-                ),
-                format!(
-                    "{} · {} · {} · {}",
-                    percent(gpu.utilization_percent),
+                    "{}{}",
                     memory_pair(gpu.memory_used_bytes, gpu.memory_total_bytes),
-                    gpu.temperature_celsius
-                        .map_or_else(|| "—".to_owned(), |value| format!("{value:.0} °C")),
-                    gpu.power_watts
-                        .map_or_else(|| "—".to_owned(), |value| format!("{value:.1} W")),
+                    gpu.utilization_percent.map_or_else(
+                        || localized_text(" · 仅静态识别", " · Static only"),
+                        |value| format!(" · {}", percent(Some(value))),
+                    ),
                 ),
                 theme,
             ));
@@ -427,6 +514,7 @@ impl OperationsView {
             ));
         }
         let gpu = server_resource_card(
+            IconName::Activity,
             localized_text("GPU", "GPU"),
             server_device_count_label(
                 snapshot.gpus.len(),
@@ -440,6 +528,7 @@ impl OperationsView {
         );
 
         let memory = server_resource_card(
+            IconName::MemoryStick,
             localized_text("内存", "Memory"),
             memory_pair(snapshot.memory.used_bytes, snapshot.memory.total_bytes),
             div()
@@ -477,12 +566,12 @@ impl OperationsView {
         let mut filter_control = div()
             .w_full()
             .flex()
-            .gap_1()
-            .p_1()
+            .gap_0()
+            .p_0p5()
             .rounded_md()
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary);
+            .border_color(theme.tool_panel_border)
+            .bg(theme.muted_surface());
         for (filter, zh, en, id) in [
             (ServerNetworkFilter::Primary, "主要", "Primary", "primary"),
             (ServerNetworkFilter::All, "全部", "All", "all"),
@@ -493,9 +582,18 @@ impl OperationsView {
                 .compact()
                 .ghost()
                 .flex_1()
-                .h(px(32.))
-                .selected(is_selected)
+                .h_6()
+                .px_2()
+                .text_size(px(11.))
+                .line_height(px(16.))
                 .toggled(is_selected)
+                .when(is_selected, |button| {
+                    button
+                        .bg(theme.panel)
+                        .text_color(theme.foreground)
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                })
+                .when(!is_selected, |button| button.text_color(theme.muted))
                 .label(crate::locale::text(zh, en))
                 .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                     view.server_network_filter = filter;
@@ -503,7 +601,11 @@ impl OperationsView {
                 }));
             filter_control = filter_control.child(option);
         }
-        let network_rates = filtered_network_rates(&snapshot.network_rates, selected_filter);
+        let network_rates = filtered_network_rates(
+            &snapshot.network_rates,
+            &snapshot.network_counters,
+            selected_filter,
+        );
         let mut network_body = div().w_full().flex().flex_col().child(filter_control);
         if network_rates.is_empty() {
             network_body = network_body.child(server_resource_empty_state(
@@ -541,11 +643,9 @@ impl OperationsView {
             }
         }
         let network = server_resource_card(
+            IconName::Network,
             localized_text("网络接口", "Network interfaces"),
-            probe_sample_label(
-                &snapshot.network_probe_status,
-                snapshot.sample_times.fast_at_unix_ms,
-            ),
+            String::new(),
             network_body,
             theme,
         );
@@ -565,27 +665,21 @@ impl OperationsView {
             ));
         } else {
             for disk in &snapshot.disks {
-                disk_body = disk_body
-                    .child(server_resource_line(
-                        format!("{} · {}", disk.mount, disk.filesystem),
-                        format!(
-                            "{} / {} · {} {}",
-                            server_bytes_label(disk.used_bytes),
-                            server_bytes_label(disk.total_bytes),
-                            server_bytes_label(disk.available_bytes),
-                            localized_text("可用", "free"),
-                        ),
-                        theme,
-                    ))
-                    .child(server_percentage_meter(server_disk_percent(disk), theme));
+                disk_body = disk_body.child(server_resource_line(
+                    disk.mount.clone(),
+                    format!(
+                        "{} / {}",
+                        server_bytes_label(disk.used_bytes),
+                        server_bytes_label(disk.total_bytes),
+                    ),
+                    theme,
+                ));
             }
         }
         let disks = server_resource_card(
+            IconName::HardDrive,
             localized_text("文件系统", "Filesystems"),
-            probe_sample_label(
-                &snapshot.disk_probe_status,
-                snapshot.sample_times.slow_at_unix_ms,
-            ),
+            String::new(),
             disk_body,
             theme,
         );
@@ -596,10 +690,7 @@ impl OperationsView {
             .flex_col()
             .gap_3()
             .child(cpu)
-            .child(gpu)
-            .child(memory)
-            .child(network)
-            .child(disks);
+            .child(gpu);
         if snapshot.npu_probe_status != ServerInfoProbeStatus::NotSampled
             || !snapshot.npus.is_empty()
         {
@@ -617,29 +708,84 @@ impl OperationsView {
                     theme,
                 ));
             } else {
-                for npu in &snapshot.npus {
-                    npu_body = npu_body.child(server_resource_line(
-                        format!(
-                            "{} · {}",
-                            npu.model.as_deref().unwrap_or(&npu.id),
-                            npu.bus_id.as_deref().unwrap_or("—"),
-                        ),
-                        format!(
-                            "{} · {} · HBM {} / {} · {} · {}",
-                            npu.health.as_deref().unwrap_or("—"),
-                            percent(npu.aicore_percent),
-                            server_bytes_label(npu.hbm_used_bytes),
-                            server_bytes_label(npu.hbm_total_bytes),
-                            npu.temperature_celsius
-                                .map_or_else(|| "—".to_owned(), |value| format!("{value:.0} °C"),),
-                            npu.power_watts
-                                .map_or_else(|| "—".to_owned(), |value| format!("{value:.1} W"),),
-                        ),
-                        theme,
-                    ));
+                for (index, npu) in snapshot.npus.iter().enumerate() {
+                    let mut health_detail = npu
+                        .health
+                        .clone()
+                        .unwrap_or_else(|| localized_text("状态未知", "Unknown state"));
+                    if let Some(temperature) = npu.temperature_celsius {
+                        health_detail.push_str(&format!(" · {temperature:.0}°C"));
+                    }
+                    if let Some(power) = npu.power_watts {
+                        health_detail.push_str(&format!(" · {power:.1} W"));
+                    }
+                    let mut row = div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .py_2()
+                        .when(index + 1 < snapshot.npus.len(), |row| {
+                            row.border_b_1().border_color(theme.tool_panel_border)
+                        })
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .text_size(theme.text_xs)
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                        .text_color(theme.foreground)
+                                        .truncate()
+                                        .child(npu.model.as_deref().unwrap_or(&npu.id).to_owned()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted)
+                                        .child(format!("NPU {}", npu.id)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .text_size(px(11.))
+                                .text_color(theme.muted)
+                                .child(format!(
+                                    "HBM {} / {} · AICore {}",
+                                    server_bytes_label(npu.hbm_used_bytes),
+                                    server_bytes_label(npu.hbm_total_bytes),
+                                    percent(npu.aicore_percent),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .text_size(px(11.))
+                                .text_color(theme.muted)
+                                .child(health_detail),
+                        );
+                    if let Some(bus_id) = &npu.bus_id {
+                        row = row.child(
+                            div()
+                                .w_full()
+                                .text_size(px(10.))
+                                .text_color(theme.muted)
+                                .truncate()
+                                .child(bus_id.clone()),
+                        );
+                    }
+                    npu_body = npu_body.child(row);
                 }
             }
             body = body.child(server_resource_card(
+                IconName::CircuitBoard,
                 localized_text("NPU", "NPU"),
                 server_device_count_label(
                     snapshot.npus.len(),
@@ -652,7 +798,7 @@ impl OperationsView {
                 theme,
             ));
         }
-        body
+        body.child(memory).child(network).child(disks)
     }
 
     /// 进程页按固定列宽展示进程、CPU 和内存，排序切换仅重新投影现有快照。
@@ -664,10 +810,9 @@ impl OperationsView {
         theme: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut processes = snapshot.processes.clone();
-        processes
-            .sort_by(|left, right| compare_server_processes(left, right, self.server_process_sort));
-        let displayed_count = processes.len().min(12);
+        let processes = server_processes_for_display(&snapshot.processes, self.server_process_sort);
+        let mono_font_family = cx.theme().mono_font_family.clone();
+        let displayed_count = processes.len();
         let mut rows = div().w_full().flex().flex_col();
         if processes.is_empty() {
             rows = rows.child(server_resource_empty_state(
@@ -687,12 +832,19 @@ impl OperationsView {
             let cpu_sort = Button::new("operations-server-process-sort-cpu")
                 .compact()
                 .ghost()
-                .w(px(70.))
-                .h(px(32.))
+                .w(px(56.))
+                .h(px(15.))
+                .px_0()
                 .justify_end()
-                .text_size(theme.text_xs)
-                .selected(cpu_selected)
+                .text_size(px(10.))
+                .line_height(px(15.))
                 .toggled(cpu_selected)
+                .when(cpu_selected, |button| {
+                    button
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                })
+                .when(!cpu_selected, |button| button.text_color(theme.muted))
                 .label("CPU")
                 .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
                     view.server_process_sort = ServerProcessSort::Cpu;
@@ -701,12 +853,19 @@ impl OperationsView {
             let memory_sort = Button::new("operations-server-process-sort-memory")
                 .compact()
                 .ghost()
-                .w(px(88.))
-                .h(px(32.))
+                .w(px(56.))
+                .h(px(15.))
+                .px_0()
                 .justify_end()
-                .text_size(theme.text_xs)
-                .selected(memory_selected)
+                .text_size(px(10.))
+                .line_height(px(15.))
                 .toggled(memory_selected)
+                .when(memory_selected, |button| {
+                    button
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                })
+                .when(!memory_selected, |button| button.text_color(theme.muted))
                 .label(localized_text("内存", "Memory"))
                 .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
                     view.server_process_sort = ServerProcessSort::Memory;
@@ -718,10 +877,11 @@ impl OperationsView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .pb_2()
+                    .pb(px(6.))
                     .border_b_1()
-                    .border_color(theme.border)
-                    .text_size(theme.text_xs)
+                    .border_color(theme.tool_panel_border)
+                    .text_size(px(10.))
+                    .line_height(px(15.))
                     .text_color(theme.muted)
                     .child(
                         div()
@@ -732,15 +892,15 @@ impl OperationsView {
                     .child(cpu_sort)
                     .child(memory_sort),
             );
-            for (index, process) in processes.iter().take(12).enumerate() {
+            for (index, process) in processes.iter().enumerate() {
                 let row = div()
                     .w_full()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .py_2()
+                    .py_2p5()
                     .when(index + 1 < displayed_count, |row| {
-                        row.border_b_1().border_color(theme.border)
+                        row.border_b_1().border_color(theme.tool_panel_border)
                     })
                     .child(
                         div()
@@ -751,32 +911,39 @@ impl OperationsView {
                             .gap_0()
                             .child(
                                 div()
-                                    .text_size(theme.text_sm)
-                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_size(theme.text_xs)
+                                    .line_height(px(16.))
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
                                     .text_color(theme.foreground)
                                     .truncate()
                                     .child(process.name.clone()),
                             )
                             .child(
                                 div()
-                                    .text_size(theme.text_xs)
                                     .text_color(theme.muted)
+                                    .font_family(mono_font_family.clone())
+                                    .text_size(px(10.))
+                                    .line_height(px(15.))
                                     .child(format!("PID {}", process.pid)),
                             ),
                     )
                     .child(
                         div()
-                            .w(px(70.))
+                            .w(px(56.))
                             .text_right()
-                            .text_size(theme.text_sm)
+                            .text_size(px(11.))
+                            .line_height(px(16.))
+                            .font_family(mono_font_family.clone())
                             .text_color(theme.foreground)
                             .child(server_process_percent(process.cpu_percent)),
                     )
                     .child(
                         div()
-                            .w(px(88.))
+                            .w(px(56.))
                             .text_right()
-                            .text_size(theme.text_sm)
+                            .text_size(px(11.))
+                            .line_height(px(16.))
+                            .font_family(mono_font_family.clone())
                             .text_color(theme.foreground)
                             .child(server_bytes_label(process.memory_bytes)),
                     );
@@ -790,11 +957,9 @@ impl OperationsView {
             .flex_col()
             .gap_3()
             .child(server_resource_card(
+                IconName::Activity,
                 localized_text("进程", "Processes"),
-                probe_sample_label(
-                    &snapshot.process_probe_status,
-                    snapshot.sample_times.slow_at_unix_ms,
-                ),
+                String::new(),
                 div()
                     .w_full()
                     .flex()
@@ -803,19 +968,12 @@ impl OperationsView {
                         div()
                             .pb_2()
                             .text_size(theme.text_xs)
+                            .line_height(px(16.))
                             .text_color(theme.muted)
-                            .child(format!(
-                                "{} {} · {} {} · {} {}",
-                                localized_text("进程", "Processes"),
-                                snapshot
-                                    .process_count
-                                    .map_or_else(|| "—".to_owned(), |count| count.to_string(),),
-                                localized_text("运行中", "running"),
-                                snapshot
-                                    .running_process_count
-                                    .map_or_else(|| "—".to_owned(), |count| count.to_string(),),
-                                localized_text("展示前", "showing top"),
-                                displayed_count,
+                            .child(server_process_summary_label(
+                                snapshot.process_count,
+                                snapshot.running_process_count,
+                                crate::locale::current_language(),
                             )),
                     )
                     .child(rows),
@@ -868,13 +1026,7 @@ impl OperationsView {
                 value,
             })
             .collect::<Vec<_>>();
-        let disk_points = self
-            .server_history
-            .disk_samples()
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        let disk_current = disk_points.last().and_then(|sample| sample.value);
+        let disk_current = server_root_disk(&snapshot.disks).and_then(server_disk_percent);
         let receive_max = dynamic_rate_max(&receive_points);
         let transmit_max = dynamic_rate_max(&transmit_points);
         let receive_plot_max = receive_max.unwrap_or(1.0);
@@ -884,21 +1036,11 @@ impl OperationsView {
             snapshot.sample_times.gpu_at_unix_ms,
             snapshot.gpus.iter().map(|gpu| gpu.utilization_percent),
         );
-        let gpu_probe = probe_sample_label(
-            &snapshot.gpu_probe_status,
-            snapshot.sample_times.gpu_at_unix_ms,
-        );
-        let disk_title = self.server_history.disk_mount().map_or_else(
-            || crate::locale::text("磁盘", "Disk").to_string(),
-            |mount| {
-                crate::locale::text(format!("磁盘 · {mount}"), format!("Disk · {mount}"))
-                    .to_string()
-            },
-        );
         let cpu = server_metric_row(
             ServerMetricRowData {
+                icon: IconName::Cpu,
                 title: crate::locale::text("CPU", "CPU").to_string(),
-                current: percentage_label(latest.and_then(|sample| sample.cpu_percent)),
+                current: percentage_label(snapshot.cpu.usage_percent),
                 samples: fast_points,
                 minimum: 0.0,
                 maximum: 100.0,
@@ -907,8 +1049,9 @@ impl OperationsView {
         );
         let memory = server_metric_row(
             ServerMetricRowData {
+                icon: IconName::MemoryStick,
                 title: crate::locale::text("内存", "Memory").to_string(),
-                current: percentage_label(latest.and_then(|sample| sample.memory_percent)),
+                current: percentage_label(server_memory_percent(&snapshot.memory)),
                 samples: memory_points,
                 minimum: 0.0,
                 maximum: 100.0,
@@ -917,6 +1060,7 @@ impl OperationsView {
         );
         let receive = server_metric_row(
             ServerMetricRowData {
+                icon: IconName::ArrowDown,
                 title: crate::locale::text("下行", "Receive").to_string(),
                 current: network_rate_label(
                     latest.and_then(|sample| sample.receive_bytes_per_second),
@@ -929,6 +1073,7 @@ impl OperationsView {
         );
         let transmit = server_metric_row(
             ServerMetricRowData {
+                icon: IconName::ArrowUp,
                 title: crate::locale::text("上行", "Transmit").to_string(),
                 current: network_rate_label(
                     latest.and_then(|sample| sample.transmit_bytes_per_second),
@@ -941,27 +1086,34 @@ impl OperationsView {
         );
         let disk = server_metric_row(
             ServerMetricRowData {
-                title: disk_title,
+                icon: IconName::HardDrive,
+                title: crate::locale::text("磁盘", "Disk").to_string(),
                 current: percentage_label(disk_current),
-                samples: disk_points,
+                samples: Vec::new(),
                 minimum: 0.0,
                 maximum: 100.0,
             },
             theme,
         );
-        let gpu = server_metric_value_row(
-            crate::locale::text("GPU", "GPU").to_string(),
-            server_gpu_overview_label(snapshot, gpu_current),
-            gpu_probe,
+        let gpu = server_metric_row(
+            ServerMetricRowData {
+                icon: IconName::Activity,
+                title: crate::locale::text("GPU", "GPU").to_string(),
+                current: server_gpu_overview_label(snapshot, gpu_current),
+                samples: Vec::new(),
+                minimum: 0.0,
+                maximum: 100.0,
+            },
             theme,
         );
         let metrics = div()
             .w_full()
             .flex()
             .flex_col()
-            .rounded_lg()
+            .rounded(theme.radius)
+            .overflow_hidden()
             .border_1()
-            .border_color(theme.border)
+            .border_color(theme.tool_panel_border)
             .bg(theme.panel)
             .child(server_metric_pair(cpu, memory, theme, false))
             .child(server_metric_pair(receive, transmit, theme, false))
@@ -969,21 +1121,21 @@ impl OperationsView {
         div().w_full().child(metrics)
     }
 
-    /// 选中页签用主题中性表面强调并保留 Kit 选中语义，避免把导航误读为主操作。
+    /// 页签沿用 main 的单行 muted surface；切页时清理临时筛选/排序，避免继承意外视图。
     ///
     /// @author kongweiguang
     fn render_server_tabs(&self, theme: ThemeTokens, cx: &mut Context<Self>) -> impl IntoElement {
         let mut row = div()
-            .min_w(px(196.))
+            .min_w_0()
             .flex_1()
             .flex()
             .items_center()
-            .gap_1()
-            .p_1()
+            .gap_0()
+            .p_0p5()
             .rounded_lg()
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary);
+            .border_color(theme.tool_panel_border)
+            .bg(theme.muted_surface());
         for (panel, zh, en, id) in [
             (ServerInfoPanel::Overview, "概览", "Overview", "overview"),
             (ServerInfoPanel::Resources, "资源", "Resources", "resources"),
@@ -994,57 +1146,81 @@ impl OperationsView {
                 .compact()
                 .ghost()
                 .flex_1()
-                .h(px(32.))
-                .text_size(px(16.))
+                .h(server_tab_height(self.compact_layout))
+                .text_size(theme.text_xs)
+                .line_height(px(16.))
                 .selected(selected)
                 .when(selected, |button| {
                     button.bg(theme.panel).text_color(theme.foreground)
                 })
-                .when(!selected, |button| button.text_color(theme.muted))
-                .label(crate::locale::text(zh, en))
-                .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                    if view.server_info_panel != panel {
-                        view.server_info_panel = panel;
-                        cx.notify();
-                    }
-                }));
+                .when(!selected, |button| button.text_color(theme.muted));
+            let button = apply_server_control_label(
+                button,
+                crate::locale::text(zh, en),
+                self.compact_layout,
+            )
+            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+                if view.server_info_panel != panel {
+                    let (network_filter, process_sort) = server_panel_control_state(
+                        view.server_info_panel,
+                        panel,
+                        view.server_network_filter,
+                        view.server_process_sort,
+                    );
+                    view.server_info_panel = panel;
+                    view.server_network_filter = network_filter;
+                    view.server_process_sort = process_sort;
+                    cx.notify();
+                }
+            }));
             row = row.child(button);
         }
         row
     }
 
-    /// 提供旧工具栏支持的固定周期选项，并将自动刷新留在同一监控 driver 中。
+    /// 固定宽度的间隔触发器保留 main 选择器的描边识别度，周期变更仍由同一监控 driver 接管。
     ///
     /// @author kongweiguang
-    fn render_server_refresh_intervals(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_server_refresh_intervals(
+        &self,
+        theme: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let selected = self.server_refresh_interval;
         let (zh, en) = selected.label();
         let entity = cx.entity().clone();
-        Button::new("operations-server-refresh-interval-picker")
-            .compact()
-            .ghost()
-            .w(px(76.))
-            .flex_shrink_0()
-            .h(px(32.))
-            .icon(IconName::ChevronDown)
-            .label(crate::locale::text(zh, en))
-            .dropdown_menu(move |mut menu, _, _| {
-                for interval in ServerInfoRefreshInterval::OPTIONS {
-                    let (zh, en) = interval.label();
-                    let entity = entity.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(crate::locale::text(zh, en))
-                            .checked(interval == selected)
-                            .on_click(move |_, _, app| {
-                                entity.update(app, |view, cx| {
-                                    view.set_server_refresh_interval(interval, cx);
-                                });
-                            }),
-                    );
-                }
-                menu
-            })
-            .into_any_element()
+        apply_server_control_label(
+            Button::new("operations-server-refresh-interval-picker")
+                .debug_selector(|| "rr-system-interval".into())
+                .compact()
+                .ghost()
+                .outline()
+                .w(px(76.))
+                .flex_shrink_0()
+                .h(px(32.))
+                .dropdown_caret(true),
+            crate::locale::text(zh, en),
+            self.compact_layout,
+        )
+        .dropdown_menu(move |mut menu, _, _| {
+            menu = crate::ui_popup::dropdown_menu(menu, theme);
+            for interval in ServerInfoRefreshInterval::OPTIONS {
+                let (zh, en) = interval.label();
+                let entity = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(crate::locale::text(zh, en))
+                        .checked(interval == selected)
+                        .on_click(move |_, _, app| {
+                            entity.update(app, |view, cx| {
+                                view.set_server_refresh_interval(interval, cx);
+                            });
+                        }),
+                );
+            }
+            menu
+        })
+        .offset(px(6.))
+        .into_any_element()
     }
 }
 
@@ -1072,50 +1248,58 @@ fn server_system_details(
         .flex()
         .flex_col()
         .gap_0()
-        .p_3()
-        .rounded_lg()
+        .px_3()
+        .py_2p5()
+        .rounded(theme.radius)
         .border_1()
-        .border_color(theme.border)
+        .border_color(theme.tool_panel_border)
         .bg(theme.panel)
         .child(
             div()
                 .w_full()
                 .pb_2()
                 .border_b_1()
-                .border_color(theme.border)
-                .text_size(px(16.))
+                .border_color(theme.tool_panel_border)
+                .text_size(theme.text_xs)
+                .line_height(px(16.))
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .text_color(theme.foreground)
                 .child(localized_text("系统", "System")),
         )
         .child(server_system_value_row(
-            localized_text("主机", "Host"),
+            localized_text("主机名", "Hostname"),
             snapshot.hostname.as_deref().unwrap_or("—"),
+            false,
             theme,
         ))
         .child(server_system_value_row(
             localized_text("系统", "OS"),
             snapshot.operating_system.as_deref().unwrap_or("—"),
+            false,
             theme,
         ))
         .child(server_system_value_row(
             localized_text("架构", "Architecture"),
             snapshot.architecture.as_deref().unwrap_or("—"),
+            false,
             theme,
         ))
         .child(server_system_value_row(
             "Kernel".to_owned(),
             snapshot.kernel.as_deref().unwrap_or("—"),
+            false,
             theme,
         ))
         .child(server_system_value_row(
             localized_text("运行时间", "Uptime"),
             &server_uptime_label(snapshot.uptime_seconds),
+            false,
             theme,
         ))
         .child(server_system_value_row(
             localized_text("根分区", "Root partition"),
             &root_partition,
+            true,
             theme,
         ))
 }
@@ -1149,40 +1333,50 @@ fn server_uptime_label(seconds: Option<u64>) -> String {
     }
 }
 
-/// 每个系统字段保持单行键值，长值截断以免抢占窄栏趋势空间。
+/// 系统信息沿用 main 的弹性标签列与自然宽度值列，避免截断主机或分区标识。
 ///
 /// @author kongweiguang
-fn server_system_value_row(label: String, value: &str, theme: ThemeTokens) -> impl IntoElement {
+fn server_system_value_row(
+    label: String,
+    value: &str,
+    last_row: bool,
+    theme: ThemeTokens,
+) -> impl IntoElement {
     div()
         .w_full()
         .flex()
         .items_center()
-        .gap_2()
+        .gap_3()
         .py_2()
-        .border_b_1()
-        .border_color(theme.border)
-        .child(
-            div()
-                .text_size(theme.text_sm)
-                .text_color(theme.muted)
-                .child(label),
-        )
+        .line_height(px(16.))
+        .when(!last_row, |row| {
+            row.border_b_1().border_color(theme.tool_panel_border)
+        })
         .child(
             div()
                 .min_w_0()
                 .flex_1()
-                .text_right()
-                .text_size(theme.text_sm)
-                .text_color(theme.foreground)
+                .text_size(theme.text_xs)
+                .text_color(theme.muted)
                 .truncate()
+                .child(label),
+        )
+        .child(
+            div()
+                .text_right()
+                .text_size(theme.text_xs)
+                .text_color(theme.foreground)
+                .flex_shrink_0()
+                .whitespace_nowrap()
                 .child(value.to_owned()),
         )
 }
 
-/// 一张卡片只用主题令牌承载边界和表面，标题/正文/辅助信息分别遵循 16/14/12px 层级。
+/// 资源卡沿用 main 的图标标题、可选尾值和单层边界，避免重复展示探针状态。
 ///
 /// @author kongweiguang
 fn server_resource_card(
+    icon: IconName,
     title: String,
     trailing: String,
     body: impl IntoElement,
@@ -1193,10 +1387,11 @@ fn server_resource_card(
         .flex()
         .flex_col()
         .gap_2()
-        .p_3()
-        .rounded_lg()
+        .px_3()
+        .py_2p5()
+        .rounded(theme.radius)
         .border_1()
-        .border_color(theme.border)
+        .border_color(theme.tool_panel_border)
         .bg(theme.panel)
         .child(
             div()
@@ -1207,26 +1402,33 @@ fn server_resource_card(
                 .gap_2()
                 .pb_2()
                 .border_b_1()
-                .border_color(theme.border)
+                .border_color(theme.tool_panel_border)
                 .child(
                     div()
                         .min_w_0()
                         .flex_1()
-                        .text_size(px(16.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(theme.text_xs)
+                        .line_height(px(16.))
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .text_color(theme.foreground)
-                        .truncate()
-                        .child(title),
+                        .child(gpui_kit::component::Icon::new(icon).size(px(16.)))
+                        .child(div().min_w_0().truncate().child(title)),
                 )
-                .child(
-                    div()
-                        .max_w(px(220.))
-                        .text_right()
-                        .text_size(theme.text_sm)
-                        .text_color(theme.foreground)
-                        .truncate()
-                        .child(trailing),
-                ),
+                .when(!trailing.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .max_w(px(220.))
+                            .text_right()
+                            .text_size(theme.text_xs)
+                            .line_height(px(16.))
+                            .text_color(theme.foreground)
+                            .truncate()
+                            .child(trailing.clone()),
+                    )
+                }),
         )
         .child(body)
 }
@@ -1241,13 +1443,14 @@ fn server_resource_line(label: String, value: String, theme: ThemeTokens) -> imp
         .items_center()
         .gap_2()
         .py_2()
+        .line_height(px(16.))
         .border_b_1()
-        .border_color(theme.border)
+        .border_color(theme.tool_panel_border)
         .child(
             div()
                 .min_w_0()
                 .flex_1()
-                .text_size(theme.text_sm)
+                .text_size(theme.text_xs)
                 .text_color(theme.muted)
                 .truncate()
                 .child(label),
@@ -1257,7 +1460,7 @@ fn server_resource_line(label: String, value: String, theme: ThemeTokens) -> imp
                 .min_w_0()
                 .flex_1()
                 .text_right()
-                .text_size(theme.text_sm)
+                .text_size(theme.text_xs)
                 .text_color(theme.foreground)
                 .truncate()
                 .child(value),
@@ -1271,12 +1474,12 @@ fn server_resource_empty_state(message: String, theme: ThemeTokens) -> impl Into
     div()
         .w_full()
         .py_3()
-        .text_size(theme.text_sm)
+        .text_size(theme.text_xs)
         .text_color(theme.muted)
         .child(message)
 }
 
-/// 只有有限的 0–100 实测百分比才填充进度条；未知值保留空轨道而非伪造零利用率。
+/// 轨道复用 main 的 hover surface；只有有限的 0–100 实测百分比才填充，未知值不伪造零利用率。
 ///
 /// @author kongweiguang
 fn server_percentage_meter(value: Option<f64>, theme: ThemeTokens) -> impl IntoElement {
@@ -1287,7 +1490,7 @@ fn server_percentage_meter(value: Option<f64>, theme: ThemeTokens) -> impl IntoE
         .w_full()
         .h(px(8.))
         .rounded_full()
-        .bg(theme.border)
+        .bg(theme.hover)
         .child(
             div()
                 .w(relative(ratio))
@@ -1365,14 +1568,19 @@ fn server_bytes_label(value: Option<u64>) -> String {
     }
 }
 
-/// 网络速率必须为有限非负值；负数或非有限样本不拿来填充资源行。
+/// 网络速率沿用 main 的采样中占位和字节单位；非法读数保持未知，不伪装成有效速率。
 ///
 /// @author kongweiguang
 fn server_rate_label(value: Option<f64>) -> String {
-    let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) else {
-        return "—".to_owned();
+    let Some(value) = value else {
+        return localized_text("采样中", "Sampling…");
     };
-    if value >= 1_073_741_824.0 {
+    if !value.is_finite() || value < 0.0 {
+        return "—".to_owned();
+    }
+    if value >= 1_099_511_627_776.0 {
+        format!("{:.1} TB/s", value / 1_099_511_627_776.0)
+    } else if value >= 1_073_741_824.0 {
         format!("{:.1} GB/s", value / 1_073_741_824.0)
     } else if value >= 1_048_576.0 {
         format!("{:.1} MB/s", value / 1_048_576.0)
@@ -1422,85 +1630,6 @@ fn server_device_count_label(
     crate::locale::text(format!("{count} {unit_zh}"), format!("{count} {unit_en}")).to_string()
 }
 
-/// 为主接口筛选保留旧版命名惯例；未知名称按物理接口处理，避免隐藏定制网卡。
-///
-/// @author kongweiguang
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ServerNetworkRole {
-    Bridge,
-    Loopback,
-    Physical,
-    Tunnel,
-    Virtual,
-}
-
-/// 将 Linux 常见桥接、回环、隧道和虚拟接口前缀映射到展示角色。
-///
-/// @author kongweiguang
-fn network_interface_role(name: &str) -> ServerNetworkRole {
-    let name = name.to_ascii_lowercase();
-    if name == "lo" {
-        ServerNetworkRole::Loopback
-    } else if ["br-", "bridge", "docker", "virbr"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        ServerNetworkRole::Bridge
-    } else if ["tun", "tap", "tailscale", "wg", "zt"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        ServerNetworkRole::Tunnel
-    } else if ["veth", "cni", "flannel", "kube-ipvs", "dummy"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        ServerNetworkRole::Virtual
-    } else {
-        ServerNetworkRole::Physical
-    }
-}
-
-/// 返回某个筛选范围的接口；Primary 无物理接口时回退到首个非回环项。
-///
-/// @author kongweiguang
-fn filtered_network_rates(
-    rates: &[kerminal_domain::operations::NetworkRateSnapshot],
-    filter: ServerNetworkFilter,
-) -> Vec<&kerminal_domain::operations::NetworkRateSnapshot> {
-    match filter {
-        ServerNetworkFilter::All => rates.iter().collect(),
-        ServerNetworkFilter::Virtual => rates
-            .iter()
-            .filter(|rate| {
-                matches!(
-                    network_interface_role(&rate.name),
-                    ServerNetworkRole::Bridge
-                        | ServerNetworkRole::Tunnel
-                        | ServerNetworkRole::Virtual
-                )
-            })
-            .collect(),
-        ServerNetworkFilter::Primary => {
-            let physical = rates
-                .iter()
-                .filter(|rate| network_interface_role(&rate.name) == ServerNetworkRole::Physical)
-                .collect::<Vec<_>>();
-            if physical.is_empty() {
-                rates
-                    .iter()
-                    .filter(|rate| {
-                        network_interface_role(&rate.name) != ServerNetworkRole::Loopback
-                    })
-                    .take(1)
-                    .collect()
-            } else {
-                physical
-            }
-        }
-    }
-}
-
 /// 简短接口角色名帮助用户理解筛选结果，同时保留原始系统接口名称。
 ///
 /// @author kongweiguang
@@ -1537,6 +1666,20 @@ fn compare_server_processes(
     primary
         .then(secondary)
         .then_with(|| left.pid.cmp(&right.pid))
+}
+
+/// 先按 main 的默认 CPU 排名限定榜单候选，再按当前列排序，保持可见范围一致。
+///
+/// @author kongweiguang
+fn server_processes_for_display(
+    processes: &[kerminal_domain::operations::ProcessSnapshot],
+    sort: ServerProcessSort,
+) -> Vec<kerminal_domain::operations::ProcessSnapshot> {
+    let mut candidates = processes.to_vec();
+    candidates.sort_by(|left, right| compare_server_processes(left, right, ServerProcessSort::Cpu));
+    candidates.truncate(SERVER_PROCESS_DISPLAY_LIMIT);
+    candidates.sort_by(|left, right| compare_server_processes(left, right, sort));
+    candidates
 }
 
 /// None 和坏 CPU 读数置后，读取值按从高到低排序以保持榜单可预测。
@@ -1609,7 +1752,7 @@ fn server_refresh_disabled(phase: SectionPhase, target_available: bool) -> bool 
     !target_available || phase == SectionPhase::Loading
 }
 
-/// 采样文案同时说明手动/周期模式；失败与取消显式区分，避免显示成已连接。
+/// 手动模式明确显示自动采集已暂停；失败与取消继续单独标识，避免被读作实时采集。
 ///
 /// @author kongweiguang
 fn server_sampling_status(
@@ -1618,7 +1761,7 @@ fn server_sampling_status(
 ) -> SharedString {
     match phase {
         SectionPhase::Ready if interval == ServerInfoRefreshInterval::Manual => {
-            crate::locale::text("采样完成", "Sampling complete")
+            crate::locale::text("自动采集已暂停", "Automatic sampling paused")
         }
         SectionPhase::Ready => crate::locale::text("实时采集中", "Live sampling"),
         SectionPhase::Loading => crate::locale::text("正在采集", "Sampling"),
@@ -1628,15 +1771,22 @@ fn server_sampling_status(
     }
 }
 
-/// 按语义状态色标明读取结果，在浅色与深色主题中继续使用 ThemeTokens。
+/// 健康点沿用 main 的 live、paused、error 色阶；基线状态保持中性，状态文案不依赖颜色。
 ///
 /// @author kongweiguang
-fn server_sampling_color(theme: ThemeTokens, phase: SectionPhase) -> Hsla {
+fn server_sampling_color(
+    theme: ThemeTokens,
+    phase: SectionPhase,
+    interval: ServerInfoRefreshInterval,
+) -> Hsla {
     match phase {
-        SectionPhase::Ready => theme.success,
-        SectionPhase::Loading => theme.accent,
-        SectionPhase::Failed => theme.error,
-        SectionPhase::Cancelled => theme.warning,
+        SectionPhase::Ready if interval == ServerInfoRefreshInterval::Manual => {
+            theme.monitor_paused
+        }
+        SectionPhase::Ready => theme.monitor_live,
+        SectionPhase::Failed => theme.monitor_error,
+        SectionPhase::Cancelled => theme.monitor_paused,
+        SectionPhase::Loading => theme.muted,
         SectionPhase::NotLoaded => theme.muted,
     }
 }
@@ -1670,7 +1820,6 @@ struct OperationsTimelinePlot {
     minimum: f64,
     maximum: f64,
     line: Hsla,
-    grid: Hsla,
 }
 
 /// 将轻量自绘图接入 Kit PlotElement，避免每个 metric 再维护一套 element 状态。
@@ -1696,19 +1845,9 @@ impl Plot for OperationsTimelinePlot {
     /// @author kongweiguang
     fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) {
         let left = bounds.origin.x + px(1.0);
-        let top = bounds.origin.y + px(1.0);
+        let top = bounds.origin.y + px(4.0);
         let width = bounds.size.width - px(2.0);
-        let height = bounds.size.height - px(2.0);
-
-        for row in 0..=2 {
-            let y = top + height * (row as f32 / 2.0);
-            let mut path = PathBuilder::stroke(px(0.75));
-            path.move_to(point(left, y));
-            path.line_to(point(left + width, y));
-            if let Ok(path) = path.build() {
-                window.paint_path(path, self.grid);
-            }
-        }
+        let height = bounds.size.height - px(4.0);
 
         let Some(start_at_unix_ms) = self.samples.first().map(|sample| sample.sampled_at_unix_ms)
         else {
@@ -1796,6 +1935,7 @@ fn finish_timeline_segment(
 ///
 /// @author kongweiguang
 struct ServerMetricRowData {
+    icon: IconName,
     title: String,
     current: String,
     samples: Vec<ServerInfoMetricSample>,
@@ -1803,11 +1943,12 @@ struct ServerMetricRowData {
     maximum: f64,
 }
 
-/// 指标格按标题、20px 读数、48px 真实趋势垂直排列；固定层级使三组双列的高度稳定。
+/// 指标格使用 main 的图标标题、16px 读数和 28px 轻趋势，保持六项网格紧凑。
 ///
 /// @author kongweiguang
 fn server_metric_row(data: ServerMetricRowData, theme: ThemeTokens) -> impl IntoElement {
     let ServerMetricRowData {
+        icon,
         title,
         current,
         samples,
@@ -1818,19 +1959,24 @@ fn server_metric_row(data: ServerMetricRowData, theme: ThemeTokens) -> impl Into
         .w_full()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap_2()
         .child(
             div()
                 .w_full()
-                .text_size(theme.text_sm)
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(theme.text_xs)
+                .line_height(px(16.))
                 .text_color(theme.muted)
-                .truncate()
-                .child(title),
+                .child(gpui_kit::component::Icon::new(icon).size(px(16.)))
+                .child(div().min_w_0().truncate().child(title)),
         )
         .child(
             div()
                 .w_full()
-                .text_size(px(20.))
+                .text_size(theme.text_heading)
+                .line_height(px(24.))
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .text_color(theme.foreground)
                 .truncate()
@@ -1839,7 +1985,7 @@ fn server_metric_row(data: ServerMetricRowData, theme: ThemeTokens) -> impl Into
         .child(server_history_plot(samples, minimum, maximum, theme))
 }
 
-/// 只在存在有效历史样本时创建绘图元素，空历史显示说明而不将零值冒充曲线。
+/// 少于两个有效历史样本时显示 main 的虚线占位，不把单点或空值伪装成趋势。
 ///
 /// @author kongweiguang
 fn server_history_plot(
@@ -1848,26 +1994,28 @@ fn server_history_plot(
     maximum: f64,
     theme: ThemeTokens,
 ) -> impl IntoElement {
-    let has_value = samples.iter().any(|sample| sample.value.is_some());
+    let has_series = samples
+        .iter()
+        .filter_map(|sample| sample.value)
+        .filter(|value| value.is_finite())
+        .take(2)
+        .count()
+        == 2;
     div()
         .w_full()
         .h(px(SERVER_METRIC_PLOT_HEIGHT_PX))
-        .when(!has_value, |plot| {
-            plot.flex().items_center().child(
-                div()
-                    .text_size(theme.text_xs)
-                    .text_color(theme.subtle)
-                    .child(crate::locale::text("暂无有效样本", "No valid samples")),
-            )
+        .when(!has_series, |plot| {
+            plot.border_b_1()
+                .border_dashed()
+                .border_color(theme.tool_panel_border)
         })
-        .when(has_value, |plot| {
+        .when(has_series, |plot| {
             plot.child(
                 OperationsTimelinePlot {
                     samples,
                     minimum,
                     maximum,
                     line: theme.accent,
-                    grid: theme.border,
                 }
                 .into_element(),
             )
@@ -1887,7 +2035,9 @@ fn server_metric_pair(
         .w_full()
         .flex()
         .flex_row()
-        .when(!last_row, |row| row.border_b_1().border_color(theme.border))
+        .when(!last_row, |row| {
+            row.border_b_1().border_color(theme.tool_panel_border)
+        })
         .child(server_metric_column(left, true, theme))
         .child(server_metric_column(right, false, theme))
 }
@@ -1901,57 +2051,13 @@ fn server_metric_column(
     theme: ThemeTokens,
 ) -> impl IntoElement {
     div()
-        .min_w(px(SERVER_OVERVIEW_METRIC_MIN_COLUMN_WIDTH))
+        .min_w_0()
         .flex_1()
         .p_3()
         .when(divider, |column| {
-            column.border_r_1().border_color(theme.border)
+            column.border_r_1().border_color(theme.tool_panel_border)
         })
         .child(content)
-}
-
-/// GPU 保留标题、突出读数和探针回执的空间，但没有历史数据时不伪造折线。
-///
-/// @author kongweiguang
-fn server_metric_value_row(
-    title: String,
-    current: String,
-    detail: String,
-    theme: ThemeTokens,
-) -> impl IntoElement {
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .w_full()
-                .text_size(theme.text_sm)
-                .text_color(theme.muted)
-                .truncate()
-                .child(title),
-        )
-        .child(
-            div()
-                .w_full()
-                .text_size(px(20.))
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .text_color(theme.foreground)
-                .truncate()
-                .child(current),
-        )
-        .child(
-            div()
-                .w_full()
-                .h(px(SERVER_METRIC_PLOT_HEIGHT_PX))
-                .flex()
-                .items_center()
-                .text_size(theme.text_xs)
-                .text_color(theme.subtle)
-                .truncate()
-                .child(detail),
-        )
 }
 
 /// 百分比仅接受已验证的 0–100 读数；越界采样保持未知，不伪装成有效边界值。
@@ -2023,6 +2129,41 @@ fn sample_age_label(sampled_at_unix_ms: u64) -> String {
     }
 }
 
+/// 页头与 main 一样显示本地绝对采样时刻；超出 Chrono 可表示范围时回退为未知。
+///
+/// @author kongweiguang
+fn server_timestamp_label(sampled_at_unix_ms: Option<u64>) -> String {
+    sampled_at_unix_ms
+        .and_then(|timestamp| i64::try_from(timestamp).ok())
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+/// 离开资源/进程页时恢复 main 的默认筛选与排序；在同页切换不丢弃用户选择。
+///
+/// @author kongweiguang
+fn server_panel_control_state(
+    current: ServerInfoPanel,
+    next: ServerInfoPanel,
+    mut network_filter: ServerNetworkFilter,
+    mut process_sort: ServerProcessSort,
+) -> (ServerNetworkFilter, ServerProcessSort) {
+    if current != next {
+        match current {
+            ServerInfoPanel::Overview => {}
+            ServerInfoPanel::Resources => network_filter = ServerNetworkFilter::Primary,
+            ServerInfoPanel::Processes => process_sort = ServerProcessSort::Cpu,
+        }
+    }
+    (network_filter, process_sort)
+}
+
 /// 页面主标题显示已保存主机名；HostId 只作为缺名回退和辅助技术提示。
 ///
 /// @author kongweiguang
@@ -2052,6 +2193,52 @@ fn server_target_label(target: &ServerInfoTarget, host_name: Option<&str>) -> St
             format!("{host} · {runtime} · {container_id}")
         }
     }
+}
+
+/// 目标副标题优先展示连接端点；缺少端点元数据时回退到已有名称，容器附加其精确范围。
+///
+/// @author kongweiguang
+fn server_target_subtitle(
+    target: &ServerInfoTarget,
+    host_subtitles: &HashMap<HostId, SharedString>,
+    fallback: &str,
+) -> String {
+    match target {
+        ServerInfoTarget::Local => fallback.to_owned(),
+        ServerInfoTarget::Ssh { host_id } => host_subtitles
+            .get(host_id)
+            .map(SharedString::as_ref)
+            .filter(|subtitle| !subtitle.trim().is_empty())
+            .map(server_ssh_endpoint_subtitle)
+            .map(str::to_owned)
+            .unwrap_or_else(|| fallback.to_owned()),
+        ServerInfoTarget::Container {
+            host_id: Some(host_id),
+            runtime,
+            container_id,
+        } => {
+            let Some(host_subtitle) = host_subtitles
+                .get(host_id)
+                .map(SharedString::as_ref)
+                .filter(|subtitle| !subtitle.trim().is_empty())
+            else {
+                return fallback.to_owned();
+            };
+            let runtime = match runtime {
+                ContainerRuntime::Docker => "Docker",
+                ContainerRuntime::Podman => "Podman",
+            };
+            format!("{host_subtitle} · {runtime} · {container_id}")
+        }
+        ServerInfoTarget::Container { host_id: None, .. } => fallback.to_owned(),
+    }
+}
+
+/// SSH 页面只显示端点；协议名由页面标题表达，其他连接类型的摘要不在此处改写。
+///
+/// @author kongweiguang
+fn server_ssh_endpoint_subtitle(subtitle: &str) -> &str {
+    subtitle.strip_suffix(" · SSH").unwrap_or(subtitle)
 }
 
 /// 只从精确目标提取 HostId 用于提示和辅助技术，不参与任何目标选择或操作 binding。
@@ -2108,6 +2295,27 @@ fn server_page_title(target: &ServerInfoTarget) -> SharedString {
         ServerInfoTarget::Local => crate::locale::text("本机服务器", "Local server"),
         ServerInfoTarget::Ssh { .. } => crate::locale::text("远程服务器", "Remote server"),
         ServerInfoTarget::Container { .. } => crate::locale::text("容器服务器", "Container server"),
+    }
+}
+
+/// 只保留主分支的总数/运行数信息；显式接收语言可避免摘要投影依赖全局 locale。
+///
+/// @author kongweiguang
+fn server_process_summary_label(
+    process_count: Option<u64>,
+    running_count: Option<u64>,
+    language: crate::locale::UiLanguage,
+) -> String {
+    match (process_count, running_count) {
+        (Some(total), Some(running)) => match language {
+            crate::locale::UiLanguage::ZhCn => format!("{total} 个 / 运行 {running}"),
+            crate::locale::UiLanguage::EnUs => format!("{total} total / {running} running"),
+        },
+        (Some(total), None) => match language {
+            crate::locale::UiLanguage::ZhCn => format!("{total} 个"),
+            crate::locale::UiLanguage::EnUs => total.to_string(),
+        },
+        (None, _) => "-".to_owned(),
     }
 }
 

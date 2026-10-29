@@ -31,7 +31,11 @@
 
 以上宽高均为逻辑像素内容尺寸，不包含 `4px` 调整槽。窗口可用宽度不足时，运行时按中心区域最小宽度等布局预算临时夹紧；窄窗抽屉夹紧到实际剩余视口，这些夹紧值不写回设置。省略整个表或任一字段都使用当前默认值，不改变现有 `schema_version = 1`。
 
-`dockPanelWidths` 只接受现有 ToolId：`context`、`agentLauncher`、`sftp`、`containers`、`snippets`、`tmux`、`ports`、`system`、`logs`。`containers` 默认紧随 `sftp`，文件和容器面板固定显示在右侧抽屉；两者的存量停靠值仍保留在配置中，但运行时按固定位置投影。此映射保留按 ToolId 的文件兼容形状，运行时不再为每个工具使用独立宽度：旧配置有多个不同宽度时，优先使用当前 Attached 工具对应的旧值；该项缺失时取非 `context` 项中的最大值；`context` 只保留为兼容键，不参与共享宽度选择。读取只建立共享运行时宽度，不自动改写旧配置；用户拖动 Attached Dock 后会把同一内容宽度写到各右侧工具键，拖回默认值则清除覆盖。Center 居中宿主使用自己的布局，不套用 Attached 共享宽度；紧凑工具抽屉复用共享宽度作为首选值并受剩余视口约束。旧工具顺序缺少新增项时由现有设置归一化补齐，同时保留用户已有顺序。未知 ID 是严格解码/校验错误；不得静默丢弃，原文件保留并进入既有只读恢复。配置仍通过文件或应用设置界面维护，不新增 MCP CRUD。
+`toolRail.order` 保存八个当前工具的全局顺序，默认依次为 `agentLauncher`、`sftp`、`snippets`、`tmux`、`ports`、`system`、`logs`、`containers`；`containers` 默认位于该数组末尾。`toolRail.hidden` 保存隐藏项，默认空数组，用户设置中至少要保留一个可见工具。`toolRail.bottom` 保存固定在底部区域的工具，默认只有 `logs`；它必须是 `order` 中现有工具的子集，未列入的工具显示在主要区域。因此默认 rail 主区依次显示 `agentLauncher`、`sftp`、`snippets`、`tmux`、`ports`、`system`、`containers`，`logs` 单独固定在 rail 底部。`toolRail.panelPlacements` 按工具分别配置内容打开位置，八项默认均为 `attached`：`attached` 贴靠右栏，`left` 打开在左侧栏，`bottom` 打开在底部面板，`center` 打开为居中自由浮窗。工具顺序、可见性、底部区域和内容位置彼此独立。
+
+当前八个产品 ToolId 为 `agentLauncher`、`sftp`、`snippets`、`tmux`、`ports`、`system`、`logs` 和 `containers`；新配置不包含已退役的 `context` 入口。旧设置中的 `context` 值可继续读取并在保存时保留，但不会作为自定义工具栏项展示。旧 `order` 缺少当前工具时，读取归一化会按默认顺序补齐缺项并保留用户已有顺序；`panelPlacements` 缺项默认按 `attached` 处理。未知 ID 是严格解码/校验错误；不得静默丢弃，原文件保留并进入既有只读恢复。配置仍通过文件或应用设置界面维护，不新增 MCP CRUD。
+
+`dockPanelWidths` 使用相同 ToolId 映射保存各工具被拖动后的 Attached 宽度覆盖，默认空表；兼容键 `context` 仍可读取，但不参与共享宽度选择。Attached 工具共用 `360` 逻辑像素内容宽度，旧配置有多个不同宽度时优先使用当前 Attached 工具对应的旧值；该项缺失时取非 `context` 项中的最大值。用户拖动 Attached Dock 后会把同一内容宽度写入各右侧工具键，拖回默认值则清除覆盖。Center 居中宿主使用自己的布局，不套用 Attached 共享宽度；紧凑工具抽屉复用共享宽度作为首选值并受剩余视口约束。读取只建立共享运行时宽度，不自动改写旧配置。
 
 `keybindings` 是快捷键行数组，每个 `action` 只能出现一次。`action` 使用应用已提供的动作标识；未知动作会保留在设置中但不会执行，不要用配置新增动作或 MCP 工具。`label` 和 `description` 是界面说明；`scope` 为 `global`、`terminal` 或 `workspace`；`editable` 控制设置页是否允许编辑该行。
 
@@ -69,6 +73,21 @@ hostSidebarCollapsed = false
 hostSidebarWidth = 220
 dockPanelWidths = {}
 bottomPanelHeight = 240
+
+[toolRail]
+order = ["agentLauncher", "sftp", "snippets", "tmux", "ports", "system", "logs", "containers"]
+hidden = []
+bottom = ["logs"]
+
+[toolRail.panelPlacements]
+agentLauncher = "attached"
+sftp = "attached"
+snippets = "attached"
+tmux = "attached"
+ports = "attached"
+system = "attached"
+logs = "attached"
+containers = "attached"
 ```
 
 ## Profile

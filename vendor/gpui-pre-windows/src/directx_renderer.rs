@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 use std::{
     slice,
     sync::{Arc, OnceLock},
@@ -45,6 +47,7 @@ pub(crate) struct DirectXRenderer {
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
+    backdrop_filter_resources: Option<BackdropFilterResources>,
 
     width: u32,
     height: u32,
@@ -86,6 +89,7 @@ struct DirectXResources {
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
+    backdrop_filter_pipeline: PipelineState<BackdropFilter>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
@@ -98,6 +102,23 @@ struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     batch_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+}
+
+#[derive(Clone)]
+struct BackdropFilterTexture {
+    texture: ID3D11Texture2D,
+    render_target_view: Option<ID3D11RenderTargetView>,
+    shader_resource_view: Option<ID3D11ShaderResourceView>,
+}
+
+#[derive(Clone)]
+struct BackdropFilterResources {
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    snapshot: BackdropFilterTexture,
+    horizontal: BackdropFilterTexture,
+    vertical: BackdropFilterTexture,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -151,6 +172,7 @@ impl DirectXRendererDevices {
 }
 
 impl DirectXRenderer {
+    /// Create the Direct3D pipeline; backdrop scratch images remain lazy until a filter is drawn.
     pub(crate) fn new(
         hwnd: HWND,
         directx_devices: &DirectXDevices,
@@ -191,6 +213,7 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             font_info: Self::get_font_info(),
+            backdrop_filter_resources: None,
             width: 1,
             height: 1,
             skip_draws: false,
@@ -260,6 +283,7 @@ impl DirectXRenderer {
         })
     }
 
+    /// Drop device-owned filter images with the rest of the renderer before rebuilding the device.
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
         let disable_direct_composition = self.direct_composition.is_none();
 
@@ -272,6 +296,7 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.backdrop_filter_resources.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -323,6 +348,7 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        self.backdrop_filter_resources = None;
         self.skip_draws = true;
         Ok(())
     }
@@ -346,6 +372,7 @@ impl DirectXRenderer {
     /// [`draw`](Self::draw) (which then presents) and
     /// [`render_to_image`](Self::render_to_image) (which reads the target back
     /// instead), so the two cannot drift.
+    /// Render ordered scene batches; filter batches snapshot the target before replacing their area.
     fn render(
         &mut self,
         scene: &Scene,
@@ -385,11 +412,14 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::BackdropFilters(range) => {
+                    self.draw_backdrop_filters(&scene.backdrop_filters[range])
+                }
             }
             .with_context(|| {
                 format!(
                     "scene too large:\
-                    {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
+                    {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces, {} backdrop filters",
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
@@ -398,6 +428,7 @@ impl DirectXRenderer {
                     scene.subpixel_sprites.len(),
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),
+                    scene.backdrop_filters.len(),
                 )
             })?;
         }
@@ -482,6 +513,7 @@ impl DirectXRenderer {
             .context("Failed to build RgbaImage from staging readback")
     }
 
+    /// Recreate size-dependent resources and release lazy filter images before resizing the swapchain.
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
         let width = new_size.width.0.max(1) as u32;
         let height = new_size.height.0.max(1) as u32;
@@ -495,6 +527,7 @@ impl DirectXRenderer {
         let devices = self.devices.as_ref().context("devices missing")?;
         unsafe { devices.device_context.OMSetRenderTargets(None, None) };
         let resources = self.resources.as_mut().context("resources missing")?;
+        self.backdrop_filter_resources = None;
         resources.render_target.take();
         resources.render_target_view.take();
 
@@ -526,6 +559,7 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// Upload instance data once per frame, including any ordered filters used by the scene.
     fn upload_scene_buffers(&mut self, scene: &Scene) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
 
@@ -577,6 +611,14 @@ impl DirectXRenderer {
             )?;
         }
 
+        if !scene.backdrop_filters.is_empty() {
+            self.pipelines.backdrop_filter_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &scene.backdrop_filters,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -610,6 +652,205 @@ impl DirectXRenderer {
             start as u32,
             len as u32,
         )
+    }
+
+    /// Snapshot the actual target and scope Gaussian passes to the filter's integer support so dimensions and samples stay aligned.
+    fn draw_backdrop_filters(&mut self, filters: &[BackdropFilter]) -> Result<()> {
+        if filters.is_empty() {
+            return Ok(());
+        }
+
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let device = devices.device.clone();
+        let context = devices.device_context.clone();
+        let (render_target, main_view, viewport, target_desc) = {
+            let resources = self.resources.as_ref().context("resources missing")?;
+            let render_target = resources
+                .render_target
+                .as_ref()
+                .context("render target missing")?
+                .clone();
+            let main_view = resources
+                .render_target_view
+                .as_ref()
+                .context("render target view missing")?
+                .clone();
+            let mut target_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { render_target.GetDesc(&mut target_desc) };
+            if target_desc.Width == 0 || target_desc.Height == 0 {
+                return Ok(());
+            }
+            let viewport = resources.viewport;
+            (render_target, main_view, viewport, target_desc)
+        };
+
+        let cache_matches_target = self
+            .backdrop_filter_resources
+            .as_ref()
+            .is_some_and(|cached| {
+                cached.width == target_desc.Width
+                    && cached.height == target_desc.Height
+                    && cached.format == target_desc.Format
+            });
+        if !cache_matches_target {
+            self.backdrop_filter_resources.take();
+            self.backdrop_filter_resources = Some(create_backdrop_filter_resources(
+                &device,
+                target_desc.Width,
+                target_desc.Height,
+                target_desc.Format,
+            )?);
+        }
+
+        let filter_resources = self
+            .backdrop_filter_resources
+            .as_ref()
+            .context("backdrop filter resources missing")?
+            .clone();
+        let batch_params = self
+            .globals
+            .batch_params_buffer
+            .as_ref()
+            .context("batch params buffer missing")?
+            .clone();
+        let sampler = self
+            .globals
+            .sampler
+            .as_ref()
+            .context("sampler missing")?
+            .clone();
+        let viewport_bounds = Bounds::from_corners(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            point(ScaledPixels(viewport.Width), ScaledPixels(viewport.Height)),
+        );
+        let viewport_mask = ContentMask {
+            bounds: viewport_bounds,
+        };
+
+        for filter in filters {
+            let final_bounds = filter.bounds.intersect(&viewport_bounds);
+            if final_bounds.is_empty() {
+                continue;
+            }
+
+            unsafe {
+                context.PSSetShaderResources(0, Some(&[None]));
+                context.VSSetShaderResources(0, Some(&[None]));
+                context.OMSetRenderTargets(None, None);
+                context.CopyResource(&filter_resources.snapshot.texture, &render_target);
+            }
+
+            let mut horizontal = filter.clone();
+            horizontal.mode = 0;
+            horizontal.blur_radius = if filter.blur_radius.is_finite() {
+                filter.blur_radius.max(0.)
+            } else {
+                0.
+            };
+            let support = (horizontal.blur_radius * 3.).ceil();
+            horizontal.bounds = filter.bounds.clone();
+            horizontal.bounds.origin.y.0 -= support;
+            horizontal.bounds.size.height.0 += support * 2.;
+            horizontal.bounds = horizontal.bounds.intersect(&viewport_bounds);
+            horizontal.content_mask = viewport_mask;
+            horizontal.corner_radii = Corners::default();
+            horizontal.saturation = 1.;
+            horizontal.opacity = 1.;
+
+            self.draw_backdrop_filter_pass(
+                &device,
+                &context,
+                &filter_resources.horizontal,
+                &filter_resources.snapshot,
+                viewport,
+                &batch_params,
+                &sampler,
+                &horizontal,
+                true,
+            )?;
+
+            let mut vertical = horizontal.clone();
+            vertical.mode = 1;
+            vertical.bounds = final_bounds;
+            self.draw_backdrop_filter_pass(
+                &device,
+                &context,
+                &filter_resources.vertical,
+                &filter_resources.horizontal,
+                viewport,
+                &batch_params,
+                &sampler,
+                &vertical,
+                true,
+            )?;
+
+            self.draw_backdrop_filter_pass(
+                &device,
+                &context,
+                &BackdropFilterTexture {
+                    texture: render_target.clone(),
+                    render_target_view: Some(main_view.clone()),
+                    shader_resource_view: None,
+                },
+                &filter_resources.vertical,
+                viewport,
+                &batch_params,
+                &sampler,
+                filter,
+                false,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Bind one pass's target and source explicitly to prevent D3D11 read/write aliasing.
+    fn draw_backdrop_filter_pass(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        output: &BackdropFilterTexture,
+        input: &BackdropFilterTexture,
+        viewport: D3D11_VIEWPORT,
+        batch_params: &ID3D11Buffer,
+        sampler: &ID3D11SamplerState,
+        params: &BackdropFilter,
+        clear_target: bool,
+    ) -> Result<()> {
+        let output_view = output
+            .render_target_view
+            .as_ref()
+            .context("backdrop filter render target view missing")?;
+        let input_view = input
+            .shader_resource_view
+            .as_ref()
+            .context("backdrop filter shader resource view missing")?;
+        let render_targets = [Some(output_view.clone())];
+        let textures = [Some(input_view.clone())];
+        let samplers = [Some(sampler.clone())];
+
+        unsafe {
+            context.OMSetRenderTargets(Some(&render_targets), None);
+            context.RSSetViewports(Some(slice::from_ref(&viewport)));
+            if clear_target {
+                context.ClearRenderTargetView(output_view, &[0.; 4]);
+            }
+        }
+
+        self.pipelines.backdrop_filter_pipeline.update_buffer(
+            device,
+            context,
+            slice::from_ref(params),
+        )?;
+        self.pipelines
+            .backdrop_filter_pipeline
+            .draw_range_with_texture(context, &textures, batch_params, &samplers, 0, 1)?;
+
+        unsafe {
+            context.PSSetShaderResources(0, Some(&[None]));
+            context.VSSetShaderResources(0, Some(&[None]));
+        }
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
@@ -940,6 +1181,7 @@ impl DirectXResources {
 }
 
 impl DirectXRenderPipelines {
+    /// Build the Windows shader set, including a dedicated pipeline for ordered backdrop passes.
     pub fn new(device: &ID3D11Device) -> Result<Self> {
         let shadow_pipeline = PipelineState::new(
             device,
@@ -953,6 +1195,13 @@ impl DirectXRenderPipelines {
             "quad_pipeline",
             ShaderModule::Quad,
             64,
+            create_blend_state(device)?,
+        )?;
+        let backdrop_filter_pipeline = PipelineState::new(
+            device,
+            "backdrop_filter_pipeline",
+            ShaderModule::BackdropFilter,
+            4,
             create_blend_state(device)?,
         )?;
         let path_rasterization_pipeline = PipelineState::new(
@@ -1001,6 +1250,7 @@ impl DirectXRenderPipelines {
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
+            backdrop_filter_pipeline,
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,
@@ -1350,6 +1600,61 @@ fn create_swap_chain(
         unsafe { dxgi_factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None) }?;
     unsafe { dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }?;
     Ok(swap_chain)
+}
+
+/// Allocate target-matched scratch views so dimension or format changes cannot reuse incompatible copies.
+fn create_backdrop_filter_resources(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+) -> Result<BackdropFilterResources> {
+    Ok(BackdropFilterResources {
+        width,
+        height,
+        format,
+        snapshot: create_backdrop_filter_texture(device, width, height, format)?,
+        horizontal: create_backdrop_filter_texture(device, width, height, format)?,
+        vertical: create_backdrop_filter_texture(device, width, height, format)?,
+    })
+}
+
+/// Create one target-matched texture for a snapshot or an intermediate blur pass.
+fn create_backdrop_filter_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+) -> Result<BackdropFilterTexture> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width.max(1),
+        Height: height.max(1),
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+    let texture = texture.context("backdrop filter texture creation returned no texture")?;
+
+    let mut render_target_view = None;
+    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut render_target_view))? };
+    let mut shader_resource_view = None;
+    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
+
+    Ok(BackdropFilterTexture {
+        texture,
+        render_target_view,
+        shader_resource_view,
+    })
 }
 
 #[inline]
@@ -1709,6 +2014,7 @@ pub(crate) mod shader_resources {
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderModule {
         Quad,
+        BackdropFilter,
         Shadow,
         Underline,
         PathRasterization,
@@ -1756,11 +2062,16 @@ pub(crate) mod shader_resources {
         }
 
         #[cfg(not(debug_assertions))]
+        /// Use build-script bytecode in release so shader compilation does not require an SDK at runtime.
         fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
             let bytes = match module {
                 ShaderModule::Quad => match target {
                     ShaderTarget::Vertex => QUAD_VERTEX_BYTES,
                     ShaderTarget::Fragment => QUAD_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropFilter => match target {
+                    ShaderTarget::Vertex => BACKDROP_FILTER_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_FILTER_FRAGMENT_BYTES,
                 },
                 ShaderModule::Shadow => match target {
                     ShaderTarget::Vertex => SHADOW_VERTEX_BYTES,
@@ -1870,9 +2181,11 @@ pub(crate) mod shader_resources {
 
     #[cfg(debug_assertions)]
     impl ShaderModule {
+        /// Keep debug compilation entrypoint names aligned with the release build-script module list.
         pub fn as_str(self) -> &'static str {
             match self {
                 ShaderModule::Quad => "quad",
+                ShaderModule::BackdropFilter => "backdrop_filter",
                 ShaderModule::Shadow => "shadow",
                 ShaderModule::Underline => "underline",
                 ShaderModule::PathRasterization => "path_rasterization",

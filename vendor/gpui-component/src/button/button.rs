@@ -10,9 +10,9 @@ use crate::{
     tooltip::{ManagedTooltipExt as _, Tooltip},
 };
 use gpui::{
-    AnyElement, App, Background, ClickEvent, Corners, Edges, ElementId, Hsla, InteractiveElement,
-    Interactivity, IntoElement, MouseButton, ParentElement, Pixels, RenderOnce, Role, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, Window, div,
+    AnyElement, App, Background, ClickEvent, Corners, Edges, ElementId, FocusHandle, Hsla,
+    InteractiveElement, Interactivity, IntoElement, MouseButton, ParentElement, Pixels, RenderOnce,
+    Role, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled, Window, div,
     prelude::FluentBuilder as _, relative, transparent_white,
 };
 
@@ -40,6 +40,7 @@ impl From<Pixels> for ButtonRounded {
 pub struct ButtonCustomVariant {
     color: Hsla,
     foreground: Hsla,
+    hover_foreground: Option<Hsla>,
     shadow: bool,
     hover: Hsla,
     active: Hsla,
@@ -104,6 +105,7 @@ impl ButtonCustomVariant {
         Self {
             color: cx.theme().transparent,
             foreground: cx.theme().foreground,
+            hover_foreground: None,
             hover: cx.theme().transparent,
             active: cx.theme().transparent,
             shadow: false,
@@ -119,6 +121,15 @@ impl ButtonCustomVariant {
     /// Set foreground color, default is theme foreground.
     pub fn foreground(mut self, color: Hsla) -> Self {
         self.foreground = color;
+        self
+    }
+
+    /// Keep hover ink inside the variant so callers do not register a second GPUI hover style.
+    /// An absent override preserves existing custom-button colors.
+    ///
+    /// @author kongweiguang
+    pub fn hover_foreground(mut self, color: Hsla) -> Self {
+        self.hover_foreground = Some(color);
         self
     }
 
@@ -227,6 +238,7 @@ pub struct Button {
     loading: bool,
     loading_icon: Option<Icon>,
     focus_ring_enabled: bool,
+    focus_handle: Option<FocusHandle>,
 
     tab_index: isize,
     tab_stop: bool,
@@ -272,6 +284,7 @@ impl Button {
             tooltip_builder: None,
             on_click: None,
             focus_ring_enabled: true,
+            focus_handle: None,
             on_hover: None,
             loading: false,
             compact: false,
@@ -492,6 +505,15 @@ impl Button {
         self
     }
 
+    /// Allows an owning dialog to focus this exact control before its first render.
+    /// The default remains element-keyed; explicit handles avoid coupling callers to nested element IDs.
+    ///
+    /// @author kongweiguang
+    pub fn focus_handle(mut self, focus_handle: &FocusHandle) -> Self {
+        self.focus_handle = Some(focus_handle.clone());
+        self
+    }
+
     /// Set to show a dropdown caret icon at the end of the button.
     pub fn dropdown_caret(mut self, dropdown_caret: bool) -> Self {
         self.dropdown_caret = dropdown_caret;
@@ -637,10 +659,12 @@ impl RenderOnce for Button {
             FocusLine::Inside(normal_style.fg.opacity(FOCUS_LINE_OPACITY))
         };
 
-        let focus_handle = window
-            .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
-            .read(cx)
-            .clone();
+        let focus_handle = self.focus_handle.clone().unwrap_or_else(|| {
+            window
+                .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone()
+        });
         let is_focused = focus_handle.is_focused(window);
 
         let rounding = match self.rounded {
@@ -1130,6 +1154,9 @@ impl ButtonVariant {
         }
     }
 
+    /// Resolve hover ink with the other variant states; GPUI permits only one hover refinement.
+    ///
+    /// @author kongweiguang
     fn hovered(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
         let bg: Background = match self {
             Self::Default => {
@@ -1199,6 +1226,7 @@ impl ButtonVariant {
             Self::Link => cx.theme().link_hover,
             Self::Text => cx.theme().foreground,
             Self::Ghost => cx.theme().accent_foreground,
+            Self::Custom(colors) => colors.hover_foreground.unwrap_or(colors.foreground),
             _ => self.text_color(outline, cx),
         };
 

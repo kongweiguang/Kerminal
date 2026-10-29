@@ -1,4 +1,4 @@
-//! SFTP 网络预算快照与动态 admission gate；活跃任务持 permit，策略更新只影响后续准入。
+//! SFTP 入队预算快照与共享 admission gate；活跃任务持 permit，更新只影响新任务快照。
 //!
 //! @author kongweiguang
 
@@ -25,7 +25,7 @@ const MAX_PACKET_BYTES: u32 = 256 * 1024;
 const MIN_IDLE_TIMEOUT_SECONDS: u16 = 30;
 const MAX_IDLE_TIMEOUT_SECONDS: u16 = 3_600;
 
-/// 入队时复制的不可变 SFTP 参数；在途任务不受后续配置变更影响。
+/// 入队时复制的不可变 SFTP 参数；包括准入上限，后续配置更新不改写已有任务。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SftpTransferPolicySnapshot {
     global_transfers: usize,
@@ -58,12 +58,12 @@ impl SftpTransferPolicySnapshot {
         })
     }
 
-    /// 返回全局并发上限，用于动态准入而非替换现有信号量。
+    /// 返回该任务入队时捕获的全局并发上限。
     pub const fn global_transfers(self) -> usize {
         self.global_transfers
     }
 
-    /// 返回每台主机并发上限，跨主机传输会同时占用其两端预算。
+    /// 返回该任务入队时捕获的每主机并发上限，跨主机传输会同时占用两端预算。
     pub const fn host_transfers(self) -> usize {
         self.host_transfers
     }
@@ -89,7 +89,7 @@ impl SftpTransferPolicySnapshot {
     }
 }
 
-/// 一个应用共享的可变策略入口；限流状态和配置快照共用短临界区以避免更新竞态。
+/// 一个应用共享的可变策略入口；配置快照可各自冻结，但所有 SFTP 任务共用活动计数。
 #[derive(Clone)]
 pub struct SftpTransferPolicyStore {
     inner: Arc<PolicyStoreInner>,
@@ -135,7 +135,7 @@ impl SftpTransferPolicyStore {
         lock_state(&self.inner).snapshot
     }
 
-    /// 一次性替换全局策略；正在使用的 permit 保留，新任务按更新后的并发门槛准入。
+    /// 一次性替换新任务默认策略；已有任务的快照和 permit 保留，唤醒等待者重查各自门槛。
     pub fn update(
         &self,
         settings: SftpPerformanceSettings,
@@ -152,7 +152,7 @@ impl SftpTransferPolicyStore {
         Ok(snapshot)
     }
 
-    /// 等待全局及所有相关主机预算同时可用，避免分步占用造成跨主机死锁。
+    /// 用当前策略等待全局及主机预算同时可用，保留 store 级动态准入能力。
     pub async fn acquire(
         &self,
         hosts: impl IntoIterator<Item = HostId>,
@@ -162,10 +162,36 @@ impl SftpTransferPolicyStore {
             .await
     }
 
-    /// 两端并发在同一门闩原子准入；主机覆盖仍受全局上限约束，配置变化不会回收在途 permit。
+    /// 用当前策略原子准入所有主机；队列 worker 应使用其入队快照版本。
     pub async fn acquire_with_host_limits(
         &self,
         hosts: impl IntoIterator<Item = (HostId, Option<usize>)>,
+        cancellation: &CancellationToken,
+    ) -> AppResult<SftpTransferPermit> {
+        self.acquire_with_host_limits_inner(hosts, None, cancellation)
+            .await
+    }
+
+    /// 排队任务始终用入队快照判断准入，设置更新只改变之后入队任务的限额。
+    ///
+    /// @author kongweiguang
+    pub(crate) async fn acquire_with_host_limits_at_snapshot(
+        &self,
+        hosts: impl IntoIterator<Item = (HostId, Option<usize>)>,
+        snapshot: SftpTransferPolicySnapshot,
+        cancellation: &CancellationToken,
+    ) -> AppResult<SftpTransferPermit> {
+        self.acquire_with_host_limits_inner(hosts, Some(snapshot), cancellation)
+            .await
+    }
+
+    /// 同步门闩始终使用共享计数；可选快照只改变此 worker 的阈值，避免按配置版本分裂配额。
+    ///
+    /// @author kongweiguang
+    async fn acquire_with_host_limits_inner(
+        &self,
+        hosts: impl IntoIterator<Item = (HostId, Option<usize>)>,
+        admission_snapshot: Option<SftpTransferPolicySnapshot>,
         cancellation: &CancellationToken,
     ) -> AppResult<SftpTransferPermit> {
         let mut limits = std::collections::BTreeMap::new();
@@ -198,12 +224,13 @@ impl SftpTransferPolicyStore {
                 if state.closed {
                     return Err(AppError::cancelled("SFTP 传输策略服务已关闭"));
                 }
-                if state.active_transfers < state.snapshot.global_transfers
+                let snapshot = admission_snapshot.unwrap_or(state.snapshot);
+                if state.active_transfers < snapshot.global_transfers
                     && limits.iter().all(|(host, limit)| {
                         state.active_by_host.get(host).copied().unwrap_or_default()
                             < limit
-                                .unwrap_or(state.snapshot.host_transfers)
-                                .min(state.snapshot.global_transfers)
+                                .unwrap_or(snapshot.host_transfers)
+                                .min(snapshot.global_transfers)
                     })
                 {
                     state.active_transfers += 1;

@@ -25,9 +25,16 @@ impl RootView {
             || self.connection_prompt_modal_open
             || self.snippet_editor_modal_open
             || self.root_confirmation_owner.is_some()
-            || self.split_target_picker.read(cx).is_open()
         {
             return;
+        }
+        if self.split_target_picker.read(cx).is_open() {
+            let return_focus = self
+                .split_target_picker
+                .update(cx, |picker, cx| picker.close(window, cx));
+            if let Some(focus) = return_focus {
+                window.focus(&focus, cx);
+            }
         }
         if self.is_creating_session {
             self.status = Some(crate::locale::text(

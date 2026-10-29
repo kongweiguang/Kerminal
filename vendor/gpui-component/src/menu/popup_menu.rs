@@ -9,10 +9,11 @@ use gpui::{
     Action, Anchor, AnyElement, App, AppContext, Bounds, Context, DismissEvent, Edges, Entity,
     EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
     ParentElement, Pixels, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, WeakEntity, Window, anchored, deferred, div, prelude::FluentBuilder, px, rems,
+    StyleRefinement, Styled, WeakEntity, Window, anchored, deferred, div, prelude::FluentBuilder,
+    px, rems,
 };
 use gpui::{ClickEvent, Half, MouseDownEvent, OwnedMenuItem, Point, Subscription};
-use gpui_base::TestSupportExt as _;
+use gpui_base::{StyledExt as _, TestSupportExt as _};
 
 use std::rc::Rc;
 
@@ -297,6 +298,13 @@ pub struct PopupMenu {
     min_width: Option<Pixels>,
     max_width: Option<Pixels>,
     max_height: Option<Pixels>,
+    surface_style: StyleRefinement,
+    items_style: StyleRefinement,
+    item_style: StyleRefinement,
+    item_checked_style: StyleRefinement,
+    separator_style: StyleRefinement,
+    item_hover_style: Option<StyleRefinement>,
+    render_surface: Option<Rc<dyn Fn(AnyElement, &mut Window, &mut App) -> AnyElement>>,
     bounds: Bounds<Pixels>,
     size: Size,
     check_side: Side,
@@ -331,6 +339,10 @@ pub struct PopupMenu {
 }
 
 impl PopupMenu {
+    /// Create a menu with the kit's standard presentation; optional refinements
+    /// stay empty so existing callers keep the same size and interaction states.
+    ///
+    /// @author kongweiguang
     pub(crate) fn new(cx: &mut App) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
@@ -343,6 +355,13 @@ impl PopupMenu {
             min_width: None,
             max_width: None,
             max_height: None,
+            surface_style: StyleRefinement::default(),
+            items_style: StyleRefinement::default(),
+            item_style: StyleRefinement::default(),
+            item_checked_style: StyleRefinement::default(),
+            separator_style: StyleRefinement::default(),
+            item_hover_style: None,
+            render_surface: None,
             check_side: Side::Left,
             bounds: Bounds::default(),
             scrollable: false,
@@ -442,6 +461,68 @@ impl PopupMenu {
     /// Set max height of the popup menu, default is half of the window height
     pub fn max_h(mut self, height: impl Into<Pixels>) -> Self {
         self.max_height = Some(height.into());
+        self
+    }
+
+    /// Refine the menu surface while leaving sizing and interaction ownership to PopupMenu.
+    ///
+    /// @author kongweiguang
+    pub fn surface_style(mut self, style: StyleRefinement) -> Self {
+        self.surface_style = style;
+        self
+    }
+
+    /// Refine the container that owns the menu items without changing their behavior.
+    ///
+    /// @author kongweiguang
+    pub fn items_style(mut self, style: StyleRefinement) -> Self {
+        self.items_style = style;
+        self
+    }
+
+    /// Refine standard actionable menu rows; custom element and submenu content keep their own styles.
+    ///
+    /// @author kongweiguang
+    pub fn item_style(mut self, style: StyleRefinement) -> Self {
+        self.item_style = style;
+        self
+    }
+
+    /// Style the committed checked value independently of the pointer or keyboard cursor.
+    /// An empty default preserves existing menus and lets selection remain visible after navigation.
+    ///
+    /// @author kongweiguang
+    pub fn item_checked_style(mut self, style: StyleRefinement) -> Self {
+        self.item_checked_style = style;
+        self
+    }
+
+    /// Refine separators independently so their divider treatment can match the owning surface.
+    ///
+    /// @author kongweiguang
+    pub fn separator_style(mut self, style: StyleRefinement) -> Self {
+        self.separator_style = style;
+        self
+    }
+
+    /// Refine both pointer hover and keyboard/current-item highlight after the kit defaults.
+    ///
+    /// @author kongweiguang
+    pub fn item_hover_style(mut self, style: StyleRefinement) -> Self {
+        self.item_hover_style = Some(style);
+        self
+    }
+
+    /// Wrap the complete interactive menu tree; the callback must include the supplied element exactly once.
+    ///
+    /// Keeping the original tree inside the wrapper preserves PopupMenu's focus and event path.
+    ///
+    /// @author kongweiguang
+    pub fn render_surface(
+        mut self,
+        render: impl Fn(AnyElement, &mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        self.render_surface = Some(Rc::new(render));
         self
     }
 
@@ -1207,6 +1288,7 @@ impl PopupMenu {
 
     /// Keep long standard labels inside the space left by menu adornments; only visual text is
     /// truncated, so the full label remains the outer menu item's accessible name.
+    /// Checked styling follows the item value while interactive highlighting follows the navigation cursor.
     ///
     /// @author kongweiguang
     fn render_item(
@@ -1268,6 +1350,9 @@ impl PopupMenu {
 
                 cx.notify();
             }))
+            .when_some(self.item_hover_style.as_ref(), |this, style| {
+                this.interactive_style(style.clone())
+            })
             .when_some(item.a11y_label(), |this, label| this.aria_label(label));
 
         match item {
@@ -1278,7 +1363,8 @@ impl PopupMenu {
                 .mx_neg_1()
                 .border_b(px(2.))
                 .border_color(cx.theme().border)
-                .disabled(true),
+                .disabled(true)
+                .refine_style(&self.separator_style),
             PopupMenuItem::Label(label) => this.disabled(true).cursor_default().child(
                 h_flex()
                     .cursor_default()
@@ -1386,6 +1472,7 @@ impl PopupMenu {
                         })
                         .children(key),
                 )
+                .refine_style(&self.item_style)
             }
             PopupMenuItem::Submenu {
                 icon,
@@ -1447,6 +1534,9 @@ impl PopupMenu {
                     })
                 }),
         }
+        .when(item.is_checked(), |this| {
+            this.refine_style(&self.item_checked_style)
+        })
     }
 }
 
@@ -1466,6 +1556,12 @@ struct RenderOptions {
 }
 
 impl Render for PopupMenu {
+    /// Build the existing interactive menu tree before applying optional surface composition.
+    ///
+    /// The default style refinements are empty, preserving existing layout and behavior.
+    /// The debug selector remains available for geometry-based UI acceptance checks.
+    ///
+    /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_submenu_menu_anchor(window);
 
@@ -1507,9 +1603,10 @@ impl Render for PopupMenu {
             radius: cx.theme().radius.min(px(8.)),
         };
 
-        v_flex()
+        let root = v_flex()
             .id("popup-menu")
             .test_support()
+            .debug_selector(|| "rr-popup-menu".into())
             .role(Role::Menu)
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -1545,11 +1642,19 @@ impl Render for PopupMenu {
                             .filter(|(ix, item)| !(*ix + 1 == items_count && item.is_separator()))
                             .map(|(ix, item)| self.render_item(ix, item, options, window, cx)),
                     )
-                    .on_prepaint(move |bounds, _, cx| view.update(cx, |r, _| r.bounds = bounds)),
+                    .on_prepaint(move |bounds, _, cx| view.update(cx, |r, _| r.bounds = bounds))
+                    .refine_style(&self.items_style),
             )
             .when(self.scrollable, |this| {
                 this.vertical_scrollbar(&self.scroll_handle)
             })
+            .refine_style(&self.surface_style);
+
+        if let Some(render_surface) = &self.render_surface {
+            render_surface(root.into_any_element(), window, cx)
+        } else {
+            root.into_any_element()
+        }
     }
 }
 

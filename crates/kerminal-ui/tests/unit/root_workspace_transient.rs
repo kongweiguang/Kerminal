@@ -79,6 +79,7 @@ fn mixed_snapshot() -> (WorkspaceSessionSnapshot, TabId, TabId, PaneId, PaneId) 
         layout: TerminalLayoutNode::pane(external_tab_pane_id.clone()),
     };
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(external_tab_id.clone()),
         focused_pane_id: Some(external_tab_pane_id.clone()),
         selected_machine_id: Some(external_host_id.as_str().to_owned()),
@@ -209,6 +210,7 @@ fn removing_last_transient_tab_clears_all_active_ids() {
     let tab_id = TabId::new();
     let pane_id = PaneId::new();
     let mut snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: Some(pane_id.clone()),
         selected_machine_id: Some(external_host.as_str().to_owned()),
@@ -244,6 +246,7 @@ fn removing_last_transient_tab_clears_all_active_ids() {
 fn sftp_tab_with_uuid_external_launch_id_is_transient() {
     let id = TabId::new();
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(id.clone()),
         focused_pane_id: None,
         selected_machine_id: None,
@@ -278,6 +281,7 @@ fn unsupported_tab_with_external_host_reference_is_removed() {
     let external_host = HostId::parse("external:unknown-target").expect("valid host ID");
     let tab_id = TabId::new();
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(tab_id.clone()),
         focused_pane_id: None,
         selected_machine_id: Some(external_host.as_str().to_owned()),
@@ -312,6 +316,7 @@ fn unsupported_tab_with_unrelated_external_looking_text_is_retained() {
     let id = TabId::new();
     let note = "external:ordinary-description";
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(id.clone()),
         focused_pane_id: None,
         selected_machine_id: None,

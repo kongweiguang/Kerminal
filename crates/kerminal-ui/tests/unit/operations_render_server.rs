@@ -3,17 +3,23 @@
 //! @author kongweiguang
 
 use super::super::super::ServerInfoRefreshInterval;
-use super::super::super::state::{SectionPhase, SectionState, ServerInfoMetricSample};
-use super::super::{is_fixed_compact_operations_panel, should_suppress_ready_empty_feedback};
+use super::super::super::state::{
+    SectionPhase, SectionState, ServerInfoMetricSample, ServerInfoPanel,
+};
+use super::super::is_fixed_compact_operations_panel;
 use super::SERVER_METRIC_PLOT_HEIGHT_PX;
 use super::{
-    SERVER_OVERVIEW_METRIC_MIN_COLUMN_WIDTH, ServerNetworkFilter, ServerNetworkRole,
-    ServerProcessSort, compare_server_processes, dynamic_rate_max, filtered_network_rates,
-    network_interface_role, operations_target_label, percentage_label, preferred_host_display_name,
-    server_bytes_label, server_device_count_label, server_disk_percent, server_gpu_utilization,
-    server_page_title, server_refresh_disabled, server_root_disk, server_sampling_status,
-    server_target_label, server_uptime_label, should_render_server_feedback,
+    ServerControlLabelMode, ServerNetworkFilter, ServerNetworkRole, ServerProcessSort,
+    compare_server_processes, dynamic_rate_max, filtered_network_rates, network_interface_role,
+    operations_target_label, percentage_label, preferred_host_display_name, server_bytes_label,
+    server_control_label_mode, server_control_typography, server_device_count_label,
+    server_disk_percent, server_gpu_utilization, server_page_title, server_panel_control_state,
+    server_process_summary_label, server_processes_for_display, server_rate_label,
+    server_refresh_disabled, server_root_disk, server_sampling_status,
+    server_ssh_endpoint_subtitle, server_tab_height, server_target_label, server_target_subtitle,
+    server_timestamp_label, server_uptime_label, should_render_server_feedback,
 };
+use crate::locale::UiLanguage;
 use kerminal_domain::identity::HostId;
 use kerminal_domain::operations::{
     ContainerRuntime, DiskSnapshot, NetworkRateSnapshot, ProcessSnapshot, ServerInfoProbeFailure,
@@ -41,34 +47,25 @@ fn server_refresh_control_is_available_and_disabled_for_unsafe_states() {
     assert!(server_refresh_disabled(SectionPhase::Loading, true));
 }
 
-/// 只有紧凑固定面板的成功空列表抑制通用提示，其他阶段继续保留原反馈语义。
+/// 紧凑右栏的 Button 标签改用显式子节点，完整工作区继续使用 Kit 原生标签。
 ///
 /// @author kongweiguang
 #[test]
-fn successful_empty_forward_feedback_is_the_only_suppressed_phase() {
-    assert!(should_suppress_ready_empty_feedback(
-        SectionPhase::Ready,
-        true,
-        true
-    ));
-    assert!(!should_suppress_ready_empty_feedback(
-        SectionPhase::Ready,
-        true,
-        false
-    ));
-    assert!(!should_suppress_ready_empty_feedback(
-        SectionPhase::Ready,
-        false,
-        true
-    ));
-    for phase in [
-        SectionPhase::NotLoaded,
-        SectionPhase::Loading,
-        SectionPhase::Failed,
-        SectionPhase::Cancelled,
-    ] {
-        assert!(!should_suppress_ready_empty_feedback(phase, true, true));
-    }
+fn server_compact_controls_select_explicit_labels_only_in_compact_layout() {
+    assert_eq!(
+        server_control_label_mode(true),
+        ServerControlLabelMode::StyledChild
+    );
+    assert_eq!(
+        server_control_label_mode(false),
+        ServerControlLabelMode::NativeButtonLabel
+    );
+    let typography = server_control_typography();
+    assert_eq!(typography.font_size, gpui_kit::px(16.));
+    assert_eq!(typography.line_height, gpui_kit::px(24.));
+    assert_eq!(typography.font_weight, gpui_kit::FontWeight::NORMAL);
+    assert_eq!(server_tab_height(true), gpui_kit::px(36.));
+    assert_eq!(server_tab_height(false), gpui_kit::px(28.));
 }
 
 /// 页标题随精确目标类型变化，避免本机、SSH 与容器被混为同一泛化页面。
@@ -164,7 +161,7 @@ fn server_sampling_status_respects_manual_and_periodic_modes() {
     let manual = server_sampling_status(SectionPhase::Ready, ServerInfoRefreshInterval::Manual);
     let periodic =
         server_sampling_status(SectionPhase::Ready, ServerInfoRefreshInterval::ThreeSeconds);
-    assert!(["采样完成", "Sampling complete"].contains(&manual.to_string().as_str()));
+    assert!(["自动采集已暂停", "Automatic sampling paused"].contains(&manual.to_string().as_str()));
     assert!(["实时采集中", "Live sampling"].contains(&periodic.to_string().as_str()));
     let failed = server_sampling_status(SectionPhase::Failed, ServerInfoRefreshInterval::Manual);
     assert!(["采样失败", "Sampling failed"].contains(&failed.to_string().as_str()));
@@ -174,6 +171,118 @@ fn server_sampling_status_respects_manual_and_periodic_modes() {
     let waiting =
         server_sampling_status(SectionPhase::NotLoaded, ServerInfoRefreshInterval::Manual);
     assert!(["等待首次采样", "Waiting for first sample"].contains(&waiting.to_string().as_str()));
+}
+
+/// 离开资源/进程页才恢复各自默认值；同页操作不丢弃用户选择。
+///
+/// @author kongweiguang
+#[test]
+fn leaving_server_pages_resets_only_the_departing_panel_control() {
+    let (network_filter, process_sort) = server_panel_control_state(
+        ServerInfoPanel::Resources,
+        ServerInfoPanel::Overview,
+        ServerNetworkFilter::All,
+        ServerProcessSort::Memory,
+    );
+    assert_eq!(network_filter, ServerNetworkFilter::Primary);
+    assert_eq!(process_sort, ServerProcessSort::Memory);
+
+    let (network_filter, process_sort) = server_panel_control_state(
+        ServerInfoPanel::Processes,
+        ServerInfoPanel::Resources,
+        ServerNetworkFilter::Virtual,
+        ServerProcessSort::Memory,
+    );
+    assert_eq!(network_filter, ServerNetworkFilter::Virtual);
+    assert_eq!(process_sort, ServerProcessSort::Cpu);
+
+    let (network_filter, process_sort) = server_panel_control_state(
+        ServerInfoPanel::Resources,
+        ServerInfoPanel::Resources,
+        ServerNetworkFilter::Virtual,
+        ServerProcessSort::Memory,
+    );
+    assert_eq!(network_filter, ServerNetworkFilter::Virtual);
+    assert_eq!(process_sort, ServerProcessSort::Memory);
+}
+
+/// 以显式语言验证主分支计数投影与英文文案，避免读取并发共享的全局 locale。
+///
+/// @author kongweiguang
+#[test]
+fn process_summary_matches_the_main_count_projection() {
+    assert_eq!(
+        server_process_summary_label(None, None, UiLanguage::ZhCn),
+        "-"
+    );
+    assert_eq!(
+        server_process_summary_label(Some(15), None, UiLanguage::ZhCn),
+        "15 个"
+    );
+    assert_eq!(
+        server_process_summary_label(Some(15), None, UiLanguage::EnUs),
+        "15"
+    );
+    assert_eq!(
+        server_process_summary_label(Some(15), Some(14), UiLanguage::ZhCn),
+        "15 个 / 运行 14"
+    );
+    assert_eq!(
+        server_process_summary_label(Some(15), Some(14), UiLanguage::EnUs),
+        "15 total / 14 running"
+    );
+}
+
+/// 时间行显示本地绝对时刻，并将缺失或不可表示的毫秒值安全回退。
+///
+/// @author kongweiguang
+#[test]
+fn server_timestamp_label_is_absolute_and_rejects_out_of_range_values() {
+    assert_eq!(server_timestamp_label(None), "-");
+    assert_eq!(server_timestamp_label(Some(u64::MAX)), "-");
+    let label = server_timestamp_label(Some(1_700_000_000_000));
+    assert_eq!(label.len(), 8);
+    assert_eq!(&label[2..3], ":");
+    assert_eq!(&label[5..6], ":");
+}
+
+/// 远程副标题优先展示端点元数据；容器附加其运行时和精确 ID。
+///
+/// @author kongweiguang
+#[test]
+fn target_subtitle_prefers_endpoint_metadata_and_keeps_safe_fallbacks() {
+    let host_id = HostId::new();
+    let mut subtitles = HashMap::new();
+    subtitles.insert(host_id.clone(), "root@192.0.2.1:22 · SSH".into());
+    let target = ServerInfoTarget::Ssh {
+        host_id: host_id.clone(),
+    };
+    assert_eq!(
+        server_target_subtitle(&target, &subtitles, "Saved host"),
+        "root@192.0.2.1:22"
+    );
+    assert_eq!(
+        server_ssh_endpoint_subtitle("root@192.0.2.1:22 · SFTP"),
+        "root@192.0.2.1:22 · SFTP"
+    );
+    assert_eq!(
+        server_ssh_endpoint_subtitle("root@192.0.2.1:22 · SSH"),
+        "root@192.0.2.1:22"
+    );
+
+    let container = ServerInfoTarget::Container {
+        host_id: Some(host_id),
+        runtime: ContainerRuntime::Docker,
+        container_id: "container-123".to_owned(),
+    };
+    assert_eq!(
+        server_target_subtitle(&container, &subtitles, "Container host"),
+        "root@192.0.2.1:22 · SSH · Docker · container-123"
+    );
+    assert_eq!(
+        server_target_subtitle(&container, &HashMap::new(), "Container host"),
+        "Container host"
+    );
 }
 
 /// 设备数只有采样成功才渲染；失败或未采样不能被误读成零张卡。
@@ -195,20 +304,22 @@ fn device_count_remains_unknown_until_probe_completes() {
     assert!(["未采样", "Not sampled"].contains(&unknown.as_str()));
 }
 
-/// 主接口优先保留全部物理网卡；无物理网卡时回退到第一条非回环接口。
+/// 角色过滤在全接口排名后执行；Primary 保留所有物理网卡，无物理网卡时回退首个非回环接口。
 ///
 /// @author kongweiguang
 #[test]
 fn network_filters_keep_physical_and_virtual_roles_distinct() {
     let rates = [
         network_rate("lo"),
-        network_rate("ens18"),
+        network_rate("eth2"),
         network_rate("docker0"),
+        network_rate("ens18"),
         network_rate("tun0"),
         network_rate("veth123"),
     ];
+    let counters = Vec::new();
 
-    assert_eq!(network_interface_role("ens18"), ServerNetworkRole::Physical);
+    assert_eq!(network_interface_role("eth2"), ServerNetworkRole::Physical);
     assert_eq!(network_interface_role("docker0"), ServerNetworkRole::Bridge);
     assert_eq!(network_interface_role("tun0"), ServerNetworkRole::Tunnel);
     assert_eq!(
@@ -217,18 +328,21 @@ fn network_filters_keep_physical_and_virtual_roles_distinct() {
     );
     assert_eq!(network_interface_role("lo"), ServerNetworkRole::Loopback);
     assert_eq!(
-        filtered_network_rates(&rates, ServerNetworkFilter::Primary)
+        filtered_network_rates(&rates, &counters, ServerNetworkFilter::Primary)
             .iter()
             .map(|rate| rate.name.as_str())
             .collect::<Vec<_>>(),
-        ["ens18"]
+        ["eth2", "ens18"]
     );
     assert_eq!(
-        filtered_network_rates(&rates, ServerNetworkFilter::All).len(),
-        5
+        filtered_network_rates(&rates, &counters, ServerNetworkFilter::All)
+            .iter()
+            .map(|rate| rate.name.as_str())
+            .collect::<Vec<_>>(),
+        ["lo", "eth2", "docker0", "ens18", "tun0", "veth123"]
     );
     assert_eq!(
-        filtered_network_rates(&rates, ServerNetworkFilter::Virtual)
+        filtered_network_rates(&rates, &counters, ServerNetworkFilter::Virtual)
             .iter()
             .map(|rate| rate.name.as_str())
             .collect::<Vec<_>>(),
@@ -237,7 +351,7 @@ fn network_filters_keep_physical_and_virtual_roles_distinct() {
 
     let fallback = [network_rate("lo"), network_rate("docker0")];
     assert_eq!(
-        filtered_network_rates(&fallback, ServerNetworkFilter::Primary)
+        filtered_network_rates(&fallback, &counters, ServerNetworkFilter::Primary)
             .iter()
             .map(|rate| rate.name.as_str())
             .collect::<Vec<_>>(),
@@ -293,6 +407,30 @@ fn root_partition_uses_only_a_real_root_mount_and_valid_capacity() {
     assert_eq!(server_disk_percent(&disk("/", 110, 100, 0)), None);
 }
 
+/// 内存排序仍只重排 main 按 CPU 选出的前五项，不能从候选范围外引入进程。
+///
+/// @author kongweiguang
+#[test]
+fn process_memory_sort_keeps_the_main_cpu_top_five_scope() {
+    let processes = vec![
+        process(1, Some(100.0), Some(1)),
+        process(2, Some(90.0), Some(2)),
+        process(3, Some(80.0), Some(3)),
+        process(4, Some(70.0), Some(4)),
+        process(5, Some(60.0), Some(5)),
+        process(6, Some(50.0), Some(1_000)),
+    ];
+
+    let by_memory = server_processes_for_display(&processes, ServerProcessSort::Memory);
+    assert_eq!(
+        by_memory
+            .iter()
+            .map(|process| process.pid)
+            .collect::<Vec<_>>(),
+        [5, 4, 3, 2, 1]
+    );
+}
+
 /// 只创建本测试所需的速率字段，保持名称分类验证不受流量值影响。
 ///
 /// @author kongweiguang
@@ -331,21 +469,35 @@ fn disk(mount: &str, used_bytes: u64, total_bytes: u64, available_bytes: u64) ->
     }
 }
 
-/// 趋势绘制区至少 40px 保持窄栏可读，且不超过 64px 维持监控卡片的紧凑层级。
+/// 趋势绘制区与 main 的 28px Sparkline 一致，避免六项网格纵向膨胀。
 ///
 /// @author kongweiguang
 #[test]
-fn overview_metric_plot_height_remains_readable() {
-    assert!((40.0..=64.0).contains(&SERVER_METRIC_PLOT_HEIGHT_PX));
+fn overview_metric_plot_height_matches_main() {
+    assert_eq!(SERVER_METRIC_PLOT_HEIGHT_PX, 28.0);
 }
 
-/// 两列最小内容宽度受固定设计约束，GPU 当前值只接受带时间的有效快照读数。
+/// 网络行的空基线采用 main 的采样中占位，容量级别显示一致的 KB 到 TB 标签。
+///
+/// @author kongweiguang
+#[test]
+fn server_rate_labels_match_main_sampling_and_units() {
+    assert_eq!(
+        server_rate_label(None),
+        crate::locale::text("采样中", "Sampling…").to_string()
+    );
+    assert_eq!(server_rate_label(Some(1_536.0)), "1.5 KB/s");
+    assert_eq!(server_rate_label(Some(1_572_864.0)), "1.5 MB/s");
+    assert_eq!(server_rate_label(Some(1_610_612_736.0)), "1.5 GB/s");
+    assert_eq!(server_rate_label(Some(1_649_267_441_664.0)), "1.5 TB/s");
+    assert_eq!(server_rate_label(Some(f64::NAN)), "—");
+}
+
+/// GPU 当前值只接受带时间的有效快照读数。
 ///
 /// @author kongweiguang
 #[test]
 fn overview_metric_grid_and_gpu_projection_keep_real_data_constraints() {
-    assert_eq!(SERVER_OVERVIEW_METRIC_MIN_COLUMN_WIDTH, 136.0);
-
     let current = server_gpu_utilization(
         &ServerInfoProbeStatus::Available,
         Some(1_700_000_000_000),

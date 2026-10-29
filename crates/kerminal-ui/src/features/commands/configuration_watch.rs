@@ -125,10 +125,10 @@ fn snippet_configuration_refresh_action(
 }
 
 impl SnippetDraftSnapshot {
-    /// 区分构造时的空表单与新建时写入的默认排序、Global 绑定，不掩盖任何用户输入。
+    /// 按布局识别构造空表单与新建默认值，避免默认元数据触发切换确认或掩盖真实输入。
     ///
     /// @author kongweiguang
-    fn matches_empty_baseline(&self, is_new: bool) -> bool {
+    fn matches_empty_baseline(&self, is_new: bool, compact_layout: bool) -> bool {
         let context_bindings_match = match (is_new, self.context_bindings.as_slice()) {
             (false, []) => true,
             (true, [(binding, target)]) => {
@@ -138,15 +138,20 @@ impl SnippetDraftSnapshot {
             }
             _ => false,
         };
+        let (category, sort_order, risk) = match (is_new, compact_layout) {
+            (true, true) => ("custom", "10", SnippetRisk::Change),
+            (true, false) => ("", "0", SnippetRisk::Unknown),
+            (false, _) => ("", "", SnippetRisk::Unknown),
+        };
 
         self.title.is_empty()
             && self.command.is_empty()
             && self.description.is_empty()
             && self.tags.is_empty()
-            && self.category.is_empty()
-            && self.sort_order == if is_new { "0" } else { "" }
+            && self.category == category
+            && self.sort_order == sort_order
             && self.scope == SnippetScope::Any
-            && self.risk == SnippetRisk::Unknown
+            && self.risk == risk
             && self.default_action == SnippetDefaultAction::Insert
             && self.variable_count == 0
             && context_bindings_match
@@ -307,7 +312,7 @@ impl CommandsView {
             return !self.snippet_draft_matches_saved(cx);
         }
         let snapshot = self.snippet_draft_snapshot(cx);
-        if snapshot.matches_empty_baseline(self.snippet_is_new) {
+        if snapshot.matches_empty_baseline(self.snippet_is_new, self.compact_layout) {
             return false;
         }
         let Ok(values) = self.collect_snippet_draft_values(cx) else {

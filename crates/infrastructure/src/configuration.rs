@@ -100,6 +100,22 @@ impl ConfigurationStore {
         })
     }
 
+    /// 供离线 CLI 校验指定根；不初始化仓储、不创建根目录或锁文件，也不执行迁移和恢复。
+    ///
+    /// 无写入锁是为了让校验命令能检查尚未启动过的目录且保持文件系统只读；调用方须接受与外部编辑并发时的逐文件读取语义。
+    ///
+    /// @author kongweiguang
+    pub fn validate_root(
+        root: impl AsRef<Path>,
+        scope: ConfigurationValidationScope,
+    ) -> AppResult<ConfigurationValidationReport> {
+        let root = root.as_ref();
+        if root.as_os_str().is_empty() {
+            return Err(AppError::invalid("配置根目录不能为空"));
+        }
+        validate_configuration_root_read_only(root, scope)
+    }
+
     /// 暴露同一个已解析根目录，供 vault、SQLite 与其它文件 adapter 共用路径布局。
     pub fn root(&self) -> &Path {
         &self.inner.root
@@ -189,8 +205,7 @@ impl ConfigurationStore {
 
     /// 普通配置路径统一检查 profile 与 host/group journal，避免任一事务半完成时读写穿透。
     fn ensure_configuration_transactions_absent(&self) -> AppResult<()> {
-        profile_default_transaction::ensure_profile_default_transaction_absent(&self.inner.root)?;
-        host_group_transaction::ensure_host_group_transaction_absent(&self.inner.root)
+        ensure_configuration_transactions_absent_at_root(&self.inner.root)
     }
 
     /// 返回启动时指南更新结果，桌面可以展示提示而不把辅助文档写入恢复门禁。
@@ -232,8 +247,7 @@ impl ConfigurationStore {
             self.inner.storage.lock().map_err(|source| {
                 AppError::infrastructure_with_source("无法锁定配置存储", source)
             })?;
-        self.ensure_configuration_transactions_absent()?;
-        validation::validate_configuration_root(&self.inner.root, scope)
+        validate_configuration_root_read_only(&self.inner.root, scope)
     }
 
     /// 调用方已持有共享存储锁时读取单份原始文档，避免递归取得同一把锁。
@@ -758,6 +772,25 @@ impl ProfileRepository for ConfigurationStore {
                 AppError::infrastructure_with_source("切换默认 profile 任务意外终止", source)
             })?
     }
+}
+
+/// 两种入口共享同一事务门禁和 schema/关联校验；此 helper 自身只读取指定根。
+///
+/// @author kongweiguang
+fn validate_configuration_root_read_only(
+    root: &Path,
+    scope: ConfigurationValidationScope,
+) -> AppResult<ConfigurationValidationReport> {
+    ensure_configuration_transactions_absent_at_root(root)?;
+    validation::validate_configuration_root(root, scope)
+}
+
+/// 以固定路径检查两类未完成配置事务，不创建目录、锁或恢复材料。
+///
+/// @author kongweiguang
+fn ensure_configuration_transactions_absent_at_root(root: &Path) -> AppResult<()> {
+    profile_default_transaction::ensure_profile_default_transaction_absent(root)?;
+    host_group_transaction::ensure_host_group_transaction_absent(root)
 }
 
 #[async_trait::async_trait]

@@ -23,8 +23,9 @@ use kerminal_application::{
 };
 use kerminal_domain::{
     agents::{
-        AgentLauncherKey, AgentProvider, AgentProviderSession, AgentSession, AgentSessionLaunch,
-        AgentSessionScope, AgentSessionStatus, AgentTargetBinding, AgentTargetLiveStatus,
+        AgentLaunchPermissionMode, AgentLauncherKey, AgentProvider, AgentProviderSession,
+        AgentSession, AgentSessionLaunch, AgentSessionScope, AgentSessionStatus,
+        AgentTargetBinding, AgentTargetLiveStatus,
     },
     identity::{AgentSessionId, PaneId, SessionId, TabId},
 };
@@ -257,6 +258,8 @@ struct AgentSessionFile {
     agent_id: AgentProvider,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     launcher_key: Option<AgentLauncherKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permission_mode: Option<AgentLaunchPermissionMode>,
     title: String,
     created_at: String,
     updated_at: String,
@@ -272,7 +275,8 @@ struct AgentSessionFile {
 impl AgentSessionFile {
     /// 反序列化后仍经领域恢复入口校验 schema、状态和 launch spec。
     fn restore(self) -> AppResult<AgentSession> {
-        AgentSession::restore(
+        let permission_mode = self.permission_mode;
+        let session = AgentSession::restore(
             self.schema_version,
             self.agent_session_id,
             self.agent_id,
@@ -287,7 +291,13 @@ impl AgentSessionFile {
             Some(self.scope),
             self.target.map(AgentTargetBinding::from),
         )
-        .map_err(|error| AppError::configuration_corrupt("Agent session").with_source(error))
+        .map_err(|error| AppError::configuration_corrupt("Agent session").with_source(error))?;
+        if permission_mode.is_some_and(|mode| mode != session.permission_mode) {
+            return Err(AppError::configuration_corrupt(
+                "Agent session permission mode does not match launch arguments",
+            ));
+        }
+        Ok(session)
     }
 
     /// 当前格式必须保存归属；拒绝把合法的短暂未绑定领域对象写成不可恢复文件。
@@ -300,6 +310,7 @@ impl AgentSessionFile {
             agent_session_id: session.agent_session_id,
             agent_id: session.agent_id,
             launcher_key: session.launcher_key,
+            permission_mode: Some(session.permission_mode),
             title: session.title,
             created_at: session.created_at,
             updated_at: session.updated_at,

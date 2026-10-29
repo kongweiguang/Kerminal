@@ -189,6 +189,7 @@ fn pending_status(repository: &GitConfigurationSyncRepository) -> ConfigurationS
 }
 
 /// 收集仓库、变更、冲突和本地保护规则；先恢复共享事务并锁定本地快照，不修改工作树或远端。
+/// Git 根目录的 show-prefix 允许仅含行终止符；不能 trim 任意空白而接受真实的子目录前缀。
 fn status_blocking(
     repository: &GitConfigurationSyncRepository,
 ) -> AppResult<ConfigurationSyncStatus> {
@@ -224,7 +225,7 @@ fn status_blocking(
         false,
     )
     .map_err(|error| to_app_error("确认 Git 仓库目录失败", error))?;
-    if !prefix.stdout.is_empty() {
+    if !matches!(prefix.stdout.as_slice(), b"" | b"\n" | b"\r\n") {
         return Err(AppError::conflict("配置目录必须是 Git 仓库根目录"));
     }
 

@@ -41,8 +41,9 @@ use crate::{
         CommandHistoryRepository, CommandSuggestionCandidate, CommandSuggestionProvider,
         CommandSuggestionRequest, CommandsService, SnippetExecutionService, SnippetFillPlan,
         SnippetImportBatchRequest, SnippetImportBatchState, SnippetPreferenceAvailability,
-        SnippetPreferenceRepository, SnippetRepository, SnippetRunHistory, SnippetRunPreparation,
-        SnippetRunResult, SnippetRunUsage, VersionedCommandDefinition, WorkflowRepository,
+        SnippetPreferenceRepository, SnippetRenderResult, SnippetRepository, SnippetRunHistory,
+        SnippetRunPreparation, SnippetRunResult, SnippetRunUsage, VersionedCommandDefinition,
+        WorkflowRepository,
     },
     sessions::{
         CreateSessionRequest, PlainTextSnapshot, PlainTextSnapshotRequest, RenderSnapshot,
@@ -1111,6 +1112,143 @@ async fn fill_writes_exact_ui_paste_without_enter_history_or_usage() {
     );
     assert!(world.history.drafts().is_empty());
     assert!(world.preferences.receipts().is_empty());
+}
+
+/// 普通填入在无 Shell 集成终端仍只发送 Paste；首尾空白按 main 去除，行内 Tab 保留。
+/// @author kongweiguang
+#[tokio::test]
+async fn direct_fill_supports_unobserved_shell_without_enter_or_history() {
+    let world = world(
+        definition("echo ready", SnippetRisk::Inspect),
+        ExecutionMode::Finished,
+        false,
+        false,
+    );
+    {
+        let mut context = world.sessions.context.lock().unwrap();
+        context.shell_dialect = RemoteShellDialect::Unknown;
+        context.availability = TerminalCommandAvailability::Unavailable(
+            TerminalCommandUnavailableReason::ShellIntegrationNotObserved,
+        );
+    }
+    world
+        .service
+        .fill_direct(
+            SnippetRenderResult {
+                command: " \n\tping\t-c 4 127.0.0.1\r\n ".to_owned(),
+                sensitive: false,
+            },
+            world.binding.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let requests = world.sessions.ui_input_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].binding, world.binding);
+    assert_eq!(requests[0].expected_context, None);
+    assert_eq!(
+        requests[0].event,
+        TerminalInputEvent::Paste("ping\t-c 4 127.0.0.1".to_owned())
+    );
+    assert_eq!(world.sessions.call_count(), 0);
+    assert!(world.history.drafts().is_empty());
+    assert!(world.preferences.receipts().is_empty());
+}
+
+/// 无效单行、取消和 owner 变化都在 writer 前闭合，不能因普通填入不探测提示符而放松目标边界。
+/// @author kongweiguang
+#[tokio::test]
+async fn direct_fill_rejects_invalid_cancelled_and_stale_targets_before_write() {
+    let world = world(
+        definition("echo ready", SnippetRisk::Inspect),
+        ExecutionMode::Finished,
+        false,
+        false,
+    );
+    for command in ["", "echo first\necho second", "echo first\recho second"] {
+        assert!(
+            world
+                .service
+                .fill_direct(
+                    SnippetRenderResult {
+                        command: command.to_owned(),
+                        sensitive: false
+                    },
+                    world.binding.clone(),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+    }
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    assert!(
+        world
+            .service
+            .fill_direct(
+                SnippetRenderResult {
+                    command: "echo ready".to_owned(),
+                    sensitive: false
+                },
+                world.binding.clone(),
+                cancellation
+            )
+            .await
+            .is_err()
+    );
+    let mut stale = world.binding.clone();
+    stale.owner = SessionOwner::Ui {
+        tab_id: TabId::parse("other-tab").unwrap(),
+        pane_id: PaneId::parse("other-pane").unwrap(),
+    };
+    assert!(
+        world
+            .service
+            .fill_direct(
+                SnippetRenderResult {
+                    command: "echo ready".to_owned(),
+                    sensitive: false
+                },
+                stale,
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(world.sessions.ui_input_call_count(), 0);
+}
+
+/// writer 回执未知时只报告原结果，不能因为缺少 Shell 集成而自动重放 Paste。
+/// @author kongweiguang
+#[tokio::test]
+async fn direct_fill_unknown_receipt_is_not_replayed() {
+    let world = world(
+        definition("echo ready", SnippetRisk::Inspect),
+        ExecutionMode::Finished,
+        false,
+        false,
+    );
+    world
+        .sessions
+        .set_ui_input_mode(UiInputMode::OutcomeUnknown);
+    let result = world
+        .service
+        .fill_direct(
+            SnippetRenderResult {
+                command: "echo ready".to_owned(),
+                sensitive: false,
+            },
+            world.binding.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        result.unwrap_err().public_code(),
+        PublicErrorCode::OutcomeUnknown
+    );
+    assert_eq!(world.sessions.ui_input_call_count(), 1);
 }
 
 /// Fill 仅接受安全的单行输入；换行和其余控制字符必须在任何 writer 调用前引导用户走 Run。

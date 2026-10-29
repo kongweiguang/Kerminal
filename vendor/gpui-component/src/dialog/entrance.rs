@@ -1,6 +1,8 @@
+// @author kongweiguang
+
 use gpui::{
-    AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, Pixels, Window, point, px,
+    AnyElement, App, Bounds, Corners, Element, ElementId, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, Pixels, Window, point, px,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,17 +32,33 @@ pub(super) struct EntranceSurface {
     child: AnyElement,
     travel: Pixels,
     top_limit: Pixels,
+    backdrop_filter: Option<BackdropFilterSpec>,
     pub(super) progress: f32,
 }
 
+#[derive(Clone)]
+pub(super) struct BackdropFilterSpec {
+    pub(super) radius: Pixels,
+    pub(super) corner_radii: Corners<Pixels>,
+    pub(super) saturation: f32,
+}
+
 impl EntranceSurface {
+    /// Keep filter settings beside the resolved surface so blur uses its final animated bounds.
     pub(super) fn new(child: AnyElement, travel: Pixels, top_limit: Pixels) -> Self {
         Self {
             child,
             travel,
             top_limit,
+            backdrop_filter: None,
             progress: 0.,
         }
+    }
+
+    /// Enable a platform-backed filter without changing layout or hit testing.
+    pub(super) fn backdrop_filter(mut self, filter: BackdropFilterSpec) -> Self {
+        self.backdrop_filter = Some(filter);
+        self
     }
 }
 
@@ -54,7 +72,7 @@ impl IntoElement for EntranceSurface {
 
 impl Element for EntranceSurface {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    type PrepaintState = Pixels;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -74,6 +92,7 @@ impl Element for EntranceSurface {
         (self.child.request_layout(window, cx), ())
     }
 
+    /// Return the exact travel applied to the child so a paint-time filter follows the same motion.
     fn prepaint(
         &mut self,
         _: Option<&GlobalElementId>,
@@ -82,23 +101,33 @@ impl Element for EntranceSurface {
         _: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> Pixels {
         let available = (bounds.top() - self.top_limit).max(px(0.));
         let travel = self.travel.max(px(0.)).min(available);
         let offset = point(px(0.), -travel * (1. - self.progress.clamp(0., 1.)));
         window.with_element_offset(offset, |window| self.child.prepaint(window, cx));
+        offset.y
     }
 
+    /// Paint the optional backdrop effect before the child surface at its animated bounds.
     fn paint(
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut (),
-        _: &mut (),
+        offset_y: &mut Pixels,
         window: &mut Window,
         cx: &mut App,
     ) {
+        if let Some(filter) = self.backdrop_filter.take() {
+            window.paint_backdrop_filter(
+                bounds + point(px(0.), *offset_y),
+                filter.radius,
+                filter.corner_radii,
+                filter.saturation,
+            );
+        }
         self.child.paint(window, cx);
     }
 }

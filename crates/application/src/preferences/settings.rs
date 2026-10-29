@@ -29,7 +29,7 @@ pub use terminal::{
     TerminalSettings,
 };
 /// 设置用例使用的稳定应用投影；它不直接描述任何 TOML 表层级。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SettingsSnapshot {
     pub theme_mode: ThemeMode,
     pub interface_language: InterfaceLanguage,

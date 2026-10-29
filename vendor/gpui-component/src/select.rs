@@ -79,6 +79,7 @@ where
 
 struct SelectOptions {
     style: StyleRefinement,
+    hover_style: Option<StyleRefinement>,
     size: Size,
     icon: Option<Icon>,
     cleanable: bool,
@@ -94,9 +95,13 @@ struct SelectOptions {
 }
 
 impl Default for SelectOptions {
+    /// 默认关闭悬停覆盖，确保新 API 不改变既有 Select 调用方的视觉行为。
+    ///
+    /// @author kongweiguang
     fn default() -> Self {
         Self {
             style: StyleRefinement::default(),
+            hover_style: None,
             size: Size::default(),
             icon: None,
             cleanable: false,
@@ -129,6 +134,7 @@ where
     icon: Option<Icon>,
     title_prefix: Option<SharedString>,
     focus_ring_enabled: bool,
+    hover_style: Option<StyleRefinement>,
 }
 
 /// A Select element.
@@ -148,7 +154,9 @@ where
     D: SearchableListDelegate + 'static,
     <D::Item as SearchableListItem>::Value: PartialEq + Clone,
 {
-    /// Create a new Select state.
+    /// Create a Select state with no hover override so existing callers keep the default theme.
+    ///
+    /// @author kongweiguang
     pub fn new(
         delegate: D,
         selected_index: Option<IndexPath>,
@@ -294,6 +302,7 @@ where
             icon: None,
             title_prefix: None,
             focus_ring_enabled: true,
+            hover_style: None,
         }
     }
 
@@ -509,6 +518,9 @@ where
     D: SearchableListDelegate + 'static,
     <D::Item as SearchableListItem>::Value: PartialEq + Clone,
 {
+    /// 只在启用时把可选 refinement 合并到触发器外框，避免 disabled 控件出现悬停状态。
+    ///
+    /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let searchable = self.searchable;
         let is_focused = self.state.focus_handle.is_focused(window);
@@ -518,6 +530,7 @@ where
         let outline_visible = self.state.open || (is_focused && !self.state.disabled);
 
         let (bg, fg) = input_style(self.state.disabled, cx);
+        let hover_style = self.hover_style.clone().filter(|_| !self.state.disabled);
 
         self.state.list.update(cx, |list, cx| {
             list.set_searchable(searchable, cx);
@@ -551,6 +564,9 @@ where
                         .input_size(self.state.size)
                         .input_text_size(self.state.size)
                         .refine_style(&self.state.style)
+                        .when_some(hover_style, |this, hover_style| {
+                            this.hover(move |style| style.refine_style(&hover_style))
+                        })
                         .when(outline_visible && self.state.appearance, |this| {
                             this.border_1().border_color(cx.theme().ring)
                         })
@@ -720,6 +736,14 @@ where
         self
     }
 
+    /// 设置指针悬停时合并到选择器触发器的样式；默认不覆盖现有外观，禁用时不应用。
+    ///
+    /// @author kongweiguang
+    pub fn hover_style(mut self, style: StyleRefinement) -> Self {
+        self.options.hover_style = Some(style);
+        self
+    }
+
     /// Set a custom closure that renders the empty-state element.
     pub fn empty<E: IntoElement + 'static>(
         mut self,
@@ -807,6 +831,9 @@ where
     D: SearchableListDelegate + 'static,
     <D::Item as SearchableListItem>::Value: PartialEq + Clone,
 {
+    /// 将调用方的 hover refinement 投影给 SelectState，由其根触发器在渲染时应用。
+    ///
+    /// @author kongweiguang
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let disabled = self.options.disabled;
         let accessibility_label = self.options.accessibility_label.clone();
@@ -817,6 +844,7 @@ where
         self.state.update(cx, |this, _| {
             this.state.style = opts.style;
             this.state.size = opts.size;
+            this.hover_style = opts.hover_style;
             this.state.cleanable = opts.cleanable;
             this.state.placeholder = opts.placeholder;
             this.state.search_placeholder = opts.search_placeholder;

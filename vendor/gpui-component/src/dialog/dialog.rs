@@ -1,11 +1,13 @@
-use super::entrance::{DialogEntrance, EntranceSurface};
+// @author kongweiguang
+
+use super::entrance::{BackdropFilterSpec, DialogEntrance, EntranceSurface};
 use crate::root::WindowState;
 use gpui_base::TestSupportExt as _;
 use std::{rc::Rc, sync::LazyLock, time::Duration};
 
 use gpui::{
-    Action, Anchor, Animation, AnimationExt as _, AnyElement, App, BoxShadow, ClickEvent, Edges,
-    FocusHandle, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, RenderOnce,
+    Action, Anchor, Animation, AnimationExt as _, AnyElement, App, BoxShadow, ClickEvent, Corners,
+    Edges, FocusHandle, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, RenderOnce,
     SharedString, StyleRefinement, Styled, Window, WindowControlArea, anchored, div, hsla, point,
     prelude::FluentBuilder, px,
 };
@@ -205,9 +207,12 @@ pub(crate) struct DialogProps {
     width: Pixels,
     max_width: Option<Pixels>,
     margin_top: Option<Pixels>,
+    centered: bool,
     close_button: bool,
 
     overlay: bool,
+    backdrop_blur: Option<Pixels>,
+    surface_backdrop_filter: Option<(Pixels, f32)>,
     overlay_closable: bool,
     pub(crate) overlay_visible: bool,
     keyboard: bool,
@@ -215,12 +220,16 @@ pub(crate) struct DialogProps {
 }
 
 impl Default for DialogProps {
+    /// Keep existing dialogs on their legacy top-offset placement unless centering is requested.
     fn default() -> Self {
         Self {
             margin_top: None,
+            centered: false,
             width: px(448.),
             max_width: None,
             overlay: true,
+            backdrop_blur: None,
+            surface_backdrop_filter: None,
             keyboard: true,
             overlay_visible: false,
             close_button: true,
@@ -475,6 +484,12 @@ impl Dialog {
         self
     }
 
+    /// Center the dialog in the content viewport; this takes precedence over `margin_top`.
+    pub fn centered(mut self) -> Self {
+        self.props.centered = true;
+        self
+    }
+
     /// Sets the width of the dialog, defaults to 448px.
     ///
     /// The dialog is never wider than the viewport minus a margin on each side.
@@ -502,6 +517,18 @@ impl Dialog {
     /// Set the overlay of the dialog, defaults to `true`.
     pub fn overlay(mut self, overlay: bool) -> Self {
         self.props.overlay = overlay;
+        self
+    }
+
+    /// Blur the content behind the dialog; disabled by default and a no-op off Windows.
+    pub fn backdrop_blur(mut self, radius: impl Into<Pixels>) -> Self {
+        self.props.backdrop_blur = Some(radius.into());
+        self
+    }
+
+    /// Filter the dialog surface; saturation `1.` preserves source color, `0.` is grayscale.
+    pub fn surface_backdrop_filter(mut self, radius: impl Into<Pixels>, saturation: f32) -> Self {
+        self.props.surface_backdrop_filter = Some((radius.into(), saturation));
         self
     }
 
@@ -591,12 +618,15 @@ impl Dialog {
 }
 
 impl RenderOnce for Dialog {
+    /// Resolve surfaces against the padded viewport and keep paint effects aligned to measured bounds.
     fn render(mut self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         if let Some(trigger) = self.trigger.take() {
             return self.render_trigger(trigger, window, cx);
         }
 
         let layer_ix = self.layer_ix;
+        let backdrop_blur = self.props.backdrop_blur;
+        let surface_backdrop_filter = self.props.surface_backdrop_filter;
         let selection_scope = self.selection_scope;
         let on_close = self.button_props.close_handler();
         let on_ok = self.button_props.ok_handler();
@@ -615,7 +645,12 @@ impl RenderOnce for Dialog {
         // margin so that the preferred offset does not waste usable height.
         let margin = cx.theme().spacing_tokens().lg;
         let layer_offset = px(layer_ix as f32 * 16.);
+        let centered = self.props.centered;
         let y = self.props.margin_top.unwrap_or(view_size.height / 10.) + layer_offset;
+        let center_position = point(
+            window_paddings.left + view_size.width / 2.,
+            window_paddings.top + view_size.height / 2. + layer_offset,
+        );
         let entrance = self.props.entrance;
         let motion = cx.theme().motion_tokens();
         let animated = entrance != DialogEntrance::None
@@ -686,15 +721,31 @@ impl RenderOnce for Dialog {
                             .close_on_backdrop_press(self.props.overlay_closable)
                             .dismiss_below_y(TITLE_BAR_HEIGHT)
                             .when(self.props.overlay, |this| {
-                                this.backdrop(
-                                    div()
-                                        .absolute()
-                                        .size_full()
-                                        .window_control_area(WindowControlArea::Drag)
-                                        .when(self.props.overlay_visible, |overlay| {
-                                            overlay.bg(overlay_color(true, cx))
-                                        }),
-                                )
+                                let backdrop = div()
+                                    .absolute()
+                                    .size_full()
+                                    .window_control_area(WindowControlArea::Drag)
+                                    .when(self.props.overlay_visible, |overlay| {
+                                        overlay.bg(overlay_color(true, cx))
+                                    });
+                                if let Some(radius) = backdrop_blur {
+                                    this.backdrop(
+                                        EntranceSurface::new(
+                                            backdrop.into_any_element(),
+                                            px(0.),
+                                            px(0.),
+                                        )
+                                        .backdrop_filter(
+                                            BackdropFilterSpec {
+                                                radius,
+                                                corner_radii: Corners::default(),
+                                                saturation: 1.,
+                                            },
+                                        ),
+                                    )
+                                } else {
+                                    this.backdrop(backdrop)
+                                }
                             })
                             .on_ok(move |event, window, cx| on_ok(event, window, cx))
                             .on_cancel(move |event, window, cx| on_cancel(event, window, cx))
@@ -707,17 +758,27 @@ impl RenderOnce for Dialog {
                                 }
                             })
                             .popup(
-                                gpui_base::Positioner::corner(
-                                    Anchor::TopLeft,
-                                    point(window_paddings.left + x, window_paddings.top + y),
-                                )
+                                (if centered {
+                                    gpui_base::Positioner::center(center_position)
+                                } else {
+                                    gpui_base::Positioner::corner(
+                                        Anchor::TopLeft,
+                                        point(window_paddings.left + x, window_paddings.top + y),
+                                    )
+                                })
                                 .margin(margin)
-                                .child(
+                                .child({
+                                    let surface_corner_radius = cx.theme().radius_lg;
+                                    let surface_background = if surface_backdrop_filter.is_some() {
+                                        cx.theme().tokens.background.opacity(0.82)
+                                    } else {
+                                        *cx.theme().tokens.background.clone()
+                                    };
                                     v_flex()
                                         .id(layer_ix)
                                         .test_support()
                                         .debug_selector(move || format!("dialog-{layer_ix}"))
-                                        .bg(cx.theme().tokens.background)
+                                        .bg(surface_background)
                                         .border_1()
                                         .border_color(cx.theme().border)
                                         .rounded(cx.theme().radius_lg)
@@ -820,28 +881,65 @@ impl RenderOnce for Dialog {
                                             }
                                         })
                                         .map(|surface| {
-                                            if animated && entrance == DialogEntrance::FadeSlide {
-                                                EntranceSurface::new(
+                                            let fade_slide =
+                                                animated && entrance == DialogEntrance::FadeSlide;
+                                            let centered_slide = centered
+                                                && animated
+                                                && entrance == DialogEntrance::SlideDown;
+                                            if fade_slide
+                                                || centered_slide
+                                                || surface_backdrop_filter.is_some()
+                                            {
+                                                let mut entrance_surface = EntranceSurface::new(
                                                     surface,
-                                                    travel,
-                                                    window_paddings.top + margin,
-                                                )
-                                                .with_animation(
-                                                    "dialog-settle",
-                                                    animation.clone(),
-                                                    |mut surface, delta| {
-                                                        surface.progress = delta;
-                                                        surface
+                                                    if centered_slide {
+                                                        view_size.height
+                                                    } else if fade_slide {
+                                                        travel
+                                                    } else {
+                                                        px(0.)
                                                     },
-                                                )
-                                                .into_any_element()
+                                                    window_paddings.top + margin,
+                                                );
+                                                if let Some((radius, saturation)) =
+                                                    surface_backdrop_filter
+                                                {
+                                                    entrance_surface = entrance_surface
+                                                        .backdrop_filter(BackdropFilterSpec {
+                                                            radius,
+                                                            corner_radii: Corners {
+                                                                top_left: surface_corner_radius,
+                                                                top_right: surface_corner_radius,
+                                                                bottom_right: surface_corner_radius,
+                                                                bottom_left: surface_corner_radius,
+                                                            },
+                                                            saturation,
+                                                        });
+                                                }
+                                                if fade_slide || centered_slide {
+                                                    entrance_surface
+                                                        .with_animation(
+                                                            "dialog-settle",
+                                                            animation.clone(),
+                                                            |mut surface, delta| {
+                                                                surface.progress = delta;
+                                                                surface
+                                                            },
+                                                        )
+                                                        .into_any_element()
+                                                } else {
+                                                    entrance_surface.into_any_element()
+                                                }
                                             } else {
                                                 surface
                                             }
-                                        }),
-                                )
+                                        })
+                                })
                                 .map(|positioner| {
-                                    if animated && entrance == DialogEntrance::SlideDown {
+                                    if animated
+                                        && entrance == DialogEntrance::SlideDown
+                                        && !centered
+                                    {
                                         positioner
                                             .with_animation(
                                                 "slide-down",
@@ -936,6 +1034,31 @@ pub(crate) mod tests {
         assert_eq!(bounds.size.width, px(448.));
         assert_eq!(bounds.origin.x, px(276.));
         assert_eq!(bounds.origin.y, px(80.));
+    }
+
+    /// Centered dialogs use measured surface bounds and ignore the legacy top offset.
+    #[gpui::test]
+    fn centered_dialog_uses_the_content_viewport_center(cx: &mut TestAppContext) {
+        let viewport = size(px(1000.), px(800.));
+        let cx = window(cx, viewport);
+        open(cx, |dialog, _, _| {
+            dialog
+                .title("Centered")
+                .child("body")
+                .centered()
+                .margin_top(px(300.))
+                .entrance(DialogEntrance::None)
+        });
+
+        let bounds = surface(cx, 0);
+        assert_eq!(
+            bounds.origin.x + bounds.size.width / 2.,
+            viewport.width / 2.
+        );
+        assert_eq!(
+            bounds.origin.y + bounds.size.height / 2.,
+            viewport.height / 2.
+        );
     }
 
     /// A dialog wider and taller than the window must shrink to the viewport

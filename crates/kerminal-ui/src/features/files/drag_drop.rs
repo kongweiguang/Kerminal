@@ -14,8 +14,8 @@ use crate::{locale, theme::ThemeTokens};
 mod external;
 
 use super::{
-    BatchEnqueueLabels, FilesPane, TransferEnqueueItem, child_endpoint, endpoint_name,
-    parent_endpoint, valid_item_name,
+    BatchEnqueueLabels, FilesPane, TransferBatchPlan, TransferEnqueueItem, child_endpoint,
+    endpoint_name, parent_endpoint, valid_item_name,
 };
 
 /// 拖动载荷冻结来源面板、目录代次与选中根项，避免鼠标移动期间改用新目录。
@@ -397,6 +397,17 @@ impl FilesPane {
             cx.notify();
             return;
         }
+        let Some(target) = self.capture_transfer_target_snapshot(destination_side) else {
+            self.status = Some(
+                locale::text(
+                    "目标目录尚未读取完成，请刷新后重新拖放。",
+                    "The destination folder is not ready. Refresh it and drop again.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
 
         let InternalDropPlan { items, issues } =
             plan_internal_drop(&drag, &destination_directory, self.queue.conflict_policy);
@@ -420,13 +431,16 @@ impl FilesPane {
         }
 
         self.enqueue_transfer_batch(
-            items,
-            drag.entries().len() + drag.included_descendants,
-            drag.included_descendants,
-            issues,
-            BatchEnqueueLabels {
-                action_zh: "拖放复制任务已入队",
-                action_en: "Dropped copy tasks queued",
+            TransferBatchPlan {
+                items,
+                total: drag.entries().len() + drag.included_descendants,
+                included_by_selected_directories: drag.included_descendants,
+                issues,
+                labels: BatchEnqueueLabels {
+                    action_zh: "拖放复制任务已入队",
+                    action_en: "Dropped copy tasks queued",
+                },
+                target,
             },
             cx,
         );

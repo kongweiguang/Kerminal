@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 use gpui::{
     AnyElement, App, ClickEvent, IntoElement, ParentElement, Pixels, RenderOnce, SharedString,
     StyleRefinement, Styled, Window, prelude::FluentBuilder as _,
@@ -227,6 +229,18 @@ impl AlertDialog {
     /// Sets the variant of the Cancel button. Default is `ButtonVariant::default()`.
     pub fn cancel_variant(mut self, cancel_variant: ButtonVariant) -> Self {
         self.base.button_props.cancel_variant = Some(cancel_variant);
+        self
+    }
+
+    /// Blur the content behind the alert dialog; disabled by default and a no-op off Windows.
+    pub fn backdrop_blur(mut self, radius: impl Into<Pixels>) -> Self {
+        self.base = self.base.backdrop_blur(radius);
+        self
+    }
+
+    /// Filter the alert surface; saturation `1.` preserves source color, `0.` is grayscale.
+    pub fn surface_backdrop_filter(mut self, radius: impl Into<Pixels>, saturation: f32) -> Self {
+        self.base = self.base.surface_backdrop_filter(radius, saturation);
         self
     }
 

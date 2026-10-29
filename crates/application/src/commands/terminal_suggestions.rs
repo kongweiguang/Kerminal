@@ -8,6 +8,7 @@ use kerminal_domain::{
         SuggestionProviderKind, SuggestionQueryMode,
     },
     connections::RemoteShellDialect,
+    preferences::ConfigurationMode,
     sessions::{SessionLifecycle, SessionOwner, SessionTarget},
 };
 use tokio_util::sync::CancellationToken;
@@ -68,7 +69,7 @@ impl CommandsService {
         }
     }
 
-    /// 在 provider 前后复核同一 UI owner 与可信上下文，迟到结果统一返回空候选。
+    /// 使用最新 UI 设置预览，并在 provider 前后复核 UI owner 与可信上下文，迟到结果统一返回空候选。
     async fn query_terminal_suggestions(
         &self,
         query: TerminalSuggestionQuery,
@@ -92,12 +93,17 @@ impl CommandsService {
             .preferences
             .as_ref()
             .ok_or_else(|| AppError::capability_not_supported("终端建议未装配设置读取端口"))?;
-        let settings = preferences
-            .load_settings()
-            .await?
-            .settings
-            .terminal
-            .inline_suggestion;
+        let settings = match self.suggestion_settings_preview.current() {
+            Some(settings) => settings,
+            None => {
+                preferences
+                    .load_settings()
+                    .await?
+                    .settings
+                    .terminal
+                    .inline_suggestion
+            }
+        };
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("终端建议查询已取消"));
         }
@@ -129,7 +135,14 @@ impl CommandsService {
             return Ok(empty());
         }
 
-        let providers = selected_providers(&settings, &query, &session.target);
+        let runtime_available = preferences.recovery_state().mode == ConfigurationMode::ReadWrite;
+        let providers = selected_providers(
+            &settings,
+            query.mode,
+            &query.input,
+            matches!(&session.target, SessionTarget::Ssh(_)),
+            runtime_available,
+        );
         if providers.is_empty() {
             return Ok(empty());
         }
@@ -234,11 +247,13 @@ fn presentation_enabled(
     )
 }
 
-/// 只按明确配置选择来源；远端探测需同时满足 SSH、安全刷新和每个 provider 开关。
+/// 只按当前查询配置选择来源；远端探测还需满足 SSH、安全刷新和可写恢复态。
 fn selected_providers(
     settings: &TerminalInlineSuggestionSettings,
-    query: &TerminalSuggestionQuery,
-    target: &SessionTarget,
+    mode: SuggestionQueryMode,
+    input: &str,
+    is_ssh: bool,
+    runtime_available: bool,
 ) -> Vec<SuggestionProviderKind> {
     let mut providers = Vec::with_capacity(6);
     if settings.providers.history {
@@ -247,12 +262,13 @@ fn selected_providers(
     if settings.providers.spec {
         providers.push(SuggestionProviderKind::Spec);
     }
-    if query.mode == SuggestionQueryMode::Menu && query.input.starts_with("::") {
+    if mode == SuggestionQueryMode::Menu && input.starts_with("::") {
         providers.push(SuggestionProviderKind::Snippet);
     }
-    let remote_enabled = settings.remote_probe_enabled
+    let remote_enabled = runtime_available
+        && settings.remote_probe_enabled
         && settings.remote_refresh == TerminalCommandSuggestionRemoteRefresh::Safe;
-    if remote_enabled && matches!(target, SessionTarget::Ssh(_)) {
+    if remote_enabled && is_ssh {
         if settings.providers.remote_path {
             providers.push(SuggestionProviderKind::RemotePath);
         }
@@ -277,3 +293,7 @@ fn suggestion_shell(target: &SessionTarget, dialect: RemoteShellDialect) -> Opti
         RemoteShellDialect::Posix | RemoteShellDialect::Unknown => None,
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/terminal_suggestion_policy.rs"]
+mod tests;

@@ -113,6 +113,25 @@ fn direct_render_sends_unknown_shell_and_unvalidated_values() {
     assert!(!rendered.sensitive);
 }
 
+/// 内置目录使用带空白占位符；复用 main 的名称归一化，同时确保替换值不会被第二次解释。
+///
+/// @author kongweiguang
+#[test]
+fn direct_render_accepts_spaced_placeholders_without_recursive_expansion() {
+    let mut definition = snippet(SnippetVariableRenderStrategy::ShellArg);
+    definition.command = "echo {{ path }} {{path}} {{\tpath\t}} {{ missing }}".to_owned();
+    definition.variables[0].sensitive = true;
+    let values = BTreeMap::from([("path".to_owned(), "127.0.0.1 {{missing}}".to_owned())]);
+
+    let rendered = direct_snippet_command(&definition, &values);
+
+    assert_eq!(
+        rendered.command,
+        "echo 127.0.0.1 {{missing}} 127.0.0.1 {{missing}} 127.0.0.1 {{missing}} {{ missing }}"
+    );
+    assert!(rendered.sensitive);
+}
+
 /// 目录项平台与 shell 声明只用于展示；目录敏感标记仍阻止历史记录。
 ///
 /// @author kongweiguang

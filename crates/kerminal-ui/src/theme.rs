@@ -166,11 +166,22 @@ pub(crate) struct ThemeTokens {
     pub background: Hsla,
     pub sidebar: Hsla,
     pub panel: Hsla,
+    pub tool_panel_surface: Hsla,
+    pub tool_panel_floating_surface: Hsla,
+    pub tool_panel_border: Hsla,
     pub secondary: Hsla,
     pub foreground: Hsla,
     pub muted: Hsla,
+    /// 表单字段名称与说明文字分开投影；右栏采用 main 的 Zinc 标签色，不改变中央工作台。
+    pub field_label: Hsla,
     pub subtle: Hsla,
     pub accent: Hsla,
+    pub tunnel_action: Hsla,
+    pub tunnel_action_hover: Hsla,
+    /// main 的监控健康点使用固定语义色阶，独立于通用文本成功/警告色保证浅深主题一致。
+    pub monitor_live: Hsla,
+    pub monitor_paused: Hsla,
+    pub monitor_error: Hsla,
     pub selected: Hsla,
     pub selected_foreground: Hsla,
     pub hover: Hsla,
@@ -179,8 +190,21 @@ pub(crate) struct ThemeTokens {
     pub error: Hsla,
     pub success: Hsla,
     pub warning: Hsla,
+    pub scrim: Hsla,
+    /// 与 main ModalShell 对齐，避免将抽屉遮罩与决策弹框的层级混用。
+    pub dialog_scrim: Hsla,
+    /// 对应 main 的 ModalShell 与 floating-surface，颜色和滤镜参数集中管理。
+    pub floating_surface: Hsla,
+    pub modal_blur_radius: Pixels,
+    pub floating_blur_radius: Pixels,
+    pub floating_saturation: f32,
+    pub tool_drawer_scrim: Hsla,
+    pub tool_drawer_blur_radius: Pixels,
     pub radius_sm: Pixels,
     pub radius: Pixels,
+    pub control_radius: Pixels,
+    pub radius_panel: Pixels,
+    pub radius_dialog: Pixels,
     pub text_xs: Pixels,
     pub text_sm: Pixels,
     pub text_body: Pixels,
@@ -191,6 +215,241 @@ pub(crate) struct ThemeTokens {
 }
 
 impl ThemeTokens {
+    /// 工作台沿用 main 的导航、终端与透明交互色；仅投影视图副本，不改设置和右栏的独立色阶。
+    /// 材质沿用已计算的原始 alpha，重复投影不会累乘透明度，也不会改变壁纸和窗口透明度偏好。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn for_workbench(mut self) -> Self {
+        self = self.for_tool_panel();
+        self.background = rgb(if self.dark { 0x101012 } else { 0xf5f5f7 }).into();
+        self.sidebar = rgb(if self.dark { 0x111113 } else { 0xffffff }).into();
+        self.panel = rgb(if self.dark { 0x1c1c1e } else { 0xffffff }).into();
+        self.terminal_background = rgb(if self.dark { 0x18181a } else { 0xf8f8fb }).into();
+        self.border = self.tool_panel_border;
+        self.hover = self.surface_hover();
+        self.selected = self.surface_selected();
+        self.selected_foreground = self.settings_choice_foreground(true);
+        self.accent = rgb(0x0a84ff).into();
+        self.materials.root_base = self.background.opacity(self.materials.root_base.a);
+        self.materials.chrome = self.sidebar.opacity(self.materials.chrome.a);
+        self.materials.workspace = self.sidebar.opacity(self.materials.workspace.a);
+        self.materials.shell = self.materials.workspace;
+        self.materials.panel = self.panel.opacity(self.materials.panel.a);
+        self.materials.terminal_header = self
+            .terminal_background
+            .opacity(self.materials.terminal_header.a);
+        self
+    }
+
+    /// main 的当前连接指示使用固定品牌蓝，独立于正文链接和用户强调色的投影。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn active_connection_indicator(self) -> Hsla {
+        rgb(0x0a84ff).into()
+    }
+
+    /// main 的已连接状态点在浅深主题保持同一绿色，不能复用面向文字对比度的 success。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn ready_connection_indicator(self) -> Hsla {
+        rgb(0x32d74b).into()
+    }
+
+    /// 右栏沿用 main 的中性 Zinc 文本与控件色阶；只投影呈现令牌，不改变中央工作台或全局 Kit 主题。
+    /// 局部副本保留材质与明暗来源，避免多个同时挂载的工具互相修改全局主题。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn for_tool_panel(mut self) -> Self {
+        self.foreground = rgb(if self.dark { 0xf4f4f5 } else { 0x18181b }).into();
+        self.muted = rgb(if self.dark { 0xa1a1aa } else { 0x71717a }).into();
+        self.field_label = rgb(if self.dark { 0xe4e4e7 } else { 0x3f3f46 }).into();
+        self.subtle = rgb(if self.dark { 0x71717a } else { 0xa1a1aa }).into();
+        self.secondary = rgb(if self.dark { 0x27272a } else { 0xf4f4f5 }).into();
+        self.hover = self.secondary;
+        self.border = rgb(if self.dark { 0x303033 } else { 0xe4e4e7 }).into();
+        self.accent = rgb(0x3b82f6).into();
+        self
+    }
+
+    /// 设置使用 main 的表单色阶；仅投影本地令牌，避免影响同时挂载的工作台和右栏。
+    /// 标题图标与字段标签分别使用 Sky 和次级文字，不能沿用工具栏动作蓝与正文白。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn for_settings(self) -> Self {
+        let mut settings = self.for_tool_panel();
+        settings.field_label = settings.muted;
+        settings.selected = settings.surface_selected();
+        settings.selected_foreground = settings.settings_choice_foreground(true);
+        settings.hover = settings.surface_hover();
+        settings.accent = rgb(if self.dark { 0x7dd3fc } else { 0x0ea5e9 }).into();
+        settings.border = if self.dark {
+            rgb(0xffffff).alpha(0.10).into()
+        } else {
+            rgb(0x000000).alpha(0.10).into()
+        };
+        settings
+    }
+
+    /// main 禁止合成字重；Windows 的 Segoe/YaHei 在 400 与 600/700 间缺少 500，CSS 会取 400。
+    /// DirectWrite 的 500 匹配会偏向粗体，因此仅设置表单使用平台映射，终端字重设置保持真实值。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn settings_medium_font_weight(self) -> gpui_kit::FontWeight {
+        if cfg!(target_os = "windows") {
+            gpui_kit::FontWeight::NORMAL
+        } else {
+            gpui_kit::FontWeight::MEDIUM
+        }
+    }
+
+    /// 保存提示按 main 的 Emerald 文字色独立于背景色，避免把强调绿直接用作正文。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn settings_saved_foreground(self) -> Hsla {
+        rgb(if self.dark { 0xd1fae5 } else { 0x047857 }).into()
+    }
+
+    /// Agent 在 main 复用终端材质而不是普通工具面板；保留同一透明系数才能在壁纸和主题切换时一致。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn agent_surface(self) -> Hsla {
+        let surface: Hsla = rgb(if self.dark { 0x18181a } else { 0xf8f8fb }).into();
+        surface.opacity(self.materials.terminal_body_opacity)
+    }
+
+    /// 设置选择卡使用 main 的 Zinc/Sky 状态文字，不借用动作蓝色改变选中层级。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn settings_choice_foreground(self, selected: bool) -> Hsla {
+        rgb(match (self.dark, selected) {
+            (true, true) => 0xe0f2fe,
+            (false, true) => 0x0369a1,
+            (true, false) => 0xd4d4d8,
+            (false, false) => 0x52525b,
+        })
+        .into()
+    }
+
+    /// main 的系统色盘使用独立的不透明中性表面，避免继承工作台透明材料而改变色彩判断。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn settings_native_color_picker_surface(self) -> Hsla {
+        rgb(if self.dark { 0x3b3b3b } else { 0xffffff }).into()
+    }
+
+    /// 对应 main 的 muted surface，作为卡片内衬叠在父表面上，避免浅深主题使用不透明近似色。
+    pub(crate) fn muted_surface(self) -> Hsla {
+        if self.dark {
+            rgb(0xffffff).alpha(0.06).into()
+        } else {
+            rgb(0x000000).alpha(0.035).into()
+        }
+    }
+
+    /// main 的字段叠在所在表面上，保留透明度才能兼容玻璃弹框与普通面板两种背景。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn field_surface(self) -> Hsla {
+        if self.dark {
+            rgb(0x000000).alpha(0.22).into()
+        } else {
+            rgb(0xffffff).alpha(0.78).into()
+        }
+    }
+
+    /// 字段悬停使用 main 的独立表面角色，不能用列表选中底色代替交互反馈。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn field_hover_surface(self) -> Hsla {
+        if self.dark {
+            rgb(0xffffff).alpha(0.09).into()
+        } else {
+            rgb(0xffffff).alpha(0.94).into()
+        }
+    }
+
+    /// 输入与强调边框比卡片分隔线略强，明暗模式均按 main 的前景透明度混合。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn strong_border(self) -> Hsla {
+        if self.dark {
+            rgb(0xffffff).alpha(0.14).into()
+        } else {
+            rgb(0x000000).alpha(0.12).into()
+        }
+    }
+
+    /// main 的表面选中态是透明青蓝色，不能复用工作台不透明的列表选中配色。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn surface_selected(self) -> Hsla {
+        if self.dark {
+            rgb(0x64d2ff).alpha(0.14).into()
+        } else {
+            rgb(0x0a84ff).alpha(0.12).into()
+        }
+    }
+
+    /// 玻璃和弱背景上的悬停按 main 的透明前景叠加，不以不透明侧栏底色覆盖原表面。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn surface_hover(self) -> Hsla {
+        if self.dark {
+            rgb(0xffffff).alpha(0.08).into()
+        } else {
+            rgb(0x000000).alpha(0.045).into()
+        }
+    }
+
+    /// 右键菜单悬停复用 main 的专用中性叠色，不让菜单命令误呈现为强调操作。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn context_menu_hover_surface(self) -> Hsla {
+        if self.dark {
+            rgb(0xffffff).alpha(0.09).into()
+        } else {
+            rgb(0x000000).alpha(0.055).into()
+        }
+    }
+
+    /// 右键菜单的玻璃背景按 main 独立使用 86% 不透明度，不与普通下拉的浮层透明度混用。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn context_menu_surface(self) -> Hsla {
+        rgb(if self.dark { 0x1c1c1e } else { 0xffffff })
+            .alpha(0.86)
+            .into()
+    }
+
+    /// main 的上传菜单在深色中使用更亮的 sky-300，局部令牌避免借用隧道操作色造成单主题漂移。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn file_upload_menu_icon(self) -> Hsla {
+        rgb(if self.dark { 0x7dd3fc } else { 0x0ea5e9 }).into()
+    }
+
+    /// main inspector 的值与 chip 使用比正文更低的中性色阶；只投影局部副本以保留其它页面配色。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn for_inspector(mut self) -> Self {
+        self.foreground = rgb(if self.dark { 0xe4e4e7 } else { 0x27272a }).into();
+        self.subtle = rgb(if self.dark { 0xd4d4d8 } else { 0x52525b }).into();
+        self.secondary = if self.dark {
+            rgb(0xffffff).alpha(0.10).into()
+        } else {
+            rgb(0x000000).alpha(0.05).into()
+        };
+        self
+    }
+
+    /// main 的弱背景按主题调节前景透明度；将明暗判断留在令牌层，避免视图读取主题内部状态。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn subtle_background(self) -> Hsla {
+        self.foreground
+            .opacity(if self.dark { 0.045 } else { 0.025 })
+    }
+
     /// 从 Kit 当前明暗模式投影同一份产品色板，窗口参数仅为兼容既有调用约定。
     ///
     /// @author kongweiguang
@@ -229,6 +488,30 @@ impl ThemeTokens {
         }
     }
 
+    /// Rail 的选中底色按 main 的透明表面混合；局部 variant 保留 Kit 的焦点和按压行为，避免改变其它页面的选择色。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn rail_button_variant(
+        self,
+        selected: bool,
+        cx: &gpui_kit::App,
+    ) -> gpui_kit::component::button::ButtonCustomVariant {
+        let (surface, foreground): (Hsla, Hsla) = if self.dark {
+            (rgb(0x64d2ff).alpha(0.14).into(), rgb(0xe0f2fe).into())
+        } else {
+            (rgb(0x0a84ff).alpha(0.12).into(), rgb(0x0369a1).into())
+        };
+        gpui_kit::component::button::ButtonCustomVariant::new(cx)
+            .color(if selected {
+                surface
+            } else {
+                self.panel.alpha(0.)
+            })
+            .foreground(if selected { foreground } else { self.muted })
+            .hover(if selected { surface } else { self.hover })
+            .active(surface)
+    }
+
     /// 主题和材料独立计算，使多窗口 appearance 与重复设置保存均得到确定结果；正文与常规辅助信息统一为 14px，12px 仅留给次级标签。
     ///
     /// @author kongweiguang
@@ -238,11 +521,20 @@ impl ThemeTokens {
                 background: rgb(0x101012).into(),
                 sidebar: rgb(0x151518).into(),
                 panel: rgb(0x1e1e20).into(),
+                tool_panel_surface: rgb(0x111113).into(),
+                tool_panel_floating_surface: rgb(0x1c1c1e).alpha(0.82).into(),
+                tool_panel_border: rgb(0xffffff).alpha(0.10).into(),
                 secondary: rgb(0x27272a).into(),
                 foreground: rgb(0xf4f4f5).into(),
                 muted: rgb(0xa1a1aa).into(),
+                field_label: rgb(0xa1a1aa).into(),
                 subtle: rgb(0x8b8b95).into(),
                 accent: rgb(0x60a5fa).into(),
+                tunnel_action: rgb(0x0ea5e9).into(),
+                tunnel_action_hover: rgb(0x38bdf8).into(),
+                monitor_live: rgb(0x10b981).into(),
+                monitor_paused: rgb(0xf59e0b).into(),
+                monitor_error: rgb(0xef4444).into(),
                 selected: rgb(0x1e3a5f).into(),
                 selected_foreground: rgb(0xdbeafe).into(),
                 hover: rgb(0x303034).into(),
@@ -252,8 +544,19 @@ impl ThemeTokens {
                 error: rgb(0xf87171).into(),
                 success: rgb(0x34d399).into(),
                 warning: rgb(0xfbbf24).into(),
+                scrim: gpui_kit::hsla(0.0, 0.0, 0.0, 0.40),
+                dialog_scrim: rgb(0x000000).alpha(0.48).into(),
+                floating_surface: rgb(0x1c1c1e).alpha(0.82).into(),
+                modal_blur_radius: px(12.),
+                floating_blur_radius: px(28.),
+                floating_saturation: 1.8,
+                tool_drawer_scrim: rgb(0x000000).alpha(0.40).into(),
+                tool_drawer_blur_radius: px(2.),
                 radius_sm: px(6.),
                 radius: px(12.),
+                control_radius: px(10.),
+                radius_panel: px(16.),
+                radius_dialog: px(20.),
                 text_xs: px(12.),
                 text_sm: px(14.),
                 text_body: px(14.),
@@ -279,11 +582,20 @@ impl ThemeTokens {
                 background: rgb(0xf7f8fa).into(),
                 sidebar: rgb(0xeff1f4).into(),
                 panel: rgb(0xffffff).into(),
+                tool_panel_surface: rgb(0xffffff).into(),
+                tool_panel_floating_surface: rgb(0xffffff).alpha(0.82).into(),
+                tool_panel_border: rgb(0x000000).alpha(0.08).into(),
                 secondary: rgb(0xf1f5f9).into(),
                 foreground: rgb(0x1f2937).into(),
                 muted: rgb(0x64748b).into(),
+                field_label: rgb(0x64748b).into(),
                 subtle: rgb(0x6b7280).into(),
                 accent: rgb(0x0066cc).into(),
+                tunnel_action: rgb(0x0ea5e9).into(),
+                tunnel_action_hover: rgb(0x38bdf8).into(),
+                monitor_live: rgb(0x10b981).into(),
+                monitor_paused: rgb(0xf59e0b).into(),
+                monitor_error: rgb(0xef4444).into(),
                 selected: rgb(0xdbeafe).into(),
                 selected_foreground: rgb(0x1e40af).into(),
                 hover: rgb(0xe8edf3).into(),
@@ -293,8 +605,19 @@ impl ThemeTokens {
                 error: rgb(0xb42318).into(),
                 success: rgb(0x15803d).into(),
                 warning: rgb(0xb45309).into(),
+                scrim: gpui_kit::hsla(240.0, 0.10, 0.0392, 0.18),
+                dialog_scrim: rgb(0x09090b).alpha(0.30).into(),
+                floating_surface: rgb(0xffffff).alpha(0.82).into(),
+                modal_blur_radius: px(12.),
+                floating_blur_radius: px(28.),
+                floating_saturation: 1.8,
+                tool_drawer_scrim: rgb(0x09090b).alpha(0.18).into(),
+                tool_drawer_blur_radius: px(2.),
                 radius_sm: px(6.),
                 radius: px(12.),
+                control_radius: px(10.),
+                radius_panel: px(16.),
+                radius_dialog: px(20.),
                 text_xs: px(12.),
                 text_sm: px(14.),
                 text_body: px(14.),
@@ -345,30 +668,18 @@ pub(crate) fn apply_theme_mode<T: 'static>(
     });
 }
 
-/// Kit 主按钮、选中与焦点沿用旧版蓝色强调语义，并为浅深模式分别选择足够清晰的填色和文字对比；Windows 普通界面延续旧 CSS 的 Segoe UI 优先级，终端字体仍独立控制。
+/// 主按钮按 main 的 app-accent 在浅深主题均使用同一蓝色与白字；hover 对应 brightness-105，避免把悬停误画为更深的另一种操作。
+/// Windows 普通界面延续旧 CSS 的 Segoe UI 优先级，终端字体仍独立控制。
 /// 保持 Kit 的 16px rem 基准，使 text_sm/text_xs 解析为 14px/12px，避免 14px 基准将常用控件缩到 12.25px/10.5px；应用正文与终端字号仍由各自令牌和配置控制。
 ///
 /// @author kongweiguang
 fn apply_kit_palette(theme: &mut KitTheme, tokens: ThemeTokens) {
     let dark = theme.mode.is_dark();
-    let (primary, primary_hover, primary_active, primary_foreground, sidebar_primary_foreground) =
-        if dark {
-            (
-                rgb(0x2563eb).into(),
-                rgb(0x1d4ed8).into(),
-                rgb(0x1e40af).into(),
-                rgb(0xf1f5f9).into(),
-                rgb(0xffffff).into(),
-            )
-        } else {
-            (
-                rgb(0x0066cc).into(),
-                rgb(0x005bb7).into(),
-                rgb(0x004c99).into(),
-                rgb(0xf8fafc).into(),
-                rgb(0xffffff).into(),
-            )
-        };
+    let primary = rgb(0x0a84ff).into();
+    let primary_hover = rgb(0x0b8bff).into();
+    let primary_active = primary_hover;
+    let primary_foreground = rgb(0xffffff).into();
+    let sidebar_primary_foreground = primary_foreground;
     let colors = &mut theme.colors;
     colors.background = tokens.background;
     colors.foreground = tokens.foreground;
@@ -436,7 +747,9 @@ fn apply_kit_palette(theme: &mut KitTheme, tokens: ThemeTokens) {
     colors.muted = tokens.secondary;
     colors.skeleton = tokens.secondary;
     colors.switch = tokens.secondary;
-    colors.switch_thumb = tokens.foreground;
+    // main 的开关拇指在浅深主题中均为白色，与文本前景无关。
+    colors.switch_thumb = rgb(0xffffff).into();
+    colors.overlay = tokens.dialog_scrim;
     colors.scrollbar = tokens.background;
     colors.scrollbar_thumb = tokens.subtle;
     colors.scrollbar_thumb_hover = tokens.muted;

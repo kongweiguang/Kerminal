@@ -19,6 +19,11 @@ path = "src/bin/kerminal-migrate.rs"
 
 [features]
 acceptance-metrics = ["kerminal-ui/acceptance-metrics"]
+right-rail-acceptance = [
+    "kerminal-ui/right-rail-acceptance",
+    "dep:gpui_pre_windows",
+    "gpui_pre_windows/test-support",
+]
 
 [dependencies]
 gpui_kit.workspace = true
@@ -49,7 +54,8 @@ tempfile.workspace = true
 embed-resource = "=3.0.12"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_UI_Shell"] }
+gpui_pre_windows = { package = "gpui-pre-windows", path = "../../vendor/gpui-pre-windows", optional = true }
+windows-sys = { workspace = true, features = ["Win32_UI_Shell", "Win32_System_StationsAndDesktops", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }

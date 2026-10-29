@@ -3,13 +3,59 @@
 //! @author kongweiguang
 
 use super::{
-    ForwardFormTransition, OperationsFormError, container_command, forward_config,
-    next_forward_form_open,
+    ForwardBindScope, ForwardFormDrafts, ForwardFormTransition, OperationsFormError,
+    container_command, default_forward_name, forward_config, next_forward_form_open,
 };
 use kerminal_domain::{
     identity::HostId,
     operations::{ForwardKind, ProxyApplyScope, ProxyProtocol, RemoteAccessScope},
 };
+
+/// Add 表单的端口、端点和监听范围与 main 四种 SSH 转发场景保持一致。
+///
+/// @author kongweiguang
+#[test]
+fn forward_add_defaults_match_main_scenarios() {
+    let drafts = ForwardFormDrafts::main_defaults();
+
+    assert_eq!(drafts.local_bind_host, "127.0.0.1");
+    assert_eq!(drafts.local_custom_bind_host, "127.0.0.1");
+    assert_eq!(drafts.local_bind_scope, ForwardBindScope::Loopback);
+    assert_eq!(drafts.local_listen_port, "15432");
+    assert_eq!(drafts.host_target_host, "127.0.0.1");
+    assert_eq!(drafts.host_target_port, "5432");
+
+    assert_eq!(drafts.remote_bind_host, "127.0.0.1");
+    assert_eq!(drafts.remote_custom_bind_host, "127.0.0.1");
+    assert_eq!(drafts.remote_bind_scope, ForwardBindScope::Loopback);
+    assert_eq!(drafts.remote_listen_port, "18080");
+    assert_eq!(drafts.local_target_host, "127.0.0.1");
+    assert_eq!(drafts.local_target_port, "3000");
+    assert_eq!(drafts.local_socks_port, "1080");
+}
+
+/// 名称留空时提交采用 main native 的主机名和对应 OpenSSH 转发 flag。
+///
+/// @author kongweiguang
+#[test]
+fn unnamed_forward_uses_main_host_and_kind_default() {
+    assert_eq!(
+        default_forward_name("Build host", ForwardKind::Local),
+        "Build host -L"
+    );
+    assert_eq!(
+        default_forward_name("Build host", ForwardKind::Remote),
+        "Build host -R"
+    );
+    assert_eq!(
+        default_forward_name("Build host", ForwardKind::Dynamic),
+        "Build host -D"
+    );
+    assert_eq!(
+        default_forward_name("Build host", ForwardKind::RemoteDynamic),
+        "Build host -R"
+    );
+}
 
 /// 参数行保持单独 argv 项，空格不能被 UI 再解释成 shell 分隔符。
 #[test]

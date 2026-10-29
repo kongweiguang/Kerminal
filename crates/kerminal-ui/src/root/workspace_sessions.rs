@@ -956,9 +956,9 @@ fn ready_workspace_pane_matches_snapshot(
         )
 }
 
-/// 记录目标解析或 Root open 同步拒绝；运行态仍保留原 pane 以便用户重试。
+/// 记录目标解析或 Root open 同步拒绝；已发布 pane 保留重试，未发布的新建 Tab 则精确回滚 reservation。
 impl RootView {
-    /// 当前失败仍更新 pane/controller 账目；停止后不刷新会触发普通任务的子视图，也不覆盖宿主原错。
+    /// 当前失败仍更新 pane/controller 账目；未发布创建清理后保留错误提示，停止期间不覆盖宿主原错。
     ///
     /// @author kongweiguang
     fn mark_workspace_pane_restore_failed(
@@ -985,7 +985,19 @@ impl RootView {
             cx.notify();
         } else {
             self.status = Some(visible_message);
-            self.finish_workspace_restore(pane_id, generation, cx);
+            let tab_id = self
+                .workspace_runtime
+                .pane(pane_id)
+                .map(|pane| pane.tab_id.clone());
+            let rolled_back = tab_id.as_ref().is_some_and(|tab_id| {
+                self.rollback_unpublished_terminal_creation(tab_id, pane_id, generation)
+            });
+            if rolled_back {
+                self.refresh_workspace_views(cx);
+                cx.notify();
+            } else {
+                self.finish_workspace_restore(pane_id, generation, cx);
+            }
         }
     }
 }

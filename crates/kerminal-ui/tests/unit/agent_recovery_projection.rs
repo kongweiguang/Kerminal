@@ -5,8 +5,10 @@
 use kerminal_application::agents::AgentResumeCapability;
 use kerminal_application::{PublicErrorCode, agents::AgentResumeRecovery};
 use kerminal_domain::{
-    agents::{AgentProvider, AgentSession, AgentSessionLaunch},
-    identity::SessionId,
+    agents::{
+        AgentProvider, AgentSession, AgentSessionLaunch, AgentSessionScope, AgentTargetBinding,
+    },
+    identity::{SessionId, TabId},
     sessions::{
         LocalSessionTarget, SessionExitStatus, SessionInfo, SessionOwner, SessionTarget,
         TerminalSize,
@@ -58,6 +60,97 @@ fn recovery_view(lifecycle: SessionLifecycle) -> AgentSessionView {
         }),
         resume_recovery: None,
     }
+}
+
+/// 明确继续只按会话归属刷新目标，并为候选持久化分配高于已保存绑定的新代次。
+///
+/// @author kongweiguang
+#[test]
+fn explicit_running_continue_refreshes_only_an_eligible_scope_target() {
+    let current_tab = TabId::new();
+    let other_tab = TabId::new();
+    let current_scope = AgentSessionScope::Tab {
+        tab_id: current_tab.clone(),
+    };
+    let mut candidate = AgentTargetBinding::unbound(0);
+    candidate.tab_id = Some(current_tab.clone());
+
+    let mut global = recovery_view(SessionLifecycle::Running);
+    global.session.scope = Some(AgentSessionScope::Global);
+    global.session.target = Some(AgentTargetBinding::unbound(7));
+    let refreshed = super::super::actions::preferred_target_binding_for_explicit_continue(
+        &global,
+        &current_scope,
+        Some(&candidate),
+    )
+    .expect("global sessions may refresh from an explicit continue");
+    assert_eq!(refreshed.generation, 8);
+    assert_eq!(refreshed.tab_id, Some(current_tab.clone()));
+
+    let mut same_tab = recovery_view(SessionLifecycle::Running);
+    same_tab.session.scope = Some(current_scope.clone());
+    assert!(
+        super::super::actions::preferred_target_binding_for_explicit_continue(
+            &same_tab,
+            &current_scope,
+            Some(&candidate),
+        )
+        .is_some()
+    );
+
+    let mut other_scope = recovery_view(SessionLifecycle::Running);
+    other_scope.session.scope = Some(AgentSessionScope::Tab { tab_id: other_tab });
+    assert!(
+        super::super::actions::preferred_target_binding_for_explicit_continue(
+            &other_scope,
+            &current_scope,
+            Some(&candidate),
+        )
+        .is_none()
+    );
+
+    let mut foreign_candidate = candidate;
+    foreign_candidate.tab_id = Some(TabId::new());
+    assert!(
+        super::super::actions::preferred_target_binding_for_explicit_continue(
+            &same_tab,
+            &current_scope,
+            Some(&foreign_candidate),
+        )
+        .is_none()
+    );
+}
+
+/// 改名提交采用浏览器一致的 UTF-16 上限，空白无效，Enter 是唯一键盘提交事件。
+///
+/// @author kongweiguang
+#[test]
+fn rename_input_matches_main_submission_and_length_rules() {
+    assert!(!super::super::can_save_agent_session_title(" \t "));
+    assert!(super::super::can_save_agent_session_title(&"a".repeat(120)));
+    assert!(!super::super::can_save_agent_session_title(
+        &"a".repeat(121)
+    ));
+
+    let emoji_title = "😀".repeat(61);
+    let bounded = super::super::truncate_agent_session_title(&emoji_title);
+    assert_eq!(bounded, "😀".repeat(60));
+    assert!(super::super::can_save_agent_session_title(&bounded));
+
+    use gpui_kit::component::input::InputEvent;
+    assert!(super::super::should_submit_agent_rename(
+        &InputEvent::PressEnter {
+            secondary: false,
+            shift: false,
+        }
+    ));
+    assert!(!super::super::should_submit_agent_rename(
+        &InputEvent::Change
+    ));
+    assert!(!super::super::should_submit_agent_rename(
+        &InputEvent::Focus
+    ));
+    assert!(!super::super::should_submit_agent_rename(&InputEvent::Blur));
 }
 
 /// 以真实保存的启动标签构造 Custom 快照，验证展示只依赖已有投影而不查询当前设置。

@@ -551,18 +551,41 @@ impl RootView {
                 }
 
                 let Some(open_result) = completion.take() else {
+                    if root.workspace_runtime.mark_restore_failed(&pane_id).is_err() {
+                        root.status = Some(crate::locale::text(
+                            "终端启动结果缺失，工作区 pane 状态已变化。",
+                            "The terminal startup result is missing and the workspace pane changed state.",
+                        ));
+                    }
+                    if let Some(controller) = root.workspace_controller.as_mut()
+                        && controller
+                            .restore_status(&WorkspaceRestoreItemId::Pane(pane_id.clone()))
+                            .is_some()
+                        && let Err(error) = controller.record_restore_result(
+                            WorkspaceRestoreItemId::Pane(pane_id.clone()),
+                            Err(WorkspaceRestoreFailure::ResourceFailure),
+                        )
+                    {
+                        root.status = Some(error.public_message().to_owned().into());
+                    }
+                    let rolled_back = root.rollback_unpublished_terminal_creation(
+                        &tab_id,
+                        &pane_id,
+                        generation,
+                    );
+                    if !rolled_back {
+                        root.finish_pending_terminal_creation(&tab_id, &pane_id, generation);
+                    }
                     root.status = Some(crate::locale::text(
-                        "终端启动结果缺失，保留 pane 供重试。",
-                        "The terminal startup result is missing; the pane was kept for retry.",
+                        "终端启动结果缺失；本次连接未确认完成，请重新发起连接。",
+                        "The terminal startup result is missing. This connection was not confirmed; start it again.",
                     ));
                     root.refresh_workspace_views(cx);
                     return true;
                 };
                 match open_result {
                     WorkspaceSessionOpenResult::Ready(prepared) => {
-                        if is_new_tab_creation {
-                            root.is_creating_session = false;
-                        }
+                        root.finish_pending_terminal_creation(&tab_id, &pane_id, generation);
                         let session_id = prepared.session.session_id.clone();
                         let target = prepared.session.target.clone();
                         let session_size = prepared.session.size;
@@ -803,10 +826,8 @@ impl RootView {
                         message,
                         cleanup_pending,
                     } => {
-                        if is_new_tab_creation {
-                            root.is_creating_session = false;
-                        }
                         if let Some((session, snapshot)) = cleanup_pending {
+                            root.finish_pending_terminal_creation(&tab_id, &pane_id, generation);
                             let safe = crate::locale::text(
                                 "终端初始化失败，资源关闭也未完成；请重试关闭。",
                                 "Terminal initialization failed and cleanup is still pending; retry closing it.",
@@ -911,6 +932,18 @@ impl RootView {
                                 )
                             {
                                 root.status = Some(error.public_message().to_owned().into());
+                            }
+                            let rolled_back = root.rollback_unpublished_terminal_creation(
+                                &tab_id,
+                                &pane_id,
+                                generation,
+                            );
+                            if !rolled_back {
+                                root.finish_pending_terminal_creation(
+                                    &tab_id,
+                                    &pane_id,
+                                    generation,
+                                );
                             }
                             root.refresh_workspace_views(cx);
                         }
@@ -1329,6 +1362,11 @@ impl RootView {
     pub(super) fn refresh_workspace_views(&mut self, cx: &mut Context<RootView>) {
         self.reconcile_workspace_search_visibility(cx);
         let Some(controller) = self.workspace_controller.as_ref() else {
+            if let Some(navigation) = self.host_navigation.clone() {
+                navigation.update(cx, |navigation, cx| {
+                    navigation.set_pinned_container_projection(Vec::new(), None, cx)
+                });
+            }
             let mut tab_projections = Vec::new();
             if self.sftp_workbench_tab_open {
                 append_shared_sftp_workbench_projection(
@@ -1348,6 +1386,15 @@ impl RootView {
         };
 
         let snapshot = controller.snapshot().clone();
+        if let Some(navigation) = self.host_navigation.clone() {
+            navigation.update(cx, |navigation, cx| {
+                navigation.set_pinned_container_projection(
+                    snapshot.pinned_containers.clone(),
+                    snapshot.selected_machine_id.clone(),
+                    cx,
+                )
+            });
+        }
         let pending_split = self.pending_workspace_split_preview(cx);
         let mut tab_projections = controller.tab_projections();
         if self.sftp_workbench_tab_open {
@@ -1719,7 +1766,7 @@ impl RootView {
         .detach();
     }
 
-    /// 恢复完成只清理对应的启动提示，不能覆盖保存失败或其它 pane 的错误状态。
+    /// 恢复完成只清理对应的启动提示和精确创建 owner，不能覆盖保存失败或其它 pane 的错误状态。
     pub(super) fn finish_workspace_restore(
         &mut self,
         pane_id: &PaneId,
@@ -1728,6 +1775,13 @@ impl RootView {
     ) {
         if !self.workspace_restore_is_current(pane_id, generation) {
             return;
+        }
+        if let Some(tab_id) = self
+            .workspace_runtime
+            .pane(pane_id)
+            .map(|pane| pane.tab_id.clone())
+        {
+            self.finish_pending_terminal_creation(&tab_id, pane_id, generation);
         }
         self.refresh_workspace_views(cx);
         if self
@@ -1766,6 +1820,7 @@ pub(super) fn unpublished_transient_local_container_target(
         }
         WorkspaceTerminalOpenKind::Direct(_)
         | WorkspaceTerminalOpenKind::ContainerExec { .. }
+        | WorkspaceTerminalOpenKind::ContainerLogs { .. }
         | WorkspaceTerminalOpenKind::TmuxAttach { .. } => None,
     }
 }
@@ -1944,6 +1999,21 @@ async fn prepare_workspace_session(
             operations
                 .containers
                 .open_exec(target, command, owner, size, cancellation.clone())
+                .await
+        }
+        WorkspaceTerminalOpenKind::ContainerLogs { target } => {
+            let Some(operations) = operations else {
+                return WorkspaceSessionOpenResult::Failed {
+                    message: crate::locale::text(
+                        "容器日志服务尚未配置。",
+                        "Container logs service is unavailable.",
+                    ),
+                    cleanup_pending: None,
+                };
+            };
+            operations
+                .containers
+                .open_logs(target, owner, size, cancellation.clone())
                 .await
         }
         WorkspaceTerminalOpenKind::TmuxAttach {

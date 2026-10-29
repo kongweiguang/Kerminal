@@ -265,6 +265,8 @@ pub enum WorkspaceFileSource {
 /// 完整终端工作区的 typed 投影；shell/sidebar 等其他上下文仍留在原 JSON。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkspaceSessionSnapshot {
+    /// 只接管可识别的固定容器；其它 sidebarMachines 行及扩展字段由文档原样保留。
+    pub pinned_containers: Vec<WorkspacePinnedContainer>,
     pub active_tab_id: Option<TabId>,
     pub focused_pane_id: Option<PaneId>,
     pub selected_machine_id: Option<String>,
@@ -273,9 +275,51 @@ pub struct WorkspaceSessionSnapshot {
     pub tab_groups: BTreeMap<WorkspaceTabGroupId, WorkspaceTabGroup>,
 }
 
+/// 侧栏容器只保存可重新解析的宿主与运行时身份，绝不保存连接凭据或一次性命令。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspacePinnedContainer {
+    pub target: kerminal_domain::operations::ContainerTarget,
+    pub name: String,
+    pub description: String,
+    pub group_id: Option<String>,
+}
+
+impl WorkspacePinnedContainer {
+    /// 与 main targetStableId 一致，同一目标重复固定只更新展示信息。
+    /// @author kongweiguang
+    pub fn stable_id(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            match self.target.runtime {
+                kerminal_domain::operations::ContainerRuntime::Docker => "docker",
+                kerminal_domain::operations::ContainerRuntime::Podman => "podman",
+            },
+            self.target.host_id.as_ref().map_or("", HostId::as_str),
+            self.target.container_id
+        )
+    }
+}
+
 impl WorkspaceSessionSnapshot {
     /// 持久化前集中验证 IDs、组引用和每个递归 layout，避免 Root/UI 缓存越界。
+    /// @author kongweiguang
     pub fn validate(&self) -> Result<(), WorkspaceSessionInvalidReason> {
+        let mut pinned_container_ids = BTreeSet::new();
+        for container in &self.pinned_containers {
+            if container.target.host_id.is_none() {
+                return Err(WorkspaceSessionInvalidReason::InvalidSchema);
+            }
+            if container.target.container_id.is_empty()
+                || container.target.container_id.chars().any(char::is_control)
+                || container.group_id.as_ref().is_some_and(|group_id| {
+                    group_id.is_empty() || group_id.chars().any(char::is_control)
+                })
+                || !pinned_container_ids.insert(container.stable_id())
+            {
+                return Err(WorkspaceSessionInvalidReason::InvalidSchema);
+            }
+        }
+
         let tab_ids = self
             .terminal_tabs
             .iter()
@@ -396,6 +440,9 @@ impl WorkspaceSessionDocument {
     }
 
     /// 更新 typed 所有字段并按稳定 ID 合并原行，从而保留行内和递归布局未知字段。
+    /// 固定容器沿用主机侧栏身份和移除标记，重排时始终紧随父 SSH 主机且保持同宿主顺序。
+    ///
+    /// @author kongweiguang
     pub fn update_known_fields(
         &mut self,
         snapshot: &WorkspaceSessionSnapshot,
@@ -405,6 +452,7 @@ impl WorkspaceSessionDocument {
         let root = next
             .as_object_mut()
             .ok_or(WorkspaceSessionInvalidReason::InvalidRoot)?;
+        update_pinned_sidebar(root, snapshot)?;
         let old_tabs = index_rows(root.get("terminalTabs"))?;
         let old_panes = index_rows(root.get("terminalPanes"))?;
         let old_groups = root
@@ -479,6 +527,8 @@ impl WorkspaceSessionDocument {
 }
 
 /// 解码根部已知工作区字段并校验跨表引用；其他 v3 根字段保持完全不透明。
+///
+/// @author kongweiguang
 fn decode_workspace_snapshot(
     value: &Value,
 ) -> Result<WorkspaceSessionSnapshot, WorkspaceSessionInvalidReason> {
@@ -501,6 +551,16 @@ fn decode_workspace_snapshot(
         .map(decode_tab)
         .collect::<Result<Vec<_>, _>>()?;
     let snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: root
+            .get("sidebarMachines")
+            .and_then(Value::as_array)
+            .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?
+            .iter()
+            .map(decode_pinned_container)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect(),
         active_tab_id: decode_optional_identity::<TabId>(root.get("activeTabId"), TabId::parse)?,
         focused_pane_id: decode_optional_identity::<PaneId>(
             root.get("focusedPaneId"),
@@ -513,6 +573,180 @@ fn decode_workspace_snapshot(
     };
     snapshot.validate()?;
     Ok(snapshot)
+}
+
+/// 合并固定容器侧栏并维护旧 schema 的移除标记；未知行原样保留，缺失父行时也不丢弃 pin。
+///
+/// @author kongweiguang
+fn update_pinned_sidebar(
+    root: &mut Map<String, Value>,
+    snapshot: &WorkspaceSessionSnapshot,
+) -> Result<(), WorkspaceSessionInvalidReason> {
+    let old_sidebar = root
+        .get("sidebarMachines")
+        .and_then(Value::as_array)
+        .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?;
+    let mut retained_rows = Vec::with_capacity(old_sidebar.len());
+    let mut old_pins = BTreeMap::new();
+    for row in old_sidebar {
+        if let Some(pin) = decode_pinned_container(row)? {
+            old_pins.insert(pin.stable_id(), (pin, row.clone()));
+        } else {
+            retained_rows.push(row.clone());
+        }
+    }
+
+    let had_removed = root.contains_key("removedSidebarMachineIds");
+    let mut removed = match root.get("removedSidebarMachineIds") {
+        Some(value) => value
+            .as_array()
+            .cloned()
+            .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?,
+        None => Vec::new(),
+    };
+    let previous_removed = removed.clone();
+    let desired_ids = snapshot
+        .pinned_containers
+        .iter()
+        .map(WorkspacePinnedContainer::stable_id)
+        .collect::<BTreeSet<_>>();
+    for id in old_pins.keys().filter(|id| !desired_ids.contains(*id)) {
+        if !removed
+            .iter()
+            .any(|value| value.as_str() == Some(id.as_str()))
+        {
+            removed.push(Value::String(id.clone()));
+        }
+    }
+    removed.retain(|value| value.as_str().is_none_or(|id| !desired_ids.contains(id)));
+
+    let mut pins_by_host: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for container in &snapshot.pinned_containers {
+        let id = container.stable_id();
+        let host_id = container
+            .target
+            .host_id
+            .as_ref()
+            .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?;
+        let host_id_str = host_id.as_str();
+        let runtime = match container.target.runtime {
+            kerminal_domain::operations::ContainerRuntime::Docker => "docker",
+            kerminal_domain::operations::ContainerRuntime::Podman => "podman",
+        };
+        let mut row = old_pins
+            .get(&id)
+            .map(|(_, row)| row.clone())
+            .unwrap_or_else(|| json!({}));
+        let fields = row
+            .as_object_mut()
+            .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?;
+        fields.extend(
+            json!({
+                "id": id,
+                "kind": "dockerContainer",
+                "name": container.name,
+                "description": container.description,
+                "parentMachineId": host_id_str,
+                "containerId": container.target.container_id,
+                "containerName": container.name,
+                "runtime": runtime,
+                "status": "offline",
+                "tags": ["container", runtime],
+                "target": {
+                    "kind": "dockerContainer",
+                    "hostId": host_id_str,
+                    "containerId": container.target.container_id,
+                    "containerName": container.name,
+                    "runtime": runtime
+                }
+            })
+            .as_object()
+            .expect("object literal")
+            .clone(),
+        );
+        set_optional_string(fields, "remoteGroupId", container.group_id.as_deref());
+        pins_by_host
+            .entry(host_id_str.to_owned())
+            .or_default()
+            .push(row);
+    }
+
+    let mut sidebar = Vec::with_capacity(retained_rows.len() + snapshot.pinned_containers.len());
+    for row in retained_rows {
+        let parent_id = row.get("id").and_then(Value::as_str).map(str::to_owned);
+        sidebar.push(row);
+        if let Some(children) = parent_id.and_then(|id| pins_by_host.remove(&id)) {
+            sidebar.extend(children);
+        }
+    }
+    for (_, children) in pins_by_host {
+        sidebar.extend(children);
+    }
+    root.insert("sidebarMachines".to_owned(), Value::Array(sidebar));
+    if had_removed || removed != previous_removed {
+        root.insert("removedSidebarMachineIds".to_owned(), Value::Array(removed));
+    }
+    Ok(())
+}
+
+/// 保留未识别侧栏行，同时严格拒绝损坏的已知容器行，避免静默丢失用户配置。
+///
+/// @author kongweiguang
+fn decode_pinned_container(
+    row: &Value,
+) -> Result<Option<WorkspacePinnedContainer>, WorkspaceSessionInvalidReason> {
+    let Some(object) = row.as_object() else {
+        return Ok(None);
+    };
+    if object.get("kind").and_then(Value::as_str) != Some("dockerContainer") {
+        return Ok(None);
+    }
+    let target = decode_target(
+        object
+            .get("target")
+            .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?,
+    )?;
+    let target = match target {
+        WorkspaceTargetRef::DockerContainer {
+            host_id,
+            container_id,
+            runtime,
+            ..
+        } => kerminal_domain::operations::ContainerTarget {
+            host_id: Some(host_id),
+            container_id,
+            runtime: match runtime {
+                WorkspaceContainerRuntime::Docker => {
+                    kerminal_domain::operations::ContainerRuntime::Docker
+                }
+                WorkspaceContainerRuntime::Podman => {
+                    kerminal_domain::operations::ContainerRuntime::Podman
+                }
+            },
+        },
+        _ => return Err(WorkspaceSessionInvalidReason::InvalidSchema),
+    };
+    let id = required_string(object.get("id"))?;
+    let parent_id = required_string(object.get("parentMachineId"))?;
+    let host_id = target
+        .host_id
+        .as_ref()
+        .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?;
+    let runtime = match target.runtime {
+        kerminal_domain::operations::ContainerRuntime::Docker => "docker",
+        kerminal_domain::operations::ContainerRuntime::Podman => "podman",
+    };
+    if id != format!("{runtime}:{}:{}", host_id.as_str(), target.container_id)
+        || parent_id != host_id.as_str()
+    {
+        return Err(WorkspaceSessionInvalidReason::InvalidSchema);
+    }
+    Ok(Some(WorkspacePinnedContainer {
+        target,
+        name: required_string(object.get("name"))?,
+        description: optional_string(object.get("description"))?.unwrap_or_default(),
+        group_id: optional_string(object.get("remoteGroupId"))?,
+    }))
 }
 
 /// 解码组 definitions；缺省 v3 字段视为空映射，非对象结构则拒绝保存。

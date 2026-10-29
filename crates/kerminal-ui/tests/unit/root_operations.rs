@@ -15,8 +15,8 @@ use kerminal_domain::{
 use super::{
     WorkspaceTerminalOpenKind, container_exec_intent, container_file_endpoint,
     is_host_file_endpoint, tmux_attach_command, tmux_binding_matches_request,
-    tmux_binding_target_ref, tmux_local_shell_is_wsl, tmux_target_matches_terminal,
-    valid_quickref_text,
+    tmux_binding_target_ref, tmux_detach_key_events, tmux_local_shell_is_wsl,
+    tmux_target_matches_terminal, valid_quickref_text,
 };
 use crate::features::operations::TmuxAttachTarget;
 
@@ -359,4 +359,22 @@ fn tmux_shortcut_character_reaches_legacy_and_kitty_encoders() {
         assert!(!encoded.contains(&b'\r'));
         assert!(!encoded.contains(&b'\n'));
     }
+}
+
+/// 分离动作编码后必须逐字节等于 main 发送的 Ctrl-B+d，且不会变成 detach-client 命令。
+///
+/// @author kongweiguang
+#[test]
+fn tmux_detach_sequence_encodes_ctrl_b_then_d() {
+    use kerminal_terminal::{TerminalModes, input::encode_input};
+
+    let events = tmux_detach_key_events();
+    assert_eq!(
+        encode_input(&events[0], TerminalModes::default()),
+        Some(vec![0x02])
+    );
+    assert_eq!(
+        encode_input(&events[1], TerminalModes::default()),
+        Some(b"d".to_vec())
+    );
 }

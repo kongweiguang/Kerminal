@@ -2,7 +2,10 @@
 //!
 //! @author kongweiguang
 
-use super::{CloseGateAction, QuitDeferral, close_gate_action, quit_deferral};
+use super::{
+    CloseGateAction, QuitDeferral, close_gate_action, quit_deferral,
+    should_flush_settings_before_close,
+};
 use crate::features::preferences::{CloseRequest, DraftStatus};
 
 /// 运行中的同步事务会延后退出，并保留是否已请求协作取消的区别。
@@ -87,4 +90,39 @@ fn navigation_close_gate_waits_confirms_or_proceeds_from_draft_state() {
         close_gate_action(CloseRequest::CloseNow, CloseRequest::CloseNow, false),
         CloseGateAction::Proceed
     );
+}
+
+/// 普通关闭 flush 有效 dirty 设置，不阻断保存中/未知/无效文本的离开路径。
+#[test]
+fn settings_close_flushes_only_valid_dirty_snapshots() {
+    assert!(should_flush_settings_before_close(
+        Some(DraftStatus::Ready),
+        true,
+        false
+    ));
+    assert!(should_flush_settings_before_close(
+        Some(DraftStatus::Failed),
+        true,
+        false
+    ));
+    assert!(!should_flush_settings_before_close(
+        Some(DraftStatus::Ready),
+        true,
+        true
+    ));
+    assert!(!should_flush_settings_before_close(
+        Some(DraftStatus::Saving),
+        true,
+        false
+    ));
+    assert!(!should_flush_settings_before_close(
+        Some(DraftStatus::OutcomeUnknown),
+        true,
+        false
+    ));
+    assert!(!should_flush_settings_before_close(
+        Some(DraftStatus::Ready),
+        false,
+        false
+    ));
 }

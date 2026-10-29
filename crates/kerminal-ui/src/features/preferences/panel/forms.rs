@@ -8,9 +8,8 @@ use gpui_kit::{
 };
 
 use super::{
-    AgentLauncherInputs, AgentLauncherTextField, KeywordRuleInputs, KeywordTextField,
-    PreferencesPanel, ProfileInputs, ProfileTextField, SettingsInputs, SettingsTextField,
-    TerminalBehaviorInputs,
+    AgentLauncherInputs, AgentLauncherTextField, PreferencesPanel, ProfileInputs, ProfileTextField,
+    SettingsInputs, SettingsTextField,
 };
 
 /// settings 文本字段建立原生 GPUI Kit 输入状态并订阅值变化。
@@ -84,22 +83,6 @@ fn create_agent_launcher_input(
     (input, subscription)
 }
 
-/// 新增和已有关键词行共用原生文本输入，字段身份通过 rule ID 而非行号关联。
-fn create_keyword_input(
-    placeholder: SharedString,
-    field: KeywordTextField,
-    window: &mut Window,
-    cx: &mut Context<PreferencesPanel>,
-) -> (Entity<InputState>, Subscription) {
-    let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
-    let subscription = cx.subscribe(&input, move |panel, input, event: &InputEvent, cx| {
-        if matches!(event, InputEvent::Change) {
-            panel.update_keyword_text(field.clone(), input.read(cx).value().to_string(), cx);
-        }
-    });
-    (input, subscription)
-}
-
 /// 仅变更现有输入的提示文案，保持其值、选择区间和焦点身份不变。
 ///
 /// @author kongweiguang
@@ -156,7 +139,10 @@ impl PreferencesPanel {
             ),
             (
                 &self.settings_inputs.background_path,
-                crate::locale::text("背景图片路径", "Background image path"),
+                crate::locale::text(
+                    r"例如 C:\Users\name\Pictures\bg.png",
+                    r"For example C:\Users\name\Pictures\bg.png",
+                ),
             ),
             (
                 &self.settings_inputs.background_opacity,
@@ -274,37 +260,6 @@ impl PreferencesPanel {
             window,
             cx,
         );
-
-        let terminal_inputs = [
-            (
-                &self.terminal_behavior_inputs.audit_retention_days,
-                crate::locale::text("审计保留天数", "Audit retention days"),
-            ),
-            (
-                &self.terminal_behavior_inputs.feedback_retention_days,
-                crate::locale::text("反馈保留天数", "Feedback retention days"),
-            ),
-            (
-                &self.terminal_behavior_inputs.new_keyword_pattern,
-                crate::locale::text("关键词或正则", "Keyword or regular expression"),
-            ),
-            (
-                &self.terminal_behavior_inputs.new_keyword_note,
-                crate::locale::text("备注（可选）", "Note (optional)"),
-            ),
-        ];
-        for (input, placeholder) in terminal_inputs {
-            refresh_input_placeholder(input, placeholder, window, cx);
-        }
-        for rule in &self.terminal_behavior_inputs.keyword_rules {
-            refresh_input_placeholder(
-                &rule.pattern,
-                crate::locale::text("关键词或正则", "Keyword or regular expression"),
-                window,
-                cx,
-            );
-            refresh_input_placeholder(&rule.note, crate::locale::text("备注", "Note"), window, cx);
-        }
     }
 }
 
@@ -332,7 +287,10 @@ impl PreferencesPanel {
                 SettingsTextField::Scrollback,
             ),
             (
-                crate::locale::text("背景图片路径", "Background image path"),
+                crate::locale::text(
+                    r"例如 C:\Users\name\Pictures\bg.png",
+                    r"For example C:\Users\name\Pictures\bg.png",
+                ),
                 SettingsTextField::BackgroundPath,
             ),
             (
@@ -503,152 +461,6 @@ impl PreferencesPanel {
         (
             AgentLauncherInputs { name, command },
             vec![name_subscription, command_subscription],
-        )
-    }
-
-    /// Terminal 行为固定输入在构造时建立，已有关键词行由 settings 加载结果单独重建。
-    pub(super) fn create_terminal_behavior_inputs(
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> (TerminalBehaviorInputs, Vec<Subscription>) {
-        let (audit_retention_days, audit_subscription) = create_settings_input(
-            crate::locale::text("审计保留天数", "Audit retention days"),
-            SettingsTextField::SuggestionAuditRetention,
-            window,
-            cx,
-        );
-        let (feedback_retention_days, feedback_subscription) = create_settings_input(
-            crate::locale::text("反馈保留天数", "Feedback retention days"),
-            SettingsTextField::SuggestionFeedbackRetention,
-            window,
-            cx,
-        );
-        let (new_keyword_pattern, pattern_subscription) = create_keyword_input(
-            crate::locale::text("关键词或正则", "Keyword or regular expression"),
-            KeywordTextField::NewPattern,
-            window,
-            cx,
-        );
-        let (new_keyword_note, note_subscription) = create_keyword_input(
-            crate::locale::text("备注（可选）", "Note (optional)"),
-            KeywordTextField::NewNote,
-            window,
-            cx,
-        );
-        (
-            TerminalBehaviorInputs {
-                audit_retention_days,
-                feedback_retention_days,
-                new_keyword_pattern,
-                new_keyword_note,
-                keyword_rules: Vec::<KeywordRuleInputs>::new(),
-            },
-            vec![
-                audit_subscription,
-                feedback_subscription,
-                pattern_subscription,
-                note_subscription,
-            ],
-        )
-    }
-
-    /// 为当前快照中的关键词规则建立稳定输入并持有 Change subscription。
-    pub(super) fn create_keyword_rule_inputs(
-        id: String,
-        pattern: &str,
-        note: &str,
-        colors: Option<&kerminal_application::preferences::TerminalKeywordHighlightCustomColors>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> (KeywordRuleInputs, Vec<Subscription>) {
-        let (pattern_input, pattern_subscription) = create_keyword_input(
-            crate::locale::text("关键词或正则", "Keyword or regular expression"),
-            KeywordTextField::RulePattern(id.clone()),
-            window,
-            cx,
-        );
-        pattern_input.update(cx, |input, cx| {
-            input.set_value(pattern.to_owned(), window, cx)
-        });
-        let (note_input, note_subscription) = create_keyword_input(
-            crate::locale::text("备注", "Note"),
-            KeywordTextField::RuleNote(id.clone()),
-            window,
-            cx,
-        );
-        note_input.update(cx, |input, cx| input.set_value(note.to_owned(), window, cx));
-        let (light_foreground, light_foreground_subscription) = create_keyword_input(
-            "#RRGGBB".into(),
-            KeywordTextField::LightForeground(id.clone()),
-            window,
-            cx,
-        );
-        let (light_background, light_background_subscription) = create_keyword_input(
-            "#RRGGBB".into(),
-            KeywordTextField::LightBackground(id.clone()),
-            window,
-            cx,
-        );
-        let (dark_foreground, dark_foreground_subscription) = create_keyword_input(
-            "#RRGGBB".into(),
-            KeywordTextField::DarkForeground(id.clone()),
-            window,
-            cx,
-        );
-        let (dark_background, dark_background_subscription) = create_keyword_input(
-            "#RRGGBB".into(),
-            KeywordTextField::DarkBackground(id.clone()),
-            window,
-            cx,
-        );
-        if let Some(colors) = colors {
-            light_foreground.update(cx, |input, cx| {
-                input.set_value(
-                    colors.light.foreground.clone().unwrap_or_default(),
-                    window,
-                    cx,
-                )
-            });
-            light_background.update(cx, |input, cx| {
-                input.set_value(
-                    colors.light.background.clone().unwrap_or_default(),
-                    window,
-                    cx,
-                )
-            });
-            dark_foreground.update(cx, |input, cx| {
-                input.set_value(
-                    colors.dark.foreground.clone().unwrap_or_default(),
-                    window,
-                    cx,
-                )
-            });
-            dark_background.update(cx, |input, cx| {
-                input.set_value(
-                    colors.dark.background.clone().unwrap_or_default(),
-                    window,
-                    cx,
-                )
-            });
-        }
-        (
-            KeywordRuleInputs {
-                id,
-                pattern: pattern_input,
-                note: note_input,
-                light_foreground,
-                light_background,
-                dark_foreground,
-                dark_background,
-            },
-            vec![
-                pattern_subscription,
-                note_subscription,
-                light_foreground_subscription,
-                light_background_subscription,
-                dark_foreground_subscription,
-                dark_background_subscription,
-            ],
         )
     }
 }

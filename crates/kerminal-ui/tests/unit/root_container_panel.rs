@@ -7,14 +7,14 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 use kerminal_application::{
     sessions::UiSessionBinding,
     workspace::{
-        WorkspaceContainerRuntime, WorkspaceLocalMachineScope, WorkspaceMachineStatus,
-        WorkspacePaneMode, WorkspaceSessionPane, WorkspaceSessionTab, WorkspaceTargetRef,
+        WorkspaceContainerRuntime, WorkspaceFileAccess, WorkspaceFileSource,
+        WorkspaceLocalMachineScope, WorkspaceMachineStatus, WorkspacePaneMode,
+        WorkspaceSessionPane, WorkspaceSessionTab, WorkspaceTargetRef,
     },
 };
 use kerminal_domain::{
     files::ContainerRuntime,
     identity::{HostId, PaneId, SessionId, TabId},
-    operations::ContainerTarget,
     sessions::{
         ContainerSessionTarget, LocalSessionTarget, SerialSessionTarget, SessionLifecycle,
         SessionOwner, SessionTarget, SshSessionTarget, TelnetSessionTarget,
@@ -27,7 +27,9 @@ use crate::{
     root::{
         CenterPanel,
         container_panel::{
-            ContainerPanelCandidate, ContainerPanelPane, resolve_container_panel_context,
+            ContainerPanelCandidate, ContainerPanelPane,
+            container_target_for_validated_host_context, resolve_container_panel_context,
+            workspace_file_host_context,
         },
         session_reconnect::SessionPanelObservation,
         workspace_runtime::RuntimePanePhase,
@@ -242,6 +244,87 @@ fn ssh_target(host_id: HostId) -> SessionTarget {
     })
 }
 
+/// 文件 Tab 测试输入保留正式 target 和 tab 身份，不经过终端 pane fixture。
+fn workspace_file_tab(
+    id: TabId,
+    target: WorkspaceTargetRef,
+    source: WorkspaceFileSource,
+) -> WorkspaceSessionTab {
+    WorkspaceSessionTab::WorkspaceFile {
+        id,
+        tab_group_id: None,
+        title: "compose.yaml".into(),
+        machine_id: "file-host".into(),
+        target,
+        path: "/srv/app/compose.yaml".into(),
+        root_path: Some("/srv/app".into()),
+        access: WorkspaceFileAccess::Readonly,
+        source,
+    }
+}
+
+/// Compose SSH 文件和容器文件均解析到真实 tab/host，结果不包含会话 binding。
+#[test]
+fn workspace_file_host_context_keeps_tab_and_host_identity() {
+    let tab_id = TabId::new();
+    let host_id = HostId::new();
+    let ssh_file = workspace_file_tab(
+        tab_id.clone(),
+        WorkspaceTargetRef::Ssh {
+            host_id: host_id.clone(),
+        },
+        WorkspaceFileSource::ComposeYaml,
+    );
+    assert_eq!(
+        workspace_file_host_context(&ssh_file),
+        Some(ContainerPanelContext::WorkspaceHost {
+            tab_id: tab_id.clone(),
+            host_id: host_id.clone(),
+        })
+    );
+
+    let container_tab_id = TabId::new();
+    let container_file = workspace_file_tab(
+        container_tab_id.clone(),
+        WorkspaceTargetRef::DockerContainer {
+            host_id: host_id.clone(),
+            container_id: "container-123".into(),
+            runtime: WorkspaceContainerRuntime::Podman,
+            container_name: None,
+            user: None,
+            workdir: None,
+        },
+        WorkspaceFileSource::Container,
+    );
+    assert_eq!(
+        workspace_file_host_context(&container_file),
+        Some(ContainerPanelContext::WorkspaceHost {
+            tab_id: container_tab_id,
+            host_id,
+        })
+    );
+}
+
+/// 本机和非 SSH 文件目标不借用当前侧栏主机来开启容器管理。
+#[test]
+fn workspace_file_without_ssh_host_has_no_container_host_context() {
+    let local = workspace_file_tab(
+        TabId::new(),
+        WorkspaceTargetRef::Local { profile_id: None },
+        WorkspaceFileSource::Local,
+    );
+    let telnet = workspace_file_tab(
+        TabId::new(),
+        WorkspaceTargetRef::Telnet {
+            host_id: HostId::new(),
+        },
+        WorkspaceFileSource::Workspace,
+    );
+
+    assert_eq!(workspace_file_host_context(&local), None);
+    assert_eq!(workspace_file_host_context(&telnet), None);
+}
+
 /// 以精确 host/runtime/container ID 构造容器终端目标。
 ///
 /// @author kongweiguang
@@ -363,9 +446,9 @@ fn owner_generation_and_split_focus_must_match_exact_pane() {
     ));
 }
 
-/// 本机与多个 SSH pane 分别产生确定宿主，工具目标不跟随左侧主机选择。
+/// 右栏仅接受明确 SSH 宿主，本机不会借用左栏主机或暴露 main 没有的容器入口。
 #[test]
-fn host_context_is_bound_to_local_or_exact_ssh_session() {
+fn host_context_rejects_local_and_binds_exact_ssh_session() {
     let local = PanelFixture::new(
         SessionTarget::Local(LocalSessionTarget {
             program: OsString::from("sh"),
@@ -377,7 +460,9 @@ fn host_context_is_bound_to_local_or_exact_ssh_session() {
     );
     assert!(matches!(
         local.resolve(),
-        ContainerPanelContext::Host { host_id: None, .. }
+        ContainerPanelContext::Unavailable {
+            reason: ContainerPanelUnavailableReason::UnsupportedProtocol,
+        }
     ));
 
     let first_host = HostId::new();
@@ -394,54 +479,108 @@ fn host_context_is_bound_to_local_or_exact_ssh_session() {
     ));
 }
 
-/// Docker/Podman 与本地/远端 host 都必须保留完整容器身份。
+/// Docker 与 Podman 的容器终端只解析其 SSH 宿主，本机容器不构成右栏的后备目标。
 #[test]
-fn container_context_preserves_runtime_host_and_container_identity() {
+fn container_terminal_context_requires_remote_host() {
     for runtime in [ContainerRuntime::Docker, ContainerRuntime::Podman] {
         for host_id in [None, Some(HostId::new())] {
             let fixture = PanelFixture::new(
                 container_target(host_id.clone(), runtime, "container-abc"),
                 SessionLifecycle::Running,
             );
-            assert!(matches!(
-                fixture.resolve(),
-                ContainerPanelContext::ContainerInfo {
-                    target: ContainerTarget {
-                        host_id: resolved_host,
-                        runtime: resolved_runtime,
-                        container_id,
-                    },
-                    terminal_running: true,
-                    ..
-                } if resolved_host == host_id
-                    && resolved_runtime == runtime
-                    && container_id == "container-abc"
-            ));
+            match host_id {
+                Some(host_id) => assert!(matches!(
+                    fixture.resolve(),
+                    ContainerPanelContext::Host { host_id: Some(resolved_host), .. }
+                        if resolved_host == host_id
+                )),
+                None => assert!(matches!(
+                    fixture.resolve(),
+                    ContainerPanelContext::Unavailable {
+                        reason: ContainerPanelUnavailableReason::UnsupportedProtocol,
+                    }
+                )),
+            }
         }
     }
 }
 
-/// 退出/失败容器保留同一只读目标；关闭/收尾及 host 结束明确进入终态提示。
+/// 远程容器 resolver 输出 Host context；Ports 从同一 binding 和 pane 还原精确容器目标。
 ///
 /// @author kongweiguang
 #[test]
-fn container_exit_preserves_identity_but_host_exit_is_unavailable() {
-    for lifecycle in [SessionLifecycle::Exited, SessionLifecycle::Failed] {
-        let fixture = PanelFixture::new(
-            container_target(Some(HostId::new()), ContainerRuntime::Podman, "retained"),
-            lifecycle,
-        );
-        let mut exited_input = PanelOverrides::valid(&fixture);
-        exited_input.handler_binding = None;
-        let result = fixture.resolve_with(exited_input);
-        assert!(matches!(
-            result,
-            ContainerPanelContext::ContainerInfo {
-                target: ContainerTarget { container_id, .. },
-                terminal_running: false,
-                ..
-            } if container_id == "retained"
-        ));
+fn remote_container_host_context_projects_exact_ports_target() {
+    let host_id = HostId::new();
+    let fixture = PanelFixture::new(
+        container_target(
+            Some(host_id.clone()),
+            ContainerRuntime::Podman,
+            "remote-container",
+        ),
+        SessionLifecycle::Running,
+    );
+    let context = fixture.resolve();
+    assert!(matches!(
+        &context,
+        ContainerPanelContext::Host {
+            binding,
+            host_id: Some(resolved_host),
+        } if binding == &fixture.handler_binding && resolved_host == &host_id
+    ));
+
+    let pane = ContainerPanelPane {
+        tab_id: &fixture.tab_id,
+        pane_id: &fixture.pane_id,
+        session_id: &fixture.session_id,
+        target: &fixture.target,
+        persisted: &fixture.persisted,
+        snapshot_persisted: &fixture.snapshot_persisted,
+        phase: RuntimePanePhase::Ready,
+        transient: fixture.transient,
+        external_lease_host_id: fixture.external_lease_host_id.as_ref(),
+    };
+    let SessionTarget::Container(session_target) = &fixture.target else {
+        unreachable!("fixture must represent a remote container terminal");
+    };
+    let expected = kerminal_domain::operations::ContainerTarget {
+        host_id: session_target.host_id.clone(),
+        runtime: session_target.runtime,
+        container_id: session_target.container_id.clone(),
+    };
+
+    assert_eq!(
+        container_target_for_validated_host_context(&context, pane),
+        Some(expected)
+    );
+}
+
+/// 容器退出后保留已确认的 SSH 宿主；本机与已关闭的会话不能新增右栏管理目标。
+///
+/// @author kongweiguang
+#[test]
+fn container_terminal_exit_keeps_host_context_but_closed_or_host_exit_is_unavailable() {
+    for host_id in [None, Some(HostId::new())] {
+        for lifecycle in [SessionLifecycle::Exited, SessionLifecycle::Failed] {
+            let fixture = PanelFixture::new(
+                container_target(host_id.clone(), ContainerRuntime::Podman, "retained"),
+                lifecycle,
+            );
+            let mut exited_input = PanelOverrides::valid(&fixture);
+            exited_input.handler_binding = None;
+            match host_id.as_ref() {
+                Some(host_id) => assert!(matches!(
+                    fixture.resolve_with(exited_input),
+                    ContainerPanelContext::Host { host_id: Some(resolved_host), .. }
+                        if &resolved_host == host_id
+                )),
+                None => assert!(matches!(
+                    fixture.resolve_with(exited_input),
+                    ContainerPanelContext::Unavailable {
+                        reason: ContainerPanelUnavailableReason::UnsupportedProtocol,
+                    }
+                )),
+            }
+        }
     }
 
     let host = PanelFixture::new(ssh_target(HostId::new()), SessionLifecycle::Exited);
@@ -469,8 +608,13 @@ fn container_exit_preserves_identity_but_host_exit_is_unavailable() {
 /// runtime 持久 pane 和 workspace snapshot 必须一致，容器目标/lease 变动不会沿用旧上下文。
 #[test]
 fn persisted_target_snapshot_and_external_lease_must_agree() {
+    let remote_host = HostId::new();
     let mut fixture = PanelFixture::new(
-        container_target(Some(HostId::new()), ContainerRuntime::Docker, "same-id"),
+        container_target(
+            Some(remote_host.clone()),
+            ContainerRuntime::Docker,
+            "same-id",
+        ),
         SessionLifecycle::Running,
     );
     let mut renamed_snapshot = fixture.snapshot_persisted.clone();
@@ -483,11 +627,7 @@ fn persisted_target_snapshot_and_external_lease_must_agree() {
             input.snapshot_persisted = &renamed_snapshot;
             input
         }),
-        ContainerPanelContext::ContainerInfo {
-            target: ContainerTarget { container_id, .. },
-            terminal_running: true,
-            ..
-        } if container_id == "same-id"
+        ContainerPanelContext::Host { host_id: Some(host_id), .. } if host_id == remote_host
     ));
 
     let mut divergent_snapshot = fixture.snapshot_persisted.clone();
@@ -534,6 +674,26 @@ fn persisted_target_snapshot_and_external_lease_must_agree() {
     external.external_lease_host_id = Some(external_host.clone());
     assert!(matches!(
         external.resolve(),
+        ContainerPanelContext::Host { host_id: Some(host_id), .. } if host_id == external_host
+    ));
+
+    let mut external_container = PanelFixture::new(
+        container_target(
+            Some(external_host.clone()),
+            ContainerRuntime::Docker,
+            "external-container",
+        ),
+        SessionLifecycle::Running,
+    );
+    assert!(matches!(
+        external_container.resolve(),
+        ContainerPanelContext::Unavailable {
+            reason: ContainerPanelUnavailableReason::TargetMismatch,
+        }
+    ));
+    external_container.external_lease_host_id = Some(external_host.clone());
+    assert!(matches!(
+        external_container.resolve(),
         ContainerPanelContext::Host { host_id: Some(host_id), .. } if host_id == external_host
     ));
 }

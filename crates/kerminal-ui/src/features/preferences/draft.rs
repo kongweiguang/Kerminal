@@ -63,6 +63,7 @@ pub struct ConfigDraft<T, R> {
     value: T,
     revision: R,
     status: DraftStatus,
+    pending_save: Option<T>,
     close_confirmation_open: bool,
 }
 
@@ -74,13 +75,19 @@ impl<T: Clone + PartialEq, R: Clone> ConfigDraft<T, R> {
             value: snapshot.value,
             revision: snapshot.revision,
             status: DraftStatus::Ready,
+            pending_save: None,
             close_confirmation_open: false,
         }
     }
 
-    /// 读取编辑值的只读引用，调用方必须经 `replace_value` 才能触发状态校验。
+    /// 读取当前编辑值；设置保存期间的后续输入使用专用迁移，Profile 仍经普通替换门禁。
     pub fn value(&self) -> &T {
         &self.value
+    }
+
+    /// 读取最近一次成功加载或保存的基线，用于与 watcher 快照做三方合并。
+    pub fn baseline_value(&self) -> &T {
+        &self.baseline
     }
 
     /// 读取打开或最近成功写入时的 revision，保存时必须原样传给应用用例。
@@ -110,6 +117,24 @@ impl<T: Clone + PartialEq, R: Clone> ConfigDraft<T, R> {
         Ok(())
     }
 
+    /// 保存中的设置仍接受新输入，但保留独立提交快照，避免异步回执覆盖后续编辑。
+    pub fn replace_value_during_save(&mut self, value: T) -> Result<(), DraftTransitionError> {
+        match self.status {
+            DraftStatus::Saving => {
+                self.value = value;
+                Ok(())
+            }
+            DraftStatus::ExternalConflict => Err(DraftTransitionError::ReloadRequired),
+            DraftStatus::OutcomeUnknown => Err(DraftTransitionError::ReadBackRequired),
+            DraftStatus::Ready | DraftStatus::Failed => Err(DraftTransitionError::SaveNotRunning),
+        }
+    }
+
+    /// 读取正在提交的不可变快照；异步保存必须使用它而不是读取可继续编辑的 value。
+    pub fn pending_save_value(&self) -> Option<&T> {
+        self.pending_save.as_ref()
+    }
+
     /// 只允许有变化且未冲突的草稿开始保存，阻止重复提交与过期 revision 重写。
     pub fn begin_save(&mut self) -> Result<(), DraftTransitionError> {
         match self.status {
@@ -121,6 +146,7 @@ impl<T: Clone + PartialEq, R: Clone> ConfigDraft<T, R> {
         if !self.is_dirty() {
             return Err(DraftTransitionError::NoChanges);
         }
+        self.pending_save = Some(self.value.clone());
         self.status = DraftStatus::Saving;
         Ok(())
     }
@@ -131,7 +157,15 @@ impl<T: Clone + PartialEq, R: Clone> ConfigDraft<T, R> {
         snapshot: DraftSnapshot<T, R>,
     ) -> Result<(), DraftTransitionError> {
         self.require_saving()?;
-        self.replace_snapshot(snapshot);
+        let submitted = self
+            .pending_save
+            .take()
+            .ok_or(DraftTransitionError::SaveNotRunning)?;
+        let edited_during_save = self.value != submitted;
+        let current_value = edited_during_save.then(|| self.value.clone());
+        self.baseline.clone_from(&snapshot.value);
+        self.value = current_value.unwrap_or(snapshot.value);
+        self.revision = snapshot.revision;
         self.status = DraftStatus::Ready;
         Ok(())
     }
@@ -139,6 +173,7 @@ impl<T: Clone + PartialEq, R: Clone> ConfigDraft<T, R> {
     /// 普通失败保留用户草稿，允许查看错误并修正或重试。
     pub fn save_failed(&mut self) -> Result<(), DraftTransitionError> {
         self.require_saving()?;
+        self.pending_save = None;
         self.status = DraftStatus::Failed;
         Ok(())
     }
@@ -146,6 +181,7 @@ impl<T: Clone + PartialEq, R: Clone> ConfigDraft<T, R> {
     /// CAS 冲突保留草稿供用户查看，但禁止静默覆盖另一个进程的新版本。
     pub fn save_conflicted(&mut self) -> Result<(), DraftTransitionError> {
         self.require_saving()?;
+        self.pending_save = None;
         self.status = DraftStatus::ExternalConflict;
         Ok(())
     }
@@ -157,8 +193,52 @@ impl<T: Clone + PartialEq, R: Clone> ConfigDraft<T, R> {
         Ok(())
     }
 
+    /// 读回与提交值相等时确认未知写入，并把回读 revision 作为新基线保留后续编辑。
+    pub fn confirm_outcome_unknown(
+        &mut self,
+        snapshot: DraftSnapshot<T, R>,
+    ) -> Result<(), DraftTransitionError> {
+        if self.status != DraftStatus::OutcomeUnknown {
+            return Err(DraftTransitionError::SaveNotRunning);
+        }
+        let submitted = self
+            .pending_save
+            .take()
+            .ok_or(DraftTransitionError::ReadBackRequired)?;
+        let edited_after_submission = self.value != submitted;
+        let current_value = edited_after_submission.then(|| self.value.clone());
+        self.baseline.clone_from(&snapshot.value);
+        self.value = current_value.unwrap_or(snapshot.value);
+        self.revision = snapshot.revision;
+        self.status = DraftStatus::Ready;
+        self.close_confirmation_open = false;
+        Ok(())
+    }
+
+    /// 外部 revision 已读回后以远端快照作新 CAS 基线，同时保留三方合并的本地值。
+    pub fn rebase(
+        &mut self,
+        snapshot: DraftSnapshot<T, R>,
+        merged_value: T,
+    ) -> Result<(), DraftTransitionError> {
+        if self.status == DraftStatus::Saving {
+            return Err(DraftTransitionError::CannotEditWhileSaving);
+        }
+        if self.status == DraftStatus::OutcomeUnknown {
+            return Err(DraftTransitionError::ReadBackRequired);
+        }
+        self.baseline = snapshot.value;
+        self.value = merged_value;
+        self.revision = snapshot.revision;
+        self.pending_save = None;
+        self.status = DraftStatus::Ready;
+        self.close_confirmation_open = false;
+        Ok(())
+    }
+
     /// 多文件事务结果未知时锁住当前草稿，要求用户刷新完整列表后再继续操作。
     pub fn mark_outcome_unknown(&mut self) {
+        self.pending_save = None;
         self.status = DraftStatus::OutcomeUnknown;
     }
 
@@ -251,5 +331,6 @@ impl<T: Clone + PartialEq, R: Clone> ConfigDraft<T, R> {
         self.baseline.clone_from(&snapshot.value);
         self.value = snapshot.value;
         self.revision = snapshot.revision;
+        self.pending_save = None;
     }
 }

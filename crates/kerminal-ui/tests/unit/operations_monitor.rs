@@ -30,6 +30,27 @@ fn hidden_panel_pauses_sampling_and_manual_disables_timer() {
     assert_eq!(ServerInfoRefreshInterval::Manual.period(false), None);
 }
 
+/// 固定刷新周期采用紧凑且中英一致的单位，避免选择值和菜单文案随 locale 漂移。
+///
+/// @author kongweiguang
+#[test]
+fn refresh_interval_labels_use_compact_units() {
+    let cases = [
+        (ServerInfoRefreshInterval::Manual, ("手动", "Manual")),
+        (ServerInfoRefreshInterval::OneSecond, ("1s", "1s")),
+        (ServerInfoRefreshInterval::ThreeSeconds, ("3s", "3s")),
+        (ServerInfoRefreshInterval::FiveSeconds, ("5s", "5s")),
+        (ServerInfoRefreshInterval::TenSeconds, ("10s", "10s")),
+        (ServerInfoRefreshInterval::ThirtySeconds, ("30s", "30s")),
+        (ServerInfoRefreshInterval::SixtySeconds, ("60s", "60s")),
+        (ServerInfoRefreshInterval::FiveMinutes, ("5min", "5min")),
+    ];
+
+    for (interval, expected) in cases {
+        assert_eq!(interval.label(), expected);
+    }
+}
+
 /// 过期判断对缺失、未来和已到 TTL 的样本均保持可恢复行为。
 #[test]
 fn tier_expiry_handles_missing_future_and_elapsed_samples() {

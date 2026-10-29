@@ -13,7 +13,7 @@ enum CloseGateAction {
     Proceed,
 }
 
-/// 把 settings/Profile 草稿状态投影成唯一离开决策，普通关闭及受控工作区导航共用同一门禁。
+/// 把 settings/Profile 草稿和未添加输入投影成唯一的关闭确认决策。
 ///
 /// @author kongweiguang
 fn close_gate_action(
@@ -40,6 +40,15 @@ enum QuitDeferral {
     VaultOperation,
     Saving,
     OutcomeUnknown,
+}
+
+/// 关闭前只 flush 已解析且可提交的 settings；格式错误、已保存与需回读状态保留原值。
+fn should_flush_settings_before_close(
+    status: Option<DraftStatus>,
+    dirty: bool,
+    has_input_errors: bool,
+) -> bool {
+    dirty && !has_input_errors && matches!(status, Some(DraftStatus::Ready | DraftStatus::Failed))
 }
 
 /// 将仍有副作用的事务和配置写入状态映射为明确的退出延后原因。
@@ -72,25 +81,19 @@ fn quit_deferral(
 }
 
 impl PreferencesPanel {
-    /// 用户请求离开时同时检查 settings/Profile dirty 状态，不让根视图切换造成静默丢稿。
+    /// 普通关闭只 flush 可提交设置并直接离开；仅 Profile 独立草稿继续使用关闭确认。
     ///
     /// @author kongweiguang
     pub fn request_close(&mut self, cx: &mut Context<Self>) {
-        let settings_close = self
-            .settings
-            .as_mut()
-            .map(ConfigDraft::request_close)
-            .unwrap_or(CloseRequest::CloseNow);
+        self.screen_color_sampling.cancel();
         let profile_close = self
             .profile_draft
             .as_mut()
             .map(ConfigDraft::request_close)
             .unwrap_or(CloseRequest::CloseNow);
-        let staged_inputs = self.has_unadded_inputs();
-        match close_gate_action(settings_close, profile_close, staged_inputs) {
+        self.flush_settings_before_close(cx);
+        match close_gate_action(CloseRequest::CloseNow, profile_close, false) {
             CloseGateAction::Wait => {
-                // 等待结果期间不保留导航意图，避免保存/未知结果读回后意外切页。
-                self.pending_navigation = None;
                 let outcome_unknown = self
                     .settings
                     .as_ref()
@@ -119,58 +122,24 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// MCP 搜索入口先记录受控目标，再经过与关闭按钮相同的 dirty/save/unknown 检查。
-    ///
-    /// @author kongweiguang
-    pub(in crate::features::preferences) fn request_mcp_runtime_navigation(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.mcp_runtime_available {
-            self.status = Some(
-                crate::locale::text(
-                    "MCP 运行时尚未由应用装配。",
-                    "The MCP runtime is not available in this build.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
+    /// 关闭不是 quit：已受理保存与未知结果回读可在 Root 持有的面板实体中继续。
+    fn flush_settings_before_close(&mut self, cx: &mut Context<Self>) {
+        let should_flush = should_flush_settings_before_close(
+            self.settings.as_ref().map(ConfigDraft::status),
+            self.settings.as_ref().is_some_and(ConfigDraft::is_dirty),
+            !self.settings_input_errors.is_empty(),
+        );
+        if should_flush {
+            self.save_settings(cx);
         }
-        if self.close_confirmation {
-            return;
-        }
-        self.pending_navigation = Some(super::PreferencesNavigationDestination::McpRuntime);
-        self.request_close(cx);
     }
 
-    /// 关于与更新只负责切换到已有工作区；沿用 close gate，避免导航绕过未保存草稿。
-    ///
-    /// @author kongweiguang
-    pub(in crate::features::preferences) fn request_updates_navigation(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
-        if self.close_confirmation {
-            return;
-        }
-        self.pending_navigation = Some(super::PreferencesNavigationDestination::Updates);
-        self.request_close(cx);
-    }
-
-    /// 离开确认通过后才发受控导航事件，Root 切换现有工作区而不绕过设置草稿门禁。
+    /// 离开时丢弃未提交关键词编辑并通知 Root 关闭面板；已提交 CAS 不受影响。
     ///
     /// @author kongweiguang
     fn emit_leave_event(&mut self, cx: &mut Context<Self>) {
-        match self.pending_navigation.take() {
-            Some(super::PreferencesNavigationDestination::McpRuntime) => {
-                cx.emit(PreferencesEvent::OpenMcpRuntimeRequested);
-            }
-            Some(super::PreferencesNavigationDestination::Updates) => {
-                cx.emit(PreferencesEvent::OpenUpdatesRequested);
-            }
-            None => cx.emit(PreferencesEvent::CloseRequested),
-        }
+        self.discard_pending_keyword_rule();
+        cx.emit(PreferencesEvent::CloseRequested);
     }
 
     /// 继续编辑只关闭确认条并重置子草稿的 close marker，不清除用户输入。
@@ -178,7 +147,6 @@ impl PreferencesPanel {
     /// @author kongweiguang
     pub(in crate::features::preferences) fn cancel_close(&mut self, cx: &mut Context<Self>) {
         self.close_confirmation = false;
-        self.pending_navigation = None;
         if let Some(draft) = self.settings.as_mut()
             && draft.close_confirmation_open()
         {
@@ -223,17 +191,19 @@ impl PreferencesPanel {
     ///
     /// @author kongweiguang
     pub fn request_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        let should_flush_settings = self.settings.as_ref().is_some_and(|draft| {
+            draft.is_dirty() && matches!(draft.status(), DraftStatus::Ready | DraftStatus::Failed)
+        }) && self.settings_input_errors.is_empty();
+        if should_flush_settings {
+            self.save_settings(cx);
+        }
         let settings_status = self.settings.as_ref().map(ConfigDraft::status);
         let profile_status = self.profile_draft.as_ref().map(ConfigDraft::status);
-        let cancellation_requested = self
-            .sync_cancellation
-            .as_ref()
-            .is_some_and(super::sync::SyncCancellationHandle::cancel_requested);
         if let Some(reason) = quit_deferral(
             self.profile_operation_running,
-            self.sync_busy.is_some(),
-            cancellation_requested,
-            self.vault_busy,
+            self.connectivity.sync_running,
+            false,
+            self.vault_busy || self.connectivity.key_saving,
             settings_status,
             profile_status,
         ) {
@@ -251,8 +221,8 @@ impl PreferencesPanel {
                 QuitDeferral::SyncOperation {
                     cancellation_requested: false,
                 } => crate::locale::text(
-                    "配置同步仍在执行；可在同步页取消或等待结果，完成后请再次退出。",
-                    "Configuration sync is still running. Cancel it on the sync page or wait for its result, then try quitting again.",
+                    "配置同步仍在执行；等待结果后请再次退出。",
+                    "Configuration sync is still running. Wait for its result, then try quitting again.",
                 ),
                 QuitDeferral::VaultOperation => crate::locale::text(
                     "Vault 操作正在执行且不能安全取消；等待结果后再退出。",
@@ -332,6 +302,7 @@ impl PreferencesPanel {
 
     /// 重用状态机回到编辑态，不在退出确认时复制一份 settings/profile 快照。
     fn discard_settings_and_profile_drafts(&mut self) {
+        self.discard_pending_keyword_rule();
         if let Some(draft) = self.settings.as_mut() {
             if draft.close_confirmation_open() {
                 let _ = draft.discard_and_close();
@@ -368,7 +339,7 @@ impl PreferencesPanel {
     fn restore_form_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(settings) = self.settings.as_ref().map(|draft| draft.value().clone()) {
             self.sync_settings_inputs(&settings, window, cx);
-            self.rebuild_keyword_inputs(&settings.terminal.keyword_highlights.rules, window, cx);
+            self.reconcile_keyword_editor(&settings.terminal.keyword_highlights.rules, window, cx);
         }
         if let Some(profile) = self
             .profile_draft
@@ -379,23 +350,9 @@ impl PreferencesPanel {
         }
         self.custom_agent_name.clear();
         self.custom_agent_command.clear();
-        self.new_keyword_pattern.clear();
-        self.new_keyword_note.clear();
         super::set_input(&self.agent_launcher_inputs.name, String::new(), window, cx);
         super::set_input(
             &self.agent_launcher_inputs.command,
-            String::new(),
-            window,
-            cx,
-        );
-        super::set_input(
-            &self.terminal_behavior_inputs.new_keyword_pattern,
-            String::new(),
-            window,
-            cx,
-        );
-        super::set_input(
-            &self.terminal_behavior_inputs.new_keyword_note,
             String::new(),
             window,
             cx,
@@ -407,12 +364,9 @@ impl PreferencesPanel {
         self.status = None;
     }
 
-    /// 临时 Agent/关键词输入在添加前也属于可丢弃草稿，关闭时不静默遗失。
+    /// 临时 Agent 输入在创建前也属于可丢弃草稿，关闭时不静默遗失。
     fn has_unadded_inputs(&self) -> bool {
-        !self.custom_agent_name.trim().is_empty()
-            || !self.custom_agent_command.trim().is_empty()
-            || !self.new_keyword_pattern.trim().is_empty()
-            || !self.new_keyword_note.trim().is_empty()
+        !self.custom_agent_name.trim().is_empty() || !self.custom_agent_command.trim().is_empty()
     }
 
     /// 设置模态的 X 统一执行 dirty-close 闭环，不在叶子层假定返回目标。

@@ -18,6 +18,7 @@ use super::{
     PendingBuiltinSnippetCopy, SnippetInlinePreview, SnippetPreviewToggleAction,
     copy_builtin_definition_to_user, is_exact_user_snippet_copy, is_snippet_search_shortcut,
     pending_builtin_copy_matches_source, snippet_copy_snapshot_matches,
+    snippet_preview_copy_is_allowed,
 };
 use crate::features::commands::SnippetDraftValues;
 use crate::features::commands::snippet_browser::{
@@ -109,6 +110,15 @@ fn template_copy_rejects_changed_user_revision() {
         &definition,
         Some(&ConfigRevision::from_sha256("revision-two".to_owned())),
     ));
+}
+
+/// 预览复制门禁允许普通命令，并拒绝任何带敏感值的展开结果。
+///
+/// @author kongweiguang
+#[test]
+fn rendered_snippet_copy_rejects_sensitive_values() {
+    assert!(snippet_preview_copy_is_allowed(false));
+    assert!(!snippet_preview_copy_is_allowed(true));
 }
 
 /// 收起或改变来源后，迟到的 exact lookup 不能重新展开或借用同 ID 条目。

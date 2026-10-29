@@ -20,7 +20,7 @@ use kerminal_domain::{
 };
 
 use super::super::history_query::{HistoryScope, PAGE_SIZE, page_window};
-use super::{LogsTarget, operation_matches_target, response_matches_target};
+use super::{HistoryReadKey, LogsTarget, operation_matches_target, response_matches_request};
 
 /// 构造绑定一致的 UI 会话样本，确保测试使用与 Root 相同的稳定身份字段。
 ///
@@ -120,6 +120,29 @@ fn ssh_scope_uses_typed_host_id_fallback() {
     assert_eq!(target.scope().pane_id, Some(pane_id));
     assert_eq!(target.scope().remote_host_id, Some(host_id));
     assert_eq!(target.scope().session_id, None);
+}
+
+/// 片段管理器的历史副本来源跟随 pane，不能被 Logs 的主机/协议筛选缩窄而遗漏旧命令。
+///
+/// @author kongweiguang
+#[test]
+fn snippet_history_scope_keeps_only_pane_and_limit() {
+    let host_id = HostId::parse("ssh-host-snippet-history").expect("valid host identity");
+    let (binding, info, pane_id) = ui_session(SessionTarget::Ssh(SshSessionTarget {
+        host_id,
+        working_directory: None,
+        command: None,
+    }));
+    let target = LogsTarget::from_ui_session(binding, &info, None)
+        .expect("matching binding creates a history target");
+    let request = target.snippet_history_request(20);
+    assert_eq!(request.pane_id, Some(pane_id));
+    assert_eq!(request.limit, Some(20));
+    assert_eq!(request.target, None);
+    assert_eq!(request.remote_host_id, None);
+    assert_eq!(request.session_id, None);
+    assert_eq!(request.query, None);
+    assert_eq!(request.source, None);
 }
 
 /// typed pane target 构造拒绝冲突的 SSH HostId，并要求 Telnet/Serial host 由同 pane 映射提供。
@@ -322,18 +345,32 @@ fn pagination_is_hidden_until_more_than_one_page_exists() {
     assert!(super::pagination_visible(PAGE_SIZE + 1));
 }
 
-/// 空白搜索与默认来源应视作无筛选，与 HistoryScope 构造查询时的搜索归一化一致。
+/// 页内范围按 UI 的一基起始位置显示，空列表和越界范围都保持可读的零计数。
 ///
 /// @author kongweiguang
 #[test]
-fn history_filter_activity_matches_request_query_normalization() {
-    assert!(!super::history_filters_active("", None));
-    assert!(!super::history_filters_active("   ", None));
-    assert!(super::history_filters_active("deploy", None));
-    assert!(super::history_filters_active(
-        "",
-        Some(CommandHistorySource::User)
-    ));
+fn history_range_label_matches_recent_commands_header() {
+    assert_eq!(super::history_range_label(0, 0, 0), "0 / 0");
+    assert_eq!(super::history_range_label(0, 1, 1), "1-1 / 1");
+    assert_eq!(super::history_range_label(8, 11, 11), "9-11 / 11");
+    assert_eq!(super::history_range_label(8, 20, 11), "9-11 / 11");
+}
+
+/// 损坏或历史格式的时间不能被强制转成1970年；合法Unix秒按当前系统时区投影。
+///
+/// @author kongweiguang
+#[test]
+fn history_timestamp_preserves_unknown_values_and_uses_local_time() {
+    for value in ["", "0", "-1", "invalid", "2026-10-28T01:00:00Z"] {
+        assert_eq!(super::history_timestamp(value), value);
+    }
+    let seconds = 1_800_000_000;
+    let expected = chrono::DateTime::from_timestamp(seconds, 0)
+        .expect("valid fixture timestamp")
+        .with_timezone(&chrono::Local)
+        .format("%m/%d %H:%M")
+        .to_string();
+    assert_eq!(super::history_timestamp(&seconds.to_string()), expected);
 }
 
 /// 来源筛选菜单维持“全部 + 每种来源各一项”，防止收拢按钮时遗漏历史类型。
@@ -417,11 +454,11 @@ fn history_context_uses_host_display_name_and_preserves_host_id_in_details() {
     assert!(detail.contains(host_id.as_str()));
 }
 
-/// 异步结果只有活动状态、generation 与完整 binding 同时一致时才能进入当前 Logs Entity。
+/// 隐藏期间仍接受同一请求结果，筛选、代次或目标变化则阻止旧回执进入当前 Logs Entity。
 ///
 /// @author kongweiguang
 #[test]
-fn late_responses_are_rejected_after_deactivation_generation_or_target_changes() {
+fn late_responses_follow_request_identity_after_deactivation() {
     let (binding, info, _) = ui_session(SessionTarget::Local(LocalSessionTarget {
         program: OsString::from("sh"),
         args: Vec::new(),
@@ -430,28 +467,51 @@ fn late_responses_are_rejected_after_deactivation_generation_or_target_changes()
     }));
     let target = LogsTarget::from_ui_session(binding.clone(), &info, None)
         .expect("matching UI binding creates a Logs target");
+    let request = HistoryReadKey {
+        target: target.clone(),
+        query: "git status".to_owned(),
+        source: Some(CommandHistorySource::User),
+    };
 
-    assert!(response_matches_target(true, 5, 5, Some(&target), &target));
-    assert!(!response_matches_target(
-        false,
+    // Deactivation preserves the current request identity, so its bounded read may still settle.
+    assert!(response_matches_request(5, 5, Some(&request), &request));
+    assert!(!response_matches_request(6, 5, Some(&request), &request));
+    assert!(!response_matches_request(5, 5, None, &request));
+
+    let changed_query = HistoryReadKey {
+        query: "git log".to_owned(),
+        ..request.clone()
+    };
+    assert!(!response_matches_request(
         5,
         5,
-        Some(&target),
-        &target
+        Some(&changed_query),
+        &request
     ));
-    assert!(!response_matches_target(true, 6, 5, Some(&target), &target));
-    assert!(!response_matches_target(true, 5, 5, None, &target));
+    let changed_source = HistoryReadKey {
+        source: None,
+        ..request.clone()
+    };
+    assert!(!response_matches_request(
+        5,
+        5,
+        Some(&changed_source),
+        &request
+    ));
 
     let mut new_binding = binding;
     new_binding.session_generation += 1;
     let new_target = LogsTarget::from_ui_session(new_binding, &info, None)
         .expect("session generation does not invalidate the matching snapshot itself");
-    assert!(!response_matches_target(
-        true,
+    let new_request = HistoryReadKey {
+        target: new_target.clone(),
+        ..request.clone()
+    };
+    assert!(!response_matches_request(
         5,
         5,
-        Some(&new_target),
-        &target
+        Some(&new_request),
+        &request
     ));
     assert!(operation_matches_target(true, Some(&target), &target));
     assert!(!operation_matches_target(false, Some(&target), &target));

@@ -6,7 +6,31 @@ use kerminal_domain::commands::{
     SnippetVariable, SnippetVariableKind, SnippetVariableRenderStrategy,
 };
 
-use super::{supports_validated_raw, transition_snippet_variable_kind};
+use super::{
+    snippet_template_variable_names, supports_validated_raw, transition_snippet_variable_kind,
+};
+
+/// compact 编辑器沿模板首次出现顺序同步参数，并只保留一份同名定义。
+///
+/// @author kongweiguang
+#[test]
+fn compact_template_variables_follow_unique_placeholder_names() {
+    assert_eq!(
+        snippet_template_variable_names("echo {{ host }} {{port}} {{host}}"),
+        vec!["host".to_owned(), "port".to_owned()]
+    );
+}
+
+/// 无效名称不生成持久定义，且嵌套花括号遵循 main 的搜索匹配行为。
+///
+/// @author kongweiguang
+#[test]
+fn compact_template_variables_skip_invalid_placeholders() {
+    assert_eq!(
+        snippet_template_variable_names("{{_bad}} {{bad-name}} {{{valid_2}}}"),
+        vec!["valid_2".to_owned()]
+    );
+}
 
 /// 构造会覆盖定义级敏感字段和原始插值的变量，验证 UI 转换使用同一领域规则。
 ///

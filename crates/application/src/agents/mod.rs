@@ -5,8 +5,8 @@
 use async_trait::async_trait;
 use kerminal_domain::{
     agents::{
-        AgentLauncherKey, AgentProvider, AgentProviderSession, AgentSession, AgentSessionScope,
-        AgentSessionStatus, AgentTargetBinding, AgentTargetLiveStatus,
+        AgentLauncherKey, AgentProvider, AgentProviderSession, AgentSession, AgentSessionLaunch,
+        AgentSessionScope, AgentSessionStatus, AgentTargetBinding, AgentTargetLiveStatus,
     },
     identity::{AgentSessionId, SessionId},
     sessions::SessionInfo,
@@ -20,11 +20,12 @@ use crate::{AppError, AppResult};
 mod history;
 mod launch;
 mod repository;
+mod session_matching;
 mod session_service;
 mod workspace_documents;
 pub use launch::{
-    AgentLaunchResolver, ResolvedAgentLauncher, builtin_resume_argv, initial_provider_session,
-    resolve_agent_launcher,
+    AgentLaunchResolver, AgentLauncherInstallationProbe, ResolvedAgentLauncher,
+    builtin_resume_argv, initial_provider_session, resolve_agent_launcher,
 };
 pub use repository::{
     AgentProviderSessionSnapshot, AgentProviderSessionStatus, AgentResumeCheckpoint,
@@ -34,6 +35,7 @@ pub use repository::{
     AgentWorkspaceWriteReceipt, CommitAgentResumeCheckpointRequest,
     PrepareAgentResumeCheckpointRequest,
 };
+pub use session_matching::find_reusable_agent_session;
 pub use session_service::AgentSessionService;
 
 /// 右栏历史的显示范围；归档是过滤视图，不执行物理删除。
@@ -106,13 +108,71 @@ pub struct CreateAgentSessionRequest {
     pub initial_palette: Option<TerminalPalette>,
 }
 
-/// 当前配置中可供新建界面选择的启动项，不包含命令内容或凭据。
+/// 当前配置中可供新建界面选择的启动项；命令只经显式展示读取器返回，不进入选项或 Debug 投影。
 ///
 /// @author kongweiguang
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentLauncherCatalog {
     pub selected_key: AgentLauncherKey,
     pub options: Vec<AgentLauncherOption>,
+    /// `None` 代表当前执行环境未接入探测器；Custom 启动器不参与 builtin 检查。
+    pub installations: Option<Vec<AgentLauncherInstallation>>,
+    legacy_custom_commands: Vec<(AgentLauncherKey, String)>,
+}
+
+impl fmt::Debug for AgentLauncherCatalog {
+    /// 自定义命令可能包含任意用户文本，调试信息仅说明兼容数据已存在而不输出正文。
+    ///
+    /// @author kongweiguang
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentLauncherCatalog")
+            .field("selected_key", &self.selected_key)
+            .field("options", &self.options)
+            .field("installations", &self.installations)
+            .field("legacy_custom_commands", &"<redacted>")
+            .finish()
+    }
+}
+
+impl AgentLauncherCatalog {
+    /// main 的启动命令提示需要用户配置原文；显式读取避免命令进入普通选项、日志或外部协议投影。
+    /// 返回值仅用于本地 UI 展示，执行仍由应用层按最新配置重新解析与校验。
+    ///
+    /// @author kongweiguang
+    pub fn custom_command_for_display(&self, key: &AgentLauncherKey) -> Option<&str> {
+        self.legacy_custom_commands
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, command)| command.as_str())
+    }
+
+    /// 以 provider 身份读取当前快照；未探测或 Custom 返回 None，不推断已安装状态。
+    ///
+    /// @author kongweiguang
+    pub fn installation_for(&self, provider: AgentProvider) -> Option<bool> {
+        self.installations
+            .as_ref()?
+            .iter()
+            .find(|installation| installation.provider == provider)
+            .map(|installation| installation.installed)
+    }
+
+    /// 在不向 UI 或 MCP 调用方返回命令正文的前提下匹配旧版 Custom 会话。
+    ///
+    /// @author kongweiguang
+    pub fn matches_legacy_custom_launch(
+        &self,
+        key: &AgentLauncherKey,
+        launch: &AgentSessionLaunch,
+    ) -> bool {
+        self.legacy_custom_commands
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .is_some_and(|(_, command)| {
+                launch::legacy_custom_command_matches_launch(command, launch)
+            })
+    }
 }
 
 /// 安全的 Launcher 选择项仅公开稳定身份、provider 和用户可见名称。
@@ -123,6 +183,15 @@ pub struct AgentLauncherOption {
     pub key: AgentLauncherKey,
     pub provider: AgentProvider,
     pub label: String,
+}
+
+/// 内置 provider 的只读可执行项探测结果；不包含 CLI 输出、参数或配置正文。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentLauncherInstallation {
+    pub provider: AgentProvider,
+    pub installed: bool,
 }
 
 /// 保留用例实现中的语义名称，同时让所有入口共享一个请求类型。

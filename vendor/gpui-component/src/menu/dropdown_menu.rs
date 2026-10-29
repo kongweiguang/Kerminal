@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 use std::rc::Rc;
 
 use gpui::{
@@ -36,6 +38,10 @@ impl DropdownMenu for Button {}
 pub struct DropdownMenuPopover<T: Selectable + IntoElement + 'static> {
     id: ElementId,
     anchor: Anchor,
+    auto_flip: bool,
+    trigger_width: Option<(gpui::Pixels, gpui::Pixels)>,
+    available_height: Option<(gpui::Pixels, gpui::Pixels)>,
+    offset: Option<gpui::Pixels>,
     trigger: T,
     builder: Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
     on_open_change: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
@@ -45,6 +51,7 @@ impl<T> DropdownMenuPopover<T>
 where
     T: Selectable + IntoElement + 'static,
 {
+    /// 默认沿用 legacy corner 定位，仅将调用方显式选择的行为存入 facade。
     fn new(
         id: ElementId,
         anchor: impl Into<Anchor>,
@@ -54,6 +61,10 @@ where
         Self {
             id: SharedString::from(format!("dropdown-menu:{:?}", id)).into(),
             anchor: anchor.into(),
+            auto_flip: false,
+            trigger_width: None,
+            available_height: None,
+            offset: None,
             trigger,
             builder: Rc::new(builder),
             on_open_change: None,
@@ -63,6 +74,38 @@ where
     /// Set the anchor corner for the dropdown menu popover.
     pub fn anchor(mut self, anchor: impl Into<Anchor>) -> Self {
         self.anchor = anchor.into();
+        self
+    }
+
+    /// 显式允许菜单在首选边空间不足时翻到触发器相反侧。
+    pub fn auto_flip(mut self) -> Self {
+        self.auto_flip = true;
+        self
+    }
+
+    /// Constrain the menu width to its trigger within the provided pixel range.
+    pub fn trigger_width(mut self, min: gpui::Pixels, max: gpui::Pixels) -> Self {
+        self.trigger_width = Some((min, max));
+        self
+    }
+
+    /// Enables vertical placement and caps content before its first layout.
+    pub fn available_height(
+        mut self,
+        minimum_space: gpui::Pixels,
+        max_height: gpui::Pixels,
+    ) -> Self {
+        self.auto_flip = true;
+        self.available_height = Some((
+            minimum_space.max(gpui::px(0.)),
+            max_height.max(gpui::px(0.)),
+        ));
+        self
+    }
+
+    /// Set the trigger-to-menu gap; omitted values preserve Popover's existing default.
+    pub fn offset(mut self, offset: impl Into<gpui::Pixels>) -> Self {
+        self.offset = Some(offset.into());
         self
     }
 
@@ -99,12 +142,18 @@ impl<T> DropdownMenuPopover<T>
 where
     T: Selectable + IntoElement + 'static,
 {
+    /// 将菜单定位选项交给共享 Popover，焦点和关闭行为仍保持单一 owner。
     fn render_popover(
         self,
         trigger_focus: FocusHandle,
         window: &mut Window,
         cx: &mut App,
     ) -> Popover {
+        // Copy the opt-in before moving the trigger into the shared Popover facade.
+        let auto_flip = self.auto_flip;
+        let trigger_width = self.trigger_width;
+        let available_height = self.available_height;
+        let offset = self.offset;
         let builder = self.builder.clone();
         let menu_state =
             window.use_keyed_state(self.id.clone(), cx, |_, _| DropdownMenuState::default());
@@ -114,6 +163,14 @@ where
             .overlay_closable(false)
             .trigger(self.trigger)
             .anchor(self.anchor)
+            .when(auto_flip, |this| this.auto_flip())
+            .when_some(trigger_width, |this, (min, max)| {
+                this.trigger_width(min, max)
+            })
+            .when_some(available_height, |this, (minimum, maximum)| {
+                this.available_height(minimum, maximum)
+            })
+            .when_some(offset, |this, offset| this.offset(offset))
             .when_some(self.on_open_change, |this, callback| {
                 this.on_open_change(move |open, window, cx| callback(open, window, cx))
             })
@@ -295,6 +352,33 @@ mod tests {
     actions!(dropdown_menu_test, [CopyText]);
 
     const CONTEXT: &str = "dropdown_menu_test";
+
+    /// Explicit menu gaps remain optional so all existing dropdowns keep Popover's default spacing.
+    #[test]
+    fn dropdown_offset_is_opt_in() {
+        let menu = Button::new("default-offset")
+            .dropdown_menu(|menu, _, _| menu.menu("Copy", Box::new(CopyText)));
+        assert_eq!(menu.offset, None);
+
+        let menu = Button::new("custom-offset")
+            .dropdown_menu(|menu, _, _| menu.menu("Copy", Box::new(CopyText)))
+            .offset(px(6.));
+        assert_eq!(menu.offset, Some(px(6.)));
+    }
+
+    /// A constrained dropdown opts into side placement while other menus keep their defaults.
+    #[test]
+    fn dropdown_available_height_is_opt_in() {
+        let menu = Button::new("default-height").dropdown_menu(|menu, _, _| menu);
+        assert!(!menu.auto_flip);
+        assert_eq!(menu.available_height, None);
+
+        let menu = Button::new("bounded-height")
+            .dropdown_menu(|menu, _, _| menu)
+            .available_height(px(152.), px(320.));
+        assert!(menu.auto_flip);
+        assert_eq!(menu.available_height, Some((px(152.), px(320.))));
+    }
 
     /// The story shape: the key binding lives in the key context of the
     /// trigger's ancestor, the menu names no `action_context`, and other

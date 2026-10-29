@@ -4,7 +4,7 @@
 
 use kerminal_application::sessions::UiSessionBinding;
 use kerminal_domain::{
-    identity::HostId,
+    identity::{HostId, TabId},
     operations::{ContainerRuntime, ContainerTarget},
 };
 
@@ -19,28 +19,33 @@ pub enum ContainerPanelUnavailableReason {
 }
 
 impl ContainerPanelUnavailableReason {
-    /// 将明确的 Root 判定转换成适合窄栏阅读的说明，不暴露内部 session 字段。
+    /// 不可用状态沿用 main 的无 SSH 宿主说明，不为本机或非 SSH 目标增加特殊引导。
+    ///
+    /// @author kongweiguang
     pub(super) fn label(self) -> (&'static str, &'static str) {
         match self {
-            Self::NoTerminal => ("请先打开一个终端。", "Open a terminal to use containers."),
+            Self::NoTerminal => (
+                "当前没有可用于容器管理的 SSH 主机。",
+                "No SSH host is available for container management.",
+            ),
             Self::NotReady => ("当前终端尚未就绪。", "The current terminal is not ready."),
             Self::TerminalEnded => (
-                "当前终端已结束或连接已断开，请使用终端的重新连接入口。",
-                "The terminal has ended or disconnected. Use the terminal's reconnect action.",
+                "当前 SSH 主机连接已结束。",
+                "The SSH host connection has ended.",
             ),
             Self::TargetMismatch => (
-                "当前终端目标已变化，请重新选择终端。",
-                "The terminal target changed; select the terminal again.",
+                "当前终端与容器 SSH 主机不匹配。",
+                "The active terminal does not match the container SSH host.",
             ),
             Self::UnsupportedProtocol => (
-                "当前终端协议不支持容器管理。",
-                "Containers are unavailable for this terminal protocol.",
+                "容器仅支持 SSH 主机上的 Docker 和 Podman。",
+                "Containers are supported only on SSH hosts using Docker and Podman.",
             ),
         }
     }
 }
 
-/// Root 校验后的显式容器面板上下文；binding 用于会话关联，不构成 MCP 权限边界。
+/// Root 校验后的显式面板上下文；文件 Tab 用真实 tab/host 身份，不伪造会话 binding。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContainerPanelContext {
     Unavailable {
@@ -49,6 +54,10 @@ pub enum ContainerPanelContext {
     Host {
         binding: UiSessionBinding,
         host_id: Option<HostId>,
+    },
+    WorkspaceHost {
+        tab_id: TabId,
+        host_id: HostId,
     },
     ContainerInfo {
         binding: UiSessionBinding,
@@ -98,7 +107,7 @@ pub(super) fn same_container_info_identity(
     )
 }
 
-/// 终端 running 边沿只更新提示；同一 binding 和 target 的在途读取仍有效。
+/// 运行状态边沿只更新提示；同一容器目标或宿主（包括文件 Tab）的在途读取仍有效。
 ///
 /// @author kongweiguang
 pub(super) fn same_read_context_scope(
@@ -108,8 +117,56 @@ pub(super) fn same_read_context_scope(
     match (current, expected) {
         (None, None) => true,
         (Some(current), Some(expected)) => {
-            current == expected || same_container_info_identity(current, expected)
+            current == expected
+                || same_container_info_identity(current, expected)
+                || same_host_context_scope(current, expected)
         }
+        _ => false,
+    }
+}
+
+/// 跨 pane 或文件 Tab 时可复用同宿主读取；写操作仍比较完整上下文身份。
+///
+/// @author kongweiguang
+pub(super) fn same_host_context_scope(
+    current: &ContainerPanelContext,
+    expected: &ContainerPanelContext,
+) -> bool {
+    match (current, expected) {
+        (
+            ContainerPanelContext::Host {
+                host_id: current, ..
+            },
+            ContainerPanelContext::Host {
+                host_id: expected, ..
+            },
+        ) => current == expected,
+        (
+            ContainerPanelContext::Host {
+                host_id: Some(current),
+                ..
+            },
+            ContainerPanelContext::WorkspaceHost {
+                host_id: expected, ..
+            },
+        )
+        | (
+            ContainerPanelContext::WorkspaceHost {
+                host_id: current, ..
+            },
+            ContainerPanelContext::Host {
+                host_id: Some(expected),
+                ..
+            },
+        ) => current == expected,
+        (
+            ContainerPanelContext::WorkspaceHost {
+                host_id: current, ..
+            },
+            ContainerPanelContext::WorkspaceHost {
+                host_id: expected, ..
+            },
+        ) => current == expected,
         _ => false,
     }
 }
@@ -123,13 +180,12 @@ pub(super) fn host_context_matches_target(
     runtime: ContainerRuntime,
     target: &ContainerTarget,
 ) -> bool {
-    matches!(
-        context,
-        ContainerPanelContext::Host { host_id: bound, .. }
-            if bound.as_ref() == host_id
-                && target.host_id.as_ref() == host_id
-                && target.runtime == runtime
-    )
+    let context_matches = match context {
+        ContainerPanelContext::Host { host_id: bound, .. } => bound.as_ref() == host_id,
+        ContainerPanelContext::WorkspaceHost { host_id: bound, .. } => Some(bound) == host_id,
+        _ => false,
+    };
+    context_matches && target.host_id.as_ref() == host_id && target.runtime == runtime
 }
 
 #[cfg(test)]

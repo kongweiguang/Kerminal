@@ -17,6 +17,45 @@ use crate::{
     theme::BackgroundMaterialSettings,
 };
 
+/// 分别选择的浅深色盘必须被生产运行态消费，跟随系统切换也不能退回旧通用值。
+/// @author kongweiguang
+#[test]
+fn terminal_palette_selection_tracks_theme_and_system_appearance() {
+    use crate::root::preferences::terminal_scheme_for_snapshot;
+    use gpui_kit::WindowAppearance;
+    let mut snapshot = SettingsSnapshot::default();
+    snapshot.terminal.light_color_scheme = TerminalColorScheme::Github;
+    snapshot.terminal.dark_color_scheme = TerminalColorScheme::TokyoNight;
+    for (mode, appearance, expected) in [
+        (
+            ThemeMode::Light,
+            WindowAppearance::Dark,
+            TerminalColorScheme::Github,
+        ),
+        (
+            ThemeMode::Dark,
+            WindowAppearance::Light,
+            TerminalColorScheme::TokyoNight,
+        ),
+        (
+            ThemeMode::System,
+            WindowAppearance::Light,
+            TerminalColorScheme::Github,
+        ),
+        (
+            ThemeMode::System,
+            WindowAppearance::Dark,
+            TerminalColorScheme::TokyoNight,
+        ),
+    ] {
+        snapshot.theme_mode = mode;
+        assert_eq!(
+            terminal_scheme_for_snapshot(&snapshot, appearance),
+            expected
+        );
+    }
+}
+
 /// 用明确可用的 GPUI 字体清单验证快照会跳过未安装的首选字体，再统一投影其它运行态字段。
 ///
 /// @author kongweiguang

@@ -99,6 +99,24 @@ pub(super) fn sync_visibility(
     cx: &mut Context<RootView>,
 ) {
     if root.snippet_editor_modal_open == open {
+        // 管理器切到编辑器仍是同一模态 owner；只在新内容挂载后移动内部焦点，不覆盖原返回焦点。
+        if open {
+            let generation = root.snippet_editor_modal_generation;
+            cx.on_next_frame(window, move |root, window, cx| {
+                if root.snippet_editor_modal_open
+                    && root.snippet_editor_modal_generation == generation
+                    && !root.preferences_modal_open
+                    && !root.connections_modal_open
+                    && root.custom_agent_manager.is_none()
+                    && !window.has_active_prompt()
+                    && let Some(commands) = root.commands_view.clone()
+                {
+                    commands.update(cx, |commands, cx| {
+                        commands.focus_snippet_overlay(window, cx)
+                    });
+                }
+            });
+        }
         return;
     }
 
@@ -123,7 +141,7 @@ pub(super) fn sync_visibility(
                 }
                 if let Some(commands) = root.commands_view.clone() {
                     commands.update(cx, |commands, cx| {
-                        commands.focus_snippet_editor(window, cx);
+                        commands.focus_snippet_overlay(window, cx);
                     });
                 }
             });
@@ -177,7 +195,7 @@ pub(super) fn handle_escape(root: &mut RootView, cx: &mut Context<RootView>) {
     }
 }
 
-/// 将编辑对话框提升到工作台根层；基础内容自然定高，长正文在视口上限内滚动，固定操作保持可见。
+/// 将编辑对话框提升到工作台根层；外框沿用 main 的圆角与遮罩，正文自行管理受限视口内的滚动。
 ///
 /// @author kongweiguang
 pub(super) fn render_overlay(
@@ -187,21 +205,24 @@ pub(super) fn render_overlay(
     cx: &mut Context<RootView>,
 ) -> Option<AnyElement> {
     let commands = root.commands_view.clone()?;
-    if !root.snippet_editor_modal_open || !commands.read(cx).snippet_editor_open() {
+    if !root.snippet_editor_modal_open || !commands.read(cx).snippet_overlay_open() {
         return None;
     }
 
     let dialog = commands.update(cx, |commands, cx| {
         commands
-            .render_snippet_editor_modal(theme, window, cx)
+            .render_snippet_overlay_modal(theme, window, cx)
             .into_any_element()
     });
     let backdrop_commands = commands.clone();
     let focus_handle = root.snippet_editor_modal_focus_handle.clone();
-    // 覆盖层上下各留 16px；矮窗口同步缩小弹层上限，避免内容越过可视区。
-    let max_surface_height = px((window.viewport_size().height.as_f32() - 32.0).clamp(0.0, 800.0));
+    // main 的编辑器固定为 min(36rem, 100vh - 48px)，管理器沿用 medium 的 34rem 上限。
+    // 限制属于模态宿主；正文只负责滚动，不能让长表单撑高到遮罩边缘。
+    let editor_open = commands.read(cx).snippet_editor_open();
+    let max_surface_height = px((window.viewport_size().height.as_f32() - 48.0)
+        .clamp(0.0, if editor_open { 576.0 } else { 544.0 }));
 
-    Some(
+    Some(crate::ui_backdrop::modal_backdrop(
         div()
             .id("workbench-snippet-editor-modal-overlay")
             .absolute()
@@ -211,34 +232,38 @@ pub(super) fn render_overlay(
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.38))
+            .bg(theme.dialog_scrim)
             .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                 backdrop_commands.update(cx, |commands, cx| {
-                    commands.close_snippet_editor(cx);
+                    commands.close_snippet_overlay(cx);
                 });
             }))
-            .child(
+            .child(crate::ui_backdrop::floating_surface(
                 div()
                     .id("workbench-snippet-editor-modal-surface")
                     .w_full()
                     .max_w(px(672.))
                     .max_h(max_surface_height)
+                    .when(editor_open, |surface| surface.h(max_surface_height))
                     .min_w(px(0.))
                     .min_h(px(0.))
                     .occlude()
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .rounded_lg()
+                    .rounded(theme.radius_dialog)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.panel)
+                    .bg(theme.floating_surface)
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .child(dialog)
                     .focus_trap("workbench-snippet-editor-focus-trap", &focus_handle),
-            )
+                theme,
+                theme.radius_dialog,
+            ))
             .into_any_element(),
-    )
+        theme,
+    ))
 }
 
 /// 在编辑弹层占用唯一 CommandsView 时提供无交互占位，绝不构造第二份编辑表单。

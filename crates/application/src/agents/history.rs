@@ -99,6 +99,7 @@ impl AgentSessionService {
             return Err(AppError::invalid("Agent title is required"));
         }
         let current = snapshot.session.clone();
+        let permission_mode = current.permission_mode;
         snapshot.session = AgentSession::restore(
             current.schema_version,
             current.agent_session_id,
@@ -115,6 +116,7 @@ impl AgentSessionService {
             current.target,
         )
         .map_err(domain_error)?;
+        snapshot.session.permission_mode = permission_mode;
         snapshot.revision = self
             .persist_session_only(&snapshot.session, snapshot.revision, &cancellation)
             .await?;

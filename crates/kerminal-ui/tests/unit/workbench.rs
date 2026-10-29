@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use gpui_kit::px;
 use kerminal_application::preferences::{
-    SettingsSnapshot, ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId,
+    InterfaceDensity, SettingsSnapshot, ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId,
     WorkbenchLayoutSettings,
 };
 use kerminal_application::workspace::{WorkspaceSessionSnapshot, WorkspaceSessionTab};
@@ -16,8 +16,9 @@ use kerminal_domain::{
 };
 
 use crate::root::workbench::{
-    ToolRailPanelSlots, ToolRailPanelState, attached_dock_default_width, focused_workspace_pane,
-    sidebar_expansion_needs_drawer, tool_rail_label, tool_rail_partition_min_height,
+    ToolRailPanelSlots, ToolRailPanelState, attached_dock_default_width,
+    compact_tool_drawer_should_be_visible, focused_workspace_pane, sidebar_expansion_needs_drawer,
+    tool_rail_button_height, tool_rail_label, tool_rail_partition_min_height,
 };
 
 /// 展开主机栏导致空间不足时必须立即给出目录抽屉，显式收起或宽窗不会补开。
@@ -31,7 +32,7 @@ fn sidebar_expansion_in_compact_budget_opens_a_reachable_drawer() {
     assert!(!sidebar_expansion_needs_drawer(true, false));
 }
 
-/// 窄窗右侧工具使用已记录宽度并夹紧到剩余区域，不能变成宽阔的中央弹框或写回偏好。
+/// 窄窗工具抽屉使用已记录宽度并夹紧到 440px 上限与剩余区域，不改写用户偏好。
 ///
 /// @author kongweiguang
 #[test]
@@ -40,36 +41,48 @@ fn compact_drawer_keeps_side_width_and_fits_the_actual_viewport() {
     assert_eq!(tool_drawer_width(832., 52., 44., 324.), 324.);
     assert_eq!(tool_drawer_width(300., 52., 44., 324.), 204.);
     assert_eq!(tool_drawer_width(40., 52., 44., 324.), 0.);
-    assert_eq!(tool_drawer_width(1200., 52., 44., 1000.), 1000.);
+    assert_eq!(tool_drawer_width(1200., 52., 44., 1000.), 440.);
     assert_eq!(tool_drawer_width(832., 52., 44., f32::NAN), 364.);
     assert_eq!(tool_drawer_width(832., 52., 44., 40.), 134.);
-    assert_eq!(tool_drawer_width(2000., 52., 44., 2000.), 1364.);
+    assert_eq!(tool_drawer_width(2000., 52., 44., 2000.), 440.);
 }
 
-/// 旧文件工具位置只影响兼容读回，实际永远右侧；重投影不改设置或另建业务实体。
+/// 文件与容器保留旧配置兼容，同时允许用户将其放到 main 支持的任一停靠位置。
 ///
 /// @author kongweiguang
 #[test]
-fn file_tool_legacy_placements_always_project_to_right_drawer_without_rewrite() {
-    for placement in [
-        ToolRailPanelPlacement::Center,
-        ToolRailPanelPlacement::Left,
-        ToolRailPanelPlacement::Bottom,
-        ToolRailPanelPlacement::Attached,
-    ] {
-        let mut settings = ToolRailSettings::default();
-        settings
-            .panel_placements
-            .insert(ToolRailToolId::Sftp, placement);
-        let original = settings.clone();
-        let mut state = ToolRailPanelState::default();
-        state.toggle(&settings, ToolRailToolId::Sftp);
-        let panels = state.reproject(&settings);
-        assert_eq!(panels.attached, Some(ToolRailToolId::Sftp));
-        assert_eq!(panels.left, None);
-        assert_eq!(panels.bottom, None);
-        assert_eq!(panels.center, None);
-        assert_eq!(settings, original);
+fn file_and_container_tools_follow_the_configured_panel_slot_without_rewriting_settings() {
+    for tool in [ToolRailToolId::Sftp, ToolRailToolId::Containers] {
+        for placement in [
+            ToolRailPanelPlacement::Center,
+            ToolRailPanelPlacement::Left,
+            ToolRailPanelPlacement::Bottom,
+            ToolRailPanelPlacement::Attached,
+        ] {
+            let mut settings = ToolRailSettings::default();
+            settings.panel_placements.insert(tool, placement);
+            let original = settings.clone();
+            let mut state = ToolRailPanelState::default();
+            state.toggle(&settings, tool);
+            let panels = state.reproject(&settings);
+            assert_eq!(
+                panels.attached,
+                (placement == ToolRailPanelPlacement::Attached).then_some(tool)
+            );
+            assert_eq!(
+                panels.left,
+                (placement == ToolRailPanelPlacement::Left).then_some(tool)
+            );
+            assert_eq!(
+                panels.bottom,
+                (placement == ToolRailPanelPlacement::Bottom).then_some(tool)
+            );
+            assert_eq!(
+                panels.center,
+                (placement == ToolRailPanelPlacement::Center).then_some(tool)
+            );
+            assert_eq!(settings, original);
+        }
     }
 }
 
@@ -98,12 +111,14 @@ fn terminal_tab(id: TabId, layout: TerminalLayoutNode) -> WorkspaceSessionTab {
 }
 
 /// 仅构造焦点解析所需的最小快照；其余应用校验由 WorkspaceSessionDocument 覆盖。
+/// @author kongweiguang
 fn snapshot(
     active_tab_id: Option<TabId>,
     focused_pane_id: Option<PaneId>,
     terminal_tabs: Vec<WorkspaceSessionTab>,
 ) -> WorkspaceSessionSnapshot {
     WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id,
         focused_pane_id,
         selected_machine_id: None,
@@ -137,10 +152,26 @@ fn container_tool_rail_uses_container_identity_and_default_width() {
     ));
     let label = tool_rail_label(ToolRailToolId::Containers).to_string();
     assert!(matches!(label.as_str(), "容器" | "Containers"));
-    assert_eq!(
-        attached_dock_default_width(ToolRailToolId::Containers, false),
-        px(364.)
-    );
+    assert_eq!(attached_dock_default_width(1500.0), px(320.));
+}
+
+/// Dock 默认外框宽度复用 main 的 24% 总宽规则，并单独保留 rail 和 gutter 的单位。
+///
+/// @author kongweiguang
+#[test]
+fn tool_panel_default_width_uses_main_viewport_ratio_and_bounds() {
+    use crate::root::workbench_layout::{
+        initial_tool_panel_width, main_attached_dock_total_to_gpui_content_width,
+    };
+
+    assert_eq!(initial_tool_panel_width(1200.0), 340.0);
+    assert_eq!(initial_tool_panel_width(1500.0), 360.0);
+    assert_eq!(initial_tool_panel_width(2000.0), 444.0);
+    assert_eq!(attached_dock_default_width(1200.0), px(300.));
+    assert_eq!(attached_dock_default_width(1500.0), px(320.));
+    assert_eq!(attached_dock_default_width(2000.0), px(404.));
+    assert_eq!(main_attached_dock_total_to_gpui_content_width(300.0), 256.0);
+    assert_eq!(main_attached_dock_total_to_gpui_content_width(360.0), 316.0);
 }
 
 /// 活动终端 split 的显式焦点 pane 应独占底部工具，不随渲染顺序切回第一 pane。
@@ -217,7 +248,7 @@ fn missing_focus_does_not_fall_back_to_first_pane() {
     assert_eq!(focused_workspace_pane(&state), None);
 }
 
-/// 工具入口顺序、隐藏/贴底与每个面板宿主分别生效，活动隐藏项仍可关闭。
+/// 工具入口顺序、隐藏/贴底与四向宿主分别生效；文件位置显式配置，不依赖旧版强制右侧行为。
 ///
 /// @author kongweiguang
 #[test]
@@ -238,7 +269,7 @@ fn tool_rail_settings_project_entries_and_distinct_panel_hosts() {
     };
     settings
         .panel_placements
-        .insert(ToolRailToolId::Sftp, ToolRailPanelPlacement::Left);
+        .insert(ToolRailToolId::Sftp, ToolRailPanelPlacement::Attached);
     settings
         .panel_placements
         .insert(ToolRailToolId::System, ToolRailPanelPlacement::Left);
@@ -284,7 +315,7 @@ fn tool_rail_settings_project_entries_and_distinct_panel_hosts() {
     assert!(!layout.entries.main.contains(&ToolRailToolId::Snippets));
 }
 
-/// 设置移动普通宿主保留打开意图，文件的历史左侧值不再参与该方向的碰撞。
+/// 文件参与正常位置投影，设置移动后同方向只保留最近打开项，不把被替换项藏在右侧。
 ///
 /// @author kongweiguang
 #[test]
@@ -300,7 +331,11 @@ fn tool_rail_reprojects_open_panels_after_settings_move() {
     state.toggle(&settings, ToolRailToolId::Sftp);
     state.toggle(&settings, ToolRailToolId::Snippets);
 
-    // 历史 SFTP 左侧值保留在配置中，但文件固定右侧，不会被新的左侧工具挤掉。
+    assert_eq!(
+        state.project(&settings).panels.left,
+        Some(ToolRailToolId::Sftp)
+    );
+    // 两个已打开工具移到同方向时保留较新者；不会凭空生成第二个宿主。
     settings
         .panel_placements
         .insert(ToolRailToolId::Sftp, ToolRailPanelPlacement::Left);
@@ -310,10 +345,12 @@ fn tool_rail_reprojects_open_panels_after_settings_move() {
     let slots = state.reproject(&settings);
 
     assert_eq!(slots.left, Some(ToolRailToolId::Snippets));
-    assert_eq!(slots.attached, Some(ToolRailToolId::Sftp));
+    assert_eq!(slots.attached, None);
+    assert_eq!(slots.center, None);
+    assert_eq!(state.open_order, [ToolRailToolId::Snippets]);
 }
 
-/// 每个停靠区最近打开的工具单独保留，点击当前工具则只关闭该面板。
+/// 文件与其它工具遵循同方向替换；关闭当前工具不复活已被替换的面板，不影响其它方向。
 ///
 /// @author kongweiguang
 #[test]
@@ -336,7 +373,8 @@ fn tool_rail_toggle_preserves_other_zones_and_closes_current() {
     let slots = state.reproject(&settings);
     assert_eq!(slots.center, Some(ToolRailToolId::Logs));
     assert_eq!(slots.left, Some(ToolRailToolId::System));
-    assert_eq!(slots.attached, Some(ToolRailToolId::Sftp));
+    assert_eq!(slots.attached, None);
+    assert!(!state.open_order.contains(&ToolRailToolId::Sftp));
 
     state.toggle(&settings, ToolRailToolId::System);
     assert_eq!(state.reproject(&settings).left, None);
@@ -440,22 +478,10 @@ fn legacy_context_visibility_keeps_one_real_tool_discoverable() {
 /// @author kongweiguang
 #[test]
 fn attached_tool_defaults_keep_sftp_and_agent_width_rules() {
-    assert_eq!(
-        attached_dock_default_width(ToolRailToolId::Sftp, false),
-        px(364.)
-    );
-    assert_eq!(
-        attached_dock_default_width(ToolRailToolId::AgentLauncher, false),
-        px(364.)
-    );
-    assert_eq!(
-        attached_dock_default_width(ToolRailToolId::AgentLauncher, true),
-        px(364.)
-    );
-    assert_eq!(
-        attached_dock_default_width(ToolRailToolId::Context, true),
-        px(364.)
-    );
+    assert_eq!(attached_dock_default_width(1500.0), px(320.));
+    assert_eq!(attached_dock_default_width(1500.0), px(320.));
+    assert_eq!(attached_dock_default_width(1500.0), px(320.));
+    assert_eq!(attached_dock_default_width(1500.0), px(320.));
 }
 
 /// 非空 Rail 底部分区保留一个可命中的图标高度，空分区不制造空白占位。
@@ -463,11 +489,19 @@ fn attached_tool_defaults_keep_sftp_and_agent_width_rules() {
 /// @author kongweiguang
 #[test]
 fn rail_bottom_partition_minimum_preserves_one_click_target() {
-    assert_eq!(tool_rail_partition_min_height(&[]), px(0.));
-    assert_eq!(
-        tool_rail_partition_min_height(&[ToolRailToolId::Logs]),
-        px(32.)
-    );
+    for (density, expected_height) in [
+        (InterfaceDensity::Compact, 28.0),
+        (InterfaceDensity::Comfortable, 32.0),
+        (InterfaceDensity::Spacious, 36.0),
+    ] {
+        let button_height = tool_rail_button_height(density);
+        assert_eq!(button_height, expected_height);
+        assert_eq!(tool_rail_partition_min_height(&[], button_height), px(0.));
+        assert_eq!(
+            tool_rail_partition_min_height(&[ToolRailToolId::Logs], button_height),
+            px(expected_height)
+        );
+    }
 }
 
 /// 自定义宽度在所有工具间共享；切换宿主不改变尺寸，拖回默认值会清除共享覆盖。
@@ -476,9 +510,9 @@ fn rail_bottom_partition_minimum_preserves_one_click_target() {
 #[test]
 fn attached_width_memory_is_shared_across_tools_and_default_resets_it() {
     let mut state = ToolRailPanelState::default();
-    let sftp_default = attached_dock_default_width(ToolRailToolId::Sftp, false);
-    let containers_default = attached_dock_default_width(ToolRailToolId::Containers, false);
-    let agent_default = attached_dock_default_width(ToolRailToolId::AgentLauncher, false);
+    let sftp_default = attached_dock_default_width(1500.0);
+    let containers_default = attached_dock_default_width(1500.0);
+    let agent_default = attached_dock_default_width(1500.0);
 
     state.remember_attached_width(ToolRailToolId::Sftp, sftp_default, sftp_default);
     state.remember_attached_width(ToolRailToolId::Containers, px(604.), containers_default);
@@ -527,12 +561,16 @@ fn tool_open_order_is_cached_per_tab_and_pruned_when_tabs_close() {
     assert_eq!(first_panels.bottom, Some(ToolRailToolId::Logs));
 
     assert_eq!(
-        state.activate_tab(Some(second_tab.clone()), &live_tabs, true),
+        state.activate_tab(Some(second_tab.clone()), &live_tabs, false),
         Some(false)
     );
     assert_eq!(
         state.project(&settings).panels,
-        ToolRailPanelSlots::default()
+        ToolRailPanelSlots {
+            attached: Some(ToolRailToolId::Sftp),
+            bottom: Some(ToolRailToolId::Logs),
+            ..ToolRailPanelSlots::default()
+        }
     );
     state.toggle(&settings, ToolRailToolId::Containers);
     assert_eq!(
@@ -541,15 +579,15 @@ fn tool_open_order_is_cached_per_tab_and_pruned_when_tabs_close() {
     );
 
     assert_eq!(
-        state.activate_tab(Some(first_tab.clone()), &live_tabs, false),
-        Some(true)
+        state.activate_tab(Some(first_tab.clone()), &live_tabs, true),
+        Some(false)
     );
     let first_panels = state.project(&settings).panels;
     assert_eq!(first_panels.attached, Some(ToolRailToolId::Sftp));
     assert_eq!(first_panels.bottom, Some(ToolRailToolId::Logs));
     assert_eq!(
-        state.activate_tab(Some(second_tab.clone()), &live_tabs, true),
-        Some(false)
+        state.activate_tab(Some(second_tab.clone()), &live_tabs, false),
+        Some(true)
     );
     assert_eq!(
         state.project(&settings).panels.attached,
@@ -557,8 +595,8 @@ fn tool_open_order_is_cached_per_tab_and_pruned_when_tabs_close() {
     );
 
     assert_eq!(
-        state.activate_tab(Some(first_tab.clone()), &[first_tab], false),
-        Some(true)
+        state.activate_tab(Some(first_tab.clone()), &[first_tab], true),
+        Some(false)
     );
     assert!(
         !state
@@ -572,6 +610,172 @@ fn tool_open_order_is_cached_per_tab_and_pruned_when_tabs_close() {
     );
 }
 
+/// 窄屏抽屉跟随当前 Tab 的活动工具；宽转窄、Tab 恢复和显式关闭都由同一打开集合投影决定。
+///
+/// @author kongweiguang
+#[test]
+fn compact_tool_drawer_tracks_viewport_tab_and_explicit_close_state() {
+    use crate::root::workbench_layout::{WorkbenchLayoutInput, resolve_workbench_layout};
+
+    let first_tab = TabId::parse("drawer-first").expect("valid tab ID");
+    let second_tab = TabId::parse("drawer-second").expect("valid tab ID");
+    let live_tabs = [first_tab.clone(), second_tab.clone()];
+    let mut settings = ToolRailSettings::default();
+    settings
+        .panel_placements
+        .insert(ToolRailToolId::Sftp, ToolRailPanelPlacement::Attached);
+    settings
+        .panel_placements
+        .insert(ToolRailToolId::Logs, ToolRailPanelPlacement::Left);
+    let mut state = ToolRailPanelState::default();
+    assert_eq!(
+        state.activate_tab(Some(first_tab.clone()), &live_tabs, false),
+        Some(false)
+    );
+    state.toggle(&settings, ToolRailToolId::Sftp);
+    state.toggle(&settings, ToolRailToolId::Logs);
+
+    let compact_target = |state: &mut ToolRailPanelState, width: f32| {
+        let panels = state.project(&settings).panels;
+        let plan = resolve_workbench_layout(&WorkbenchLayoutInput {
+            viewport_width: width,
+            viewport_height: 900.0,
+            host_sidebar_collapsed: false,
+            right_dock_collapsed: false,
+            host_sidebar_preferred_width: 220.0,
+            attached_dock_preferred_width: 420.0,
+            left_tool_panel_preferred_width: 320.0,
+            left_tool_open: panels.left.is_some(),
+            attached_tool_open: panels.attached.is_some(),
+            bottom_tool_open: panels.bottom.is_some(),
+            focused_tools_height: 0.0,
+            focused_tools_expanded_height: 0.0,
+            status_bar_height: 26.0,
+            reserved_vertical_height: 0.0,
+            open_tool_order: &state.open_order,
+        });
+        let active = plan.compact_active_tool;
+        compact_tool_drawer_should_be_visible(plan.compact_panels, active, false)
+            .then_some(active)
+            .flatten()
+    };
+
+    assert_eq!(compact_target(&mut state, 1_800.0), None);
+    assert_eq!(
+        compact_target(&mut state, 832.0),
+        Some(ToolRailToolId::Logs)
+    );
+    assert!(!compact_tool_drawer_should_be_visible(
+        true,
+        Some(ToolRailToolId::Logs),
+        true,
+    ));
+
+    assert_eq!(
+        state.activate_tab(Some(second_tab.clone()), &live_tabs, false),
+        Some(false)
+    );
+    state.toggle(&settings, ToolRailToolId::Logs);
+    assert_eq!(
+        compact_target(&mut state, 832.0),
+        Some(ToolRailToolId::Sftp)
+    );
+    assert_eq!(
+        state.activate_tab(Some(first_tab.clone()), &live_tabs, false),
+        Some(false)
+    );
+    assert_eq!(
+        compact_target(&mut state, 832.0),
+        Some(ToolRailToolId::Logs)
+    );
+
+    assert!(state.close(&settings, ToolRailToolId::Logs));
+    assert_eq!(
+        compact_target(&mut state, 832.0),
+        Some(ToolRailToolId::Sftp)
+    );
+    assert!(state.close(&settings, ToolRailToolId::Sftp));
+    assert_eq!(compact_target(&mut state, 832.0), None);
+}
+
+/// Main 的浮窗以 Shell 内居中为首态，拖动超出可视区域时保留标题栏和面板边缘。
+///
+/// @author kongweiguang
+#[test]
+fn floating_panel_starts_centered_and_drag_stays_inside_the_workbench() {
+    use crate::root::workbench_layout::{
+        FloatingPanelPosition, floating_panel_geometry, initial_floating_panel_position,
+    };
+
+    let geometry = floating_panel_geometry(1440.0, 864.0);
+    assert_eq!(geometry.width, 760.0);
+    assert_eq!(geometry.height, 720.0);
+    let initial = initial_floating_panel_position(1440.0, 864.0, geometry);
+    assert_eq!(initial, FloatingPanelPosition { x: 340, y: 76 });
+
+    let tool = ToolRailToolId::Snippets;
+    let mut keyboard_state = ToolRailPanelState::default();
+    assert!(keyboard_state.nudge_floating_position(
+        tool,
+        initial,
+        (12, -12),
+        1440.0,
+        864.0,
+        geometry
+    ));
+    assert_eq!(
+        keyboard_state.floating_position(tool),
+        Some(FloatingPanelPosition { x: 352, y: 64 })
+    );
+    assert!(keyboard_state.nudge_floating_position(
+        tool,
+        initial,
+        (40, 40),
+        1440.0,
+        864.0,
+        geometry
+    ));
+    assert_eq!(
+        keyboard_state.floating_position(tool),
+        Some(FloatingPanelPosition { x: 392, y: 104 })
+    );
+    keyboard_state.set_floating_position(tool, FloatingPanelPosition { x: 672, y: 136 });
+    assert!(!keyboard_state.nudge_floating_position(
+        tool,
+        initial,
+        (12, 12),
+        1440.0,
+        864.0,
+        geometry
+    ));
+
+    let mut state = ToolRailPanelState::default();
+    state.set_floating_position(tool, initial);
+    state.begin_floating_drag(tool, 400.0, 100.0, initial);
+    assert!(state.update_floating_drag(3_000.0, 900.0, 1440.0, 864.0, geometry));
+    assert_eq!(
+        state.floating_position(tool),
+        Some(FloatingPanelPosition { x: 672, y: 136 })
+    );
+    assert!(state.finish_floating_drag());
+    assert!(!state.floating_drag_is_active());
+
+    state.begin_floating_drag(tool, 400.0, 100.0, initial);
+    assert!(state.update_floating_drag(460.0, 160.0, 1440.0, 864.0, geometry));
+    assert!(state.cancel_floating_drag());
+    assert_eq!(state.floating_position(tool), Some(initial));
+    assert!(!state.floating_drag_is_active());
+
+    let mut settings = ToolRailSettings::default();
+    settings
+        .panel_placements
+        .insert(tool, ToolRailPanelPlacement::Center);
+    state.toggle(&settings, tool);
+    state.begin_floating_drag(tool, 400.0, 100.0, initial);
+    assert!(state.close(&settings, tool));
+    assert!(!state.floating_drag_is_active());
+}
+
 /// 只有当前活动宿主的显式拖动能写入宽度记忆，旧工具的迟到回调不会污染另一个工具。
 ///
 /// @author kongweiguang
@@ -581,10 +785,7 @@ fn attached_width_memory_accepts_only_current_user_resize() {
     let agent_width = px(392.);
     state.set_attached_tool(
         Some(ToolRailToolId::AgentLauncher),
-        Some(attached_dock_default_width(
-            ToolRailToolId::AgentLauncher,
-            false,
-        )),
+        Some(attached_dock_default_width(1500.0)),
     );
 
     assert!(!state.remember_user_resize(ToolRailToolId::Sftp, px(548.)));
@@ -598,7 +799,7 @@ fn attached_width_memory_accepts_only_current_user_resize() {
 
     state.set_attached_tool(
         Some(ToolRailToolId::Sftp),
-        Some(attached_dock_default_width(ToolRailToolId::Sftp, false)),
+        Some(attached_dock_default_width(1500.0)),
     );
     assert!(!state.remember_user_resize(ToolRailToolId::AgentLauncher, px(420.)));
     assert_eq!(
@@ -617,8 +818,8 @@ fn attached_width_memory_accepts_only_current_user_resize() {
 #[test]
 fn agent_default_width_updates_without_erasing_custom_widths() {
     let mut state = ToolRailPanelState::default();
-    let empty_default = attached_dock_default_width(ToolRailToolId::AgentLauncher, false);
-    let running_default = attached_dock_default_width(ToolRailToolId::AgentLauncher, true);
+    let empty_default = attached_dock_default_width(1500.0);
+    let running_default = attached_dock_default_width(1500.0);
     state.set_attached_tool(Some(ToolRailToolId::AgentLauncher), Some(empty_default));
 
     state.remember_attached_width(ToolRailToolId::AgentLauncher, px(392.), empty_default);
@@ -646,8 +847,8 @@ fn agent_default_width_updates_without_erasing_custom_widths() {
 fn agent_content_width_transition_requests_one_default_restore() {
     let mut state = ToolRailPanelState::default();
     let tool = ToolRailToolId::AgentLauncher;
-    let empty = attached_dock_default_width(tool, false);
-    let running = attached_dock_default_width(tool, true);
+    let empty = attached_dock_default_width(1500.0);
+    let running = attached_dock_default_width(1500.0);
     state.set_attached_tool(Some(tool), Some(empty));
 
     assert!(!state.update_attached_default_width(tool, running));

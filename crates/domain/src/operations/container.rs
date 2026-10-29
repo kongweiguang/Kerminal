@@ -107,6 +107,9 @@ pub struct ContainerInspect {
     pub user: Option<String>,
     pub ports: Vec<String>,
     pub networks: Vec<String>,
+    /// 详情展示来自本次 inspect；保持既有 MCP/持久化序列化投影，避免 UI 补齐字段改变外部契约。
+    #[serde(skip)]
+    pub labels: Vec<(String, String)>,
 }
 
 /// 容器资源快照；原始文本仅用于展示，计算字段继续保持可空。

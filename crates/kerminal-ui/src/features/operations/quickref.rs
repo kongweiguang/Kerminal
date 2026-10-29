@@ -25,21 +25,21 @@ const COMMANDS: [TmuxQuickrefItem; 10] = [
         kind: TmuxQuickrefKind::Command,
     },
     TmuxQuickrefItem {
-        label_zh: "新建 work 会话",
+        label_zh: "新建名为 work 的会话",
         label_en: "Create work session",
         display: "tmux new -s work",
         payload: "tmux new -s work",
         kind: TmuxQuickrefKind::Command,
     },
     TmuxQuickrefItem {
-        label_zh: "连接 work 会话",
+        label_zh: "连接到 work 会话",
         label_en: "Attach to work",
         display: "tmux attach -t work",
         payload: "tmux attach -t work",
         kind: TmuxQuickrefKind::Command,
     },
     TmuxQuickrefItem {
-        label_zh: "命令方式分离",
+        label_zh: "命令方式退出当前连接",
         label_en: "Detach client",
         display: "tmux detach-client",
         payload: "tmux detach-client",
@@ -53,7 +53,7 @@ const COMMANDS: [TmuxQuickrefItem; 10] = [
         kind: TmuxQuickrefKind::Command,
     },
     TmuxQuickrefItem {
-        label_zh: "新建 logs 窗口",
+        label_zh: "新建名为 logs 的窗口",
         label_en: "Create logs window",
         display: "tmux new-window -n logs",
         payload: "tmux new-window -n logs",
@@ -74,14 +74,14 @@ const COMMANDS: [TmuxQuickrefItem; 10] = [
         kind: TmuxQuickrefKind::Command,
     },
     TmuxQuickrefItem {
-        label_zh: "查看 work 窗口",
+        label_zh: "查看 work 会话窗口",
         label_en: "List work windows",
         display: "tmux list-windows -t work",
         payload: "tmux list-windows -t work",
         kind: TmuxQuickrefKind::Command,
     },
     TmuxQuickrefItem {
-        label_zh: "重新加载配置",
+        label_zh: "重新加载 tmux 配置",
         label_en: "Reload tmux config",
         display: "tmux source-file ~/.tmux.conf",
         payload: "tmux source-file ~/.tmux.conf",
@@ -91,7 +91,7 @@ const COMMANDS: [TmuxQuickrefItem; 10] = [
 
 const SHORTCUTS: [TmuxQuickrefItem; 10] = [
     TmuxQuickrefItem {
-        label_zh: "退出当前连接",
+        label_zh: "快捷键退出当前 tmux 连接",
         label_en: "Detach client",
         display: "Ctrl-b d",
         payload: "\u{2}d",
@@ -105,14 +105,14 @@ const SHORTCUTS: [TmuxQuickrefItem; 10] = [
         kind: TmuxQuickrefKind::Shortcut,
     },
     TmuxQuickrefItem {
-        label_zh: "下一个窗口",
+        label_zh: "切到下一个窗口",
         label_en: "Next window",
         display: "Ctrl-b n",
         payload: "\u{2}n",
         kind: TmuxQuickrefKind::Shortcut,
     },
     TmuxQuickrefItem {
-        label_zh: "上一个窗口",
+        label_zh: "切到上一个窗口",
         label_en: "Previous window",
         display: "Ctrl-b p",
         payload: "\u{2}p",
@@ -133,14 +133,14 @@ const SHORTCUTS: [TmuxQuickrefItem; 10] = [
         kind: TmuxQuickrefKind::Shortcut,
     },
     TmuxQuickrefItem {
-        label_zh: "切换分屏",
+        label_zh: "切换到下一个分屏",
         label_en: "Next pane",
         display: "Ctrl-b o",
         payload: "\u{2}o",
         kind: TmuxQuickrefKind::Shortcut,
     },
     TmuxQuickrefItem {
-        label_zh: "关闭当前分屏（会确认）",
+        label_zh: "关闭当前分屏，tmux 会确认",
         label_en: "Close pane (prompts)",
         display: "Ctrl-b x",
         payload: "\u{2}x",
@@ -154,7 +154,7 @@ const SHORTCUTS: [TmuxQuickrefItem; 10] = [
         kind: TmuxQuickrefKind::Shortcut,
     },
     TmuxQuickrefItem {
-        label_zh: "查看快捷键",
+        label_zh: "查看 tmux 快捷键列表",
         label_en: "List key bindings",
         display: "Ctrl-b ?",
         payload: "\u{2}?",

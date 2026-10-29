@@ -2,9 +2,51 @@
 //!
 //! @author kongweiguang
 
-use super::{compose_config_endpoint, kill_session_result_message, tmux_session_creation_enabled};
+use super::{
+    compose_config_endpoint, kill_session_result_message, tmux_mutation_feedback,
+    tmux_session_creation_enabled,
+};
 use kerminal_application::{AppError, operations::TmuxCapability};
 use kerminal_domain::{files::FileEndpoint, identity::HostId};
+
+/// 隐藏确定成功反馈不能吞掉刷新失败或未知结果；后者仍需用户回读原会话。
+#[test]
+fn compact_tmux_feedback_keeps_unconfirmed_results_visible() {
+    use kerminal_domain::operations::{TmuxMutationReceipt, TmuxSession};
+    let receipt = TmuxMutationReceipt {
+        session: TmuxSession {
+            id: "$fixture".into(),
+            name: "fixture".into(),
+            attached: false,
+            clients: 0,
+            windows: 1,
+            current_path: None,
+            created_at: None,
+            activity_at: None,
+            target_ref: "local".into(),
+        },
+        refresh_required: false,
+    };
+    assert!(tmux_mutation_feedback(Ok(receipt.clone()), false, true).is_none());
+    assert!(tmux_mutation_feedback(Ok(receipt.clone()), false, false).is_some());
+    assert!(
+        tmux_mutation_feedback(
+            Ok(TmuxMutationReceipt {
+                refresh_required: true,
+                ..receipt
+            }),
+            false,
+            true
+        )
+        .is_some()
+    );
+    let unknown = AppError::outcome_unknown("tmux result lost");
+    let expected = unknown.public_message().to_owned();
+    assert_eq!(
+        tmux_mutation_feedback(Err(unknown), true, true).as_deref(),
+        Some(expected.as_str())
+    );
+}
 
 /// 应用层明确返回未删除时，界面必须说明没有执行结束操作。
 #[test]

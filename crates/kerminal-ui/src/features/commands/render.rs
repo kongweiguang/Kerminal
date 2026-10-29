@@ -29,11 +29,16 @@ mod workflows;
 
 impl Render for CommandsView {
     /// 右栏片段把分类导航收进列表，只保留一次任务标题；其它紧凑页面仍使用共享导航，避免丢失工作区入口。
-    /// 根层与状态条沿用统一材质，避免工具内部另起一块不透明背景。
+    /// 根层与状态条沿用统一材质；右栏使用局部中性色阶，避免影响同实体的中央工作区呈现。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ThemeTokens::current(window, cx);
+        let theme = if self.compact_layout {
+            theme.for_tool_panel()
+        } else {
+            theme
+        };
         let show_navigation = !(self.compact_layout && self.section == CommandsSection::Snippets);
         let navigation =
             show_navigation.then(|| self.render_navigation(theme, cx).into_any_element());
@@ -51,7 +56,13 @@ impl Render for CommandsView {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(theme.materials.shell)
+            .bg(
+                if self.compact_layout && self.section == CommandsSection::Snippets {
+                    theme.tool_panel_surface
+                } else {
+                    theme.materials.shell
+                },
+            )
             .text_color(theme.foreground)
             .child(self.render_header(theme))
             .when_some(navigation, |view, navigation| view.child(navigation))
@@ -91,8 +102,7 @@ impl Render for CommandsView {
 }
 
 impl CommandsView {
-    /// 紧凑工具栏直接标明当前任务；片段的精确目标统一放在列表工具栏，避免重复占高。
-    /// 其余页面保留目标与加载提示，长目标不能挤占标题或缩小字号。
+    /// 片段标题占用 main 抽屉内边距、标题和下方间距的总高度；其它紧凑页保留目标与加载提示。
     ///
     /// @author kongweiguang
     fn render_header(&self, theme: ThemeTokens) -> impl IntoElement {
@@ -117,13 +127,16 @@ impl CommandsView {
             .unwrap_or_else(|| {
                 crate::locale::text("未选择终端", "No terminal selected").to_string()
             });
-        let mut header = div()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_2()
-            .bg(theme.materials.chrome);
-        header = if self.compact_layout {
+        let mut header = div().w_full().flex().items_center().gap_2().bg(
+            if self.compact_layout && self.section == CommandsSection::Snippets {
+                theme.tool_panel_surface
+            } else {
+                theme.materials.chrome
+            },
+        );
+        header = if self.compact_layout && self.section == CommandsSection::Snippets {
+            header.h(px(52.)).px_3()
+        } else if self.compact_layout {
             header.h(px(40.)).px_2()
         } else {
             header.h(px(52.)).px_4()
@@ -133,11 +146,15 @@ impl CommandsView {
                 div()
                     .flex_1()
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .text_size(if self.compact_layout {
-                        theme.text_title
-                    } else {
-                        theme.text_heading
-                    })
+                    .text_size(
+                        if self.compact_layout && self.section == CommandsSection::Snippets {
+                            px(18.)
+                        } else if self.compact_layout {
+                            theme.text_title
+                        } else {
+                            theme.text_heading
+                        },
+                    )
                     .child(if self.compact_layout {
                         match self.section {
                             CommandsSection::History => crate::locale::text("历史", "History"),

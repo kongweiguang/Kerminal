@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::AppResult;
+use crate::{AppError, AppResult, PublicErrorCode};
 
 /// 仓库状态与操作错误分离，让尚未配置 Git 的数据目录仍能显示配置页面。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -51,6 +51,14 @@ pub struct ConfigurationSyncStatus {
     pub missing_ignore_rules: Vec<String>,
 }
 
+/// 同步设置页展示的真实数据根与 Vault key 路径；不包含文件内容。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigurationWorkspaceInfo {
+    pub workspace_root: String,
+    pub vault_key_path: String,
+}
+
 /// 用户显式触发的 Git 动作；fetch 不会隐含检出或推送。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,11 +94,25 @@ pub struct ConfigurationSyncOperationResult {
     pub commit_hash: Option<String>,
 }
 
+/// 一次完整同步的阶段回执；阶段结果保留，避免把部分成功误报为整体成功。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigurationSyncRunResult {
+    pub outcome: ConfigurationSyncOutcome,
+    pub summary: String,
+    pub stages: Vec<ConfigurationSyncOperationResult>,
+}
+
 /// 基础设施端口；所有变更动作都需显式调用并接收调用方的取消令牌。
 #[async_trait]
 pub trait ConfigurationSyncRepository: Send + Sync + 'static {
     /// 只读取仓库状态，不修改文件、引用或远端。
     async fn status(&self) -> AppResult<ConfigurationSyncStatus>;
+
+    /// 返回本地同步对象的展示路径；默认缺失用于不支持路径投影的测试或其他 adapter。
+    async fn workspace_info(&self) -> AppResult<Option<ConfigurationWorkspaceInfo>> {
+        Ok(None)
+    }
 
     /// 仅获取远端引用，不检出或合并远端内容。
     async fn fetch(
@@ -146,6 +168,142 @@ impl ConfigurationSyncService {
         self.repository.status().await
     }
 
+    /// 只公开 repository 已验证的数据根和固定 key 路径，不由 UI 猜测配置目录。
+    pub async fn workspace_info(&self) -> AppResult<Option<ConfigurationWorkspaceInfo>> {
+        self.repository.workspace_info().await
+    }
+
+    /// 把安全的原子 Git 操作编排为设置页的单次同步动作；每一步失败都保留已完成阶段。
+    pub async fn synchronize(
+        &self,
+        cancellation: CancellationToken,
+    ) -> AppResult<ConfigurationSyncRunResult> {
+        use ConfigurationSyncOutcome as Outcome;
+
+        let mut status = self.status().await?;
+        if !status.git_available {
+            return Ok(sync_blocked("未找到 Git，无法同步。"));
+        }
+        if !status.writable {
+            return Ok(sync_blocked("配置处于只读恢复状态，无法同步。"));
+        }
+        if status.repository != SyncRepositoryState::Ready
+            && status.repository != SyncRepositoryState::NoUpstream
+        {
+            return Ok(sync_blocked(match status.repository {
+                SyncRepositoryState::Missing => "Git 仓库尚未初始化，无法同步。",
+                SyncRepositoryState::Detached => "当前处于 detached HEAD，无法同步。",
+                SyncRepositoryState::PendingBusy => "Git 上次操作仍在清理，请稍后重试。",
+                SyncRepositoryState::Ready | SyncRepositoryState::NoUpstream => {
+                    "当前仓库状态发生变化，请刷新后重试。"
+                }
+            }));
+        }
+        if status.rebase_in_progress || !status.conflicts.is_empty() {
+            return Ok(sync_blocked("当前仓库存在未解决的变基冲突，请先处理。"));
+        }
+        if status.upstream.is_some() && !status.protected_changes.is_empty() {
+            return Ok(sync_blocked(
+                "受保护文件存在本地变更，当前不能应用远端内容。",
+            ));
+        }
+
+        let mut stages = Vec::new();
+        if !status.local_changes.is_empty() {
+            let result = match self.commit(cancellation.clone()).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(sync_run_from_stages(
+                        sync_error_outcome(&error),
+                        error.public_message(),
+                        stages,
+                    ));
+                }
+            };
+            let outcome = result.outcome;
+            stages.push(result);
+            if !matches!(outcome, Outcome::Succeeded | Outcome::NoChanges) {
+                return Ok(sync_run_from_stages(outcome, "本地变更未能提交。", stages));
+            }
+            status = match self.status().await {
+                Ok(status) => status,
+                Err(error) => {
+                    return Ok(sync_run_from_stages(
+                        sync_error_outcome(&error),
+                        error.public_message(),
+                        stages,
+                    ));
+                }
+            };
+        }
+
+        if status.upstream.is_some() {
+            let result = match self.pull(cancellation.clone()).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(sync_run_from_stages(
+                        sync_error_outcome(&error),
+                        error.public_message(),
+                        stages,
+                    ));
+                }
+            };
+            let outcome = result.outcome;
+            stages.push(result);
+            if !matches!(outcome, Outcome::Succeeded | Outcome::NoChanges) {
+                return Ok(sync_run_from_stages(
+                    outcome,
+                    "拉取远端内容未完成。",
+                    stages,
+                ));
+            }
+            status = match self.status().await {
+                Ok(status) => status,
+                Err(error) => {
+                    return Ok(sync_run_from_stages(
+                        sync_error_outcome(&error),
+                        error.public_message(),
+                        stages,
+                    ));
+                }
+            };
+        }
+
+        if status.upstream.is_some() && status.ahead.unwrap_or_default() > 0 {
+            let result = match self.push(cancellation).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(sync_run_from_stages(
+                        sync_error_outcome(&error),
+                        error.public_message(),
+                        stages,
+                    ));
+                }
+            };
+            let outcome = result.outcome;
+            stages.push(result);
+            if !matches!(outcome, Outcome::Succeeded | Outcome::NoChanges) {
+                return Ok(sync_run_from_stages(outcome, "本地提交尚未推送。", stages));
+            }
+        }
+
+        let outcome = if stages.is_empty() {
+            Outcome::NoChanges
+        } else {
+            Outcome::Succeeded
+        };
+        let summary = if status.upstream.is_none() && stages.is_empty() {
+            "工作区没有需要提交的变更；当前分支没有上游，未执行远端同步。"
+        } else if status.upstream.is_none() {
+            "本地变更已提交；当前分支没有上游，未执行远端同步。"
+        } else if stages.is_empty() {
+            "配置已是最新状态，没有需要同步的变更。"
+        } else {
+            "已完成本地提交、远端变基与可推送提交的同步。"
+        };
+        Ok(sync_run_from_stages(outcome, summary, stages))
+    }
+
     /// 单独获取远端引用；不会检出本地文件。
     pub async fn fetch(
         &self,
@@ -192,5 +350,37 @@ impl ConfigurationSyncService {
         cancellation: CancellationToken,
     ) -> AppResult<ConfigurationSyncOperationResult> {
         self.repository.abort_rebase(cancellation).await
+    }
+}
+
+/// 用稳定的无阶段回执表达可恢复的同步前置条件失败。
+fn sync_blocked(summary: &str) -> ConfigurationSyncRunResult {
+    ConfigurationSyncRunResult {
+        outcome: ConfigurationSyncOutcome::Blocked,
+        summary: summary.to_owned(),
+        stages: Vec::new(),
+    }
+}
+
+/// 保留阶段回执并给失败说明补充本次操作的具体上下文。
+fn sync_run_from_stages(
+    outcome: ConfigurationSyncOutcome,
+    summary: &str,
+    stages: Vec<ConfigurationSyncOperationResult>,
+) -> ConfigurationSyncRunResult {
+    ConfigurationSyncRunResult {
+        outcome,
+        summary: summary.to_owned(),
+        stages,
+    }
+}
+
+/// 将应用层公共错误分类转为可恢复终态，并由上层继续显示已完成阶段。
+fn sync_error_outcome(error: &AppError) -> ConfigurationSyncOutcome {
+    match error.public_code() {
+        PublicErrorCode::OutcomeUnknown => ConfigurationSyncOutcome::OutcomeUnknown,
+        PublicErrorCode::Conflict => ConfigurationSyncOutcome::Conflict,
+        PublicErrorCode::Cancelled => ConfigurationSyncOutcome::Cancelled,
+        _ => ConfigurationSyncOutcome::Blocked,
     }
 }

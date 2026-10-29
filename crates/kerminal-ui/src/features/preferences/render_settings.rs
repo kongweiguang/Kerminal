@@ -2,15 +2,15 @@
 //!
 //! @author kongweiguang
 
+use crate::theme::ThemeTokens;
 use gpui_kit::{
-    AnyElement, ClickEvent, Context, Entity, IntoElement, SharedString, StatefulInteractiveElement,
-    Window,
+    ClickEvent, Context, Entity, IntoElement, SharedString, StatefulInteractiveElement, Window,
     assets::IconName,
     base::Selectable,
     component::{
         Disableable, FocusableExt as _, Icon, Sizable as _,
         button::{Button, ButtonCustomVariant, ButtonVariants},
-        input::{Input, InputState},
+        input::Input,
         select::Select,
         slider::{Slider, SliderState},
         switch::Switch,
@@ -21,21 +21,58 @@ use gpui_kit::{
 };
 use kerminal_application::preferences::SettingsSnapshot;
 
-use crate::theme::ThemeTokens;
-
 use super::{
-    BackgroundFit, InterfaceDensity, KeybindingScope, KeyboardPlatform, TerminalColorScheme,
-    TerminalCursorStyle, ThemeMode,
+    BackgroundFit, InterfaceDensity, ThemeMode,
     panel::{PreferencesPanel, ShortcutBindingField, ShortcutInputs, keyboard_platform},
     render::settings_error_banner,
     validate_settings,
 };
 
-const THEME_CHOICE_HEIGHT_PX: f32 = 60.0;
-const DENSITY_SEGMENT_HEIGHT_PX: f32 = 44.0;
-const DENSITY_SEGMENT_MIN_WIDTH_PX: f32 = 136.0;
-// 460px 保留三个现有密度选项和卡片内边距；是否并排只由扣除侧栏后的实际正文宽度决定。
-const APPEARANCE_COLUMN_BASIS_PX: f32 = 460.0;
+const THEME_CHOICE_HEIGHT_PX: f32 = 80.0;
+const DENSITY_CHOICE_MIN_HEIGHT_PX: f32 = 64.0;
+const BACKGROUND_FIT_CHOICE_MIN_HEIGHT_PX: f32 = 96.0;
+
+/// 表单字段覆盖 Kit 默认工作台表面，保留原输入实体、校验与焦点行为。
+/// 使用透明字段表面才能在浅深色的 main 卡片背景上保持同样层次。
+///
+/// @author kongweiguang
+pub(super) fn settings_input(
+    input: &Entity<gpui_kit::component::input::InputState>,
+    theme: ThemeTokens,
+) -> Input {
+    Input::new(input)
+        .bg(theme.field_surface())
+        .border_color(theme.strong_border())
+        .rounded(theme.control_radius)
+        .font_weight(gpui_kit::FontWeight::NORMAL)
+}
+
+/// main 的安静按钮只使用中性 hover；默认 Kit Ghost 的动作选中色会把折叠项误画成选中页。
+///
+/// @author kongweiguang
+pub(super) fn settings_ghost_variant(
+    theme: ThemeTokens,
+    cx: &gpui_kit::App,
+) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .foreground(theme.settings_choice_foreground(false))
+        .hover(theme.surface_hover())
+        .active(theme.surface_hover())
+}
+
+/// 将选择卡文案与布局要求作为一个选项单元，避免标签、说明和尺寸错位。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy)]
+struct PreferenceChoiceCardSpec {
+    id: &'static str,
+    label_zh: &'static str,
+    label_en: &'static str,
+    description_zh: &'static str,
+    description_en: &'static str,
+    min_height: f32,
+    full_width: bool,
+}
 
 /// 同一组密度选项共用标签、值与稳定 ID，避免分段按钮和保存回调各自维护不同顺序。
 /// @author kongweiguang
@@ -45,6 +82,8 @@ struct DensityChoiceSpec {
     value: InterfaceDensity,
     label_zh: &'static str,
     label_en: &'static str,
+    description_zh: &'static str,
+    description_en: &'static str,
 }
 
 const DENSITY_CHOICES: [DensityChoiceSpec; 3] = [
@@ -53,156 +92,69 @@ const DENSITY_CHOICES: [DensityChoiceSpec; 3] = [
         value: InterfaceDensity::Compact,
         label_zh: "紧凑",
         label_en: "Compact",
+        description_zh: "更紧凑，适合小屏。",
+        description_en: "More compact for smaller screens.",
     },
     DensityChoiceSpec {
         id: "density-comfortable",
         value: InterfaceDensity::Comfortable,
         label_zh: "舒适",
         label_en: "Comfortable",
+        description_zh: "默认留白。",
+        description_en: "Default spacing.",
     },
     DensityChoiceSpec {
         id: "density-spacious",
         value: InterfaceDensity::Spacious,
         label_zh: "宽松",
         label_en: "Spacious",
+        description_zh: "留白更多。",
+        description_en: "More spacing.",
     },
 ];
 
-/// 将三个系统的快捷键输入并列呈现；Windows 备用键作为同一平台的小型第二行。
+/// 背景适配选项与 main 的标签、说明和稳定身份保持同一顺序。
 ///
 /// @author kongweiguang
-fn shortcut_platform_cell(
-    platform: SharedString,
-    binding_label: SharedString,
-    primary: Option<Entity<InputState>>,
-    disabled: bool,
-    theme: ThemeTokens,
-    note: Option<AnyElement>,
-    alternate: Option<(SharedString, Option<Entity<InputState>>)>,
-) -> impl IntoElement {
-    let mut cell = div()
-        .flex_1()
-        .min_w(px(190.))
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_size(theme.text_sm)
-                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                .child(platform),
-        );
-    if let Some(note) = note {
-        cell = cell.child(note);
-    }
-    cell = cell.child(shortcut_input_row(binding_label, primary, disabled, theme));
-    if let Some((label, input)) = alternate {
-        cell = cell.child(shortcut_input_row(label, input, disabled, theme));
-    }
-    cell
+#[derive(Clone, Copy)]
+struct BackgroundFitChoiceSpec {
+    id: &'static str,
+    value: BackgroundFit,
+    label_zh: &'static str,
+    label_en: &'static str,
+    description_zh: &'static str,
+    description_en: &'static str,
 }
 
-/// 输入尚未加载时保留明确占位；标签与输入同一行以节省每条快捷键卡的高度。
-///
-/// @author kongweiguang
-fn shortcut_input_row(
-    label: SharedString,
-    input: Option<Entity<InputState>>,
-    disabled: bool,
-    theme: ThemeTokens,
-) -> impl IntoElement {
-    div()
-        .w_full()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .w(px(58.))
-                .flex_shrink_0()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(label),
-        )
-        .child(match input {
-            Some(input) => Input::new(&input)
-                .disabled(disabled)
-                .w_full()
-                .min_w(px(0.))
-                .into_any_element(),
-            None => div()
-                .flex_1()
-                .min_w(px(0.))
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(crate::locale::text("加载中…", "Loading…"))
-                .into_any_element(),
-        })
-}
-
-/// 呈现 Linux 继承状态和显式禁用入口，避免空白输入掩盖旧配置的回退语义。
-///
-/// @author kongweiguang
-fn linux_binding_controls(
-    binding: &kerminal_application::preferences::KeybindingPreference,
-    disabled: bool,
-    theme: ThemeTokens,
-    cx: &mut Context<PreferencesPanel>,
-) -> AnyElement {
-    let inherited = binding.linux_binding.is_none();
-    let note = match binding.linux_binding.as_deref() {
-        None => {
-            let value = effective_binding(&binding.windows_binding, &binding.binding);
-            if value.is_empty() {
-                crate::locale::text(
-                    "沿用 Windows/通用值：未绑定",
-                    "Inherited Windows/generic value: unbound",
-                )
-            } else {
-                crate::locale::text(
-                    format!("沿用 Windows/通用值：{value}"),
-                    format!("Inherited Windows/generic value: {value}"),
-                )
-            }
-        }
-        Some("") => crate::locale::text("Linux 绑定已禁用", "Linux binding is disabled"),
-        Some(_) => crate::locale::text("使用 Linux 独立绑定", "Using a Linux-specific binding"),
-    };
-    let action = binding.action.clone();
-    div()
-        .w_full()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(note),
-        )
-        .child(
-            Button::new(format!("shortcut-linux-toggle-{}", binding.action))
-                .compact()
-                .ghost()
-                .label(if inherited {
-                    crate::locale::text("禁用 Linux", "Disable Linux")
-                } else {
-                    crate::locale::text("恢复继承", "Restore inherited")
-                })
-                .disabled(disabled)
-                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-                    panel.toggle_linux_binding_inheritance(&action, window, cx)
-                })),
-        )
-        .into_any_element()
-}
+const BACKGROUND_FIT_CHOICES: [BackgroundFitChoiceSpec; 3] = [
+    BackgroundFitChoiceSpec {
+        id: "fit-cover",
+        value: BackgroundFit::Cover,
+        label_zh: "填充画布",
+        label_en: "Fill canvas",
+        description_zh: "铺满工作台。",
+        description_en: "Fill the workbench.",
+    },
+    BackgroundFitChoiceSpec {
+        id: "fit-contain",
+        value: BackgroundFit::Contain,
+        label_zh: "完整显示",
+        label_en: "Fit image",
+        description_zh: "完整显示，避免裁切。",
+        description_en: "Show the whole image without cropping.",
+    },
+    BackgroundFitChoiceSpec {
+        id: "fit-tile",
+        value: BackgroundFit::Tile,
+        label_zh: "平铺纹理",
+        label_en: "Tile texture",
+        description_zh: "重复平铺。",
+        description_en: "Repeat the image as a tile.",
+    },
+];
 
 impl PreferencesPanel {
-    /// 恢复、读取、写入和外部冲突期间锁定表单，避免视图与 CAS 草稿短暂分叉。
+    /// 加载、只读恢复、冲突与未知写入结果锁定表单；保存中仍允许编辑以保留连续输入体验。
     pub(super) fn settings_controls_locked(&self) -> bool {
         self.loading_settings
             || self.recovery.mode
@@ -210,16 +162,13 @@ impl PreferencesPanel {
             || self.settings.as_ref().is_some_and(|draft| {
                 matches!(
                     draft.status(),
-                    super::DraftStatus::Saving
-                        | super::DraftStatus::ExternalConflict
-                        | super::DraftStatus::OutcomeUnknown
+                    super::DraftStatus::ExternalConflict | super::DraftStatus::OutcomeUnknown
                 )
             })
     }
 
-    /// 外观卡片按实际正文宽度自然换行，避免用窗口宽度误把侧导航算作可用内容。
-    /// 只重排现有控件与次要入口；主题、密度和背景仍更新同一 typed 草稿及保存门禁。
-    /// 关闭图片只收起其专属控件；输入与滑块实体、未保存值和独立材质透明度继续由原 owner 保留。
+    /// 按 main 的 viewport xl 断点切换外观卡片列数，窄窗纵向使用自然高度以保留滚动内容。
+    /// 背景开关仍只影响工作台绘制，所有修改继续进入同一 typed 草稿和既有保存门禁。
     ///
     /// @author kongweiguang
     pub(super) fn render_appearance(
@@ -233,37 +182,12 @@ impl PreferencesPanel {
         };
         let controls_locked = self.settings_controls_locked();
         let mode = settings.theme_mode;
-        let language = settings.interface_language;
         let density = settings.interface_density;
         let background_enabled = settings.background_enabled;
         let background_fit = settings.background_fit;
-        sync_percentage_slider(
-            &self.background_opacity_slider,
-            settings.background_opacity,
-            0.,
-            100.,
-            window,
-            cx,
-        );
-        sync_percentage_slider(
-            &self.window_opacity_slider,
-            settings.window_opacity,
-            35.,
-            100.,
-            window,
-            cx,
-        );
-        if self
-            .interface_language_select
-            .read(cx)
-            .selected_value()
-            .copied()
-            != Some(language)
-        {
-            self.interface_language_select.update(cx, |select, cx| {
-                select.set_selected_value(&language, window, cx);
-            });
-        }
+        let viewport_width = window.viewport_size().width.as_f32();
+        let medium_layout = viewport_width >= 768.0;
+        let wide_layout = viewport_width >= 1280.0;
         let issue_rows = self
             .settings_issues
             .iter()
@@ -272,6 +196,31 @@ impl PreferencesPanel {
             .settings_input_errors
             .values()
             .map(|message| issue_row(message, theme));
+        let background_fit_cards = BACKGROUND_FIT_CHOICES
+            .into_iter()
+            .map(|choice| {
+                let card = PreferenceChoiceCardSpec {
+                    id: choice.id,
+                    label_zh: choice.label_zh,
+                    label_en: choice.label_en,
+                    description_zh: choice.description_zh,
+                    description_en: choice.description_en,
+                    min_height: BACKGROUND_FIT_CHOICE_MIN_HEIGHT_PX,
+                    full_width: false,
+                };
+                preference_choice_card(
+                    card,
+                    background_fit == choice.value,
+                    controls_locked,
+                    theme,
+                    cx.listener(move |panel, _: &ClickEvent, _, cx| {
+                        panel.edit_settings(|settings| settings.background_fit = choice.value, cx)
+                    }),
+                    cx,
+                )
+                .into_any_element()
+            })
+            .collect();
 
         let mut body = div()
             .id("preferences-appearance")
@@ -281,24 +230,43 @@ impl PreferencesPanel {
             .min_h(px(0.))
             .overflow_y_scroll()
             .track_scroll(&self.content_scroll)
-            .p_4()
             .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_start()
-            .content_start()
+            .flex_col()
             .gap_4()
-            .bg(theme.background)
             .child(
-                section_card(crate::locale::text("基础外观", "Basic appearance"), theme)
-                    .map(appearance_column)
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex()
+                    .when(wide_layout, |layout| {
+                        layout.flex_row().items_stretch()
+                    })
+                    .when(!wide_layout, |layout| layout.flex_col())
+                    .gap_4()
+                    .child(
+                        section_panel(theme)
+                    .when(wide_layout, |card| appearance_column(card, 0.92))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::new(IconName::Languages).small().text_color(theme.muted))
+                            .child(
+                                div()
+                                    .text_size(theme.text_body)
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .child(crate::locale::text("基础外观", "Basic appearance")),
+                            ),
+                    )
                     .child(form_row(
                         crate::locale::text("界面语言", "Interface language"),
-                        crate::locale::text(
-                            "跟随系统会使用系统语言。",
-                            "System mode follows the operating system language.",
-                        ),
                         Select::new(&self.interface_language_select)
+                            .bg(theme.field_surface())
+                            .border_color(theme.strong_border())
+                            .rounded(theme.control_radius)
+                            .id("settings-interface-language-select")
                             .w_full()
                             .h(px(36.))
                             .disabled(controls_locked)
@@ -309,12 +277,11 @@ impl PreferencesPanel {
                         theme,
                     ))
                     .child(form_row(
-                        crate::locale::text("主题", "Theme"),
-                        crate::locale::text("选择应用界面的外观。", "Choose the app appearance."),
+                        crate::locale::text("应用外观", "App appearance"),
                         div()
                             .w_full()
                             .flex()
-                            .gap_3()
+                                    .gap_2()
                             .child(theme_choice_card(
                                 "theme-dark",
                                 IconName::Moon,
@@ -368,28 +335,35 @@ impl PreferencesPanel {
                             )),
                         theme,
                     ))
+                    .child(percentage_control(
+                        crate::locale::text("界面透明度", "Interface opacity"),
+                        &self.window_opacity_slider,
+                        settings.window_opacity,
+                        controls_locked,
+                        theme,
+                    ))
                     .child(form_row(
                         crate::locale::text("界面密度", "Interface density"),
-                        crate::locale::text(
-                            "紧凑显示更多，舒适更均衡，宽松增加留白。",
-                            "Compact shows more; comfortable balances; spacious adds room.",
-                        ),
                         div()
                             .w_full()
                             .flex()
-                            .flex_wrap()
-                            .gap_1()
-                            .p_1()
-                            .rounded(theme.radius_sm)
-                            .bg(theme.sidebar)
+                            .flex_col()
+                            .gap_2()
                             .children(DENSITY_CHOICES.into_iter().map(|choice| {
-                                density_choice_segment(
-                                    choice,
-                                    ChoiceCardStyle {
-                                        selected: density == choice.value,
-                                        disabled: controls_locked,
-                                        theme,
-                                    },
+                                let card = PreferenceChoiceCardSpec {
+                                    id: choice.id,
+                                    label_zh: choice.label_zh,
+                                    label_en: choice.label_en,
+                                    description_zh: choice.description_zh,
+                                    description_en: choice.description_en,
+                                    min_height: DENSITY_CHOICE_MIN_HEIGHT_PX,
+                                    full_width: true,
+                                };
+                                preference_choice_card(
+                                    card,
+                                    density == choice.value,
+                                    controls_locked,
+                                    theme,
                                     cx.listener(move |panel, _: &ClickEvent, _, cx| {
                                         panel.edit_settings(
                                             |settings| settings.interface_density = choice.value,
@@ -400,541 +374,158 @@ impl PreferencesPanel {
                                 )
                             })),
                         theme,
-                    ))
-                    .child(
-                        div().w_full().flex().justify_end().child(
-                            Button::new("preferences-about-updates")
-                                .compact()
-                                .ghost()
-                                .label(crate::locale::text("关于与更新", "About & updates"))
-                                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                    panel.request_updates_navigation(cx);
-                                })),
-                        ),
-                    ),
+                    )),
             )
-            .child(
-                section_card(
-                    crate::locale::text("背景与窗口", "Background and window"),
-                    theme,
-                )
-                .map(appearance_column)
-                .child(
-                    Switch::new("preferences-background-enabled")
-                        .checked(background_enabled)
-                        .disabled(controls_locked)
-                        .label(crate::locale::text(
-                            "启用背景图片",
-                            "Enable background image",
-                        ))
-                        .on_change(cx.listener(|panel, enabled: &bool, _, cx| {
-                            panel.edit_settings(
-                                |settings| settings.background_enabled = *enabled,
-                                cx,
-                            )
-                        })),
-                )
-                .children(appearance_image_controls(background_enabled, |controls| {
-                    controls
-                        .child(form_row(
-                            crate::locale::text("背景图片路径", "Background image path"),
-                            crate::locale::text(
-                                "选择本机图片，路径会随设置草稿保存。",
-                                "Choose a local image. Its path is saved with the settings draft.",
-                            ),
-                            div()
-                                .w_full()
-                                .min_w(px(0.))
-                                .flex()
-                                .flex_col()
-                                .items_start()
-                                .gap_2()
-                                .child(
-                                    Input::new(&self.settings_inputs.background_path)
-                                        .disabled(controls_locked)
-                                        .w_full()
-                                        .min_w(px(0.)),
-                                )
-                                .child(
-                                    div().w_full().flex().justify_end().child(
-                                        Button::new("preferences-choose-background")
-                                            .compact()
-                                            .flex_shrink_0()
-                                            .label(crate::locale::text(
-                                                "选择图片…",
-                                                "Choose image…",
-                                            ))
-                                            .disabled(controls_locked)
-                                            .on_click(cx.listener(
-                                                |panel, _: &ClickEvent, _, cx| {
-                                                    panel.choose_background_image(cx)
-                                                },
-                                            )),
+                    .child(
+                        section_panel(theme)
+                    .when(wide_layout, |card| appearance_column(card, 1.08))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(Icon::new(IconName::Image).size(px(16.)).text_color(theme.muted))
+                                            .child(
+                                                div()
+                                                    .text_size(theme.text_body)
+                                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                                    .child(crate::locale::text(
+                                                        "主页面背景",
+                                                        "Workbench background",
+                                                    )),
+                                            ),
+                                    )
+                                    .child(
+                                                div()
+                                                    .text_size(theme.text_xs)
+                                                    .line_height(px(20.))
+                                                    .text_color(theme.muted)
+                                                    .child(crate::locale::text(
+                                                        "在工作台底层显示本地图片。",
+                                                        "Display a local image behind the workbench.",
+                                                    )),
                                     ),
-                                ),
-                            theme,
-                        ))
-                        .child(
-                            enum_selector(
-                                crate::locale::text("图片适配", "Image fit"),
-                                Some(fit_label(background_fit)),
-                                theme,
                             )
-                            .child(enum_button(
-                                "fit-cover",
-                                crate::locale::text("填充", "Cover"),
-                                background_fit == BackgroundFit::Cover,
-                                controls_locked,
-                                cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                    panel.edit_settings(
-                                        |settings| settings.background_fit = BackgroundFit::Cover,
-                                        cx,
-                                    )
-                                }),
-                            ))
-                            .child(enum_button(
-                                "fit-contain",
-                                crate::locale::text("完整显示", "Contain"),
-                                background_fit == BackgroundFit::Contain,
-                                controls_locked,
-                                cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                    panel.edit_settings(
-                                        |settings| settings.background_fit = BackgroundFit::Contain,
-                                        cx,
-                                    )
-                                }),
-                            ))
-                            .child(enum_button(
-                                "fit-tile",
-                                crate::locale::text("平铺", "Tile"),
-                                background_fit == BackgroundFit::Tile,
-                                controls_locked,
-                                cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                    panel.edit_settings(
-                                        |settings| settings.background_fit = BackgroundFit::Tile,
-                                        cx,
-                                    )
-                                }),
-                            )),
-                        )
-                        .child(form_row(
-                            crate::locale::text("背景透明度", "Image opacity"),
-                            crate::locale::text(
-                                "调整背景图片的可见程度。",
-                                "Adjust how visible the background image is.",
+                            .child(
+                                Switch::new("preferences-background-enabled")
+                                    .track_size(px(40.), px(24.))
+                                    .checked(background_enabled)
+                                    .disabled(controls_locked)
+                                    .accessibility_label(crate::locale::text(
+                                        "启用主页面背景",
+                                        "Enable workbench background",
+                                    ))
+                                    .on_change(cx.listener(|panel, enabled: &bool, _, cx| {
+                                        panel.edit_settings(
+                                            |settings| settings.background_enabled = *enabled,
+                                            cx,
+                                        )
+                                    })),
                             ),
-                            percentage_control(
+                    )
+                    .child(
+                        div()
+                            .id("background-opacity-control")
+                            .child(percentage_control(
+                                crate::locale::text("背景透明度", "Background opacity"),
                                 &self.background_opacity_slider,
                                 settings.background_opacity,
                                 controls_locked,
                                 theme,
-                            ),
-                            theme,
-                        ))
-                }))
-                .child(form_row(
-                    crate::locale::text("背景材质透明度", "Window material opacity"),
-                    crate::locale::text(
-                        "调整窗口与面板背景，文字保持清晰。",
-                        "Adjusts window and panel backgrounds while keeping text clear.",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("background-fit-controls")
+                            .w_full()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(theme.settings_medium_font_weight())
+                                    .text_color(theme.muted)
+                                    .child(crate::locale::text("背景铺放", "Image fit")),
+                            )
+                            .child(settings_grid_rows(
+                                background_fit_cards,
+                                if medium_layout {
+                                    &[1.0, 1.0, 1.0]
+                                } else {
+                                    &[1.0]
+                                },
+                                SettingsGridGap::Compact,
+                                false,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("background-path-control")
+                            .child(form_row(
+                                crate::locale::text("背景图路径", "Background image path"),
+                                div()
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .when(medium_layout, |row| {
+                                        row.flex_row().items_end()
+                                    })
+                                    .when(!medium_layout, |column| column.flex_col())
+                                    .gap_2()
+                                    .child(
+                                        gpui_kit::Styled::h(settings_input(&self.settings_inputs.background_path, theme), px(36.))
+                                            .disabled(controls_locked)
+                                            .w_full()
+                                            .min_w(px(0.)),
+                                    )
+                                    .child(
+                                        Button::new("preferences-choose-background")
+                                            .compact()
+                                            .flex_shrink_0()
+                                            .h(px(36.))
+                                            .label(crate::locale::text("浏览", "Browse"))
+                                            .icon(IconName::Image)
+                                            .disabled(controls_locked)
+                                            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                                panel.choose_background_image(cx)
+                                            })),
+                                    ),
+                                theme,
+                            )),
                     ),
-                    percentage_control(
-                        &self.window_opacity_slider,
-                        settings.window_opacity,
-                        controls_locked,
-                        theme,
                     ),
-                    theme,
-                )),
             );
         if let Some(error) = settings_error_banner(self.settings_error.as_deref(), theme) {
             body = body.child(error);
         }
-        body.children(issue_rows).children(input_errors)
-    }
-
-    /// 终端页字段纵向排列并填充可用宽度，避免固定输入宽度挤出设置卡片边界。
-    ///
-    /// @author kongweiguang
-    pub(super) fn render_terminal(
-        &mut self,
-        theme: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let Some(settings) = self.settings.as_ref().map(|draft| draft.value().clone()) else {
-            return self.render_settings_loading(theme);
-        };
-        let controls_locked = self.settings_controls_locked();
-        let terminal = settings.terminal;
-        let cursor_style = terminal.cursor_style;
-        let color_scheme = terminal.color_scheme;
-        div()
-            .id("preferences-terminal")
-            .flex_1()
-            .w_full()
-            .min_w(px(0.))
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&self.content_scroll)
-            .p_5()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .bg(theme.background)
-            .child(page_heading(
-                crate::locale::text("终端外观", "Terminal appearance"),
-                crate::locale::text(
-                    "终端运行参数和绘制偏好保存在 settings.toml。",
-                    "Terminal runtime and rendering preferences are saved in settings.toml.",
-                ),
-                theme,
-            ))
-            .child(
-                section_card(
-                    crate::locale::text("字体与滚动", "Font and scrollback"),
-                    theme,
-                )
-                .child(form_row(
-                    crate::locale::text("字体", "Font family"),
-                    crate::locale::text(
-                        "填写系统已安装的字体族；终端缺字时仍由字体回退处理。",
-                        "Use an installed font family. Missing glyphs still use font fallback.",
-                    ),
-                    Input::new(&self.settings_inputs.font_family)
-                        .disabled(controls_locked)
-                        .w_full()
-                        .min_w(px(0.)),
-                    theme,
-                ))
-                .child(form_row(
-                    crate::locale::text("字号", "Font size"),
-                    crate::locale::text("范围 10–24。", "Range: 10–24."),
-                    Input::new(&self.settings_inputs.font_size)
-                        .disabled(controls_locked)
-                        .w(px(100.)),
-                    theme,
-                ))
-                .child(form_row(
-                    crate::locale::text("行高", "Line height"),
-                    crate::locale::text("范围 1.0–1.8。", "Range: 1.0–1.8."),
-                    Input::new(&self.settings_inputs.line_height)
-                        .disabled(controls_locked)
-                        .w(px(100.)),
-                    theme,
-                ))
-                .child(form_row(
-                    crate::locale::text("滚屏缓冲", "Scrollback"),
-                    crate::locale::text("范围 1000–50000 行。", "Range: 1,000–50,000 lines."),
-                    Input::new(&self.settings_inputs.scrollback)
-                        .disabled(controls_locked)
-                        .w(px(150.)),
-                    theme,
-                ))
-                .child(
-                    Switch::new("preferences-cursor-blink")
-                        .checked(terminal.cursor_blink)
-                        .disabled(controls_locked)
-                        .label(crate::locale::text("光标闪烁", "Cursor blink"))
-                        .on_change(cx.listener(|panel, enabled: &bool, _, cx| {
-                            panel.edit_settings(
-                                |settings| settings.terminal.cursor_blink = *enabled,
-                                cx,
-                            )
-                        })),
-                )
-                .child(
-                    Switch::new("preferences-selection-copy")
-                        .checked(terminal.selection_copy)
-                        .disabled(controls_locked)
-                        .label(crate::locale::text(
-                            "选中后复制到剪贴板",
-                            "Copy selection to clipboard",
-                        ))
-                        .on_change(cx.listener(|panel, enabled: &bool, _, cx| {
-                            panel.edit_settings(
-                                |settings| settings.terminal.selection_copy = *enabled,
-                                cx,
-                            )
-                        })),
-                ),
-            )
-            .child(
-                section_card(
-                    crate::locale::text("光标与配色", "Cursor and color scheme"),
-                    theme,
-                )
-                .child(
-                    enum_selector(
-                        crate::locale::text("光标样式", "Cursor style"),
-                        Some(cursor_label(cursor_style)),
-                        theme,
-                    )
-                    .child(enum_button(
-                        "cursor-block",
-                        crate::locale::text("块状", "Block"),
-                        cursor_style == TerminalCursorStyle::Block,
-                        controls_locked,
-                        cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.edit_settings(
-                                |settings| {
-                                    settings.terminal.cursor_style = TerminalCursorStyle::Block
-                                },
-                                cx,
-                            )
-                        }),
-                    ))
-                    .child(enum_button(
-                        "cursor-bar",
-                        crate::locale::text("竖线", "Bar"),
-                        cursor_style == TerminalCursorStyle::Bar,
-                        controls_locked,
-                        cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.edit_settings(
-                                |settings| {
-                                    settings.terminal.cursor_style = TerminalCursorStyle::Bar
-                                },
-                                cx,
-                            )
-                        }),
-                    ))
-                    .child(enum_button(
-                        "cursor-underline",
-                        crate::locale::text("下划线", "Underline"),
-                        cursor_style == TerminalCursorStyle::Underline,
-                        controls_locked,
-                        cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.edit_settings(
-                                |settings| {
-                                    settings.terminal.cursor_style = TerminalCursorStyle::Underline
-                                },
-                                cx,
-                            )
-                        }),
-                    )),
-                )
-                .child(
-                    enum_selector(
-                        crate::locale::text("配色方案", "Color scheme"),
-                        Some(color_scheme_label(color_scheme).into()),
-                        theme,
-                    )
-                    .child(enum_button(
-                        "scheme-kerminal",
-                        "Kerminal",
-                        color_scheme == TerminalColorScheme::Kerminal,
-                        controls_locked,
-                        cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.edit_settings(
-                                |settings| {
-                                    settings.terminal.color_scheme = TerminalColorScheme::Kerminal
-                                },
-                                cx,
-                            )
-                        }),
-                    ))
-                    .child(enum_button(
-                        "scheme-tokyo",
-                        "Tokyo Night",
-                        color_scheme == TerminalColorScheme::TokyoNight,
-                        controls_locked,
-                        cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.edit_settings(
-                                |settings| {
-                                    settings.terminal.color_scheme = TerminalColorScheme::TokyoNight
-                                },
-                                cx,
-                            )
-                        }),
-                    ))
-                    .child(enum_button(
-                        "scheme-solarized",
-                        "Solarized",
-                        color_scheme == TerminalColorScheme::Solarized,
-                        controls_locked,
-                        cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.edit_settings(
-                                |settings| {
-                                    settings.terminal.color_scheme = TerminalColorScheme::Solarized
-                                },
-                                cx,
-                            )
-                        }),
-                    ))
-                    .child(enum_button(
-                        "scheme-github",
-                        "GitHub",
-                        color_scheme == TerminalColorScheme::Github,
-                        controls_locked,
-                        cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.edit_settings(
-                                |settings| {
-                                    settings.terminal.color_scheme = TerminalColorScheme::Github
-                                },
-                                cx,
-                            )
-                        }),
-                    )),
-                ),
-            )
-            .child(self.render_terminal_behavior(theme, cx))
-            .children(
-                self.settings_issues
-                    .iter()
-                    .map(|issue| settings_issue_row(issue, theme)),
-            )
-            .children(
-                self.settings_input_errors
-                    .values()
-                    .map(|message| issue_row(message, theme)),
-            )
-            .children(settings_error_banner(self.settings_error.as_deref(), theme))
-    }
-
-    /// 三个平台各占一列，Windows 主键和备用键同列；旧 Linux 回退值仅在用户编辑后显式保存。
-    ///
-    /// @author kongweiguang
-    pub(super) fn render_shortcuts(
-        &mut self,
-        theme: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let Some(settings) = self.settings.as_ref().map(|draft| draft.value().clone()) else {
-            return self.render_settings_loading(theme);
-        };
-        let controls_locked = self.settings_controls_locked();
-        let platform = keyboard_platform();
-        let rows = settings.keybindings.iter().map(|binding| {
-            let fields = self
-                .shortcut_inputs
-                .iter()
-                .find(|inputs| inputs.action == binding.action);
-            let related = self
-                .settings_issues
-                .iter()
-                .filter(|issue| issue.actions.iter().any(|action| action == &binding.action));
-            div()
-                .w_full()
-                .px_4()
-                .py_3()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .bg(theme.panel)
-                .rounded_md()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .child(keybinding_label(&binding.action, &binding.label)),
-                        )
-                        .child(scope_badge(binding.scope, theme))
-                        .child(if binding.editable {
-                            crate::locale::text("", "")
-                        } else {
-                            crate::locale::text("内置", "Built-in")
-                        }),
-                )
-                .child(
-                    div()
-                        .text_size(theme.text_xs)
-                        .text_color(theme.muted)
-                        .child(binding.description.clone()),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_wrap()
-                        .items_start()
-                        .gap_3()
-                        .child(shortcut_platform_cell(
-                            crate::locale::text("Windows", "Windows"),
-                            crate::locale::text("主键", "Primary"),
-                            fields.map(|fields| fields.windows.clone()),
-                            !binding.editable || controls_locked,
-                            theme,
-                            None,
-                            Some((
-                                crate::locale::text("备用", "Alternate"),
-                                fields.map(|fields| fields.windows_alternate.clone()),
-                            )),
-                        ))
-                        .child(shortcut_platform_cell(
-                            crate::locale::text("Linux", "Linux"),
-                            crate::locale::text("绑定", "Binding"),
-                            fields.map(|fields| fields.linux.clone()),
-                            !binding.editable || controls_locked,
-                            theme,
-                            Some(linux_binding_controls(
-                                binding,
-                                !binding.editable || controls_locked,
-                                theme,
-                                cx,
-                            )),
-                            None,
-                        ))
-                        .child(shortcut_platform_cell(
-                            crate::locale::text("macOS", "macOS"),
-                            crate::locale::text("绑定", "Binding"),
-                            fields.map(|fields| fields.mac.clone()),
-                            !binding.editable || controls_locked,
-                            theme,
-                            None,
-                            None,
-                        )),
-                )
-                .children(related.map(|issue| settings_issue_row(issue, theme)))
-        });
-        let platform_name = match platform {
-            KeyboardPlatform::Windows => crate::locale::text("Windows", "Windows"),
-            KeyboardPlatform::Linux => crate::locale::text("Linux", "Linux"),
-            KeyboardPlatform::Mac => crate::locale::text("macOS", "macOS"),
-        };
-        div()
-            .id("preferences-shortcuts")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&self.content_scroll)
-            .p_5()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .bg(theme.background)
-            .child(page_heading(
-                crate::locale::text("快捷键", "Keyboard shortcuts"),
-                crate::locale::text(
-                    "校验当前平台并显示冲突。三平台分列；旧 Linux 配置沿用 Windows/通用键位，可用按钮显式禁用。Windows 备用键留空即禁用。组合键步骤以空格分隔。",
-                    "Validates this platform and reports conflicts. Legacy Linux entries inherit the Windows/generic binding and can be explicitly disabled. A blank Windows alternate disables it. Separate chord steps with spaces.",
-                ),
-                theme,
-            ))
-            .child(
-                div()
-                    .w_full()
-                    .text_size(px(12.))
-                    .text_color(theme.muted)
-                    .child(crate::locale::text(
-                        format!("当前检查平台：{platform_name}。组合键示例：Ctrl+K Ctrl+C。"),
-                        format!("Validation uses {platform_name}. Chord example: Ctrl+K Ctrl+C."),
-                    )),
-            )
-            .children(rows)
-            .children(
-                self.settings_input_errors
-                    .values()
-                    .map(|message| issue_row(message, theme)),
-            )
-            .children(settings_error_banner(self.settings_error.as_deref(), theme))
+        body.children(issue_rows)
+            .children(input_errors)
+            .child(self.render_save_notice(theme))
     }
 
     /// 设置暂未成功读取时显示错误或加载进度，不构造虚假的默认表单。
-    fn render_settings_loading(&self, theme: ThemeTokens) -> gpui_kit::Stateful<gpui_kit::Div> {
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn render_settings_loading(
+        &self,
+        theme: ThemeTokens,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
         let message = self.settings_error.clone().unwrap_or_else(|| {
             if self.loading_settings {
                 crate::locale::text("正在读取设置…", "Loading preferences…").to_string()
@@ -1077,36 +668,136 @@ impl PreferencesPanel {
     }
 }
 
-/// 图片关闭时不构建专属控件或留下占位；实体与值仍由原 panel 持有，不在可见性分支清空草稿。
-/// 只组合图片路径、选择、适配和图片透明度；窗口材质必须由调用方独立绘制，不受此开关限制。
-///
+/// xl 双栏使用包含内边距的百分比宽度，再由 flex 按比例扣除列间距，复现 main 的 0.92fr/1.08fr。
+/// 不能使用零 basis 的 grow，因为它会在分配比例之后另加内边距，令两列偏离 CSS grid 的外框比例。
 /// @author kongweiguang
-fn appearance_image_controls(
-    enabled: bool,
-    build: impl FnOnce(gpui_kit::Div) -> gpui_kit::Div,
-) -> Option<gpui_kit::Div> {
-    enabled.then(|| build(div().w_full().min_w(px(0.)).flex().flex_col().gap_4()))
+fn appearance_column(card: gpui_kit::Div, grow: f32) -> gpui_kit::Div {
+    card.w(gpui_kit::relative(grow / 2.0)).min_w(px(0.))
 }
 
-/// basis 只决定一行能否容纳两张卡，min-width 为零让单列在窄正文中继续安全收缩。
-/// 不设固定高度或持久化宽度，窗口夹紧、侧导航和 DPI 仍由既有布局分配。
+/// 已由 viewport 断点选定列数后再顺序分行，避免子控件最小宽度决定列数并裁切内容。
 /// @author kongweiguang
-fn appearance_column(card: gpui_kit::Div) -> gpui_kit::Div {
-    card.flex_1()
-        .flex_basis(px(APPEARANCE_COLUMN_BASIS_PX))
-        .min_w(px(0.))
+#[derive(Clone, Copy)]
+pub(super) enum SettingsGridGap {
+    Compact,
+    Standard,
 }
 
-/// 标签与说明放在控件上方，避免窄正文把说明压成逐字换行并给输入保留完整可用宽度。
+/// 顺序分行并填充空槽以保留固定列宽；末行不扩展单元格，也不改变阅读顺序。
+/// @author kongweiguang
+pub(super) fn settings_grid_rows(
+    items: Vec<gpui_kit::AnyElement>,
+    column_weights: &[f32],
+    gap: SettingsGridGap,
+    align_items_end: bool,
+) -> gpui_kit::Div {
+    // Preserve CSS grid's column widths on the final row instead of stretching its remaining item.
+    let columns = column_weights.len().max(1);
+    let mut items = items.into_iter();
+    let mut rows = Vec::new();
+
+    loop {
+        let mut controls = items.by_ref().take(columns).collect::<Vec<_>>();
+        if controls.is_empty() {
+            break;
+        }
+        while controls.len() < columns {
+            controls.push(div().into_any_element());
+        }
+
+        let cells = controls.into_iter().enumerate().map(|(column, control)| {
+            let weight = column_weights
+                .get(column)
+                .copied()
+                .filter(|weight| weight.is_finite() && *weight > 0.0)
+                .unwrap_or(1.0);
+            div()
+                .flex()
+                .flex_grow(weight)
+                .flex_basis(px(0.))
+                .min_w(px(0.))
+                .child(control)
+        });
+        let mut row = div().w_full().flex().flex_row();
+        row = match gap {
+            SettingsGridGap::Compact => row.gap_2(),
+            SettingsGridGap::Standard => row.gap_3(),
+        };
+        if align_items_end {
+            row = row.items_end();
+        }
+        rows.push(row.children(cells));
+    }
+
+    let mut grid = div().w_full().flex().flex_col();
+    grid = match gap {
+        SettingsGridGap::Compact => grid.gap_2(),
+        SettingsGridGap::Standard => grid.gap_3(),
+    };
+    grid.children(rows)
+}
+
+/// 字段统一按 main 的 12px 次要标签和紧邻控件排列，避免工具栏标签令牌提高表单的视觉权重。
 ///
 /// @author kongweiguang
 fn form_row(
     label: impl Into<SharedString>,
-    description: impl Into<SharedString>,
     input: impl IntoElement,
     theme: ThemeTokens,
 ) -> impl IntoElement {
-    let description = description.into();
+    div()
+        .w_full()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .w_full()
+                .min_w(px(0.))
+                .text_size(px(12.))
+                .font_weight(theme.settings_medium_font_weight())
+                .text_color(theme.muted)
+                .child(label.into()),
+        )
+        .child(div().w_full().min_w(px(0.)).child(input))
+}
+
+/// 为带图标、辅助说明或开关的卡片标题复用同一边界，避免空标题占用垂直空间。
+///
+/// @author kongweiguang
+fn section_panel(theme: ThemeTokens) -> gpui_kit::Div {
+    div()
+        .w_full()
+        .min_w(px(0.))
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_4()
+        .bg(theme.panel)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.radius_panel)
+}
+
+/// Kit's Custom variant retains 20% of its normal color; compensate only its input alpha to match main's muted fill.
+/// Hover and active colors remain untouched so pointer feedback keeps the component's native state transitions.
+///
+/// @author kongweiguang
+fn settings_choice_variant_fill(fill: gpui_kit::Hsla) -> gpui_kit::Hsla {
+    fill.alpha((fill.a / 0.2).min(1.0))
+}
+
+/// 将百分比标签和当前值按 main 的次要/正文层级并排呈现，保留 Kit 滑块的键鼠行为。
+///
+/// @author kongweiguang
+fn percentage_control(
+    label: impl Into<SharedString>,
+    slider: &Entity<SliderState>,
+    value: u8,
+    disabled: bool,
+    theme: ThemeTokens,
+) -> impl IntoElement {
     div()
         .w_full()
         .min_w(px(0.))
@@ -1116,140 +807,36 @@ fn form_row(
         .child(
             div()
                 .w_full()
-                .min_w(px(0.))
                 .flex()
-                .flex_col()
-                .gap_1()
-                .child(div().text_size(px(14.)).child(label.into()))
+                .items_center()
+                .justify_between()
+                .gap_3()
                 .child(
                     div()
                         .text_size(px(12.))
+                        .font_weight(theme.settings_medium_font_weight())
                         .text_color(theme.muted)
-                        .child(description),
+                        .child(label.into()),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(theme.foreground)
+                        .child(format!("{value}%")),
                 ),
         )
-        .child(div().w_full().min_w(px(0.)).child(input))
-}
-
-/// 分组卡片提供统一间距和语义边界，并允许窄正文收缩而不被内容最小宽度撑开。
-///
-/// @author kongweiguang
-fn section_card(title: impl Into<SharedString>, theme: ThemeTokens) -> gpui_kit::Div {
-    div()
-        .w_full()
-        .min_w(px(0.))
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_4()
-        .bg(theme.panel)
-        .rounded_md()
-        .child(
-            div()
-                .text_size(theme.text_body)
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .child(title.into()),
-        )
-}
-
-/// 让外部设置回读后的百分比驱动滑块，避免控件继续显示旧草稿值。
-///
-/// @author kongweiguang
-fn sync_percentage_slider(
-    slider: &Entity<SliderState>,
-    value: u8,
-    min: f32,
-    max: f32,
-    window: &mut Window,
-    cx: &mut Context<PreferencesPanel>,
-) {
-    let current = slider.read(cx).value().end().round();
-    let next = (value as f32).clamp(min, max);
-    if current != next {
-        slider.update(cx, |state, cx| state.set_value(next, window, cx));
-    }
-}
-
-/// 用整数百分比和Kit滑块编辑透明度，精确到每一个配置值并保留读数。
-///
-/// @author kongweiguang
-fn percentage_control(
-    slider: &Entity<SliderState>,
-    value: u8,
-    disabled: bool,
-    theme: ThemeTokens,
-) -> impl IntoElement {
-    div()
-        .w_full()
-        .min_w(px(0.))
-        .flex()
-        .items_center()
-        .gap_3()
         .child(
             Slider::new(slider)
-                .flex_1()
+                .w_full()
                 .min_w(px(0.))
-                .h(px(28.))
+                .h(px(16.))
+                .bg(theme.tunnel_action)
+                .text_color(theme.tunnel_action)
                 .disabled(disabled),
         )
-        .child(
-            div()
-                .w(px(56.))
-                .flex_shrink_0()
-                .text_size(px(14.))
-                .text_color(theme.foreground)
-                .text_right()
-                .child(format!("{value}%")),
-        )
 }
 
-/// 设置页主标题区提供清晰层级，避免控件本身承担说明文本职责。
-fn page_heading(
-    title: impl Into<SharedString>,
-    description: impl Into<SharedString>,
-    theme: ThemeTokens,
-) -> impl IntoElement {
-    let title = title.into();
-    let description = description.into();
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_size(px(20.))
-                .font_weight(gpui_kit::FontWeight::BOLD)
-                .child(title),
-        )
-        .child(
-            div()
-                .text_size(px(12.))
-                .text_color(theme.muted)
-                .child(description),
-        )
-}
-
-/// 枚举选项保持按钮自身宽度，让父级换行而不是压缩文字；当前选择仍用 primary 状态表示。
-///
-/// @author kongweiguang
-fn enum_button(
-    id: &'static str,
-    label: impl Into<SharedString>,
-    selected: bool,
-    disabled: bool,
-    listener: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
-) -> Button {
-    let button = Button::new(id)
-        .compact()
-        .flex_shrink_0()
-        .label(label)
-        .disabled(disabled)
-        .on_click(listener);
-    if selected { button.primary() } else { button }
-}
-
-/// 合并主题/密度选择卡的状态与 Kit app 上下文，避免八个平行参数在两类卡片间错位。
+/// 合并主题选择卡的状态与 Kit app 上下文，避免并行参数在三态卡片间错位。
 ///
 /// @author kongweiguang
 struct ChoiceCardStyle {
@@ -1258,7 +845,7 @@ struct ChoiceCardStyle {
     theme: ThemeTokens,
 }
 
-/// 三态主题卡用弱强调选中色；Kit 自定义状态需由 App 构造并统一承载 hover/press 颜色。
+/// 三态主题卡以底色表达选择，沿用 main 的控件圆角、图标与标题两层，不额外增加选中图标。
 ///
 /// 这样既保留 Kit 的可访问选择状态，也避免依赖当前版本 Button 不提供的 active 样式扩展。
 ///
@@ -1278,30 +865,30 @@ fn theme_choice_card(
     } = style;
     let label = label.into();
     let fill = if selected {
-        theme.accent.opacity(0.12)
+        theme.surface_selected()
     } else {
-        theme.secondary
+        theme.muted_surface()
     };
     let border = if selected {
-        theme.accent.opacity(0.62)
+        theme.tunnel_action.opacity(0.35)
     } else {
-        theme.border
+        theme.border.opacity(0.8)
     };
     let hover = if selected {
-        theme.accent.opacity(0.18)
+        theme.surface_selected()
     } else {
-        theme.hover
+        theme.surface_hover()
     };
     let active = if selected {
-        theme.accent.opacity(0.24)
+        theme.surface_selected()
     } else {
-        theme.secondary
+        theme.muted_surface()
     };
     Button::new(id)
         .flex_1()
         .min_w(px(0.))
-        .h(px(THEME_CHOICE_HEIGHT_PX))
-        .rounded(theme.radius)
+        .min_h(px(THEME_CHOICE_HEIGHT_PX))
+        .rounded(theme.control_radius)
         .outline()
         .border_1()
         .border_color(border)
@@ -1318,8 +905,8 @@ fn theme_choice_card(
         .on_click(listener)
         .custom(
             ButtonCustomVariant::new(cx)
-                .color(fill)
-                .foreground(theme.foreground)
+                .color(settings_choice_variant_fill(fill))
+                .foreground(theme.settings_choice_foreground(selected))
                 .hover(hover)
                 .active(active),
         )
@@ -1333,84 +920,82 @@ fn theme_choice_card(
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .child(Icon::new(icon).size(px(20.)).text_color(if selected {
-                    theme.accent
-                } else {
-                    theme.muted
-                }))
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_size(px(14.))
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .text_color(theme.foreground)
-                                .child(label),
-                        )
-                        .when(selected, |row| {
-                            row.child(
-                                Icon::new(IconName::CircleCheck)
-                                    .small()
-                                    .text_color(theme.accent)
-                                    .flex_shrink_0(),
-                            )
-                        }),
+                    Icon::new(icon)
+                        .size(px(16.))
+                        .text_color(theme.settings_choice_foreground(selected)),
+                )
+                .child(
+                    div().flex().items_center().justify_center().gap_2().child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(gpui_kit::FontWeight::NORMAL)
+                            .text_color(theme.settings_choice_foreground(selected))
+                            .child(label),
+                    ),
                 ),
         )
 }
 
-/// 紧凑密度分段保留逐项焦点与可访问名称，同时让选中态和保存值始终指向同一选项。
+/// 密度与背景铺放复用受控状态及 main 的 12px/10px 内边距；铺放卡允许窄列换行。
 ///
 /// @author kongweiguang
-fn density_choice_segment(
-    choice: DensityChoiceSpec,
-    style: ChoiceCardStyle,
+fn preference_choice_card(
+    spec: PreferenceChoiceCardSpec,
+    selected: bool,
+    disabled: bool,
+    theme: ThemeTokens,
     listener: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
     cx: &gpui_kit::App,
 ) -> Button {
-    let ChoiceCardStyle {
-        selected,
-        disabled,
-        theme,
-    } = style;
-    let label = crate::locale::text(choice.label_zh, choice.label_en);
+    let PreferenceChoiceCardSpec {
+        id,
+        label_zh,
+        label_en,
+        description_zh,
+        description_en,
+        min_height,
+        full_width,
+    } = spec;
+    let label = crate::locale::text(label_zh, label_en);
+    let description = crate::locale::text(description_zh, description_en);
     let fill = if selected {
-        theme.accent.opacity(0.12)
+        theme.surface_selected()
     } else {
-        theme.secondary
+        theme.muted_surface()
     };
     let border = if selected {
-        theme.accent.opacity(0.62)
+        theme.tunnel_action.opacity(0.35)
     } else {
-        theme.border
+        theme.border.opacity(0.8)
     };
     let hover = if selected {
-        theme.accent.opacity(0.18)
+        theme.surface_selected()
     } else {
-        theme.hover
+        theme.surface_hover()
     };
     let active = if selected {
-        theme.accent.opacity(0.24)
+        theme.surface_selected()
     } else {
-        theme.secondary
+        theme.muted_surface()
     };
-    Button::new(choice.id)
-        .flex_1()
-        .min_w(px(DENSITY_SEGMENT_MIN_WIDTH_PX))
-        .h(px(DENSITY_SEGMENT_HEIGHT_PX))
-        .rounded(theme.radius_sm)
+    Button::new(id)
+        .when(full_width, |button| button.w_full())
+        .when(!full_width, |button| {
+            button.flex_1().flex_basis(px(0.)).min_w(px(0.))
+        })
+        .min_h(px(min_height))
+        .px_3()
+        .py(px(10.))
+        .rounded(theme.control_radius)
         .outline()
         .border_1()
         .border_color(border)
         .selected(selected)
         .toggled(selected)
         .accessibility_label(crate::locale::text(
-            format!("界面密度：{label}"),
-            format!("Interface density: {label}"),
+            format!("{label}：{description}"),
+            format!("{label}: {description}"),
         ))
         .tab_stop(true)
         .tab_index(0)
@@ -1419,79 +1004,59 @@ fn density_choice_segment(
         .on_click(listener)
         .custom(
             ButtonCustomVariant::new(cx)
-                .color(fill)
-                .foreground(theme.foreground)
+                .color(settings_choice_variant_fill(fill))
+                .foreground(theme.settings_choice_foreground(selected))
                 .hover(hover)
                 .active(active),
         )
         .child(
             div()
                 .w_full()
-                .h_full()
-                .px_2()
                 .flex()
-                .items_center()
-                .justify_center()
-                .gap_2()
+                .flex_col()
+                .gap_1()
                 .child(
-                    div().flex().items_center().justify_center().child(
-                        div()
-                            .text_size(px(14.))
-                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                            .text_color(theme.foreground)
-                            .child(label),
-                    ),
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(theme.text_sm)
+                                .line_height(px(20.))
+                                .font_weight(theme.settings_medium_font_weight())
+                                .text_color(theme.settings_choice_foreground(selected))
+                                .child(label),
+                        )
+                        .when(selected && full_width, |row| {
+                            row.child(
+                                Icon::new(IconName::Check)
+                                    .small()
+                                    .text_color(theme.accent)
+                                    .flex_shrink_0(),
+                            )
+                        }),
                 )
-                .when(selected, |row| {
-                    row.child(
-                        Icon::new(IconName::CircleCheck)
-                            .small()
-                            .text_color(theme.accent)
-                            .flex_shrink_0(),
-                    )
-                }),
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(theme.text_xs)
+                        .line_height(px(20.))
+                        .text_color(theme.muted)
+                        .child(description),
+                ),
         )
 }
 
-/// 标签和可选的当前值占独立整宽说明区，后续选项作为可换行按钮排列。
+/// 校验项使用语义错误色，在浅深主题中保留同等可读性。
 ///
 /// @author kongweiguang
-fn enum_selector(
-    label: impl Into<SharedString>,
-    current: Option<SharedString>,
+pub(in crate::features::preferences) fn issue_row(
+    message: &str,
     theme: ThemeTokens,
-) -> gpui_kit::Div {
-    let mut label_group = div()
-        .w_full()
-        .min_w(px(0.))
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(div().w_full().text_size(px(14.)).child(label.into()));
-    if let Some(current) = current {
-        label_group = label_group.child(
-            div()
-                .w_full()
-                .text_size(px(12.))
-                .text_color(theme.muted)
-                .child(crate::locale::text(
-                    format!("当前：{current}"),
-                    format!("Current: {current}"),
-                )),
-        );
-    }
-    div()
-        .w_full()
-        .min_w(px(0.))
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_2()
-        .child(label_group)
-}
-
-/// 校验项始终用项目语义错误色显示，与浅色、深色主题令牌同步。
-fn issue_row(message: &str, theme: ThemeTokens) -> impl IntoElement {
+) -> impl IntoElement {
     div()
         .w_full()
         .px_2()
@@ -1502,7 +1067,10 @@ fn issue_row(message: &str, theme: ThemeTokens) -> impl IntoElement {
 }
 
 /// 兼容性未知 action 以提示色呈现，其余会阻止保存的问题继续使用错误色。
-fn settings_issue_row(issue: &super::SettingsIssue, theme: ThemeTokens) -> impl IntoElement {
+pub(in crate::features::preferences) fn settings_issue_row(
+    issue: &super::SettingsIssue,
+    theme: ThemeTokens,
+) -> impl IntoElement {
     div()
         .w_full()
         .px_2()
@@ -1516,82 +1084,12 @@ fn settings_issue_row(issue: &super::SettingsIssue, theme: ThemeTokens) -> impl 
         .child(issue.message.clone())
 }
 
-/// 快捷键作用域 badge 与配置类型保持同源，不从 label 文本推断行为。
-///
-/// @author kongweiguang
-fn scope_badge(scope: KeybindingScope, theme: ThemeTokens) -> impl IntoElement {
-    let label = match scope {
-        KeybindingScope::Global => crate::locale::text("全局", "Global"),
-        KeybindingScope::Terminal => crate::locale::text("终端", "Terminal"),
-        KeybindingScope::Workspace => crate::locale::text("工作区", "Workspace"),
-    };
-    div()
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .bg(theme.sidebar)
-        .text_size(theme.text_xs)
-        .text_color(theme.muted)
-        .child(label)
-}
-
-/// 已知动作使用当前界面语义，标签切换覆盖全部类型；旧 action ID 和未知扩展的用户标签继续保留。
-pub(super) fn keybinding_label(action: &str, fallback: &str) -> SharedString {
-    let (zh_cn, en_us) = match action {
-        "settings.open" => ("打开设置", "Open settings"),
-        "settings.keybindings" => ("查看快捷键与动作", "View shortcuts and actions"),
-        "terminal.focus" => ("回到终端", "Focus terminal"),
-        "terminal.paste" => ("粘贴到终端", "Paste into terminal"),
-        "terminal.newTab" => ("新建本地终端", "New local terminal"),
-        "terminal.closeTab" => ("关闭当前终端标签", "Close current terminal tab"),
-        "terminal.closePane" => ("关闭当前分屏", "Close current pane"),
-        "terminal.splitHorizontal" => ("左右分屏", "Split left and right"),
-        "terminal.splitVertical" => ("上下分屏", "Split top and bottom"),
-        "terminal.previousTab" => ("上一个标签", "Previous tab"),
-        "terminal.nextTab" => ("下一个标签", "Next tab"),
-        "tool.agentLauncher" => ("打开 Agent Launcher", "Open Agent Launcher"),
-        "tool.system" => ("打开系统信息", "Open system information"),
-        "tool.sftp" => ("打开 SFTP", "Open SFTP"),
-        "tool.ports" => ("打开端口转发", "Open port forwarding"),
-        "tool.snippets" => ("打开脚本片段", "Open command snippets"),
-        "tool.logs" => ("打开日志", "Open logs"),
-        _ => return fallback.to_owned().into(),
-    };
-    crate::locale::text(zh_cn, en_us)
-}
-
 /// 回退通用键位用于显示和初始编辑，但仅在用户保存时写入对应平台字段。
 fn effective_binding(platform: &str, generic: &str) -> String {
     if platform.is_empty() {
         generic.to_owned()
     } else {
         platform.to_owned()
-    }
-}
-
-/// 背景适配方式文案描述实际绘制行为。
-fn fit_label(value: BackgroundFit) -> SharedString {
-    match value {
-        BackgroundFit::Cover => crate::locale::text("填充", "Cover"),
-        BackgroundFit::Contain => crate::locale::text("完整显示", "Contain"),
-        BackgroundFit::Tile => crate::locale::text("平铺", "Tile"),
-    }
-}
-/// 终端光标形态文案对应 Alacritty terminal 可用样式。
-fn cursor_label(value: TerminalCursorStyle) -> SharedString {
-    match value {
-        TerminalCursorStyle::Block => crate::locale::text("块状", "Block"),
-        TerminalCursorStyle::Bar => crate::locale::text("竖线", "Bar"),
-        TerminalCursorStyle::Underline => crate::locale::text("下划线", "Underline"),
-    }
-}
-/// 色盘名称使用用户可识别品牌和社区主题名。
-fn color_scheme_label(value: TerminalColorScheme) -> &'static str {
-    match value {
-        TerminalColorScheme::Kerminal => "Kerminal",
-        TerminalColorScheme::TokyoNight => "Tokyo Night",
-        TerminalColorScheme::Solarized => "Solarized",
-        TerminalColorScheme::Github => "GitHub",
     }
 }
 

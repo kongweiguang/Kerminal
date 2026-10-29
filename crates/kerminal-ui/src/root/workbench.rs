@@ -6,31 +6,29 @@ use std::{collections::BTreeMap, time::Duration};
 
 use gpui_kit::{
     AnyElement, App, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     StatefulInteractiveElement as _, Window,
     assets::IconName,
     base::Selectable as _,
+    canvas,
     component::{
-        Disableable, FocusTrapElement as _, Icon, Sizable as _,
+        Disableable, FocusTrapElement as _, Icon, Sizable as _, WindowExt as _,
         button::{Button, ButtonVariants},
-        menu::{ContextMenuExt as _, PopupMenuItem},
         resizable::{h_resizable, resizable_panel, v_resizable},
         tooltip::Tooltip,
     },
     div,
     prelude::*,
-    px,
+    px, relative,
 };
 use kerminal_application::{
     preferences::{
-        SettingsSnapshot, ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId,
-        WorkbenchLayoutSettings,
+        InterfaceDensity, SettingsSnapshot, ToolRailPanelPlacement, ToolRailSettings,
+        ToolRailToolId, WorkbenchLayoutSettings,
     },
     workspace::{WorkspaceSessionSnapshot, WorkspaceSessionTab},
 };
-use kerminal_domain::{
-    files::FileEndpoint,
-    identity::{PaneId, TabId},
-};
+use kerminal_domain::identity::{PaneId, TabId};
 
 use crate::{features::connections::HostNavigation, theme::ThemeTokens};
 
@@ -48,14 +46,21 @@ const HOST_NAVIGATION_CONTROL_WIDTH: f32 = 40.0;
 const HOST_NAVIGATION_MIN_WIDTH: f32 = 168.0;
 const HOST_NAVIGATION_MAX_WIDTH: f32 = 360.0;
 const WORKBENCH_MIN_HEIGHT: f32 = 240.0;
-const LEFT_TOOL_PANEL_WIDTH: f32 = 320.0;
-const TOOL_RAIL_WIDTH: f32 = 44.0;
-const TOOL_RAIL_BUTTON_SIZE: f32 = 32.0;
-const ATTACHED_DOCK_DEFAULT_WIDTH: f32 = 360.0;
-const ATTACHED_DOCK_MIN_WIDTH: f32 = 130.0;
+const LEFT_TOOL_PANEL_MIN_WIDTH: f32 = 300.0;
 const ATTACHED_DOCK_MAX_WIDTH: f32 = 1_360.0;
-pub(super) const RESIZABLE_EDGE_GUTTER: f32 = 4.0;
 const WORKBENCH_PANEL_GUTTER: f32 = 4.0;
+const WORKBENCH_TITLE_BAR_HEIGHT: f32 = 36.0;
+
+pub(super) use super::workbench_layout::{RESIZABLE_EDGE_GUTTER, TOOL_RAIL_WIDTH};
+
+/// 键盘操作冻结当前绘制帧的浮窗与边界，窗口变化后由下一帧重新提供一致几何。
+#[derive(Clone, Copy)]
+pub(super) struct FloatingPanelKeyLayout {
+    rendered_position: workbench_layout::FloatingPanelPosition,
+    viewport_width: f32,
+    body_height: f32,
+    geometry: workbench_layout::FloatingPanelGeometry,
+}
 
 /// Root 只保留最新 RAM 意图与 owner 序号；revision、在途与失败 fence 仍由 Preferences 管理。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,18 +141,6 @@ pub(super) struct ToolRailPanelSlots {
     pub(super) center: Option<ToolRailToolId>,
 }
 
-/// 工具右键菜单仅表达设置变更；Root 负责基于最新快照执行带版本校验的保存。
-///
-/// @author kongweiguang
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ToolRailContextAction {
-    MoveUp,
-    MoveDown,
-    PinToBottom,
-    MoveToTop,
-    Dock(ToolRailPanelPlacement),
-}
-
 /// 工作台只消费已归一的入口与面板宿主，不负责创建或销毁业务 Entity。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ToolRailLayout {
@@ -201,9 +194,21 @@ pub(super) struct ToolRailPanelState {
     active_tab_id: Option<TabId>,
     tab_open_orders: BTreeMap<Option<TabId>, Vec<ToolRailToolId>>,
     tab_right_dock_collapsed: BTreeMap<Option<TabId>, bool>,
+    floating_positions: BTreeMap<ToolRailToolId, workbench_layout::FloatingPanelPosition>,
+    floating_drag: Option<FloatingPanelDrag>,
+    viewport_width: u16,
     attached_tool: Option<ToolRailToolId>,
     attached_default_width: Option<gpui_kit::Pixels>,
     shared_attached_width: Option<gpui_kit::Pixels>,
+}
+
+/// A drag uses the original pointer and panel position so every move is independent of event order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FloatingPanelDrag {
+    tool: ToolRailToolId,
+    pointer_origin_x: i32,
+    pointer_origin_y: i32,
+    panel_origin: workbench_layout::FloatingPanelPosition,
 }
 
 impl Default for ToolRailPanelState {
@@ -216,6 +221,9 @@ impl Default for ToolRailPanelState {
             active_tab_id: None,
             tab_open_orders: BTreeMap::new(),
             tab_right_dock_collapsed: BTreeMap::new(),
+            floating_positions: BTreeMap::new(),
+            floating_drag: None,
+            viewport_width: 1_440,
             attached_tool: None,
             attached_default_width: None,
             shared_attached_width: None,
@@ -224,7 +232,8 @@ impl Default for ToolRailPanelState {
 }
 
 impl ToolRailPanelState {
-    /// 切换 active tab 时保存旧工具顺序并恢复新 tab 的顺序；清掉已关闭 tab 的缓存。
+    /// 新 Tab 继承切换时的工具集合；已访问 Tab 即使集合为空也优先恢复自身快照。
+    /// 收起状态同样保留显式 false，只有从未初始化的新 Tab 才继承当前状态；Tab 切换同时终止旧浮窗拖动。
     ///
     /// @author kongweiguang
     pub(super) fn activate_tab(
@@ -247,22 +256,21 @@ impl ToolRailPanelState {
             return None;
         }
 
+        self.end_floating_drag();
         self.tab_right_dock_collapsed
             .insert(self.active_tab_id.clone(), right_dock_collapsed);
-        if !self.open_order.is_empty() {
-            self.tab_open_orders.insert(
-                self.active_tab_id.clone(),
-                std::mem::take(&mut self.open_order),
-            );
-        } else {
-            self.tab_open_orders.remove(&self.active_tab_id);
-        }
+        let previous_open_order = std::mem::take(&mut self.open_order);
+        self.tab_open_orders
+            .insert(self.active_tab_id.clone(), previous_open_order.clone());
         self.active_tab_id = tab_id.clone();
-        self.open_order = self.tab_open_orders.remove(&tab_id).unwrap_or_default();
+        self.open_order = self
+            .tab_open_orders
+            .remove(&tab_id)
+            .unwrap_or(previous_open_order);
         let restored_collapsed = self
             .tab_right_dock_collapsed
             .remove(&tab_id)
-            .unwrap_or(false);
+            .unwrap_or(right_dock_collapsed);
         self.tab_open_orders.retain(|cached_tab_id, _| {
             cached_tab_id
                 .as_ref()
@@ -276,8 +284,139 @@ impl ToolRailPanelState {
         Some(restored_collapsed)
     }
 
+    /// Remember the latest logical viewport so non-render callbacks can restore the same panel baseline.
+    pub(super) fn remember_viewport_width(&mut self, viewport_width: f32) {
+        if viewport_width.is_finite() {
+            self.viewport_width =
+                viewport_width.max(0.0).round().clamp(0.0, u16::MAX as f32) as u16;
+        }
+    }
+
+    /// Return the last finite logical width used to derive main-shell panel defaults.
+    pub(super) fn viewport_width(&self) -> f32 {
+        f32::from(self.viewport_width)
+    }
+
+    /// Read the per-tool run-time floating position without persisting it to application settings.
+    pub(super) fn floating_position(
+        &self,
+        tool: ToolRailToolId,
+    ) -> Option<workbench_layout::FloatingPanelPosition> {
+        self.floating_positions.get(&tool).copied()
+    }
+
+    /// Clamp and remember a floating position after first render or viewport resizing.
+    pub(super) fn set_floating_position(
+        &mut self,
+        tool: ToolRailToolId,
+        position: workbench_layout::FloatingPanelPosition,
+    ) {
+        self.floating_positions.insert(tool, position);
+    }
+
+    /// Start moving only the captured floating tool, using a stable drag origin for all later events.
+    pub(super) fn begin_floating_drag(
+        &mut self,
+        tool: ToolRailToolId,
+        pointer_x: f32,
+        pointer_y: f32,
+        panel_origin: workbench_layout::FloatingPanelPosition,
+    ) {
+        self.floating_drag = Some(FloatingPanelDrag {
+            tool,
+            pointer_origin_x: pointer_x.round() as i32,
+            pointer_origin_y: pointer_y.round() as i32,
+            panel_origin,
+        });
+    }
+
+    /// Move the captured tool within its current geometry; unchanged coordinates do not rerender the workspace.
+    pub(super) fn update_floating_drag(
+        &mut self,
+        pointer_x: f32,
+        pointer_y: f32,
+        viewport_width: f32,
+        body_height: f32,
+        geometry: workbench_layout::FloatingPanelGeometry,
+    ) -> bool {
+        let Some(drag) = self.floating_drag else {
+            return false;
+        };
+        let position = workbench_layout::clamp_floating_panel_position(
+            workbench_layout::FloatingPanelPosition {
+                x: drag.panel_origin.x + pointer_x.round() as i32 - drag.pointer_origin_x,
+                y: drag.panel_origin.y + pointer_y.round() as i32 - drag.pointer_origin_y,
+            },
+            viewport_width,
+            body_height,
+            geometry,
+        );
+        if self.floating_positions.get(&drag.tool) == Some(&position) {
+            return false;
+        }
+        self.floating_positions.insert(drag.tool, position);
+        true
+    }
+
+    /// Move the floating panel with a paired keyboard delta using the same clamped runtime geometry as pointer dragging.
+    pub(super) fn nudge_floating_position(
+        &mut self,
+        tool: ToolRailToolId,
+        rendered_position: workbench_layout::FloatingPanelPosition,
+        delta: (i32, i32),
+        viewport_width: f32,
+        body_height: f32,
+        geometry: workbench_layout::FloatingPanelGeometry,
+    ) -> bool {
+        let origin = self
+            .floating_positions
+            .get(&tool)
+            .copied()
+            .unwrap_or(rendered_position);
+        let position = workbench_layout::clamp_floating_panel_position(
+            workbench_layout::FloatingPanelPosition {
+                x: origin.x.saturating_add(delta.0),
+                y: origin.y.saturating_add(delta.1),
+            },
+            viewport_width,
+            body_height,
+            geometry,
+        );
+        if position == origin {
+            return false;
+        }
+        self.floating_positions.insert(tool, position);
+        true
+    }
+
+    /// Finish a captured drag after mouse release or window focus loss, preserving its last clamped position.
+    pub(super) fn finish_floating_drag(&mut self) -> bool {
+        self.end_floating_drag().is_some()
+    }
+
+    /// Escape cancels a floating drag by restoring the captured origin before the panel closes.
+    pub(super) fn cancel_floating_drag(&mut self) -> bool {
+        let Some(drag) = self.end_floating_drag() else {
+            return false;
+        };
+        self.floating_positions.insert(drag.tool, drag.panel_origin);
+        true
+    }
+
+    /// End the data-only drag snapshot so layout state remains cloneable and comparable.
+    ///
+    /// @author kongweiguang
+    fn end_floating_drag(&mut self) -> Option<FloatingPanelDrag> {
+        self.floating_drag.take()
+    }
+
+    /// The paint phase installs global pointer listeners only while a floating drag is active.
+    pub(super) fn floating_drag_is_active(&self) -> bool {
+        self.floating_drag.is_some()
+    }
+
     /// 切换指定工具；历史 Context 只保留配置可读性，不再创建面板状态。
-    /// 同方向最近打开者替换旧宿主，不同方向保持并行。
+    /// 同方向最近打开者替换旧宿主，不同方向保持并行；被替换工具的未完成拖动立即失效。
     ///
     /// @author kongweiguang
     pub(super) fn toggle(&mut self, settings: &ToolRailSettings, tool: ToolRailToolId) {
@@ -294,15 +433,24 @@ impl ToolRailPanelState {
         self.open_order
             .retain(|candidate| panel_placement(settings, *candidate) != placement);
         self.open_order.push(tool);
+        if self
+            .floating_drag
+            .is_some_and(|drag| !self.open_order.contains(&drag.tool))
+        {
+            self.end_floating_drag();
+        }
     }
 
-    /// 显式关闭只移除原工具的运行时打开事实；重复回调不能反向打开，也不改停靠位置或用户宽度。
+    /// 显式关闭只移除原工具的运行时打开事实；重复回调不能反向打开，也不改停靠位置或用户宽度，并结束该工具拖动。
     ///
     /// @author kongweiguang
     pub(super) fn close(&mut self, settings: &ToolRailSettings, tool: ToolRailToolId) -> bool {
         self.reproject(settings);
         let was_open = self.open_order.contains(&tool);
         self.open_order.retain(|candidate| *candidate != tool);
+        if self.floating_drag.is_some_and(|drag| drag.tool == tool) {
+            self.end_floating_drag();
+        }
         was_open
     }
 
@@ -379,7 +527,7 @@ impl ToolRailPanelState {
         default: gpui_kit::Pixels,
     ) {
         let width = measured.as_f32();
-        let minimum = ATTACHED_DOCK_MIN_WIDTH + RESIZABLE_EDGE_GUTTER;
+        let minimum = workbench_layout::ATTACHED_DOCK_CONTENT_MIN_WIDTH + RESIZABLE_EDGE_GUTTER;
         let maximum = ATTACHED_DOCK_MAX_WIDTH + RESIZABLE_EDGE_GUTTER;
         if !width.is_finite() || !(minimum..=maximum).contains(&width) {
             return;
@@ -486,6 +634,49 @@ impl ToolRailPanelState {
 }
 
 impl RootView {
+    /// Match main's drag-handle arrow controls using one rendered layout snapshot, keeping movement scoped to the floating tool.
+    pub(super) fn handle_floating_tool_panel_key_down(
+        &mut self,
+        tool: ToolRailToolId,
+        layout: FloatingPanelKeyLayout,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.to_ascii_lowercase();
+        let (delta_x, delta_y) = match key.as_str() {
+            "left" | "arrowleft" => (-1, 0),
+            "right" | "arrowright" => (1, 0),
+            "up" | "arrowup" => (0, -1),
+            "down" | "arrowdown" => (0, 1),
+            _ => return,
+        };
+        let settings = self.current_tool_rail_settings();
+        if self.tool_rail_rendered_compact.0
+            || self.tool_rail_state.project(&settings).panels.center != Some(tool)
+        {
+            return;
+        }
+
+        let step = if event.keystroke.modifiers.shift {
+            40
+        } else {
+            12
+        };
+        window.prevent_default();
+        cx.stop_propagation();
+        if self.tool_rail_state.nudge_floating_position(
+            tool,
+            layout.rendered_position,
+            (delta_x * step, delta_y * step),
+            layout.viewport_width,
+            layout.body_height,
+            layout.geometry,
+        ) {
+            cx.notify();
+        }
+    }
+
     /// 单字段手势以末意图为基线，不能从响应式有效尺寸或 Agent 默认宽度重新拼整份布局。
     ///
     /// @author kongweiguang
@@ -759,7 +950,8 @@ impl RootView {
         self.show_compact_tool_panel(tool, window, cx);
     }
 
-    /// 工具抽屉只保存临时激活项；窄窗口恢复后原停靠位置、右 Dock 折叠值和面板尺寸仍有效。
+    /// 新工具按 main 的单面板 compact 语义替换既有打开项；已打开工具只切换抽屉焦点。
+    /// 关闭仍经共享切换路径完成，以同步 Agent 搜索、Dock 宽度与工具专属状态。
     ///
     /// @author kongweiguang
     fn show_compact_tool_panel(
@@ -770,6 +962,12 @@ impl RootView {
     ) {
         if !self.tool_rail_state.open_order.contains(&tool) {
             let right_dock_was_collapsed = self.right_dock_collapsed;
+            self.right_dock_collapsed = false;
+            // Re-read the projected order after each close so a settings reproject cannot reopen a stale collision.
+            while let Some(open_tool) = self.tool_rail_state.open_order.last().copied() {
+                self.toggle_tool_rail_panel(open_tool, window, cx);
+            }
+            self.right_dock_collapsed = right_dock_was_collapsed;
             self.toggle_tool_rail_panel(tool, window, cx);
             self.right_dock_collapsed = right_dock_was_collapsed;
         }
@@ -782,6 +980,72 @@ impl RootView {
         window.focus(&self.compact_drawer_focus_handle, cx);
         cx.notify();
     }
+
+    /// 只在验收构建中打开活动态投影；隐藏窗口不接收 OS 激活，生产状态仍以窗口焦点为准。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn enable_right_rail_acceptance_activity(&mut self, cx: &mut Context<Self>) {
+        self.right_rail_acceptance_active_override = true;
+        cx.notify();
+    }
+
+    /// compact 验收直接幂等挂载 drawer；常规布局清理旧工具后走生产入口并按新预算复算宿主。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn activate_right_rail_tool_for_acceptance(
+        &mut self,
+        tool: ToolRailToolId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (compact_panels, compact_active_tool) = self.tool_rail_rendered_compact;
+        if compact_panels {
+            self.show_compact_tool_panel(tool, window, cx);
+            return;
+        }
+
+        let open_tools = self.tool_rail_state.open_order.clone();
+        for open_tool in open_tools {
+            self.toggle_tool_rail_panel(open_tool, window, cx);
+        }
+        self.activate_compact_tool_rail_panel(
+            tool,
+            compact_active_tool,
+            compact_panels,
+            window,
+            cx,
+        );
+    }
+
+    /// compact 模式只报告抽屉已打开且仍在实际投影中的工具，避免验收把 open_order 误当作可见面板。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn right_rail_acceptance_active_tool(&self) -> Option<ToolRailToolId> {
+        if self.tool_rail_rendered_compact.0 {
+            if !self.compact_tool_drawer_open {
+                return None;
+            }
+            return self
+                .tool_rail_rendered_compact
+                .1
+                .filter(|tool| self.tool_rail_state.open_order.contains(tool));
+        }
+        self.tool_rail_state.open_order.last().copied()
+    }
+}
+
+/// 窄屏抽屉由当前 Tab 的活动工具决定；主机抽屉占用同一焦点宿主时优先显示。
+///
+/// @author kongweiguang
+pub(super) fn compact_tool_drawer_should_be_visible(
+    compact_panels: bool,
+    active_tool: Option<ToolRailToolId>,
+    host_drawer_open: bool,
+) -> bool {
+    compact_panels && active_tool.is_some() && !host_drawer_open
 }
 
 /// 同一紧凑工具的再次激活只关闭已有抽屉；隐藏抽屉或其它工具不能被旧活动槽误判为关闭请求。
@@ -807,14 +1071,15 @@ pub(super) fn compact_tool_panel_open_target(
         .then_some(requested_tool)
 }
 
-/// 右栏工具切换不改变工作区几何，因此 Agent、文件和运维共用相同默认尺寸。
+/// All right tools share main's total width after removing the rail while retaining the GPUI resize gutter.
 ///
 /// @author kongweiguang
-pub(super) fn attached_dock_default_width(
-    _tool: ToolRailToolId,
-    _show_agent_terminal: bool,
-) -> gpui_kit::Pixels {
-    px(ATTACHED_DOCK_DEFAULT_WIDTH + RESIZABLE_EDGE_GUTTER)
+pub(super) fn attached_dock_default_width(viewport_width: f32) -> gpui_kit::Pixels {
+    px(
+        workbench_layout::main_attached_dock_total_to_gpui_panel_width(
+            workbench_layout::initial_tool_panel_width(viewport_width),
+        ),
+    )
 }
 
 /// 文件与容器工具固定右侧；其余工具沿用配置，兼容停靠值只在投影时忽略而不改写磁盘。
@@ -858,12 +1123,16 @@ fn panel_slot_mut(
 /// 终端下方不保留常驻状态条，必要状态改用可关闭的浮层提示，不占用终端高度。
 /// Agent 终端可见时 launcher 仅按头部与恢复/错误反馈定高，终端独占 Dock 的剩余高度；无终端时入口继续填满并居中。
 /// 搜索按实际可见宿主挂起或恢复，状态位避免重绘反复重启防抖，恢复查询不获取焦点。
-/// Center 的 X 与遮罩提供不依赖子控件 Escape 的退出口；正文点击截断冒泡，关闭仍由 Root 核对原工具。
+/// Center 浮窗独立于终端和 Rail，拖动坐标受 Shell 边界约束且不设遮罩或焦点陷阱。
 /// 绘制与首次激活共用只读视口投影；主机栏展开也按展开后的预算打开抽屉，不能只挤走工具却不显示目录。
 /// 设置弹层限制为可扫读的双栏宽高；密集分类继续内部滚动，固定操作栏与窄窗视口夹紧规则不变。
 /// 两侧分隔槽平时透明，悬停光效只由 Kit 的拖动状态驱动；收起右栏仍补齐与左侧相同的留白。
 /// 运维表单接收扣除边框的宿主高度，正文滚动不能挤出固定操作栏。
+/// 右栏决策弹框按 main 先过滤背景再绘制主题玻璃表面；紧凑遮罩覆盖 body，面板单独内缩 8px。
+/// 窄屏工具抽屉从当前 Tab 活动工具派生，常规停靠宿主只处理精确 owner 冒泡到达的未消费 Escape。
+/// Root 确认、连接提示与 Kit 模态优先持有焦点；只暂停抽屉的焦点回收，保留 main 的模态背景。
 /// 主机弹层统一按 rem 缩放并夹紧视口；主机树插槽允许收缩，使内部滚动区能接收剩余高度。
+/// 工作台按 main 的局部色板呈现；标签区的唯一前导间距与抽屉按钮到分隔线的距离一致。
 ///
 /// @author kongweiguang
 pub(super) fn render_workbench(
@@ -891,7 +1160,7 @@ pub(super) fn render_workbench(
             .is_some_and(|view| view.read(cx).is_open())
         || window.has_active_prompt();
     track_workbench_status_toast(root, feedback_obscured, cx);
-    let theme = ThemeTokens::current(window, cx);
+    let theme = ThemeTokens::current(window, cx).for_workbench();
     let resize_handle_appearance = super::workbench_resize::appearance(theme.accent);
     let ui_font_family =
         cx.read_global::<gpui_kit::component::Theme, _>(|theme, _| theme.font_family.clone());
@@ -938,6 +1207,8 @@ pub(super) fn render_workbench(
     }
 
     let viewport = window.viewport_size();
+    root.tool_rail_state
+        .remember_viewport_width(viewport.width.as_f32());
     let WorkbenchViewportProjection {
         plan: layout_plan,
         failed_file_tab,
@@ -960,11 +1231,38 @@ pub(super) fn render_workbench(
         || snippet_editor_open
         || root.pending_quit_intent.is_some()
         || window.has_active_prompt();
+    let compact_drawer_focus_blocked = compact_drawer_blocked
+        || root.connection_prompt_modal_open
+        || root.root_confirmation_owner.is_some()
+        || window.has_active_dialog(cx);
+    let should_show_active_compact_tool = compact_tool_drawer_should_be_visible(
+        compact_panels,
+        compact_active_tool,
+        root.compact_host_drawer_open,
+    );
+    // 显隐由活动工具投影驱动；只在焦点离开抽屉时回收，保留最初的返回焦点。
+    if !compact_drawer_focus_blocked {
+        if should_show_active_compact_tool {
+            if !root.compact_tool_drawer_open {
+                if root.compact_drawer_return_focus.is_none() {
+                    root.compact_drawer_return_focus = window.focused(cx);
+                }
+                root.compact_tool_drawer_open = true;
+                window.focus(&root.compact_drawer_focus_handle, cx);
+            } else if !root
+                .compact_drawer_focus_handle
+                .contains_focused(window, cx)
+            {
+                window.focus(&root.compact_drawer_focus_handle, cx);
+            }
+        } else if root.compact_tool_drawer_open && !root.compact_host_drawer_open {
+            root.close_compact_drawer(window, cx);
+        }
+    }
     let show_compact_host_drawer =
         layout_plan.compact_width && root.compact_host_drawer_open && !compact_drawer_blocked;
     let show_compact_tool_drawer =
-        compact_panels && root.compact_tool_drawer_open && !compact_drawer_blocked;
-    let compact_drawer_left_inset = layout_plan.compact_drawer_left_inset;
+        should_show_active_compact_tool && root.compact_tool_drawer_open && !compact_drawer_blocked;
 
     let title_brand = div()
         .id("workbench-title-brand")
@@ -1031,8 +1329,6 @@ pub(super) fn render_workbench(
         .h_full()
         .flex()
         .items_center()
-        .border_b_1()
-        .border_color(theme.border)
         .child(title_brand)
         .child(
             div()
@@ -1042,6 +1338,7 @@ pub(super) fn render_workbench(
                 .h_full()
                 .flex()
                 .items_center()
+                .pl_1()
                 .gap_1()
                 .overflow_hidden()
                 .child(
@@ -1066,6 +1363,8 @@ pub(super) fn render_workbench(
         TitleBar::new()
             .h(px(36.))
             .bg(sidebar_background)
+            .border_b_1()
+            .border_color(theme.border)
             .on_close_window(move |_: &ClickEvent, window, app| {
                 root_entity.update(app, |root, cx| {
                     root.handle_window_close_request(window, cx);
@@ -1075,6 +1374,11 @@ pub(super) fn render_workbench(
     };
 
     let compact_host_navigation = host_navigation.clone();
+    let (footer_x, footer_y) = match super::preferences::current_interface_density(root) {
+        InterfaceDensity::Compact => (12., 3.),
+        InterfaceDensity::Comfortable => (14., 3.),
+        InterfaceDensity::Spacious => (16., 5.),
+    };
     let left_sidebar = {
         let mut sidebar = div()
             .id("workbench-left-sidebar")
@@ -1108,15 +1412,23 @@ pub(super) fn render_workbench(
             div()
                 .id("workbench-sidebar-footer")
                 .w_full()
-                .h(px(42.))
+                .relative()
                 .flex_shrink_0()
-                .px_2()
+                .px(px(footer_x))
+                .py(px(footer_y))
                 .flex()
                 .items_center()
                 .gap_1()
-                .border_t_1()
-                .border_color(theme.border)
                 .bg(sidebar_background)
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(px(footer_x + 8.))
+                        .right(px(footer_x + 8.))
+                        .h(px(1.))
+                        .bg(theme.border),
+                )
                 .child(render_settings_button(
                     "workbench-open-preferences-sidebar",
                     "workbench-open-preferences-sidebar-tooltip",
@@ -1154,9 +1466,17 @@ pub(super) fn render_workbench(
             let content = renderers.take_for(tool);
             div()
                 .id("workbench-tool-panel-left-host")
-                .w(px(LEFT_TOOL_PANEL_WIDTH))
+                .on_key_down(cx.listener(move |root, event, window, cx| {
+                    root.handle_docked_tool_panel_key_down(
+                        ToolRailPanelPlacement::Left,
+                        tool,
+                        event,
+                        window,
+                        cx,
+                    );
+                }))
                 .h_full()
-                .flex_shrink_0()
+                .min_w(px(0.))
                 .child(workbench_tool_panel_slot(
                     "workbench-tool-panel-left",
                     content,
@@ -1394,6 +1714,15 @@ pub(super) fn render_workbench(
             let content = renderers.take_for(tool);
             let bottom_panel = div()
                 .id("workbench-tool-panel-bottom-host")
+                .on_key_down(cx.listener(move |root, event, window, cx| {
+                    root.handle_docked_tool_panel_key_down(
+                        ToolRailPanelPlacement::Bottom,
+                        tool,
+                        event,
+                        window,
+                        cx,
+                    );
+                }))
                 .size_full()
                 .flex()
                 .flex_col()
@@ -1462,6 +1791,9 @@ pub(super) fn render_workbench(
         center_column = center_column.child(center_content_slot);
     }
 
+    let density = super::preferences::interface_density_metrics(root);
+    let rail_button_height =
+        tool_rail_button_height(super::preferences::current_interface_density(root));
     let mut rail_main = div()
         .id("workbench-tool-rail-main")
         .w_full()
@@ -1469,10 +1801,9 @@ pub(super) fn render_workbench(
         .min_h(px(0.))
         .flex()
         .flex_col()
-        .gap(px(5.))
+        .gap(px(density.item_gap / 2.0))
         .items_center()
         .overflow_y_scroll();
-    let root_entity = cx.entity();
     for tool in entries.main.iter().copied() {
         let selected = if compact_panels {
             show_compact_tool_drawer && compact_active_tool == Some(tool)
@@ -1488,6 +1819,7 @@ pub(super) fn render_workbench(
             tool_rail_button_id(tool),
             tool_rail_icon(tool),
             tool_rail_label(tool),
+            rail_button_height,
             selected,
             Some(toggled),
             cx.listener(move |root, _: &ClickEvent, window, cx| {
@@ -1500,36 +1832,26 @@ pub(super) fn render_workbench(
                 );
             }),
         );
-        rail_main = rail_main.child(tool_rail_context_button(
-            button,
-            tool,
-            entries.main.clone(),
-            false,
-            root_entity.clone(),
-            selected
-                && (compact_panels || panels.attached != Some(tool) || !root.right_dock_collapsed),
-        ));
+        rail_main = rail_main.child(button.custom(theme.rail_button_variant(selected, cx)));
     }
     let mut rail_bottom = div()
         .id("workbench-tool-rail-bottom")
         .w_full()
-        .flex_shrink_1()
-        .min_h(tool_rail_partition_min_height(&entries.bottom))
+        .flex_shrink_0()
+        .min_h(tool_rail_partition_min_height(
+            &entries.bottom,
+            rail_button_height,
+        ))
+        .max_h(relative(0.55))
         .flex()
         .flex_col()
-        .gap(px(5.))
-        .items_center();
-    let mut rail_bottom_tools = div()
-        .id("workbench-tool-rail-bottom-tools")
-        .w_full()
-        .flex_1()
-        .min_h(tool_rail_partition_min_height(&entries.bottom))
-        .flex()
-        .flex_col()
-        .justify_end()
-        .gap(px(5.))
+        .gap(px(density.item_gap / 2.0))
         .items_center()
-        .overflow_y_scroll();
+        .pt(px(density.item_gap / 2.0))
+        .overflow_y_scroll()
+        .when(!entries.main.is_empty(), |this| {
+            this.border_t_1().border_color(theme.tool_panel_border)
+        });
     for tool in entries.bottom.iter().copied() {
         let selected = if compact_panels {
             show_compact_tool_drawer && compact_active_tool == Some(tool)
@@ -1545,6 +1867,7 @@ pub(super) fn render_workbench(
             tool_rail_button_id(tool),
             tool_rail_icon(tool),
             tool_rail_label(tool),
+            rail_button_height,
             selected,
             Some(toggled),
             cx.listener(move |root, _: &ClickEvent, window, cx| {
@@ -1557,29 +1880,40 @@ pub(super) fn render_workbench(
                 );
             }),
         );
-        rail_bottom_tools = rail_bottom_tools.child(tool_rail_context_button(
-            button,
-            tool,
-            entries.bottom.clone(),
-            true,
-            root_entity.clone(),
-            selected
-                && (compact_panels || panels.attached != Some(tool) || !root.right_dock_collapsed),
-        ));
+        rail_bottom = rail_bottom.child(button.custom(theme.rail_button_variant(selected, cx)));
     }
-    rail_bottom = rail_bottom.child(rail_bottom_tools);
     let tool_rail = div()
         .id("workbench-tool-rail")
+        .debug_selector(|| "workbench-tool-rail".into())
         .w(px(TOOL_RAIL_WIDTH))
         .h_full()
         .flex()
         .flex_col()
         .items_center()
-        .gap(px(5.))
-        .py_0()
+        .py(px(density.tool_rail_padding_y))
+        .border_l_1()
+        .border_color(theme.tool_panel_border)
         .overflow_hidden()
         .bg(sidebar_background)
         .text_color(theme.muted)
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|root, _, window, cx| {
+                window.prevent_default();
+                root.open_tool_rail_customizer(window, cx);
+                cx.stop_propagation();
+            }),
+        )
+        .on_key_down(cx.listener(|root, event: &KeyDownEvent, window, cx| {
+            let opens_menu = event.keystroke.key == "ContextMenu"
+                || (event.keystroke.key.eq_ignore_ascii_case("F10")
+                    && event.keystroke.modifiers.shift);
+            if opens_menu && !event.is_held {
+                window.prevent_default();
+                root.open_tool_rail_customizer(window, cx);
+                cx.stop_propagation();
+            }
+        }))
         .child(rail_main)
         .child(rail_bottom);
     let has_agent_terminal = agent_terminal_content.is_some();
@@ -1587,12 +1921,24 @@ pub(super) fn render_workbench(
         has_agent_terminal && panels.attached == Some(ToolRailToolId::AgentLauncher);
     let mut agent_dock = div()
         .id("workbench-agent-dock")
+        .on_key_down(cx.listener({
+            let rendered_tool = panels.attached.unwrap_or(ToolRailToolId::AgentLauncher);
+            move |root, event, window, cx| {
+                root.handle_docked_tool_panel_key_down(
+                    ToolRailPanelPlacement::Attached,
+                    rendered_tool,
+                    event,
+                    window,
+                    cx,
+                );
+            }
+        }))
         .w_full()
         .h_full()
         .flex()
         .flex_col()
         .overflow_hidden()
-        .bg(workspace_background);
+        .bg(theme.tool_panel_surface);
     if let Some(tool) = panels.attached {
         let content = renderers.take_for(tool);
         let panel_slot = if tool == ToolRailToolId::AgentLauncher {
@@ -1630,16 +1976,50 @@ pub(super) fn render_workbench(
     }
     let mut agent_dock_element = Some(agent_dock.into_any_element());
 
-    let mut center_area = div()
-        .id("workbench-center-area")
-        .size_full()
-        .flex()
-        .gap(px(4.))
-        .overflow_hidden();
-    if let Some(left_panel) = left_tool_panel {
-        center_area = center_area.child(left_panel);
-    }
-    center_area = center_area.child(center_column);
+    let left_default_width = px(workbench_layout::initial_tool_panel_width(
+        viewport.width.as_f32(),
+    ) + RESIZABLE_EDGE_GUTTER);
+    let initial_left_tool_width = root
+        .workbench_left_tool_resizable_state
+        .read(cx)
+        .preferred_panel_size(0)
+        .or_else(|| {
+            root.workbench_left_tool_resizable_state
+                .read(cx)
+                .sizes()
+                .first()
+                .copied()
+        })
+        .unwrap_or(left_default_width);
+    let center_area = if let Some(left_panel) = left_tool_panel {
+        h_resizable("workbench-left-tool-panel-split")
+            .preserve_panel_size_on_container_resize(0)
+            .with_state(&root.workbench_left_tool_resizable_state)
+            .with_handle_appearance(resize_handle_appearance.clone())
+            .child(
+                resizable_panel()
+                    .size(initial_left_tool_width)
+                    .size_range(
+                        px(LEFT_TOOL_PANEL_MIN_WIDTH + RESIZABLE_EDGE_GUTTER)
+                            ..px(layout_plan.left_tool_panel_max_width + RESIZABLE_EDGE_GUTTER),
+                    )
+                    .flex_none()
+                    .child(
+                        div()
+                            .size_full()
+                            .pr(px(RESIZABLE_EDGE_GUTTER))
+                            .child(left_panel),
+                    ),
+            )
+            .child(
+                resizable_panel()
+                    .size_range(px(layout_plan.center_min_width)..px(4_000.0))
+                    .child(center_column),
+            )
+            .into_any_element()
+    } else {
+        center_column.into_any_element()
+    };
 
     let dock_is_visible = !compact_panels
         && !root.right_dock_collapsed
@@ -1653,7 +2033,7 @@ pub(super) fn render_workbench(
         cx,
     );
     let dock_tool = panels.attached.unwrap_or(ToolRailToolId::AgentLauncher);
-    let dock_default_width = attached_dock_default_width(dock_tool, show_agent_terminal);
+    let dock_default_width = attached_dock_default_width(viewport.width.as_f32());
     if root
         .tool_rail_state
         .update_attached_default_width(dock_tool, dock_default_width)
@@ -1768,7 +2148,7 @@ pub(super) fn render_workbench(
     }
     let center_area_min_width = layout_plan.center_min_width
         + if !compact_panels && panels.left.is_some() {
-            LEFT_TOOL_PANEL_WIDTH + WORKBENCH_PANEL_GUTTER
+            LEFT_TOOL_PANEL_MIN_WIDTH + RESIZABLE_EDGE_GUTTER * 2.0
         } else {
             0.0
         };
@@ -1780,7 +2160,7 @@ pub(super) fn render_workbench(
     };
     let main_workspace_min_width = center_area_min_width
         + if dock_is_visible {
-            ATTACHED_DOCK_MIN_WIDTH + RESIZABLE_EDGE_GUTTER * 3.0
+            workbench_layout::ATTACHED_DOCK_CONTENT_MIN_WIDTH + RESIZABLE_EDGE_GUTTER * 3.0
         } else {
             RESIZABLE_EDGE_GUTTER + closed_dock_gutter
         };
@@ -1830,8 +2210,9 @@ pub(super) fn render_workbench(
                 resizable_panel()
                     .size(initial_dock_width)
                     .size_range(
-                        px(ATTACHED_DOCK_MIN_WIDTH + RESIZABLE_EDGE_GUTTER)
-                            ..px(ATTACHED_DOCK_MAX_WIDTH + RESIZABLE_EDGE_GUTTER),
+                        px(workbench_layout::ATTACHED_DOCK_CONTENT_MIN_WIDTH
+                            + RESIZABLE_EDGE_GUTTER)
+                            ..px(layout_plan.attached_dock_max_width + RESIZABLE_EDGE_GUTTER),
                     )
                     // 保留用户拖动后的面板基准尺寸，避免中心区受最小宽度约束时 Dock 继续吸收剩余空间。
                     .flex_none()
@@ -1935,8 +2316,12 @@ pub(super) fn render_workbench(
                 .min_h(px(WORKBENCH_MIN_HEIGHT))
                 .h_full()
                 .child(main_columns),
-        )
-        .child(tool_rail);
+        );
+
+    let mut tool_rail = Some(tool_rail);
+    if show_compact_tool_drawer && let Some(tool_rail) = tool_rail.take() {
+        workbench_body = workbench_body.child(tool_rail);
+    }
 
     if show_compact_host_drawer {
         let drawer_width =
@@ -1969,20 +2354,17 @@ pub(super) fn render_workbench(
             content,
             tool,
             workbench_drawers::ToolDrawerLayout {
-                left: compact_drawer_left_inset,
-                right: TOOL_RAIL_WIDTH + WORKBENCH_PANEL_GUTTER,
+                left: 0.0,
+                right: 0.0,
                 width: workbench_drawers::tool_drawer_width(
                     viewport.width.as_f32(),
-                    compact_drawer_left_inset,
-                    TOOL_RAIL_WIDTH + WORKBENCH_PANEL_GUTTER,
-                    root.tool_rail_state
-                        .attached_width(tool)
-                        .unwrap_or_else(|| root.current_attached_default_width(tool))
-                        .as_f32(),
+                    8.0,
+                    8.0,
+                    440.0,
                 ),
             },
             theme,
-            panel_background,
+            theme.tool_panel_floating_surface,
             &root.compact_drawer_focus_handle,
             cx,
         ));
@@ -1991,73 +2373,207 @@ pub(super) fn render_workbench(
     if let Some(tool) = super::tool_panels::expanded_center_tool_panel(panels, compact_panels) {
         let content = renderers.take_for(tool);
         let close_label = crate::locale::text("关闭工具面板", "Close tool panel");
+        let drag_tooltip = crate::locale::text(
+            "拖动工具浮窗；方向键可微调位置",
+            "Drag the floating panel; use arrow keys to adjust its position",
+        );
+        let viewport_width = viewport.width.as_f32();
+        let body_height = (viewport.height.as_f32() - WORKBENCH_TITLE_BAR_HEIGHT).max(0.0);
+        let floating_geometry =
+            workbench_layout::floating_panel_geometry(viewport_width, body_height);
+        let floating_position = root
+            .tool_rail_state
+            .floating_position(tool)
+            .map(|position| {
+                workbench_layout::clamp_floating_panel_position(
+                    position,
+                    viewport_width,
+                    body_height,
+                    floating_geometry,
+                )
+            })
+            .unwrap_or_else(|| {
+                workbench_layout::initial_floating_panel_position(
+                    viewport_width,
+                    body_height,
+                    floating_geometry,
+                )
+            });
+        root.tool_rail_state
+            .set_floating_position(tool, floating_position);
         workbench_body = workbench_body.child(
             div()
-                .id("workbench-tool-panel-center-overlay")
+                .id("workbench-tool-panel-center-floating")
+                .debug_selector(|| "workbench-tool-panel-center-floating".into())
                 .absolute()
-                .inset_0()
+                .left(px(floating_position.x as f32))
+                .top(px(floating_position.y as f32))
+                .w(px(floating_geometry.width))
+                .h(px(floating_geometry.height))
                 .flex()
-                .items_center()
-                .justify_center()
-                .bg(gpui_kit::hsla(0., 0., 0., 0.24))
-                .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
-                    root.dismiss_center_tool_panel(tool, window, cx);
+                .flex_col()
+                .overflow_hidden()
+                .rounded(theme.radius_panel)
+                .shadow_lg()
+                .border_1()
+                .border_color(theme.tool_panel_border)
+                .bg(theme.tool_panel_surface)
+                .on_key_down(cx.listener(move |root, event, window, cx| {
+                    root.handle_center_tool_panel_key_down(tool, event, window, cx);
                 }))
                 .child(
                     div()
-                        .id("workbench-tool-panel-center-host")
-                        .w(px(720.))
-                        .h(px(540.))
+                        .id("workbench-tool-panel-center-header")
+                        .w_full()
+                        .h(px(40.))
                         .flex_shrink_0()
+                        .px_3()
                         .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.panel)
-                        .on_click(|_, _, cx| cx.stop_propagation())
-                        .on_key_down(cx.listener(move |root, event, window, cx| {
-                            root.handle_center_tool_panel_key_down(tool, event, window, cx);
-                        }))
+                        .items_center()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(theme.tool_panel_border)
+                        .text_color(theme.foreground)
                         .child(
                             div()
-                                .id("workbench-tool-panel-center-header")
-                                .w_full()
-                                .h(px(40.))
-                                .flex_shrink_0()
-                                .px_3()
+                                .id("workbench-tool-panel-center-drag-handle")
+                                .debug_selector(|| "workbench-tool-panel-center-drag-handle".into())
+                                .flex_1()
+                                .min_w(px(0.))
+                                .h_full()
                                 .flex()
                                 .items_center()
-                                .justify_between()
-                                .border_b_1()
-                                .border_color(theme.border)
-                                .text_color(theme.foreground)
-                                .child(tool_rail_label(tool))
-                                .child(
-                                    Button::new("workbench-close-center-tool-panel")
-                                        .compact()
-                                        .ghost()
-                                        .icon(IconName::X)
-                                        .accessibility_label(close_label.clone())
-                                        .tooltip(close_label)
-                                        .tab_stop(true)
-                                        .on_click(cx.listener(
-                                            move |root, _: &ClickEvent, window, cx| {
-                                                root.dismiss_center_tool_panel(tool, window, cx);
+                                .gap_2()
+                                .cursor(if root.tool_rail_state.floating_drag_is_active() {
+                                    gpui_kit::CursorStyle::ClosedHand
+                                } else {
+                                    gpui_kit::CursorStyle::OpenHand
+                                })
+                                .role(gpui_kit::Role::Button)
+                                .tab_index(0)
+                                .tab_stop(true)
+                                .aria_label(crate::locale::text(
+                                    "拖动工具浮窗",
+                                    "Drag floating tool panel",
+                                ))
+                                .aria_keyshortcuts("ArrowLeft ArrowRight ArrowUp ArrowDown")
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(drag_tooltip.clone()).build(window, cx)
+                                })
+                                .focus_visible(|style| style.border_color(theme.accent))
+                                .on_key_down(cx.listener(
+                                    move |root, event: &KeyDownEvent, window, cx| {
+                                        root.handle_floating_tool_panel_key_down(
+                                            tool,
+                                            FloatingPanelKeyLayout {
+                                                rendered_position: floating_position,
+                                                viewport_width,
+                                                body_height,
+                                                geometry: floating_geometry,
                                             },
-                                        )),
-                                ),
+                                            event,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                ))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |root, event: &MouseDownEvent, window, cx| {
+                                        window.prevent_default();
+                                        cx.stop_propagation();
+                                        root.tool_rail_state.begin_floating_drag(
+                                            tool,
+                                            event.position.x.as_f32(),
+                                            event.position.y.as_f32() - WORKBENCH_TITLE_BAR_HEIGHT,
+                                            floating_position,
+                                        );
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(
+                                    Icon::new(IconName::GripVertical)
+                                        .rotate(gpui_kit::radians(std::f32::consts::FRAC_PI_2))
+                                        .size(px(16.)),
+                                )
+                                .child(tool_rail_label(tool)),
                         )
-                        .child(workbench_tool_panel_slot(
-                            "workbench-tool-panel-center",
-                            content,
-                        ))
-                        .focus_trap(
-                            "workbench-tool-panel-center-focus-trap",
-                            &root.compact_drawer_focus_handle,
+                        .child(
+                            Button::new("workbench-close-center-tool-panel")
+                                .compact()
+                                .ghost()
+                                .icon(IconName::X)
+                                .accessibility_label(close_label.clone())
+                                .tooltip(close_label)
+                                .tab_stop(true)
+                                .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
+                                    root.dismiss_center_tool_panel(tool, window, cx);
+                                })),
                         ),
-                ),
+                )
+                .child(workbench_tool_panel_slot(
+                    "workbench-tool-panel-center",
+                    content,
+                )),
+        );
+    }
+
+    if root.tool_rail_state.floating_drag_is_active() {
+        let root_entity = cx.entity();
+        let viewport_width = viewport.width.as_f32();
+        let body_height = (viewport.height.as_f32() - WORKBENCH_TITLE_BAR_HEIGHT).max(0.0);
+        let floating_geometry =
+            workbench_layout::floating_panel_geometry(viewport_width, body_height);
+        workbench_body = workbench_body.child(
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    let root_entity_for_move = root_entity.clone();
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, app| {
+                        if !phase.bubble() || !event.dragging() {
+                            return;
+                        }
+                        let x = event.position.x.as_f32();
+                        let y = event.position.y.as_f32() - WORKBENCH_TITLE_BAR_HEIGHT;
+                        root_entity_for_move.update(app, |root, cx| {
+                            if root.tool_rail_state.update_floating_drag(
+                                x,
+                                y,
+                                viewport_width,
+                                body_height,
+                                floating_geometry,
+                            ) {
+                                cx.notify();
+                            }
+                        });
+                    });
+                    let root_entity_for_key = root_entity.clone();
+                    window.on_key_event(move |event: &KeyDownEvent, phase, window, app| {
+                        if !phase.capture() || !event.keystroke.key.eq_ignore_ascii_case("escape") {
+                            return;
+                        }
+                        root_entity_for_key.update(app, |root, cx| {
+                            if root.tool_rail_state.cancel_floating_drag() {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        });
+                    });
+                    let root_entity_for_up = root_entity.clone();
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, app| {
+                        if phase.bubble() && event.button == MouseButton::Left {
+                            root_entity_for_up.update(app, |root, cx| {
+                                if root.tool_rail_state.finish_floating_drag() {
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .inset_0(),
         );
     }
 
@@ -2066,6 +2582,9 @@ pub(super) fn render_workbench(
         render_workbench_feedback(root, theme, panel_background, feedback_max_width, cx)
     {
         workbench_body = workbench_body.child(feedback);
+    }
+    if let Some(tool_rail) = tool_rail {
+        workbench_body = workbench_body.child(tool_rail);
     }
 
     let mut workbench = div()
@@ -2086,7 +2605,7 @@ pub(super) fn render_workbench(
     {
         let focus_handle = root.preferences_modal_focus_handle.clone();
         let preferences_panel = root.preferences_panel.clone();
-        workbench = workbench.child(
+        workbench = workbench.child(crate::ui_backdrop::modal_backdrop(
             div()
                 .id("workbench-preferences-modal-overlay")
                 .absolute()
@@ -2099,32 +2618,39 @@ pub(super) fn render_workbench(
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.38))
-                .on_click(cx.listener(|root, _: &ClickEvent, _, cx| {
-                    root.request_close_preferences_modal(cx);
-                }))
-                .child(
+                .bg(theme.dialog_scrim)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|root, _: &MouseDownEvent, _, cx| {
+                        root.request_close_preferences_modal(cx);
+                    }),
+                )
+                .child(crate::ui_backdrop::floating_surface(
                     div()
                         .id("workbench-preferences-modal-surface")
                         .w_full()
                         .h_full()
                         .max_w(px(1152.))
-                        .max_h(px(760.))
+                        .max_h(px(780.))
                         .min_w(px(0.))
                         .min_h(px(0.))
                         .occlude()
                         .flex()
                         .flex_col()
                         .overflow_hidden()
-                        .rounded_lg()
+                        .rounded(px(20.))
                         .border_1()
                         .border_color(theme.border)
-                        .bg(panel_background)
+                        .bg(theme.floating_surface)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child(preferences_panel)
                         .focus_trap("workbench-preferences-focus-trap", &focus_handle),
-                ),
-        );
+                    theme,
+                    theme.radius_dialog,
+                )),
+            theme,
+        ));
     } else if root.connection_prompt_modal_open
         || root.connections_modal_open && root.root_confirmation_owner.is_none()
     {
@@ -2183,14 +2709,29 @@ pub(super) fn render_workbench(
         workbench = workbench.child(manager);
     }
     if root.root_confirmation_owner.is_some() && !root.connection_prompt_modal_open {
-        let confirmation_width = root
-            .root_confirmation_operations_view
-            .as_ref()
-            .filter(|_| root.root_confirmation_owner == Some(RootConfirmationOwner::Operations))
-            .map_or(680., |operations| {
-                operations.read(cx).root_confirmation_max_width()
-            });
-        let confirmation_height = (viewport.height.as_f32() - 40.0).clamp(0.0, 720.0);
+        // 运维与文件弹框复刻 main ModalShell；编辑器退出确认继续使用其独立宿主外观。
+        let rail_dialog = matches!(
+            root.root_confirmation_owner,
+            Some(RootConfirmationOwner::Operations | RootConfirmationOwner::FileDelete)
+        );
+        let confirmation_width = match root.root_confirmation_owner {
+            Some(RootConfirmationOwner::Operations) => root
+                .root_confirmation_operations_view
+                .as_ref()
+                .map_or(680., |view| view.read(cx).root_confirmation_max_width()),
+            Some(RootConfirmationOwner::FileDelete) => root
+                .root_confirmation_file_pane
+                .as_ref()
+                .map_or(576., |pane| pane.read(cx).global_dialog_max_width()),
+            _ => 680.,
+        };
+        // main 的普通 ModalShell 使用 16px 外围留白与 48px 高度安全区；表单按自然内容收缩。
+        let confirmation_padding = if rail_dialog { 16. } else { 20. };
+        let confirmation_height = if rail_dialog {
+            (viewport.height.as_f32() - 48.0).clamp(0.0, 704.0)
+        } else {
+            (viewport.height.as_f32() - 40.0).clamp(0.0, 720.0)
+        };
         let confirmation = match root.root_confirmation_owner {
             Some(RootConfirmationOwner::Operations) => root
                 .root_confirmation_operations_view
@@ -2199,7 +2740,8 @@ pub(super) fn render_workbench(
                     operations.update(cx, |view, cx| {
                         view.render_root_confirmation(
                             theme,
-                            (viewport.width.as_f32() - 40.).min(confirmation_width),
+                            (viewport.width.as_f32() - confirmation_padding * 2.)
+                                .min(confirmation_width),
                             (confirmation_height - 2.0).max(0.0),
                             cx,
                         )
@@ -2208,7 +2750,7 @@ pub(super) fn render_workbench(
             Some(RootConfirmationOwner::FileDelete) => root
                 .root_confirmation_file_pane
                 .clone()
-                .and_then(|pane| render_file_delete_confirmation(pane, theme, cx)),
+                .and_then(|pane| pane.update(cx, |pane, cx| pane.render_global_dialog(window, cx))),
             Some(RootConfirmationOwner::Editor) => {
                 root.root_confirmation_editor.clone().and_then(|editor| {
                     editor.update(cx, |editor, cx| editor.render_root_confirmation(theme, cx))
@@ -2224,11 +2766,15 @@ pub(super) fn render_workbench(
                     .absolute()
                     .inset_0()
                     .occlude()
-                    .p(px(20.))
+                    .p(px(confirmation_padding))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.38))
+                    .bg(if rail_dialog {
+                        theme.dialog_scrim
+                    } else {
+                        gpui_kit::hsla(0.0, 0.0, 0.0, 0.38)
+                    })
                     .on_click(cx.listener(|root, _: &ClickEvent, _, cx| {
                         root.cancel_root_confirmation(cx);
                     }))
@@ -2244,10 +2790,18 @@ pub(super) fn render_workbench(
                             .flex()
                             .flex_col()
                             .overflow_hidden()
-                            .rounded_lg()
+                            .rounded(if rail_dialog {
+                                theme.radius_dialog
+                            } else {
+                                px(8.)
+                            })
                             .border_1()
                             .border_color(theme.border)
-                            .bg(panel_background)
+                            .bg(if rail_dialog {
+                                theme.floating_surface
+                            } else {
+                                panel_background
+                            })
                             .on_click(|_, _, cx| cx.stop_propagation())
                             .child(
                                 div()
@@ -2258,161 +2812,30 @@ pub(super) fn render_workbench(
                                     .overflow_y_scroll()
                                     .child(confirmation),
                             )
-                            .focus_trap("workbench-root-confirmation-focus-trap", &focus_handle),
-                    ),
+                            .focus_trap("workbench-root-confirmation-focus-trap", &focus_handle)
+                            .map(|surface| {
+                                if rail_dialog {
+                                    crate::ui_backdrop::floating_surface(
+                                        surface,
+                                        theme,
+                                        theme.radius_dialog,
+                                    )
+                                } else {
+                                    surface.into_any_element()
+                                }
+                            }),
+                    )
+                    .map(|overlay| {
+                        if rail_dialog {
+                            crate::ui_backdrop::modal_backdrop(overlay, theme)
+                        } else {
+                            overlay.into_any_element()
+                        }
+                    }),
             );
         }
     }
     workbench
-}
-
-/// 删除确认集中显示完整实际 endpoint，避免只用文件名造成跨主机或跨目录误删。
-///
-/// @author kongweiguang
-fn render_file_delete_confirmation(
-    pane: Entity<crate::features::files::FilesPane>,
-    theme: ThemeTokens,
-    cx: &mut Context<RootView>,
-) -> Option<AnyElement> {
-    let endpoints = pane.read(cx).pending_delete_confirmation()?;
-    let labels = endpoints
-        .iter()
-        .map(file_delete_endpoint_label)
-        .collect::<Vec<_>>();
-    let cancel_pane = pane.clone();
-    let confirm_pane = pane;
-    Some(
-        div()
-            .id("workbench-file-delete-confirmation")
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4()
-            .bg(theme.materials.chrome)
-            .text_color(theme.foreground)
-            .rounded_lg()
-            .child(
-                div()
-                    .text_size(theme.text_heading)
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .child(crate::locale::text("删除文件", "Delete files")),
-            )
-            .child(div().text_size(theme.text_sm).child(crate::locale::text(
-                format!("将删除以下 {} 个目标。此操作不可撤销。", labels.len()),
-                format!(
-                    "The following {} targets will be deleted. This cannot be undone.",
-                    labels.len()
-                ),
-            )))
-            .child(
-                div()
-                    .id("workbench-file-delete-targets")
-                    .max_h(px(360.))
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .children(labels.into_iter().map(|label| {
-                        div()
-                            .w_full()
-                            .min_w(px(0.))
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(theme.materials.panel)
-                            .text_size(theme.text_sm)
-                            .child(label)
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("workbench-file-delete-cancel")
-                            .compact()
-                            .ghost()
-                            .label(crate::locale::text("取消", "Cancel"))
-                            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                                cancel_pane
-                                    .update(cx, |pane, cx| pane.cancel_delete_confirmation(cx));
-                            })),
-                    )
-                    .child(
-                        Button::new("workbench-file-delete-confirm")
-                            .compact()
-                            .danger()
-                            .label(crate::locale::text("删除", "Delete"))
-                            .disabled(endpoints.is_empty())
-                            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                                confirm_pane.update(cx, |pane, cx| {
-                                    pane.confirm_delete_confirmation(cx);
-                                    // 提交会先清空待确认快照再异步删除；显式通知现有 Root observer 及时撤下遮罩。
-                                    cx.notify();
-                                });
-                            })),
-                    ),
-            )
-            .into_any_element(),
-    )
-}
-
-/// 通过协议、主机与绝对位置共同标识删除项，避免重复文件名看起来像同一个目标。
-///
-/// @author kongweiguang
-fn file_delete_endpoint_label(endpoint: &FileEndpoint) -> gpui_kit::SharedString {
-    crate::locale::text(
-        match endpoint {
-            FileEndpoint::Local { path } => format!("本机 · {}", path.display()),
-            FileEndpoint::Remote { host_id, path } => {
-                format!("SSH · {} · {}", host_id.as_str(), path.as_str())
-            }
-            FileEndpoint::Container {
-                host_id,
-                runtime,
-                container_id,
-                path,
-            } => format!(
-                "容器 · {} · {} · {} · {}",
-                host_id.as_ref().map_or("本机", |host| host.as_str()),
-                runtime_name(*runtime),
-                container_id,
-                path.as_str()
-            ),
-        },
-        match endpoint {
-            FileEndpoint::Local { path } => format!("Local · {}", path.display()),
-            FileEndpoint::Remote { host_id, path } => {
-                format!("SSH · {} · {}", host_id.as_str(), path.as_str())
-            }
-            FileEndpoint::Container {
-                host_id,
-                runtime,
-                container_id,
-                path,
-            } => format!(
-                "Container · {} · {} · {} · {}",
-                host_id.as_ref().map_or("local", |host| host.as_str()),
-                runtime_name(*runtime),
-                container_id,
-                path.as_str()
-            ),
-        },
-    )
-}
-
-/// 将固定容器运行时 enum 转成简短界面标签，不暴露命令行拼接或任意文本。
-///
-/// @author kongweiguang
-fn runtime_name(runtime: kerminal_domain::files::ContainerRuntime) -> &'static str {
-    match runtime {
-        kerminal_domain::files::ContainerRuntime::Docker => "Docker",
-        kerminal_domain::files::ContainerRuntime::Podman => "Podman",
-    }
 }
 
 /// 仅本次计算的只读投影；不增加 Root 缓存、延迟重试或第二份响应式状态。
@@ -2486,7 +2909,25 @@ fn project_workbench_viewport(
                 .unwrap_or_else(|| root.current_attached_default_width(tool))
                 .as_f32()
         })
-        .unwrap_or(ATTACHED_DOCK_MIN_WIDTH + RESIZABLE_EDGE_GUTTER);
+        .unwrap_or(workbench_layout::ATTACHED_DOCK_CONTENT_MIN_WIDTH + RESIZABLE_EDGE_GUTTER);
+    let left_tool_panel_preferred_width = root
+        .workbench_left_tool_resizable_state
+        .read(cx)
+        .preferred_panel_size(0)
+        .or_else(|| {
+            root.workbench_left_tool_resizable_state
+                .read(cx)
+                .sizes()
+                .first()
+                .copied()
+        })
+        .unwrap_or_else(|| {
+            px(
+                workbench_layout::initial_tool_panel_width(viewport.width.as_f32())
+                    + RESIZABLE_EDGE_GUTTER,
+            )
+        })
+        .as_f32();
     let workspace_notice = super::workspace_session_notice(
         root.workspace_session_state.as_ref(),
         root.workspace_session_error.as_deref(),
@@ -2519,6 +2960,7 @@ fn project_workbench_viewport(
             right_dock_collapsed: root.right_dock_collapsed,
             host_sidebar_preferred_width,
             attached_dock_preferred_width,
+            left_tool_panel_preferred_width,
             left_tool_open: panels.left.is_some(),
             attached_tool_open: panels.attached.is_some(),
             bottom_tool_open: panels.bottom.is_some(),
@@ -2750,7 +3192,7 @@ fn tool_rail_button_id(tool: ToolRailToolId) -> &'static str {
     }
 }
 
-/// 把延迟提示挂在独立 GPUI 触发器上；按钮离开或卸载时由原生生命周期取消待显示提示。
+/// 设置沿用 main 的齿轮图标；独立提示触发器不改变按钮命中区或终端焦点生命周期。
 ///
 /// @author kongweiguang
 fn render_settings_button(
@@ -2773,7 +3215,7 @@ fn render_settings_button(
             Button::new(button_id)
                 .compact()
                 .ghost()
-                .icon(IconName::Settings2)
+                .icon(IconName::Settings)
                 .accessibility_label(label)
                 .tab_stop(true)
                 .on_click(on_click),
@@ -2826,7 +3268,7 @@ fn repeated_tool_panel_renderer(tool: ToolRailToolId) -> AnyElement {
 /// 图标继续复用同版本 Kit 资源，稳定工具身份仍由屏幕阅读器单独识别。
 ///
 /// @author kongweiguang
-fn tool_rail_icon(tool: ToolRailToolId) -> IconName {
+pub(super) fn tool_rail_icon(tool: ToolRailToolId) -> IconName {
     match tool {
         ToolRailToolId::Context => IconName::Link2,
         ToolRailToolId::AgentLauncher => IconName::Bot,
@@ -2850,13 +3292,14 @@ fn tool_is_in_panel_slots(tool: ToolRailToolId, slots: ToolRailPanelSlots) -> bo
         || slots.center == Some(tool)
 }
 
-/// 使用同一套 Kit 图标按钮呈现固定宽度导航，保留屏幕阅读名称、键盘焦点和选择态。
+/// 右栏按钮尺寸沿用 main 的 density-control-height，同时保留 Kit 的焦点和可访问名称。
 ///
 /// @author kongweiguang
 fn workbench_rail_button(
     id: &'static str,
     icon: IconName,
     label: gpui_kit::SharedString,
+    button_height: f32,
     selected: bool,
     toggled: Option<bool>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -2865,8 +3308,8 @@ fn workbench_rail_button(
         .compact()
         .ghost()
         .icon(icon)
-        .w(px(TOOL_RAIL_BUTTON_SIZE))
-        .h(px(TOOL_RAIL_BUTTON_SIZE))
+        .w(px(button_height))
+        .h(px(button_height))
         .selected(selected)
         .accessibility_label(label.clone())
         .tooltip(label)
@@ -2878,132 +3321,25 @@ fn workbench_rail_button(
     button
 }
 
-/// 工具入口右键只打开菜单；显式停靠动作携带实际面板可见性，不能用 Rail 选中态冒充已挂载宿主。
-/// 顺序范围仍取同分区有效可见项，普通重投影不产生新的焦点意图。
+/// main 的密度令牌同时控制图标按钮宽高，确保各档工具栏节奏一致。
 ///
 /// @author kongweiguang
-fn tool_rail_context_button(
-    button: Button,
-    tool: ToolRailToolId,
-    visible_partition: Vec<ToolRailToolId>,
-    partition_is_bottom: bool,
-    root_entity: Entity<RootView>,
-    source_visible: bool,
-) -> impl IntoElement + 'static {
-    let index = visible_partition
-        .iter()
-        .position(|candidate| *candidate == tool);
-    let can_move_up = index.is_some_and(|index| index > 0);
-    let can_move_down = index.is_some_and(|index| index + 1 < visible_partition.len());
-    div()
-        .flex_shrink_0()
-        .child(button.context_menu(move |mut menu, _, _| {
-            menu = menu
-                .item(tool_rail_action_item(
-                    root_entity.clone(),
-                    tool,
-                    source_visible,
-                    ToolRailContextAction::MoveUp,
-                    crate::locale::text("上移", "Move up"),
-                    !can_move_up,
-                ))
-                .item(tool_rail_action_item(
-                    root_entity.clone(),
-                    tool,
-                    source_visible,
-                    ToolRailContextAction::MoveDown,
-                    crate::locale::text("下移", "Move down"),
-                    !can_move_down,
-                ))
-                .item(PopupMenuItem::separator());
-            menu = if partition_is_bottom {
-                menu.item(tool_rail_action_item(
-                    root_entity.clone(),
-                    tool,
-                    source_visible,
-                    ToolRailContextAction::MoveToTop,
-                    crate::locale::text("移回顶部", "Move to top"),
-                    false,
-                ))
-            } else {
-                menu.item(tool_rail_action_item(
-                    root_entity.clone(),
-                    tool,
-                    source_visible,
-                    ToolRailContextAction::PinToBottom,
-                    crate::locale::text("固定到底部", "Pin to bottom"),
-                    false,
-                ))
-            };
-            // Files 与 Containers 固定跟随当前终端在右侧打开，不提供其他停靠位置。
-            if matches!(tool, ToolRailToolId::Sftp | ToolRailToolId::Containers) {
-                return menu;
-            }
-            menu.item(PopupMenuItem::separator())
-                .item(tool_rail_action_item(
-                    root_entity.clone(),
-                    tool,
-                    source_visible,
-                    ToolRailContextAction::Dock(ToolRailPanelPlacement::Attached),
-                    crate::locale::text("停靠在右侧", "Dock on right"),
-                    false,
-                ))
-                .item(tool_rail_action_item(
-                    root_entity.clone(),
-                    tool,
-                    source_visible,
-                    ToolRailContextAction::Dock(ToolRailPanelPlacement::Left),
-                    crate::locale::text("停靠在左侧", "Dock on left"),
-                    false,
-                ))
-                .item(tool_rail_action_item(
-                    root_entity.clone(),
-                    tool,
-                    source_visible,
-                    ToolRailContextAction::Dock(ToolRailPanelPlacement::Bottom),
-                    crate::locale::text("停靠在底部", "Dock at bottom"),
-                    false,
-                ))
-                .item(tool_rail_action_item(
-                    root_entity.clone(),
-                    tool,
-                    source_visible,
-                    ToolRailContextAction::Dock(ToolRailPanelPlacement::Center),
-                    crate::locale::text("居中显示", "Show in center"),
-                    false,
-                ))
-        }))
+fn tool_rail_button_height(density: InterfaceDensity) -> f32 {
+    match density {
+        InterfaceDensity::Compact => 28.0,
+        InterfaceDensity::Comfortable => 32.0,
+        InterfaceDensity::Spacious => 36.0,
+    }
 }
 
 /// 非空 Rail 分区至少保留一个完整图标的命中高度；空分区不占用底部空间。
 ///
 /// @author kongweiguang
-fn tool_rail_partition_min_height(tools: &[ToolRailToolId]) -> gpui_kit::Pixels {
-    px(if tools.is_empty() {
-        0.0
-    } else {
-        TOOL_RAIL_BUTTON_SIZE
-    })
-}
-
-/// 右键菜单将原面板可见性与显式动作一起交给 Root；保存仍走最新配置校验与 CAS，不提前改布局或焦点。
-///
-/// @author kongweiguang
-fn tool_rail_action_item(
-    root_entity: Entity<RootView>,
-    tool: ToolRailToolId,
-    source_visible: bool,
-    action: ToolRailContextAction,
-    label: gpui_kit::SharedString,
-    disabled: bool,
-) -> PopupMenuItem {
-    PopupMenuItem::new(label)
-        .disabled(disabled)
-        .on_click(move |_, window, app| {
-            root_entity.update(app, |root, cx| {
-                root.apply_tool_rail_context_action(tool, action, source_visible, window, cx);
-            });
-        })
+fn tool_rail_partition_min_height(
+    tools: &[ToolRailToolId],
+    button_height: f32,
+) -> gpui_kit::Pixels {
+    px(if tools.is_empty() { 0.0 } else { button_height })
 }
 
 /// 判断是否已有活动标签；空终端页只在没有活动标签时提供创建 CTA。

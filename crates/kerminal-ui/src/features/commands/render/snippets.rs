@@ -7,8 +7,9 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Window,
     assets::IconName,
     component::{
-        Disableable, Sizable as _,
-        button::{Button, ButtonVariants},
+        Disableable, Icon, Sizable as _,
+        button::{Button, ButtonCustomVariant, ButtonVariants},
+        checkbox::Checkbox,
         input::Input,
         tab::{Tab, TabBar},
         tooltip::Tooltip,
@@ -19,7 +20,7 @@ use gpui_kit::{
 };
 use kerminal_application::commands::SnippetCatalogSection;
 use kerminal_domain::commands::{
-    SnippetCatalogItem, SnippetCatalogOrigin, SnippetPreferenceKey, SnippetRisk, SnippetScope,
+    SnippetCatalogItem, SnippetCatalogOrigin, SnippetPreferenceKey, SnippetScope,
 };
 
 use crate::theme::ThemeTokens;
@@ -34,6 +35,7 @@ use super::super::{
 
 #[path = "snippet_dialog.rs"]
 mod dialog;
+pub(super) use dialog::compact_snippet_field;
 #[path = "snippet_manager.rs"]
 mod manager;
 #[path = "snippet_preview.rs"]
@@ -51,7 +53,9 @@ struct SnippetCatalogNotice {
 }
 
 impl CommandsView {
-    /// 管理 flag 路由到独立配置页；搜索快捷键仅在片段子树内接管且不覆盖输入控件焦点。
+    /// 紧凑目录沿用 main 右栏的 12px 内边距和分组间距；宽工作区保持原排版。
+    /// 搜索快捷键仅在片段子树内接管且不覆盖输入控件焦点；紧凑目录延续宿主表面，避免暗色下叠深第二层面板。
+    /// 单行搜索尺寸通过 Styled 指定，避免 Input 的多行专用 h 忽略右栏规格。
     ///
     /// @author kongweiguang
     pub(super) fn render_snippets(
@@ -60,24 +64,33 @@ impl CommandsView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        if self.snippet_import_review.is_some() {
-            return self
-                .render_snippet_import_review(theme, cx)
-                .into_any_element();
-        }
-        if self.snippet_library_manager_open {
-            return self
-                .render_snippet_library_manager(theme, cx)
-                .into_any_element();
-        }
-
         let toolbar = self.render_snippet_toolbar(theme, cx);
+        let search_input = gpui_kit::Styled::h(
+            Input::new(&self.snippet_query).w_full(),
+            if self.compact_layout {
+                px(36.)
+            } else {
+                px(32.)
+            },
+        );
+        let search_input = if self.compact_layout {
+            search_input
+                .text_size(px(16.))
+                .line_height(px(24.))
+                .aria_label(crate::locale::text("搜索命令片段", "Search snippets"))
+                .prefix(
+                    Icon::new(IconName::Search)
+                        .size(px(16.))
+                        .text_color(theme.subtle),
+                )
+        } else {
+            search_input
+        };
         let search = div()
             .id("snippet-catalog-search")
             .w_full()
-            .px_3()
-            .py_1()
-            .child(Input::new(&self.snippet_query).w_full().h(px(32.)))
+            .when(!self.compact_layout, |search| search.px_3().py_1())
+            .child(search_input)
             .into_any_element();
         let section_tabs = self.render_snippet_sections(theme, cx);
         let fill_blocked = self.snippet_terminal_fill_blocked();
@@ -200,8 +213,6 @@ impl CommandsView {
         } else {
             None
         };
-        let has_more = self.snippet_next_cursor.is_some() && !rows_stale && !has_error;
-
         div()
             .id("command-snippets-view")
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
@@ -238,8 +249,13 @@ impl CommandsView {
             .flex()
             .flex_col()
             .min_h(px(0.))
+            .when(self.compact_layout, |view| view.gap_3().px_3().pb_3())
             .overflow_hidden()
-            .bg(theme.materials.shell)
+            .bg(if self.compact_layout {
+                theme.tool_panel_surface
+            } else {
+                theme.materials.shell
+            })
             .child(toolbar)
             .child(search)
             .child(section_tabs)
@@ -266,6 +282,9 @@ impl CommandsView {
                     .min_h(px(0.))
                     .w_full()
                     .overflow_y_scroll()
+                    .when(self.compact_layout, |list| {
+                        list.border_y_1().border_color(theme.border)
+                    })
                     .children(rows)
                     .when_some(empty_state, |list, empty_state| list.child(empty_state))
                     .when(loading, |list| {
@@ -276,20 +295,6 @@ impl CommandsView {
                                 .p_3()
                                 .text_color(theme.muted)
                                 .child(crate::locale::text("正在加载片段…", "Loading snippets…")),
-                        )
-                    })
-                    .when(has_more, |list| {
-                        list.child(
-                            div().w_full().flex().justify_center().p_2().child(
-                                Button::new("snippet-catalog-load-more")
-                                    .compact()
-                                    .ghost()
-                                    .label(crate::locale::text("加载更多", "Load more"))
-                                    .disabled(loading)
-                                    .on_click(cx.listener(|view, _: &ClickEvent, window, cx| {
-                                        view.load_more_snippets(window, cx);
-                                    })),
-                            ),
                         )
                     }),
             )
@@ -346,10 +351,10 @@ impl CommandsView {
             .into_any_element()
     }
 
-    /// 导入确认只呈现安全摘要；结果未知时保留批次身份并只开放状态查询。
+    /// Root 提供唯一模态表面；按 main 实窗的 17px 标题和紧邻两行候选排版，Unknown 只开放原批次查询。
     ///
     /// @author kongweiguang
-    fn render_snippet_import_review(
+    pub(super) fn render_snippet_import_review(
         &mut self,
         theme: ThemeTokens,
         cx: &mut Context<Self>,
@@ -360,108 +365,111 @@ impl CommandsView {
             return div().id("snippet-import-review-empty").into_any_element();
         };
         let phase = review.phase;
-        let selected_count = review.selected_count();
         let candidates_empty = review.candidates.is_empty();
+        let candidate_count = review.candidates.len();
         let candidate_rows = review
             .candidates
             .iter()
-            .map(|candidate| {
+            .enumerate()
+            .map(|(index, candidate)| {
                 let source_index = candidate.source_index;
                 let selected = candidate.selected;
                 let title = candidate.title.clone();
+                let command = candidate.command.clone();
                 let conflict = candidate.title_conflicts;
-                let scope = import_scope_label(candidate.scope);
-                let risk = import_risk_label(candidate.risk);
-                let variable_count = candidate.variable_count;
-                let toggle_label = if selected {
-                    crate::locale::text("已选择", "Selected")
-                } else {
-                    crate::locale::text("选择导入", "Select")
-                };
-                div()
-                    .id(format!("snippet-import-candidate-{source_index}"))
+                let accessible_title =
+                    crate::locale::text(format!("导入 {title}"), format!("Import {title}"));
+                let candidate_entity = cx.entity().clone();
+                Checkbox::new(format!("snippet-import-candidate-{source_index}"))
+                    .checked(selected)
+                    .disabled(!matches!(
+                        phase,
+                        SnippetImportPhase::Reviewing | SnippetImportPhase::NotCommitted
+                    ))
+                    .accessibility_label(accessible_title)
                     .w_full()
-                    .flex()
-                    .items_center()
                     .gap_3()
-                    .px_3()
+                    .items_start()
+                    .px_2()
                     .py_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .when(selected, |row| row.bg(theme.selected.opacity(0.2)))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w(px(0.))
+                            .w_full()
                             .flex()
-                            .flex_col()
-                            .gap_1()
+                            .items_start()
+                            .gap_3()
                             .child(
                                 div()
-                                    .w_full()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_color(theme.foreground)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
                                     .flex()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .text_size(theme.text_xs)
-                                    .text_color(theme.muted)
-                                    .child(scope)
-                                    .child(risk)
-                                    .child(crate::locale::text(
-                                        format!("{variable_count} 个变量"),
-                                        format!("{variable_count} variables"),
-                                    ))
-                                    .when(conflict, |row| {
-                                        row.child(crate::locale::text(
-                                            "标题与已有片段重复",
-                                            "Title conflicts with an existing snippet",
-                                        ))
+                                    .flex_col()
+                                    .gap_0()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(12.))
+                                            .line_height(px(16.))
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .text_color(theme.foreground)
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .font_family("monospace")
+                                            .text_size(px(11.))
+                                            .line_height(px(15.7143))
+                                            .text_color(theme.muted)
+                                            .child(command),
+                                    ),
+                            )
+                            .when(conflict, |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .whitespace_nowrap()
+                                        .text_size(px(11.))
                                         .text_color(theme.warning)
-                                    }),
-                            ),
+                                        .child(crate::locale::text(
+                                            "同名，将另存",
+                                            "Same name; saved as a copy",
+                                        )),
+                                )
+                            }),
                     )
-                    .child(
-                        Button::new(format!("snippet-import-select-{source_index}"))
-                            .compact()
-                            .when(selected, Button::secondary)
-                            .when(!selected, Button::ghost)
-                            .accessibility_label(crate::locale::text(
-                                if selected {
-                                    "取消选择导入"
-                                } else {
-                                    "选择导入"
-                                },
-                                if selected {
-                                    "Deselect import"
-                                } else {
-                                    "Select import"
-                                },
-                            ))
-                            .label(toggle_label)
-                            .disabled(!matches!(
-                                phase,
-                                SnippetImportPhase::Reviewing | SnippetImportPhase::NotCommitted
-                            ))
-                            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                                view.set_snippet_import_candidate_selected(
-                                    source_index,
-                                    !selected,
-                                    cx,
-                                );
-                            })),
-                    )
+                    .when(index + 1 < candidate_count, |row| {
+                        row.border_b_1().border_color(theme.border)
+                    })
+                    .on_change(move |checked, _, app| {
+                        candidate_entity.update(app, |view, cx| {
+                            view.set_snippet_import_candidate_selected(source_index, *checked, cx);
+                        });
+                    })
             })
             .collect::<Vec<_>>();
-        let file_name = review.file_name.clone();
-        let issues = review.issues.clone();
         let status = review.status.clone();
+        let issues = review
+            .issues
+            .iter()
+            .enumerate()
+            .map(|(index, issue)| {
+                div()
+                    .id(format!("snippet-import-issue-{index}"))
+                    .w_full()
+                    .text_size(px(12.))
+                    .text_color(theme.error)
+                    .child(issue.clone())
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let show_error_area = !issues.is_empty() || status.is_some();
         let can_change_selection = matches!(
             phase,
             SnippetImportPhase::Reviewing | SnippetImportPhase::NotCommitted
@@ -470,55 +478,56 @@ impl CommandsView {
             phase,
             SnippetImportPhase::Committing | SnippetImportPhase::OutcomeUnknown
         ) && !self.snippet_transfer_busy;
-        let can_confirm = can_change_selection && selected_count > 0 && !self.snippet_transfer_busy;
+        let can_confirm =
+            can_change_selection && review.selected_count() > 0 && !self.snippet_transfer_busy;
         let can_reconcile =
             phase == SnippetImportPhase::OutcomeUnknown && !self.snippet_transfer_busy;
+        let status_color = match phase {
+            SnippetImportPhase::OutcomeUnknown | SnippetImportPhase::NotCommitted => theme.warning,
+            SnippetImportPhase::Committed => theme.success,
+            SnippetImportPhase::Reviewing | SnippetImportPhase::Committing => theme.muted,
+        };
 
         div()
             .id("snippet-import-review")
-            .size_full()
+            .w_full()
             .min_h(px(0.))
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(theme.materials.shell)
+            .text_color(theme.foreground)
             .child(
                 div()
+                    .id("snippet-import-review-header")
                     .w_full()
                     .flex_shrink_0()
                     .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_4()
-                    .py_3()
+                    .items_start()
+                    .gap_4()
+                    .px_5()
+                    .py_4()
                     .border_b_1()
                     .border_color(theme.border)
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                    .child(crate::locale::text("导入预览", "Import preview")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(theme.text_xs)
-                                    .text_color(theme.muted)
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(file_name),
-                            ),
+                            .text_size(px(17.))
+                            .line_height(px(24.))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child(crate::locale::text("导入命令片段", "Import snippets")),
                     )
                     .child(
                         Button::new("snippet-import-review-close")
                             .compact()
-                            .label(crate::locale::text("关闭", "Close"))
+                            .focus_handle(&self.snippet_manager_focus)
+                            .ghost()
+                            .w(px(36.))
+                            .h(px(36.))
+                            .rounded(theme.control_radius)
+                            .icon(IconName::X)
+                            .accessibility_label(crate::locale::text("关闭", "Close"))
+                            .tooltip(crate::locale::text("关闭", "Close"))
                             .disabled(!can_close)
                             .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
                                 view.cancel_snippet_import_review(cx);
@@ -527,58 +536,57 @@ impl CommandsView {
             )
             .child(
                 div()
-                    .id("snippet-import-review-summary")
+                    .id("snippet-import-review-body")
                     .w_full()
-                    .flex_shrink_0()
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_4()
-                    .py_2()
-                    .text_size(theme.text_xs)
-                    .text_color(theme.muted)
-                    .child(crate::locale::text(
-                        format!("已选择 {selected_count} 个片段",),
-                        format!("{selected_count} snippets selected",),
-                    ))
-                    .when(!can_change_selection, |bar| {
-                        bar.child(import_phase_label(phase))
-                    }),
-            )
-            .child(
-                div()
-                    .id("snippet-import-review-list")
-                    .flex_1()
+                    .flex_col()
+                    .gap_3()
+                    .px_5()
+                    .py_4()
                     .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .children(candidate_rows)
-                    .when(issues.is_empty() && candidates_empty, |list| {
-                        list.child(div().w_full().p_4().text_color(theme.muted).child(
-                            crate::locale::text(
-                                "没有可导入的有效片段。",
-                                "No valid snippets are available to import.",
-                            ),
-                        ))
-                    })
-                    .children(issues.into_iter().enumerate().map(|(index, issue)| {
-                        div()
-                            .id(format!("snippet-import-issue-{index}"))
-                            .w_full()
-                            .px_4()
-                            .py_2()
-                            .text_size(theme.text_xs)
-                            .text_color(theme.warning)
-                            .child(issue)
-                    }))
-                    .when_some(status, |list, status| {
-                        list.child(
+                    .when(show_error_area, |body| {
+                        body.child(
                             div()
-                                .id("snippet-import-review-status")
+                                .id("snippet-import-review-errors")
                                 .w_full()
-                                .px_4()
-                                .py_2()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .children(issues)
+                                .when_some(status, |area, status| {
+                                    area.child(
+                                        div()
+                                            .id("snippet-import-review-status")
+                                            .w_full()
+                                            .text_size(px(12.))
+                                            .text_color(status_color)
+                                            .child(status),
+                                    )
+                                }),
+                        )
+                    })
+                    .when(candidates_empty, |body| {
+                        body.child(
+                            div()
+                                .w_full()
+                                .text_size(px(14.))
                                 .text_color(theme.muted)
-                                .child(status),
+                                .child(crate::locale::text(
+                                    "没有可导入的片段。",
+                                    "No snippets to import.",
+                                )),
+                        )
+                    })
+                    .when(!candidates_empty, |body| {
+                        body.child(
+                            div()
+                                .id("snippet-import-review-list")
+                                .w_full()
+                                .max_h(px(288.))
+                                .overflow_y_scroll()
+                                .border_y_1()
+                                .border_color(theme.border)
+                                .children(candidate_rows),
                         )
                     }),
             )
@@ -588,64 +596,75 @@ impl CommandsView {
                     .w_full()
                     .flex_shrink_0()
                     .flex()
-                    .flex_wrap()
                     .justify_end()
                     .items_center()
                     .gap_2()
-                    .px_4()
-                    .py_3()
+                    .px_5()
+                    .py_4()
                     .border_t_1()
                     .border_color(theme.border)
-                    .bg(theme.materials.chrome)
-                    .when(can_reconcile, |footer| {
-                        footer.child(
-                            Button::new("snippet-import-reconcile")
-                                .compact()
-                                .primary()
-                                .label(crate::locale::text("查询批次状态", "Check batch status"))
-                                .disabled(!can_reconcile)
-                                .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
-                                    view.reconcile_snippet_import(cx);
-                                })),
-                        )
-                    })
-                    .when(can_change_selection, |footer| {
-                        footer.child(
-                            Button::new("snippet-import-confirm")
-                                .compact()
-                                .primary()
-                                .label(crate::locale::text(
-                                    if phase == SnippetImportPhase::NotCommitted {
-                                        "再次确认导入"
-                                    } else {
-                                        "导入所选片段"
-                                    },
-                                    if phase == SnippetImportPhase::NotCommitted {
-                                        "Confirm import again"
-                                    } else {
-                                        "Import selected"
-                                    },
-                                ))
-                                .disabled(!can_confirm)
-                                .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
-                                    view.confirm_snippet_import(cx);
-                                })),
-                        )
-                    })
                     .child(
-                        Button::new("snippet-import-review-cancel")
-                            .compact()
-                            .label(crate::locale::text("返回", "Back"))
-                            .disabled(!can_close)
-                            .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
+                        snippet_import_button(
+                            "snippet-import-review-cancel",
+                            crate::locale::text("取消", "Cancel"),
+                            None,
+                            theme,
+                        )
+                        .ghost()
+                        .disabled(!can_close)
+                        .on_click(cx.listener(
+                            |view, _: &ClickEvent, _, cx| {
                                 view.cancel_snippet_import_review(cx);
-                            })),
+                            },
+                        )),
+                    )
+                    .when(phase == SnippetImportPhase::OutcomeUnknown, |footer| {
+                        footer.child(
+                            snippet_import_button(
+                                "snippet-import-reconcile",
+                                crate::locale::text("查询批次状态", "Check batch status"),
+                                Some(IconName::RefreshCw),
+                                theme,
+                            )
+                            .primary()
+                            .disabled(!can_reconcile)
+                            .on_click(cx.listener(
+                                |view, _: &ClickEvent, _, cx| {
+                                    view.reconcile_snippet_import(cx);
+                                },
+                            )),
+                        )
+                    })
+                    .when(
+                        matches!(
+                            phase,
+                            SnippetImportPhase::Reviewing
+                                | SnippetImportPhase::NotCommitted
+                                | SnippetImportPhase::Committing
+                        ),
+                        |footer| {
+                            footer.child(
+                                snippet_import_button(
+                                    "snippet-import-confirm",
+                                    crate::locale::text("导入所选", "Import selected"),
+                                    Some(IconName::Upload),
+                                    theme,
+                                )
+                                .primary()
+                                .disabled(!can_confirm)
+                                .on_click(cx.listener(
+                                    |view, _: &ClickEvent, _, cx| {
+                                        view.confirm_snippet_import(cx);
+                                    },
+                                )),
+                            )
+                        },
                     ),
             )
             .into_any_element()
     }
 
-    /// 头部操作只调用已接入的目录用例，并返回拥有化元素以结束对 Commands 状态的渲染期借用。
+    /// 头部目标身份和状态分行，长主机名不会挤掉状态；操作仍只调用已接入的目录用例。
     ///
     /// @author kongweiguang
     fn render_snippet_toolbar(
@@ -653,7 +672,7 @@ impl CommandsView {
         theme: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let target = self.snippet_current_target_label();
+        let (target, target_status) = self.snippet_current_target_labels();
         let target_tooltip = target.clone();
         let transfer_available = self.snippet_transfer_files.is_some();
         let manager_available = self.configuration_directory.is_some();
@@ -663,30 +682,59 @@ impl CommandsView {
             .flex()
             .items_center()
             .gap_3()
-            .px_3()
-            .py_1()
+            .when(self.compact_layout, |toolbar| toolbar.gap_2())
+            .when(!self.compact_layout, |toolbar| toolbar.px_3().py_1())
             .child(
                 div()
                     .id("snippet-current-target")
                     .flex_1()
                     .min_w(px(0.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_size(theme.text_xs)
-                    .text_color(theme.muted)
-                    .aria_label(target.clone())
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(target_tooltip.clone()).build(window, cx)
-                    })
-                    .child(target),
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("snippet-current-target-name")
+                            .w_full()
+                            .min_w(px(0.))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(theme.text_xs)
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_color(theme.foreground)
+                            .aria_label(target.clone())
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(target_tooltip.clone()).build(window, cx)
+                            })
+                            .child(target),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w(px(0.))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .child(target_status),
+                    ),
             )
             .child(
                 Button::new("snippet-import")
                     .compact()
                     .ghost()
-                    .w(px(32.))
-                    .h(px(32.))
+                    .w(if self.compact_layout {
+                        px(36.)
+                    } else {
+                        px(32.)
+                    })
+                    .h(if self.compact_layout {
+                        px(36.)
+                    } else {
+                        px(32.)
+                    })
                     .icon(IconName::Upload)
                     .accessibility_label(crate::locale::text("导入片段", "Import snippets"))
                     .tooltip(crate::locale::text("导入片段", "Import snippets"))
@@ -699,8 +747,16 @@ impl CommandsView {
                 Button::new("snippet-export")
                     .compact()
                     .ghost()
-                    .w(px(32.))
-                    .h(px(32.))
+                    .w(if self.compact_layout {
+                        px(36.)
+                    } else {
+                        px(32.)
+                    })
+                    .h(if self.compact_layout {
+                        px(36.)
+                    } else {
+                        px(32.)
+                    })
                     .icon(IconName::Download)
                     .accessibility_label(crate::locale::text("导出片段", "Export snippets"))
                     .tooltip(crate::locale::text("导出片段", "Export snippets"))
@@ -714,8 +770,16 @@ impl CommandsView {
                 Button::new("snippet-library-manager")
                     .compact()
                     .ghost()
-                    .w(px(32.))
-                    .h(px(32.))
+                    .w(if self.compact_layout {
+                        px(36.)
+                    } else {
+                        px(32.)
+                    })
+                    .h(if self.compact_layout {
+                        px(36.)
+                    } else {
+                        px(32.)
+                    })
                     .icon(IconName::Settings2)
                     .accessibility_label(crate::locale::text(
                         "打开片段库管理",
@@ -734,8 +798,16 @@ impl CommandsView {
                 Button::new("snippet-new")
                     .compact()
                     .primary()
-                    .w(px(32.))
-                    .h(px(32.))
+                    .w(if self.compact_layout {
+                        px(36.)
+                    } else {
+                        px(32.)
+                    })
+                    .h(if self.compact_layout {
+                        px(36.)
+                    } else {
+                        px(32.)
+                    })
                     .icon(IconName::Plus)
                     .accessibility_label(crate::locale::text("新建片段", "New snippet"))
                     .tooltip(crate::locale::text("新建片段", "New snippet"))
@@ -747,7 +819,8 @@ impl CommandsView {
             .into_any_element()
     }
 
-    /// 分类栏复用 Kit TabBar 的语义并补齐键盘导航；拥有化返回值让后续目录行构建可独立借用状态。
+    /// 紧凑栏用等分 Tab 单元匹配 main 的无间距下划线；宽目录继续复用 Kit TabBar 的尺寸与滚动行为。
+    /// 两种布局都由同一焦点句柄处理方向键和选择变化，避免切换布局后键盘路径分叉。
     ///
     /// @author kongweiguang
     fn render_snippet_sections(
@@ -770,16 +843,16 @@ impl CommandsView {
             ),
         ];
         let selected_index = section_index(self.snippet_catalog_section);
+        let compact_layout = self.compact_layout;
 
         div()
             .id("snippet-catalog-section-focus")
             .w_full()
-            .px_3()
-            .py_1()
+            .when(!self.compact_layout, |tabs| tabs.px_3().py_1())
             .track_focus(&self.snippet_catalog_focus)
             .tab_index(0)
             .tab_stop(true)
-            .role(gpui_kit::Role::Group)
+            .role(gpui_kit::Role::TabList)
             .aria_label(crate::locale::text("片段分类", "Snippet categories"))
             .aria_keyshortcuts("ArrowLeft ArrowRight Home End Enter Space")
             .focus_visible(|style| style.border_color(theme.accent))
@@ -803,7 +876,54 @@ impl CommandsView {
                     cx.stop_propagation();
                 }
             }))
-            .child(
+            .child(if compact_layout {
+                div()
+                    .id("snippet-catalog-sections")
+                    .w_full()
+                    .h(px(32.))
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .children(tabs.into_iter().map(|(section, label)| {
+                        let selected = section == self.snippet_catalog_section;
+                        let tab_label = label.clone();
+                        div()
+                            .id(format!("snippet-catalog-tab-{}", section_index(section)))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .border_b_2()
+                            .border_color(if selected {
+                                theme.accent
+                            } else {
+                                theme.tool_panel_surface
+                            })
+                            .text_size(px(16.))
+                            .line_height(px(24.))
+                            .font_weight(gpui_kit::FontWeight::NORMAL)
+                            .text_color(if selected {
+                                theme.foreground
+                            } else {
+                                theme.muted
+                            })
+                            .cursor_pointer()
+                            .role(gpui_kit::Role::Tab)
+                            .aria_label(tab_label)
+                            .aria_selected(selected)
+                            .aria_keyshortcuts("Enter Space")
+                            .tab_index(-1)
+                            .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
+                                window.focus(&view.snippet_catalog_focus, cx);
+                                view.select_snippet_catalog_section(section, window, cx);
+                            }))
+                            .child(label)
+                    }))
+                    .into_any_element()
+            } else {
                 TabBar::new("snippet-catalog-sections")
                     .underline()
                     .small()
@@ -812,25 +932,27 @@ impl CommandsView {
                     .h(px(32.))
                     .border_b_1()
                     .border_color(theme.border)
-                    .text_size(theme.text_heading)
+                    .text_size(theme.text_xs)
                     .children(tabs.into_iter().map(|(section, label)| {
                         let aria_label = label.clone();
                         Tab::new()
                             .flex_1()
                             .justify_center()
-                            .label(label)
                             .aria_label(aria_label)
+                            .label(label)
                             .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
                                 window.focus(&view.snippet_catalog_focus, cx);
                                 view.select_snippet_catalog_section(section, window, cx);
                             }))
-                    })),
-            )
+                    }))
+                    .into_any_element()
+            })
             .into_any_element()
     }
 
-    /// 目录项以标题和说明为主；展开区仅复用已选定义、变量实体和唯一运行状态。
-    /// 行本身自然增高，预览正文独立滚动，窄栏不会把执行确认挤出可见列表。
+    /// 紧凑行复用 main 的双行摘要与整行切换命中区，宽目录保留较舒展的原布局。
+    /// 预览仍单独滚动，避免窄栏内的长正文挤压行控件。
+    /// 按钮悬停色通过 Kit variant 注入，避免重复注册组件内部的 hover refinement。
     ///
     /// @author kongweiguang
     fn render_snippet_row(
@@ -849,8 +971,13 @@ impl CommandsView {
         let favorite = item.favorite;
         let selected = self.selected_snippet_matches_key(&key);
         let preview_open = self.snippet_inline_preview.matches_key(&key);
-        let (metadata, metadata_details) =
-            row_metadata(item.origin, item.scope, &item.platforms, &item.shells);
+        let (metadata, metadata_details) = row_metadata(
+            item.origin,
+            &item.category,
+            item.scope,
+            &item.platforms,
+            &item.shells,
+        );
         let open_key = key.clone();
         let chevron_key = key.clone();
         let favorite_key = key.clone();
@@ -872,6 +999,171 @@ impl CommandsView {
                 format!("{} · Expand preview", title)
             },
         );
+        if self.compact_layout {
+            let summary_is_template = description.trim().is_empty();
+            let summary = if summary_is_template {
+                item.template.clone()
+            } else {
+                description.clone()
+            };
+            let row_button_variant = ButtonCustomVariant::new(cx)
+                .foreground(theme.foreground)
+                .hover(theme.hover)
+                .active(theme.hover);
+
+            return div()
+                .id(format!(
+                    "snippet-row-{}-{}",
+                    origin_key(item.origin),
+                    item.id
+                ))
+                .w_full()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .border_b_1()
+                .border_color(theme.border)
+                .when(selected, |row| row.bg(theme.selected.opacity(0.22)))
+                .child(
+                    div()
+                        .w_full()
+                        .min_w(px(0.))
+                        .flex()
+                        .items_center()
+                        .hover(|style| style.bg(theme.hover))
+                        .child(
+                            Button::new(format!(
+                                "snippet-favorite-{}-{}",
+                                origin_key(item.origin),
+                                item.id
+                            ))
+                            .compact()
+                            .custom(row_button_variant)
+                            .ml_1()
+                            .w(px(32.))
+                            .h(px(32.))
+                            .child(Icon::new(IconName::Star).size(px(14.)).text_color(
+                                if favorite {
+                                    theme.warning
+                                } else {
+                                    theme.subtle
+                                },
+                            ))
+                            .accessibility_label(crate::locale::text(
+                                if favorite {
+                                    format!("取消收藏 {title}")
+                                } else {
+                                    format!("收藏 {title}")
+                                },
+                                if favorite {
+                                    format!("Remove favorite {title}")
+                                } else {
+                                    format!("Favorite {title}")
+                                },
+                            ))
+                            .disabled(stale)
+                            .on_click(cx.listener(
+                                move |view, _: &ClickEvent, _, cx| {
+                                    view.set_snippet_favorite(favorite_key.clone(), !favorite, cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            Button::new(format!(
+                                "snippet-open-{}-{}",
+                                origin_key(item.origin),
+                                item.id
+                            ))
+                            .compact()
+                            .custom(row_button_variant)
+                            .flex_1()
+                            .min_w(px(0.))
+                            .min_h(px(48.))
+                            .px_2()
+                            .py_2()
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .accessibility_label(title_action.clone())
+                            .disabled(stale)
+                            .text_color(if selected {
+                                theme.accent
+                            } else {
+                                theme.foreground
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(12.))
+                                            .line_height(px(16.))
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .text_color(if selected {
+                                                theme.accent
+                                            } else {
+                                                theme.foreground
+                                            })
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(11.))
+                                            .line_height(px(16.5))
+                                            .when(summary_is_template, |line| {
+                                                line.font_family("monospace")
+                                            })
+                                            .text_color(theme.muted)
+                                            .child(summary),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(format!(
+                                        "snippet-metadata-{}-{}",
+                                        origin_key(item.origin),
+                                        item.id
+                                    ))
+                                    .flex_shrink_0()
+                                    .text_size(px(10.))
+                                    .line_height(px(15.))
+                                    .text_color(theme.subtle)
+                                    .whitespace_nowrap()
+                                    .aria_label(metadata_details.clone())
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(metadata_details.clone()).build(window, cx)
+                                    })
+                                    .child(metadata),
+                            )
+                            .child(
+                                Icon::new(preview_icon)
+                                    .size(px(14.))
+                                    .text_color(theme.subtle),
+                            )
+                            .on_click(cx.listener(
+                                move |view, _: &ClickEvent, window, cx| {
+                                    view.toggle_snippet_preview(open_key.clone(), window, cx);
+                                },
+                            )),
+                        ),
+                )
+                .when_some(preview, |row, preview| row.child(preview))
+                .into_any_element();
+        }
+
         div()
             .id(format!(
                 "snippet-row-{}-{}",
@@ -1129,34 +1421,31 @@ impl CommandsView {
             .into_any_element()
     }
 
-    /// 先显示与当前 UI binding 精确匹配的用户标签；投影缺失时才退回安全的协议和短会话标识。
+    /// 目标名和状态分别投影，完整名称仍可由目标名 tooltip 检查。
     ///
     /// @author kongweiguang
-    fn snippet_current_target_label(&self) -> gpui_kit::SharedString {
+    fn snippet_current_target_labels(&self) -> (gpui_kit::SharedString, gpui_kit::SharedString) {
         if let Some(label) = self.session_target_label() {
-            return crate::locale::text(
-                format!("{label} · 当前填入目标"),
-                format!("{label} · Fill target"),
+            return (
+                crate::locale::text(label.to_owned(), label.to_owned()),
+                crate::locale::text("当前填入目标", "Fill target"),
             );
         }
         let Some(info) = self.session_info.as_ref() else {
-            return crate::locale::text("未选择终端", "No terminal selected");
+            return (
+                crate::locale::text("未选择终端", "No terminal selected"),
+                crate::locale::text("选择分屏后可填入命令", "Choose a pane to fill commands"),
+            );
         };
-        let target = match &info.target {
-            kerminal_domain::sessions::SessionTarget::Local(_) => {
-                crate::locale::text("本地终端", "Local terminal")
-            }
-            kerminal_domain::sessions::SessionTarget::Ssh(_) => {
-                crate::locale::text("SSH 终端", "SSH terminal")
-            }
+        let (target_zh, target_en) = match &info.target {
+            kerminal_domain::sessions::SessionTarget::Local(_) => ("本地终端", "Local terminal"),
+            kerminal_domain::sessions::SessionTarget::Ssh(_) => ("SSH 终端", "SSH terminal"),
             kerminal_domain::sessions::SessionTarget::Telnet(_) => {
-                crate::locale::text("Telnet 终端", "Telnet terminal")
+                ("Telnet 终端", "Telnet terminal")
             }
-            kerminal_domain::sessions::SessionTarget::Serial(_) => {
-                crate::locale::text("串口终端", "Serial terminal")
-            }
+            kerminal_domain::sessions::SessionTarget::Serial(_) => ("串口终端", "Serial terminal"),
             kerminal_domain::sessions::SessionTarget::Container(_) => {
-                crate::locale::text("容器终端", "Container terminal")
+                ("容器终端", "Container terminal")
             }
         };
         let session_id = info.session_id.as_str();
@@ -1168,9 +1457,16 @@ impl CommandsView {
             .into_iter()
             .rev()
             .collect::<String>();
-        crate::locale::text(
-            format!("当前填入目标 · {target} · {short_id}"),
-            format!("Fill target · {target} · {short_id}"),
+        (
+            crate::locale::text(
+                format!("{target_zh} · {short_id}"),
+                format!("{target_en} · {short_id}"),
+            ),
+            if self.ui_session_binding.is_some() {
+                crate::locale::text("当前填入目标", "Fill target")
+            } else {
+                crate::locale::text("选择分屏后可填入命令", "Choose a pane to fill commands")
+            },
         )
     }
 }
@@ -1198,11 +1494,12 @@ fn snippet_filter_description(
     }
 }
 
-/// 紧凑行只标注定义范围；平台与 shell 声明仅供参考，不把元数据伪装成直接发送的限制。
+/// 行尾标签与 main 一样显示内置片段分类或“我的”；tooltip 保留来源、范围、平台和 shell 信息。
 ///
 /// @author kongweiguang
 fn row_metadata(
     origin: SnippetCatalogOrigin,
+    category: &str,
     scope: SnippetScope,
     platforms: &[String],
     shells: &[String],
@@ -1236,17 +1533,48 @@ fn row_metadata(
     } else {
         shells.join(", ")
     };
+    let (category_zh, category_en) = match origin {
+        SnippetCatalogOrigin::User => ("我的".to_owned(), "Mine".to_owned()),
+        SnippetCatalogOrigin::Builtin => (category.to_owned(), category.to_owned()),
+    };
     (
-        crate::locale::text(scope_zh, scope_en),
+        crate::locale::text(category_zh.clone(), category_en.clone()),
         crate::locale::text(
             format!(
-                "来源：{source_zh} · 范围：{scope_zh} · 平台：{platforms_zh} · Shell：{shells_zh}"
+                "分类：{category_zh} · 来源：{source_zh} · 范围：{scope_zh} · 平台：{platforms_zh} · Shell：{shells_zh}"
             ),
             format!(
-                "Source: {source_en} · Scope: {scope_en} · Platforms: {platforms_en} · Shells: {shells_en}"
+                "Category: {category_en} · Source: {source_en} · Scope: {scope_en} · Platforms: {platforms_en} · Shells: {shells_en}"
             ),
         ),
     )
+}
+
+/// main 导入弹框的按钮受 font: inherit 影响，实窗为 16px/36px；内容单独定标以保留 Kit 的焦点和禁用行为。
+///
+/// @author kongweiguang
+fn snippet_import_button(
+    id: &'static str,
+    label: gpui_kit::SharedString,
+    icon: Option<IconName>,
+    theme: ThemeTokens,
+) -> Button {
+    Button::new(id)
+        .h(px(36.))
+        .px(px(14.))
+        .rounded(theme.control_radius)
+        .accessibility_label(label.clone())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(16.))
+                .line_height(px(24.))
+                .font_weight(gpui_kit::FontWeight::NORMAL)
+                .when_some(icon, |row, icon| row.child(Icon::new(icon).size(px(16.))))
+                .child(label),
+        )
 }
 
 /// 来源前缀用于稳定组件 ID，用户与内置模板可以共享人类可读标题。
@@ -1278,51 +1606,5 @@ fn section_at(index: usize) -> SnippetCatalogSection {
         0 => SnippetCatalogSection::Common,
         1 => SnippetCatalogSection::Mine,
         _ => SnippetCatalogSection::Library,
-    }
-}
-
-/// 导入预览只映射用户可核对的类型标签，不暴露完整片段定义或变量默认值。
-///
-/// @author kongweiguang
-fn import_scope_label(scope: SnippetScope) -> gpui_kit::SharedString {
-    match scope {
-        SnippetScope::Any => crate::locale::text("通用", "Any"),
-        SnippetScope::Local => crate::locale::text("本地", "Local"),
-        SnippetScope::Ssh => crate::locale::text("SSH", "SSH"),
-    }
-}
-
-/// 风险摘要保留领域分类，未知风险不会被简化为安全状态。
-///
-/// @author kongweiguang
-fn import_risk_label(risk: SnippetRisk) -> gpui_kit::SharedString {
-    match risk {
-        SnippetRisk::Inspect => crate::locale::text("只读", "Inspect"),
-        SnippetRisk::Change => crate::locale::text("变更", "Change"),
-        SnippetRisk::Destructive => crate::locale::text("破坏性", "Destructive"),
-        SnippetRisk::Unknown => crate::locale::text("未知风险", "Unknown risk"),
-    }
-}
-
-/// 批次阶段向用户说明下一步，不把 Unknown 描述成失败或可重发。
-///
-/// @author kongweiguang
-fn import_phase_label(
-    phase: super::super::snippet_transfer_ui::SnippetImportPhase,
-) -> gpui_kit::SharedString {
-    use super::super::snippet_transfer_ui::SnippetImportPhase;
-
-    match phase {
-        SnippetImportPhase::Reviewing => crate::locale::text("待确认", "Ready to review"),
-        SnippetImportPhase::Committing => crate::locale::text("正在提交", "Importing"),
-        SnippetImportPhase::NotCommitted => {
-            crate::locale::text("尚未提交，可再次确认", "Not committed; review again")
-        }
-        SnippetImportPhase::OutcomeUnknown => crate::locale::text(
-            "结果未知，请查询原批次",
-            "Outcome unknown; check this batch",
-        ),
-        SnippetImportPhase::Committed => crate::locale::text("已导入", "Imported"),
-        SnippetImportPhase::Failed => crate::locale::text("未能导入", "Import failed"),
     }
 }

@@ -48,8 +48,9 @@ use crate::{
 
 use super::{
     AgentHistoryProjection, AgentHistoryRequest, AgentLaunchResolver, AgentLauncherCatalog,
-    AgentMcpEndpointContextProjection, AgentProviderSessionSnapshot, AgentProviderSessionStatus,
-    AgentResumeCapability, AgentResumeRecovery, AgentResumeRecoveryStatus, AgentService,
+    AgentLauncherInstallationProbe, AgentMcpEndpointContextProjection,
+    AgentProviderSessionSnapshot, AgentProviderSessionStatus, AgentResumeCapability,
+    AgentResumeRecovery, AgentResumeRecoveryStatus, AgentService,
     AgentSessionContextPathsProjection, AgentSessionLaunchProjection, AgentSessionPathsProjection,
     AgentSessionRecordDiagnostic, AgentSessionRecordProjection,
     AgentSessionRecordSessionProjection, AgentSessionView,
@@ -155,6 +156,18 @@ impl ResumeCreateAdmission {
     }
 }
 
+/// 聚合启动 CLI 所需的冻结输入与 resume 准入证据，避免调用点错配目标、命令或保留 ID。
+///
+/// @author kongweiguang
+struct AgentTerminalStartRequest<'a> {
+    session: &'a AgentSession,
+    launch: &'a kerminal_domain::agents::AgentSessionLaunch,
+    endpoint: &'a str,
+    preallocated_session_id: Option<kerminal_domain::identity::SessionId>,
+    resume_admission: Option<ResumeCreateAdmission>,
+    initial_palette: Option<TerminalPalette>,
+}
+
 /// 仅在目录创建成功后构造，绑定本次独占的 ID 与 root；异步回滚始终由用例显式等待。
 ///
 /// @author kongweiguang
@@ -201,6 +214,17 @@ impl AgentSessionService {
     /// 将桌面同一 ProfileService 注入 launcher resolver，使 Windows shell 命令遵循实际 profile。
     pub fn with_profile_service(mut self, profile_service: Arc<ProfileService>) -> Self {
         self.launch_resolver = self.launch_resolver.with_profile_service(profile_service);
+        self
+    }
+
+    /// 将桌面只读 PATH 探测器注入现有 launcher catalog 查询链，不执行 Agent 命令。
+    ///
+    /// @author kongweiguang
+    pub fn with_launcher_installation_probe(
+        mut self,
+        probe: Arc<dyn AgentLauncherInstallationProbe>,
+    ) -> Self {
+        self.launch_resolver = self.launch_resolver.with_installation_probe(probe);
         self
     }
 
@@ -550,12 +574,14 @@ impl AgentSessionService {
 
         let created = self
             .start_agent_terminal(
-                &session,
-                &session.launch,
-                endpoint,
-                None,
-                None,
-                initial_palette,
+                AgentTerminalStartRequest {
+                    session: &session,
+                    launch: &session.launch,
+                    endpoint,
+                    preallocated_session_id: None,
+                    resume_admission: None,
+                    initial_palette,
+                },
                 cancellation,
             )
             .await?;
@@ -881,12 +907,14 @@ impl AgentSessionService {
 
         let created = match self
             .start_agent_terminal(
-                &session,
-                &launch,
-                &endpoint,
-                Some(terminal_session_id.clone()),
-                Some(pending.create_admission.clone()),
-                initial_palette,
+                AgentTerminalStartRequest {
+                    session: &session,
+                    launch: &launch,
+                    endpoint: &endpoint,
+                    preallocated_session_id: Some(terminal_session_id.clone()),
+                    resume_admission: Some(pending.create_admission.clone()),
+                    initial_palette,
+                },
                 &cancellation,
             )
             .await
@@ -2681,14 +2709,17 @@ impl AgentSessionService {
     /// @author kongweiguang
     async fn start_agent_terminal(
         &self,
-        session: &AgentSession,
-        launch: &kerminal_domain::agents::AgentSessionLaunch,
-        endpoint: &str,
-        preallocated_session_id: Option<kerminal_domain::identity::SessionId>,
-        resume_admission: Option<ResumeCreateAdmission>,
-        initial_palette: Option<TerminalPalette>,
+        request: AgentTerminalStartRequest<'_>,
         cancellation: &CancellationToken,
     ) -> AppResult<SessionInfo> {
+        let AgentTerminalStartRequest {
+            session,
+            launch,
+            endpoint,
+            preallocated_session_id,
+            resume_admission,
+            initial_palette,
+        } = request;
         self.ensure_request_active(cancellation, "Agent CLI launch was cancelled")?;
         let mut environment = std::collections::BTreeMap::new();
         environment.insert(

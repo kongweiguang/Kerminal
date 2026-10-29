@@ -457,6 +457,26 @@ impl PortForwardService {
         self.stop_until(id, Instant::now() + STOP_TIMEOUT).await
     }
 
+    /// 表单编辑和直接删除先释放冻结配置的同代运行实例；已停止定义无需伪造 stop 成功。
+    /// @author kongweiguang
+    pub async fn stop_definition_instance(
+        &self,
+        expected: &PortForwardDefinition,
+    ) -> AppResult<()> {
+        let record = lock_recover(&self.records).get(&expected.id).cloned();
+        let Some(record) = record else {
+            return Ok(());
+        };
+        {
+            let forward = record.forward.lock().await;
+            if forward.config != expected.config {
+                return Err(AppError::conflict("端口转发配置已变化，请刷新后重试"));
+            }
+        }
+        self.stop_record_until(&expected.id, &record, Instant::now() + STOP_TIMEOUT)
+            .await
+    }
+
     /// 同步关闭转发 intake、后续代理策略和未发布启动，让组合根可先 quiesce 再并行 join。
     pub fn begin_shutdown(&self, deadline: Instant) {
         self.future_proxy_policy.cancel_all();

@@ -49,6 +49,8 @@ const LINUX_SYSTEM_IDENTITY_PROBE: &str = concat!(
     "printf 'os='; uname -s; ",
     "printf '\\narchitecture='; uname -m; ",
     "printf '\\nkernel='; uname -r; ",
+    "printf '\\ndistribution='; ",
+    "if [ -r /etc/os-release ]; then sed -n 's/^PRETTY_NAME=//p' /etc/os-release | head -n 1; fi; ",
     "printf '\\n'",
 );
 
@@ -369,9 +371,13 @@ impl SystemServerInfoCollector {
                 )
                 .await?;
             if let Some(output) = identity_output {
-                let (operating_system, architecture, kernel) = parse_linux_identity_output(&output);
-                if operating_system.as_deref() == Some("Linux") {
-                    snapshot.operating_system = operating_system;
+                let (platform, distribution, architecture, kernel) =
+                    parse_linux_identity_output(&output);
+                if platform
+                    .as_deref()
+                    .is_some_and(|platform| platform.eq_ignore_ascii_case("linux"))
+                {
+                    snapshot.operating_system = distribution.or(platform);
                     snapshot.architecture = architecture;
                     snapshot.kernel = kernel;
                     snapshot.sample_times.static_info_at_unix_ms = Some(unix_time_ms());
@@ -916,12 +922,12 @@ async fn collect_linux_snapshot(
             &cancel,
         )
         .await?;
-        let (operating_system, architecture, kernel) = parse_linux_identity_output(&platform);
-        let operating_system =
-            operating_system.ok_or_else(|| AppError::unsupported("无法识别远程 Linux 主机"))?;
-        if !operating_system.eq_ignore_ascii_case("linux") {
+        let (platform, distribution, architecture, kernel) = parse_linux_identity_output(&platform);
+        let platform = platform.ok_or_else(|| AppError::unsupported("无法识别远程 Linux 主机"))?;
+        if !platform.eq_ignore_ascii_case("linux") {
             return Err(AppError::unsupported("远程资源采样当前仅实现 Linux 主机"));
         }
+        let operating_system = distribution.unwrap_or(platform);
         let hostname = nonempty(run_remote(lease, "hostname", Vec::new(), &cancel).await?);
         let cpuinfo = run_remote(lease, "cat", vec!["/proc/cpuinfo".into()], &cancel).await?;
         (operating_system, architecture, kernel, hostname, cpuinfo)
@@ -1057,26 +1063,51 @@ async fn collect_linux_snapshot(
     })
 }
 
-/// 通过固定键名归属 uname 输出，缺失或空白字段继续保持未知而不被相邻字段顶替。
+/// 保留 uname 的 Linux 平台校验，并单独解析发行版展示名，缺失时由调用方回退到 Linux。
 ///
 /// @author kongweiguang
-fn parse_linux_identity_output(output: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let mut operating_system = None;
+fn parse_linux_identity_output(
+    output: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let mut platform = None;
     let mut architecture = None;
     let mut kernel = None;
+    let mut distribution = None;
     for line in output.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
         let value = nonempty(value.to_owned());
         match key {
-            "os" => operating_system = value,
+            "os" => platform = value,
             "architecture" => architecture = value,
             "kernel" => kernel = value,
+            "distribution" => {
+                distribution = value
+                    .map(|value| {
+                        let value = value.trim();
+                        value
+                            .strip_prefix('"')
+                            .and_then(|value| value.strip_suffix('"'))
+                            .or_else(|| {
+                                value
+                                    .strip_prefix('\'')
+                                    .and_then(|value| value.strip_suffix('\''))
+                            })
+                            .unwrap_or(value)
+                            .to_owned()
+                    })
+                    .and_then(nonempty)
+            }
             _ => {}
         }
     }
-    (operating_system, architecture, kernel)
+    (platform, distribution, architecture, kernel)
 }
 
 /// Linux `/proc/uptime` 首列允许小数秒；拒绝负数、非有限值和损坏文本，避免把未知伪装成零。

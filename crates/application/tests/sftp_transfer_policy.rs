@@ -376,6 +376,172 @@ async fn settings_update_preserves_existing_override_permit() -> AppResult<()> {
     assert_eq!(after_update.hosts(), &[host]);
     Ok(())
 }
+
+/// 已入队快照的每主机上限在热更新后保持不变，新快照仍可按新上限准入。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn queued_snapshot_preserves_host_limit_after_policy_update() -> AppResult<()> {
+    let store = SftpTransferPolicyStore::new(settings(4, 1))?;
+    let host = HostId::new();
+    let queued_policy = store.snapshot();
+    let active = store
+        .acquire_with_host_limits_at_snapshot(
+            [(host.clone(), None)],
+            queued_policy,
+            &CancellationToken::new(),
+        )
+        .await?;
+
+    let waiter_store = store.clone();
+    let waiter_host = host.clone();
+    let mut queued_waiter = tokio::spawn(async move {
+        waiter_store
+            .acquire_with_host_limits_at_snapshot(
+                [(waiter_host, None)],
+                queued_policy,
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut queued_waiter)
+            .await
+            .is_err()
+    );
+
+    let updated_policy = store.update(settings(4, 2))?;
+    let new_task = store
+        .acquire_with_host_limits_at_snapshot(
+            [(host.clone(), None)],
+            updated_policy,
+            &CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut queued_waiter)
+            .await
+            .is_err()
+    );
+
+    drop(active);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut queued_waiter)
+            .await
+            .is_err()
+    );
+    drop(new_task);
+    let old_task = tokio::time::timeout(Duration::from_secs(1), queued_waiter)
+        .await
+        .expect("释放旧任务快照占用后应唤醒等待者")
+        .expect("等待任务不 panic")?;
+    assert_eq!(old_task.hosts(), std::slice::from_ref(&host));
+    drop(old_task);
+
+    let first = store
+        .acquire_with_host_limits_at_snapshot(
+            [(host.clone(), None)],
+            updated_policy,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let second = store
+        .acquire_with_host_limits_at_snapshot(
+            [(host.clone(), None)],
+            updated_policy,
+            &CancellationToken::new(),
+        )
+        .await?;
+    drop((first, second));
+    Ok(())
+}
+
+/// 不同配置版本的任务共用全局活动计数，旧快照不能因更新而提前越过自身上限。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn queued_snapshot_shares_global_active_count_after_policy_update() -> AppResult<()> {
+    let store = SftpTransferPolicyStore::new(settings(2, 1))?;
+    let host_a = HostId::new();
+    let host_b = HostId::new();
+    let host_c = HostId::new();
+    let host_d = HostId::new();
+    let queued_policy = store.snapshot();
+    let first = store
+        .acquire_with_host_limits_at_snapshot(
+            [(host_a.clone(), None)],
+            queued_policy,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let second = store
+        .acquire_with_host_limits_at_snapshot(
+            [(host_b.clone(), None)],
+            queued_policy,
+            &CancellationToken::new(),
+        )
+        .await?;
+
+    let waiter_store = store.clone();
+    let waiter_host = host_c.clone();
+    let mut queued_waiter = tokio::spawn(async move {
+        waiter_store
+            .acquire_with_host_limits_at_snapshot(
+                [(waiter_host, None)],
+                queued_policy,
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut queued_waiter)
+            .await
+            .is_err()
+    );
+
+    let updated_policy = store.update(settings(4, 2))?;
+    let third = store
+        .acquire_with_host_limits_at_snapshot(
+            [(host_c.clone(), None)],
+            updated_policy,
+            &CancellationToken::new(),
+        )
+        .await?;
+    let fourth = store
+        .acquire_with_host_limits_at_snapshot(
+            [(host_d, None)],
+            updated_policy,
+            &CancellationToken::new(),
+        )
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut queued_waiter)
+            .await
+            .is_err()
+    );
+
+    drop(first);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut queued_waiter)
+            .await
+            .is_err()
+    );
+    drop(second);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut queued_waiter)
+            .await
+            .is_err()
+    );
+    drop(third);
+    let old_task = tokio::time::timeout(Duration::from_secs(1), queued_waiter)
+        .await
+        .expect("活动数低于旧上限后应唤醒等待者")
+        .expect("等待任务不 panic")?;
+    assert_eq!(old_task.hosts(), &[host_c]);
+    drop((old_task, fourth));
+    Ok(())
+}
+
 /// 等待中的任务能响应 caller cancellation，不占用全局或主机配额。
 #[tokio::test]
 async fn waiting_admission_is_cancellable() -> AppResult<()> {
@@ -385,11 +551,19 @@ async fn waiting_admission_is_cancellable() -> AppResult<()> {
         .acquire([host.clone()], &CancellationToken::new())
         .await?;
     let cancellation = CancellationToken::new();
+    let queued_policy = store.snapshot();
     let waiter_store = store.clone();
     let waiter_host = host;
     let waiter_cancel = cancellation.clone();
-    let mut waiter =
-        tokio::spawn(async move { waiter_store.acquire([waiter_host], &waiter_cancel).await });
+    let mut waiter = tokio::spawn(async move {
+        waiter_store
+            .acquire_with_host_limits_at_snapshot(
+                [(waiter_host, None)],
+                queued_policy,
+                &waiter_cancel,
+            )
+            .await
+    });
     tokio::task::yield_now().await;
     cancellation.cancel();
     let result = tokio::time::timeout(Duration::from_secs(1), &mut waiter)
@@ -398,6 +572,14 @@ async fn waiting_admission_is_cancellable() -> AppResult<()> {
         .expect("admission task does not panic");
     assert!(matches!(result, Err(AppError::Cancelled { .. })));
     drop(active);
+    let after_cancel = store
+        .acquire_with_host_limits_at_snapshot(
+            [(HostId::new(), None)],
+            queued_policy,
+            &CancellationToken::new(),
+        )
+        .await?;
+    drop(after_cancel);
     Ok(())
 }
 
@@ -406,6 +588,7 @@ async fn waiting_admission_is_cancellable() -> AppResult<()> {
 async fn close_wakes_waiters_and_rejects_new_admissions() -> AppResult<()> {
     let store = SftpTransferPolicyStore::new(settings(1, 1))?;
     let host = HostId::new();
+    let queued_policy = store.snapshot();
     let active = store
         .acquire([host.clone()], &CancellationToken::new())
         .await?;
@@ -413,7 +596,11 @@ async fn close_wakes_waiters_and_rejects_new_admissions() -> AppResult<()> {
     let waiter_host = host.clone();
     let mut waiter = tokio::spawn(async move {
         waiter_store
-            .acquire([waiter_host], &CancellationToken::new())
+            .acquire_with_host_limits_at_snapshot(
+                [(waiter_host, None)],
+                queued_policy,
+                &CancellationToken::new(),
+            )
             .await
     });
     tokio::task::yield_now().await;

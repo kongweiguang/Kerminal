@@ -29,7 +29,7 @@ use crate::{locale, theme::ThemeTokens};
 use super::{FilesPane, NameAction, bookmark_endpoint, endpoint_name};
 
 impl Render for FilesPane {
-    /// 宽工作区并列展示两端，窄 dock 只显示活动端；外层使用 shell 材质以露出全局壁纸。
+    /// 宽工作区保留 shell 材质以露出全局壁纸；紧凑右栏只投影 main 的工具面板色阶，避免改动共享 Kit 主题。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -47,6 +47,11 @@ impl Render for FilesPane {
         self.initialize(cx);
         self.watch_transfer_queue(cx);
         let theme = ThemeTokens::current(window, cx);
+        let theme = if self.compact_layout {
+            theme.for_tool_panel()
+        } else {
+            theme
+        };
         let empty_remote_target = self.host_picker.enabled
             && self.host_picker.right_target_unselected
             && !self.compact_layout;
@@ -110,7 +115,11 @@ impl Render for FilesPane {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(theme.materials.shell)
+            .bg(if self.compact_layout {
+                theme.tool_panel_surface
+            } else {
+                theme.materials.shell
+            })
             .text_color(theme.foreground);
         // 右栏在浏览状态下省去重复标题；工作区状态仍保留返回入口。
         let show_header = self.host_picker.enabled
@@ -125,7 +134,21 @@ impl Render for FilesPane {
         if !self.compact_layout {
             pane = pane.child(render_bookmarks(self, theme, cx));
         }
-        pane = pane.child(transfers::render_transfers(self, theme, cx));
+        let empty_compact_queue = self.compact_layout
+            && self.queue.archive_loaded
+            && self.transfer_rows.is_empty()
+            && self.transfer_recovery_rows.is_empty()
+            && self.queue.archive_records.is_empty()
+            && !self.queue.archive_loading
+            && self.queue.archive_error.is_none()
+            && !self.queue.recovery_list_loading
+            && self.queue.recovery_list_error.is_none()
+            && !self.queue.history_expanded
+            && !self.queue.is_clearing_completed_history();
+        // 仅在已确认没有可浏览的历史或恢复材料时省去右栏空队列；加载与错误仍可见。
+        if !empty_compact_queue {
+            pane = pane.child(transfers::render_transfers(self, theme, cx));
+        }
         if let Some(details) = render_status_details(self, theme) {
             pane = pane.child(details);
         }
@@ -271,7 +294,7 @@ fn render_compact_no_terminal_target(theme: ThemeTokens) -> AnyElement {
         .into_any_element()
 }
 
-/// 仅在新建或重命名时显示名称编辑条，避免静态操作按钮占据文件浏览空间。
+/// 紧凑右栏的新建和重命名由 Root 弹框承载，避免相同编辑状态在浏览器底部重复显示。
 ///
 /// @author kongweiguang
 fn render_name_action(
@@ -279,6 +302,10 @@ fn render_name_action(
     theme: ThemeTokens,
     cx: &mut Context<FilesPane>,
 ) -> impl IntoElement {
+    if pane.compact_layout {
+        return div().id("files-name-action").w_full().h(px(0.));
+    }
+
     let mut row = div()
         .id("files-name-action")
         .w_full()

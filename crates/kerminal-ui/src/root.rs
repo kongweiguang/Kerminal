@@ -22,6 +22,30 @@ mod preferences;
 mod proxy_runtime;
 mod quick_open;
 mod quit;
+#[cfg(feature = "right-rail-acceptance")]
+mod right_rail_acceptance;
+#[cfg(feature = "right-rail-acceptance")]
+mod settings_acceptance;
+#[cfg(feature = "right-rail-acceptance")]
+mod workbench_acceptance;
+#[cfg(feature = "right-rail-acceptance")]
+pub use self::right_rail_acceptance::RightRailAcceptanceShellSnapshot;
+#[cfg(feature = "right-rail-acceptance")]
+pub use self::settings_acceptance::SettingsAcceptanceState;
+#[cfg(feature = "right-rail-acceptance")]
+mod right_rail_acceptance_agent;
+#[cfg(feature = "right-rail-acceptance")]
+mod right_rail_acceptance_compose;
+#[cfg(feature = "right-rail-acceptance")]
+mod right_rail_acceptance_files;
+#[cfg(feature = "right-rail-acceptance")]
+mod right_rail_acceptance_forwarding;
+#[cfg(feature = "right-rail-acceptance")]
+mod right_rail_acceptance_operations;
+#[cfg(feature = "right-rail-acceptance")]
+mod right_rail_acceptance_snippets;
+#[cfg(feature = "right-rail-acceptance")]
+mod right_rail_acceptance_transfers;
 mod services;
 mod session_command_pump;
 mod session_queue;
@@ -42,6 +66,7 @@ mod terminal_tools_runtime;
 mod terminal_viewport;
 pub(crate) mod terminal_wheel;
 mod tool_panels;
+mod tool_rail_customizer;
 mod update_host_recovery;
 mod updates;
 #[cfg(target_os = "windows")]
@@ -61,6 +86,10 @@ mod workspace_tab_creation;
 mod workspace_transient;
 
 pub use self::quit::{QuitIntent, RootHostLifecycle, RootViewEvent};
+#[cfg(feature = "right-rail-acceptance")]
+pub use self::right_rail_acceptance_agent::AgentAcceptanceSetup;
+#[cfg(feature = "right-rail-acceptance")]
+pub use self::right_rail_acceptance_compose::ComposeAcceptanceOpenRequest;
 pub use self::services::AppServices;
 
 use std::{
@@ -197,6 +226,113 @@ struct ContainerExecRefreshTarget {
     runtime: ContainerRuntime,
 }
 
+/// 新标签终端创建的唯一归属；只有相同 tab、pane 和恢复代次的回执才能解除忙状态。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingTerminalCreationOwner {
+    tab_id: TabId,
+    pane_id: PaneId,
+    generation: u64,
+}
+
+impl PendingTerminalCreationOwner {
+    /// 完整身份匹配阻止旧请求回执解除新请求的忙状态。
+    ///
+    /// @author kongweiguang
+    fn matches(&self, tab_id: &TabId, pane_id: &PaneId, generation: u64) -> bool {
+        self.tab_id == *tab_id && self.pane_id == *pane_id && self.generation == generation
+    }
+}
+
+/// 只回滚仍由同一创建 owner 持有的未发布单 pane reservation；删除令牌和代次使迟到回执失效。
+/// 已发布 tab、分屏操作、真实 session 或待清理 owner 都继续由原工作区生命周期处理。
+/// 显式借用各状态槽以复用生产清理逻辑做无窗口回归，不为一次性回滚引入新的状态所有者。
+///
+/// @author kongweiguang
+#[allow(clippy::too_many_arguments)]
+fn rollback_unpublished_terminal_creation_state(
+    runtime: &mut WorkspaceRuntime,
+    controller: Option<&WorkspaceController>,
+    has_workspace_resource_operation: bool,
+    restore_generations: &mut HashMap<PaneId, u64>,
+    restore_cancellations: &mut HashMap<PaneId, CancellationToken>,
+    pending_owner: &mut Option<PendingTerminalCreationOwner>,
+    is_creating_session: &mut bool,
+    pending_focus_intent: &mut Option<PendingPaneFocusIntent>,
+    #[cfg(feature = "acceptance-metrics")] pending_fresh_terminal_probes: &mut HashMap<PaneId, u64>,
+    tab_id: &TabId,
+    pane_id: &PaneId,
+    generation: u64,
+) -> bool {
+    let Some(controller) = controller else {
+        return false;
+    };
+    if has_workspace_resource_operation
+        || controller
+            .snapshot()
+            .terminal_tabs
+            .iter()
+            .any(|tab| tab.id() == tab_id)
+        || !restore_generations
+            .get(pane_id)
+            .is_some_and(|current| *current == generation)
+        || !restore_cancellations
+            .get(pane_id)
+            .is_some_and(|cancellation| !cancellation.is_cancelled())
+        || !pending_owner
+            .as_ref()
+            .is_some_and(|owner| owner.matches(tab_id, pane_id, generation))
+    {
+        return false;
+    }
+
+    let Some(runtime_pane) = runtime.pane(pane_id) else {
+        return false;
+    };
+    if runtime_pane.tab_id != *tab_id
+        || runtime_pane.session_id.is_some()
+        || !matches!(
+            runtime_pane.phase,
+            RuntimePanePhase::RestorePending | RuntimePanePhase::RestoreFailed
+        )
+        || runtime.orphan_cleanup_for_pane(pane_id).next().is_some()
+        || runtime.orphan_cleanup_for_tab(tab_id).next().is_some()
+    {
+        return false;
+    }
+    let Some(layout) = runtime.tab_layout(tab_id) else {
+        return false;
+    };
+    let layout_panes = layout.pane_ids();
+    if layout_panes.len() != 1 || layout_panes.first() != Some(pane_id) {
+        return false;
+    }
+    if !matches!(runtime.remove_empty_pane(pane_id), Ok(true)) {
+        return false;
+    }
+    runtime.remove_tab_layout(tab_id);
+
+    if let Some(cancellation) = restore_cancellations.remove(pane_id) {
+        cancellation.cancel();
+    }
+    restore_generations.remove(pane_id);
+    *pending_owner = None;
+    *is_creating_session = false;
+    if pending_focus_intent.as_ref().is_some_and(|intent| {
+        intent.tab_id == *tab_id
+            && intent.pane_id == *pane_id
+            && intent.restore_generation == Some(generation)
+    }) {
+        *pending_focus_intent = None;
+    }
+    #[cfg(feature = "acceptance-metrics")]
+    if pending_fresh_terminal_probes.get(pane_id) == Some(&generation) {
+        pending_fresh_terminal_probes.remove(pane_id);
+    }
+    true
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CenterPanel {
     Terminal,
@@ -205,9 +341,7 @@ enum CenterPanel {
     Preferences,
     Commands,
     Connections,
-    McpRuntime,
     Agents,
-    Updates,
 }
 
 /// 将会话目标投影为 v3 可恢复意图；Telnet/Serial 的运行目标不含 HostId，必须由连接请求补入，
@@ -479,6 +613,9 @@ pub(super) enum WorkspaceTerminalOpenKind {
         target: ContainerTarget,
         command: Vec<String>,
     },
+    ContainerLogs {
+        target: ContainerTarget,
+    },
     TmuxAttach {
         target: TmuxTarget,
         session_id: String,
@@ -493,6 +630,7 @@ pub struct RootView {
     /// Close-to-tray is enabled only after the desktop confirms a real tray owner.
     tray_owner_installed: bool,
     is_creating_session: bool,
+    pending_terminal_creation_owner: Option<PendingTerminalCreationOwner>,
     status: Option<SharedString>,
     /// 短提示按已观察消息分代，迟到的自动关闭不能清除之后的提示。
     status_toast_revision: u64,
@@ -521,6 +659,8 @@ pub struct RootView {
     pending_tool_rail_placement_focus: Option<tool_panels::ToolRailPlacementFocusIntent>,
     /// 按键复用上一帧真正采用的紧凑布局与活动工具；只是绘制事实，不另算预算、不保存用户设置。
     tool_rail_rendered_compact: (bool, Option<ToolRailToolId>),
+    #[cfg(feature = "right-rail-acceptance")]
+    right_rail_acceptance_active_override: bool,
     /// 广播目标保留校验时的完整 UI binding，重连后旧输入必须由 SessionService CAS 拒绝。
     broadcast_session_ids: Option<Vec<UiSessionBinding>>,
     broadcast_generation: u64,
@@ -564,6 +704,7 @@ pub struct RootView {
     group_rename_return_surface: Option<CenterPanel>,
     /// 操作/文件危险确认只保存当前 feature owner；表单基线与提交仍由该 Entity 持有。
     root_confirmation_owner: Option<RootConfirmationOwner>,
+    tool_rail_customizer: Option<Entity<tool_rail_customizer::ToolRailCustomizer>>,
     root_confirmation_operations_view: Option<Entity<crate::features::operations::OperationsView>>,
     root_confirmation_file_pane: Option<Entity<crate::features::files::FilesPane>>,
     root_confirmation_editor: Option<Entity<FileEditorWorkspace>>,
@@ -580,6 +721,7 @@ pub struct RootView {
     reported_focus_session: Option<SessionId>,
     _focus_in_subscription: gpui_kit::Subscription,
     _focus_out_subscription: gpui_kit::Subscription,
+    _floating_drag_focus_lost_subscription: gpui_kit::Subscription,
     terminal_tools_runtime: terminal_tools_runtime::TerminalToolsRuntime,
     /// 命令块的异步快照与正文读取按工具 Entity 和 pane generation 隔离。
     command_block_runtime: command_blocks::CommandBlockRuntime,
@@ -595,6 +737,7 @@ pub struct RootView {
     commands_view: Option<Entity<crate::features::commands::CommandsView>>,
     _snippet_editor_visibility_subscription: Option<gpui_kit::Subscription>,
     _snippet_terminal_fill_subscription: Option<gpui_kit::Subscription>,
+    _snippet_current_command_subscription: Option<gpui_kit::Subscription>,
     connections_panel: Option<Entity<crate::features::connections::ConnectionsPanel>>,
     operations_view: Option<Entity<crate::features::operations::OperationsView>>,
     _operations_event_subscription: Option<gpui_kit::Subscription>,
@@ -715,6 +858,8 @@ pub struct RootView {
     host_sidebar_collapsed: bool,
     /// 右侧 dock 折叠时暂不渲染分组，但继续保留其尺寸状态与工具 Entity。
     workbench_dock_resizable_state: Entity<ResizableState>,
+    /// 左侧工具与终端共享一组可恢复尺寸，偏好只在真实 resize 回调中提交。
+    workbench_left_tool_resizable_state: Entity<ResizableState>,
     /// 底部工具拖动高度归 Root 持有，窗口变矮时临时夹紧不替换用户原始尺寸。
     workbench_bottom_resizable_state: Entity<ResizableState>,
     /// 每个宿主的工具状态由同一 Root 持有，停靠变化不会复制/重建 feature Entity。
@@ -835,6 +980,27 @@ impl RootView {
     ///
     /// @author kongweiguang
     pub(super) fn cancel_workspace_restore(&mut self, pane_id: &PaneId) {
+        let generation = self.workspace_restore_generations.get(pane_id).copied();
+        let owner_tab_id = self
+            .pending_terminal_creation_owner
+            .as_ref()
+            .filter(|owner| owner.pane_id == *pane_id && Some(owner.generation) == generation)
+            .map(|owner| owner.tab_id.clone());
+        let runtime_tab_id = self
+            .workspace_runtime
+            .pane(pane_id)
+            .map(|pane| pane.tab_id.clone());
+        if let Some(generation) = generation {
+            self.cancel_pending_terminal_creation_for_pane(pane_id, generation);
+        }
+        if let Some(tab_id) = runtime_tab_id.or(owner_tab_id)
+            && self
+                .pending_pane_focus_intent
+                .as_ref()
+                .is_some_and(|intent| intent.tab_id == tab_id && intent.pane_id == *pane_id)
+        {
+            self.pending_pane_focus_intent = None;
+        }
         #[cfg(feature = "acceptance-metrics")]
         if self
             .workspace_restore_generations
@@ -866,7 +1032,12 @@ impl RootView {
             || logical_input_modal_blocked(
                 self.preferences_modal_open,
                 self.connections_modal_open,
-                self.snippet_editor_modal_open || self.custom_agent_manager.is_some(),
+                self.snippet_editor_modal_open
+                    || (self.custom_agent_manager.is_some()
+                        || self
+                            .tool_rail_customizer
+                            .as_ref()
+                            .is_some_and(|dialog| dialog.read(cx).is_open())),
                 self.root_confirmation_owner.is_some(),
                 self.pending_quit_intent.is_some() || self.quit_ready_intent.is_some(),
             )
@@ -2615,6 +2786,11 @@ impl RootView {
         let focus_out_subscription = cx.on_blur(&focus_handle, window, |view, _, cx| {
             view.set_reported_focus_session(None, cx);
         });
+        let floating_drag_focus_lost_subscription = cx.on_focus_lost(window, |view, _, cx| {
+            if view.tool_rail_state.finish_floating_drag() {
+                cx.notify();
+            }
+        });
         let configuration_recovery = services.preferences.recovery_state();
         let workbench_sidebar_resizable_state = cx.new(|_| ResizableState::default());
         // ResizableState 的 Resized 事件在拖动结束或程序化尺寸变更后发出，避免每帧轮询并让标题栏同步最新分隔线位置。
@@ -2623,6 +2799,7 @@ impl RootView {
             |_, _, _: &ResizablePanelEvent, cx| cx.notify(),
         );
         let workbench_dock_resizable_state = cx.new(|_| ResizableState::default());
+        let workbench_left_tool_resizable_state = cx.new(|_| ResizableState::default());
         let workbench_bottom_resizable_state = cx.new(|_| ResizableState::default());
         crate::locale::apply_interface_language(
             InterfaceLanguage::System,
@@ -2656,6 +2833,7 @@ impl RootView {
                     configuration_changes,
                     external_protocol,
                     mcp_runtime_available,
+                    mcp_runtime: services.mcp_runtime.clone(),
                     executor,
                 };
                 let panel = PreferencesPanel::new(services, window, cx);
@@ -2675,18 +2853,14 @@ impl RootView {
                 }
                 PreferencesEvent::SettingsSaved(settings) => {
                     root.apply_settings_snapshot(settings.clone(), window, cx);
+                    root.finish_tool_rail_customizer_save(Ok(()), window, cx);
                     root.complete_tool_rail_placement_focus(window, cx);
+                }
+                PreferencesEvent::SettingsPreview(settings) => {
+                    root.apply_settings_snapshot(settings.clone(), window, cx);
                 }
                 PreferencesEvent::CloseRequested => {
                     root.close_preferences_modal(window, cx);
-                }
-                PreferencesEvent::OpenMcpRuntimeRequested => {
-                    root.close_preferences_modal(window, cx);
-                    root.show_mcp_runtime(window, cx);
-                }
-                PreferencesEvent::OpenUpdatesRequested => {
-                    root.close_preferences_modal(window, cx);
-                    root.set_center_panel(CenterPanel::Updates, window, cx);
                 }
                 PreferencesEvent::QuitConfirmed => {
                     root.handle_preferences_quit_result(true, cx);
@@ -2764,6 +2938,9 @@ impl RootView {
                 }
                 PreferencesEvent::ToolRailSaveFailed { message } => {
                     root.pending_tool_rail_placement_focus = None;
+                    if root.finish_tool_rail_customizer_save(Err(message.clone()), window, cx) {
+                        return;
+                    }
                     root.status = Some(message.clone().into());
                     root.open_preferences_modal(window, cx);
                     cx.notify();
@@ -2779,8 +2956,11 @@ impl RootView {
             cx.new(|cx| FileEditorWorkspace::new(service, executor, target_name_lookup, window, cx))
         });
         let commands_view = Self::create_commands_view(&services, window, cx);
-        let (snippet_editor_visibility_subscription, snippet_terminal_fill_subscription) =
-            Self::subscribe_commands_view(commands_view.as_ref(), window, cx);
+        let (
+            snippet_editor_visibility_subscription,
+            snippet_terminal_fill_subscription,
+            snippet_current_command_subscription,
+        ) = Self::subscribe_commands_view(commands_view.as_ref(), window, cx);
         let connections_panel = services
             .hosts
             .clone()
@@ -2963,6 +3143,11 @@ impl RootView {
                 services.executor.clone(),
                 services.notifications.clone(),
             )
+        });
+        preferences_panel.update(cx, |panel, cx| {
+            panel.attach_inline_updates(updates_panel.clone(), cx);
+            panel.attach_notifications(services.notifications.clone());
+            panel.attach_screen_color_sampler(services.screen_color_sampler.clone());
         });
         let updates_event_subscription =
             cx.subscribe_in(&updates_panel, window, |root, _panel, event, window, cx| {
@@ -3177,6 +3362,7 @@ impl RootView {
             services,
             tray_owner_installed: false,
             is_creating_session: false,
+            pending_terminal_creation_owner: None,
             status: None,
             status_toast_revision: 0,
             status_toast_observed: None,
@@ -3195,6 +3381,8 @@ impl RootView {
             pane_focus_intent_generation: 0,
             pending_tool_rail_placement_focus: None,
             tool_rail_rendered_compact: (false, None),
+            #[cfg(feature = "right-rail-acceptance")]
+            right_rail_acceptance_active_override: false,
             broadcast_session_ids: None,
             broadcast_generation: 0,
             pending_broadcast_generation: None,
@@ -3226,6 +3414,7 @@ impl RootView {
             connections_modal_generation: 0,
             group_rename_return_surface: None,
             root_confirmation_owner: None,
+            tool_rail_customizer: None,
             root_confirmation_operations_view: None,
             root_confirmation_file_pane: None,
             root_confirmation_editor: None,
@@ -3241,6 +3430,7 @@ impl RootView {
             reported_focus_session: None,
             _focus_in_subscription: focus_in_subscription,
             _focus_out_subscription: focus_out_subscription,
+            _floating_drag_focus_lost_subscription: floating_drag_focus_lost_subscription,
             center_panel: CenterPanel::Terminal,
             theme_mode: initial_theme_mode,
             terminal_metrics: TerminalMetrics::from_settings(
@@ -3257,6 +3447,7 @@ impl RootView {
             commands_view,
             _snippet_editor_visibility_subscription: snippet_editor_visibility_subscription,
             _snippet_terminal_fill_subscription: snippet_terminal_fill_subscription,
+            _snippet_current_command_subscription: snippet_current_command_subscription,
             connections_panel,
             operations_view,
             _operations_event_subscription: operations_event_subscription,
@@ -3339,6 +3530,7 @@ impl RootView {
             workbench_bottom_restore_pending: false,
             host_sidebar_collapsed: false,
             workbench_dock_resizable_state,
+            workbench_left_tool_resizable_state,
             workbench_bottom_resizable_state,
             tool_rail_state: workbench::ToolRailPanelState::default(),
             context_panel,
@@ -3457,12 +3649,54 @@ impl RootView {
             return;
         }
         let candidate = self.current_agent_target_candidate();
-        if self.agent_target_candidate.0 == candidate {
-            return;
-        }
+        let candidate_changed = self.agent_target_candidate.0 != candidate;
+        let summary = self.current_agent_target_summary();
         self.agent_target_candidate = CachedAgentTargetCandidate(candidate.clone());
         if let Some(panel) = self.agents_panel.clone() {
-            panel.update(cx, |panel, cx| panel.set_target_candidate(candidate, cx));
+            panel.update(cx, |panel, cx| {
+                if candidate_changed {
+                    panel.set_target_candidate(candidate, cx);
+                }
+                panel.set_target_summary(Some(summary), cx);
+            });
+        }
+    }
+
+    /// 摘要描述整个 Tab 的首选上下文，与 Agent 会话绑定分离；分屏增减时即使候选未变也需刷新数量。
+    /// 按 main 优先使用存活 pane 数，恢复尚未挂载 runtime 时回退到布局数量，不显示内部身份。
+    ///
+    /// @author kongweiguang
+    fn current_agent_target_summary(&self) -> String {
+        let active_tab = self.workspace_controller.as_ref().and_then(|controller| {
+            let snapshot = controller.snapshot();
+            let active_tab_id = snapshot.active_tab_id.as_ref()?;
+            snapshot
+                .terminal_tabs
+                .iter()
+                .find(|tab| tab.id() == active_tab_id)
+        });
+        let Some(WorkspaceSessionTab::Terminal { title, layout, .. }) = active_tab else {
+            return crate::locale::text("整个 Kerminal", "All of Kerminal").to_string();
+        };
+        let pane_ids = layout.pane_ids();
+        let live_count = pane_ids
+            .iter()
+            .filter(|pane_id| self.workspace_runtime.pane(pane_id).is_some())
+            .count();
+        let count = if live_count > 0 {
+            live_count
+        } else {
+            pane_ids.len().max(1)
+        };
+        let summary = crate::locale::text(
+            format!("当前 Tab · {count} 个终端"),
+            format!("Current tab · {count} terminals"),
+        );
+        let title = title.trim();
+        if title.is_empty() {
+            summary.to_string()
+        } else {
+            format!("{summary} · {title}")
         }
     }
 
@@ -3726,14 +3960,16 @@ impl RootView {
 
     /// 按窗口外观和用户设置取得此次渲染、OSC 响应都要使用的 engine 调色板。
     fn current_terminal_palette(&self) -> TerminalPalette {
-        terminal_palette_for_mode(
-            self.window_appearance,
-            self.theme_mode,
-            self.terminal_color_scheme,
-        )
+        let scheme = self
+            .settings_snapshot
+            .as_ref()
+            .map_or(self.terminal_color_scheme, |settings| {
+                preferences::terminal_scheme_for_snapshot(settings, self.window_appearance)
+            });
+        terminal_palette_for_mode(self.window_appearance, self.theme_mode, scheme)
     }
 
-    /// 完整快照仍应用其它偏好；有未确认布局时只更新持久基线，不回滚更晚的窗口手势。
+    /// 同一快照驱动工作台与命令建议预览；布局有未确认手势时只更新持久基线。
     ///
     /// @author kongweiguang
     fn apply_settings_snapshot(
@@ -3754,6 +3990,9 @@ impl RootView {
         let confirm_terminal_close = settings.terminal.confirm_close_tab;
         let suggestion_settings = settings.terminal.inline_suggestion.clone();
         self.keybinding_runtime.update(&settings.keybindings);
+        if let Some(commands) = self.services.commands.as_ref() {
+            commands.update_suggestion_settings(&suggestion_settings);
+        }
         self.terminal_command_suggestions
             .set_settings(Some(suggestion_settings));
         preferences::apply_snapshot(self, settings, window, cx);
@@ -4093,6 +4332,8 @@ impl RootView {
         if self.preferences_modal_open || self.connections_modal_open {
             return;
         }
+        self.preferences_panel
+            .update(cx, |panel, cx| panel.begin_modal_session(window, cx));
         self.clear_pending_pane_focus();
         self.preferences_modal_return_focus = window.focused(cx);
         self.preferences_modal_open = true;
@@ -4113,7 +4354,7 @@ impl RootView {
                     return;
                 }
                 preferences_panel.update(cx, |panel, cx| {
-                    panel.focus_navigation_search(window, cx);
+                    panel.focus_initial_control(window, cx);
                 });
             });
         });
@@ -4158,7 +4399,12 @@ impl RootView {
                     logical_input_modal_blocked(
                         root.preferences_modal_open,
                         root.connections_modal_open,
-                        root.snippet_editor_modal_open || root.custom_agent_manager.is_some(),
+                        root.snippet_editor_modal_open
+                            || (root.custom_agent_manager.is_some()
+                                || root
+                                    .tool_rail_customizer
+                                    .as_ref()
+                                    .is_some_and(|dialog| dialog.read(cx).is_open())),
                         false,
                         root.pending_quit_intent.is_some(),
                     ),
@@ -4345,7 +4591,7 @@ impl RootView {
             .chain(self.sftp_panel.iter())
             .cloned()
             .chain(self.workspace_files.files_panes())
-            .find(|pane| pane.read(cx).pending_delete_confirmation().is_some());
+            .find(|pane| pane.read(cx).pending_global_dialog());
         if let Some(pane) = files {
             self.sync_file_delete_root_confirmation(pane, true, window, cx);
             return;
@@ -4357,7 +4603,7 @@ impl RootView {
         }
     }
 
-    /// 文件删除的目标 Entity 固定在发起确认的 pane；其它文件标签的刷新不能改写本次目标。
+    /// 文件弹框的目标 Entity 固定在发起操作的 pane；其它标签的刷新不能改写本次目标。
     ///
     /// @author kongweiguang
     pub(super) fn sync_file_delete_root_confirmation(
@@ -4505,7 +4751,7 @@ impl RootView {
         });
     }
 
-    /// 删除、编辑和运维共用根 trap；仅运维需要再把焦点交给其内部确认按钮组。
+    /// 文件与运维共享根 trap，再按各自规则聚焦；文件先聚焦 main 对应的关闭按钮，运维保留表单焦点。
     ///
     /// @author kongweiguang
     fn focus_root_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4517,6 +4763,11 @@ impl RootView {
             && let Some(operations) = self.root_confirmation_operations_view.clone()
         {
             operations.update(cx, |view, cx| view.focus_root_confirmation(window, cx));
+        } else if self.root_confirmation_owner == Some(RootConfirmationOwner::FileDelete)
+            && let Some(pane) = self.root_confirmation_file_pane.clone()
+        {
+            let focus = pane.update(cx, |pane, cx| pane.global_dialog_focus_handle(cx));
+            window.focus(&focus, cx);
         }
     }
 
@@ -4532,7 +4783,7 @@ impl RootView {
             }
             Some(RootConfirmationOwner::FileDelete) => {
                 if let Some(pane) = self.root_confirmation_file_pane.clone() {
-                    pane.update(cx, |pane, cx| pane.cancel_delete_confirmation(cx));
+                    pane.update(cx, |pane, cx| pane.cancel_global_dialog(cx));
                 }
             }
             Some(RootConfirmationOwner::Editor) => {
@@ -4668,7 +4919,12 @@ impl RootView {
                     logical_input_modal_blocked(
                         root.preferences_modal_open,
                         root.connections_modal_open,
-                        root.snippet_editor_modal_open || root.custom_agent_manager.is_some(),
+                        root.snippet_editor_modal_open
+                            || (root.custom_agent_manager.is_some()
+                                || root
+                                    .tool_rail_customizer
+                                    .as_ref()
+                                    .is_some_and(|dialog| dialog.read(cx).is_open())),
                         false,
                         root.pending_quit_intent.is_some(),
                     ),
@@ -4699,16 +4955,6 @@ impl RootView {
         }
         self.preferences_panel
             .update(cx, |panel, cx| panel.request_close(cx));
-    }
-
-    /// 搜索导航和左栏入口共用同一 MCP 面板 Entity，只刷新快照并切换中心面板。
-    ///
-    /// @author kongweiguang
-    fn show_mcp_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(panel) = self.mcp_runtime_panel.as_ref() {
-            panel.update(cx, |panel, cx| panel.refresh(cx));
-            self.set_center_panel(CenterPanel::McpRuntime, window, cx);
-        }
     }
 
     /// 仅在用户明确新建终端时调用创建用例，并在首快照前订阅合并通知。
@@ -4752,6 +4998,7 @@ impl RootView {
             return;
         }
         self.is_creating_session = true;
+        self.pending_terminal_creation_owner = None;
         self.status = Some(
             match &target_request {
                 TerminalTargetRequest::ProfileDefaultLocal => "正在启动本地终端…",
@@ -4812,7 +5059,7 @@ impl RootView {
         ) {
             Ok(reservation) => reservation,
             Err(error) => {
-                self.is_creating_session = false;
+                self.finish_unreserved_terminal_creation();
                 self.status = Some(error);
                 cx.notify();
                 return;
@@ -4832,13 +5079,11 @@ impl RootView {
             .set_pending_size(&pane_id, size)
             .is_err()
         {
-            self.clear_pending_pane_focus();
-            reservation.cancellation.cancel();
             self.cancel_workspace_restore(&pane_id);
             let _ = self.workspace_runtime.remove_empty_pane(&pane_id);
             self.workspace_runtime
                 .remove_tab_layout(&reservation.tab_id);
-            self.is_creating_session = false;
+            self.finish_unreserved_terminal_creation();
             self.status = Some("无法为终端 pane 保留窗口尺寸。".into());
             self.refresh_workspace_views(cx);
             cx.notify();
@@ -4855,6 +5100,11 @@ impl RootView {
         }
 
         if let Some(target) = target {
+            self.set_pending_terminal_creation_owner(
+                reservation.tab_id.clone(),
+                pane_id.clone(),
+                reservation.generation,
+            );
             if let Err(error) = self.open_workspace_terminal_pane(
                 terminal_open::WorkspaceTerminalOpenRequest {
                     tab_id: reservation.tab_id.clone(),
@@ -4868,23 +5118,130 @@ impl RootView {
                 },
                 cx,
             ) {
-                self.clear_pending_pane_focus();
-                reservation.cancellation.cancel();
-                self.cancel_workspace_restore(&pane_id);
-                let _ = self.workspace_runtime.remove_empty_pane(&pane_id);
-                self.workspace_runtime
-                    .remove_tab_layout(&reservation.tab_id);
-                self.is_creating_session = false;
+                if !self.rollback_unpublished_terminal_creation(
+                    &reservation.tab_id,
+                    &pane_id,
+                    reservation.generation,
+                ) {
+                    reservation.cancellation.cancel();
+                    self.finish_pending_terminal_creation(
+                        &reservation.tab_id,
+                        &pane_id,
+                        reservation.generation,
+                    );
+                }
                 self.status = Some(error);
                 self.refresh_workspace_views(cx);
                 cx.notify();
             }
         } else {
             // Profile 默认目标只能由统一 resolver 读取；不会在 UI 中猜测或复制 profile 配置。
-            self.restore_workspace_pane(reservation.tab_id, reservation.pane, cx);
+            self.restore_workspace_pane(reservation.tab_id.clone(), reservation.pane, cx);
+            let generation = self
+                .workspace_restore_generations
+                .get(&pane_id)
+                .copied()
+                .unwrap_or(reservation.generation);
+            self.set_pending_terminal_creation_owner(reservation.tab_id, pane_id, generation);
         }
     }
-    /// 模态及主机弹层阻断底层快捷键，但放行已聚焦搜索框的原生字符，避免 Windows 丢失 WM_CHAR。
+
+    /// 创建失败时仅移除当前代次的未发布 pane，并让迟到回执失去重新绑定该 pane 的机会。
+    /// 对已有 tab、分屏或仍有真实资源的失败只释放精确创建门，不接管其生命周期。
+    ///
+    /// @author kongweiguang
+    fn rollback_unpublished_terminal_creation(
+        &mut self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+        generation: u64,
+    ) -> bool {
+        let has_workspace_resource_operation =
+            self.workspace_resource_operations.contains_key(pane_id);
+        let rolled_back = rollback_unpublished_terminal_creation_state(
+            &mut self.workspace_runtime,
+            self.workspace_controller.as_ref(),
+            has_workspace_resource_operation,
+            &mut self.workspace_restore_generations,
+            &mut self.workspace_restore_cancellations,
+            &mut self.pending_terminal_creation_owner,
+            &mut self.is_creating_session,
+            &mut self.pending_pane_focus_intent,
+            #[cfg(feature = "acceptance-metrics")]
+            &mut self.pending_fresh_terminal_probes,
+            tab_id,
+            pane_id,
+            generation,
+        );
+        if rolled_back {
+            self.container_exec_refresh_targets.remove(pane_id);
+            self.terminal_link_discovery_caches.remove(pane_id);
+        }
+        rolled_back
+    }
+
+    /// 绑定恢复代次后，迟到的旧终端回执不能结束后来创建的 tab。
+    ///
+    /// @author kongweiguang
+    fn set_pending_terminal_creation_owner(
+        &mut self,
+        tab_id: TabId,
+        pane_id: PaneId,
+        generation: u64,
+    ) {
+        self.pending_terminal_creation_owner = Some(PendingTerminalCreationOwner {
+            tab_id,
+            pane_id,
+            generation,
+        });
+    }
+
+    /// 只接受与当前创建请求完整匹配的 ACK，避免清除新请求的忙状态。
+    ///
+    /// @author kongweiguang
+    fn finish_pending_terminal_creation(
+        &mut self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+        generation: u64,
+    ) -> bool {
+        let owns_creation = self
+            .pending_terminal_creation_owner
+            .as_ref()
+            .is_some_and(|owner| owner.matches(tab_id, pane_id, generation));
+        if owns_creation {
+            self.pending_terminal_creation_owner = None;
+            self.is_creating_session = false;
+        }
+        owns_creation
+    }
+
+    /// 仅释放尚未预留 pane 的同步失败；已预留请求必须通过完整 owner 收尾。
+    ///
+    /// @author kongweiguang
+    fn finish_unreserved_terminal_creation(&mut self) {
+        if self.pending_terminal_creation_owner.is_none() {
+            self.is_creating_session = false;
+        }
+    }
+
+    /// pane 取消会使其代次递增；同时收尾该 pane 的创建 owner，防止等待永远保留忙状态。
+    ///
+    /// @author kongweiguang
+    /// 只释放代次仍 current 的创建 owner，避免按 pane 清理旧回执时解除后来请求的忙状态。
+    ///
+    /// @author kongweiguang
+    fn cancel_pending_terminal_creation_for_pane(&mut self, pane_id: &PaneId, generation: u64) {
+        let owner = self
+            .pending_terminal_creation_owner
+            .as_ref()
+            .filter(|owner| owner.pane_id == *pane_id && owner.generation == generation)
+            .cloned();
+        if let Some(owner) = owner {
+            self.finish_pending_terminal_creation(&owner.tab_id, &owner.pane_id, owner.generation);
+        }
+    }
+    /// 模态及主机弹层阻断底层快捷键，但放行已聚焦搜索框的原生字符；工具自定义 Dialog 自己处理关闭与焦点恢复。
     ///
     /// @author kongweiguang
     fn handle_workbench_key_down(
@@ -4893,6 +5250,10 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let tool_rail_customizer_open = self
+            .tool_rail_customizer
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).is_open());
         let root_modal_open = terminal_input_modal_blocked(
             self.preferences_modal_open
                 || self.connections_modal_open
@@ -4900,6 +5261,7 @@ impl RootView {
                 || self.root_confirmation_owner.is_some()
                 || self.snippet_editor_modal_open
                 || self.custom_agent_manager.is_some()
+                || tool_rail_customizer_open
                 || self.split_target_picker.read(cx).is_open()
                 || self
                     .workspace_tabs_view
@@ -4960,6 +5322,11 @@ impl RootView {
             cx.stop_propagation();
             return;
         }
+        if tool_rail_customizer_open {
+            // Kit Dialog owns Escape, focus restoration, and closing; Root only blocks underlying shortcuts.
+            cx.stop_propagation();
+            return;
+        }
         if self.preferences_modal_open || self.connections_modal_open {
             let key = event.keystroke.key.to_ascii_lowercase();
             if key == "escape" {
@@ -5012,7 +5379,11 @@ impl RootView {
                 || self.connection_prompt_modal_open
                 || self.root_confirmation_owner.is_some()
                 || self.snippet_editor_modal_open
-                || self.custom_agent_manager.is_some()
+                || (self.custom_agent_manager.is_some()
+                    || self
+                        .tool_rail_customizer
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.read(cx).is_open()))
                 || self.split_target_picker.read(cx).is_open()
                 || self
                     .workspace_tabs_view
@@ -5762,7 +6133,7 @@ impl Render for RootView {
     /// Workspace 与 Agent 搜索分别挂在自身 Canvas 上；仅真实画布焦点覆盖 Kit Tab 导航。
     /// Agent 面板按活动标签换挂已保活的实体，避免跨标签串用草稿和 CLI 选择。
     /// 其它右栏工具也按标签换挂；停用隐藏运维视图，保留其筛选与选择状态。
-    /// 群发栏占真实 flex 槽，候选与现有 pane 都从剩余高度测量 PTY，避免用显示前的旧网格启动。
+    /// 群发栏与终端共用左右缩进；发送结果只进弹层，候选与现有 pane 从稳定剩余高度测量 PTY。
     /// 容器只由固定右栏挂载；退出准备失败提示保留在工作台，不伪造服务已停止。
     ///
     /// @author kongweiguang
@@ -5807,6 +6178,8 @@ impl Render for RootView {
                     .get(id)
                     .cloned()
                     .map(|render| {
+                        let inset =
+                            preferences::interface_density_metrics(self).terminal_content_inset;
                         let broadcast_bar = self.render_workspace_broadcast_bar(id, window, cx);
                         div()
                             .id("active-terminal-workspace")
@@ -5815,6 +6188,8 @@ impl Render for RootView {
                             .min_h(px(0.))
                             .flex()
                             .flex_col()
+                            .px(px(inset))
+                            .pt(px(if broadcast_bar.is_some() { inset } else { 0. }))
                             .children(broadcast_bar)
                             .child(
                                 div()
@@ -5822,6 +6197,7 @@ impl Render for RootView {
                                     .flex_1()
                                     .min_w(px(0.))
                                     .min_h(px(0.))
+                                    .py(px(inset))
                                     .overflow_hidden()
                                     .child(render),
                             )
@@ -5942,59 +6318,6 @@ impl Render for RootView {
                 "Agent sessions are shown in the right workspace.",
                 theme.muted,
             ),
-            CenterPanel::McpRuntime => self.mcp_runtime_panel.clone().map_or_else(
-                || {
-                    empty_workbench_slot(
-                        "MCP runtime control is unavailable.",
-                        "MCP runtime control is unavailable.",
-                        theme.muted,
-                    )
-                },
-                |panel| {
-                    div()
-                        .id("mcp-runtime-workspace")
-                        .size_full()
-                        .child(panel)
-                        .into_any_element()
-                },
-            ),
-            CenterPanel::Updates => div()
-                .id("updates-workspace")
-                .size_full()
-                .child(self.updates_panel.clone())
-                .into_any_element(),
-        };
-        // 设置中的辅助页保留明确返回入口，不再依赖已移除的“更多”工作区切换器。
-        // 返回只切换视图，原来的终端、分屏和 Agent 目标仍由 Root 持有。
-        let center_content = if matches!(
-            self.center_panel,
-            CenterPanel::McpRuntime | CenterPanel::Updates
-        ) {
-            div()
-                .id("auxiliary-workspace-with-return")
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .w_full()
-                        .flex_shrink_0()
-                        .px_2()
-                        .py_1()
-                        .bg(theme.materials.panel)
-                        .child(
-                            Button::new("auxiliary-workspace-return-terminal")
-                                .compact()
-                                .label(crate::locale::text("返回终端", "Back to terminal"))
-                                .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
-                                    root.set_center_panel(CenterPanel::Terminal, window, cx);
-                                })),
-                        ),
-                )
-                .child(div().flex_1().min_h(px(0.)).child(center_content))
-                .into_any_element()
-        } else {
-            center_content
         };
         let center_key_context = if self.center_panel == CenterPanel::Terminal {
             crate::keybindings::KeybindingContext::Terminal.as_gpui_identifier()

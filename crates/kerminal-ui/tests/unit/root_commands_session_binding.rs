@@ -60,6 +60,7 @@ fn snapshot(
     terminal_panes: Vec<WorkspaceSessionPane>,
 ) -> WorkspaceSessionSnapshot {
     WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
         active_tab_id: Some(active_tab_id),
         focused_pane_id: Some(focused_pane_id),
         selected_machine_id: None,

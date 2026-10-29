@@ -2,13 +2,16 @@
 //!
 //! @author kongweiguang
 
+use chrono::DateTime;
 use gpui_kit::{
-    ClickEvent, Context, InteractiveElement as _, IntoElement, Render, Window,
+    AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement, Render,
+    StatefulInteractiveElement as _, Subscription, Window,
     assets::IconName,
-    component::Side,
+    component::WindowExt as _,
     component::{
-        Disableable,
-        button::{Button, ButtonVariants},
+        Disableable, Theme as KitTheme,
+        button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants},
+        dialog::{DialogDescription, DialogFooter, DialogTitle},
         input::Input,
         menu::{DropdownMenu as _, PopupMenuItem},
         tooltip::Tooltip,
@@ -24,7 +27,7 @@ use kerminal_application::{
     },
 };
 use kerminal_domain::{
-    agents::{AgentProvider, AgentSessionStatus},
+    agents::{AgentProvider, AgentSessionScope, AgentSessionStatus, AgentTargetLiveStatus},
     identity::AgentSessionId,
     sessions::SessionLifecycle,
 };
@@ -32,7 +35,8 @@ use kerminal_domain::{
 use crate::theme::ThemeTokens;
 
 use super::{
-    AgentPanelEvent, AgentRenameTarget, AgentTerminalFeedback, AgentTerminalFeedbackSource,
+    AgentArchiveConfirmationOwner, AgentPanelEvent, AgentPendingSendPreview, AgentRenameTarget,
+    AgentSendHistoryMetadata, AgentSendOutcome, AgentTerminalFeedback, AgentTerminalFeedbackSource,
     AgentsPanel,
 };
 
@@ -47,6 +51,394 @@ struct HistoryFilterOption {
     description_en: &'static str,
     count: usize,
     mode: AgentHistoryMode,
+}
+
+impl AgentsPanel {
+    /// 冻结历史行上下文并复用 Kit 的焦点与关闭语义；应用组合按 main 自绘三段表面，避免估高定位。
+    ///
+    /// @author kongweiguang
+    pub(super) fn open_archive_confirmation(
+        &mut self,
+        mut owner: AgentArchiveConfirmationOwner,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy || self.archive_confirmation_owner.is_some() {
+            return;
+        }
+        self.archive_confirmation_generation =
+            self.archive_confirmation_generation.wrapping_add(1).max(1);
+        owner.generation = self.archive_confirmation_generation;
+        self.archive_confirmation_owner = Some(owner.clone());
+        self.archive_confirmation_error = None;
+        let entity = cx.entity().clone();
+        let runtime_active = self.sessions.iter().any(|view| {
+            view.session.agent_session_id == owner.id
+                && view.session.title == owner.expected_title
+                && has_running_agent_terminal(view)
+        });
+        let runtime_description = if runtime_active {
+            crate::locale::text(
+                "该会话当前仍在 Kerminal 中运行，删除记录后会同时关闭这里的 Agent 终端。",
+                "This chat is still running in Kerminal. Deleting the record also closes its Agent terminal here.",
+            )
+        } else {
+            crate::locale::text(
+                "删除后，这条会话将不再出现在 Kerminal 的历史列表中。",
+                "This chat will no longer appear in Kerminal's history list.",
+            )
+        };
+        let footer_entity =
+            cx.new(|cx| AgentArchiveConfirmationFooter::new(entity.clone(), owner.clone(), cx));
+        let content_entity = cx.new(|cx| {
+            AgentArchiveConfirmationContent::new(
+                entity.clone(),
+                owner.clone(),
+                runtime_description.to_string(),
+                footer_entity.clone(),
+                cx,
+            )
+        });
+        window.open_dialog(cx, move |dialog, window, app| {
+            let theme = entity.update(app, |_, cx| {
+                ThemeTokens::current(window, cx).for_tool_panel()
+            });
+            let confirm_entity = entity.clone();
+            let confirm_owner = owner.clone();
+            let cancel_entity = entity.clone();
+            let cancel_owner = owner.clone();
+            let dialog_content = content_entity.clone();
+            dialog
+                .centered()
+                .p_0()
+                .gap_0()
+                .min_h(px(0.))
+                .close_button(false)
+                .backdrop_blur(theme.modal_blur_radius)
+                .surface_backdrop_filter(theme.floating_blur_radius, theme.floating_saturation)
+                .bg(theme.floating_surface)
+                .border_color(theme.tool_panel_border)
+                .rounded(theme.radius_dialog)
+                .child(dialog_content)
+                .on_ok(move |_, window, app| {
+                    let owner = confirm_owner.clone();
+                    let window_handle = window.window_handle();
+                    confirm_entity.update(app, |panel, cx| {
+                        panel.confirm_archive_confirmation(&owner, window_handle, cx);
+                    });
+                    false
+                })
+                .on_cancel(move |_, _, app| {
+                    cancel_entity.update(app, |panel, cx| {
+                        panel.cancel_archive_confirmation(&cancel_owner, cx)
+                    })
+                })
+        });
+        cx.notify();
+    }
+}
+
+/// 确认弹框观察 panel 的 owner、busy 与错误状态，避免异步失败被 modal 遮挡。
+///
+/// @author kongweiguang
+struct AgentArchiveConfirmationContent {
+    panel: Entity<AgentsPanel>,
+    owner: AgentArchiveConfirmationOwner,
+    runtime_description: String,
+    footer: Entity<AgentArchiveConfirmationFooter>,
+    _panel_subscription: Subscription,
+}
+
+impl AgentArchiveConfirmationContent {
+    /// 订阅唯一 panel 状态源，使失败可重试、提交中按钮禁用并显示加载态。
+    ///
+    /// @author kongweiguang
+    fn new(
+        panel: Entity<AgentsPanel>,
+        owner: AgentArchiveConfirmationOwner,
+        runtime_description: String,
+        footer: Entity<AgentArchiveConfirmationFooter>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let _panel_subscription = cx.observe(&panel, |_, _, cx| cx.notify());
+        Self {
+            panel,
+            owner,
+            runtime_description,
+            footer,
+            _panel_subscription,
+        }
+    }
+}
+
+impl Render for AgentArchiveConfirmationContent {
+    /// main 的自然高度封顶 288px，三段保留固定头尾与正文滚动；错误增长后仍由实测高度居中。
+    ///
+    /// @author kongweiguang
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (busy, _, error) = self
+            .panel
+            .read(cx)
+            .archive_confirmation_feedback(&self.owner);
+        let theme = ThemeTokens::current(window, cx).for_tool_panel();
+        let dark = cx.read_global::<KitTheme, _>(|theme, _| {
+            theme.mode == gpui_kit::component::ThemeMode::Dark
+        });
+        let foreground = gpui_kit::rgb(if dark { 0xfafafa } else { 0x09090b });
+        let description_color = gpui_kit::rgb(if dark { 0xd4d4d8 } else { 0x52525b });
+        let title = self.owner.expected_title.clone();
+        let runtime_description = self.runtime_description.clone();
+        let cancel_parent = self.panel.clone();
+        let cancel_owner = self.owner.clone();
+        // 表面外框另占 2px；正文组合与它共同遵守 main 的 288px/视口减 48px 上限。
+        let max_height = px(286.).min((window.viewport_size().height - px(50.)).max(px(0.)));
+
+        let mut body = div()
+            .id("agent-archive-confirmation-content")
+            .w_full()
+            .min_h(px(0.))
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .px_5()
+            .py_4()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .p_3()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(theme.tool_panel_border)
+                    .bg(theme.muted_surface())
+                    .child(
+                        div()
+                            .size(px(32.))
+                            .flex_none()
+                            .rounded(px(8.))
+                            .bg(theme.tool_panel_surface)
+                            .text_color(theme.muted)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(IconName::MessageSquare),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(theme.text_sm)
+                            .text_color(foreground)
+                            .line_height(px(20.))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(title),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(theme.text_xs)
+                    .line_height(px(20.))
+                    .text_color(description_color)
+                    .child(runtime_description),
+            )
+            .child(
+                div()
+                    .text_size(theme.text_xs)
+                    .line_height(px(20.))
+                    .text_color(theme.muted)
+                    .child(crate::locale::text(
+                        "Codex、Claude 或其他 Agent 服务商自身保存的历史不会被删除。",
+                        "History saved by Codex, Claude, or another Agent provider is not deleted.",
+                    )),
+            );
+        if let Some(error) = error {
+            body = body.child(
+                div()
+                    .id("agent-archive-confirmation-error")
+                    .text_size(theme.text_xs)
+                    .text_color(theme.error)
+                    .child(error),
+            );
+        }
+        div()
+            .id("agent-archive-confirmation-surface")
+            .w_full()
+            .max_h(max_height)
+            .min_h(px(0.))
+            .text_color(foreground)
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .w_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_4()
+                    .px_5()
+                    .py_4()
+                    .border_b_1()
+                    .border_color(theme.tool_panel_border)
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                DialogTitle::new()
+                                    .text_size(px(17.))
+                                    .line_height(px(24.))
+                                    .child(crate::locale::text(
+                                        "删除会话记录？",
+                                        "Delete chat record?",
+                                    )),
+                            )
+                            .child(
+                                DialogDescription::new()
+                                    .text_size(px(13.))
+                                    .line_height(px(20.))
+                                    .text_color(theme.muted)
+                                    .child(crate::locale::text(
+                                        "会从 Kerminal 的对话列表中移除这条记录。",
+                                        "This removes the record from Kerminal's chat list.",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Button::new("agent-archive-close")
+                            .ghost()
+                            .icon(IconName::Close)
+                            .w(px(36.))
+                            .h(px(36.))
+                            .accessibility_label(crate::locale::text("关闭弹窗", "Close dialog"))
+                            .disabled(busy)
+                            .on_click(move |_, window, app| {
+                                cancel_parent.update(app, |panel, cx| {
+                                    if panel.cancel_archive_confirmation(&cancel_owner, cx) {
+                                        window.close_dialog(cx);
+                                    }
+                                });
+                            }),
+                    ),
+            )
+            .child(body)
+            .child(self.footer.clone())
+    }
+}
+
+/// 确认按钮订阅与正文相同的 panel owner，避免弹框忙碌状态下重复归档或取消。
+///
+/// @author kongweiguang
+struct AgentArchiveConfirmationFooter {
+    panel: Entity<AgentsPanel>,
+    owner: AgentArchiveConfirmationOwner,
+    _panel_subscription: Subscription,
+}
+
+impl AgentArchiveConfirmationFooter {
+    /// footer 独立投影禁用和忙碌文案，与正文共享 panel；外框和焦点仍由 Kit Dialog 持有。
+    ///
+    /// @author kongweiguang
+    fn new(
+        panel: Entity<AgentsPanel>,
+        owner: AgentArchiveConfirmationOwner,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let _panel_subscription = cx.observe(&panel, |_, _, cx| cx.notify());
+        Self {
+            panel,
+            owner,
+            _panel_subscription,
+        }
+    }
+}
+
+impl Render for AgentArchiveConfirmationFooter {
+    /// 失败保持原 owner 以供重试；按钮沿用 main 的右对齐、透明危险态及忙碌文案，不引入额外入口。
+    ///
+    /// @author kongweiguang
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (busy, owner_is_current, _) = self
+            .panel
+            .read(cx)
+            .archive_confirmation_feedback(&self.owner);
+        let parent = self.panel.clone();
+        let owner = self.owner.clone();
+        let cancel_parent = parent.clone();
+        let cancel_owner = owner.clone();
+        let theme = ThemeTokens::current(window, cx).for_tool_panel();
+        let dark = cx.read_global::<KitTheme, _>(|theme, _| {
+            theme.mode == gpui_kit::component::ThemeMode::Dark
+        });
+        let cancel_color = gpui_kit::rgb(if dark { 0xd4d4d8 } else { 0x52525b });
+        let danger_color = gpui_kit::rgb(if dark { 0xfca5a5 } else { 0xdc2626 });
+        let danger_hover = gpui_kit::rgb(if dark { 0xfecaca } else { 0xb91c1c });
+        DialogFooter::new()
+            .w_full()
+            .flex_shrink_0()
+            .justify_end()
+            .gap_2()
+            .px_5()
+            .py_4()
+            .border_t_1()
+            .border_color(theme.tool_panel_border)
+            .child(
+                Button::new("agent-archive-cancel")
+                    .ghost()
+                    .h(px(32.))
+                    .px_3()
+                    .text_size(px(16.))
+                    .line_height(px(24.))
+                    .text_color(cancel_color)
+                    .font_weight(gpui_kit::FontWeight::NORMAL)
+                    .label(crate::locale::text("取消", "Cancel"))
+                    .disabled(busy)
+                    .on_click(move |_, window, cx| {
+                        cancel_parent.update(cx, |panel, cx| {
+                            if panel.cancel_archive_confirmation(&cancel_owner, cx) {
+                                window.close_dialog(cx);
+                            }
+                        });
+                    }),
+            )
+            .child(
+                Button::new("agent-archive-confirm")
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .foreground(danger_color.into())
+                            .hover_foreground(danger_hover.into())
+                            .hover(gpui_kit::rgb(0xef4444).opacity(0.1).into())
+                            .active(gpui_kit::rgb(0xef4444).opacity(0.1).into()),
+                    )
+                    .h(px(32.))
+                    .px_3()
+                    .text_size(px(16.))
+                    .line_height(px(24.))
+                    .font_weight(gpui_kit::FontWeight::NORMAL)
+                    .icon(IconName::Trash)
+                    .label(if busy {
+                        crate::locale::text("正在删除", "Deleting")
+                    } else {
+                        crate::locale::text("删除记录", "Delete record")
+                    })
+                    .disabled(busy || !owner_is_current)
+                    .on_click(move |_, window, cx| {
+                        let window_handle = window.window_handle();
+                        parent.update(cx, |panel, cx| {
+                            panel.confirm_archive_confirmation(&owner, window_handle, cx);
+                        });
+                    }),
+            )
+    }
 }
 
 /// 历史 terminal 的退出分类只从 typed 生命周期与回执导出，不解析错误文案。
@@ -80,10 +472,10 @@ enum TerminalStatusTone {
 }
 
 impl Render for AgentsPanel {
-    /// Shell 材质贯穿面板；landing 自己提供会话工具行，只有运行态保留必要的 Agent 页头。
+    /// 根容器复用 main 的 Agent 终端表面，并投影局部工具面板色阶供所有子视图共用。
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ThemeTokens::current(window, cx);
+        let theme = ThemeTokens::current(window, cx).for_tool_panel();
         let terminal_attached = has_selected_agent_terminal_surface(self.selected_view());
 
         let mut panel = div()
@@ -92,7 +484,7 @@ impl Render for AgentsPanel {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(theme.materials.shell)
+            .bg(theme.agent_surface())
             .text_color(theme.foreground);
         if terminal_attached {
             panel = panel.child(self.render_header(theme, terminal_attached, cx));
@@ -118,6 +510,9 @@ impl Render for AgentsPanel {
 
         if self.context_preview.is_some() {
             panel = panel.child(self.render_context_preview(theme, cx));
+        }
+        if self.pending_send.is_some() || !self.send_history.is_empty() {
+            panel = panel.child(self.render_pending_send(theme, cx));
         }
         if let Some(feedback) = self.visible_terminal_feedback() {
             panel = panel.child(render_terminal_feedback(theme, feedback.message.clone()));
@@ -276,7 +671,8 @@ impl AgentsPanel {
         cx.notify();
     }
 
-    /// 入口与历史共享有界居中列；landing 不重复绘制运行态页头，刷新归到“对话”标题行。
+    /// 外层滚动区负责 12px 留白，列前 8px 外边距在双 flex spacer 中将内容整体下移 4px，对齐 main。
+    /// 列本身只限宽不二次缩进，保持 main 的 320px 内容宽度。
     /// @author kongweiguang
     fn render_landing_content(
         &self,
@@ -289,6 +685,8 @@ impl AgentsPanel {
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
+            .px_3()
+            .py_3()
             .child(
                 div()
                     .id("agents-landing-scroll-content")
@@ -304,7 +702,8 @@ impl AgentsPanel {
                             .w_full()
                             .max_w(px(320.))
                             .flex_shrink_0()
-                            .px_3()
+                            .mt(px(8.))
+                            .py_2()
                             .flex()
                             .flex_col()
                             .gap_3()
@@ -315,7 +714,7 @@ impl AgentsPanel {
             )
     }
 
-    /// 只有已有会话需要运行态页头和快速切换器；无终端时入口与刷新由正文统一承载。
+    /// 页头沿用 main 的实色内容表面；只有已有会话显示，无终端时入口与刷新由正文承载。
     /// 会话标题与终端状态分行，避免窄右栏压缩到两者都不可读。
     ///
     /// @author kongweiguang
@@ -345,7 +744,7 @@ impl AgentsPanel {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .bg(theme.materials.chrome)
+            .bg(theme.panel)
             .border_b_1()
             .border_color(theme.border)
             .child(
@@ -807,91 +1206,24 @@ impl AgentsPanel {
         cx.notify();
     }
 
-    /// 320px 栏内保留清楚的启动顺序；标题与目标详情分别提供可发现入口，标题编辑仍可用。
+    /// 选择器与主启动动作相接并保留 main 的 58px 命中宽；compact Button 的字号由显式子文本覆盖。
+    /// 空目录仍通过选择菜单进入自定义定义管理。
+    ///
     /// @author kongweiguang
     fn render_launcher(&self, theme: ThemeTokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let launcher_catalog_empty = self
-            .launcher_catalog
-            .as_ref()
-            .is_some_and(|catalog| catalog.options.is_empty());
         div()
             .id("agents-launcher")
             .w_full()
             .flex()
             .flex_col()
             .gap_1()
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .text_size(theme.text_body)
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .text_color(theme.foreground)
-                    .child(crate::locale::text("新建对话", "New chat"))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                Button::new("agents-launcher-details")
-                                    .compact()
-                                    .ghost()
-                                    .icon(IconName::Info)
-                                    .accessibility_label(crate::locale::text(
-                                        "启动器与目标详情",
-                                        "Launcher and target details",
-                                    ))
-                                    .tooltip(self.launcher_technical_detail()),
-                            )
-                            .child(
-                                Button::new("agents-title-editor-toggle")
-                                    .compact()
-                                    .ghost()
-                                    .icon(if self.title_editor_visible {
-                                        IconName::X
-                                    } else {
-                                        IconName::Pencil
-                                    })
-                                    .accessibility_label(crate::locale::text(
-                                        if self.title_editor_visible {
-                                            "隐藏标题"
-                                        } else {
-                                            "设置标题"
-                                        },
-                                        if self.title_editor_visible {
-                                            "Hide title"
-                                        } else {
-                                            "Set title"
-                                        },
-                                    ))
-                                    .tooltip(crate::locale::text(
-                                        if self.title_editor_visible {
-                                            "隐藏标题"
-                                        } else {
-                                            "设置标题"
-                                        },
-                                        if self.title_editor_visible {
-                                            "Hide title"
-                                        } else {
-                                            "Set title"
-                                        },
-                                    ))
-                                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                        panel.toggle_title_editor(cx)
-                                    })),
-                            ),
-                    ),
-            )
             .child(self.render_new_chat_target(theme))
             .child(
                 div()
                     .w_full()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .px(px(2.))
                     .child(
                         div()
                             .flex_1()
@@ -902,41 +1234,23 @@ impl AgentsPanel {
                         Button::new("agents-launcher-start")
                             .compact()
                             .flex_none()
+                            .min_w(px(58.))
                             .h(px(44.))
-                            .text_size(theme.text_body)
                             .primary()
-                            .icon(IconName::ArrowRight)
-                            .label(crate::locale::text("进入", "Open"))
+                            .accessibility_label("进入")
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .line_height(px(24.))
+                                    .font_weight(gpui_kit::FontWeight::NORMAL)
+                                    .child("进入"),
+                            )
                             .disabled(!self.can_create_with_selected_launcher())
                             .on_click(
                                 cx.listener(|panel, _: &ClickEvent, _, cx| panel.create_agent(cx)),
                             ),
                     ),
             )
-            .when(self.title_editor_visible, |element| {
-                element.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(theme.text_xs)
-                                .text_color(theme.subtle)
-                                .child(crate::locale::text(
-                                    "对话标题（可选）",
-                                    "Chat title (optional)",
-                                )),
-                        )
-                        .child(
-                            Input::new(&self.title)
-                                .w_full()
-                                .h(px(32.))
-                                .text_size(theme.text_sm),
-                        ),
-                )
-            })
             .when_some(self.launcher_load_error.as_ref(), |element, error| {
                 let retry_enabled =
                     !self.busy && !self.launcher_selection_busy && !self.launcher_catalog_loading;
@@ -979,32 +1293,6 @@ impl AgentsPanel {
                                     cx,
                                 )),
                         ),
-                )
-            })
-            .when(launcher_catalog_empty, |element| {
-                element.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_1()
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(theme.text_xs)
-                                .text_color(theme.warning)
-                                .child(crate::locale::text(
-                                    "没有可用的 Agent 启动器。",
-                                    "No Agent launchers are available.",
-                                )),
-                        )
-                        .child(self.render_launcher_settings_button(
-                            "agents-launcher-empty-settings",
-                            "设置",
-                            "Settings",
-                            cx,
-                        )),
                 )
             })
             .when_some(self.launcher_selection_error.as_ref(), |element, error| {
@@ -1064,8 +1352,8 @@ impl AgentsPanel {
             }))
     }
 
-    /// 选择器沿用目录身份；标准菜单项提供 UIA 名称，简短来源标签控制常见选项的菜单宽度。
-    ///
+    /// 沿用目录顺序与安装快照；外层裁切补足 Kit Button 不公开的单侧圆角，同时保留其焦点与键盘行为。
+    /// 菜单继续由 Kit 管理状态，空目录仍能打开“添加自定义 Agent”。
     /// @author kongweiguang
     fn render_launcher_selector(
         &self,
@@ -1080,25 +1368,39 @@ impl AgentsPanel {
                 catalog
                     .options
                     .iter()
-                    .map(|option| (option.key.clone(), option.label.clone(), option.provider))
+                    .map(|option| {
+                        (
+                            option.key.clone(),
+                            option.label.clone(),
+                            option.provider,
+                            catalog.installation_for(option.provider),
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         let selected_provider = selected_key.as_ref().and_then(|key| {
             options
                 .iter()
-                .find(|(option_key, _, _)| option_key == key)
-                .map(|(_, _, provider)| *provider)
+                .find(|(option_key, _, _, _)| option_key == key)
+                .map(|(_, _, provider, _)| *provider)
+        });
+        let selected_installation = selected_key.as_ref().and_then(|key| {
+            options
+                .iter()
+                .find(|(option_key, _, _, _)| option_key == key)
+                .and_then(|(_, _, _, installation)| *installation)
         });
         let selected_icon = selected_provider.map_or(IconName::Bot, launcher_icon);
-        let selected_descriptor = selected_provider.map(launcher_status_descriptor);
+        let selected_descriptor = selected_provider
+            .map(|provider| launcher_status_descriptor(provider, selected_installation));
         let label = selected_key
             .as_ref()
             .and_then(|key| {
                 options
                     .iter()
-                    .find(|(option_key, _, _)| option_key == key)
-                    .map(|(_, label, _)| label.clone())
+                    .find(|(option_key, _, _, _)| option_key == key)
+                    .map(|(_, label, _, _)| label.clone())
             })
             .unwrap_or_else(|| {
                 if self.launcher_catalog_loading {
@@ -1125,15 +1427,19 @@ impl AgentsPanel {
         );
         let entity = cx.entity().clone();
         let disabled = self.busy || self.launcher_selection_busy || self.launcher_catalog_loading;
+        let accent = cx.read_global::<KitTheme, _>(|theme, _| theme.colors.primary);
 
-        Button::new("agents-launcher-selector")
+        let picker = Button::new("agents-launcher-selector")
             .compact()
             .secondary()
             .outline()
+            .rounded(ButtonRounded::None)
+            .px_3()
             .w_full()
             .min_w(px(0.))
             .h(px(44.))
             .dropdown_caret(true)
+            .debug_selector(|| "rr-agent-picker".into())
             .accessibility_label(accessibility_label)
             .tooltip(label.clone())
             .child(
@@ -1146,8 +1452,10 @@ impl AgentsPanel {
                     .child(
                         div()
                             .size(px(28.))
-                            .rounded_md()
-                            .bg(theme.secondary)
+                            .rounded_lg()
+                            .bg(theme.panel)
+                            .text_color(accent)
+                            .shadow_sm()
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1163,7 +1471,9 @@ impl AgentsPanel {
                             .gap_0()
                             .child(
                                 div()
-                                    .text_size(theme.text_sm)
+                                    .text_size(px(13.))
+                                    .line_height(px(16.))
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                     .text_color(theme.foreground)
                                     .whitespace_nowrap()
                                     .text_ellipsis()
@@ -1175,120 +1485,211 @@ impl AgentsPanel {
                                         .flex()
                                         .items_center()
                                         .gap_1()
-                                        .text_size(theme.text_xs)
-                                        .text_color(theme.muted)
-                                        .child(launcher_configured_dot(theme))
+                                        .text_size(px(10.))
+                                        .line_height(px(14.))
+                                        .text_color(theme.subtle)
+                                        .child(launcher_installation_dot(
+                                            theme,
+                                            selected_installation,
+                                        ))
                                         .child(detail),
                                 )
                             }),
                     ),
             )
-            .disabled(disabled || options.is_empty())
-            .dropdown_menu(move |mut menu, _, _| {
-                menu = menu.check_side(Side::Right);
-                for (key, label, provider) in &options {
+            .disabled(disabled)
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = crate::ui_popup::agent_launcher_menu(menu, theme);
+                for (key, label, provider, installation) in &options {
                     let selected = selected_key.as_ref() == Some(key);
                     let key = key.clone();
                     let label = label.clone();
                     let provider = *provider;
+                    let installation = *installation;
                     let entity = entity.clone();
-                    let detail = launcher_menu_descriptor(provider);
+                    let detail = launcher_menu_descriptor(provider, installation);
                     let icon = launcher_icon(provider);
+                    let option_id = format!("agents-launcher-option-{}", key.as_str());
+                    let option_accessibility_label = format!("{} · {}", label, detail);
                     menu = menu.item(
-                        PopupMenuItem::new(format!("{label} · {detail}"))
-                            .icon(icon)
-                            .checked(selected)
-                            .on_click(move |_, _, app| {
-                                let key = key.clone();
-                                entity.update(app, |panel, cx| panel.select_launcher(key, cx));
-                            }),
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .id(option_id.clone())
+                                .aria_label(option_accessibility_label.clone())
+                                .flex_1()
+                                .min_w(px(0.))
+                                .min_h(px(32.))
+                                .py_2()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .size(px(32.))
+                                        .flex_none()
+                                        .rounded_md()
+                                        .bg(theme.panel)
+                                        .text_color(accent)
+                                        .shadow_sm()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(icon),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_0()
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .text_size(px(13.))
+                                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                                .text_color(theme.foreground)
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .child(label.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .text_size(px(10.))
+                                                .line_height(px(14.))
+                                                .text_color(theme.subtle)
+                                                .child(launcher_installation_dot(
+                                                    theme,
+                                                    installation,
+                                                ))
+                                                .child(detail.clone()),
+                                        ),
+                                )
+                        })
+                        .checked(selected)
+                        .on_click(move |_, _, app| {
+                            let key = key.clone();
+                            entity.update(app, |panel, cx| panel.select_launcher(key, cx));
+                        }),
                     );
                 }
                 let manage_entity = entity.clone();
+                menu = menu.item(PopupMenuItem::separator());
                 menu.item(
-                    PopupMenuItem::new(crate::locale::text(
-                        "管理自定义 Agent…",
-                        "Manage custom Agents…",
-                    ))
-                    .on_click(move |_, _, app| {
-                        manage_entity.update(app, |_panel, cx| {
-                            cx.emit(AgentPanelEvent::OpenCustomAgentManager);
-                        });
-                    }),
+                    PopupMenuItem::new(crate::locale::text("添加自定义 Agent", "Add custom Agent"))
+                        .icon(IconName::Plus)
+                        .on_click(move |_, _, app| {
+                            manage_entity.update(app, |_panel, cx| {
+                                cx.emit(AgentPanelEvent::OpenCustomAgentManager);
+                            });
+                        }),
                 )
             })
-    }
+            .available_height(px(152.), px(320.))
+            .offset(px(6.))
+            .trigger_width(px(240.), px(360.));
 
-    /// 主摘要复用当前真实目标名；技术引用只放在可访问的 Info 提示里，避免常驻显示内部 ID。
-    /// @author kongweiguang
-    fn render_new_chat_target(&self, theme: ThemeTokens) -> impl IntoElement {
-        let label = self.candidate.as_ref().map_or_else(
-            || crate::locale::text("当前目标 · 未绑定终端", "Current target · Unbound").to_string(),
-            |candidate| {
-                crate::locale::text(
-                    format!("当前目标 · {}", candidate.label),
-                    format!("Current target · {}", candidate.label),
-                )
-                .to_string()
-            },
-        );
         div()
             .w_full()
-            .flex()
-            .items_center()
-            .gap_1()
-            .text_size(theme.text_xs)
-            .text_color(theme.muted)
-            .child(IconName::Link2)
-            .child(label)
+            .rounded_tl(px(10.))
+            .rounded_bl(px(10.))
+            .overflow_hidden()
+            .child(picker)
     }
 
-    /// 技术详情按需显示当前启动器的真实默认命令与目标类型；目录未提供的自定义命令不臆测。
+    /// 目标与 Info 保持 main 的 muted 辅助层级，避免目标说明抢过 Agent 启动入口。
+    ///
+    /// @author kongweiguang
+    fn render_new_chat_target(&self, theme: ThemeTokens) -> impl IntoElement {
+        let summary = self.target_summary.as_deref().or_else(|| {
+            self.candidate
+                .as_ref()
+                .map(|candidate| candidate.label.as_str())
+        });
+        let target_label = summary
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::locale::text("未绑定终端", "Unbound").to_string());
+        div()
+            .w_full()
+            .px_1()
+            .mb_1()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .overflow_hidden()
+                    .text_size(px(11.))
+                    .text_color(theme.muted)
+                    .child(crate::locale::text("当前目标 ·", "Current target · "))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .font_weight(gpui_kit::FontWeight::NORMAL)
+                            .text_color(theme.muted)
+                            .child(target_label),
+                    ),
+            )
+            .child(
+                Button::new("agents-launcher-details")
+                    .compact()
+                    .ghost()
+                    .text_color(theme.muted)
+                    .flex_none()
+                    .w(px(24.))
+                    .h(px(24.))
+                    .icon(IconName::Info)
+                    .accessibility_label(crate::locale::text(
+                        "启动器与目标详情",
+                        "Launcher and target details",
+                    ))
+                    .tooltip(self.launcher_technical_detail()),
+            )
+    }
+
+    /// Info 只显示原始自定义命令或内置启动参数，避免把目标身份混入启动命令提示。
     /// @author kongweiguang
     fn launcher_technical_detail(&self) -> String {
-        let launcher = self
-            .launcher_catalog
+        self.launcher_catalog
             .as_ref()
             .and_then(|catalog| {
-                self.launcher_key
-                    .as_ref()
-                    .and_then(|key| catalog.options.iter().find(|option| &option.key == key))
+                self.launcher_key.as_ref().and_then(|key| {
+                    catalog
+                        .custom_command_for_display(key)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            catalog
+                                .options
+                                .iter()
+                                .find(|option| &option.key == key)
+                                .map(|option| launcher_command_detail(option.provider))
+                        })
+                })
             })
-            .map(|option| {
-                format!(
-                    "{} · {}",
-                    option.label,
-                    launcher_command_detail(option.provider)
+            .map(|command| {
+                crate::locale::text(
+                    format!("启动命令：{command}"),
+                    format!("Command: {command}"),
                 )
+                .to_string()
             })
             .unwrap_or_else(|| {
                 crate::locale::text("未选择启动器", "No launcher selected").to_string()
-            });
-        let target = self.candidate.as_ref().map_or_else(
-            || crate::locale::text("未绑定终端", "Unbound").to_string(),
-            |candidate| {
-                let target_kind = candidate
-                    .binding
-                    .target_kind
-                    .as_deref()
-                    .map(target_kind_label)
-                    .unwrap_or_else(|| crate::locale::text("未知类型", "Unknown type").to_string());
-                let target_ref = candidate
-                    .binding
-                    .target_ref
-                    .as_deref()
-                    .map(|reference| {
-                        format!(" · {} {reference}", crate::locale::text("目标引用", "ref"))
-                    })
-                    .unwrap_or_default();
-                format!("{} · {target_kind}{target_ref}", candidate.label)
-            },
-        );
-        crate::locale::text(
-            format!("启动器：{launcher}\n目标：{target}"),
-            format!("Launcher: {launcher}\nTarget: {target}"),
-        )
-        .to_string()
+            })
     }
 
     /// 只有目录中的当前 key 才能启动，避免保存失败或配置外部变更后回退到另一 Agent。
@@ -1297,6 +1698,8 @@ impl AgentsPanel {
         !self.busy
             && !self.launcher_selection_busy
             && !self.launcher_catalog_loading
+            && !self.loading
+            && self.sessions_verified
             && self.launcher_catalog.as_ref().is_some_and(|catalog| {
                 self.launcher_key
                     .as_ref()
@@ -1304,7 +1707,7 @@ impl AgentsPanel {
             })
     }
 
-    /// 两段主筛选保留准确计数与完整 AX 描述，归档由标题行的低强调入口承载。
+    /// 两段筛选匹配 main 的 190px 等宽组；背景覆盖完整按钮，避免 Kit 内边距缩短选中面。
     /// @author kongweiguang
     fn render_history_filter(
         &self,
@@ -1327,7 +1730,8 @@ impl AgentsPanel {
         } else {
             theme.muted
         };
-        let label = crate::locale::text(label_zh, label_en).to_string();
+        let label =
+            history_filter_display_text(crate::locale::text(label_zh, label_en).as_ref(), count);
         let description = crate::locale::text(description_zh, description_en).to_string();
         let accessibility_label = format!("{description} · {count}");
 
@@ -1336,33 +1740,29 @@ impl AgentsPanel {
             .ghost()
             .flex_1()
             .min_w(px(0.))
-            .h(px(30.))
+            .h(px(28.))
+            .p_0()
             .accessibility_label(accessibility_label)
             .child(
                 div()
                     .w_full()
                     .h_full()
                     .min_w(px(0.))
-                    .px_1()
-                    .rounded_sm()
+                    .rounded_md()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .gap_1()
-                    .when(selected, |element| element.bg(theme.hover))
+                    .justify_center()
+                    .px_2()
+                    .when(selected, |element| element.bg(theme.panel).shadow_sm())
                     .child(
                         div()
                             .min_w(px(0.))
-                            .text_size(theme.text_xs)
+                            .whitespace_nowrap()
+                            .text_size(px(16.))
+                            .line_height(px(24.))
+                            .font_weight(gpui_kit::FontWeight::NORMAL)
                             .text_color(foreground)
                             .child(label),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(theme.text_xs)
-                            .text_color(foreground)
-                            .child(count.to_string()),
                     ),
             )
             .on_click(
@@ -1370,7 +1770,8 @@ impl AgentsPanel {
             )
     }
 
-    /// Landing 中把刷新、归档收进对话标题行，主筛选只保留“当前/全部”两段。
+    /// 历史区沿用 main 的标题、190px 双段筛选和整宽记录卡；组内 2px 留白形成 32px 总高。
+    /// 刷新只在读取失败时出现，归档仍逐条确认。
     /// @author kongweiguang
     fn render_session_history(
         &self,
@@ -1380,441 +1781,390 @@ impl AgentsPanel {
         let mut history = div()
             .id("agents-session-history")
             .w_full()
-            .px_2()
             .pt_1()
             .pb_2()
             .flex()
             .flex_col()
             .gap_1();
-        let title = if self.history_mode == AgentHistoryMode::Archived {
-            crate::locale::text("已归档", "Archived")
-        } else {
-            crate::locale::text("对话", "Chats")
-        };
         let refresh_disabled = self.loading
             || self.busy
             || self.launcher_catalog_loading
             || self.launcher_selection_busy;
-        let archive_selected = self.history_mode == AgentHistoryMode::Archived;
-        let archive_accessibility_label = if archive_selected {
-            crate::locale::text("返回当前目标对话", "Back to current target chats")
-        } else {
-            crate::locale::text(
-                format!("查看归档对话 · {}", self.archived_count),
-                format!("Show archived chats · {}", self.archived_count),
-            )
-        };
-        let archive_button = if archive_selected {
-            Button::new("agents-history-archive")
-                .compact()
-                .secondary()
-                .icon(IconName::Archive)
-        } else {
-            Button::new("agents-history-archive")
-                .compact()
-                .ghost()
-                .icon(IconName::Archive)
-        };
         history = history.child(
             div()
                 .id("agents-history-heading")
                 .w_full()
-                .h(px(32.))
-                .px_1()
+                .mb_1()
                 .flex()
                 .items_center()
                 .justify_between()
+                .gap_2()
                 .child(
                     div()
+                        .flex_1()
+                        .h(px(16.))
                         .flex()
                         .items_center()
-                        .gap_1()
-                        .text_size(theme.text_sm)
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_size(theme.text_xs)
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .text_color(theme.foreground)
-                        .child(title)
-                        .child(
-                            div()
-                                .text_size(theme.text_xs)
-                                .font_weight(gpui_kit::FontWeight::NORMAL)
-                                .text_color(theme.muted)
-                                .child(self.visible_session_ids.len().to_string()),
-                        ),
+                        .child(crate::locale::text("对话", "Chats")),
                 )
                 .child(
                     div()
+                        .id("agents-history-filter")
                         .flex()
                         .items_center()
-                        .gap_1()
-                        .child(
-                            Button::new("agents-refresh")
-                                .compact()
-                                .ghost()
-                                .icon(IconName::RefreshCw)
-                                .accessibility_label(crate::locale::text(
-                                    "刷新会话",
-                                    "Refresh chats",
-                                ))
-                                .tooltip(crate::locale::text("刷新会话", "Refresh chats"))
-                                .disabled(refresh_disabled)
-                                .on_click(
-                                    cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                        panel.reload_all(cx)
-                                    }),
-                                ),
-                        )
-                        .child(
-                            archive_button
-                                .accessibility_label(archive_accessibility_label.clone())
-                                .tooltip(crate::locale::text(
-                                    if archive_selected {
-                                        "返回当前目标对话"
-                                    } else {
-                                        "归档对话"
-                                    },
-                                    if archive_selected {
-                                        "Back to current target chats"
-                                    } else {
-                                        "Archived chats"
-                                    },
-                                ))
-                                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                    let mode = if panel.history_mode == AgentHistoryMode::Archived {
-                                        AgentHistoryMode::CurrentTarget
-                                    } else {
-                                        AgentHistoryMode::Archived
-                                    };
-                                    panel.set_history_mode(mode, cx);
-                                })),
-                        ),
+                        .w(px(190.))
+                        .p(px(2.))
+                        .rounded_lg()
+                        .bg(theme.secondary)
+                        .child(self.render_history_filter(
+                            HistoryFilterOption {
+                                id: "agents-history-current",
+                                label_zh: "当前目标",
+                                label_en: "Current target",
+                                description_zh: "当前目标会话",
+                                description_en: "Chats for the current target",
+                                count: self.current_target_count,
+                                mode: AgentHistoryMode::CurrentTarget,
+                            },
+                            theme,
+                            cx,
+                        ))
+                        .child(self.render_history_filter(
+                            HistoryFilterOption {
+                                id: "agents-history-all",
+                                label_zh: "全部",
+                                label_en: "All",
+                                description_zh: "全部未归档会话",
+                                description_en: "All non-archived chats",
+                                count: self.all_count,
+                                mode: AgentHistoryMode::All,
+                            },
+                            theme,
+                            cx,
+                        )),
                 ),
         );
-
-        let mut filters = div()
-            .id("agents-history-filter")
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_1()
-            .p_1()
-            .rounded_md()
-            .bg(theme.secondary)
-            .border_1()
-            .border_color(theme.border);
-        for (id, label_zh, label_en, description_zh, description_en, count, mode) in [
-            (
-                "agents-history-current",
-                "当前",
-                "Current",
-                "当前目标会话",
-                "Sessions for the current target",
-                self.current_target_count,
-                AgentHistoryMode::CurrentTarget,
-            ),
-            (
-                "agents-history-all",
-                "全部",
-                "All",
-                "全部未归档会话",
-                "All non-archived sessions",
-                self.all_count,
-                AgentHistoryMode::All,
-            ),
-        ] {
-            filters = filters.child(self.render_history_filter(
-                HistoryFilterOption {
-                    id,
-                    label_zh,
-                    label_en,
-                    description_zh,
-                    description_en,
-                    count,
-                    mode,
-                },
-                theme,
-                cx,
-            ));
+        if self.loading || !self.sessions_verified {
+            let refreshing = self.loading;
+            history =
+                history.child(
+                    div()
+                        .p_2()
+                        .rounded_md()
+                        .bg(theme.secondary)
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.warning)
+                        .child(if refreshing {
+                            crate::locale::text(
+                                "正在刷新，暂时保留已确认记录。",
+                                "Refreshing; confirmed records remain visible.",
+                            )
+                        } else {
+                            crate::locale::text(
+                                "列表读取失败，显示的是上次已确认结果。",
+                                "The refresh failed; these are the last confirmed sessions.",
+                            )
+                        })
+                        .when(!refreshing, |element| {
+                            element.child(
+                                Button::new("agents-refresh")
+                                    .compact()
+                                    .ghost()
+                                    .label(crate::locale::text("重试", "Retry"))
+                                    .disabled(refresh_disabled)
+                                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                        panel.reload_all(cx)
+                                    })),
+                            )
+                        }),
+                );
         }
-        history = history.child(filters);
         if self.visible_session_ids.is_empty() {
             return history.child(self.render_empty_state(theme));
         }
-        if self.loading || !self.sessions_verified {
-            history = history.child(
-                div()
-                    .p_2()
-                    .rounded_md()
-                    .bg(theme.secondary)
-                    .text_size(theme.text_xs)
-                    .text_color(theme.warning)
-                    .child(if self.loading {
-                        crate::locale::text(
-                            "正在刷新，暂时保留已确认记录。",
-                            "Refreshing; confirmed records remain visible.",
-                        )
-                    } else {
-                        crate::locale::text(
-                            "列表读取失败，显示的是上次已确认结果。",
-                            "The refresh failed; these are the last confirmed sessions.",
-                        )
-                    }),
-            );
-        }
+        let mut rows = div()
+            .id("agents-session-list")
+            .w_full()
+            .max_h(px(320.))
+            .overflow_y_scroll()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.panel);
         for view in &self.sessions {
             if self
                 .visible_session_ids
                 .contains(&view.session.agent_session_id)
             {
-                history = history.child(self.render_session_row(
+                rows = rows.child(self.render_session_row(
                     view,
                     self.selected_agent.as_ref() == Some(&view.session.agent_session_id),
                     self.sessions_verified && !self.loading,
+                    theme,
                     cx,
                 ));
             }
         }
-        history
+        history.child(rows)
     }
 
-    /// 每行绑定自己的 AgentSessionId；待核对时保留核对入口并禁用会冲突的归档写入。
+    /// 主按钮覆盖卡片信息区以继续原会话；改名和删除仍绑定稳定 ID，避免操作落到后来选中的记录。
+    /// 单行改名通过 Styled 指定高度；Input 自带的 h 仅控制多行编辑器。
+    ///
     /// @author kongweiguang
     fn render_session_row(
         &self,
         view: &AgentSessionView,
         active: bool,
         selectable: bool,
+        theme: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let id = view.session.agent_session_id.clone();
         let title = view.session.title.clone();
-        let label = format!("{} · {}", compact_title(&title), lifecycle_label(view));
         let can_rename = view.resume_recovery.is_none();
+        let can_archive = agent_can_archive(view);
+        let running = has_running_agent_terminal(view);
+        let mode = self.history_mode;
+        let scope = self.scope.clone();
+        let candidate = self.candidate.as_ref().map(|value| value.binding.clone());
+        let is_current_target = session_matches_current_target(view, &scope, candidate.as_ref());
+        let metadata = format!(
+            "{} · {} · {}",
+            session_provider_label(view.session.agent_id),
+            session_scope_label(view, is_current_target),
+            format_session_time(view),
+        );
+        let status_color = if view.resume_recovery.is_some() {
+            theme.warning
+        } else if running {
+            theme.accent
+        } else if view
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.lifecycle == SessionLifecycle::Failed)
+        {
+            theme.error
+        } else {
+            theme.muted
+        };
+
         if self
             .rename_target
             .as_ref()
             .is_some_and(|(rename_id, _)| rename_id == &id)
         {
+            let rename_title_valid =
+                super::can_save_agent_session_title(self.rename_title.read(cx).value().as_ref());
             return div()
                 .id(format!("agent-session-rename-{}", id.as_str()))
                 .w_full()
+                .p_3()
+                .border_b_1()
+                .border_color(theme.border)
                 .flex()
-                .items_center()
-                .gap_1()
+                .items_start()
+                .gap_2()
+                .child(session_icon(theme))
                 .child(
-                    Input::new(&self.rename_title)
+                    div()
                         .flex_1()
                         .min_w(px(0.))
-                        .h(px(30.)),
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    gpui_kit::Styled::h(
+                                        Input::new(&self.rename_title).flex_1().min_w(px(0.)),
+                                        px(28.),
+                                    )
+                                    .disabled(self.busy || !selectable || !can_rename),
+                                )
+                                .child(
+                                    Button::new(format!("agent-session-save-{}", id.as_str()))
+                                        .compact()
+                                        .ghost()
+                                        .icon(IconName::Check)
+                                        .accessibility_label(crate::locale::text(
+                                            "保存标题",
+                                            "Save title",
+                                        ))
+                                        .tooltip(crate::locale::text("保存标题", "Save title"))
+                                        .disabled(
+                                            self.busy
+                                                || !selectable
+                                                || !can_rename
+                                                || !rename_title_valid,
+                                        )
+                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                            panel.save_agent_title(cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new(format!("agent-session-cancel-{}", id.as_str()))
+                                        .compact()
+                                        .ghost()
+                                        .icon(IconName::X)
+                                        .accessibility_label(crate::locale::text(
+                                            "取消改名",
+                                            "Cancel rename",
+                                        ))
+                                        .tooltip(crate::locale::text("取消改名", "Cancel rename"))
+                                        .disabled(self.busy)
+                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                            panel.cancel_agent_rename(cx)
+                                        })),
+                                ),
+                        )
+                        .child(session_metadata(&metadata, theme)),
                 )
-                .child(
-                    Button::new(format!("agent-session-save-{}", id.as_str()))
-                        .compact()
-                        .primary()
-                        .label(crate::locale::text("保存", "Save"))
-                        .disabled(self.busy || !selectable || !can_rename)
-                        .on_click(
-                            cx.listener(|panel, _: &ClickEvent, _, cx| panel.save_agent_title(cx)),
-                        ),
-                )
-                .child(
-                    Button::new(format!("agent-session-cancel-{}", id.as_str()))
-                        .compact()
-                        .ghost()
-                        .icon(IconName::X)
-                        .accessibility_label(crate::locale::text("取消改名", "Cancel rename"))
-                        .disabled(self.busy)
-                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.cancel_agent_rename(cx)
-                        })),
-                );
+                .child(session_status_badge(view, running, status_color, theme));
         }
 
-        let mode = self.history_mode;
-        let scope = self.scope.clone();
-        let candidate = self.candidate.as_ref().map(|value| value.binding.clone());
-        let is_archived = view.session.status == AgentSessionStatus::Archived;
-        let can_archive = agent_can_archive(view);
-        let can_reconcile = agent_can_reconcile(view);
-        let can_create_from_history = view.resume_recovery.is_none();
-        let can_resume = agent_can_resume(view);
-        let entity = cx.entity().clone();
-        let select_id = id.clone();
-        let primary = Button::new(format!("agent-session-{}", id.as_str()))
+        let continue_id = id.clone();
+        let continue_title = title.clone();
+        let continue_scope = scope.clone();
+        let continue_candidate = candidate.clone();
+        let primary = Button::new(format!("agent-session-continue-{}", id.as_str()))
             .compact()
             .ghost()
             .flex_1()
             .min_w(px(0.))
-            .label(label)
-            .disabled(!selectable)
-            .when(active, Button::primary)
+            .accessibility_label(crate::locale::text(
+                format!("继续对话 {title}"),
+                format!("Continue chat {title}"),
+            ))
+            .tooltip(crate::locale::text("继续这段对话", "Continue this chat"))
+            .disabled(!selectable || self.busy)
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(session_icon(theme))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .text_size(theme.text_xs)
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(title.clone()),
+                            )
+                            .child(session_metadata(&metadata, theme)),
+                    )
+                    .child(session_status_badge(view, running, status_color, theme)),
+            )
             .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                panel.select_agent(select_id.clone(), cx)
+                panel.continue_agent_from_history(
+                    continue_id.clone(),
+                    continue_title.clone(),
+                    mode,
+                    continue_scope.clone(),
+                    continue_candidate.clone(),
+                    cx,
+                );
             }));
 
-        let menu_entity = entity.clone();
-        let action_id = id.clone();
-        let action_title = title.clone();
-        let action_scope = scope.clone();
-        let action_candidate = candidate.clone();
-        let action_menu = Button::new(format!("agent-session-actions-{}", id.as_str()))
+        let rename_id = id.clone();
+        let rename_title = title.clone();
+        let rename_scope = scope.clone();
+        let rename_candidate = candidate.clone();
+        let rename = Button::new(format!("agent-session-rename-{}", id.as_str()))
             .compact()
             .ghost()
-            .icon(IconName::Ellipsis)
+            .icon(IconName::Pencil)
             .accessibility_label(crate::locale::text(
-                format!("{} 的会话操作", title),
-                format!("Actions for {}", title),
+                format!("重命名 {title}"),
+                format!("Rename {title}"),
             ))
-            .disabled(!selectable || self.busy)
-            .dropdown_menu(move |mut menu, _, _| {
-                let resume_entity = menu_entity.clone();
-                let resume_id = action_id.clone();
-                let resume_title = action_title.clone();
-                let resume_scope = action_scope.clone();
-                let resume_candidate = action_candidate.clone();
-                let reconcile_entity = menu_entity.clone();
-                let reconcile_id = action_id.clone();
-                let reconcile_title = action_title.clone();
-                let reconcile_scope = action_scope.clone();
-                let reconcile_candidate = action_candidate.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(crate::locale::text("核对恢复", "Reconcile recovery"))
-                        .disabled(!can_reconcile)
-                        .on_click(move |_, _, app| {
-                            reconcile_entity.update(app, |panel, cx| {
-                                if panel.ensure_history_action(
-                                    &reconcile_id,
-                                    &reconcile_title,
-                                    mode,
-                                    &reconcile_scope,
-                                    reconcile_candidate.as_ref(),
-                                    cx,
-                                ) {
-                                    panel.reconcile_agent(reconcile_id.clone(), cx);
-                                }
-                            });
-                        }),
+            .tooltip(crate::locale::text("重命名", "Rename"))
+            .disabled(self.busy || !selectable || !can_rename)
+            .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                panel.begin_rename_agent(
+                    AgentRenameTarget {
+                        id: rename_id.clone(),
+                        expected_title: rename_title.clone(),
+                    },
+                    mode,
+                    rename_scope.clone(),
+                    rename_candidate.clone(),
+                    window,
+                    cx,
                 );
-                if can_resume {
-                    menu = menu.item(
-                        PopupMenuItem::new(crate::locale::text("继续会话", "Continue chat"))
-                            .icon(IconName::Play)
-                            .on_click(move |_, _, app| {
-                                resume_entity.update(app, |panel, cx| {
-                                    if panel.ensure_history_action(
-                                        &resume_id,
-                                        &resume_title,
-                                        mode,
-                                        &resume_scope,
-                                        resume_candidate.as_ref(),
-                                        cx,
-                                    ) {
-                                        panel.resume_agent(resume_id.clone(), cx);
-                                    }
-                                });
-                            }),
-                    );
-                }
+            }));
 
-                let new_entity = menu_entity.clone();
-                let new_id = action_id.clone();
-                let new_title = action_title.clone();
-                let new_scope = action_scope.clone();
-                let new_candidate = action_candidate.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(crate::locale::text(
-                        "使用此启动配置新建",
-                        "New chat from these launch settings",
-                    ))
-                    .icon(IconName::Plus)
-                    .disabled(!can_create_from_history)
-                    .on_click(move |_, _, app| {
-                        new_entity.update(app, |panel, cx| {
-                            panel.create_from_history(
-                                new_id.clone(),
-                                new_title.clone(),
-                                mode,
-                                new_scope.clone(),
-                                new_candidate.clone(),
-                                cx,
-                            );
-                        });
-                    }),
-                );
-
-                let rename_entity = menu_entity.clone();
-                let rename_id = action_id.clone();
-                let rename_title = action_title.clone();
-                let rename_scope = action_scope.clone();
-                let rename_candidate = action_candidate.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(crate::locale::text("重命名", "Rename"))
-                        .icon(IconName::Pencil)
-                        .disabled(!can_rename)
-                        .on_click(move |_, window, app| {
-                            rename_entity.update(app, |panel, cx| {
-                                panel.begin_rename_agent(
-                                    AgentRenameTarget {
-                                        id: rename_id.clone(),
-                                        expected_title: rename_title.clone(),
-                                    },
-                                    mode,
-                                    rename_scope.clone(),
-                                    rename_candidate.clone(),
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }),
-                );
-
-                if !is_archived {
-                    let archive_entity = menu_entity.clone();
-                    let archive_id = action_id.clone();
-                    let archive_title = action_title.clone();
-                    let archive_scope = action_scope.clone();
-                    let archive_candidate = action_candidate.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(crate::locale::text("归档", "Archive"))
-                            .icon(IconName::Archive)
-                            .disabled(!can_archive)
-                            .on_click(move |_, _, app| {
-                                archive_entity.update(app, |panel, cx| {
-                                    if panel.ensure_history_action(
-                                        &archive_id,
-                                        &archive_title,
-                                        mode,
-                                        &archive_scope,
-                                        archive_candidate.as_ref(),
-                                        cx,
-                                    ) {
-                                        panel.archive_agent(archive_id.clone(), cx);
-                                    }
-                                });
-                            }),
-                    );
-                }
-                if can_reconcile {
-                    menu = menu.item(PopupMenuItem::label(crate::locale::text(
-                        "待核对记录不能归档；先核对恢复。",
-                        "Unresolved recovery cannot be archived; reconcile it first.",
-                    )));
-                }
-                menu
-            });
+        let confirmation_owner = AgentArchiveConfirmationOwner {
+            id: id.clone(),
+            expected_title: title.clone(),
+            mode,
+            scope: scope.clone(),
+            candidate: candidate.clone(),
+            generation: 0,
+        };
+        let delete = Button::new(format!("agent-session-delete-{}", id.as_str()))
+            .compact()
+            .ghost()
+            .icon(IconName::Trash)
+            .accessibility_label(crate::locale::text(
+                format!("删除 {title}"),
+                format!("Delete {title}"),
+            ))
+            .tooltip(crate::locale::text("删除记录", "Delete chat record"))
+            .disabled(self.busy || !selectable || !can_archive)
+            .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                panel.open_archive_confirmation(confirmation_owner.clone(), window, cx);
+            }));
 
         div()
             .id(format!("agent-history-row-{}", id.as_str()))
             .w_full()
+            .p_3()
+            .border_b_1()
+            .border_color(theme.border)
             .flex()
-            .items_center()
-            .gap_1()
+            .items_start()
+            .gap_2()
+            .when(active, |element| element.bg(theme.hover))
             .child(primary)
-            .child(action_menu)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(rename)
+                    .child(delete),
+            )
     }
 
-    /// 空态收进有边界的居中卡片，错误仍保留刷新恢复提示，降低列表区域的视觉噪声。
+    /// 正常空列表使用 main 的描边圆角卡片和 28px 垂直留白；加载与读取失败保留恢复说明。
     /// @author kongweiguang
     fn render_empty_state(&self, theme: ThemeTokens) -> impl IntoElement {
+        let show_recovery_detail = self.loading || !self.sessions_verified;
         let (title, body) = if self.loading {
             (
                 crate::locale::text("正在读取会话", "Loading chats"),
@@ -1831,17 +2181,9 @@ impl AgentsPanel {
                     "Refresh to retry; the last known state is preserved.",
                 ),
             )
-        } else if self.history_mode == AgentHistoryMode::Archived {
-            (
-                crate::locale::text("暂无归档会话", "No archived chats"),
-                crate::locale::text(
-                    "归档的会话会保留在这里。",
-                    "Archived chats remain available here.",
-                ),
-            )
         } else if self.history_mode == AgentHistoryMode::CurrentTarget {
             (
-                crate::locale::text("当前目标暂无会话", "No chats for this target"),
+                crate::locale::text("当前目标暂无对话", "No chats for this target"),
                 crate::locale::text(
                     "可切换到全部历史查看其他会话。",
                     "Switch to All to view other chats.",
@@ -1849,42 +2191,59 @@ impl AgentsPanel {
             )
         } else {
             (
-                crate::locale::text("暂无历史会话", "No chat history"),
+                crate::locale::text("暂无 Agent 对话", "No chat history"),
                 crate::locale::text("新建后的会话会显示在这里。", "New chats will appear here."),
             )
         };
-        div()
-            .id("agents-empty-state")
-            .w_full()
-            .min_h(px(96.))
-            .p_3()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary)
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .child(
-                div()
-                    .text_size(theme.text_xs)
-                    .text_color(if self.loading || !self.sessions_verified {
-                        theme.warning
-                    } else {
-                        theme.muted
-                    })
-                    .child(title),
-            )
-            .child(
+        let mut empty_state = div().id("agents-empty-state").w_full();
+        if show_recovery_detail {
+            empty_state = empty_state
+                .min_h(px(96.))
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary)
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_1();
+        } else {
+            empty_state = empty_state
+                .px_3()
+                .py(px(28.))
+                .text_center()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.panel);
+        }
+        empty_state = empty_state.child(
+            div()
+                .h(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(theme.text_xs)
+                .text_color(if show_recovery_detail {
+                    theme.warning
+                } else {
+                    theme.muted
+                })
+                .child(title),
+        );
+        if show_recovery_detail {
+            empty_state = empty_state.child(
                 div()
                     .max_w(px(260.))
                     .text_size(theme.text_xs)
                     .text_color(theme.muted)
                     .text_center()
                     .child(body),
-            )
+            );
+        }
+        empty_state
     }
 
     /// 预览只展示 application 返回的受限文本并限制可视高度；固定区不随 Launcher 视口收缩。
@@ -1944,6 +2303,438 @@ impl AgentsPanel {
                     .child(content),
             )
     }
+
+    /// 显示 Root 提供的短期发送预览与无正文历史；确认事件只携带 opaque IDs。
+    ///
+    /// @author kongweiguang
+    fn render_pending_send(
+        &mut self,
+        theme: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let pending = self.pending_send.clone();
+        let preview = self.pending_send_preview.clone();
+        let history = self.send_history.clone();
+        let selected_agent = self.selected_agent.clone();
+        let mut content = div()
+            .id("agents-pending-send")
+            .w_full()
+            .max_h(px(300.))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.materials.chrome);
+
+        if let Some(pending) = pending {
+            let preview = preview.filter(|preview| preview.request_id == pending.request_id);
+            content = content.child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(IconName::Send)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(theme.text_sm)
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child(crate::locale::text("发送到 Agent", "Send to Agent")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme.text_xs)
+                                    .text_color(theme.muted)
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(pending.source_label.clone()),
+                            ),
+                    ),
+            );
+            if let Some(preview) = preview {
+                let expired = pending_send_preview_expired(&preview);
+                let target_matches = selected_agent.as_ref() == Some(&preview.agent_session_id);
+                let confirm_request_id = preview.request_id.clone();
+                let confirm_preview_id = preview.preview_id.clone();
+                let confirm_agent_id = preview.agent_session_id.clone();
+                let cancel_request_id = pending.request_id;
+                let mut preview_body = div()
+                    .id("agents-pending-send-body")
+                    .min_h(px(0.))
+                    .max_h(px(136.))
+                    .mx_3()
+                    .mt_2()
+                    .overflow_y_scroll()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.materials.shell)
+                    .p_2()
+                    .text_size(theme.text_xs)
+                    .text_color(theme.foreground)
+                    .child(gpui_kit::text!(
+                        id = "agents-pending-send-body-text",
+                        preview.text.clone()
+                    ));
+                if preview.redacted || preview.truncated || expired || !target_matches {
+                    let warning = if expired {
+                        crate::locale::text(
+                            "发送预览已过期，请重新选择内容。",
+                            "The send preview expired. Select the content again.",
+                        )
+                    } else if !target_matches {
+                        crate::locale::text(
+                            "预览关联的 Agent 已变化，请选择对应会话。",
+                            "The preview belongs to another Agent session. Select that session to continue.",
+                        )
+                    } else if preview.truncated {
+                        crate::locale::text("预览内容已截断。", "The preview is truncated.")
+                    } else {
+                        crate::locale::text(
+                            "预览内容包含脱敏数据。",
+                            "The preview contains redacted data.",
+                        )
+                    };
+                    preview_body = preview_body.text_color(theme.warning);
+                    content = content.child(
+                        div()
+                            .mx_3()
+                            .mt_2()
+                            .text_size(theme.text_xs)
+                            .text_color(theme.warning)
+                            .child(warning),
+                    );
+                }
+                let preview_details = crate::locale::text(
+                    format!(
+                        "{} · {} B · 截止 {}",
+                        pending_source_short_label(&pending.source_label),
+                        preview.byte_length,
+                        send_preview_expiry_label(&preview.expires_at)
+                    ),
+                    format!(
+                        "{} · {} B · Expires {}",
+                        pending_source_short_label(&pending.source_label),
+                        preview.byte_length,
+                        send_preview_expiry_label(&preview.expires_at)
+                    ),
+                );
+                content = content.child(preview_body).child(
+                    div()
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("agents-pending-send-cancel")
+                                .compact()
+                                .ghost()
+                                .icon(IconName::X)
+                                .label(crate::locale::text("取消", "Cancel"))
+                                .disabled(self.busy)
+                                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
+                                    panel.pending_send = None;
+                                    panel.pending_send_preview = None;
+                                    cx.emit(AgentPanelEvent::PendingSendCancelled {
+                                        request_id: cancel_request_id.clone(),
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("agents-pending-send-confirm")
+                                .compact()
+                                .primary()
+                                .icon(IconName::ArrowRight)
+                                .label(crate::locale::text("确认发送", "Send"))
+                                .disabled(self.busy || expired || !target_matches)
+                                .tooltip(preview_details)
+                                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
+                                    if panel.pending_send_preview.as_ref().is_none_or(|current| {
+                                        current.request_id != confirm_request_id
+                                            || current.preview_id != confirm_preview_id
+                                            || pending_send_preview_expired(current)
+                                    }) || panel.selected_agent.as_ref()
+                                        != Some(&confirm_agent_id)
+                                    {
+                                        return;
+                                    }
+                                    panel.pending_send_preview = None;
+                                    cx.emit(AgentPanelEvent::PendingSendConfirmed {
+                                        agent_session_id: confirm_agent_id.clone(),
+                                        request_id: confirm_request_id.clone(),
+                                        preview_id: confirm_preview_id.clone(),
+                                    });
+                                })),
+                        ),
+                );
+            } else {
+                content = content.child(
+                    div()
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(crate::locale::text(
+                            "选择一个 Agent 会话后生成安全预览。",
+                            "Select an Agent session to create a safe preview.",
+                        )),
+                );
+            }
+        }
+
+        if !history.is_empty() {
+            content = content.child(render_send_history(&history, theme));
+        }
+        content
+    }
+}
+
+/// 过期预览按失效处理；Root service 仍是发送前最终校验的权威来源。
+///
+/// @author kongweiguang
+fn pending_send_preview_expired(preview: &AgentPendingSendPreview) -> bool {
+    DateTime::parse_from_rfc3339(&preview.expires_at).map_or(true, |expires| {
+        expires.timestamp_millis() <= chrono::Utc::now().timestamp_millis()
+    })
+}
+
+/// Root supplies a sanitized source label; keep the displayed label bounded in the narrow rail.
+///
+/// @author kongweiguang
+fn pending_source_short_label(label: &str) -> String {
+    const MAX_CHARS: usize = 42;
+    let mut chars = label.chars();
+    let value = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{value}…")
+    } else {
+        value
+    }
+}
+
+/// 将历史 metadata 渲染为不含正文的可扫读列表。
+///
+/// @author kongweiguang
+fn render_send_history(
+    history: &[AgentSendHistoryMetadata],
+    theme: ThemeTokens,
+) -> impl IntoElement {
+    let mut list = div()
+        .id("agents-send-history")
+        .w_full()
+        .max_h(px(104.))
+        .overflow_y_scroll()
+        .border_t_1()
+        .border_color(theme.border);
+    for item in history.iter().take(8) {
+        let (outcome, color) = match item.outcome {
+            AgentSendOutcome::Sent => (crate::locale::text("已发送", "Sent"), theme.accent),
+            AgentSendOutcome::Queued => (crate::locale::text("已排队", "Queued"), theme.accent),
+            AgentSendOutcome::Cancelled => {
+                (crate::locale::text("已取消", "Cancelled"), theme.muted)
+            }
+            AgentSendOutcome::Expired => (crate::locale::text("已过期", "Expired"), theme.warning),
+            AgentSendOutcome::Failed => (crate::locale::text("失败", "Failed"), theme.error),
+        };
+        list = list.child(
+            div()
+                .id(format!("agents-send-history-{}", item.request_id))
+                .w_full()
+                .px_3()
+                .py_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(theme.text_xs)
+                                .text_color(theme.foreground)
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(pending_source_short_label(&item.source_label)),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme.text_xs)
+                                .text_color(theme.muted)
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(format!("{} · {} B", item.created_at, item.byte_length)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(theme.text_xs)
+                        .text_color(color)
+                        .child(outcome),
+                ),
+        );
+    }
+    list
+}
+
+/// 把 ISO 时间显示为本地时钟时间；格式无效时保留来源字符串以便故障核对。
+///
+/// @author kongweiguang
+fn send_preview_expiry_label(value: &str) -> String {
+    DateTime::parse_from_rfc3339(value)
+        .map(|expires| {
+            expires
+                .with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|_| value.to_owned())
+}
+
+/// Session 图标使用固定尺寸，保证标题长短和窄栏宽度不会推动卡片结构变化。
+///
+/// @author kongweiguang
+fn session_icon(theme: ThemeTokens) -> impl IntoElement {
+    div()
+        .size(px(28.))
+        .flex_none()
+        .rounded_md()
+        .bg(theme.secondary)
+        .text_color(theme.muted)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(IconName::MessageSquare)
+}
+
+/// 元数据按 main 的 10px/14px 辅助层级换行，窄栏仍保留时间与目录信息。
+///
+/// @author kongweiguang
+fn session_metadata(metadata: &str, theme: ThemeTokens) -> impl IntoElement {
+    div()
+        .w_full()
+        .text_size(px(10.))
+        .line_height(px(14.))
+        .text_color(theme.subtle)
+        .child(metadata.to_owned())
+}
+
+/// 状态用文字和边界共同表达，运行态用强调色，恢复待核对状态用警示色。
+///
+/// @author kongweiguang
+fn session_status_badge(
+    view: &AgentSessionView,
+    running: bool,
+    status_color: gpui_kit::Hsla,
+    theme: ThemeTokens,
+) -> impl IntoElement {
+    div()
+        .flex_none()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(if running { theme.accent } else { theme.border })
+        .text_size(theme.text_xs)
+        .text_color(status_color)
+        .child(lifecycle_label(view))
+}
+
+/// 卡片归属标签与当前筛选共享同一 scope 语义；旧记录才回退到显式目标绑定。
+///
+/// @author kongweiguang
+fn session_matches_current_target(
+    view: &AgentSessionView,
+    current_scope: &AgentSessionScope,
+    current_candidate: Option<&kerminal_domain::agents::AgentTargetBinding>,
+) -> bool {
+    if let Some(session_scope) = view.session.scope.as_ref() {
+        return session_scope == current_scope;
+    }
+    match view.session.target.as_ref() {
+        Some(target) if target.live_status == AgentTargetLiveStatus::Unbound => {
+            matches!(current_scope, AgentSessionScope::Global)
+        }
+        Some(target) => {
+            current_candidate.is_some_and(|candidate| candidate.points_to_same_session(target))
+        }
+        None => matches!(current_scope, AgentSessionScope::Global),
+    }
+}
+
+/// 当前目标记录简称为“当前目标”，其它历史按 main 的 global/tab 权限范围显示。
+///
+/// @author kongweiguang
+fn session_scope_label(view: &AgentSessionView, is_current_target: bool) -> String {
+    if is_current_target {
+        return crate::locale::text("当前目标", "Current target").to_string();
+    }
+    let scope = view.session.scope.as_ref();
+    match scope {
+        Some(AgentSessionScope::Tab { .. }) => {
+            crate::locale::text("当前 Tab", "Current tab").to_string()
+        }
+        Some(AgentSessionScope::Global) => {
+            crate::locale::text("整个 Kerminal", "Entire Kerminal").to_string()
+        }
+        None if view
+            .session
+            .target
+            .as_ref()
+            .is_some_and(|target| target.tab_id.is_some()) =>
+        {
+            crate::locale::text("当前 Tab", "Current tab").to_string()
+        }
+        None => crate::locale::text("整个 Kerminal", "Entire Kerminal").to_string(),
+    }
+}
+
+/// Provider 标签与 main 历史卡片的词汇保持一致，不把自定义启动命令内容展开到列表。
+///
+/// @author kongweiguang
+fn session_provider_label(provider: AgentProvider) -> String {
+    let (zh, en) = match provider {
+        AgentProvider::Codex => ("Codex", "Codex"),
+        AgentProvider::Claude => ("Claude", "Claude"),
+        AgentProvider::Pi => ("PI Agent", "PI Agent"),
+        AgentProvider::Custom => ("Custom", "Custom"),
+    };
+    crate::locale::text(zh, en).to_string()
+}
+
+/// 使用最近业务更新时间并回退创建时间；无效记录显示未知，避免格式化失败影响整张历史卡片。
+///
+/// @author kongweiguang
+fn format_session_time(view: &AgentSessionView) -> String {
+    let value = if view.session.updated_at.trim().is_empty() {
+        view.session.created_at.as_str()
+    } else {
+        view.session.updated_at.as_str()
+    };
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.format("%-m/%-d %H:%M").to_string())
+        .unwrap_or_else(|_| crate::locale::text("时间未知", "Time unknown").to_string())
 }
 
 /// 将图标身份与安全的短命令提示统一映射，菜单和当前选择不会出现相互矛盾的说明。
@@ -1957,9 +2748,12 @@ fn launcher_icon(provider: AgentProvider) -> IconName {
     }
 }
 
-/// 明示内置来源或已保存状态，不将目录成员误写成 CLI 可运行；自定义命令内容留在管理器。
+/// 优先呈现本次目录探测结果；未探测或 Custom 时继续显示来源状态，不推断命令可运行。
 /// @author kongweiguang
-fn launcher_status_descriptor(provider: AgentProvider) -> String {
+fn launcher_status_descriptor(provider: AgentProvider, installation: Option<bool>) -> String {
+    if let Some(descriptor) = launcher_installation_descriptor(provider, installation) {
+        return descriptor;
+    }
     let descriptor = match provider {
         AgentProvider::Codex => {
             crate::locale::text("内置启动器 · codex", "Built-in launcher · codex")
@@ -1978,10 +2772,13 @@ fn launcher_status_descriptor(provider: AgentProvider) -> String {
     descriptor.to_string()
 }
 
-/// 菜单把短来源说明与完整名称合并，保留可访问名称并减少来源文案的横向占用。
+/// 菜单使用同一份安装快照；未知和 Custom 保持中性来源文案，避免目录成员被误读成可运行。
 ///
 /// @author kongweiguang
-fn launcher_menu_descriptor(provider: AgentProvider) -> String {
+fn launcher_menu_descriptor(provider: AgentProvider, installation: Option<bool>) -> String {
+    if let Some(descriptor) = launcher_installation_descriptor(provider, installation) {
+        return descriptor;
+    }
     match provider {
         AgentProvider::Codex => crate::locale::text("内置 · codex", "Built-in · codex"),
         AgentProvider::Claude => crate::locale::text("内置 · claude", "Built-in · claude"),
@@ -1991,6 +2788,28 @@ fn launcher_menu_descriptor(provider: AgentProvider) -> String {
         }
     }
     .to_string()
+}
+
+/// 只有 builtin 的明确探测结果才生成安装状态，Custom 与未接入探测的调用返回 None。
+///
+/// @author kongweiguang
+fn launcher_installation_descriptor(
+    provider: AgentProvider,
+    installation: Option<bool>,
+) -> Option<String> {
+    let command = match provider {
+        AgentProvider::Codex => "codex",
+        AgentProvider::Claude => "claude",
+        AgentProvider::Pi => "pi --approve",
+        AgentProvider::Custom => return None,
+    };
+    let installed = installation?;
+    let (zh, en) = if installed {
+        ("可用", "Available")
+    } else {
+        ("需安装", "Needs installation")
+    };
+    Some(crate::locale::text(format!("{zh} · {command}"), format!("{en} · {command}")).to_string())
 }
 
 /// 技术提示里的默认命令与应用层首次启动 argv 保持一致；可运行状态仍不由静态目录推断。
@@ -2011,23 +2830,23 @@ fn launcher_command_detail(provider: AgentProvider) -> String {
     }
 }
 
-/// 使用中性点配合“内置/已保存”文字，避免绿色状态暗示已探测 CLI 可运行。
+/// 仅对明确探测结果使用语义色；无探测时以中性点保留原有外观。
+///
 /// @author kongweiguang
-fn launcher_configured_dot(theme: ThemeTokens) -> impl IntoElement {
-    div().size(px(6.)).rounded_full().bg(theme.muted)
+fn launcher_installation_dot(theme: ThemeTokens, installation: Option<bool>) -> impl IntoElement {
+    let color = match installation {
+        Some(true) => theme.success,
+        Some(false) => theme.warning,
+        None => theme.muted,
+    };
+    div().size(px(6.)).rounded_full().bg(color)
 }
 
-/// 把绑定类型转换成界面术语；未知的新类型保留原值，避免掩盖新增目标。
+/// 计数与标签留在同一不换行文本中，避免窄 flex 段压掉零值。
+///
 /// @author kongweiguang
-fn target_kind_label(kind: &str) -> String {
-    match kind {
-        "local" => crate::locale::text("本机", "Local").to_string(),
-        "ssh" => "SSH".to_owned(),
-        "telnet" => "Telnet".to_owned(),
-        "serial" => crate::locale::text("串口", "Serial").to_string(),
-        "container" => crate::locale::text("容器", "Container").to_string(),
-        other => other.to_owned(),
-    }
+fn history_filter_display_text(label: &str, count: usize) -> String {
+    format!("{label} {count}")
 }
 
 /// 只在有业务回执时展开有限高度；长错误允许换行并提供完整提示，不能藏掉核对后再试的指引。
@@ -2322,7 +3141,7 @@ fn should_render_continue(view: Option<&AgentSessionView>) -> bool {
 
 /// 只把实际处于 Running 的 CLI 当作活动终端，Exited 的历史句柄不能占据运行布局。
 /// @author kongweiguang
-fn has_running_agent_terminal(view: &AgentSessionView) -> bool {
+pub(super) fn has_running_agent_terminal(view: &AgentSessionView) -> bool {
     view.session.status == AgentSessionStatus::Active
         && view.resume_recovery.is_none()
         && view
@@ -2411,3 +3230,11 @@ fn session_picker_label(view: &AgentSessionView, status_is_separate: bool) -> St
 #[cfg(test)]
 #[path = "../../../tests/unit/agent_recovery_projection.rs"]
 mod recovery_projection_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/agent_pending_send.rs"]
+mod pending_send_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/agent_landing_visual.rs"]
+mod agent_landing_visual_tests;

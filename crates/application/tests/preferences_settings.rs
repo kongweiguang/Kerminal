@@ -56,11 +56,11 @@ fn validation_report_records_typed_error_and_warning_fields() {
     assert_eq!(report.diagnostics, vec![error, warning]);
 }
 
-/// Files 与 Containers 固定使用右栏，但读取旧设置不得改写存量停靠值。
+/// 所有工具遵循 main 的独立停靠设置；读取旧配置保留原值，未配置的工具仍默认贴靠右栏。
 ///
 /// @author kongweiguang
 #[test]
-fn effective_tool_rail_placement_keeps_legacy_fixed_tool_values() {
+fn effective_tool_rail_placement_preserves_each_tools_stored_choice() {
     let mut settings = ToolRailSettings::default();
     settings
         .panel_placements
@@ -75,11 +75,11 @@ fn effective_tool_rail_placement_keeps_legacy_fixed_tool_values() {
 
     assert_eq!(
         settings.effective_panel_placement(ToolRailToolId::Sftp),
-        ToolRailPanelPlacement::Attached
+        ToolRailPanelPlacement::Center
     );
     assert_eq!(
         settings.effective_panel_placement(ToolRailToolId::Containers),
-        ToolRailPanelPlacement::Attached
+        ToolRailPanelPlacement::Left
     );
     assert_eq!(
         settings.effective_panel_placement(ToolRailToolId::Logs),
@@ -100,23 +100,26 @@ fn effective_tool_rail_placement_keeps_legacy_fixed_tool_values() {
     );
 }
 
-/// 默认入口将容器放在文件之后；旧布局校验会补齐缺项并保留原有顺序。
+/// 默认顺序与底部 Logs 分区共同决定主区容器末尾的显示位置；旧布局补齐仍保留原顺序。
 ///
 /// @author kongweiguang
 #[test]
-fn containers_default_order_and_legacy_completion_are_stable() -> AppResult<()> {
+fn tool_rail_default_order_and_legacy_completion_are_stable() -> AppResult<()> {
     let default = ToolRailSettings::default();
-    let files_position = default
-        .order
-        .iter()
-        .position(|tool| *tool == ToolRailToolId::Sftp)
-        .expect("Files tool exists by default");
-    let containers_position = default
-        .order
-        .iter()
-        .position(|tool| *tool == ToolRailToolId::Containers)
-        .expect("Containers tool exists by default");
-    assert_eq!(containers_position, files_position + 1);
+    assert_eq!(
+        default.order,
+        vec![
+            ToolRailToolId::AgentLauncher,
+            ToolRailToolId::Sftp,
+            ToolRailToolId::Snippets,
+            ToolRailToolId::Tmux,
+            ToolRailToolId::Ports,
+            ToolRailToolId::System,
+            ToolRailToolId::Logs,
+            ToolRailToolId::Containers,
+        ]
+    );
+    assert_eq!(default.bottom, vec![ToolRailToolId::Logs]);
     assert_eq!(
         serde_json::to_string(&ToolRailToolId::Containers).expect("container tool serializes"),
         "\"containers\""

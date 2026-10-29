@@ -16,13 +16,18 @@ mod acceptance_metrics;
 mod bootstrap;
 mod composition;
 mod config_root;
+mod configuration_validation;
 mod external_activation;
 #[cfg(target_os = "linux")]
 mod fonts;
 mod host_coordinator;
 mod logging;
 mod platform_lifecycle;
+#[cfg(feature = "right-rail-acceptance")]
+mod right_rail_acceptance;
 mod runtime;
+#[cfg(feature = "right-rail-acceptance")]
+mod settings_acceptance;
 
 use std::{
     error::Error,
@@ -95,6 +100,50 @@ struct MacApplicationQuit;
 ///
 /// @author kongweiguang
 fn main() {
+    // 离线校验必须早于配置迁移和桌面初始化；脚本只能读取显式指定的根目录。
+    if let Some(exit_code) = configuration_validation::run_from_args(std::env::args_os().skip(1)) {
+        std::process::exit(exit_code);
+    }
+    #[cfg(feature = "right-rail-acceptance")]
+    let settings_acceptance_requested = settings_acceptance::requested();
+    #[cfg(not(feature = "right-rail-acceptance"))]
+    let settings_acceptance_requested = std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--settings-acceptance");
+    if settings_acceptance_requested {
+        #[cfg(feature = "right-rail-acceptance")]
+        {
+            if let Err(error) = settings_acceptance::run() {
+                eprintln!("设置验收运行失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "right-rail-acceptance"))]
+        {
+            eprintln!("设置验收入口未编译；请使用 --features right-rail-acceptance 构建。");
+            std::process::exit(2);
+        }
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--right-rail-acceptance")
+    {
+        #[cfg(feature = "right-rail-acceptance")]
+        {
+            if let Err(error) = right_rail_acceptance::run() {
+                // 脚本验收不可弹原生 MessageBox，否则隐藏窗口失败会阻塞并打断用户的前台工作。
+                eprintln!("右栏验收运行失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "right-rail-acceptance"))]
+        {
+            eprintln!("右栏验收入口未编译；请使用 --features right-rail-acceptance 构建。",);
+            std::process::exit(2);
+        }
+    }
     let config_root = match config_root::ConfigRoot::resolve() {
         Ok(config_root) => config_root,
         Err(error) => {

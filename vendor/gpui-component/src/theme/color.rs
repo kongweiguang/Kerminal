@@ -1,3 +1,4 @@
+// @author kongweiguang
 use std::{collections::HashMap, fmt::Display};
 
 use gpui::{
@@ -282,31 +283,35 @@ impl Colorize for Hsla {
         rgb.into()
     }
 
+    /// Round normalized channels to their nearest byte: HSL round trips can land just below
+    /// an integer, and truncation would silently change the color on every edit/save cycle.
     fn to_hex(&self) -> String {
         let rgb = self.to_rgb();
 
         if rgb.a < 1. {
             return format!(
                 "#{:02X}{:02X}{:02X}{:02X}",
-                ((rgb.r * 255.) as u32),
-                ((rgb.g * 255.) as u32),
-                ((rgb.b * 255.) as u32),
-                ((self.a * 255.) as u32)
+                (rgb.r.clamp(0., 1.) * 255.).round() as u8,
+                (rgb.g.clamp(0., 1.) * 255.).round() as u8,
+                (rgb.b.clamp(0., 1.) * 255.).round() as u8,
+                (self.a.clamp(0., 1.) * 255.).round() as u8
             );
         }
 
         format!(
             "#{:02X}{:02X}{:02X}",
-            ((rgb.r * 255.) as u32),
-            ((rgb.g * 255.) as u32),
-            ((rgb.b * 255.) as u32)
+            (rgb.r.clamp(0., 1.) * 255.).round() as u8,
+            (rgb.g.clamp(0., 1.) * 255.).round() as u8,
+            (rgb.b.clamp(0., 1.) * 255.).round() as u8
         )
     }
 
+    /// Validate ASCII before slicing byte pairs; incomplete or IME input must return an
+    /// error rather than panic at a UTF-8 boundary in the live color text field.
     fn parse_hex(hex: &str) -> Result<Self> {
-        let hex = hex.trim_start_matches('#');
+        let hex = hex.strip_prefix('#').unwrap_or(hex);
         let len = hex.len();
-        if len != 6 && len != 8 {
+        if (len != 6 && len != 8) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(anyhow::anyhow!("invalid hex color"));
         }
 

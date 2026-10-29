@@ -3,6 +3,8 @@
 //! @author kongweiguang
 
 use gpui_kit::{ClipboardItem, Context, IntoElement, Window};
+#[cfg(feature = "right-rail-acceptance")]
+use kerminal_application::sessions::UiSessionBinding;
 use kerminal_application::{
     AppError, PublicErrorCode,
     commands::{
@@ -17,6 +19,7 @@ use kerminal_domain::commands::{
 };
 use kerminal_domain::preferences::ConfigRevision;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroize;
 
 use super::{
     CommandsSection, CommandsView, SnippetEditorVisibilityChanged, command_error_context,
@@ -24,6 +27,13 @@ use super::{
 };
 
 const SNIPPET_PAGE_SIZE: usize = 100;
+
+/// 敏感命令只允许预览或填入终端，不进入系统剪贴板；按钮和处理函数共用此门禁。
+///
+/// @author kongweiguang
+pub(super) fn snippet_preview_copy_is_allowed(sensitive: bool) -> bool {
+    !sensitive
+}
 
 /// 只接管目录局部的 `/` 与 Ctrl/Cmd+F；修饰键组合不会被误当成普通搜索入口。
 ///
@@ -364,7 +374,8 @@ impl CommandsView {
         self.load_snippet_page(None, cx);
     }
 
-    /// 用实体保存的输入状态更新搜索；订阅负责触发唯一查询路径，避免重复请求。
+    /// 程序赋值不产生 InputEvent::Change，因此值变化后显式复用查询代次与取消路径。
+    /// 相同值直接返回，避免清空或外部同步重复重启同一个请求。
     ///
     /// @author kongweiguang
     pub fn set_snippet_query(
@@ -373,11 +384,15 @@ impl CommandsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.snippet_query.read(cx).value().as_ref() == query {
+            return;
+        }
         self.snippet_query
-            .update(cx, |input, cx| input.set_value(query, window, cx));
+            .update(cx, |input, cx| input.set_value(query.clone(), window, cx));
+        self.schedule_snippet_query(query, cx);
     }
 
-    /// 切换目录区段时清除 continuation；应用层会对非空 query 使用全目录搜索。
+    /// 切换目录区段时清除 continuation 并撤销尚未完成的新建意图；应用层会对非空 query 使用全目录搜索。
     ///
     /// @author kongweiguang
     pub fn select_snippet_catalog_section(
@@ -389,6 +404,7 @@ impl CommandsView {
         if self.snippet_catalog_section == section {
             return;
         }
+        self.cancel_pending_snippet_command_request(cx);
         self.snippet_inline_preview = SnippetInlinePreview::Collapsed;
         self.snippet_query_generation = self.snippet_query_generation.wrapping_add(1).max(1);
         self.snippet_catalog_section = section;
@@ -398,7 +414,7 @@ impl CommandsView {
         self.load_snippet_page(None, cx);
     }
 
-    /// 请求第一页或 continuation，并在请求边界重新确认代次和取消令牌。
+    /// 请求边界核对代次并串行续读右栏目录；目录响应只清理自己的错误，不吞掉导入等操作反馈。
     ///
     /// @author kongweiguang
     pub(super) fn load_snippet_page(
@@ -463,6 +479,8 @@ impl CommandsView {
                 }
                 match result {
                     Ok(SnippetCatalogPageOutcome::Page(page)) => {
+                        let clear_directory_status = view.snippet_page_error.is_some()
+                            && view.status == view.snippet_page_error;
                         apply_snippet_page_success(
                             SnippetPageSuccessState {
                                 items: &mut view.snippet_page_items,
@@ -482,7 +500,16 @@ impl CommandsView {
                                 append,
                             },
                         );
-                        view.status = None;
+                        if clear_directory_status {
+                            view.status = None;
+                        }
+                        // main 的右栏展示完整目录；使用既有分页串行续读，不从 render 发起 I/O。
+                        if view.compact_layout
+                            && let Some(next) = view.snippet_next_cursor.clone()
+                            && Some(&next) != failed_cursor.as_ref()
+                        {
+                            view.load_snippet_page(Some(next), cx);
+                        }
                     }
                     Ok(SnippetCatalogPageOutcome::StaleCursor) => {
                         view.snippet_next_cursor = None;
@@ -542,6 +569,27 @@ impl CommandsView {
             return;
         };
         self.load_snippet_page(Some(cursor), cx);
+    }
+
+    /// 只接受当前 pane binding 下成功覆盖当前筛选的真实目录页；成功空页也是有效结果。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub(crate) fn right_rail_acceptance_snippet_directory_ready(
+        &self,
+        binding: &UiSessionBinding,
+        cx: &gpui_kit::App,
+    ) -> bool {
+        let query = self.snippet_query.read(cx).value().to_string();
+        self.ui_session_binding.as_ref() == Some(binding)
+            && !self.snippet_page_loading
+            && self.snippet_page_error.is_none()
+            && snippet_page_matches_filter(
+                self.snippet_page_loaded_section,
+                self.snippet_page_loaded_query.as_deref(),
+                self.snippet_catalog_section,
+                &query,
+            )
     }
 
     /// 重试失败查询；若失败的是 continuation，只重试该游标，不清除已成功的前页。
@@ -672,7 +720,7 @@ impl CommandsView {
         self.copy_snippet(key, cx);
     }
 
-    /// 复制只展开当前表单中的命令与变量；剪贴板是明确用户动作，不依赖终端平台或 shell 查询。
+    /// 复制只展开当前表单中的非敏感命令；处理函数复核敏感状态，避免 UI 禁用之外的调用绕过限制。
     ///
     /// @author kongweiguang
     pub(super) fn copy_snippet_preview(
@@ -693,7 +741,8 @@ impl CommandsView {
             cx.notify();
             return;
         }
-        let Some(rendered) = super::snippet_fill::render_selected_snippet_direct(self, cx) else {
+        let Some(mut rendered) = super::snippet_fill::render_selected_snippet_direct(self, cx)
+        else {
             self.status = Some(command_message("请先选择片段", "Select a snippet first"));
             cx.notify();
             return;
@@ -706,16 +755,17 @@ impl CommandsView {
             cx.notify();
             return;
         }
-        let status = if rendered.sensitive {
-            command_message(
-                "敏感命令已复制；不会写入命令历史",
-                "Sensitive command copied; it will not be recorded in command history",
-            )
-        } else {
-            command_message("命令已复制", "Command copied")
-        };
+        if !snippet_preview_copy_is_allowed(rendered.sensitive) {
+            rendered.command.zeroize();
+            self.status = Some(command_message(
+                "含敏感值的命令不能复制",
+                "Commands with sensitive values cannot be copied",
+            ));
+            cx.notify();
+            return;
+        }
         cx.write_to_clipboard(ClipboardItem::new_string(rendered.command));
-        self.status = Some(status);
+        self.status = Some(command_message("命令已复制", "Command copied"));
         cx.notify();
     }
     /// 将当前只读内置定义另存为新的用户定义；创建 CAS 与精确读回避免覆盖或盲目重试。
@@ -1284,7 +1334,7 @@ impl CommandsView {
         cx.notify();
     }
 
-    /// 根级弹层只报告可见性变化，并推进独立代次供异步 Fill 拒绝关闭后来重开的编辑器。
+    /// 根级弹层只报告可见性变化；关闭时同时撤销未完成的命令预填，阻止迟到结果重开编辑器。
     /// 草稿、revision 与输入实体始终留在同一个 CommandsView 中。
     ///
     /// @author kongweiguang
@@ -1301,13 +1351,18 @@ impl CommandsView {
         focus_command_draft: bool,
         cx: &mut Context<Self>,
     ) {
+        if !open {
+            self.cancel_pending_snippet_command_request(cx);
+        } else if self.snippet_library_manager_open {
+            return;
+        }
         if self.snippet_editor_open == open {
             return;
         }
         self.snippet_editor_open = open;
         self.snippet_editor_generation = self.snippet_editor_generation.wrapping_add(1).max(1);
         cx.emit(SnippetEditorVisibilityChanged {
-            open,
+            open: self.snippet_overlay_open(),
             focus_command_draft,
         });
         cx.notify();
@@ -1336,6 +1391,9 @@ impl CommandsView {
     ///
     /// @author kongweiguang
     pub fn focus_snippet_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.snippet_editor_open() || self.snippet_library_manager_open {
+            return;
+        }
         let editable_title = self.snippet_is_new
             || self
                 .selected_snippet
@@ -1367,11 +1425,17 @@ impl CommandsView {
         true
     }
 
-    /// Escape 与关闭按钮使用相同门禁；dirty 草稿保留在实体中供稍后继续。
+    /// Escape 分派实际最上层弹框，导入的提交门禁不能被编辑器关闭路径绕过。
     ///
     /// @author kongweiguang
     pub fn handle_snippet_editor_escape(&mut self, cx: &mut Context<Self>) {
-        self.close_snippet_editor(cx);
+        if self.snippet_import_review.is_some() {
+            self.cancel_snippet_import_review(cx);
+        } else if self.snippet_library_manager_open {
+            self.close_snippet_library_manager(cx);
+        } else {
+            self.close_snippet_editor(cx);
+        }
     }
 
     /// 只隐藏编辑器；保存、删除确认和切换决策未完成时不允许绕过既有状态机。

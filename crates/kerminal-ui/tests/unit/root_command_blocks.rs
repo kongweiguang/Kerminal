@@ -12,8 +12,9 @@ use kerminal_application::sessions::{
 use kerminal_domain::identity::{AgentSessionId, SessionId};
 
 use crate::root::command_blocks::{
-    CommandBlockContent, CommandBlockContentUnavailable, CommandBlockRuntime, project_blocks,
-    project_command_block_output, snapshot_matches_session,
+    CommandBlockContent, CommandBlockContentUnavailable, CommandBlockRuntime,
+    main_command_block_text, project_blocks, project_command_block_output,
+    snapshot_matches_session, snippet_command_block_text,
 };
 
 /// UI 元数据刷新不得把 shell parser 的命令内容误当成已经读取的终端输出。
@@ -298,6 +299,127 @@ fn transcript_projection_preserves_capture_revision_and_text_boundary() {
                 truncated: false,
                 complete: true,
             })
+    );
+}
+
+/// 新建片段预填复用 main 的命令块全文格式，并清理每行尾部空白。
+#[test]
+fn snippet_prefill_contains_command_and_captured_output() {
+    let session_id = SessionId::new();
+    let block_id = CommandBlockId {
+        session_generation: 8,
+        prompt_epoch: 4,
+        ordinal: 2,
+    };
+    let snapshot = output_snapshot(
+        session_id.clone(),
+        block_id,
+        CommandBlockOutputState::Complete { exit_code: Some(0) },
+        Some(CommandBlockOutputText::from_capture(Arc::from(
+            "first  \nsecond\n",
+        ))),
+    );
+
+    assert_eq!(
+        snippet_command_block_text(snapshot, &session_id, block_id, 8, Some(2), "printf safe")
+            .expect("matching transcript becomes snippet text"),
+        "$ printf safe\nfirst\nsecond"
+    );
+}
+
+/// 缺少输出或回执属于其它 block 时不创建只有命令前缀的片段。
+#[test]
+fn snippet_prefill_rejects_missing_or_mismatched_output() {
+    let session_id = SessionId::new();
+    let block_id = CommandBlockId {
+        session_generation: 8,
+        prompt_epoch: 4,
+        ordinal: 2,
+    };
+    assert!(
+        snippet_command_block_text(
+            output_snapshot(
+                session_id.clone(),
+                block_id,
+                CommandBlockOutputState::NotCaptured,
+                None,
+            ),
+            &session_id,
+            block_id,
+            8,
+            Some(2),
+            "printf safe",
+        )
+        .is_err()
+    );
+
+    let mut truncated = output_snapshot(
+        session_id.clone(),
+        block_id,
+        CommandBlockOutputState::Complete { exit_code: Some(0) },
+        Some(CommandBlockOutputText::from_capture(Arc::from("prefix"))),
+    );
+    truncated.truncated = true;
+    assert!(
+        snippet_command_block_text(truncated, &session_id, block_id, 8, Some(2), "printf safe",)
+            .is_err()
+    );
+
+    let other_block = CommandBlockId {
+        ordinal: 3,
+        ..block_id
+    };
+    assert!(
+        snippet_command_block_text(
+            output_snapshot(
+                session_id.clone(),
+                other_block,
+                CommandBlockOutputState::Complete { exit_code: Some(0) },
+                Some(CommandBlockOutputText::from_capture(Arc::from("output"))),
+            ),
+            &session_id,
+            block_id,
+            8,
+            Some(2),
+            "printf safe",
+        )
+        .is_err()
+    );
+}
+
+/// 即使 session 和 block 仍匹配，输出 revision 变化也不能用旧命令块文本创建片段。
+#[test]
+fn snippet_prefill_rejects_changed_capture_revision() {
+    let session_id = SessionId::new();
+    let block_id = CommandBlockId {
+        session_generation: 8,
+        prompt_epoch: 4,
+        ordinal: 2,
+    };
+    let snapshot = output_snapshot_with_revision(
+        session_id.clone(),
+        block_id,
+        CommandBlockOutputState::Complete { exit_code: Some(0) },
+        Some(CommandBlockOutputText::from_capture(Arc::from("output"))),
+        Some(2),
+    );
+
+    assert!(
+        snippet_command_block_text(snapshot, &session_id, block_id, 8, Some(1), "printf safe",)
+            .is_err()
+    );
+}
+
+/// main 保留固定字符尾窗，避免超长 transcript 造成无界片段草稿。
+#[test]
+fn snippet_prefill_uses_main_output_tail_window() {
+    let output = format!("{}tail", "x".repeat(128_000));
+    let text = main_command_block_text("printf safe", &output);
+
+    assert!(text.ends_with("tail"));
+    assert_eq!(
+        text.chars().count(),
+        "$ printf safe\n".chars().count() + 128_000
     );
 }
 

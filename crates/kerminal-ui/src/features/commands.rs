@@ -2,10 +2,11 @@
 //!
 //! @author kongweiguang
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, SharedString, Subscription, Window,
+    AppContext as _, Context, Entity, EventEmitter, FocusHandle, SharedString, Subscription,
+    Window,
     component::{
         input::{InputEvent, InputState, TextareaState},
         searchable_list::SearchableListItem,
@@ -23,7 +24,7 @@ use kerminal_application::{
     },
     configuration_directory::ConfigurationDirectoryService,
     preferences::{ConfigurationValidationService, ThemeMode},
-    sessions::UiSessionBinding,
+    sessions::{CommandBlockId, UiSessionBinding},
 };
 use kerminal_domain::{
     commands::{
@@ -51,6 +52,9 @@ mod history_query;
 mod logs;
 #[path = "commands/render.rs"]
 mod render;
+#[cfg(feature = "right-rail-acceptance")]
+#[path = "commands/right_rail_acceptance.rs"]
+mod right_rail_acceptance;
 #[path = "commands/send_state.rs"]
 mod send_state;
 #[path = "commands/snippet_browser.rs"]
@@ -64,6 +68,10 @@ mod workflow_editor;
 
 use send_state::{SendOperationKind, SendOperationState, SendOperationToken};
 
+#[cfg(feature = "right-rail-acceptance")]
+pub use logs::right_rail_acceptance::{
+    RightRailAcceptanceLogsEntry, RightRailAcceptanceLogsSnapshot,
+};
 pub use logs::{LogsTarget, LogsView};
 
 /// 面板按业务任务切换内容；切换仅改变视图，不销毁共享终端会话。
@@ -176,6 +184,121 @@ impl SearchableListItem for SnippetVariableRenderStrategyOption {
     }
 }
 
+/// 片段编辑器各类下拉项使用领域枚举值，避免从当前语言的显示文案反解析状态。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SnippetEditorSelection {
+    Scope(SnippetScope),
+    Risk(SnippetRisk),
+    DefaultAction(SnippetDefaultAction),
+    ContextBinding(SnippetContextBindingKind),
+}
+
+/// Select 展示本地化标题，但提交稳定的领域值供表单和保存逻辑共用。
+///
+/// @author kongweiguang
+#[derive(Clone)]
+pub(super) struct SnippetEditorSelectionOption {
+    selection: SnippetEditorSelection,
+    label: SharedString,
+}
+
+impl SearchableListItem for SnippetEditorSelectionOption {
+    type Value = SnippetEditorSelection;
+
+    /// 选项文案单独说明选中含义，供弹层行与辅助技术共用。
+    ///
+    /// @author kongweiguang
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    /// 选择结果保留领域枚举，不依赖可能变化的翻译文案。
+    ///
+    /// @author kongweiguang
+    fn value(&self) -> &Self::Value {
+        &self.selection
+    }
+}
+
+/// 作用域候选与 main V2 保持同一固定顺序，并用领域枚举作为稳定提交值。
+///
+/// @author kongweiguang
+fn snippet_scope_options() -> Vec<SnippetEditorSelectionOption> {
+    [
+        (SnippetScope::Any, "通用", "Any"),
+        (SnippetScope::Local, "本地", "Local"),
+        (SnippetScope::Ssh, "SSH", "SSH"),
+    ]
+    .into_iter()
+    .map(|(scope, zh_cn, en_us)| SnippetEditorSelectionOption {
+        selection: SnippetEditorSelection::Scope(scope),
+        label: crate::locale::text(zh_cn, en_us),
+    })
+    .collect()
+}
+
+/// 风险候选名称与 main V2 一致，未知状态仍可被明确选择和保存。
+///
+/// @author kongweiguang
+fn snippet_risk_options() -> Vec<SnippetEditorSelectionOption> {
+    [
+        (SnippetRisk::Inspect, "只读检查", "Read-only inspection"),
+        (SnippetRisk::Change, "可能变更", "May change state"),
+        (SnippetRisk::Destructive, "破坏性", "Destructive"),
+        (SnippetRisk::Unknown, "未知", "Unknown"),
+    ]
+    .into_iter()
+    .map(|(risk, zh_cn, en_us)| SnippetEditorSelectionOption {
+        selection: SnippetEditorSelection::Risk(risk),
+        label: crate::locale::text(zh_cn, en_us),
+    })
+    .collect()
+}
+
+/// 默认动作只保存显式选项；选择“运行前确认”不会直接触发执行。
+///
+/// @author kongweiguang
+fn snippet_default_action_options() -> Vec<SnippetEditorSelectionOption> {
+    [
+        (
+            SnippetDefaultAction::Insert,
+            "填入终端",
+            "Insert into terminal",
+        ),
+        (
+            SnippetDefaultAction::Run,
+            "运行前确认",
+            "Confirm before running",
+        ),
+    ]
+    .into_iter()
+    .map(|(action, zh_cn, en_us)| SnippetEditorSelectionOption {
+        selection: SnippetEditorSelection::DefaultAction(action),
+        label: crate::locale::text(zh_cn, en_us),
+    })
+    .collect()
+}
+
+/// 上下文选项直接映射 main V2 的单选值，不将显示文案带入目标身份。
+///
+/// @author kongweiguang
+fn snippet_context_binding_options() -> Vec<SnippetEditorSelectionOption> {
+    [
+        (SnippetContextBindingKind::Global, "全局", "Global"),
+        (SnippetContextBindingKind::Workspace, "工作区", "Workspace"),
+        (SnippetContextBindingKind::Host, "主机", "Host"),
+        (SnippetContextBindingKind::HostGroup, "主机组", "Host group"),
+    ]
+    .into_iter()
+    .map(|(kind, zh_cn, en_us)| SnippetEditorSelectionOption {
+        selection: SnippetEditorSelection::ContextBinding(kind),
+        label: crate::locale::text(zh_cn, en_us),
+    })
+    .collect()
+}
+
 /// 绑定项单独保存目标输入，编辑类型时保留所有其它绑定和未知元数据。
 pub(super) struct SnippetContextBindingInput {
     pub binding: SnippetContextBinding,
@@ -202,6 +325,7 @@ pub(super) struct SnippetDraftValues {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum EditorTransition {
     New,
+    NewFromCommand(String),
     Open(String),
     OpenKey(SnippetPreferenceKey),
     PreviewKey(SnippetPreferenceKey),
@@ -214,6 +338,43 @@ pub struct SnippetEditorVisibilityChanged {
     pub open: bool,
     /// Fill 成功关闭弹层后，Root 应聚焦历史命令草稿而不是恢复到已隐藏的变量输入框。
     pub focus_command_draft: bool,
+}
+
+/// 新建片段时冻结当前 pane 的命令块身份；Root 只按此身份读取 transcript。
+///
+/// @author kongweiguang
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct SnippetCommandBlockSource {
+    pub(crate) binding: UiSessionBinding,
+    pub(crate) block_id: CommandBlockId,
+    pub(crate) session_generation: u64,
+    pub(crate) capture_revision: Option<u64>,
+    pub(crate) command: String,
+}
+
+impl fmt::Debug for SnippetCommandBlockSource {
+    /// 命令文本不进入事件诊断，保持终端正文与其它命令块投影相同的脱敏边界。
+    ///
+    /// @author kongweiguang
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnippetCommandBlockSource")
+            .field("binding", &self.binding)
+            .field("block_id", &self.block_id)
+            .field("session_generation", &self.session_generation)
+            .field("capture_revision", &self.capture_revision)
+            .field("command", &"<redacted>")
+            .finish()
+    }
+}
+
+/// 当前命令块预填请求由 Root 在异步读取前复核活动 Commands 实体。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SnippetCurrentCommandRequested {
+    pub(crate) request_id: u64,
+    pub(crate) source: SnippetCommandBlockSource,
 }
 
 /// 片段成功写入后的焦点意图票据；Root 仍须核对活动目标和点击时焦点。
@@ -235,6 +396,27 @@ pub(crate) struct SnippetTerminalFillCompleted {
 pub(crate) struct CommandsTargetPresentation {
     pub binding: UiSessionBinding,
     pub label: String,
+}
+
+/// 由组合根投影的配置管理复制值；Commands 不猜测目录或 validator 命令。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CommandsConfigurationActions {
+    directory: Option<String>,
+    validator_command: Option<String>,
+}
+
+impl CommandsConfigurationActions {
+    /// 只携带共享服务已经解析的展示与复制文本，不在 UI 中重建配置规则。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn new(directory: Option<String>, validator_command: Option<String>) -> Self {
+        Self {
+            directory,
+            validator_command,
+        }
+    }
 }
 
 impl CommandsTargetPresentation {
@@ -272,6 +454,7 @@ pub struct CommandsView {
     /// 文件目录/validator/导入文件都由 composition root 装配，UI 不直接访问路径或磁盘。
     pub(super) configuration_validation: Option<ConfigurationValidationService>,
     pub(super) configuration_directory: Option<ConfigurationDirectoryService>,
+    pub(super) configuration_actions: CommandsConfigurationActions,
     pub(super) snippet_transfer_files: Option<SnippetTransferFileService>,
     /// Shell 执行与目标绑定在应用用例内完成，面板不直接编排 SessionService。
     pub(super) snippet_execution: Option<Arc<SnippetExecutionService>>,
@@ -289,7 +472,11 @@ pub struct CommandsView {
     pub(super) snippet_query: Entity<InputState>,
     /// TabList 的独立键盘焦点，避免搜索输入与列表方向键处理互相争用。
     pub(super) snippet_catalog_focus: FocusHandle,
+    /// 管理器覆盖层的焦点目标，不借用其下方可能隐藏的编辑器输入。
+    pub(super) snippet_manager_focus: FocusHandle,
     pub(super) snippet_query_subscription: Option<Subscription>,
+    /// compact 编辑器的参数名只从模板占位符推导；宽工作台保留手动维护入口。
+    pub(super) snippet_command_subscription: Option<Subscription>,
     pub(super) snippet_command: Entity<TextareaState>,
     pub(super) workflow_title: Entity<InputState>,
     pub(super) snippet_description: Entity<InputState>,
@@ -297,10 +484,15 @@ pub struct CommandsView {
     pub(super) snippet_category: Entity<InputState>,
     pub(super) snippet_sort_order: Entity<InputState>,
     pub(super) snippet_scope: SnippetScope,
+    pub(super) snippet_scope_select: Entity<SelectState<Vec<SnippetEditorSelectionOption>>>,
     pub(super) snippet_risk: SnippetRisk,
+    pub(super) snippet_risk_select: Entity<SelectState<Vec<SnippetEditorSelectionOption>>>,
     pub(super) snippet_default_action: SnippetDefaultAction,
+    pub(super) snippet_default_action_select:
+        Entity<SelectState<Vec<SnippetEditorSelectionOption>>>,
+    pub(super) snippet_context_select: Entity<SelectState<Vec<SnippetEditorSelectionOption>>>,
+    snippet_editor_select_subscriptions: Vec<Subscription>,
     pub(super) snippet_context_bindings: Vec<SnippetContextBindingInput>,
-    pub(super) snippet_advanced_open: bool,
     pub(super) workflow_steps: Vec<WorkflowStepEditor>,
     pub(super) history: Vec<CommandHistoryEntry>,
     pub(super) snippet_catalog_section: SnippetCatalogSection,
@@ -331,11 +523,18 @@ pub struct CommandsView {
     pub(super) snippet_transfer_cancellation: Option<CancellationToken>,
     pub(super) snippet_library_manager_open: bool,
     pub(super) snippet_validation_running: bool,
-    pub(super) snippet_validation_report:
-        Option<kerminal_application::preferences::ConfigurationValidationReport>,
     pub(super) snippet_directory_request_pending: bool,
     pub(super) snippet_manager_generation: u64,
     pub(super) snippet_manager_cancellation: Option<CancellationToken>,
+    pub(super) snippet_usage_clear_confirm: bool,
+    pub(super) snippet_usage_clear_running: bool,
+    pub(super) snippet_usage_clear_generation: u64,
+    pub(super) snippet_history_target: Option<LogsTarget>,
+    pub(super) snippet_history_entries: Vec<CommandHistoryEntry>,
+    pub(super) snippet_history_loading: bool,
+    pub(super) snippet_history_loaded: bool,
+    pub(super) snippet_history_generation: u64,
+    pub(super) snippet_history_cancellation: Option<CancellationToken>,
     pub(super) workflows: Vec<CommandWorkflow>,
     pub(super) ui_sessions: Vec<SessionInfo>,
     pub(super) suggestions: Vec<CommandSuggestionCandidate>,
@@ -350,6 +549,8 @@ pub struct CommandsView {
     /// 输入控件事件以单调 ID 定位变量；删除前项后迟到选择不会改到相邻变量。
     snippet_variable_id: u64,
     pub(super) snippet_is_new: bool,
+    /// 新建标题需区分空白片段与从当前命令块保存的快照。
+    pub(super) snippet_new_from_command: bool,
     pub(super) workflow_is_new: bool,
     pub(super) snippet_saving: bool,
     pub(super) workflow_saving: bool,
@@ -359,6 +560,8 @@ pub struct CommandsView {
     /// 只接受最近一次 Fill 回执；并行点击不会让较早请求覆盖较新的操作。
     pub(super) snippet_fill_generation: u64,
     snippet_terminal_fill: snippet_fill::TerminalFillState,
+    /// Run 确认冻结点击时的命令、目标和片段代次；确认期间的变化不得改投新目标。
+    pending_snippet_run: Option<snippet_fill::PendingSnippetRun>,
     pub(super) workflow_editor_generation: u64,
     pub(super) workflow_delete_generation: u64,
     pub(super) pending_snippet_transition: Option<EditorTransition>,
@@ -394,12 +597,18 @@ pub struct CommandsView {
     pub(super) ui_session_binding: Option<UiSessionBinding>,
     /// 与精确 binding 同代的目标展示名；焦点/目标更新后必须重新投影。
     pub(super) target_presentation: Option<CommandsTargetPresentation>,
+    /// Root 投影的当前已确认命令块身份；点击新建时按冻结的 block 读取全文 transcript。
+    pub(super) snippet_command_source: Option<SnippetCommandBlockSource>,
+    snippet_command_request_generation: u64,
+    pending_snippet_command_request: Option<u64>,
     history_read: history_query::HistoryReadState,
     pub(super) panel_generation: u64,
     pub(super) suggestion_generation: u64,
     pub(super) suggestion_cancellation: Option<CancellationToken>,
     pub(super) workflow_generation: u64,
 }
+
+impl EventEmitter<SnippetCurrentCommandRequested> for CommandsView {}
 
 type PanelLoad = (
     Option<Result<SessionInfo, AppError>>,
@@ -409,7 +618,9 @@ type PanelLoad = (
 );
 
 impl CommandsView {
-    /// 稳定输入实体与历史读取槽由视图持有；重绘不重建草稿或在途查询。
+    /// 稳定输入和选择实体与历史读取槽由视图持有；重绘不重建草稿或在途查询。
+    ///
+    /// @author kongweiguang
     pub fn new(
         commands: Arc<CommandsService>,
         executor: ApplicationTaskExecutor,
@@ -432,11 +643,12 @@ impl CommandsView {
         });
         let snippet_query = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::locale::text(
-                "搜索名称、命令、标签…",
-                "Search titles, commands, and tags…",
+                "搜索名称、命令或标签",
+                "Search names, commands, or tags",
             ))
         });
         let snippet_catalog_focus = cx.focus_handle().tab_stop(true);
+        let snippet_manager_focus = cx.focus_handle().tab_stop(true);
         let snippet_command = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder(crate::locale::text(
@@ -464,11 +676,48 @@ impl CommandsView {
         let snippet_sort_order = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::locale::text("排序", "Sort order"))
         });
+        let snippet_scope_select =
+            cx.new(|cx| SelectState::new(snippet_scope_options(), None, window, cx));
+        let snippet_risk_select =
+            cx.new(|cx| SelectState::new(snippet_risk_options(), None, window, cx));
+        let snippet_default_action_select =
+            cx.new(|cx| SelectState::new(snippet_default_action_options(), None, window, cx));
+        let snippet_context_select =
+            cx.new(|cx| SelectState::new(snippet_context_binding_options(), None, window, cx));
+        snippet_scope_select.update(cx, |select, cx| {
+            select.set_selected_value(
+                &SnippetEditorSelection::Scope(SnippetScope::Any),
+                window,
+                cx,
+            );
+        });
+        snippet_risk_select.update(cx, |select, cx| {
+            select.set_selected_value(
+                &SnippetEditorSelection::Risk(SnippetRisk::Unknown),
+                window,
+                cx,
+            );
+        });
+        snippet_default_action_select.update(cx, |select, cx| {
+            select.set_selected_value(
+                &SnippetEditorSelection::DefaultAction(SnippetDefaultAction::Insert),
+                window,
+                cx,
+            );
+        });
+        snippet_context_select.update(cx, |select, cx| {
+            select.set_selected_value(
+                &SnippetEditorSelection::ContextBinding(SnippetContextBindingKind::Global),
+                window,
+                cx,
+            );
+        });
         let mut view = Self {
             commands,
             executor,
             configuration_validation: None,
             configuration_directory: None,
+            configuration_actions: CommandsConfigurationActions::default(),
             snippet_transfer_files: None,
             snippet_execution: None,
             session_id: None,
@@ -482,7 +731,9 @@ impl CommandsView {
             snippet_title,
             snippet_query,
             snippet_catalog_focus,
+            snippet_manager_focus,
             snippet_query_subscription: None,
+            snippet_command_subscription: None,
             snippet_command,
             workflow_title,
             snippet_description,
@@ -490,10 +741,14 @@ impl CommandsView {
             snippet_category,
             snippet_sort_order,
             snippet_scope: SnippetScope::Any,
+            snippet_scope_select,
             snippet_risk: SnippetRisk::Unknown,
+            snippet_risk_select,
             snippet_default_action: SnippetDefaultAction::Insert,
+            snippet_default_action_select,
+            snippet_context_select,
+            snippet_editor_select_subscriptions: Vec::new(),
             snippet_context_bindings: Vec::new(),
-            snippet_advanced_open: false,
             workflow_steps: Vec::new(),
             history: Vec::new(),
             snippet_catalog_section: SnippetCatalogSection::Common,
@@ -518,10 +773,18 @@ impl CommandsView {
             snippet_transfer_cancellation: None,
             snippet_library_manager_open: false,
             snippet_validation_running: false,
-            snippet_validation_report: None,
             snippet_directory_request_pending: false,
             snippet_manager_generation: 0,
             snippet_manager_cancellation: None,
+            snippet_usage_clear_confirm: false,
+            snippet_usage_clear_running: false,
+            snippet_usage_clear_generation: 0,
+            snippet_history_target: None,
+            snippet_history_entries: Vec::new(),
+            snippet_history_loading: false,
+            snippet_history_loaded: false,
+            snippet_history_generation: 0,
+            snippet_history_cancellation: None,
             workflows: Vec::new(),
             ui_sessions: Vec::new(),
             suggestions: Vec::new(),
@@ -533,6 +796,7 @@ impl CommandsView {
             snippet_variables: Vec::new(),
             snippet_variable_id: 0,
             snippet_is_new: false,
+            snippet_new_from_command: false,
             workflow_is_new: false,
             snippet_saving: false,
             workflow_saving: false,
@@ -541,6 +805,7 @@ impl CommandsView {
             snippet_generation: 0,
             snippet_fill_generation: 0,
             snippet_terminal_fill: Default::default(),
+            pending_snippet_run: None,
             workflow_editor_generation: 0,
             workflow_delete_generation: 0,
             pending_snippet_transition: None,
@@ -567,12 +832,67 @@ impl CommandsView {
             session_view_generation: 0,
             ui_session_binding: None,
             target_presentation: None,
+            snippet_command_source: None,
+            snippet_command_request_generation: 0,
+            pending_snippet_command_request: None,
             history_read: history_query::HistoryReadState::default(),
             panel_generation: 0,
             suggestion_generation: 0,
             suggestion_cancellation: None,
             workflow_generation: 0,
         };
+        let scope_select = view.snippet_scope_select.clone();
+        let risk_select = view.snippet_risk_select.clone();
+        let action_select = view.snippet_default_action_select.clone();
+        let context_select = view.snippet_context_select.clone();
+        view.snippet_editor_select_subscriptions = vec![
+            cx.subscribe_in(
+                &scope_select,
+                window,
+                |view, _, event: &SelectEvent<Vec<SnippetEditorSelectionOption>>, window, cx| {
+                    if let SelectEvent::Confirm(Some(SnippetEditorSelection::Scope(scope))) = event
+                    {
+                        view.set_snippet_scope(*scope, cx);
+                        view.sync_snippet_editor_selects(window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &risk_select,
+                window,
+                |view, _, event: &SelectEvent<Vec<SnippetEditorSelectionOption>>, window, cx| {
+                    if let SelectEvent::Confirm(Some(SnippetEditorSelection::Risk(risk))) = event {
+                        view.set_snippet_risk(*risk, cx);
+                        view.sync_snippet_editor_selects(window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &action_select,
+                window,
+                |view, _, event: &SelectEvent<Vec<SnippetEditorSelectionOption>>, window, cx| {
+                    if let SelectEvent::Confirm(Some(SnippetEditorSelection::DefaultAction(
+                        action,
+                    ))) = event
+                    {
+                        view.set_snippet_default_action(*action, cx);
+                        view.sync_snippet_editor_selects(window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &context_select,
+                window,
+                |view, _, event: &SelectEvent<Vec<SnippetEditorSelectionOption>>, window, cx| {
+                    if let SelectEvent::Confirm(Some(SnippetEditorSelection::ContextBinding(
+                        kind,
+                    ))) = event
+                    {
+                        view.set_snippet_context_binding_selection(*kind, window, cx);
+                    }
+                },
+            ),
+        ];
         let query_entity = view.snippet_query.clone();
         view.snippet_query_subscription = Some(cx.subscribe(
             &query_entity,
@@ -580,6 +900,17 @@ impl CommandsView {
                 if matches!(event, InputEvent::Change) {
                     let query = input.read(cx).value().to_string();
                     view.schedule_snippet_query(query, cx);
+                }
+            },
+        ));
+        let snippet_command_entity = view.snippet_command.clone();
+        view.snippet_command_subscription = Some(cx.subscribe_in(
+            &snippet_command_entity,
+            window,
+            |view, input, event: &InputEvent, window, cx| {
+                if view.compact_layout && matches!(event, InputEvent::Change) {
+                    let command = input.read(cx).text().to_string();
+                    view.sync_snippet_template_variables(&command, window, cx);
                 }
             },
         ));
@@ -623,10 +954,11 @@ impl CommandsView {
         cx.notify();
     }
 
-    /// 语言切换只改已创建输入实体的占位文字，保留搜索、命令、定义草稿与输入焦点。
+    /// 语言切换只改已创建输入实体的占位文字，保留搜索、命令、定义草稿与输入焦点；右栏编辑器与 main 一样保持空白提示。
     ///
     /// @author kongweiguang
     pub fn refresh_locale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let compact = self.compact_layout;
         self.history_query.update(cx, |input, cx| {
             input.set_placeholder(
                 crate::locale::text("搜索命令历史", "Search command history"),
@@ -642,24 +974,33 @@ impl CommandsView {
             )
         });
         self.snippet_title.update(cx, |input, cx| {
-            input.set_placeholder(crate::locale::text("片段名称", "Snippet name"), window, cx)
+            input.set_placeholder(
+                if compact {
+                    SharedString::default()
+                } else {
+                    crate::locale::text("片段名称", "Snippet name")
+                },
+                window,
+                cx,
+            )
         });
         self.snippet_query.update(cx, |input, cx| {
             input.set_placeholder(
-                crate::locale::text(
-                    "搜索名称、命令、标签…",
-                    "Search titles, commands, and tags…",
-                ),
+                crate::locale::text("搜索名称、命令或标签", "Search names, commands, or tags"),
                 window,
                 cx,
             )
         });
         self.snippet_command.update(cx, |input, cx| {
             input.set_placeholder(
-                crate::locale::text(
-                    "命令模板；变量写作 {{name}}",
-                    "Command template; variables use {{name}}",
-                ),
+                if compact {
+                    SharedString::default()
+                } else {
+                    crate::locale::text(
+                        "命令模板；变量写作 {{name}}",
+                        "Command template; variables use {{name}}",
+                    )
+                },
                 window,
                 cx,
             )
@@ -740,14 +1081,20 @@ impl CommandsView {
         cx.notify();
     }
 
-    /// 宿主按面板槽位设置紧凑布局；值未变化时不触发无效重绘。
+    /// 宿主按面板槽位设置紧凑布局；只在模式变化时同步占位文字，防止右栏外观泄漏到中央编辑器。
     ///
     /// @author kongweiguang
-    pub fn set_compact_layout(&mut self, compact: bool, cx: &mut Context<Self>) {
+    pub fn set_compact_layout(
+        &mut self,
+        compact: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.compact_layout == compact {
             return;
         }
         self.compact_layout = compact;
+        self.refresh_locale(window, cx);
         cx.notify();
     }
 
@@ -809,6 +1156,7 @@ impl CommandsView {
         if self.section == section {
             return;
         }
+        self.cancel_pending_snippet_command_request(cx);
         if self.snippet_editor_open && section != CommandsSection::Snippets {
             self.status = Some(command_message(
                 "请先关闭片段编辑器，再切换工作区",
@@ -836,6 +1184,7 @@ impl CommandsView {
     ///
     /// @author kongweiguang
     pub fn open_snippet_by_id(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_pending_snippet_command_request(cx);
         self.select_snippets(cx);
         if self.section != CommandsSection::Snippets {
             return;
@@ -1055,6 +1404,118 @@ impl CommandsView {
             return;
         }
         self.target_presentation = presentation;
+        cx.notify();
+    }
+
+    /// 保存 Root 对活动 pane 最新安全命令块的身份投影；正文仍由应用 transcript 服务按需读取。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn set_snippet_command_source(
+        &mut self,
+        source: Option<SnippetCommandBlockSource>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.snippet_command_source == source {
+            return;
+        }
+        self.snippet_command_source = source;
+        cx.notify();
+    }
+
+    /// 只接受当前未被新建/导航意图取代的 transcript 回执，再沿用已有草稿切换门禁。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn complete_snippet_current_command_request(
+        &mut self,
+        request_id: u64,
+        command_block_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.pending_snippet_command_request != Some(request_id) {
+            return false;
+        }
+        self.pending_snippet_command_request = None;
+        self.clear_snippet_command_request_status();
+        self.request_new_snippet(Some(command_block_text), window, cx);
+        true
+    }
+
+    /// 失败回执只结束对应 pending，不把缺失 transcript 伪装成空白片段或复用旧命令。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn fail_snippet_current_command_request(
+        &mut self,
+        request_id: u64,
+        message: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.pending_snippet_command_request != Some(request_id) {
+            return false;
+        }
+        self.pending_snippet_command_request = None;
+        self.status = Some(message);
+        cx.notify();
+        true
+    }
+
+    /// 标签切换或用户开始另一条导航后撤销旧预填请求，防止迟到结果重新打开编辑器。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn cancel_pending_snippet_command_request(&mut self, cx: &mut Context<Self>) {
+        if self.pending_snippet_command_request.take().is_none() {
+            return;
+        }
+        self.snippet_command_request_generation = self
+            .snippet_command_request_generation
+            .wrapping_add(1)
+            .max(1);
+        self.clear_snippet_command_request_status();
+        cx.notify();
+    }
+
+    /// 仅清理由本请求显示的等待文案，保留等待期间其它操作的最新状态反馈。
+    fn clear_snippet_command_request_status(&mut self) {
+        let waiting = command_message("正在读取当前命令块…", "Reading the current command block…");
+        if self.status.as_deref() == Some(waiting.as_str()) {
+            self.status = None;
+        }
+    }
+
+    /// 接收共享配置服务提供的可复制文本，避免从配置目录结构推导路径或命令。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn set_configuration_actions(
+        &mut self,
+        actions: CommandsConfigurationActions,
+        cx: &mut Context<Self>,
+    ) {
+        if self.configuration_actions == actions {
+            return;
+        }
+        self.configuration_actions = actions;
+        cx.notify();
+    }
+
+    /// 历史选择器使用 Logs 同源的冻结 pane scope；切换目标时作废旧列表和迟到回执。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn set_snippet_history_target(
+        &mut self,
+        target: Option<LogsTarget>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.snippet_history_target == target {
+            return;
+        }
+        if let Some(cancellation) = self.snippet_history_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.snippet_history_generation = self.snippet_history_generation.wrapping_add(1).max(1);
+        self.snippet_history_target = target;
+        self.snippet_history_entries.clear();
+        self.snippet_history_loading = false;
+        self.snippet_history_loaded = false;
         cx.notify();
     }
 
@@ -1568,13 +2029,12 @@ impl CommandsView {
         self.suggestions.clear();
     }
 
-    /// 显式草稿填入与右栏发送复用同一渲染快照；不会运行片段或检查平台适配性。
-    /// 填入后把焦点交给命令草稿，终端写入只由单独的发送按钮触发。
+    /// 宽工作台把片段填进本地草稿；右栏则用 Paste-only writer 填入当前终端，不提交回车。
     ///
     /// @author kongweiguang
     pub(super) fn fill_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.compact_layout {
-            self.send_snippet_terminal(window, cx);
+            self.fill_snippet_terminal(window, cx);
             return;
         }
         if self.snippet_saving
@@ -1645,6 +2105,58 @@ impl CommandsView {
     /// @author kongweiguang
     pub(super) fn open_snippet(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.open_snippet_by_id(id, window, cx);
+    }
+
+    /// compact 模板参数与 main 同步；同名实体保留元数据和运行输入，失效参数随模板移除。
+    ///
+    /// @author kongweiguang
+    fn sync_snippet_template_variables(
+        &mut self,
+        command: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let names = snippet_template_variable_names(command);
+        if self
+            .snippet_variables
+            .iter()
+            .map(|field| field.variable.name.as_str())
+            .eq(names.iter().map(String::as_str))
+        {
+            return;
+        }
+
+        let mut existing = std::mem::take(&mut self.snippet_variables);
+        let mut variables = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some(index) = existing
+                .iter()
+                .position(|field| field.variable.name == name)
+            {
+                variables.push(existing.remove(index));
+            } else {
+                let id = self.allocate_snippet_variable_id();
+                let variable = SnippetVariable {
+                    name: name.clone(),
+                    label: name,
+                    description: String::new(),
+                    kind: SnippetVariableKind::Text,
+                    required: true,
+                    default_value: None,
+                    suggestions: Vec::new(),
+                    validation: None,
+                    render_strategy: SnippetVariableRenderStrategy::ShellArg,
+                    sensitive: false,
+                };
+                variables.push(new_snippet_variable_input(id, variable, window, cx));
+            }
+        }
+
+        self.selected_snippet_sensitive = variables.iter().any(|field| {
+            field.variable.sensitive || field.variable.kind == SnippetVariableKind::Secret
+        });
+        self.snippet_variables = variables;
+        cx.notify();
     }
 
     /// 新增最小安全文本变量；敏感值仅留在运行输入，不能变成定义默认值或建议。
@@ -1740,6 +2252,29 @@ impl CommandsView {
         cx.notify();
     }
 
+    /// Checkbox 回执以稳定变量 ID 写入；重排或模板同步后旧控件不能改到相邻参数。
+    ///
+    /// @author kongweiguang
+    pub(super) fn set_snippet_variable_required(
+        &mut self,
+        variable_id: u64,
+        required: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(field) = self
+            .snippet_variables
+            .iter_mut()
+            .find(|field| field.id == variable_id)
+        else {
+            return;
+        };
+        if field.variable.required == required {
+            return;
+        }
+        field.variable.required = required;
+        cx.notify();
+    }
+
     /// 类型改变只更新当前草稿；Secret 清除持久化默认项、建议和旧敏感运行值。
     ///
     /// @author kongweiguang
@@ -1813,13 +2348,9 @@ impl CommandsView {
         cx.notify();
     }
 
-    /// 高级元数据使用同一版本化定义持久化，不让内置片段进入用户写路径。
-    pub(super) fn toggle_snippet_advanced(&mut self, cx: &mut Context<Self>) {
-        self.snippet_advanced_open = !self.snippet_advanced_open;
-        cx.notify();
-    }
-
     /// 上下文绑定增加一个可编辑项；非全局项保存前必须提供真实目标 ID。
+    ///
+    /// @author kongweiguang
     pub(super) fn add_snippet_context_binding(
         &mut self,
         window: &mut Window,
@@ -1834,19 +2365,35 @@ impl CommandsView {
                 window,
                 cx,
             ));
+        self.sync_snippet_editor_selects(window, cx);
         cx.notify();
     }
 
     /// 删除绑定项不触及其它绑定；允许零绑定表示目录默认范围。
-    pub(super) fn remove_snippet_context_binding(&mut self, index: usize, cx: &mut Context<Self>) {
+    ///
+    /// @author kongweiguang
+    pub(super) fn remove_snippet_context_binding(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index < self.snippet_context_bindings.len() {
             self.snippet_context_bindings.remove(index);
+            self.sync_snippet_editor_selects(window, cx);
             cx.notify();
         }
     }
 
     /// 循环上下文类型时保留目标文本，切到 Global 才清掉无意义的 targetId。
-    pub(super) fn cycle_snippet_context_binding(&mut self, index: usize, cx: &mut Context<Self>) {
+    ///
+    /// @author kongweiguang
+    pub(super) fn cycle_snippet_context_binding(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(binding) = self.snippet_context_bindings.get_mut(index) else {
             return;
         };
@@ -1859,7 +2406,86 @@ impl CommandsView {
         if binding.binding.kind == SnippetContextBindingKind::Global {
             binding.binding.target_id = None;
         }
+        self.sync_snippet_editor_selects(window, cx);
         cx.notify();
+    }
+
+    /// 单选绑定沿用 main V2：换类型后仅保留一项，并清空此前的目标 ID。
+    ///
+    /// @author kongweiguang
+    pub(super) fn set_snippet_context_binding_selection(
+        &mut self,
+        kind: SnippetContextBindingKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_kind = self
+            .snippet_context_bindings
+            .first()
+            .map_or(SnippetContextBindingKind::Global, |binding| {
+                binding.binding.kind
+            });
+        if current_kind == kind {
+            return;
+        }
+        if let Some(binding) = self.snippet_context_bindings.first_mut() {
+            binding.binding = SnippetContextBinding {
+                kind,
+                target_id: None,
+            };
+            binding
+                .target_id
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.snippet_context_bindings.truncate(1);
+        } else {
+            self.snippet_context_bindings
+                .push(new_context_binding_input(
+                    SnippetContextBinding {
+                        kind,
+                        target_id: None,
+                    },
+                    window,
+                    cx,
+                ));
+        }
+        self.sync_snippet_editor_selects(window, cx);
+        cx.notify();
+    }
+
+    /// 所有元数据选择器都只是 view-owned 投影，目录载入或宽布局修改后统一从草稿回显。
+    ///
+    /// @author kongweiguang
+    fn sync_snippet_editor_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let scope = SnippetEditorSelection::Scope(self.snippet_scope);
+        if self.snippet_scope_select.read(cx).selected_value() != Some(&scope) {
+            self.snippet_scope_select.update(cx, |select, cx| {
+                select.set_selected_value(&scope, window, cx)
+            });
+        }
+        let risk = SnippetEditorSelection::Risk(self.snippet_risk);
+        if self.snippet_risk_select.read(cx).selected_value() != Some(&risk) {
+            self.snippet_risk_select.update(cx, |select, cx| {
+                select.set_selected_value(&risk, window, cx)
+            });
+        }
+        let action = SnippetEditorSelection::DefaultAction(self.snippet_default_action);
+        if self.snippet_default_action_select.read(cx).selected_value() != Some(&action) {
+            self.snippet_default_action_select.update(cx, |select, cx| {
+                select.set_selected_value(&action, window, cx)
+            });
+        }
+        let kind = self
+            .snippet_context_bindings
+            .first()
+            .map_or(SnippetContextBindingKind::Global, |binding| {
+                binding.binding.kind
+            });
+        let context = SnippetEditorSelection::ContextBinding(kind);
+        if self.snippet_context_select.read(cx).selected_value() != Some(&context) {
+            self.snippet_context_select.update(cx, |select, cx| {
+                select.set_selected_value(&context, window, cx)
+            });
+        }
     }
 
     /// 统一规范化表单里的定义字段，保证 dirty 判断与版本化保存针对同一值比较。
@@ -2001,22 +2627,55 @@ impl CommandsView {
         })
     }
 
-    /// 请求创建空片段并进入详情；脏稿门禁重新显示编辑器，避免隐藏弹层后看不到保留决策。
+    /// 有可信命令块时先发 typed intent 读取冻结 transcript；无来源时仍按 main 创建空片段。
     ///
     /// @author kongweiguang
-    pub(super) fn new_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn new_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snippet_saving || self.confirm_snippet_delete {
+            return;
+        }
+        if let Some(source) = self.snippet_command_source.clone() {
+            self.snippet_command_request_generation = self
+                .snippet_command_request_generation
+                .wrapping_add(1)
+                .max(1);
+            let request_id = self.snippet_command_request_generation;
+            self.pending_snippet_command_request = Some(request_id);
+            self.status = Some(command_message(
+                "正在读取当前命令块…",
+                "Reading the current command block…",
+            ));
+            cx.emit(SnippetCurrentCommandRequested { request_id, source });
+            cx.notify();
+            return;
+        }
+        self.cancel_pending_snippet_command_request(cx);
+        self.request_new_snippet(None, window, cx);
+    }
+
+    /// 先冻结新片段命令，再沿用保存/丢弃/取消门禁，避免切 pane 或取消时覆盖当前草稿。
+    ///
+    /// @author kongweiguang
+    fn request_new_snippet(
+        &mut self,
+        command: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_pending_snippet_command_request(cx);
         if self.snippet_saving || self.confirm_snippet_delete {
             return;
         }
         snippet_browser::cancel_snippet_copy(self);
-        if self.snippet_is_new && self.selected_snippet.is_none() {
+        if self.snippet_is_new && self.selected_snippet.is_none() && command.is_none() {
             self.set_snippet_editor_open(true, cx);
             self.show_compact_detail(CommandsSection::Snippets, cx);
             return;
         }
         self.show_compact_detail(CommandsSection::Snippets, cx);
+        let transition = command.map_or(EditorTransition::New, EditorTransition::NewFromCommand);
         if self.snippet_draft_is_dirty(cx) {
-            self.pending_snippet_transition = Some(EditorTransition::New);
+            self.pending_snippet_transition = Some(transition);
             self.set_snippet_editor_open(true, cx);
             self.status = Some(command_message(
                 "片段草稿尚未保存，请选择保存、丢弃或取消切换",
@@ -2025,15 +2684,26 @@ impl CommandsView {
             cx.notify();
             return;
         }
-        self.install_new_snippet(window, cx);
+        self.apply_snippet_transition(transition, window, cx);
     }
 
-    /// 只有过渡决策已确认后才重置状态，避免把用户输入当作可丢弃的临时视图。
-    fn install_new_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 只有过渡决策已确认后才重置状态，并只填入该过渡冻结的命令快照；compact 还要显式派生参数，因为 set_value 不发 Change。
+    /// 右栏新增弹框沿用 main 的空白初态；变量语法提示仅留在完整工作台，避免额外提示挤压命令字段。
+    ///
+    /// @author kongweiguang
+    fn install_new_snippet(
+        &mut self,
+        command: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let compact_layout = self.compact_layout;
+        self.snippet_new_from_command = command
+            .as_deref()
+            .is_some_and(|command| !command.trim().is_empty());
         self.snippet_generation = self.snippet_generation.wrapping_add(1).max(1);
         self.snippet_inline_preview = snippet_browser::SnippetInlinePreview::Collapsed;
         self.selected_snippet = None;
-        self.snippet_advanced_open = false;
         self.configuration_conflict = None;
         self.selected_snippet_sensitive = false;
         self.snippet_variables.clear();
@@ -2050,24 +2720,37 @@ impl CommandsView {
         self.snippet_is_new = true;
         self.set_snippet_editor_open(true, cx);
         self.snippet_scope = SnippetScope::Any;
-        self.snippet_risk = SnippetRisk::Unknown;
+        self.snippet_risk = if compact_layout {
+            SnippetRisk::Change
+        } else {
+            SnippetRisk::Unknown
+        };
         self.snippet_default_action = SnippetDefaultAction::Insert;
+        self.sync_snippet_editor_selects(window, cx);
         self.snippet_description
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.snippet_tags
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.snippet_category
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.snippet_sort_order
-            .update(cx, |input, cx| input.set_value("0", window, cx));
+        self.snippet_category.update(cx, |input, cx| {
+            input.set_value(if compact_layout { "custom" } else { "" }, window, cx)
+        });
+        self.snippet_sort_order.update(cx, |input, cx| {
+            input.set_value(if compact_layout { "10" } else { "0" }, window, cx)
+        });
         self.snippet_title
             .update(cx, |input, cx| input.set_value("", window, cx));
+        let command = command.unwrap_or_default();
         self.snippet_command
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.status = Some(command_message(
-            "新建片段：命令变量使用 {{name}} 语法",
-            "New snippet: reference variables with {{name}}",
-        ));
+            .update(cx, |input, cx| input.set_value(command.clone(), window, cx));
+        if self.compact_layout {
+            self.sync_snippet_template_variables(&command, window, cx);
+        }
+        self.status = (!compact_layout).then(|| {
+            command_message(
+                "新建片段：命令变量使用 {{name}} 语法",
+                "New snippet: reference variables with {{name}}",
+            )
+        });
         cx.notify();
     }
 
@@ -2081,7 +2764,10 @@ impl CommandsView {
             return;
         };
         match transition {
-            EditorTransition::New => self.install_new_snippet(window, cx),
+            EditorTransition::New => self.install_new_snippet(None, window, cx),
+            EditorTransition::NewFromCommand(command) => {
+                self.install_new_snippet(Some(command), window, cx)
+            }
             EditorTransition::Open(id) => self.open_snippet_by_id(id, window, cx),
             EditorTransition::OpenKey(key) => self.load_snippet_key(key, true, false, window, cx),
             EditorTransition::PreviewKey(key) => {
@@ -2119,7 +2805,10 @@ impl CommandsView {
         cx: &mut Context<Self>,
     ) {
         match transition {
-            EditorTransition::New => self.install_new_snippet(window, cx),
+            EditorTransition::New => self.install_new_snippet(None, window, cx),
+            EditorTransition::NewFromCommand(command) => {
+                self.install_new_snippet(Some(command), window, cx)
+            }
             EditorTransition::Open(id) => self.open_snippet_by_id(id, window, cx),
             EditorTransition::OpenKey(key) => self.load_snippet_key(key, true, false, window, cx),
             EditorTransition::PreviewKey(key) => {
@@ -2999,7 +3688,6 @@ impl CommandsView {
         };
         if identity_changed {
             snippet_browser::cancel_snippet_copy(self);
-            self.snippet_advanced_open = false;
         }
         let definition = &saved.definition;
         self.snippet_title.update(cx, |input, cx| {
@@ -3018,8 +3706,16 @@ impl CommandsView {
         self.snippet_tags.update(cx, |input, cx| {
             input.set_value(definition.tags.join(", "), window, cx)
         });
+        let fallback_category = if self.compact_layout { "custom" } else { "" };
         self.snippet_category.update(cx, |input, cx| {
-            input.set_value(definition.category.clone().unwrap_or_default(), window, cx)
+            input.set_value(
+                definition
+                    .category
+                    .clone()
+                    .unwrap_or_else(|| fallback_category.to_owned()),
+                window,
+                cx,
+            )
         });
         self.snippet_sort_order.update(cx, |input, cx| {
             input.set_value(definition.sort_order.to_string(), window, cx)
@@ -3033,7 +3729,7 @@ impl CommandsView {
             .cloned()
             .map(|binding| new_context_binding_input(binding, window, cx))
             .collect();
-        if self.snippet_context_bindings.is_empty() {
+        if self.snippet_context_bindings.is_empty() && !self.compact_layout {
             self.snippet_context_bindings
                 .push(new_context_binding_input(
                     SnippetContextBinding {
@@ -3044,6 +3740,7 @@ impl CommandsView {
                     cx,
                 ));
         }
+        self.sync_snippet_editor_selects(window, cx);
         let mut next_variable_id = self.snippet_variable_id;
         self.snippet_variables = definition
             .variables
@@ -3061,6 +3758,7 @@ impl CommandsView {
             .any(|variable| variable.sensitive || variable.kind == SnippetVariableKind::Secret);
         self.selected_snippet = Some(saved);
         self.snippet_is_new = false;
+        self.snippet_new_from_command = false;
         self.configuration_conflict = None;
         self.status = None;
         cx.notify();
@@ -3436,6 +4134,62 @@ fn snippet_variable_render_strategy_options(
             ),
         })
         .collect()
+}
+
+/// 按 main 的双花括号语法提取有序唯一参数名；无效占位符不会生成无法保存的参数定义。
+///
+/// @author kongweiguang
+fn snippet_template_variable_names(command: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut search_from = 0;
+    while search_from < command.len() {
+        let Some(relative_open) = command[search_from..].find("{{") else {
+            break;
+        };
+        let open = search_from + relative_open;
+        let mut cursor = open + 2;
+        while let Some(character) = command[cursor..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            cursor += character.len_utf8();
+        }
+
+        let name_start = cursor;
+        let Some(first) = command[cursor..].chars().next() else {
+            search_from = open + 1;
+            continue;
+        };
+        if !first.is_ascii_alphabetic() {
+            search_from = open + 1;
+            continue;
+        }
+        cursor += first.len_utf8();
+        while let Some(character) = command[cursor..].chars().next() {
+            if !(character.is_ascii_alphanumeric() || character == '_') {
+                break;
+            }
+            cursor += character.len_utf8();
+        }
+        let name_end = cursor;
+        while let Some(character) = command[cursor..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            cursor += character.len_utf8();
+        }
+
+        if command[cursor..].starts_with("}}") {
+            let name = command[name_start..name_end].to_owned();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+            search_from = cursor + 2;
+        } else {
+            search_from = open + 1;
+        }
+    }
+    names
 }
 
 /// 创建类型、策略选择器和字段输入；提示属于 InputState，Secret 默认值不会进入运行输入。

@@ -9,6 +9,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         input::Input,
         menu::{DropdownMenu as _, PopupMenuItem},
+        select::Select,
     },
     div,
     prelude::*,
@@ -21,41 +22,153 @@ use kerminal_domain::commands::{
 use crate::theme::ThemeTokens;
 
 use super::super::CommandsView;
+use super::snippets::compact_snippet_field;
 
 impl CommandsView {
-    /// 将低频元数据收在可展开区域，并返回拥有化元素，避免与主表单后续输入字段争用视图借用。
+    /// 范围与标题同属编辑器首行；擦除按钮的 opaque 类型，避免 Rust 2024 隐式捕获 self/cx 借用。
     ///
     /// @author kongweiguang
-    pub(super) fn render_snippet_advanced(
+    pub(super) fn render_snippet_scope_control(
         &mut self,
         theme: ThemeTokens,
         writable: bool,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let open = self.snippet_advanced_open;
+        let scope = self.snippet_scope;
+        let scope_label = scope_label(scope);
+        let disabled = !writable || self.snippet_saving;
+        if self.compact_layout {
+            return compact_snippet_field(
+                Select::new(&self.snippet_scope_select)
+                    .id("snippet-scope-select")
+                    .w_full()
+                    .placeholder(crate::locale::text("选择作用域", "Choose scope"))
+                    .accessibility_label(crate::locale::text("作用域", "Scope"))
+                    .disabled(disabled),
+                theme,
+            )
+            .into_any_element();
+        }
+        let scope_view = cx.entity().clone();
+        Button::new("snippet-scope-cycle")
+            .compact()
+            .ghost()
+            .dropdown_caret(true)
+            .label(crate::locale::text(
+                format!("范围 · {scope_label}"),
+                format!("Scope · {scope_label}"),
+            ))
+            .disabled(disabled)
+            .dropdown_menu(move |mut menu, _, _| {
+                for (candidate, label) in [
+                    (SnippetScope::Any, crate::locale::text("通用", "Any")),
+                    (SnippetScope::Local, crate::locale::text("本地", "Local")),
+                    (SnippetScope::Ssh, crate::locale::text("SSH", "SSH")),
+                ] {
+                    let target = scope_view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(candidate == scope)
+                            .on_click(move |_, window, app| {
+                                target.update(app, |view, cx| {
+                                    view.set_snippet_scope(candidate, cx);
+                                    view.sync_snippet_editor_selects(window, cx);
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
+    /// 把片段元数据放在命令模板前常驻展示；紧凑上下文组沿用 main 的独立 16px 表单组间距。
+    ///
+    /// @author kongweiguang
+    pub(super) fn render_snippet_editor_metadata(
+        &mut self,
+        theme: ThemeTokens,
+        writable: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let saving = self.snippet_saving;
-        let body = open.then(|| {
+        if self.compact_layout {
+            let disabled = !writable || saving;
+            let context_bindings = self.render_snippet_context_bindings(theme, writable, true, cx);
             div()
-                .id("snippet-advanced-fields")
+                .id("snippet-editor-metadata")
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .gap_3()
+                        .child(compact_field_label(
+                            crate::locale::text("分类", "Category"),
+                            compact_snippet_field(
+                                Input::new(&self.snippet_category)
+                                    .disabled(disabled)
+                                    .w_full(),
+                                theme,
+                            ),
+                            theme,
+                        ))
+                        .child(compact_field_label(
+                            crate::locale::text("风险", "Risk"),
+                            compact_snippet_field(
+                                Select::new(&self.snippet_risk_select)
+                                    .id("snippet-risk-select")
+                                    .w_full()
+                                    .placeholder(crate::locale::text("选择风险", "Choose risk"))
+                                    .accessibility_label(crate::locale::text("风险", "Risk"))
+                                    .disabled(disabled),
+                                theme,
+                            ),
+                            theme,
+                        ))
+                        .child(compact_field_label(
+                            crate::locale::text("默认动作", "Default action"),
+                            compact_snippet_field(
+                                Select::new(&self.snippet_default_action_select)
+                                    .id("snippet-default-action-select")
+                                    .w_full()
+                                    .placeholder(crate::locale::text(
+                                        "选择默认动作",
+                                        "Choose default action",
+                                    ))
+                                    .accessibility_label(crate::locale::text(
+                                        "默认动作",
+                                        "Default action",
+                                    ))
+                                    .disabled(disabled),
+                                theme,
+                            ),
+                            theme,
+                        ))
+                        .child(compact_field_label(
+                            crate::locale::text("排序", "Sort order"),
+                            compact_snippet_field(
+                                Input::new(&self.snippet_sort_order)
+                                    .disabled(disabled)
+                                    .w_full(),
+                                theme,
+                            ),
+                            theme,
+                        )),
+                )
+                .child(context_bindings)
+                .into_any_element()
+        } else {
+            div()
+                .id("snippet-editor-metadata")
                 .w_full()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .pt_3()
-                .child(field_label(
-                    crate::locale::text("说明", "Description"),
-                    Input::new(&self.snippet_description)
-                        .disabled(!writable || saving)
-                        .w_full(),
-                    theme,
-                ))
-                .child(field_label(
-                    crate::locale::text("标签（逗号分隔）", "Tags (comma separated)"),
-                    Input::new(&self.snippet_tags)
-                        .disabled(!writable || saving)
-                        .w_full(),
-                    theme,
-                ))
                 .child(
                     div()
                         .w_full()
@@ -68,62 +181,62 @@ impl CommandsView {
                                 .disabled(!writable || saving)
                                 .w_full(),
                             theme,
+                            false,
                         ))
+                        .child(self.render_snippet_policy_controls(theme, writable, cx))
                         .child(field_label(
                             crate::locale::text("排序值", "Sort order"),
                             Input::new(&self.snippet_sort_order)
                                 .disabled(!writable || saving)
                                 .w_full(),
                             theme,
+                            false,
                         )),
                 )
-                .child(self.render_snippet_policy_controls(theme, writable, cx))
-                .child(self.render_snippet_context_bindings(theme, writable, cx))
-                .when(!writable && !self.snippet_variables.is_empty(), |body| {
-                    body.child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(section_title(
-                                crate::locale::text("变量定义", "Variable definitions"),
-                                theme,
-                            ))
-                            .children(
-                                self.render_snippet_variable_definitions(theme, writable, cx),
-                            ),
-                    )
-                })
-        });
+                .child(self.render_snippet_context_bindings(theme, writable, false, cx))
+                .into_any_element()
+        }
+    }
 
+    /// 说明和标签留在编辑表单末尾，贴合主分支的字段次序并保持完整可见。
+    ///
+    /// @author kongweiguang
+    pub(super) fn render_snippet_editor_text_details(
+        &self,
+        theme: ThemeTokens,
+        writable: bool,
+    ) -> gpui_kit::AnyElement {
+        let saving = self.snippet_saving;
+        let compact_layout = self.compact_layout;
+        let tags_label = if self.compact_layout {
+            crate::locale::text("标签", "Tags")
+        } else {
+            crate::locale::text("标签（逗号分隔）", "Tags (comma separated)")
+        };
         div()
-            .id("snippet-advanced-editor")
+            .id("snippet-editor-text-details")
             .w_full()
-            .border_t_1()
-            .border_color(theme.border)
-            .child(
-                Button::new("snippet-advanced-toggle")
-                    .compact()
-                    .ghost()
-                    .label(crate::locale::text(
-                        if open {
-                            "收起高级设置"
-                        } else {
-                            "更多设置"
-                        },
-                        if open {
-                            "Hide advanced settings"
-                        } else {
-                            "More settings"
-                        },
-                    ))
-                    .disabled(saving)
-                    .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
-                        view.toggle_snippet_advanced(cx);
-                    })),
-            )
-            .when_some(body, |section, body| section.child(body))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(field_label(
+                crate::locale::text("说明", "Description"),
+                Input::new(&self.snippet_description)
+                    .disabled(!writable || saving)
+                    .w_full()
+                    .when(compact_layout, |input| compact_snippet_field(input, theme)),
+                theme,
+                compact_layout,
+            ))
+            .child(field_label(
+                tags_label,
+                Input::new(&self.snippet_tags)
+                    .disabled(!writable || saving)
+                    .w_full()
+                    .when(compact_layout, |input| compact_snippet_field(input, theme)),
+                theme,
+                compact_layout,
+            ))
             .into_any_element()
     }
 
@@ -136,14 +249,11 @@ impl CommandsView {
         writable: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let scope = self.snippet_scope;
         let risk = self.snippet_risk;
         let action = self.snippet_default_action;
-        let scope_label = scope_label(scope);
         let risk_label = risk_label(risk);
         let action_label = default_action_label(action);
         let disabled = !writable || self.snippet_saving;
-        let scope_view = cx.entity().clone();
         let risk_view = cx.entity().clone();
         let action_view = cx.entity().clone();
         div()
@@ -154,36 +264,6 @@ impl CommandsView {
             .items_center()
             .gap_2()
             .text_color(theme.foreground)
-            .child(
-                Button::new("snippet-scope-cycle")
-                    .compact()
-                    .ghost()
-                    .dropdown_caret(true)
-                    .label(crate::locale::text(
-                        format!("范围 · {scope_label}"),
-                        format!("Scope · {scope_label}"),
-                    ))
-                    .disabled(disabled)
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for (candidate, label) in [
-                            (SnippetScope::Any, crate::locale::text("通用", "Any")),
-                            (SnippetScope::Local, crate::locale::text("本地", "Local")),
-                            (SnippetScope::Ssh, crate::locale::text("SSH", "SSH")),
-                        ] {
-                            let target = scope_view.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(label)
-                                    .checked(candidate == scope)
-                                    .on_click(move |_, _, app| {
-                                        target.update(app, |view, cx| {
-                                            view.set_snippet_scope(candidate, cx);
-                                        });
-                                    }),
-                            );
-                        }
-                        menu
-                    }),
-            )
             .child(
                 Button::new("snippet-risk-cycle")
                     .compact()
@@ -208,9 +288,10 @@ impl CommandsView {
                             menu = menu.item(
                                 PopupMenuItem::new(label)
                                     .checked(candidate == risk)
-                                    .on_click(move |_, _, app| {
+                                    .on_click(move |_, window, app| {
                                         target.update(app, |view, cx| {
                                             view.set_snippet_risk(candidate, cx);
+                                            view.sync_snippet_editor_selects(window, cx);
                                         });
                                     }),
                             );
@@ -243,9 +324,10 @@ impl CommandsView {
                             menu = menu.item(
                                 PopupMenuItem::new(label)
                                     .checked(candidate == action)
-                                    .on_click(move |_, _, app| {
+                                    .on_click(move |_, window, app| {
                                         target.update(app, |view, cx| {
                                             view.set_snippet_default_action(candidate, cx);
+                                            view.sync_snippet_editor_selects(window, cx);
                                         });
                                     }),
                             );
@@ -262,8 +344,59 @@ impl CommandsView {
         &mut self,
         theme: ThemeTokens,
         writable: bool,
+        compact_layout: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui_kit::AnyElement {
+        if compact_layout {
+            let kind = self
+                .snippet_context_bindings
+                .first()
+                .map_or(SnippetContextBindingKind::Global, |binding| {
+                    binding.binding.kind
+                });
+            let target = self
+                .snippet_context_bindings
+                .first()
+                .filter(|_| kind != SnippetContextBindingKind::Global)
+                .map(|binding| {
+                    compact_field_label(
+                        crate::locale::text("绑定目标 ID", "Binding target ID"),
+                        compact_snippet_field(
+                            Input::new(&binding.target_id)
+                                .disabled(!writable || self.snippet_saving)
+                                .w_full(),
+                            theme,
+                        ),
+                        theme,
+                    )
+                    .into_any_element()
+                });
+            return div()
+                .id("snippet-context-bindings")
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .gap_3()
+                .child(compact_field_label(
+                    crate::locale::text("上下文绑定", "Context binding"),
+                    compact_snippet_field(
+                        Select::new(&self.snippet_context_select)
+                            .id("snippet-context-binding-kind")
+                            .w_full()
+                            .placeholder(binding_kind_label(kind))
+                            .accessibility_label(crate::locale::text(
+                                "上下文绑定",
+                                "Context binding",
+                            ))
+                            .disabled(!writable || self.snippet_saving),
+                        theme,
+                    ),
+                    theme,
+                ))
+                .when_some(target, |row, target| row.child(target))
+                .into_any_element();
+        }
+
         let bindings = self
             .snippet_context_bindings
             .iter()
@@ -283,8 +416,8 @@ impl CommandsView {
                             .compact()
                             .label(binding_kind_label(kind))
                             .disabled(!writable || self.snippet_saving)
-                            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                                view.cycle_snippet_context_binding(index, cx);
+                            .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
+                                view.cycle_snippet_context_binding(index, window, cx);
                             })),
                     )
                     .when(target_required, |row| {
@@ -300,8 +433,8 @@ impl CommandsView {
                             .ghost()
                             .label(crate::locale::text("移除", "Remove"))
                             .disabled(!writable || self.snippet_saving)
-                            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                                view.remove_snippet_context_binding(index, cx);
+                            .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
+                                view.remove_snippet_context_binding(index, window, cx);
                             })),
                     )
             })
@@ -353,41 +486,64 @@ impl CommandsView {
                     )
                 },
             )
+            .into_any_element()
     }
 }
 
 /// 字段标签为低频选项提供常驻名称，避免用户必须猜测 placeholder。
+/// 字段名称使用独立语义色，右栏根弹层与内嵌表单保持相同对比度。
 ///
 /// @author kongweiguang
 fn field_label(
     label: gpui_kit::SharedString,
     input: impl IntoElement,
     theme: ThemeTokens,
+    compact_layout: bool,
 ) -> impl IntoElement {
     div()
         .flex_1()
         .min_w(px(180.))
         .flex()
         .flex_col()
-        .gap_1()
+        .when(!compact_layout, |label| label.gap_1())
         .child(
             div()
                 .text_size(theme.text_xs)
-                .text_color(theme.muted)
+                .when(compact_layout, |label| {
+                    label
+                        .line_height(px(24.))
+                        .font_weight(gpui_kit::FontWeight::NORMAL)
+                })
+                .text_color(theme.field_label)
                 .child(label),
         )
         .child(input)
 }
 
-/// 变量定义标题局部绘制，避免依赖片段弹层的私有 renderer helper。
+/// Compact 元数据固定两列，最窄字段宽度保护标签，最大宽度也让单独的 Global 控件保持半行。
+/// 标签保留 main 的 24px 父行盒和实际常规中文字形，避免每组高度误差向下累积。
 ///
 /// @author kongweiguang
-fn section_title(label: gpui_kit::SharedString, theme: ThemeTokens) -> impl IntoElement {
+fn compact_field_label(
+    label: gpui_kit::SharedString,
+    input: impl IntoElement,
+    theme: ThemeTokens,
+) -> impl IntoElement {
     div()
-        .text_size(theme.text_sm)
-        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-        .text_color(theme.foreground)
-        .child(label)
+        .flex_1()
+        .min_w(px(250.))
+        .max_w(px(310.))
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .text_size(theme.text_xs)
+                .line_height(px(24.))
+                .font_weight(gpui_kit::FontWeight::NORMAL)
+                .text_color(theme.field_label)
+                .child(label),
+        )
+        .child(input)
 }
 
 /// 来源标签仅映射领域枚举，未知值不会被伪装成通用范围。

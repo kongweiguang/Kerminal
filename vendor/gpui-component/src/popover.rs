@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Bounds, Context, Div, ElementId,
     FocusHandle, InteractiveElement as _, IntoElement, MouseButton, ParentElement, PathBuilder,
@@ -13,9 +15,9 @@ use crate::{
     styled::{popover_ring, popover_shadow},
     v_flex,
 };
-use gpui_base::Placement;
 use gpui_base::Popover as BasePopover;
 pub use gpui_base::PopoverState;
+use gpui_base::{Align, Placement};
 
 pub(crate) fn init(_: &mut App) {}
 
@@ -40,35 +42,30 @@ fn dropdown_positioner(bounds: Bounds<Pixels>) -> gpui_base::Positioner {
         .margin(px(8.))
 }
 
-/// Positions a dropdown surface under its trigger and animates it in.
+/// Positions a dropdown surface under its trigger and eases it into place.
 ///
-/// This is the shared open motion for Select, Combobox and DatePicker, modelled
-/// on shadcn/ui: over 150ms the surface fades up from nothing while sliding the
-/// last 8px out of the trigger's edge, on an ease-out curve so it decelerates
-/// into place.
+/// This shared Select, Combobox and DatePicker motion slides the opaque surface
+/// the last 8px from the trigger's edge while its shadow settles over 150ms.
 ///
 /// `surface` must be the panel itself — the element carrying
 /// [`ThemeStyled::popover_style`] — and not a wrapper around it. GPUI takes a
 /// shadow's shape from the element it is set on, so a wrapper of a different
 /// size would throw the shadow out of register with the panel.
 ///
-/// # Why the shadow is animated too
+/// # Why the surface stays opaque
 ///
-/// GPUI has no group compositing: `opacity` multiplies into each primitive's
-/// alpha separately rather than fading a composited subtree. A drop shadow is
-/// painted as a full blurred rect *under* the element — the shader only cuts the
-/// element out of `inset` shadows — so a translucent panel does not hide its own
-/// shadow, and mid-fade the shadow shows straight through the panel as a dark
-/// slab. Ramping the ink by the cube of the fade keeps it out of sight until the
-/// panel is opaque enough to cover it, and still lands on the resting shadow
-/// [`popover_shadow`] gives every other popup.
+/// GPUI multiplies opacity into each primitive instead of compositing the panel
+/// as one layer. Fading this surface therefore makes its themed background and
+/// option text translucent together, letting the content below show through.
+/// Only the shadow is ramped; the semantic popover background remains a distinct
+/// surface for the entire opening motion.
 ///
 /// # Departures from shadcn
 ///
 /// - shadcn also scales the surface up from 95% (`zoom-in-95`). GPUI has no
 ///   element transform — only images and SVGs take a `TransformationMatrix` —
-///   so there is nothing to scale a subtree with, and the fade and slide carry
-///   the motion on their own.
+///   so there is nothing to scale a subtree with, and the slide carries the
+///   motion on its own.
 /// - There is no exit motion. A closing dropdown stops being rendered in the
 ///   same frame its state flips, so playing one would mean keeping the surface
 ///   mounted past the close, which is a change to how each of these components
@@ -81,6 +78,8 @@ fn dropdown_positioner(bounds: Bounds<Pixels>) -> gpui_base::Positioner {
 ///
 /// Reduced motion needs no handling here: GPUI's animation element adopts the
 /// final value on the first frame when the system asks for it.
+///
+/// @author kongweiguang
 pub(crate) fn dropdown_popup(
     id: impl Into<ElementId>,
     bounds: Bounds<Pixels>,
@@ -97,7 +96,6 @@ pub(crate) fn dropdown_popup(
         move |surface, delta| {
             surface
                 .top(px(travel * (1. - delta)))
-                .opacity(delta)
                 .shadow(popover_shadow(ring, delta * delta * delta))
         },
     ))
@@ -109,6 +107,9 @@ pub struct Popover {
     id: ElementId,
     style: StyleRefinement,
     anchor: Anchor,
+    auto_flip: bool,
+    trigger_width: Option<(Pixels, Pixels)>,
+    available_height: Option<(Pixels, Pixels)>,
     offset: Option<Pixels>,
     arrow: bool,
     default_open: bool,
@@ -133,11 +134,16 @@ pub struct Popover {
 
 impl Popover {
     /// Create a new Popover with `view` mode.
+    ///
+    /// 翻转默认关闭，保留现有 anchor 与弹层位置契约。
     pub fn new(id: impl Into<ElementId>) -> Self {
         Self {
             id: id.into(),
             style: StyleRefinement::default(),
             anchor: Anchor::TopLeft,
+            auto_flip: false,
+            trigger_width: None,
+            available_height: None,
             offset: None,
             arrow: false,
             trigger: None,
@@ -168,6 +174,25 @@ impl Popover {
     /// Preserves the anchor and does not enable automatic flipping.
     pub fn offset(mut self, offset: impl Into<Pixels>) -> Self {
         self.offset = Some(offset.into());
+        self
+    }
+
+    /// 显式启用视口感知翻转，同时保留 anchor 的沿边对齐。
+    pub fn auto_flip(mut self) -> Self {
+        self.auto_flip = true;
+        self
+    }
+
+    /// Constrain the popup width to the trigger's measured width within the provided range.
+    pub fn trigger_width(mut self, min: Pixels, max: Pixels) -> Self {
+        self.trigger_width = Some((min, max));
+        self
+    }
+
+    /// Constrain vertical popup content to the chosen side before its first layout.
+    pub fn available_height(mut self, minimum_space: Pixels, max_height: Pixels) -> Self {
+        self.auto_flip = true;
+        self.available_height = Some((minimum_space.max(px(0.)), max_height.max(px(0.))));
         self
     }
 
@@ -315,8 +340,12 @@ impl Popover {
 }
 
 impl RenderOnce for Popover {
+    /// 复用 Base 的定位和开关状态机；默认箭头几何保持原 anchor 行为。
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let anchor = self.anchor;
+        let auto_flip = self.auto_flip;
+        let trigger_width = self.trigger_width;
+        let available_height = self.available_height;
         let arrow_size = if self.arrow {
             window.rem_size() * 0.375
         } else {
@@ -343,6 +372,13 @@ impl RenderOnce for Popover {
         BasePopover::new(self.id)
             .anchor(self.anchor)
             .offset(offset)
+            .when(auto_flip, |this| this.auto_flip())
+            .when_some(trigger_width, |this, (min, max)| {
+                this.trigger_width(min, max)
+            })
+            .when_some(available_height, |this, (minimum, maximum)| {
+                this.available_height(minimum, maximum)
+            })
             .on_position(move |position, trigger| resolved.set(Some((position, trigger))))
             .mouse_button(self.mouse_button)
             .default_open(self.default_open)
@@ -363,10 +399,21 @@ impl RenderOnce for Popover {
                             canvas(
                                 |_, _, _| {},
                                 move |bounds, _, window, _| {
-                                    let Some((_, trigger)) = arrow_position.get() else {
+                                    let Some((position, trigger)) = arrow_position.get() else {
                                         return;
                                     };
-                                    let (side, target) = arrow_anchor(anchor, trigger);
+                                    let (side, target) = if auto_flip {
+                                        position
+                                            .placement
+                                            .map(|placement| {
+                                                arrow_anchor_for_position(
+                                                    anchor, placement, trigger,
+                                                )
+                                            })
+                                            .unwrap_or_else(|| arrow_anchor(anchor, trigger))
+                                    } else {
+                                        arrow_anchor(anchor, trigger)
+                                    };
                                     let trigger = Bounds::new(target, gpui::size(px(0.), px(0.)));
                                     let points =
                                         arrow_points(bounds, trigger, side, arrow_size, radius);
@@ -427,6 +474,37 @@ fn arrow_anchor(anchor: Anchor, trigger: Bounds<Pixels>) -> (Placement, Point<Pi
         Anchor::LeftCenter => (Placement::Right, trigger.right_center()),
         Anchor::RightCenter => (Placement::Left, trigger.left_center()),
     }
+}
+
+/// 按真实落边调整箭头朝向，同时沿用原 anchor 的水平对齐约束。
+fn arrow_anchor_for_position(
+    anchor: Anchor,
+    placement: Placement,
+    trigger: Bounds<Pixels>,
+) -> (Placement, Point<Pixels>) {
+    let align = match anchor {
+        Anchor::TopLeft | Anchor::BottomLeft => Align::Start,
+        Anchor::TopCenter | Anchor::BottomCenter | Anchor::LeftCenter | Anchor::RightCenter => {
+            Align::Center
+        }
+        Anchor::TopRight | Anchor::BottomRight => Align::End,
+    };
+
+    let target = match placement {
+        Placement::Bottom => match align {
+            Align::Start => trigger.bottom_left(),
+            Align::Center => trigger.bottom_center(),
+            Align::End => trigger.bottom_right(),
+        },
+        Placement::Top => match align {
+            Align::Start => trigger.origin,
+            Align::Center => trigger.top_center(),
+            Align::End => trigger.top_right(),
+        },
+        Placement::Left => trigger.left_center(),
+        Placement::Right => trigger.right_center(),
+    };
+    (placement, target)
 }
 
 /// Clamp the arrow base clear of rounded corners while aiming at the trigger.
@@ -514,6 +592,42 @@ mod tests {
         assert!(popover.default_open);
         assert!(!popover.appearance);
         assert!(!popover.overlay_closable);
+    }
+
+    /// 自动翻转必须由调用方显式启用，避免默默改变已有 anchor 行为。
+    #[test]
+    fn auto_flip_is_opt_in() {
+        assert!(!Popover::new("legacy-popover").auto_flip);
+        assert!(Popover::new("flipping-popover").auto_flip().auto_flip);
+    }
+
+    /// Width bounds remain opt-in at the themed facade so legacy popovers keep intrinsic sizing.
+    #[test]
+    fn trigger_width_is_opt_in() {
+        assert_eq!(Popover::new("legacy-width").trigger_width, None);
+        assert_eq!(
+            Popover::new("bounded-width")
+                .trigger_width(px(240.), px(360.))
+                .trigger_width,
+            Some((px(240.), px(360.)))
+        );
+    }
+
+    /// Vertical layout constraints stay opt-in so the existing popover family keeps its geometry.
+    #[test]
+    fn available_height_is_opt_in() {
+        assert_eq!(Popover::new("legacy-height").available_height, None);
+        assert_eq!(
+            Popover::new("bounded-height")
+                .available_height(px(152.), px(320.))
+                .available_height,
+            Some((px(152.), px(320.)))
+        );
+        assert!(
+            Popover::new("bounded-height")
+                .available_height(px(152.), px(320.))
+                .auto_flip
+        );
     }
 
     #[test]
@@ -806,6 +920,39 @@ mod tests {
             ),
         ] {
             assert_eq!(arrow_anchor(anchor, trigger), (side, target));
+        }
+    }
+
+    /// 翻转后箭头改指向触发器实际相邻边，同时保持原 anchor 的横向对齐。
+    #[test]
+    fn flipped_arrow_targets_the_trigger_edge_near_the_resolved_side() {
+        let trigger = Bounds::new(point(px(120.), px(120.)), size(px(40.), px(20.)));
+        for (anchor, placement, target) in [
+            (Anchor::TopLeft, Placement::Top, trigger.origin),
+            (Anchor::TopCenter, Placement::Top, trigger.top_center()),
+            (Anchor::TopRight, Placement::Top, trigger.top_right()),
+            (Anchor::BottomLeft, Placement::Bottom, trigger.bottom_left()),
+            (
+                Anchor::BottomCenter,
+                Placement::Bottom,
+                trigger.bottom_center(),
+            ),
+            (
+                Anchor::BottomRight,
+                Placement::Bottom,
+                trigger.bottom_right(),
+            ),
+            (Anchor::LeftCenter, Placement::Left, trigger.left_center()),
+            (
+                Anchor::RightCenter,
+                Placement::Right,
+                trigger.right_center(),
+            ),
+        ] {
+            assert_eq!(
+                arrow_anchor_for_position(anchor, placement, trigger),
+                (placement, target)
+            );
         }
     }
 

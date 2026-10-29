@@ -161,6 +161,24 @@ impl ConfigurationSyncRepository for GitConfigurationSyncRepository {
         status::status(self.clone()).await
     }
 
+    /// 从已装配的 ConfigurationStore 根目录生成真实展示路径，并固定 key 文件相对位置。
+    async fn workspace_info(
+        &self,
+    ) -> AppResult<Option<kerminal_application::configuration_sync::ConfigurationWorkspaceInfo>>
+    {
+        Ok(Some(
+            kerminal_application::configuration_sync::ConfigurationWorkspaceInfo {
+                workspace_root: self.root.to_string_lossy().into_owned(),
+                vault_key_path: self
+                    .root
+                    .join("secrets")
+                    .join("vault-key.toml")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        ))
+    }
+
     /// 只获取远端引用；fetch 子进程不持共享存储锁。
     async fn fetch(
         &self,

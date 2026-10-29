@@ -1,5 +1,8 @@
 use super::*;
 use crate::features::files::{
+    DirectoryPathError, create_directory_destination, file_list_row_height,
+};
+use crate::features::files::{
     FileSort, FileSortColumn, bookmark_response_is_current, bookmark_target,
     permissions::{PermissionEditor, supports_posix_mode_endpoint},
     transfer_queue::TransferQueueUi,
@@ -7,8 +10,11 @@ use crate::features::files::{
     workspace_projection_push_is_newer, workspace_projection_request_is_current,
     workspace_projection_response_is_fresh,
 };
+use kerminal_application::preferences::InterfaceDensity;
 use kerminal_domain::{
-    files::{ConflictPolicy, ContainerRuntime, FileEntryKind},
+    files::{
+        BookmarkTarget, ConflictPolicy, ContainerRuntime, FileBookmark, FileEntryKind, RemotePath,
+    },
     identity::HostId,
 };
 use std::path::PathBuf;
@@ -37,13 +43,94 @@ fn browser_toolbar_projects_two_rows_and_compact_ssh_follow() {
     assert!(!compact_local.show_terminal_follow);
 }
 
-/// 宽度边界确保完整工具组空间充足前仍从“更多”菜单访问低频操作。
+/// 表格宽度边界与紧凑工具栏固定图标布局相互独立。
 ///
 /// @author kongweiguang
 #[test]
-fn compact_toolbar_direct_actions_respect_width_boundary() {
-    assert!(!FileBrowserLayout::for_width(px(639.)).show_compact_toolbar_actions);
-    assert!(FileBrowserLayout::for_width(px(640.)).show_compact_toolbar_actions);
+fn browser_columns_respect_width_boundary() {
+    assert!(!FileBrowserLayout::for_width(px(399.)).columns.size);
+    assert!(FileBrowserLayout::for_width(px(400.)).columns.size);
+    assert!(!FileBrowserLayout::for_width(px(539.)).columns.permissions);
+    assert!(FileBrowserLayout::for_width(px(540.)).columns.permissions);
+}
+
+/// 当前请求加载、失败、空列表和已加载列表必须对应互斥菜单内容。
+///
+/// @author kongweiguang
+#[test]
+fn bookmark_menu_projects_loading_error_empty_and_items() {
+    let bookmark = FileBookmark {
+        created_at_unix_ms: 0,
+        target: BookmarkTarget::Remote {
+            host_id: HostId::new(),
+        },
+        path: "/srv/app".to_owned(),
+        label: None,
+    };
+    let bookmarks = vec![bookmark];
+
+    assert_eq!(
+        bookmark_menu_state(true, Some("stale error"), bookmarks.as_slice()),
+        BookmarkMenuState::Loading
+    );
+    assert_eq!(
+        bookmark_menu_state(false, Some("read failed"), &[]),
+        BookmarkMenuState::Error("read failed")
+    );
+    assert_eq!(
+        bookmark_menu_state(false, None, &[]),
+        BookmarkMenuState::Empty
+    );
+    assert_eq!(
+        bookmark_menu_state(false, None, bookmarks.as_slice()),
+        BookmarkMenuState::Items(bookmarks.as_slice())
+    );
+}
+
+/// 新建目录对话框接受相对或绝对路径，并拒绝远端根路径及无法解析的输入。
+///
+/// @author kongweiguang
+#[test]
+fn directory_creation_resolves_full_paths_and_rejects_roots() {
+    let host = HostId::new();
+    let current = FileEndpoint::remote(host.clone(), "/srv/app").unwrap();
+    let relative = create_directory_destination(&current, "nested/new-folder").unwrap();
+    let absolute = create_directory_destination(&current, "/var/tmp/new-folder").unwrap();
+
+    assert_eq!(
+        relative.remote_path().unwrap().as_str(),
+        "/srv/app/nested/new-folder"
+    );
+    assert_eq!(
+        absolute.remote_path().unwrap().as_str(),
+        "/var/tmp/new-folder"
+    );
+    assert_eq!(
+        create_directory_destination(&current, "/"),
+        Err(DirectoryPathError::Root)
+    );
+    assert_eq!(
+        create_directory_destination(&current, "  "),
+        Err(DirectoryPathError::Empty)
+    );
+    let relative_current = FileEndpoint::Remote {
+        host_id: host,
+        path: RemotePath::parse(".").unwrap(),
+    };
+    assert_eq!(
+        create_directory_destination(&relative_current, "new-folder"),
+        Err(DirectoryPathError::NotAbsolute)
+    );
+}
+
+/// 文件行高与 main 的 Compact、Comfortable、Spacious 设置映射一致。
+///
+/// @author kongweiguang
+#[test]
+fn file_rows_follow_interface_density() {
+    assert_eq!(file_list_row_height(InterfaceDensity::Compact), 36.0);
+    assert_eq!(file_list_row_height(InterfaceDensity::Comfortable), 44.0);
+    assert_eq!(file_list_row_height(InterfaceDensity::Spacious), 48.0);
 }
 
 /// 目录请求可填充同版本首个快照，但过期返回不能覆盖已经推送的新状态。

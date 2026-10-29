@@ -4,32 +4,11 @@
 
 use super::draft::{CloseRequest, ConfigDraft, DraftSnapshot, DraftStatus, DraftTransitionError};
 use super::panel::parse_environment;
-use super::render::settings_footer_message;
 use super::validation::{
     KeybindingDraft, KeyboardPlatform, ProfileIssueKind, SettingsDraft, SettingsIssueKind,
     validate_profile, validate_settings,
 };
 use super::{InterfaceLanguage, KeybindingScope, ProfileDraft, ThemeMode};
-/// 当前读回错误优先于之前成功提示，避免 footer 把真实冲突隐藏在旧状态下面。
-///
-/// @author kongweiguang
-#[test]
-fn settings_footer_prefers_current_readback_error_over_stale_status() {
-    assert_eq!(
-        settings_footer_message(
-            Some("Settings changed outside the app. Reload before saving."),
-            Some("Settings saved."),
-        ),
-        Some((
-            "Settings changed outside the app. Reload before saving.",
-            true,
-        )),
-    );
-    assert_eq!(
-        settings_footer_message(None, Some("Settings reloaded.")),
-        Some(("Settings reloaded.", false)),
-    );
-}
 
 /// 构造最小可用的表单快照，保留其余字段默认值且避免先默认后覆盖。
 ///
@@ -153,6 +132,36 @@ fn failed_save_keeps_editable_draft_and_only_success_updates_revision() {
     assert!(!draft.is_dirty());
 }
 
+/// 保存中的后续输入不改变提交快照；成功回执只推进基线和 revision。
+#[test]
+fn successful_save_preserves_edits_made_after_submission() {
+    let mut draft = ConfigDraft::new(DraftSnapshot {
+        value: "initial".to_owned(),
+        revision: 1_u64,
+    });
+    draft.replace_value("submitted".to_owned()).unwrap();
+    draft.begin_save().unwrap();
+    assert_eq!(
+        draft.pending_save_value().map(String::as_str),
+        Some("submitted")
+    );
+    draft
+        .replace_value_during_save("later edit".to_owned())
+        .unwrap();
+    draft
+        .save_succeeded(DraftSnapshot {
+            value: "submitted".to_owned(),
+            revision: 2,
+        })
+        .unwrap();
+
+    assert_eq!(draft.status(), DraftStatus::Ready);
+    assert_eq!(draft.value(), "later edit");
+    assert_eq!(draft.baseline_value(), "submitted");
+    assert_eq!(*draft.revision(), 2);
+    assert!(draft.is_dirty());
+}
+
 /// 未知提交结果必须读回才能恢复编辑，禁止再次提交、丢弃或关闭页面。
 #[test]
 fn outcome_unknown_requires_explicit_readback_before_any_followup_action() {
@@ -189,6 +198,61 @@ fn outcome_unknown_requires_explicit_readback_before_any_followup_action() {
     assert_eq!(draft.status(), DraftStatus::Ready);
     assert_eq!(draft.value(), "committed or old value");
     assert_eq!(*draft.revision(), 2);
+}
+
+/// watcher 三方合并后以 remote revision 为基线，并保留合并结果中的本地字段。
+#[test]
+fn settings_rebase_accepts_remote_revision_and_keeps_merged_value() {
+    let mut draft = ConfigDraft::new(DraftSnapshot {
+        value: ("dark", "font-a"),
+        revision: 1_u64,
+    });
+    draft.replace_value(("dark", "font-b")).unwrap();
+    draft
+        .rebase(
+            DraftSnapshot {
+                value: ("light", "font-a"),
+                revision: 2,
+            },
+            ("light", "font-b"),
+        )
+        .unwrap();
+
+    assert_eq!(draft.status(), DraftStatus::Ready);
+    assert_eq!(draft.value(), &("light", "font-b"));
+    assert_eq!(draft.baseline_value(), &("light", "font-a"));
+    assert_eq!(*draft.revision(), 2);
+    assert!(draft.is_dirty());
+}
+
+/// 未知写入仅在读回提交值相同后确认，并把提交后的继续输入保留为 dirty。
+#[test]
+fn unknown_save_readback_confirms_only_the_submitted_value() {
+    let mut draft = ConfigDraft::new(DraftSnapshot {
+        value: 1_u8,
+        revision: 1_u64,
+    });
+    draft.replace_value(2).unwrap();
+    draft.begin_save().unwrap();
+    assert_eq!(
+        draft.replace_value(3),
+        Err(DraftTransitionError::CannotEditWhileSaving)
+    );
+    draft.replace_value_during_save(3).unwrap();
+    draft.save_outcome_unknown().unwrap();
+
+    assert_eq!(draft.pending_save_value(), Some(&2));
+    draft
+        .confirm_outcome_unknown(DraftSnapshot {
+            value: 2,
+            revision: 2,
+        })
+        .unwrap();
+    assert_eq!(draft.value(), &3);
+    assert_eq!(draft.baseline_value(), &2);
+    assert_eq!(*draft.revision(), 2);
+    assert_eq!(draft.status(), DraftStatus::Ready);
+    assert!(draft.is_dirty());
 }
 
 /// 外部文件变更保留 dirty 输入并阻止保存，避免 watcher 静默覆盖用户草稿。
