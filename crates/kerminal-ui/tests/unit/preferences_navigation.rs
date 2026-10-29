@@ -19,10 +19,10 @@ fn navigation_search_matches_bilingual_and_multiword_queries() {
     assert!(!matches_navigation_query(keywords, "vault"));
 }
 
-/// 默认导航严格保持 main 的 11 项及顺序，避免把独立工作区或实现服务加入设置侧栏。
+/// 默认导航保留原有页面顺序并加入唯一的 Profile 管理入口。
 /// @author kongweiguang
 #[test]
-fn navigation_exposes_exactly_the_eleven_main_pages_in_order() {
+fn navigation_exposes_profile_and_existing_pages_in_order() {
     let pages = navigation_targets(None, false)
         .into_iter()
         .filter(|target| target.category)
@@ -34,6 +34,7 @@ fn navigation_exposes_exactly_the_eleven_main_pages_in_order() {
         [
             "appearance",
             "terminal",
+            "profiles",
             "keywords",
             "suggestions",
             "sftp",
@@ -57,7 +58,7 @@ fn main_search_targets_cover_each_settings_page() {
         .filter(|target| !target.category)
         .collect::<Vec<_>>();
 
-    assert_eq!(entries.len(), 18);
+    assert_eq!(entries.len(), 19);
     for (id, section) in [
         (
             "settings-interface-appearance-panel",
@@ -81,6 +82,7 @@ fn main_search_targets_cover_each_settings_page() {
             "settings-terminal-cursor-panel",
             PreferencesSection::Terminal,
         ),
+        ("settings-profiles-panel", PreferencesSection::Profiles),
         (
             "settings-keyword-highlights-panel",
             PreferencesSection::KeywordHighlights,
@@ -127,6 +129,30 @@ fn search_filters_pages_and_caps_results_at_eight() {
     assert_eq!(sftp.len(), 1);
     assert_eq!(sftp[0].id, "settings-sftp-panel");
     assert_eq!(sftp[0].section, PreferencesSection::Sftp);
+}
+
+/// 应用配色和终端配色是两个可独立定位的设置入口。
+///
+/// @author kongweiguang
+#[test]
+fn app_palette_search_finds_the_application_appearance() {
+    for query in [
+        "应用配色",
+        "JetBrains",
+        "Fleet",
+        "VS Code",
+        "vscode",
+        "app color scheme",
+    ] {
+        let results = matching_navigation_targets(None, false, query);
+        assert!(
+            results.iter().any(|target| {
+                target.id == "settings-interface-appearance-panel"
+                    && target.section == PreferencesSection::Appearance
+            }),
+            "{query}"
+        );
+    }
 }
 
 /// MCP 和关于均作为设置页始终可搜索；服务缺失只影响状态，不替换为跳往其它工作区。
@@ -186,16 +212,22 @@ fn field_search_projects_the_selected_page_and_scroll_target() {
     assert_eq!(selection.scroll_index, Some(1));
 }
 
-/// 空查询恢复 11 个导航项；本地主机/Profile 管理不在设置导航中重复出现。
+/// 清空搜索后恢复包含 Profile 的页面导航。
 /// @author kongweiguang
 #[test]
-fn clearing_search_restores_page_navigation_without_profiles() {
+fn clearing_search_restores_page_navigation_with_profiles() {
     let categories = matching_navigation_targets(None, false, "")
         .into_iter()
         .filter(|target| target.category)
         .collect::<Vec<_>>();
-    assert_eq!(categories.len(), 11);
-    assert!(categories.iter().all(|target| target.id != "profiles"));
+    assert_eq!(categories.len(), 12);
+    assert_eq!(
+        categories
+            .iter()
+            .filter(|target| target.id == "profiles")
+            .count(),
+        1
+    );
 
     let cleared = resolve_navigation_search_selection(
         "",

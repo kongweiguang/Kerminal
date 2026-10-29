@@ -49,6 +49,7 @@ rfd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 
 [build-dependencies]
 embed-resource = "=3.0.12"

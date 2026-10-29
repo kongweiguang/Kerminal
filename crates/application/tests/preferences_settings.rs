@@ -8,13 +8,40 @@ use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult,
     preferences::{
-        ConfigurationGuideStatus, ConfigurationRepository, ConfigurationValidationDiagnostic,
-        ConfigurationValidationReport, ConfigurationValidationScope,
-        ConfigurationValidationSeverity, KeybindingScope, PreferencesService, SettingsRepository,
-        SettingsSnapshot, ThemeMode, ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId,
-        VersionedSettings,
+        AppColorScheme, ConfigurationGuideStatus, ConfigurationRepository,
+        ConfigurationValidationDiagnostic, ConfigurationValidationReport,
+        ConfigurationValidationScope, ConfigurationValidationSeverity, KeybindingScope,
+        PreferencesService, SettingsRepository, SettingsSnapshot, ThemeMode,
+        ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId, VersionedSettings,
     },
 };
+
+/// 应用色板在快照中的稳定编码与缺省值独立于终端设置，旧快照缺字段仍可恢复。
+///
+/// @author kongweiguang
+#[test]
+fn app_color_scheme_snapshot_defaults_and_wire_values_are_stable() {
+    let default = SettingsSnapshot::default();
+    let terminal = default.terminal.clone();
+    let mut legacy = serde_json::to_value(&default).expect("编码完整设置快照");
+    legacy
+        .as_object_mut()
+        .expect("设置快照是对象")
+        .remove("app_color_scheme");
+    let restored: SettingsSnapshot = serde_json::from_value(legacy).expect("旧快照可缺少应用配色");
+    assert_eq!(restored.app_color_scheme, AppColorScheme::Kerminal);
+    assert_eq!(restored.terminal, terminal);
+
+    for scheme in AppColorScheme::ALL {
+        let encoded = serde_json::to_string(&scheme).expect("编码配色标识");
+        assert_eq!(encoded, format!("\"{}\"", scheme.as_str()));
+        assert_eq!(
+            serde_json::from_str::<AppColorScheme>(&encoded).expect("解码配色标识"),
+            scheme
+        );
+    }
+    assert!(serde_json::from_str::<AppColorScheme>("\"future-palette\"").is_err());
+}
 use kerminal_domain::preferences::{
     ConfigDocument, ConfigDocumentPath, ConfigRevision, ConfigurationMode,
     ConfigurationRecoveryState,

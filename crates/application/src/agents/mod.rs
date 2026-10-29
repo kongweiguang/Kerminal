@@ -511,13 +511,6 @@ pub trait AgentService: Send + Sync {
         cancellation: CancellationToken,
     ) -> AppResult<AgentSessionView>;
 
-    /// 读取脱敏记录投影、provider 状态和待确认恢复 owner，供 current_session 单次消费。
-    async fn record_projection(
-        &self,
-        agent_session_id: AgentSessionId,
-        cancellation: CancellationToken,
-    ) -> AppResult<AgentSessionRecordProjection>;
-
     /// 显式继续会话；存储结果未确认时保留已启动 owner，并通过 view 暴露可恢复状态。
     async fn resume(
         &self,

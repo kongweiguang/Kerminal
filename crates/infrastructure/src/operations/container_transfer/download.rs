@@ -56,6 +56,7 @@ struct ArchiveReceiveRequest<'a> {
 }
 
 /// 经容器 tar stdout 流式落入本机私有 staging，校验通过后按文件原子合并到目标树。
+/// 固定的规范化路径只用于实际文件操作；恢复记录保留用户原请求的路径表示以维持身份核对。
 ///
 /// @author kongweiguang
 pub(super) async fn download(
@@ -113,7 +114,12 @@ pub(super) async fn download(
         });
     };
     let destination_endpoint = FileEndpoint::Local {
-        path: destination.clone(),
+        path: logical_local_destination(
+            requested_path,
+            context.actual_destination.as_ref(),
+            &destination,
+        )
+        .map_err(|error| app_failure(error, context.actual_destination.clone(), false))?,
     };
     context
         .progress
@@ -147,6 +153,11 @@ pub(super) async fn download(
     {
         Ok(bytes) => bytes,
         Err(ContainerStreamFailure { error, cleanup, .. }) => {
+            tracing::warn!(
+                error_code = error.public_code().as_str(),
+                reason = error.public_message(),
+                "容器归档下载失败"
+            );
             if !cleanup.is_released() {
                 return Err(app_failure_with_cleanup(
                     error,
@@ -296,7 +307,33 @@ pub(super) async fn download(
     })
 }
 
+/// 恢复仓储按原请求比较目标身份；Rename 只替换文件名，已固定的重试目标沿用原身份。
+/// 文件写入始终使用独立 canonical 目标，不能由此函数绕过父目录及冲突策略校验。
+///
+/// @author kongweiguang
+fn logical_local_destination(
+    requested: &Path,
+    pinned: Option<&FileEndpoint>,
+    resolved: &Path,
+) -> AppResult<PathBuf> {
+    if let Some(endpoint) = pinned {
+        return match endpoint {
+            FileEndpoint::Local { path } => Ok(path.clone()),
+            _ => Err(AppError::invalid("固定的本机传输目标类型无效")),
+        };
+    }
+    let name = resolved
+        .file_name()
+        .ok_or_else(|| AppError::invalid("本机传输目标缺少文件名"))?;
+    if requested.file_name() == Some(name) {
+        Ok(requested.to_path_buf())
+    } else {
+        Ok(requested.with_file_name(name))
+    }
+}
+
 /// 从容器 exec stdout 送入有界 blocking tar reader；请求保持源端、目标与 staging 的配对。
+/// finish 回执结束后释放 stream 锁，再进入可能重试同一 owner 的失败清理。
 ///
 /// @author kongweiguang
 async fn receive_archive(
@@ -388,27 +425,34 @@ async fn receive_archive(
             event = async { stream.lock().await.next_event().await }, if !output_finished => match event {
                 Ok(Some(CommandStreamEvent::Stdout(bytes))) => {
                     if extraction.is_some() {
-                        let send_result = tokio::select! {
-                            _ = context.cancellation.cancelled() => Err(AppError::cancelled("容器文件下载已取消")),
-                            result = async {
-                                match sender.as_ref() {
-                                    Some(sender) => sender.send(bytes).await,
-                                    None => Err(mpsc::error::SendError(Vec::new())),
-                                }
-                            } => result.map_err(|_| AppError::infrastructure("本机 tar 解包器提前结束")),
+                        let send_result = match sender.as_ref() {
+                            Some(sender) => send_archive_chunk(
+                                sender,
+                                &mut extraction,
+                                bytes,
+                                &context.cancellation,
+                            ).await,
+                            None => Err(AppError::infrastructure("本机 tar 输入通道不可用")),
                         };
-                        if let Err(error) = send_result {
-                            drop(sender.take());
-                            let extract_result = join_extractor_if_running(extraction.take()).await;
-                            let error = with_cleanup_error(error, extract_result);
-                            return Err(close_failed_stream_with_cleanup(
-                                stream.clone(),
-                                error,
-                                cleanup_deadline(context),
-                                Some(Arc::new(LocalStagingCleanup {
-                                    path: staging_root.to_path_buf(),
-                                })),
-                            ).await);
+                        match send_result {
+                            Ok(Some(path)) => {
+                                extraction_result = Some(path);
+                                drop(sender.take());
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                drop(sender.take());
+                                let extract_result = join_extractor_if_running(extraction.take()).await;
+                                let error = with_cleanup_error(error, extract_result);
+                                return Err(close_failed_stream_with_cleanup(
+                                    stream.clone(),
+                                    error,
+                                    cleanup_deadline(context),
+                                    Some(Arc::new(LocalStagingCleanup {
+                                        path: staging_root.to_path_buf(),
+                                    })),
+                                ).await);
+                            }
                         }
                     }
                 }
@@ -456,7 +500,12 @@ async fn receive_archive(
             },
         }
     }
-    let exit = match stream.lock().await.finish().await {
+    // 错误分支需要再次获取同一 stream 处理清理，先释放 finish 持有的锁以避免自锁。
+    let finish_result = {
+        let mut guard = stream.lock().await;
+        guard.finish().await
+    };
+    let exit = match finish_result {
         Ok(exit) => exit,
         Err(error) => {
             return Err(close_failed_stream_with_cleanup(
@@ -487,6 +536,24 @@ async fn receive_archive(
         ))
     })?;
     Ok(bytes.load(Ordering::Relaxed))
+}
+
+/// 解包器可能在读取 tar 结束块后先于 trailing padding 返回；通道关闭时必须读取其真实回执再判定成败。
+///
+/// @author kongweiguang
+async fn send_archive_chunk(
+    sender: &mpsc::Sender<Vec<u8>>,
+    extraction: &mut Option<JoinHandle<io::Result<PathBuf>>>,
+    bytes: Vec<u8>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> AppResult<Option<PathBuf>> {
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(AppError::cancelled("容器文件下载已取消")),
+        result = sender.send(bytes) => match result {
+            Ok(()) => Ok(None),
+            Err(_) => join_extractor(extraction.take()).await.map(Some),
+        },
+    }
 }
 
 /// 让传输队列在 stream 未关闭时暂存 staging 所有权，避免并发删除仍在写入的文件树。
@@ -633,6 +700,10 @@ async fn join_extractor_if_running(
         None => Ok(()),
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/container_download_stream.rs"]
+mod stream_tests;
 
 /// 实现阻塞 Read 以便 tar crate 在 blocking pool 内解析有界异步数据通道。
 struct ChannelReader {

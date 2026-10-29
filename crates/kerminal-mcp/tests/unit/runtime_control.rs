@@ -12,10 +12,9 @@ use kerminal_application::{
     AppError, AppResult,
     agents::{
         AgentHistoryProjection, AgentHistoryRequest, AgentLauncherCatalog, AgentService,
-        AgentSessionRecordProjection, AgentSessionView, AgentTargetContext, AgentTargetResolution,
-        AgentTerminalSnapshotRequest, AgentTextPreview, AgentTextSubmissionReceipt,
-        CreateAgentSessionFromHistoryRequest, CreateAgentSessionRequest,
-        RenameAgentSessionTitleRequest, SendAgentCommandRequest,
+        AgentSessionView, AgentTargetContext, AgentTargetResolution, AgentTerminalSnapshotRequest,
+        AgentTextPreview, AgentTextSubmissionReceipt, CreateAgentSessionFromHistoryRequest,
+        CreateAgentSessionRequest, RenameAgentSessionTitleRequest, SendAgentCommandRequest,
     },
 };
 use kerminal_domain::{agents::AgentTargetBinding, identity::AgentSessionId};
@@ -147,15 +146,6 @@ impl AgentService for FakeAgentService {
         _agent_session_id: AgentSessionId,
         _cancellation: CancellationToken,
     ) -> AppResult<AgentSessionView> {
-        unused_agent_operation()
-    }
-
-    /// 未被此测试调用的记录投影能力明确返回 unsupported。
-    async fn record_projection(
-        &self,
-        _agent_session_id: AgentSessionId,
-        _cancellation: CancellationToken,
-    ) -> AppResult<AgentSessionRecordProjection> {
         unused_agent_operation()
     }
 

@@ -40,6 +40,10 @@ const CONFIG_GUIDE_REVISION_9_SHA256: &str =
     "41a2d9a34f503a5182027880595f2d42ebb7181b6120e1744fbfa3e93ff1382c";
 const CONFIG_GUIDE_REVISION_10_SHA256: &str =
     "721c2d1853c54b2c1beed73e513989545de4f2afb28bf00a7c239e68958d17f7";
+const CONFIG_GUIDE_REVISION_11_SHA256: &str =
+    "8e0bbf0bfd3ab7323e3a55a97c0000b06c1dfd74307ed8aa538c543a80d0b676";
+const CONFIG_GUIDE_REVISION_12_SHA256: &str =
+    "4acb8caac57c0696275684ac0eb6a9190192472af4c3fb3c576f9495c1b70864";
 const LEGACY_TAURI_CONFIG_GUIDE_SHA256: &str =
     "e70de091c515a0a143cd04f379a4274fbe18f810a411a6ca273277bc743220ad";
 
@@ -1256,6 +1260,10 @@ fn outdated_guide_revision(contents: &[u8]) -> Option<u32> {
     if digest == configuration::config_guide_digest(kerminal_application::preferences::CONFIG_GUIDE)
     {
         None
+    } else if digest == CONFIG_GUIDE_REVISION_12_SHA256 {
+        Some(12)
+    } else if digest == CONFIG_GUIDE_REVISION_11_SHA256 {
+        Some(11)
     } else if digest == CONFIG_GUIDE_REVISION_10_SHA256 {
         Some(10)
     } else if digest == CONFIG_GUIDE_REVISION_9_SHA256 {
@@ -1303,6 +1311,8 @@ fn known_previous_guide_digest(revision: u32) -> Option<&'static str> {
         8 => Some(CONFIG_GUIDE_REVISION_8_SHA256),
         9 => Some(CONFIG_GUIDE_REVISION_9_SHA256),
         10 => Some(CONFIG_GUIDE_REVISION_10_SHA256),
+        11 => Some(CONFIG_GUIDE_REVISION_11_SHA256),
+        12 => Some(CONFIG_GUIDE_REVISION_12_SHA256),
         _ => None,
     }
 }

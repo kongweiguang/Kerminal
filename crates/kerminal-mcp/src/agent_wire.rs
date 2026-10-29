@@ -19,13 +19,6 @@ use kerminal_domain::agents::{
 use serde::Serialize;
 use serde_json::Value;
 
-/// 将已验证的 application record projection 映射成 v0.3.45 MCP 记录外形。
-pub(crate) fn session_record_value(
-    projection: &AgentSessionRecordProjection,
-) -> Result<Value, AppError> {
-    to_value(AgentSessionRecordWire::from_projection(projection)?)
-}
-
 /// 将未确认的恢复操作映射为错误 data 中的可追踪原 session 标识。
 pub(crate) fn resume_recovery_data(recovery: &AgentResumeRecovery) -> Value {
     let status = match recovery.status {
@@ -35,25 +28,6 @@ pub(crate) fn resume_recovery_data(recovery: &AgentResumeRecovery) -> Value {
     serde_json::json!({
         "terminalSessionId": recovery.terminal_session_id.as_str(),
         "status": status
-    })
-}
-
-/// 将真实 target resolution 映射为旧版 targetBinding snapshot；缺少身份字段时显式失败。
-pub(crate) fn target_binding_value(resolution: &AgentTargetResolution) -> Result<Value, AppError> {
-    to_value(AgentTargetBindingSnapshotWire::from_resolution(resolution)?)
-}
-
-/// 生成旧版 entity 字段，实体类型和 terminalSessionId 是 MCP host 的稳定关联键。
-pub(crate) fn target_binding_entity_value(
-    resolution: &AgentTargetResolution,
-) -> Result<Value, AppError> {
-    let binding = AgentTargetBindingSnapshotWire::from_resolution(resolution)?;
-    let status = binding.status.as_str();
-    to_value(AgentTargetBindingEntityWire {
-        entity_type: "agentTargetBinding",
-        agent_session_id: binding.agent_session_id,
-        terminal_session_id: binding.target_terminal_session_id,
-        status,
     })
 }
 
@@ -547,25 +521,6 @@ impl AgentTargetBindingSnapshotStatusWire {
             }
         }
     }
-
-    /// 生成旧 entity 使用的稳定小写状态值。
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Live => "live",
-            Self::Stale => "stale",
-            Self::Closed => "closed",
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentTargetBindingEntityWire {
-    #[serde(rename = "type")]
-    entity_type: &'static str,
-    agent_session_id: String,
-    terminal_session_id: String,
-    status: &'static str,
 }
 
 #[derive(Serialize)]

@@ -16,7 +16,7 @@ use gpui_kit::{
     assets::IconName,
     component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
     component::{
-        Disableable as _, Sizable as _,
+        Disableable as _,
         button::{Button, ButtonVariants as _},
         checkbox::Checkbox,
         tooltip::Tooltip,
@@ -288,7 +288,7 @@ impl WorkspacePanes {
     }
 
     /// 递归绘制 split 树并在候选分支逐层累加同帧探针；只测实际祖先路径，避免猜测 Kit 几何。
-    /// 子容器只在相邻分屏之间留半个间距；嵌套布局不叠加外边距，确保与上方工具栏对齐。
+    /// 相邻分屏各留 2px 合成紧凑分隔带；嵌套布局不叠加外边距，确保与上方工具栏对齐。
     ///
     /// @author kongweiguang
     fn render_node(
@@ -410,8 +410,8 @@ impl WorkspacePanes {
                                 (ratio * 1_000.0).max(120.0) as f32
                             })
                         });
-                    let before = if index == 0 { 0. } else { 4. };
-                    let after = if index + 1 == children.len() { 0. } else { 4. };
+                    let before = if index == 0 { 0. } else { 2. };
+                    let after = if index + 1 == children.len() { 0. } else { 2. };
                     let mut panel_slot = div().size_full().flex().flex_col();
                     panel_slot = match direction {
                         SplitDirection::Horizontal => panel_slot.pl(px(before)).pr(px(after)),
@@ -1030,7 +1030,8 @@ fn split_button(
     })
 }
 
-/// 重启会影响当前 shell，保留明确文字以区别数据刷新；忙碌或 binding 缺失时不发出过期操作。
+/// 重启与分屏按钮共用图标槽位，以提示和无障碍名称说明作用范围；忙碌时保留槽位并禁止重复操作。
+/// 点击继续使用渲染时冻结的 binding，避免图标化改变会话身份校验。
 ///
 /// @author kongweiguang
 fn pane_refresh_button(
@@ -1039,13 +1040,16 @@ fn pane_refresh_button(
     cx: &mut Context<WorkspacePanes>,
 ) -> impl IntoElement {
     let enabled = refresh.as_ref().is_some_and(|refresh| !refresh.busy);
+    let busy = refresh.as_ref().is_some_and(|refresh| refresh.busy);
     let binding = refresh.map(|refresh| refresh.binding);
     let label = crate::locale::text("重启当前终端", "Restart terminal");
     let mut button = Button::new(format!("pane-refresh-{}", pane_id.as_str()))
         .compact()
         .ghost()
-        .small()
-        .label(crate::locale::text("重启", "Restart"))
+        .icon(IconName::RefreshCw)
+        .w(px(22.))
+        .h(px(22.))
+        .loading(busy)
         .flex_shrink_0()
         .accessibility_label(label.clone())
         .tooltip(label)

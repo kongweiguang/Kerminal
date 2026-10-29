@@ -6,8 +6,8 @@ use super::*;
 use gpui_pre::WindowBounds;
 use kerminal_application::{
     connections::management::{
-        HostAuthenticationMode, HostDraft, HostRouteSettings, HostSftpOptions, HostTerminalOptions,
-        RdpDisplayOptions,
+        HostAuthenticationMode, HostDraft, HostGroupDraft, HostRouteSettings, HostSftpOptions,
+        HostTerminalOptions, RdpDisplayOptions,
     },
     preferences::{ProfileDraft, ProfileRevision, VersionedProfile},
 };
@@ -18,12 +18,19 @@ use kerminal_domain::{
 use serde::Serialize;
 
 const WORKBENCH_ACCEPTANCE_ENV: &str = "KERMINAL_WORKBENCH_ACCEPTANCE";
+const WORKBENCH_POWERSHELL_ENV: &str = "KERMINAL_WORKBENCH_ACCEPTANCE_POWERSHELL";
 const WORKBENCH_REPORT_FILE: &str = "workbench-report.json";
 const WORKBENCH_PROFILE_ID: &str = "acceptance-default";
 const WORKBENCH_PROFILE_NAME: &str = "Acceptance Local Profile";
 const WORKBENCH_CONFLICT_PROFILE_ID: &str = "acceptance-conflicting-default";
 const WORKBENCH_HOST_ID: &str = "acceptance-host";
 const WORKBENCH_HOST_NAME: &str = "Acceptance Host Details";
+const WORKBENCH_UNGROUPED_HOST_ID: &str = "acceptance-ungrouped-host";
+const WORKBENCH_SFTP_HOST_ID: &str = "acceptance-sftp-host";
+const WORKBENCH_GROUP_ID: &str = "acceptance-pinned-group";
+
+#[path = "workbench_sidebar_menus.rs"]
+mod sidebar_menus;
 const WORKBENCH_READY_TIMEOUT: Duration = Duration::from_secs(45);
 const WORKBENCH_ACTION_TIMEOUT: Duration = Duration::from_secs(25);
 const REPEATED_PROFILE_OPENS: usize = 10;
@@ -60,12 +67,13 @@ struct WorkbenchAcceptanceReport {
     capture_backend: &'static str,
     native_isolation: crate::right_rail_acceptance::isolation::DesktopIsolationEvidence,
     config_directory: String,
+    local_profile_shell: String,
     window_visible: bool,
     window_active: bool,
     window_width: f32,
     window_height: f32,
-    host_details: AcceptanceCheck,
-    local_profile_details: AcceptanceCheck,
+    host_selection: AcceptanceCheck,
+    local_profile_selection: AcceptanceCheck,
     host_selection_preserved_agent_target: AcceptanceCheck,
     profile_selection_preserved_agent_target: AcceptanceCheck,
     default_profile_retry: AcceptanceCheck,
@@ -196,7 +204,9 @@ struct WorkbenchContext {
     fixture: AcceptanceFixture,
 }
 
-/// 通过应用服务创建隔离主机和默认 Profile，使验收复用真实校验、revision 与保存事务。
+/// 通过应用服务创建隔离主机、置顶分组和默认 Profile，同时核对真实目录样式与连接生命周期。
+/// 加入未分组与 SFTP 样本覆盖菜单差异，所有网络地址均为未连接的隔离 fixture。
+/// 可显式选用 Store PowerShell 的真实安装入口，避免 cmd 样本掩盖应用别名启动故障。
 async fn prepare_fixture(
     services: &kerminal_ui::AppServices,
 ) -> Result<AcceptanceFixture, Box<dyn Error>> {
@@ -205,9 +215,27 @@ async fn prepare_fixture(
         .hosts
         .clone()
         .ok_or_else(|| io::Error::other("host management service is unavailable"))?;
+    let group_service = host_service.clone();
+    services
+        .executor
+        .clone()
+        .run(move |_| async move {
+            let groups = group_service.load_groups().await?;
+            group_service
+                .save_group(
+                    HostGroupDraft {
+                        id: Some(WORKBENCH_GROUP_ID.to_owned()),
+                        name: "默认分组".to_owned(),
+                        sort_order: -1,
+                    },
+                    groups.revision,
+                )
+                .await
+        })
+        .await?;
     let draft = HostDraft {
         id: Some(host_id.clone()),
-        group_id: None,
+        group_id: Some(WORKBENCH_GROUP_ID.to_owned()),
         name: WORKBENCH_HOST_NAME.to_owned(),
         note: Some("Isolated host-details acceptance fixture; never connected.".to_owned()),
         protocol: kerminal_domain::connections::RemoteProtocol::Ssh,
@@ -233,7 +261,19 @@ async fn prepare_fixture(
     services
         .executor
         .clone()
-        .run(move |_| async move { host_service.save_host(draft, None).await })
+        .run(move |_| async move {
+            host_service.save_host(draft.clone(), None).await?;
+            let mut ungrouped = draft.clone();
+            ungrouped.id = Some(HostId::parse(WORKBENCH_UNGROUPED_HOST_ID)?);
+            ungrouped.name = "Acceptance Ungrouped Host".to_owned();
+            ungrouped.group_id = None;
+            host_service.save_host(ungrouped, None).await?;
+            let mut sftp = draft;
+            sftp.id = Some(HostId::parse(WORKBENCH_SFTP_HOST_ID)?);
+            sftp.name = "Acceptance SFTP Host".to_owned();
+            sftp.protocol = kerminal_domain::connections::RemoteProtocol::Sftp;
+            host_service.save_host(sftp, None).await
+        })
         .await?;
 
     let profile_id = WORKBENCH_PROFILE_ID.to_owned();
@@ -248,11 +288,15 @@ async fn prepare_fixture(
                     ProfileDraft {
                         id: Some(initial_profile_id),
                         name: WORKBENCH_PROFILE_NAME.to_owned(),
-                        shell: "cmd.exe".to_owned(),
-                        args: vec!["/Q".to_owned()],
+                        shell: acceptance_profile_shell(),
+                        args: if std::env::var_os(WORKBENCH_POWERSHELL_ENV).is_some() {
+                            vec!["-NoLogo".to_owned(), "-NoProfile".to_owned()]
+                        } else {
+                            vec!["/D".to_owned(), "/Q".to_owned()]
+                        },
                         cwd: None,
                         env: std::collections::BTreeMap::new(),
-                        sidebar_group_id: None,
+                        sidebar_group_id: Some(WORKBENCH_GROUP_ID.to_owned()),
                         sort_order: 0,
                     },
                     None,
@@ -376,7 +420,15 @@ fn run_hidden_window(
     Ok(())
 }
 
-/// 用真实控件、GPUI 键盘事件和异步状态回读覆盖失败恢复、重复开页、分屏与独立关闭闭环。
+/// 默认 cmd 样本之外允许精确选择调用方提供的 PowerShell 入口，配置仍只写入隔离根。
+///
+/// @author kongweiguang
+fn acceptance_profile_shell() -> String {
+    std::env::var(WORKBENCH_POWERSHELL_ENV).unwrap_or_else(|_| "cmd.exe".to_owned())
+}
+
+/// 用真实控件覆盖单击保持终端、双击及键盘连接、失败恢复、分屏与独立关闭，不借助中央详情按钮。
+/// 失败重试恢复本轮真实 shell；报告保留入口，区分普通 cmd 与 Store 应用别名验收。
 async fn capture_workbench(
     cx: &mut AsyncApp,
     root: Entity<RootView>,
@@ -412,51 +464,52 @@ async fn capture_workbench(
         .agent_target_key
         .clone()
         .ok_or_else(|| io::Error::other("initial Agent target candidate is unavailable"))?;
+    click_selector(cx, window, "host-navigation-refresh")?;
 
     click_selector(
         cx,
         window,
         &format!("host-navigation-host-{}", fixture.host_id.as_str()),
     )?;
-    let host_details_state = wait_for_workbench_state(
+    let host_selection_state = wait_for_workbench_state(
         cx,
         &root,
         window,
         &fixture,
         Instant::now() + WORKBENCH_ACTION_TIMEOUT,
-        "remote host details selection",
+        "remote host selection without center navigation",
         |state| state.host_selected && state.agent_target_key.as_ref() == Some(&initial_agent_key),
     )
     .await?;
     let _ = save_frame(
         cx,
         window,
-        context
-            .output_directory
-            .join("remote-host-details-before-check.png"),
+        context.output_directory.join("remote-host-selection.png"),
     )?;
-    let host_details_observation = workbench_state(cx, &root, window, &fixture)?;
+    let host_selection_observation = workbench_state(cx, &root, window, &fixture)?;
     fs::write(
         context
             .output_directory
-            .join("remote-host-details-state.json"),
-        serde_json::to_vec_pretty(&host_details_observation)?,
+            .join("remote-host-selection-state.json"),
+        serde_json::to_vec_pretty(&host_selection_observation)?,
     )?;
-    let host_detail_visible =
-        wait_for_selector(cx, window, "connections-edit-host", "remote host details").await?;
-    let host_details = AcceptanceCheck {
-        action: "select-remote-host-details",
-        passed: host_details_state.host_selected && host_detail_visible,
+    let host_detail_visible = workbench_selector_visible(cx, window, "connections-edit-host")?;
+    let host_selection = AcceptanceCheck {
+        action: "select-remote-host-without-details",
+        passed: host_selection_state.host_selected && !host_detail_visible
+            && host_selection_state.active_local_pane_id == first_session.active_local_pane_id
+            && host_selection_state.ready_session_ids == first_session.ready_session_ids,
         expected:
-            "HostSelected shows the saved host details in the center panel without connecting"
+            "selecting a remote host preserves the center terminal and session without showing details"
                 .to_owned(),
         observed: format!(
             "centerSelected={}, detailVisible={}, readyLocalSessions={}",
-            host_details_state.host_selected,
+            host_selection_state.host_selected,
             host_detail_visible,
-            host_details_state.ready_session_ids.len()
+            host_selection_state.ready_session_ids.len()
         ),
     };
+    capture_sidebar_themes(cx, &root, window, &services, &context.output_directory).await?;
 
     click_selector(
         cx,
@@ -469,29 +522,26 @@ async fn capture_workbench(
         window,
         &fixture,
         Instant::now() + WORKBENCH_ACTION_TIMEOUT,
-        "local Profile details selection",
+        "local Profile selection without center navigation",
         |state| {
             state.local_profile_selected
                 && state.agent_target_key.as_ref() == Some(&initial_agent_key)
         },
     )
     .await?;
-    let local_detail_visible = wait_for_selector(
-        cx,
-        window,
-        "connections-local-host-connect",
-        "local Profile details",
-    )
-    .await?;
+    let local_detail_visible =
+        workbench_selector_visible(cx, window, "connections-local-host-connect")?;
     let _ = save_frame(
         cx,
         window,
-        context.output_directory.join("local-profile-details.png"),
+        context.output_directory.join("local-profile-selection.png"),
     )?;
-    let local_profile_details = AcceptanceCheck {
-        action: "select-local-profile-details",
-        passed: local_details_state.local_profile_selected && local_detail_visible,
-        expected: "LocalProfileSelected shows the saved Profile details in the center panel"
+    let local_profile_selection = AcceptanceCheck {
+        action: "select-local-profile-without-details",
+        passed: local_details_state.local_profile_selected && !local_detail_visible
+            && local_details_state.active_local_pane_id == first_session.active_local_pane_id
+            && local_details_state.ready_session_ids == first_session.ready_session_ids,
+        expected: "selecting a local Profile preserves the center terminal and session without showing details"
             .to_owned(),
         observed: format!(
             "centerSelected={}, detailVisible={}",
@@ -500,9 +550,9 @@ async fn capture_workbench(
     };
     let host_selection_preserved_agent_target = AcceptanceCheck {
         action: "host-selection-preserves-agent-target",
-        passed: host_details_state.agent_target_key.as_ref() == Some(&initial_agent_key),
+        passed: host_selection_state.agent_target_key.as_ref() == Some(&initial_agent_key),
         expected: "the Agent target identity remains bound to the active terminal".to_owned(),
-        observed: if host_details_state.agent_target_key.as_ref() == Some(&initial_agent_key) {
+        observed: if host_selection_state.agent_target_key.as_ref() == Some(&initial_agent_key) {
             "unchanged".to_owned()
         } else {
             "changed".to_owned()
@@ -540,7 +590,7 @@ async fn capture_workbench(
         },
     )
     .await?;
-    update_profile_shell(&services, &fixture, "cmd.exe".to_owned()).await?;
+    update_profile_shell(&services, &fixture, acceptance_profile_shell()).await?;
     // 修复默认 shell 后仍从原加号入口重试，确认失败 reservation 已完整回滚。
     click_selector(cx, window, "workspace-tabs-create-terminal")?;
     let recovered = wait_for_workbench_state(
@@ -660,18 +710,15 @@ async fn capture_workbench(
             window,
             &format!("host-navigation-profile-{}", fixture.profile_id),
         )?;
-        wait_for_selector(
-            cx,
-            window,
-            "connections-local-host-connect",
-            "repeated local Profile details",
-        )
-        .await?;
         let previous = repeated.clone();
         if open_index == 1 {
             dispatch_workbench_key(cx, window, "enter")?;
         } else {
-            click_selector(cx, window, "connections-local-host-connect")?;
+            dispatch_workbench_second_click(
+                cx,
+                window,
+                &format!("host-navigation-profile-{}", fixture.profile_id),
+            )?;
         }
         let opened = wait_for_workbench_state(
             cx,
@@ -869,17 +916,18 @@ async fn capture_workbench(
             ))
         })??;
     let report = WorkbenchAcceptanceReport {
-        schema_version: 3,
+        schema_version: 4,
         capture_mode: "hidden-native-window",
         capture_backend: "gpui-root-click-and-state-readback",
         native_isolation: crate::right_rail_acceptance::isolation::capture()?,
         config_directory: context.config_directory.to_string_lossy().into_owned(),
+        local_profile_shell: acceptance_profile_shell(),
         window_visible,
         window_active,
         window_width,
         window_height,
-        host_details,
-        local_profile_details,
+        host_selection,
+        local_profile_selection,
         host_selection_preserved_agent_target,
         profile_selection_preserved_agent_target,
         default_profile_retry,
@@ -896,8 +944,8 @@ async fn capture_workbench(
         .native_isolation
         .validate_window_state(window_visible, window_active)?;
     if [
-        &report.host_details,
-        &report.local_profile_details,
+        &report.host_selection,
+        &report.local_profile_selection,
         &report.host_selection_preserved_agent_target,
         &report.profile_selection_preserved_agent_target,
         &report.default_profile_retry,
@@ -1041,6 +1089,105 @@ where
         }
         cx.background_executor().timer(POLL_INTERVAL).await;
     }
+}
+
+/// 从真实设置入口切换三种明暗模式并关闭模态后截图，避免只验证默认主题或绕过保存链路。
+/// 每个主题随后验证对象/背景菜单归属、Escape 焦点恢复和新建连接实际打开编辑器。
+///
+/// @author kongweiguang
+async fn capture_sidebar_themes(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    services: &kerminal_ui::AppServices,
+    output_directory: &Path,
+) -> Result<(), Box<dyn Error>> {
+    for (theme, name, selector) in THEMES {
+        press_key(cx, window, "ctrl-alt-s")?;
+        wait_for_state(cx, root, window, Instant::now() + ACTION_TIMEOUT, |state| {
+            state.modal_open() && state.settings_ready() && state.draft_ready()
+        })
+        .await?;
+        ensure_page(cx, root, window, "appearance", "appearance").await?;
+        reveal_settings_selector(cx, root, window, "appearance", selector).await?;
+        click_selector(cx, window, selector)?;
+        wait_for_state(cx, root, window, Instant::now() + ACTION_TIMEOUT, |state| {
+            state.draft_theme_mode() == Some(name) && !state.draft_dirty() && state.draft_ready()
+        })
+        .await?;
+        if load_persisted_settings(services).await?.settings.theme_mode != theme {
+            return Err(io::Error::other(format!("sidebar theme {name} was not saved")).into());
+        }
+        click_selector(cx, window, "preferences-close")?;
+        wait_for_state(cx, root, window, Instant::now() + ACTION_TIMEOUT, |state| {
+            !state.modal_open()
+        })
+        .await?;
+        let _ = save_frame(
+            cx,
+            window,
+            output_directory.join(format!("sidebar-{name}.png")),
+        )?;
+        sidebar_menus::capture(cx, root, window, output_directory, name).await?;
+    }
+    Ok(())
+}
+
+/// 在同一帧检查详情动作是否实际挂载，证明目录单击没有暗中替换中央终端。
+///
+/// @author kongweiguang
+fn workbench_selector_visible(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    selector: &str,
+) -> Result<bool, Box<dyn Error>> {
+    Ok(window.update(cx, |_, window, app| {
+        ensure_hidden_window(window)?;
+        window.refresh();
+        draw_acceptance_frame(window, app);
+        Ok::<_, io::Error>(selector_bounds(window, selector).is_ok())
+    })??)
+}
+
+/// 与前一个单击组成真实的第二击事件，只驱动私有窗口事件树，不使用操作系统鼠标。
+///
+/// @author kongweiguang
+fn dispatch_workbench_second_click(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    selector: &str,
+) -> Result<(), Box<dyn Error>> {
+    window.update(cx, |_, window, app| {
+        ensure_hidden_window(window)?;
+        window.refresh();
+        draw_acceptance_frame(window, app);
+        let bounds = selector_bounds(window, selector)?;
+        if !bounds_inside_viewport(bounds, window.visual_viewport_bounds()) {
+            return Err(io::Error::other(
+                "double-click target is outside the viewport",
+            ));
+        }
+        for event in [
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position: bounds.center(),
+                click_count: 2,
+                ..Default::default()
+            }
+            .to_platform_input(),
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position: bounds.center(),
+                click_count: 2,
+                ..Default::default()
+            }
+            .to_platform_input(),
+        ] {
+            let _ = window.dispatch_event(event, app);
+        }
+        Ok::<_, io::Error>(())
+    })??;
+    Ok(())
 }
 
 /// 按键直接进入私有窗口的生产焦点与事件树，验证真实键盘路径而不注入操作系统键鼠。

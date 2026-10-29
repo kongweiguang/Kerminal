@@ -19,7 +19,7 @@ use crate::theme::ThemeTokens;
 use super::panel::{ConnectionsPanel, PendingTrust, host_key_trust_allowed};
 use kerminal_domain::preferences::ConfigurationMode;
 
-/// 展示完整指纹；变化密钥或只读恢复状态不提供继续连接的信任动作。
+/// 展示完整指纹并沿用应用的决策遮罩；变化密钥或只读恢复状态不提供继续连接的信任动作。
 /// @author kongweiguang
 pub(super) fn render_trust_confirmation(
     pending: Option<&PendingTrust>,
@@ -114,7 +114,7 @@ pub(super) fn render_trust_confirmation(
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui_kit::hsla(0., 0., 0., 0.48))
+            .bg(theme.dialog_scrim)
             .child(
                 div()
                     .w_full()

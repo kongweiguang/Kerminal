@@ -142,7 +142,7 @@ struct NavigationTargetSpec<'a> {
 
 /// 将设置页的可见卡片映射到同一搜索目录，索引对应各页滚动容器的直接子项。
 /// 固定宽度导航使用简短标题，完整业务名称保留在页内，避免窄栏裁切。
-/// 本地主机及默认项已统一到连接管理，不再通过 Profile 分类暴露第二套编辑入口。
+/// Profile 与左栏本地主机共用同一服务，设置导航只暴露一个管理入口。
 ///
 /// @author kongweiguang
 fn navigation_targets(
@@ -165,6 +165,14 @@ fn navigation_targets(
             "终端",
             "Terminal",
             "配色 color 字体 font 字号 行高 字重 渲染 renderer 光标 cursor 右键 滚屏 scrollback",
+            IconName::Terminal,
+        ),
+        (
+            "profiles",
+            PreferencesSection::Profiles,
+            "Profile",
+            "Profiles",
+            "本地终端 默认 default shell profile powershell cmd wsl 配置 新建",
             IconName::Terminal,
         ),
         (
@@ -255,13 +263,13 @@ fn navigation_targets(
             })
         })
         .collect();
-    // 与 main 同源的十八个搜索入口；标题、说明、分类与关键词共同参与匹配。
+    // 各设置入口的标题、说明、分类与关键词共同参与匹配。
     for (id, section, title, description, index) in [
         (
             "settings-interface-appearance-panel",
             PreferencesSection::Appearance,
             "应用外观",
-            "切换深色、浅色或跟随系统。 dark light system theme 主题 深色 浅色",
+            "切换深浅外观与应用配色。 dark light system app color scheme palette 主题 配色 深色 浅色 Kerminal JetBrains Fleet Xcode Claude VS Code vscode",
             0,
         ),
         (
@@ -312,6 +320,13 @@ fn navigation_targets(
             "光标形态",
             "光标样式和闪烁行为。 cursor blink 光标 闪烁",
             4,
+        ),
+        (
+            "settings-profiles-panel",
+            PreferencesSection::Profiles,
+            "本地终端 Profile",
+            "管理本地 Profile 和默认终端。 profile local shell powershell cmd wsl 默认 终端",
+            0,
         ),
         (
             "settings-keyword-highlights-panel",
@@ -428,7 +443,7 @@ fn navigation_target(spec: NavigationTargetSpec<'_>) -> NavigationTarget {
 }
 
 impl Render for PreferencesPanel {
-    /// 沿用 main 的十一页和即时反馈；输入搜索时正文保留当前页，避免滚动与焦点跳动。
+    /// 设置页与本地主机共用 Profile，输入搜索时正文保留当前页，避免滚动与焦点跳动。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1007,7 +1022,7 @@ impl PreferencesPanel {
         })
     }
 
-    /// Dirty-close 提示同时覆盖两个草稿上下文，取消保留输入，丢弃后才发出根视图返回事件。
+    /// Dirty-close 提示覆盖两个草稿上下文，遮罩沿用主题以保持浅深色层级一致。
     fn render_close_confirmation(
         &mut self,
         theme: ThemeTokens,
@@ -1020,7 +1035,7 @@ impl PreferencesPanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui_kit::hsla(0., 0., 0., 0.45))
+                .bg(theme.dialog_scrim)
                 .child(
                     div()
                         .w(px(420.))
@@ -1071,7 +1086,7 @@ impl PreferencesPanel {
         })
     }
 
-    /// 切换 profile 前的丢弃提示局限在 Profile 表单，不会误丢其它设置草稿。
+    /// 切换 profile 前的丢弃提示局限于该表单，遮罩由当前应用主题决定。
     fn render_profile_switch_confirmation(
         &mut self,
         theme: ThemeTokens,
@@ -1084,7 +1099,7 @@ impl PreferencesPanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui_kit::hsla(0., 0., 0., 0.45))
+                .bg(theme.dialog_scrim)
                 .child(
                     div()
                         .w(px(420.))
@@ -1137,7 +1152,7 @@ impl PreferencesPanel {
         })
     }
 
-    /// 外部 Profile 版本冲突后，重读前明确提示会丢弃当前本地草稿。
+    /// 外部 Profile 冲突时明确提示重读的草稿后果，并复用当前主题遮罩。
     fn render_profile_reload_confirmation(
         &mut self,
         theme: ThemeTokens,
@@ -1150,7 +1165,7 @@ impl PreferencesPanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui_kit::hsla(0., 0., 0., 0.45))
+                .bg(theme.dialog_scrim)
                 .child(
                     div()
                         .w(px(420.))
@@ -1202,7 +1217,7 @@ impl PreferencesPanel {
         })
     }
 
-    /// 删除使用单独的二次确认，避免列表按钮误触发持久化删除。
+    /// 删除保持独立确认以避免误触发，并复用当前主题的决策层遮罩。
     fn render_profile_delete_confirmation(
         &mut self,
         theme: ThemeTokens,
@@ -1215,7 +1230,7 @@ impl PreferencesPanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui_kit::hsla(0., 0., 0., 0.45))
+                .bg(theme.dialog_scrim)
                 .child(
                     div()
                         .w(px(420.))
@@ -1265,7 +1280,7 @@ impl PreferencesPanel {
         })
     }
 
-    /// 偏好草稿退出确认由面板先完成，根窗口再依次检查编辑器并决定是否关闭。
+    /// 草稿退出确认先于根窗口检查，遮罩由主题提供以避免不同配色下层级漂移。
     fn render_quit_confirmation(
         &mut self,
         theme: ThemeTokens,
@@ -1278,7 +1293,7 @@ impl PreferencesPanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui_kit::hsla(0., 0., 0., 0.45))
+                .bg(theme.dialog_scrim)
                 .child(
                     div()
                         .w(px(440.))

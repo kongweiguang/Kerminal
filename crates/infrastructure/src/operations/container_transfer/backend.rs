@@ -484,12 +484,20 @@ pub(super) fn app_failure(
 }
 
 /// 取消只有在资源释放得到确认后才映射为 Cancelled，否则保留 Pending owner 的失败态。
+/// 仅记录应用固定的安全码和文案，便于诊断阶段故障而不暴露路径、命令或源错误详情。
+///
+/// @author kongweiguang
 pub(super) fn app_failure_with_cleanup(
     error: AppError,
     destination: Option<FileEndpoint>,
     retryable: bool,
     cleanup: TransferCleanupState,
 ) -> TransferExecutionError {
+    tracing::warn!(
+        error_code = error.public_code().as_str(),
+        reason = error.public_message(),
+        "容器传输失败"
+    );
     if error.public_code() == PublicErrorCode::Cancelled && cleanup.is_released() {
         return TransferExecutionError::Cancelled {
             checkpoint: None,

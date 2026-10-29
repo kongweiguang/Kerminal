@@ -32,6 +32,8 @@ pub use terminal::{
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SettingsSnapshot {
     pub theme_mode: ThemeMode,
+    #[serde(default)]
+    pub app_color_scheme: AppColorScheme,
     pub interface_language: InterfaceLanguage,
     pub interface_density: InterfaceDensity,
     pub background_enabled: bool,
@@ -56,6 +58,7 @@ impl Default for SettingsSnapshot {
     fn default() -> Self {
         Self {
             theme_mode: ThemeMode::Dark,
+            app_color_scheme: AppColorScheme::default(),
             interface_language: InterfaceLanguage::System,
             interface_density: InterfaceDensity::Compact,
             background_enabled: false,
@@ -136,6 +139,47 @@ pub enum ThemeMode {
     Dark,
     Light,
     System,
+}
+
+/// 应用界面的内置色板；终端 ANSI 与光标颜色由独立设置控制。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AppColorScheme {
+    #[default]
+    Kerminal,
+    #[serde(rename = "jetbrains")]
+    JetBrains,
+    Fleet,
+    Xcode,
+    Claude,
+    #[serde(rename = "vscode")]
+    VsCode,
+}
+
+impl AppColorScheme {
+    /// 内置选项顺序作为设置界面的稳定顺序，避免显示与持久化各自维护列表。
+    pub const ALL: [Self; 6] = [
+        Self::Kerminal,
+        Self::JetBrains,
+        Self::Fleet,
+        Self::Xcode,
+        Self::Claude,
+        Self::VsCode,
+    ];
+
+    /// 返回与 TOML 序列化一致的稳定标识，避免用本地化标签作为配置值。
+    ///
+    /// @author kongweiguang
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Kerminal => "kerminal",
+            Self::JetBrains => "jetbrains",
+            Self::Fleet => "fleet",
+            Self::Xcode => "xcode",
+            Self::Claude => "claude",
+            Self::VsCode => "vscode",
+        }
+    }
 }
 
 /// 设置界面语言策略；System 表示沿用当前应用语言选择。

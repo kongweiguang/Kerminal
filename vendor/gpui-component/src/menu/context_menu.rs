@@ -362,6 +362,9 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
         window.insert_hitbox(bounds, HitboxBehavior::Normal)
     }
 
+    /// GPUI 按注册逆序冒泡，因此先注册再绘制子元素，让最内层菜单先获得右键。
+    /// 命中菜单独占这次按下，避免对象与背景菜单同时打开，也保留外侧点击关闭的捕获阶段。
+    /// @author kongweiguang
     fn paint(
         &mut self,
         _: Option<&gpui::GlobalElementId>,
@@ -396,17 +399,18 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
             }
         });
 
-        if let Some(element) = &mut request_layout.element {
-            element.paint(window, cx);
-        }
-
         // When right mouse click, to build content menu, and show it at the mouse position.
         let hitbox = hitbox.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
             if phase.bubble() && event.button == MouseButton::Right && hitbox.is_hovered(window) {
                 open_menu(&shared_state, &builder, event.position, window, cx);
+                cx.stop_propagation();
             }
         });
+
+        if let Some(element) = &mut request_layout.element {
+            element.paint(window, cx);
+        }
     }
 }
 

@@ -1,14 +1,14 @@
-//! MCP SFTP 工具到统一 FileService 与 TransferService 的边界映射。
+//! MCP SFTP 传输工具到统一 TransferService 的边界映射。
 //!
 //! @author kongweiguang
 
 use std::path::PathBuf;
 
-use kerminal_application::{AppError, AppResult, PublicErrorCode, files::MAX_FILE_PREVIEW_BYTES};
+use kerminal_application::{AppError, AppResult, PublicErrorCode};
 use kerminal_domain::{
     files::{
-        ConflictPolicy, DeleteTargetKind, FileEndpoint, FileEntry, FileEntryKind, FilePreview,
-        RemotePath, TransferKind, TransferRequest, TransferStatus, TransferSummary,
+        ConflictPolicy, ContainerRuntime, FileEndpoint, RemotePath, TransferKind, TransferRequest,
+        TransferStatus, TransferSummary,
     },
     identity::{HostId, TransferId},
 };
@@ -19,51 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     McpServices,
-    terminal_tools::{failure, parse_args, success},
+    terminal_tools::{failure, parse_args},
 };
-
-const DEFAULT_PREVIEW_BYTES: usize = 64 * 1024;
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct HostPathArgs {
-    host_id: String,
-    path: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RenameArgs {
-    host_id: String,
-    from_path: String,
-    to_path: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PreviewArgs {
-    host_id: String,
-    path: String,
-    #[serde(default)]
-    max_bytes: Option<usize>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DeleteArgs {
-    host_id: String,
-    path: String,
-    #[serde(default)]
-    directory: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ChmodArgs {
-    host_id: String,
-    path: String,
-    mode: String,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
@@ -137,7 +94,7 @@ struct OptionalTransferIdArgs {
     transfer_id: Option<String>,
 }
 
-/// 只把冻结的 SFTP tool id 路由到 application 用例；此层不维护第二份连接或队列状态。
+/// 只把保留的传输工具路由到应用队列；此层不维护第二份连接或队列状态。
 ///
 /// @author kongweiguang
 pub(crate) async fn dispatch(
@@ -150,298 +107,11 @@ pub(crate) async fn dispatch(
         return failure(AppError::cancelled("SFTP MCP 请求已取消"));
     }
     match tool_id {
-        "sftp.list" => list(services, arguments, cancellation).await,
-        "sftp.rename" | "sftp.move" => {
-            rename_file(services, arguments, cancellation, tool_id == "sftp.move").await
-        }
-        "sftp.preview" => preview(services, arguments, cancellation).await,
-        "sftp.delete" => delete(services, arguments, cancellation).await,
-        "sftp.create_directory" => create_directory(services, arguments, cancellation).await,
-        "sftp.chmod" => chmod(services, arguments, cancellation).await,
         "sftp.transfer.enqueue" => enqueue_transfer(services, arguments, cancellation).await,
         "sftp.transfer.list" => list_transfers(services, arguments, cancellation).await,
         "sftp.transfer.cancel" => cancel_transfer(services, arguments, cancellation).await,
         "sftp.transfer.retry" => retry_transfer(services, arguments, cancellation).await,
-        "sftp.transfer.clear_completed" => clear_completed(services, cancellation).await,
         _ => failure(AppError::unsupported("SFTP tool id is not supported")),
-    }
-}
-
-/// 把 rename 与 move 的旧工具 ID 映射到同一文件用例，并保持远端路径显式校验。
-///
-/// @author kongweiguang
-async fn rename_file(
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancellation: CancellationToken,
-    move_alias: bool,
-) -> CallToolResult {
-    let args = match parse_args::<RenameArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return failure(error),
-    };
-    let source = match remote_endpoint(&args.host_id, &args.from_path, false) {
-        Ok(endpoint) => endpoint,
-        Err(error) => return failure(error),
-    };
-    let destination = match remote_endpoint(&args.host_id, &args.to_path, false) {
-        Ok(endpoint) => endpoint,
-        Err(error) => return failure(error),
-    };
-    let files = match services.require_files() {
-        Ok(files) => files,
-        Err(error) => return failure(error),
-    };
-
-    match files.rename(cancellation, source, destination).await {
-        Ok(()) => success(
-            if move_alias {
-                format!("远程路径已移动：{} -> {}。", args.from_path, args.to_path)
-            } else {
-                format!("远程路径已重命名：{} -> {}。", args.from_path, args.to_path)
-            },
-            json!({
-                "hostId": args.host_id,
-                "fromPath": args.from_path,
-                "toPath": args.to_path
-            }),
-            Vec::new(),
-        ),
-        Err(error) => failure(error),
-    }
-}
-
-/// 读取一层远端目录并沿用外部 Agent 已使用的 entry 与 entity 形状。
-///
-/// @author kongweiguang
-async fn list(
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    let args = match parse_args::<HostPathArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return failure(error),
-    };
-    let endpoint = match remote_endpoint(&args.host_id, &args.path, true) {
-        Ok(endpoint) => endpoint,
-        Err(error) => return failure(error),
-    };
-    let listing = match services.require_files() {
-        Ok(files) => match files.list_directory(cancellation, endpoint).await {
-            Ok(listing) => listing,
-            Err(error) => return failure(error),
-        },
-        Err(error) => return failure(error),
-    };
-    let (host_id, path) = match remote_endpoint_parts(&listing.directory) {
-        Ok(parts) => parts,
-        Err(error) => return failure(error),
-    };
-    let mut entries = Vec::with_capacity(listing.entries.len());
-    let mut entities = Vec::with_capacity(listing.entries.len());
-    for entry in &listing.entries {
-        let value = match file_entry_value(entry) {
-            Ok(value) => value,
-            Err(error) => return failure(error),
-        };
-        entities.push(json!({
-            "type": "sftpEntry",
-            "hostId": host_id,
-            "path": path,
-            "name": entry.name,
-            "kind": entry_kind_value(entry.kind),
-            "size": entry.size,
-            "permissions": entry.permissions.map(|mode| permission_string(entry.kind, mode)),
-            "modified": entry.modified,
-            "raw": entry.raw,
-        }));
-        entries.push(value);
-    }
-    let count = entries.len();
-    success(
-        format!("远程目录已读取：{host_id}:{path}，共 {count} 项。"),
-        json!({ "hostId": host_id, "path": path, "entryCount": count, "entries": entries }),
-        entities,
-    )
-}
-
-/// 预览严格受应用层最大字节预算约束，二进制正文不会被冒充为文本交给 Agent。
-///
-/// @author kongweiguang
-async fn preview(
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    let args = match parse_args::<PreviewArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return failure(error),
-    };
-    let endpoint = match remote_endpoint(&args.host_id, &args.path, false) {
-        Ok(endpoint) => endpoint,
-        Err(error) => return failure(error),
-    };
-    let max_bytes = args
-        .max_bytes
-        .unwrap_or(DEFAULT_PREVIEW_BYTES)
-        .min(MAX_FILE_PREVIEW_BYTES);
-    if max_bytes == 0 {
-        return failure(AppError::invalid("maxBytes must be greater than zero"));
-    }
-    let files = match services.require_files() {
-        Ok(files) => files,
-        Err(error) => return failure(error),
-    };
-    let preview = match files.preview_file(cancellation, endpoint, max_bytes).await {
-        Ok(preview) => preview,
-        Err(error) => return failure(error),
-    };
-    let (host_id, path) = match remote_endpoint_parts(&preview.endpoint) {
-        Ok(parts) => parts,
-        Err(error) => return failure(error),
-    };
-    let content = preview_content(&preview);
-    let encoding = if preview.binary { "binary" } else { "utf-8" };
-    success(
-        format!(
-            "远程文件已预览：{host_id}:{path}，读取 {} / {max_bytes} 字节{}。",
-            preview.bytes.len(),
-            if preview.truncated {
-                "，内容已截断"
-            } else {
-                ""
-            }
-        ),
-        json!({
-            "hostId": host_id,
-            "path": path,
-            "content": content,
-            "bytesRead": preview.bytes.len(),
-            "maxBytes": max_bytes,
-            "truncated": preview.truncated,
-            "encoding": encoding
-        }),
-        Vec::new(),
-    )
-}
-
-/// 通过远端 adapter 删除文件或仅删除空目录，不把旧 SFTP 语义扩展成递归删除。
-///
-/// @author kongweiguang
-async fn delete(
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    let args = match parse_args::<DeleteArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return failure(error),
-    };
-    let endpoint = match remote_endpoint(&args.host_id, &args.path, false) {
-        Ok(endpoint) => endpoint,
-        Err(error) => return failure(error),
-    };
-    let kind = if args.directory.unwrap_or(false) {
-        DeleteTargetKind::Directory
-    } else {
-        DeleteTargetKind::File
-    };
-    let files = match services.require_files() {
-        Ok(files) => files,
-        Err(error) => return failure(error),
-    };
-    match files.delete(cancellation, endpoint, kind).await {
-        Ok(()) => success(
-            if kind == DeleteTargetKind::Directory {
-                format!("远程空目录删除已执行：{}:{}。", args.host_id, args.path)
-            } else {
-                format!("远程文件删除已执行：{}:{}。", args.host_id, args.path)
-            },
-            json!({ "hostId": args.host_id, "path": args.path, "directory": kind == DeleteTargetKind::Directory }),
-            Vec::new(),
-        ),
-        Err(error) => failure(error),
-    }
-}
-
-/// 新建单层目录并把创建结果返回给 MCP host。
-///
-/// @author kongweiguang
-async fn create_directory(
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    let args = match parse_args::<HostPathArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return failure(error),
-    };
-    let endpoint = match remote_endpoint(&args.host_id, &args.path, false) {
-        Ok(endpoint) => endpoint,
-        Err(error) => return failure(error),
-    };
-    let files = match services.require_files() {
-        Ok(files) => files,
-        Err(error) => return failure(error),
-    };
-    match files.create_directory(cancellation, endpoint).await {
-        Ok(()) => success(
-            format!("远程目录已创建：{}:{}。", args.host_id, args.path),
-            json!({ "hostId": args.host_id, "path": args.path }),
-            Vec::new(),
-        ),
-        Err(error) => failure(error),
-    }
-}
-
-/// 解析八进制权限文本后调用 SFTP chmod，禁止接受任意非八进制字符。
-///
-/// @author kongweiguang
-async fn chmod(
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    let args = match parse_args::<ChmodArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return failure(error),
-    };
-    let endpoint = match remote_endpoint(&args.host_id, &args.path, false) {
-        Ok(endpoint) => endpoint,
-        Err(error) => return failure(error),
-    };
-    let mode_text = args.mode.trim();
-    if mode_text.is_empty()
-        || mode_text.len() > 4
-        || !mode_text.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
-    {
-        return failure(AppError::invalid(
-            "mode must be a three or four digit octal value",
-        ));
-    }
-    let mode = match u32::from_str_radix(mode_text, 8) {
-        Ok(mode) if mode <= 0o7777 => mode,
-        _ => {
-            return failure(AppError::invalid(
-                "mode is outside supported Unix permissions",
-            ));
-        }
-    };
-    let files = match services.require_files() {
-        Ok(files) => files,
-        Err(error) => return failure(error),
-    };
-    match files.chmod(cancellation, endpoint, mode).await {
-        Ok(()) => success(
-            format!(
-                "远程路径权限已修改：{}:{} -> {:o}。",
-                args.host_id, args.path, mode
-            ),
-            json!({ "hostId": args.host_id, "path": args.path, "mode": format!("{:o}", mode) }),
-            Vec::new(),
-        ),
-        Err(error) => failure(error),
     }
 }
 
@@ -638,32 +308,6 @@ fn retry_failure(error: AppError) -> CallToolResult {
     }))
 }
 
-/// 清理可安全移除的终态记录，并把 MCP host 的运行中取消传递给队列用例。
-///
-/// @author kongweiguang
-async fn clear_completed(
-    services: &McpServices,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    if cancellation.is_cancelled() {
-        return failure(AppError::cancelled("SFTP transfer cleanup was cancelled"));
-    }
-    let transfers = match services.require_transfers() {
-        Ok(transfers) => transfers,
-        Err(error) => return failure(error),
-    };
-    match transfers.clear_completed(cancellation).await {
-        Ok((removed_count, remaining_count)) => success(
-            format!(
-                "已清理 {removed_count} 个可安全移除的结束任务，当前保留 {remaining_count} 个任务；仍需核对的提交结果会保留。"
-            ),
-            json!({ "removedCount": removed_count, "remainingCount": remaining_count }),
-            Vec::new(),
-        ),
-        Err(error) => failure(error),
-    }
-}
-
 /// 按旧工具契约支持 canonical 端点和已投入使用的 flat upload/download 请求。
 ///
 /// @author kongweiguang
@@ -696,7 +340,7 @@ fn transfer_request(arguments: Map<String, Value>) -> AppResult<TransferRequest>
     let args = parse_args::<LegacyTransferArgs>(arguments)?;
     validate_idle_timeout(args.idle_timeout_seconds)?;
     let local = local_endpoint(&args.local_path, "localPath")?;
-    let remote = remote_endpoint(&args.host_id, &args.remote_path, false)?;
+    let remote = remote_endpoint(&args.host_id, &args.remote_path)?;
     let (source, destination) = match args.direction {
         TransferDirectionArgs::Upload => (local, remote),
         TransferDirectionArgs::Download => (remote, local),
@@ -718,7 +362,7 @@ fn transfer_request(arguments: Map<String, Value>) -> AppResult<TransferRequest>
 fn transfer_endpoint(args: TransferEndpointArgs, label: &str) -> AppResult<FileEndpoint> {
     match args {
         TransferEndpointArgs::Local { path } => local_endpoint(&path, label),
-        TransferEndpointArgs::Remote { host_id, path } => remote_endpoint(&host_id, &path, false),
+        TransferEndpointArgs::Remote { host_id, path } => remote_endpoint(&host_id, &path),
     }
 }
 
@@ -736,122 +380,17 @@ fn local_endpoint(path: &str, label: &str) -> AppResult<FileEndpoint> {
     })
 }
 
-/// 将 opaque host id 和 POSIX 路径解析为受限 SFTP endpoint。
+/// 将 opaque host id 和 POSIX 路径解析为受限传输端点，禁止把远程根目录作为复制目标。
 ///
 /// @author kongweiguang
-fn remote_endpoint(host_id: &str, path: &str, allow_root: bool) -> AppResult<FileEndpoint> {
+fn remote_endpoint(host_id: &str, path: &str) -> AppResult<FileEndpoint> {
     let host_id = HostId::parse(host_id).map_err(|_| AppError::invalid("host id"))?;
     let normalized_path = path.replace('\\', "/");
     let path = RemotePath::parse(&normalized_path).map_err(|_| AppError::invalid("remote path"))?;
-    if !allow_root && path.as_str() == "/" {
+    if path.as_str() == "/" {
         return Err(AppError::invalid("remote root is not a file target"));
     }
     Ok(FileEndpoint::Remote { host_id, path })
-}
-
-/// 读取已构造的远端 endpoint 标识，用于输出外部协议的 hostId/path 字段。
-///
-/// @author kongweiguang
-fn remote_endpoint_parts(endpoint: &FileEndpoint) -> AppResult<(&str, &str)> {
-    match endpoint {
-        FileEndpoint::Remote { host_id, path } => Ok((host_id.as_str(), path.as_str())),
-        _ => Err(AppError::infrastructure(
-            "SFTP adapter returned a non-remote endpoint",
-        )),
-    }
-}
-
-/// 转换单个领域目录行；没有协议原文或属性投影时以 null 保留旧 wire 字段形状。
-///
-/// @author kongweiguang
-fn file_entry_value(entry: &FileEntry) -> AppResult<Value> {
-    let path = match &entry.endpoint {
-        FileEndpoint::Remote { path, .. } => path.as_str().to_owned(),
-        _ => {
-            return Err(AppError::infrastructure(
-                "SFTP entry returned a non-remote endpoint",
-            ));
-        }
-    };
-    Ok(json!({
-        "name": entry.name,
-        "path": path,
-        "kind": entry_kind_value(entry.kind),
-        "size": entry.size,
-        "permissions": entry.permissions.map(|mode| permission_string(entry.kind, mode)),
-        "modified": entry.modified,
-        "raw": entry.raw,
-    }))
-}
-
-/// 保持历史 MCP 目录项类型的小写 wire 值。
-///
-/// @author kongweiguang
-fn entry_kind_value(kind: FileEntryKind) -> &'static str {
-    match kind {
-        FileEntryKind::File => "file",
-        FileEntryKind::Directory => "directory",
-        FileEntryKind::Symlink => "symlink",
-        FileEntryKind::Other => "other",
-    }
-}
-
-/// 将文件类型和 Unix mode 格式化为十位 ls 权限文本；特殊位未设置时仍显示普通 `x` 或 `-`。
-///
-/// @author kongweiguang
-fn permission_string(kind: FileEntryKind, mode: u32) -> String {
-    let file_type = match kind {
-        FileEntryKind::File => '-',
-        FileEntryKind::Directory => 'd',
-        FileEntryKind::Symlink => 'l',
-        FileEntryKind::Other => '?',
-    };
-    let mut output = String::with_capacity(10);
-    output.push(file_type);
-    for (read, write, execute) in [
-        (0o400, 0o200, 0o100),
-        (0o040, 0o020, 0o010),
-        (0o004, 0o002, 0o001),
-    ] {
-        output.push(if mode & read != 0 { 'r' } else { '-' });
-        output.push(if mode & write != 0 { 'w' } else { '-' });
-        let special = match execute {
-            0o100 => 0o4000,
-            0o010 => 0o2000,
-            _ => 0o1000,
-        };
-        let marker = if mode & special != 0 {
-            if special == 0o1000 {
-                if mode & execute != 0 { 't' } else { 'T' }
-            } else if mode & execute != 0 {
-                's'
-            } else {
-                'S'
-            }
-        } else if mode & execute != 0 {
-            'x'
-        } else {
-            '-'
-        };
-        output.push(marker);
-    }
-    output
-}
-
-/// 只对预览正文做 UTF-8 解码；截断末尾的不完整码点被裁掉而不被误标为二进制。
-///
-/// @author kongweiguang
-fn preview_content(preview: &FilePreview) -> String {
-    if preview.binary {
-        return String::new();
-    }
-    match std::str::from_utf8(&preview.bytes) {
-        Ok(text) => text.to_owned(),
-        Err(error) if preview.truncated && error.error_len().is_none() => {
-            String::from_utf8_lossy(&preview.bytes[..error.valid_up_to()]).into_owned()
-        }
-        Err(_) => String::from_utf8_lossy(&preview.bytes).into_owned(),
-    }
 }
 
 /// 拒绝目录传输源与目标互为祖先，避免递归复制把一侧再次纳入另一侧。
@@ -989,7 +528,7 @@ fn transfer_projection(summary: &TransferSummary) -> Value {
             "retryable": summary.retryable,
             "resumable": summary.resumable
         })),
-        "transportMode": if matches!(request.source, FileEndpoint::Remote { .. }) && matches!(destination, FileEndpoint::Remote { .. }) { "clientBridge" } else { "singleHostSftp" },
+        "transportMode": if matches!(request.source, FileEndpoint::Container { .. }) || matches!(destination, FileEndpoint::Container { .. }) { "containerArchive" } else if matches!(request.source, FileEndpoint::Remote { .. }) && matches!(destination, FileEndpoint::Remote { .. }) { "clientBridge" } else { "singleHostSftp" },
         "phase": transfer_phase_value(summary.status),
         "error": summary.safe_error
     });
@@ -1023,7 +562,7 @@ fn transfer_entity(summary: &TransferSummary) -> Value {
     })
 }
 
-/// 输出统一 endpoint wire shape，local path 使用宿主平台原生文本。
+/// 队列也承载容器归档传输，必须保留可回读的目标身份，不能把已受理的容器任务标成 unsupported。
 ///
 /// @author kongweiguang
 fn transfer_endpoint_value(endpoint: &FileEndpoint) -> Value {
@@ -1037,17 +576,34 @@ fn transfer_endpoint_value(endpoint: &FileEndpoint) -> Value {
             "hostId": host_id.as_str(),
             "path": path.as_str()
         }),
-        FileEndpoint::Container { .. } => json!({ "type": "unsupported" }),
+        FileEndpoint::Container {
+            host_id,
+            runtime,
+            container_id,
+            path,
+        } => json!({
+            "type": "container",
+            "hostId": host_id.as_ref().map(HostId::as_str),
+            "runtime": if *runtime == ContainerRuntime::Docker { "docker" } else { "podman" },
+            "containerId": container_id,
+            "path": path.as_str()
+        }),
     }
 }
 
-/// 根据实际端点方向确定旧 transfer projection 的 operation 字段。
+/// 按本机与远端（含容器）之间的方向报告上传下载，保持普通 SFTP 的旧值并避免容器上传误报 remoteCopy。
 ///
 /// @author kongweiguang
 fn transfer_operation(source: &FileEndpoint, destination: &FileEndpoint) -> &'static str {
     match (source, destination) {
-        (FileEndpoint::Local { .. }, FileEndpoint::Remote { .. }) => "upload",
-        (FileEndpoint::Remote { .. }, FileEndpoint::Local { .. }) => "download",
+        (
+            FileEndpoint::Local { .. },
+            FileEndpoint::Remote { .. } | FileEndpoint::Container { .. },
+        ) => "upload",
+        (
+            FileEndpoint::Remote { .. } | FileEndpoint::Container { .. },
+            FileEndpoint::Local { .. },
+        ) => "download",
         (FileEndpoint::Remote { .. }, FileEndpoint::Remote { .. }) => "remoteCopy",
         _ => "remoteCopy",
     }

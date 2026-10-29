@@ -8,7 +8,7 @@ use gpui_kit::{
         Disableable as _,
         command::{Command, CommandItem, CommandState},
     },
-    div, hsla,
+    div,
     prelude::*,
     px,
 };
@@ -352,7 +352,7 @@ impl Render for QuickOpenView {
                 });
             });
 
-        quick_open_overlay_surface().child(
+        quick_open_overlay_surface(theme).child(
             div()
                 .id("quick-open-modal")
                 .key_context("Modal")
@@ -373,9 +373,10 @@ impl Render for QuickOpenView {
 
 /// 遮罩必须阻挡鼠标和滚动命中；单纯绘制半透明背景不会在 GPUI 中遮蔽后方 Canvas 或标题栏。
 /// 保持面板子控件正常接收输入，不用全窗捕获事件吞掉 Input 自己的聚焦、选中或组合输入。
+/// 颜色由调用帧的活动主题提供，已打开的搜索面板换色时也不会残留旧遮罩。
 ///
 /// @author kongweiguang
-pub(super) fn quick_open_overlay_surface() -> Stateful<Div> {
+pub(super) fn quick_open_overlay_surface(theme: ThemeTokens) -> Stateful<Div> {
     div()
         .id("quick-open-overlay")
         .absolute()
@@ -384,7 +385,7 @@ pub(super) fn quick_open_overlay_surface() -> Stateful<Div> {
         .flex()
         .justify_center()
         .items_start()
-        .bg(hsla(0., 0., 0., 0.42))
+        .bg(theme.scrim)
 }
 
 /// 仅展示当前被查询的数据源；Root 通过精确 ID 再次校验目标存在和状态。

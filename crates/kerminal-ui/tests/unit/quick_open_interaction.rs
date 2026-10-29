@@ -113,10 +113,10 @@ impl QuickOpenInteractionHarness {
 }
 
 impl Render for QuickOpenInteractionHarness {
-    /// 使用真实 Kit Command/InputState，并复刻 QuickOpenView 的 owner 更新与命令状态回调边界。
+    /// 使用真实 Kit Command/InputState 与当前主题，复刻 owner 更新边界而不固定遮罩配色。
     ///
     /// @author kongweiguang
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let canvas_mouse_down = cx.listener(|root, _, _, _| {
             root.canvas_mouse_downs += 1;
         });
@@ -199,16 +199,17 @@ impl Render for QuickOpenInteractionHarness {
                 });
             });
         surface = surface.child(
-            super::view::quick_open_overlay_surface().child(
-                div()
-                    .id("quick-open-modal")
-                    .debug_selector(|| "quick-open-command-frame".to_owned())
-                    .mt(px(54.))
-                    .w(px(720.))
-                    .max_w_full()
-                    .max_h(px(560.))
-                    .child(command),
-            ),
+            super::view::quick_open_overlay_surface(crate::theme::ThemeTokens::current(window, cx))
+                .child(
+                    div()
+                        .id("quick-open-modal")
+                        .debug_selector(|| "quick-open-command-frame".to_owned())
+                        .mt(px(54.))
+                        .w(px(720.))
+                        .max_w_full()
+                        .max_h(px(560.))
+                        .child(command),
+                ),
         );
         surface
     }

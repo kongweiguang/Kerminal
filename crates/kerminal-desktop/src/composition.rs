@@ -26,10 +26,6 @@ use kerminal_application::{
         management::{HostManagementRepository, HostManagementService},
         probe::{ConnectionProbeBackend, ConnectionProbeService},
     },
-    diagnostics::{
-        DiagnosticBundleArchive, DiagnosticsContextProvider, DiagnosticsService,
-        RuntimeHealthCollector,
-    },
     executor::ApplicationTaskExecutor,
     files::{
         FileAccessProvider, FileBookmarkRepository, FileService,
@@ -75,7 +71,6 @@ use kerminal_infrastructure::{
         serial::{SerialRuntimeConfig, SerialSessionTransportFactory, TokioSerialPortRepository},
         telnet::{TelnetRuntimeConfig, TelnetSessionTransportFactory},
     },
-    diagnostics::LocalDiagnosticsAdapter,
     files::{
         JsonFileBookmarkRepository, JsonTransferRecoveryRepository, LocalFileProvider,
         SftpFileProvider, SftpTransferBackend,
@@ -454,18 +449,6 @@ impl DesktopComposition {
         let sync_repository: Arc<dyn ConfigurationSyncRepository> = git_sync_repository.clone();
         let configuration_sync = ConfigurationSyncService::new(sync_repository);
 
-        let diagnostics_adapter = Arc::new(LocalDiagnosticsAdapter::new(
-            storage.clone(),
-            command_history,
-            preferences.clone(),
-            session_service.clone(),
-            operations_command_executor.clone(),
-        ));
-        let diagnostics_context: Arc<dyn DiagnosticsContextProvider> = diagnostics_adapter.clone();
-        let runtime_health: Arc<dyn RuntimeHealthCollector> = diagnostics_adapter.clone();
-        let bundle_archive: Arc<dyn DiagnosticBundleArchive> = diagnostics_adapter;
-        let diagnostics =
-            DiagnosticsService::new(diagnostics_context, runtime_health, bundle_archive);
         let session_log_repository: Arc<dyn SessionLogRepository> = Arc::new(session_logs.clone());
         let session_log_service = SessionLogService::new(session_log_repository);
         let agent_workspace_repository: Arc<dyn AgentWorkspaceRepository> =
@@ -495,13 +478,11 @@ impl DesktopComposition {
                 host_management.clone(),
                 credential_service.clone(),
             )
-            .with_files(files.clone(), transfers.clone())
+            .with_transfers(transfers.clone())
             .with_operations(operations.as_ref().clone())
             .with_commands(commands.as_ref().clone())
             .with_profiles(profiles.clone())
-            .with_configuration_validation(configuration_validation.clone())
-            .with_diagnostics(diagnostics.clone())
-            .with_session_logs(session_log_service.clone());
+            .with_configuration_validation(configuration_validation.clone());
         let mcp_runtime: Arc<dyn McpRuntimeControl> = Arc::new(McpRuntimeController::new(
             runtime.clone(),
             mcp_services,
@@ -1212,3 +1193,7 @@ mod shutdown_ordering_tests;
 #[cfg(test)]
 #[path = "../tests/support/serial_port_composition_unit.rs"]
 mod serial_port_composition_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/mcp_live/mod.rs"]
+mod mcp_live_acceptance;

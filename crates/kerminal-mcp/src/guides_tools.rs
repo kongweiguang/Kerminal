@@ -29,10 +29,20 @@ const ABSENT_TOOL_FAMILIES: &[&str] = &[
     "history.record",
     "history.delete",
     "history.clear",
+    "sftp.list",
+    "sftp.preview",
+    "sftp.rename",
+    "sftp.delete",
+    "sftp.create_directory",
+    "sftp.chmod",
+    "container.*",
+    "tmux.*",
+    "server_info.snapshot",
+    "terminal.log.*",
+    "terminal.reconnect",
+    "diagnostics.*",
     "pending/confirm/approval/audit queues",
 ];
-
-const CONTAINER_TEXT_WRITE_GUIDANCE: &str = "编辑现有容器文件时先调用 container.files.preview，并将返回的 revision 原样传入 container.files.write_text.expectedRevision；只要 expectedRevision 存在就执行比较并交换，目标缺失或 revision 不匹配都应重新读取处理。无 revision 时，create=true 表示仅新建，overwriteOnConflict=true 表示显式覆盖，两者同时为 true 表示显式 upsert；两者均为 false 会拒绝。改名不会覆盖已存在的目标。提交结果未知时先读回目标，再决定后续操作。";
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -61,22 +71,41 @@ pub(crate) async fn dispatch(
         return failure(AppError::cancelled("MCP discovery request was cancelled"));
     }
     match tool_id {
-        "kerminal.capabilities" => capabilities(arguments),
-        "kerminal.app_guide" => app_guide(arguments),
-        "kerminal.config_guide" => config_guide(arguments),
-        "kerminal.tool_help" => tool_help(arguments),
-        "kerminal.operation_guide" => operation_guide(arguments),
+        "kerminal.help" => help(services, arguments),
         "kerminal.runtime_snapshot" => runtime_snapshot(services, arguments, cancellation).await,
         _ => failure(AppError::invalid("Unknown discovery tool")),
     }
 }
 
-/// 从 catalog 注解形成能力地图，保持 MCP host 审批责任和当前真实工具集合可发现。
-fn capabilities(arguments: Map<String, Value>) -> CallToolResult {
+/// 一个只读入口按主题返回已有帮助；参数仍由对应主题 DTO 严格校验，不能触发执行。
+fn help(services: &McpServices, mut arguments: Map<String, Value>) -> CallToolResult {
+    let inferred = if ["toolId", "family", "query", "includeSchemas"]
+        .iter()
+        .any(|key| arguments.contains_key(*key))
+    {
+        "tools"
+    } else if arguments.contains_key("intent") || arguments.contains_key("goal") {
+        "operation"
+    } else {
+        "overview"
+    };
+    let topic = arguments.remove("topic").unwrap_or_else(|| json!(inferred));
+    match topic.as_str() {
+        Some("overview") => capabilities(services, arguments),
+        Some("app") => app_guide(services, arguments),
+        Some("config") => config_guide(arguments),
+        Some("tools") => tool_help(services, arguments),
+        Some("operation") => operation_guide(services, arguments),
+        _ => failure(AppError::invalid("Unknown Kerminal help topic")),
+    }
+}
+
+/// 概览只描述当前 endpoint 的固定可调用集合，避免把已移除入口呈现为可启用工具。
+fn capabilities(services: &McpServices, arguments: Map<String, Value>) -> CallToolResult {
     if !arguments.is_empty() {
         return failure(AppError::invalid("tool arguments"));
     }
-    let catalog = tool_catalog_entries();
+    let catalog = tool_catalog_entries(services);
     let exposed_count = catalog.len();
     let write_ids = catalog
         .iter()
@@ -122,15 +151,12 @@ fn capabilities(arguments: Map<String, Value>) -> CallToolResult {
             "schemaVersion": 1,
             "purpose": "帮助外部 Agent 发现 Kerminal 运行态工具、配置边界与 host 审批职责。",
             "recommendedFirstCalls": [
-                "kerminal.app_guide", "kerminal.config_guide", "kerminal.capabilities",
-                "kerminal.tool_help", "kerminal.operation_guide", "kerminal.runtime_snapshot",
-                "ssh.command", "terminal.create", "kerminal.config.validate"
+                "kerminal.help", "kerminal.runtime_snapshot", "ssh.command", "terminal.create"
             ],
             "sessionWorkspace": {
                 "readFirst": ["AGENTS.md", "CLAUDE.md", "context/mcp-endpoint.json",
                     "context/target-binding.json", "context/terminal-snapshot.json", "kerminal-config.md"],
-                "refreshTools": ["kerminal.agent.current_session", "kerminal.agent.target_context",
-                    "terminal.list", "terminal.snapshot"],
+                "refreshTools": refresh_tools(services),
                 "scopeRule": "Agent 会话具有全局运行态能力；targetBinding 只是内置 Agent 首选终端，不是访问权限边界。",
                 "terminalWriteRule": "外部 MCP 默认后台执行。持久或交互式 shell 使用 terminal.create 并保存其返回的 sessionId；目标失效时报错，不替换为其他 Tab。",
                 "terminalExecutionPolicy": {
@@ -142,14 +168,16 @@ fn capabilities(arguments: Map<String, Value>) -> CallToolResult {
                     "headlessFallback": "创建后台 PTY 后，使用其明确 sessionId 执行 snapshot、write 和 close。",
                     "backgroundFallback": "后台失败不自动改为向可见终端写入。",
                     "uiTabInteraction": "仅用户明确要求操作可见 Tab 时才选择已确认的 sessionId。",
-                    "reconnect": "仅对明确选定的断开 pane 重连，不自动换 pane。"
+                    "reconnect": "断开的 UI pane 由界面操作重连，MCP 不提供重连入口。"
                 }
             },
             "runtimeToolFamilies": families,
+            "helpTopics": ["overview", "app", "config", "tools", "operation"],
             "fileFirstConfiguration": {
                 "editableFiles": editable_files(),
                 "manualGuide": "kerminal-config.md",
-                "manualGuideTool": "kerminal.config_guide",
+                "manualGuideTool": "kerminal.help",
+                "manualGuideArguments": {"topic":"config"},
                 "validator": "kerminal.config.validate",
                 "secretBoundary": "普通主机 TOML 只保存 vault 引用；密钥通过受管 vault 用例保存。",
                 "autoRefresh": "运行时配置由应用装配层观察文件变化；修改后仍应运行 validator。"
@@ -181,11 +209,11 @@ fn capabilities(arguments: Map<String, Value>) -> CallToolResult {
 }
 
 /// 导航只映射现有 UI 入口；保留区域 ID 与工具族，避免界面收敛破坏外部发现契约。
-/// 容器导航固定在右栏并只绑定活动 pane；Context UI 入口移除不影响 Agent 目标绑定、context 文件或后台工具调用。
-/// MCP 容器工具继续使用调用方显式目标，导航说明不改变其参数和执行语义。
+/// 容器导航绑定经过校验的 SSH 宿主；Context UI 入口移除不影响 Agent 目标绑定、context 文件或后台工具调用。
+/// UI 能力与 MCP 目录分别描述，避免把容器和 tmux 面板误写成可调用工具族。
 ///
 /// @author kongweiguang
-fn app_guide(arguments: Map<String, Value>) -> CallToolResult {
+fn app_guide(services: &McpServices, arguments: Map<String, Value>) -> CallToolResult {
     if !arguments.is_empty() {
         return failure(AppError::invalid("tool arguments"));
     }
@@ -205,8 +233,8 @@ fn app_guide(arguments: Map<String, Value>) -> CallToolResult {
         json!({
             "id":"agent-and-tools",
             "location":"right",
-            "purpose":"右侧提供 Agent 与文件、运维工具，按需打开；容器工具固定在右侧并按当前活动 pane 显示宿主管理或容器只读信息。其它工具的顺序与位置可通过工具栏右键菜单调整。发现与诊断工具描述运行态能力，不要求打开面板。",
-            "toolFamilies":["agent-session","sftp","container","tmux","port-forward","server-info","discovery","diagnostics"]
+            "purpose":"右侧提供 Agent 与文件、运维工具，按需打开；容器和 tmux 面板属于 UI 能力。通过 MCP 操作 SSH 主机上的容器、tmux 和服务器信息时使用 ssh.command。工具的顺序与内容打开位置可通过工具栏右键菜单调整。",
+            "toolFamilies":["agent-session","sftp","ssh","port-forward","discovery"]
         }),
         json!({
             "id":"bottom-tools",
@@ -221,7 +249,7 @@ fn app_guide(arguments: Map<String, Value>) -> CallToolResult {
             "toolFamilies":["config"]
         }),
     ];
-    let tool_ids = tool_catalog_entries()
+    let tool_ids = tool_catalog_entries(services)
         .iter()
         .filter_map(|tool| tool["toolId"].as_str().map(ToOwned::to_owned))
         .collect::<Vec<_>>();
@@ -234,20 +262,21 @@ fn app_guide(arguments: Map<String, Value>) -> CallToolResult {
             "mcpToolIds": tool_ids,
             "sessionWorkspace": {
                 "readFirst": ["AGENTS.md", "CLAUDE.md", "context/mcp-endpoint.json", "context/target-binding.json", "context/terminal-snapshot.json", "kerminal-config.md"],
-                "refreshTools": ["kerminal.agent.current_session", "kerminal.agent.target_context"],
+                "refreshTools": refresh_tools(services),
                 "scope": "Agent endpoint 对应一个 live Agent session；普通 Tab 切换不会更新首选目标。"
             },
             "containerPanel": {
                 "uiToolId": "containers",
                 "location": "right",
-                "fixedPosition": true,
+                "fixedPosition": false,
                 "defaultAfter": "sftp",
-                "binding": "当前活动 pane 的已核实目标",
-                "hostMode": "本机或 SSH pane 管理对应宿主的容器列表。",
-                "containerMode": "容器 pane 只读当前容器的概览、资源和日志；不提供生命周期、Compose、exec 或文件操作。",
-                "unavailable": "无有效终端、目标身份不一致、Telnet 或串口时显示原因，不回退到左栏选中的主机。"
+                "customization": "在工具栏右键菜单中调整顺序、显示状态和内容打开位置。",
+                "binding": "当前活动 SSH pane 或文件 Tab 的已核实宿主",
+                "hostMode": "SSH pane 管理对应宿主的容器列表；本机 pane 不提供宿主容器管理。",
+                "containerMode": "容器 pane 解析创建时的 SSH 宿主，仍显示该宿主的容器工具；文件 Tab 保留真实宿主身份。",
+                "unavailable": "无有效目标、目标身份不一致、本机、Telnet 或串口时显示原因，不回退到左栏选中的主机。"
             },
-            "configuration": {"guide":"kerminal.config_guide", "validator":"kerminal.config.validate", "editableFiles":editable_files()},
+            "configuration": {"guide":"kerminal.help", "guideArguments":{"topic":"config"}, "validator":"kerminal.config.validate", "editableFiles":editable_files()},
             "safetyBoundaries": {
                 "approval": "MCP host 管理审批、权限、hook 与审计，Kerminal 不添加第二层确认。",
                 "background": "外部 MCP 操作不要求先打开终端 Tab。",
@@ -294,15 +323,15 @@ fn config_guide(arguments: Map<String, Value>) -> CallToolResult {
     )
 }
 
-/// 根据 toolId、family 或 query 查找冻结 schema；SFTP 细分操作由调用方按需通过 family 查询。
+/// 根据筛选条件查询当前目录的 schema，不将已移除工具描述为可调用。
 ///
 /// @author kongweiguang
-fn tool_help(arguments: Map<String, Value>) -> CallToolResult {
+fn tool_help(services: &McpServices, arguments: Map<String, Value>) -> CallToolResult {
     let args = match crate::terminal_tools::parse_args::<ToolHelpArgs>(arguments) {
         Ok(args) => args,
         Err(error) => return failure(error),
     };
-    let catalog = tool_catalog_entries();
+    let catalog = tool_catalog_entries(services);
     let requested_id = non_empty(args.tool_id);
     let requested_family = non_empty(args.family);
     let requested_query = non_empty(args.query);
@@ -360,6 +389,11 @@ fn tool_help(arguments: Map<String, Value>) -> CallToolResult {
         .map(|tool| {
             let mut reference = (**tool).clone();
             reference["exampleArguments"] = example_arguments(&reference["inputSchema"]);
+            // SSH 的目标条件是联合约束；仅生成 schema.required 会遗漏可执行请求必需的目标。
+            if reference["toolId"] == "ssh.command" {
+                reference["exampleArguments"]["hostId"] = json!("<saved-host-id>");
+                reference["exampleArguments"]["command"] = json!("pwd");
+            }
             if !include_schemas && let Some(object) = reference.as_object_mut() {
                 object.remove("inputSchema");
             }
@@ -395,19 +429,19 @@ fn tool_help(arguments: Map<String, Value>) -> CallToolResult {
             "absentToolMatches":absent,
             "deliberatelyAbsentToolFamilies":ABSENT_TOOL_FAMILIES,
             "fallbacks":[
-                "Use kerminal.operation_guide when a task needs a sequence of calls.",
+                "Use kerminal.help with topic=operation when a task needs a sequence of calls.",
                 "Use tools/list for the protocol-level catalog.",
-                "For configuration, read kerminal.config_guide, edit files, then validate.",
-                "For a specific SFTP operation, set family to sftp in kerminal.tool_help to inspect that tool's schema and safety notes.",
+                "For configuration, read kerminal.help with topic=config, edit files, then validate.",
+                "For file transfer, inspect the sftp.transfer tools; server-side file commands use ssh.command.",
                 "If a write result is outcome unknown because its acknowledgement was lost, inspect the affected resource before any retry."
             ],
             "safetyBoundaries":{
-                "readOnly":"kerminal.tool_help never invokes the referenced tool.",
+                "readOnly":"kerminal.help never invokes the referenced tool.",
                 "hostPolicy":"The MCP host owns confirmations, permissions, hooks and audit.",
                 "fileFirstConfiguration":"Configuration CRUD tools are intentionally absent.",
                 "terminalExecution":"Use background tools by default; explicit sessionId selects a session, and invalid targets are never substituted.",
                 "outcomeUnknown":"A lost acknowledgement after a possible write does not prove that the operation failed. Read back state before retrying.",
-                "containerTextWrite":CONTAINER_TEXT_WRITE_GUIDANCE
+                "serverOperations":"Use ssh.command for server-side container, tmux and file commands; the SFTP queue accepts local and remote endpoints."
             },
             "nextActions":[
                 "Check the selected tool's schema and safety annotations before calling it.",
@@ -422,8 +456,8 @@ fn tool_help(arguments: Map<String, Value>) -> CallToolResult {
     )
 }
 
-/// 将任务意图归一成当前可用工具序列，并为容器编辑提供 revision 优先的写入流程。
-fn operation_guide(arguments: Map<String, Value>) -> CallToolResult {
+/// 将任务意图归一成当前可用工具序列，已移除的运维入口改为显式 SSH 命令。
+fn operation_guide(services: &McpServices, arguments: Map<String, Value>) -> CallToolResult {
     let args = match crate::terminal_tools::parse_args::<OperationGuideArgs>(arguments) {
         Ok(args) => args,
         Err(error) => return failure(error),
@@ -437,7 +471,7 @@ fn operation_guide(arguments: Map<String, Value>) -> CallToolResult {
     let note = (intent != normalized)
         .then(|| format!("Unsupported intent `{requested_intent}` was normalized to `{intent}`."));
     let calls = intent_calls(intent);
-    let catalog = tool_catalog_entries();
+    let catalog = tool_catalog_entries(services);
     let available = calls
         .iter()
         .filter(|id| catalog.iter().any(|tool| tool["toolId"] == **id))
@@ -448,7 +482,7 @@ fn operation_guide(arguments: Map<String, Value>) -> CallToolResult {
         .filter(|id| !available.contains(id))
         .copied()
         .collect::<Vec<_>>();
-    let workflow = workflow_steps(intent, &available);
+    let workflow = workflow_steps(intent, &available, &catalog);
     let refs = catalog
         .iter()
         .filter(|tool| available.contains(&tool["toolId"].as_str().unwrap_or_default()))
@@ -470,28 +504,14 @@ fn operation_guide(arguments: Map<String, Value>) -> CallToolResult {
             "workflow":workflow,
             "toolReference":refs,
             "requiredContextFiles":["AGENTS.md","CLAUDE.md","context/mcp-endpoint.json","context/target-binding.json","context/terminal-snapshot.json","kerminal-config.md"],
-            "fileFirstConfiguration":{"readBeforeEditing":"kerminal-config.md or kerminal.config_guide","guideTool":"kerminal.config_guide","editableFiles":editable_files(),"validator":"kerminal.config.validate"},
+            "fileFirstConfiguration":{"readBeforeEditing":"kerminal-config.md or kerminal.help(topic=config)","guideTool":"kerminal.help","guideArguments":{"topic":"config"},"editableFiles":editable_files(),"validator":"kerminal.config.validate"},
             "safetyBoundaries":{
                 "hostPolicy":"The MCP host owns confirmation, approval, permissions, hooks, and audit.",
                 "terminalWrite":"External MCP defaults to background. Use returned sessionId explicitly; do not substitute a stale target.",
                 "outcomeUnknown":"If the acknowledgement to a write is lost, read back the destination before deciding whether to retry.",
-                "containerTextWrite":if intent == "container" { CONTAINER_TEXT_WRITE_GUIDANCE } else { "See kerminal.tool_help for container.files.write_text guidance." },
+                "serverOperations":"Use ssh.command for server-side container, tmux, system and file commands. Local shell tasks use terminal.create with an explicit sessionId.",
                 "secrets":"Never expose vault content or plaintext credentials."
             },
-            "containerTextWriteWorkflow":if intent == "container" { json!({
-                "readTool":"container.files.preview",
-                "writeTool":"container.files.write_text",
-                "revisionSource":"将预览成功响应 structuredContent.data.revision 的完整对象复制到 expectedRevision。",
-                "writeModes":{
-                    "compareAndSwap":"提供 expectedRevision 后始终执行比较并交换，优先于 create 与 overwriteOnConflict。",
-                    "createOnly":{"create":true,"overwriteOnConflict":false},
-                    "explicitOverwrite":{"create":false,"overwriteOnConflict":true},
-                    "explicitUpsert":{"create":true,"overwriteOnConflict":true},
-                    "implicitWrite":{"create":false,"overwriteOnConflict":false,"result":"没有 expectedRevision 时拒绝"}
-                },
-                "conflict":"冲突后重新读取目标并处理差异，再决定是否写入。",
-                "unknownOutcome":"回执未知时先读回目标，确认状态后再决定是否重试。"
-            }) } else { Value::Null },
             "availableReferencedToolIds":available,
             "missingReferencedToolIds":missing,
             "deliberatelyAbsentToolFamilies":ABSENT_TOOL_FAMILIES,
@@ -563,7 +583,7 @@ async fn runtime_snapshot(
     } else {
         Vec::new()
     };
-    let families = tool_catalog_entries();
+    let families = tool_catalog_entries(services);
     let data = json!({
         "schemaVersion":1,
         "runtime":{"terminalSessionCount":terminal_sessions.len(),"agentSessionCount":agent_sessions.len(),"portForwardCount":forwards.len()},
@@ -578,6 +598,15 @@ async fn runtime_snapshot(
         data,
         Vec::new(),
     )
+}
+
+/// 普通 endpoint 不推荐会话专用工具，避免帮助再次引导客户端调用隐藏入口。
+fn refresh_tools(services: &McpServices) -> Vec<&'static str> {
+    if services.agent_scope.is_some() {
+        vec!["kerminal.agent.target_context"]
+    } else {
+        vec!["terminal.list", "terminal.snapshot"]
+    }
 }
 
 /// 为每个开放的配置文件类别返回统一路径，禁止 discovery 工具创造新的配置读写通道。
@@ -638,30 +667,27 @@ fn is_sensitive_field(name: &str) -> bool {
     .any(|marker| name.contains(marker))
 }
 
-/// 匹配旧帮助族别名，且始终按冻结 catalog 顺序返回结果。
+/// 匹配仍受支持的帮助族别名，且始终按当前 catalog 顺序返回结果。
 fn family_matches(requested: &str, family: &str) -> bool {
     let requested = requested.trim().to_ascii_lowercase().replace('_', "-");
     match requested.as_str() {
         "guide" | "guides" => family == "discovery",
         "agent" | "session" => family == "agent-session",
         "ssh-command" => family == "ssh",
-        "docker" | "podman" => family == "container",
         "port" | "port-forwarding" => family == "port-forward",
-        "server" => family == "server-info",
-        "diagnostic" => family == "diagnostics",
         "credential" | "vault" | "secret" => family == "credentials",
         _ => requested == family,
     }
 }
 
-/// 返回当前工具族对应的已知故意缺席能力，避免把不存在的 CRUD 描述成可调用工具。
+/// 将用户筛选与已移除族名统一归一化，避免下划线或连字符差异掩盖缺席能力。
 fn matching_absent_families(filter: &str) -> Vec<&'static str> {
     let normalized = filter.trim().to_ascii_lowercase().replace('_', "-");
     ABSENT_TOOL_FAMILIES
         .iter()
         .copied()
         .filter(|family| {
-            let family = family.to_ascii_lowercase();
+            let family = family.to_ascii_lowercase().replace('_', "-");
             normalized.contains(family.trim_end_matches('*').trim_end_matches('.'))
                 || family.contains(&normalized)
         })
@@ -701,101 +727,56 @@ fn intent_calls(intent: &str) -> Vec<&'static str> {
             "terminal.write",
             "terminal.close",
         ],
-        "session-terminal" => vec![
-            "kerminal.agent.current_session",
-            "kerminal.agent.target_context",
-            "terminal.resolve_agent_target",
-            "terminal.snapshot",
-        ],
-        "ssh-command" => vec![
-            "kerminal.runtime_snapshot",
-            "ssh.command",
-            "ssh.command_on_resolved_host",
-        ],
+        "session-terminal" => vec!["kerminal.agent.target_context", "terminal.snapshot"],
+        "ssh-command" => vec!["kerminal.runtime_snapshot", "ssh.command"],
         "sftp" => vec![
-            "sftp.list",
             "sftp.transfer.enqueue",
             "sftp.transfer.list",
             "sftp.transfer.retry",
             "sftp.transfer.cancel",
         ],
-        "tmux" => vec![
-            "kerminal.runtime_snapshot",
-            "tmux.probe",
-            "tmux.list_sessions",
-            "tmux.list_windows",
-            "tmux.list_panes",
-            "tmux.capture_pane",
-        ],
-        "container" => vec![
-            "kerminal.runtime_snapshot",
-            "container.list",
-            "container.inspect",
-            "container.logs.tail",
-            "container.stats",
-            "container.start",
-            "container.stop",
-            "container.restart",
-            "container.remove",
-            "container.files.list",
-            "container.files.preview",
-            "container.files.write_text",
-            "container.files.create_directory",
-            "container.files.rename",
-            "container.files.chmod",
-            "container.files.delete",
-            "container.files.upload",
-            "container.files.download",
-            "sftp.transfer.list",
-            "sftp.transfer.retry",
-            "sftp.transfer.cancel",
-        ],
+        "tmux" | "container" | "server-info" => vec!["ssh.command"],
         "port-forward" => vec![
             "kerminal.runtime_snapshot",
             "port_forward.list",
             "port_forward.create",
             "port_forward.close",
         ],
-        "server-info" => vec!["kerminal.runtime_snapshot", "server_info.snapshot"],
         "history" => vec!["history.search"],
-        "config" => vec!["kerminal.config_guide", "kerminal.config.validate"],
+        "config" => vec!["kerminal.help", "kerminal.config.validate"],
         "credentials" => vec![
-            "kerminal.tool_help",
+            "kerminal.help",
             "kerminal.host.upsert_with_credential",
             "kerminal.vault.encrypt_secret",
         ],
-        "diagnostics" => vec![
-            "diagnostics.runtime_health",
-            "diagnostics.create_bundle",
-            "kerminal.runtime_snapshot",
-        ],
-        _ => vec![
-            "kerminal.app_guide",
-            "kerminal.capabilities",
-            "kerminal.runtime_snapshot",
-            "kerminal.tool_help",
-        ],
+        "diagnostics" => vec!["kerminal.runtime_snapshot"],
+        _ => vec!["kerminal.help", "kerminal.runtime_snapshot"],
     }
 }
 
 /// 为工具序列生成简洁工作步骤，并在缺少真实可用工具时不伪称成功路径存在。
-fn workflow_steps(intent: &str, tool_ids: &[&str]) -> Vec<Value> {
+fn workflow_steps(intent: &str, tool_ids: &[&str], catalog: &[Value]) -> Vec<Value> {
     tool_ids.iter().enumerate().map(|(index, tool_id)| json!({
         "id":format!("step-{}", index + 1),
         "toolId":tool_id,
         "description":step_description(intent, tool_id),
-        "requiredArguments":required_arguments(tool_id),
+        "requiredArguments":required_arguments(tool_id, catalog),
         "safety":"Use only the explicitly selected target. If a write outcome is unknown, inspect state before retrying."
     })).collect()
 }
 
-/// 根据工具语义选择任务步骤说明，不从自由文本拼接命令或目标参数。
+/// 根据工具和任务意图说明替代路径，不从自由文本拼接命令或目标参数。
 fn step_description(intent: &str, tool_id: &str) -> &'static str {
     match tool_id {
         "terminal.create" => "创建一个无需 UI Tab 的后台终端并记录返回 sessionId。",
         "terminal.write" => "只向显式 sessionId 写入已授权的终端输入。",
         "terminal.snapshot" => "读取已选 session 的有界文本快照。",
         "terminal.close" => "完成任务后关闭同一 sessionId 创建的后台终端。",
+        "ssh.command" if intent == "container" => {
+            "通过保存的 SSH 目标执行容器运行时命令；文件写入结果未知时先回读。"
+        }
+        "ssh.command" if intent == "tmux" => "通过保存的 SSH 目标执行 tmux 命令。",
+        "ssh.command" if intent == "server-info" => "通过保存的 SSH 目标执行服务器信息查询命令。",
         "ssh.command" => "通过保存的 SSH 目标执行一次非交互命令。",
         "sftp.transfer.enqueue" => "提交传输任务；请求受理不代表文件已传输完成。",
         "sftp.transfer.list" => {
@@ -807,28 +788,15 @@ fn step_description(intent: &str, tool_id: &str) -> &'static str {
         "sftp.transfer.cancel" => {
             "取消请求受理不代表任务已停止；继续查询同一 transferId 直到终态。"
         }
-        "container.files.upload" | "container.files.download" => {
-            "只受理容器文件传输并返回 transferId，accepted=true 且 completed=false；随后用 sftp.transfer.list 查询直到终态。"
-        }
-        "container.files.rename" => "在同一容器内改名；目标已存在时不会覆盖。",
-        "container.files.chmod" => "修改显式容器路径的八进制权限。",
-        "container.files.delete" => "删除显式选择的容器文件或目录；目录删除具有破坏性。",
-        "container.files.create_directory" => "在显式容器路径创建目录。",
-        "container.remove" => "移除显式选择的容器；force 只在明确传 true 时生效。",
-        "container.files.write_text" => {
-            "先读取目标 revision；无 revision 时显式选择新建或覆盖策略。"
-        }
         "kerminal.config.validate" => "检查文件化配置并处理返回的错误或警告。",
         "history.search" => "只读查询与当前任务相关的历史命令。",
-        "diagnostics.create_bundle" => "生成应用管理目录下的本地脱敏诊断包。",
         _ if intent == "overview" => "先确认当前运行态和工具能力，再继续具体操作。",
         _ => "调用对应的只读或运行态工具，并核对目标与返回状态。",
     }
 }
 
-/// 从冻结 JSON Schema 读取 required names，帮助调用方与 tool/list 保持同一参数定义。
-fn required_arguments(tool_id: &str) -> Vec<String> {
-    let catalog = tool_catalog_entries();
+/// 从本次请求的同一目录快照读取必填项，避免流程与帮助使用不同的暴露集合。
+fn required_arguments(tool_id: &str, catalog: &[Value]) -> Vec<String> {
     catalog
         .iter()
         .find(|tool| tool["toolId"] == tool_id)
@@ -846,15 +814,12 @@ fn required_arguments(tool_id: &str) -> Vec<String> {
 /// 生成各类应用领域可读类别名，保留 catalog 的原始 category 字段。
 fn category_label(category: &str) -> &'static str {
     match category {
-        "container" => "容器",
         "diagnostics" => "诊断与发现",
         "history" => "命令历史",
         "portForward" => "端口转发",
-        "serverInfo" => "服务器信息",
         "sftp" => "文件传输",
         "ssh" => "SSH 命令",
         "terminal" => "终端",
-        "tmux" => "tmux",
         _ => "运行态工具",
     }
 }

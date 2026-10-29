@@ -4375,6 +4375,7 @@ dependencies = [
  "kerminal-terminal",
  "kerminal-ui",
  "rfd",
+ "rmcp",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4453,7 +4454,6 @@ dependencies = [
  "windows-sys 0.61.2",
  "zbus",
  "zeroize",
- "zip",
 ]
 
 [[package]]
@@ -9477,12 +9477,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "typed-path"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
-
-[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11382,20 +11376,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "zip"
-version = "9.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a954114b47a54df49f83d2722814e86b23d4bb1b54a1b90fb7d92b41619ddc22"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap",
- "memchr",
- "nix 0.31.3",
- "typed-path",
 ]
 
 [[package]]

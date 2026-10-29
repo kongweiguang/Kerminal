@@ -351,6 +351,20 @@ impl ConnectivityState {
         }
     }
 
+    /// 点击时重读共享状态；停止超时只重试原 owner 的收尾，不能误路由到被门禁拒绝的启动。
+    pub(in crate::features::preferences) fn toggle_mcp(
+        &mut self,
+        cx: &mut Context<PreferencesPanel>,
+    ) {
+        match self.current_mcp_snapshot().state {
+            McpRuntimeState::Running | McpRuntimeState::Stopping => self.stop_mcp(cx),
+            McpRuntimeState::Stopped | McpRuntimeState::Synchronizing | McpRuntimeState::Failed => {
+                self.start_mcp(cx);
+            }
+            McpRuntimeState::Unavailable | McpRuntimeState::Starting => {}
+        }
+    }
+
     /// 启动共享 MCP listener，按 runtime 实际状态门禁，旧操作结果不能覆盖新状态。
     pub(in crate::features::preferences) fn start_mcp(
         &mut self,
@@ -450,7 +464,7 @@ impl ConnectivityState {
         cx.notify();
     }
 
-    /// 仅接受当前 listener 操作的回执，以实际快照判断启动失败并将通知交给共享策略。
+    /// 仅接受当前操作回执；停止未完成给出本地化恢复动作，底层原因仍由 runtime 快照保留。
     fn finish_mcp_operation(
         &mut self,
         generation: u64,
@@ -502,7 +516,19 @@ impl ConnectivityState {
                     start_failure_reason = Some(error.public_message().to_owned());
                 }
                 status_is_error = error.public_code() != PublicErrorCode::Cancelled;
-                Some(super::localized_error(&error))
+                Some(
+                    if operation == Some(McpOperation::Stop)
+                        && self.mcp_snapshot.state == McpRuntimeState::Stopping
+                    {
+                        crate::locale::text(
+                            "停止未完成，请点击“重试停止”继续清理。",
+                            "Stopping did not finish. Choose Retry stop to finish cleanup.",
+                        )
+                        .to_string()
+                    } else {
+                        super::localized_error(&error)
+                    },
+                )
             }
         }
         .or_else(|| self.mcp_snapshot.failure_reason.clone())
@@ -539,11 +565,14 @@ impl ConnectivityState {
         cx.notify();
     }
 
-    /// 仅在剪贴板回读与期望 JSON 完全一致时确认复制，避免报告未完成的系统剪贴板写入。
+    /// 在途状态禁止复制旧配置；只有剪贴板回读匹配才确认，避免报告未完成的系统写入。
     pub(in crate::features::preferences) fn copy_mcp_json(
         &mut self,
         cx: &mut Context<PreferencesPanel>,
     ) {
+        if self.mcp_operation.is_some() {
+            return;
+        }
         if let Some(runtime) = self.runtime.as_ref() {
             self.mcp_snapshot = runtime.snapshot();
         }

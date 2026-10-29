@@ -3,9 +3,9 @@
 //! @author kongweiguang
 
 use kerminal_application::preferences::{
-    AgentLauncherSettings, BackgroundFit, DesktopNotificationSettings, ExternalLaunchSettings,
-    InterfaceDensity, InterfaceLanguage, KeybindingPreference, SettingsSnapshot,
-    SftpPerformanceSettings, TerminalSettings, ThemeMode, ToolRailSettings,
+    AgentLauncherSettings, AppColorScheme, BackgroundFit, DesktopNotificationSettings,
+    ExternalLaunchSettings, InterfaceDensity, InterfaceLanguage, KeybindingPreference,
+    SettingsSnapshot, SftpPerformanceSettings, TerminalSettings, ThemeMode, ToolRailSettings,
     WorkbenchLayoutSettings,
 };
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,7 @@ struct SettingsDocument {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 struct AppearanceSettings {
+    color_scheme: AppColorScheme,
     interface_language: InterfaceLanguage,
     background_enabled: bool,
     background_fit: BackgroundFit,
@@ -60,6 +61,7 @@ impl SettingsDocument {
             theme_mode: settings.theme_mode,
             interface_density: settings.interface_density,
             appearance: AppearanceSettings {
+                color_scheme: settings.app_color_scheme,
                 interface_language: settings.interface_language,
                 background_enabled: settings.background_enabled,
                 background_fit: settings.background_fit,
@@ -84,6 +86,7 @@ impl SettingsDocument {
     fn into_snapshot(self) -> SettingsSnapshot {
         SettingsSnapshot {
             theme_mode: self.theme_mode,
+            app_color_scheme: self.appearance.color_scheme,
             interface_language: self.appearance.interface_language,
             interface_density: self.interface_density,
             background_enabled: self.appearance.background_enabled,

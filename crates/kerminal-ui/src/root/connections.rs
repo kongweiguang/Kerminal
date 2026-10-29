@@ -311,15 +311,26 @@ pub(super) fn handle_connections_event(
             cx.notify();
             true
         }
-        ConnectionsEvent::ConnectRequested { host_id, target } => {
-            root.create_terminal_for_target(
-                TerminalTargetRequest::ExplicitHost {
-                    host_id: host_id.clone(),
-                    target: target.clone(),
-                },
-                window,
-                cx,
-            );
+        ConnectionsEvent::ConnectRequested {
+            host_id,
+            target,
+            intent_id,
+        } => {
+            if let Some(intent_id) = intent_id {
+                super::sidebar_containers::accept_connection(
+                    root, intent_id, host_id, target, window, cx,
+                );
+            } else {
+                root.pending_sidebar_container = None;
+                root.create_terminal_for_target(
+                    TerminalTargetRequest::ExplicitHost {
+                        host_id: host_id.clone(),
+                        target: target.clone(),
+                    },
+                    window,
+                    cx,
+                );
+            }
             true
         }
         ConnectionsEvent::ConnectLocalProfileRequested { profile_id } => {
@@ -1452,10 +1463,12 @@ fn open_pinned_container(
 
 /// 路由主机与本地 Profile 意图；容器目标由活动终端绑定，不从左栏选择或覆盖。
 ///
-/// Hosts 选择切换到中心详情；创建/重命名共享原工作区返回点，中心不再打开重复连接目录。
+/// 主机单击只更新导航选择，不加载详情或替换中央工作区；详情由明确的查看或编辑动作打开。
+/// 创建/重命名共享原工作区返回点，中心不再打开重复连接目录。
 /// 本地主机表单复用 ConnectionsPanel 的编辑器模态；连接与传输继续使用原有会话路径。
 /// 每次显式终端连接意图都会交给连接面板预检并创建独立会话，不因同主机已有 pane 而改为激活旧标签。
 /// 顶部工作台和折叠直接路由现有 Root 状态，不要求选中主机或先创建终端。
+/// 新建事件保留可空分组，背景/未分组与已保存分组复用同一编辑器门禁。
 /// @author kongweiguang
 pub(super) fn handle_host_navigation_event(
     root: &mut RootView,
@@ -1463,7 +1476,21 @@ pub(super) fn handle_host_navigation_event(
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) {
+    // 后来的侧栏操作优先；信任预检或终端就绪的迟到结果不能重开容器工具。
+    root.pending_sidebar_container = None;
     match event {
+        HostNavigationEvent::OpenHostContainersRequested { host_id } => {
+            super::sidebar_containers::open_host(root, host_id.clone(), None, window, cx);
+            return;
+        }
+        HostNavigationEvent::PinnedContainerDetailsRequested { stable_id } => {
+            super::sidebar_containers::open_pinned_details(root, stable_id, window, cx);
+            return;
+        }
+        HostNavigationEvent::PinnedContainerFilesRequested { stable_id } => {
+            super::sidebar_containers::open_pinned_files(root, stable_id, window, cx);
+            return;
+        }
         HostNavigationEvent::PinnedContainerSelected { stable_id } => {
             handle_pinned_container_selection(root, stable_id, cx);
             return;
@@ -1515,29 +1542,26 @@ pub(super) fn handle_host_navigation_event(
             root.create_terminal_for_target(local_profile_target_request(profile_id), window, cx);
             return;
         }
-        HostNavigationEvent::LocalProfileSelected { profile_id } => {
-            // 点击本地行显示同一 Profile 的中心详情，并清除上一次远端选择以免运维目标漂移。
-            if let Some(panel) = root.connections_panel.clone() {
-                panel.update(cx, |panel, cx| {
-                    panel.clear_host_selection(cx);
-                    panel.select_local_host(Some(profile_id.clone()), window, cx);
-                });
-            }
+        HostNavigationEvent::LocalProfileSelected { .. } => {
+            // 目录选择不启动隐藏详情读取，也不改变终端布局或 Agent 的冻结目标。
             root.selected_host_id = None;
             root.refresh_operations_panel_targets(cx);
-            root.set_center_panel(CenterPanel::Connections, window, cx);
             cx.notify();
             return;
         }
-        HostNavigationEvent::HostSelected { .. } => {
-            root.set_center_panel(CenterPanel::Connections, window, cx);
+        HostNavigationEvent::HostSelected { host_id } => {
+            root.selected_host_id = Some(host_id.clone());
+            root.refresh_operations_panel_targets(cx);
+            cx.notify();
+            return;
         }
         HostNavigationEvent::ConnectRequested { .. }
         | HostNavigationEvent::OpenSftpRequested { .. } => {}
         HostNavigationEvent::CreateSftpTransferTabRequested { .. } => {}
         HostNavigationEvent::EditHostRequested { .. }
         | HostNavigationEvent::CopyHostRequested { .. }
-        | HostNavigationEvent::CreateHostInGroupRequested { .. }
+        | HostNavigationEvent::CopyHostAsSshRequested { .. }
+        | HostNavigationEvent::CreateHostRequested { .. }
         | HostNavigationEvent::CreateLocalProfileRequested { .. }
         | HostNavigationEvent::EditLocalProfileRequested { .. }
         | HostNavigationEvent::CopyLocalProfileRequested { .. } => {
@@ -1557,7 +1581,10 @@ pub(super) fn handle_host_navigation_event(
         }
         HostNavigationEvent::PinnedContainerSelected { .. }
         | HostNavigationEvent::PinnedContainerOpenRequested { .. }
-        | HostNavigationEvent::PinnedContainerRemoveRequested { .. } => {}
+        | HostNavigationEvent::PinnedContainerRemoveRequested { .. }
+        | HostNavigationEvent::PinnedContainerDetailsRequested { .. }
+        | HostNavigationEvent::PinnedContainerFilesRequested { .. }
+        | HostNavigationEvent::OpenHostContainersRequested { .. } => {}
     }
 
     let Some(panel) = root.connections_panel.clone() else {
@@ -1578,12 +1605,15 @@ pub(super) fn handle_host_navigation_event(
     let mut group_editor_failed = false;
     panel.update(cx, |panel, cx| match event {
         HostNavigationEvent::OpenSftpWorkbenchRequested
+        | HostNavigationEvent::HostSelected { .. }
         | HostNavigationEvent::LocalProfileSelected { .. }
         | HostNavigationEvent::LocalProfileConnectRequested { .. }
         | HostNavigationEvent::PinnedContainerSelected { .. }
         | HostNavigationEvent::PinnedContainerOpenRequested { .. }
-        | HostNavigationEvent::PinnedContainerRemoveRequested { .. } => {}
-        HostNavigationEvent::HostSelected { host_id } => panel.select_host_id(host_id, cx),
+        | HostNavigationEvent::PinnedContainerRemoveRequested { .. }
+        | HostNavigationEvent::PinnedContainerDetailsRequested { .. }
+        | HostNavigationEvent::PinnedContainerFilesRequested { .. }
+        | HostNavigationEvent::OpenHostContainersRequested { .. } => {}
         HostNavigationEvent::ConnectRequested { host_id } => {
             panel.request_connect_host(host_id, cx)
         }
@@ -1602,11 +1632,18 @@ pub(super) fn handle_host_navigation_event(
         HostNavigationEvent::CopyHostRequested { host_id } => {
             panel.duplicate_saved_host(host_id, window, cx)
         }
+        HostNavigationEvent::CopyHostAsSshRequested { host_id } => {
+            panel.duplicate_saved_host_as_ssh(host_id, window, cx)
+        }
         HostNavigationEvent::DeleteHostRequested { host_id } => {
             panel.request_delete_host(host_id, cx)
         }
-        HostNavigationEvent::CreateHostInGroupRequested { group_id } => {
-            panel.create_host_in_group(group_id, window, cx)
+        HostNavigationEvent::CreateHostRequested { group_id } => {
+            if let Some(group_id) = group_id {
+                panel.create_host_in_group(group_id, window, cx)
+            } else {
+                panel.begin_create_host(window, cx)
+            }
         }
         HostNavigationEvent::CreateLocalProfileRequested { group_id } => {
             panel.begin_create_local_host(group_id.clone(), window, cx)

@@ -39,21 +39,6 @@ const MAX_SUMMARY_SAMPLE_CHARS: usize = 160;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CommandArgs {
-    host_id: String,
-    command: String,
-    #[serde(default)]
-    proxy_url: Option<String>,
-    #[serde(default)]
-    proxy_protocol: Option<String>,
-    #[serde(default)]
-    timeout_seconds: Option<u64>,
-    #[serde(default)]
-    max_output_bytes: Option<usize>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ResolvedCommandArgs {
     command: String,
     #[serde(default)]
@@ -155,7 +140,7 @@ impl StreamCapture {
     }
 }
 
-/// 将协议派发限制到两个冻结的 SSH 命令工具，未知 toolId 通过公共错误 adapter 返回。
+/// 只保留一个 SSH 执行入口，hostId 与名称定位共享相同限额、消歧及连接回收。
 pub(crate) async fn dispatch(
     tool_id: &str,
     services: &McpServices,
@@ -164,64 +149,15 @@ pub(crate) async fn dispatch(
 ) -> CallToolResult {
     match tool_id {
         "ssh.command" => command(services, args, cancel).await,
-        "ssh.command_on_resolved_host" => command_on_resolved_host(services, args, cancel).await,
         _ => failure(AppError::invalid("SSH tool id")),
     }
 }
 
-/// 明确 hostId 先解析为唯一目标，再借用同一配置交执行入口，避免响应身份与实际连接分离。
-/// 命令仍保持原始 shell 语义；请求结构不改变公开 MCP 字段或凭据解析边界。
-///
-/// @author kongweiguang
-pub(crate) async fn command(
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancel: CancellationToken,
-) -> CallToolResult {
-    let args = match parse_args::<CommandArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return failure(error),
-    };
-    let host_id = match HostId::parse(&args.host_id) {
-        Ok(host_id) => host_id,
-        Err(error) => {
-            tracing::debug!(%error, "SSH command received an invalid host id");
-            return failure(AppError::invalid("SSH host id"));
-        }
-    };
-    let hosts = match services.require_host_management() {
-        Ok(hosts) => hosts,
-        Err(error) => return failure(error),
-    };
-    let host = match hosts.load_host(&host_id).await {
-        Ok(Some(host)) => host,
-        Ok(None) => return failure(AppError::not_found("SSH host was not found")),
-        Err(error) => return failure(error),
-    };
-    execute(
-        services,
-        SshCommandTarget {
-            host: &host,
-            group_name: None,
-            include_group: false,
-        },
-        SshCommandInput {
-            command: &args.command,
-            proxy_url: args.proxy_url.as_deref(),
-            proxy_protocol: args.proxy_protocol.as_deref(),
-            timeout_seconds: args.timeout_seconds,
-            max_output_bytes: args.max_output_bytes,
-        },
-        cancel,
-    )
-    .await
-}
-
-/// 保留旧版合取 selector 与 hostId 优先规则；消歧成功后把目标和 group 响应身份一并借用。
+/// 合并入口仍保留合取 selector 与 hostId 优先规则，旧 hostId 请求无需迁移参数。
 /// 输入与目标分开建模，避免归并命令参数时改变候选范围或复制主机认证引用。
 ///
 /// @author kongweiguang
-pub(crate) async fn command_on_resolved_host(
+pub(crate) async fn command(
     services: &McpServices,
     arguments: Map<String, Value>,
     cancel: CancellationToken,

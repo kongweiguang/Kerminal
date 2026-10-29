@@ -283,13 +283,14 @@ fn option_matches_query<T>(
 }
 
 impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
-    /// 按当前主题渲染紧凑列表；捕获阶段先处理方向键与回车，避免输入控件的按键处理抢走列表导航。
+    /// 按活动应用主题渲染紧凑列表；缺省投影也保留用户色板，不从系统外观重建默认配色。
+    /// 捕获阶段先处理方向键与回车，避免输入控件的按键处理抢走列表导航。
     ///
     /// @author kongweiguang
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = self
             .theme
-            .unwrap_or_else(|| ThemeTokens::for_appearance(window.appearance()));
+            .unwrap_or_else(|| ThemeTokens::current(window, cx));
         let grouped = self.grouped_options();
         let visible_options = grouped
             .iter()

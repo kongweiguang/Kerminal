@@ -10,7 +10,7 @@ pub mod configuration_changes;
 pub mod configuration_sync;
 pub mod connections;
 pub mod data_migration;
-pub mod diagnostics;
+mod diagnostics;
 pub mod files;
 pub mod local_pty;
 pub mod operations;

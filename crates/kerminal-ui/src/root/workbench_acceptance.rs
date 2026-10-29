@@ -29,16 +29,16 @@ impl RootView {
             })
     }
 
-    /// 同时核对 Root 选择态与 Connections 面板状态，避免单一镜像值掩盖中心详情未切换。
+    /// 同时核对目录选择与终端中心未被替换，避免单击选中时偷偷导航到详情。
     ///
     /// @author kongweiguang
-    pub fn workbench_acceptance_host_selected(&self, host_id: &HostId, cx: &Context<Self>) -> bool {
-        self.center_panel == CenterPanel::Connections
+    pub fn workbench_acceptance_host_selected(
+        &self,
+        host_id: &HostId,
+        _cx: &Context<Self>,
+    ) -> bool {
+        self.center_panel == CenterPanel::Terminal
             && self.selected_host_id.as_ref() == Some(host_id)
-            && self
-                .connections_panel
-                .as_ref()
-                .is_some_and(|panel| panel.read(cx).selected_host_id().as_ref() == Some(host_id))
     }
 
     /// 暴露模态遮挡状态，使隐藏窗口验收能区分事件选择成功与中心内容被模态替代。
@@ -55,11 +55,11 @@ impl RootView {
         self.connections_panel.is_some()
     }
 
-    /// 验证本地 Profile 详情使用中心 Connections 面板且未残留远端主机选择。
+    /// 本地目录单击清除远端选择，但保留中央终端及其会话。
     ///
     /// @author kongweiguang
     pub fn workbench_acceptance_local_profile_selected(&self) -> bool {
-        self.center_panel == CenterPanel::Connections && self.selected_host_id.is_none()
+        self.center_panel == CenterPanel::Terminal && self.selected_host_id.is_none()
     }
 
     /// 复制当前候选绑定作为稳定观测值，验证主机和 Profile 导航不重绑活动 Agent 目标。

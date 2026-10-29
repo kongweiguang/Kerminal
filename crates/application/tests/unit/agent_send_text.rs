@@ -799,7 +799,7 @@ fn apply_documents(
     receipts
 }
 
-/// 复用实际记录查询与 endpoint stop-sync，确认当前全局地址可读并在停止时清成 None。
+/// 从统一目标上下文读取当前全局地址；停止后 listener 不再可用，因此回读受管文件确认清理。
 ///
 /// @author kongweiguang
 #[tokio::test]
@@ -837,13 +837,15 @@ async fn current_global_endpoint_is_readable_and_stop_sync_clears_it() {
         false,
     ));
     let service = agent_service(workspace.clone(), sessions);
+    *service.endpoint.write().await = Some(endpoint.clone());
 
     let before = service
-        .record_projection(agent_session_id.clone(), CancellationToken::new())
+        .target_context(agent_session_id.clone(), 1024, CancellationToken::new())
         .await
         .expect("current global endpoint should be queryable");
     assert_eq!(
         before
+            .record
             .mcp_endpoint
             .as_ref()
             .and_then(|context| context.endpoint.as_deref()),
@@ -855,17 +857,6 @@ async fn current_global_endpoint_is_readable_and_stop_sync_clears_it() {
         .await
         .expect("stop sync should clear a valid endpoint owned by this Agent");
 
-    let after = service
-        .record_projection(agent_session_id.clone(), CancellationToken::new())
-        .await
-        .expect("cleared endpoint context should remain queryable");
-    assert_eq!(
-        after
-            .mcp_endpoint
-            .as_ref()
-            .and_then(|context| context.endpoint.as_deref()),
-        None
-    );
     let saved = workspace
         .mcp_endpoint_context(&agent_session_id)
         .expect("stop sync should commit the endpoint context");
@@ -874,13 +865,13 @@ async fn current_global_endpoint_is_readable_and_stop_sync_clears_it() {
     assert!(saved["endpoint"].is_null());
 }
 
-/// 普通 0.4 reader 拒绝旧 snake_case 身份头并给出迁移诊断，不将其当作当前文档读取。
+/// 恢复结果未决时上下文不得回写，旧身份头仍给出迁移诊断并保留原文。
 ///
 /// @author kongweiguang
 #[tokio::test]
-async fn record_projection_rejects_legacy_snake_case_context_headers() {
+async fn target_context_rejects_legacy_snake_case_context_headers_during_recovery() {
     let agent_session_id = AgentSessionId::new();
-    let session = active_agent(agent_session_id.clone(), AgentSessionStatus::Active);
+    let session = active_agent(agent_session_id.clone(), AgentSessionStatus::Stale);
     let workspace = Arc::new(MemoryAgentWorkspace::new(
         session,
         codex_provider_session(),
@@ -894,10 +885,9 @@ async fn record_projection_rejects_legacy_snake_case_context_headers() {
         "toolsOnly": true,
         "generatedAt": "2026-10-19T00:00:00Z"
     });
-    workspace.seed_mcp_endpoint_context(
-        &agent_session_id,
-        serde_json::to_string(&legacy).expect("synthetic legacy context should serialize"),
-    );
+    let legacy_contents =
+        serde_json::to_string(&legacy).expect("synthetic legacy context should serialize");
+    workspace.seed_mcp_endpoint_context(&agent_session_id, legacy_contents.clone());
     let sessions = Arc::new(MemorySessions::new(
         vec![terminal_info(
             SessionId::new(),
@@ -909,18 +899,23 @@ async fn record_projection_rejects_legacy_snake_case_context_headers() {
         TEST_SESSION_GENERATION,
         false,
     ));
-    let service = agent_service(workspace, sessions);
+    let service = agent_service(workspace.clone(), sessions);
 
-    let projection = service
-        .record_projection(agent_session_id, CancellationToken::new())
+    let context = service
+        .target_context(agent_session_id.clone(), 1024, CancellationToken::new())
         .await
         .expect("a malformed optional context is reported as a diagnostic");
 
-    assert!(projection.mcp_endpoint.is_none());
-    assert!(projection.diagnostics.iter().any(|diagnostic| {
+    assert!(context.record.resume_recovery.is_some());
+    assert!(context.record.mcp_endpoint.is_none());
+    assert!(context.record.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "invalidMcpEndpoint"
             && diagnostic.message.contains("one-time data migration")
     }));
+    assert_eq!(
+        workspace.mcp_endpoint_context(&agent_session_id),
+        Some(legacy_contents)
+    );
 }
 
 /// 旧 scoped endpoint 在迁移前仍失败闭合，停止同步不能绕过校验并覆盖原文档。

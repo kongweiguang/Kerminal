@@ -7,10 +7,9 @@ use kerminal_application::{
     AppError, AppResult,
     agents::{
         AgentHistoryProjection, AgentHistoryRequest, AgentLauncherCatalog, AgentService,
-        AgentSessionRecordProjection, AgentSessionView, AgentTargetContext, AgentTargetResolution,
-        AgentTerminalSnapshotRequest, AgentTextPreview, AgentTextSubmissionReceipt,
-        CreateAgentSessionFromHistoryRequest, CreateAgentSessionRequest,
-        RenameAgentSessionTitleRequest, SendAgentCommandRequest,
+        AgentSessionView, AgentTargetContext, AgentTargetResolution, AgentTerminalSnapshotRequest,
+        AgentTextPreview, AgentTextSubmissionReceipt, CreateAgentSessionFromHistoryRequest,
+        CreateAgentSessionRequest, RenameAgentSessionTitleRequest, SendAgentCommandRequest,
     },
 };
 use kerminal_domain::{agents::AgentTargetBinding, identity::AgentSessionId};
@@ -110,15 +109,6 @@ impl AgentService for FixedAgentService {
             return Err(AppError::not_found("test Agent not found"));
         }
         Ok(self.view.clone())
-    }
-
-    /// 本测试不读取 Agent 记录投影。
-    async fn record_projection(
-        &self,
-        _agent_session_id: AgentSessionId,
-        _cancellation: CancellationToken,
-    ) -> AppResult<AgentSessionRecordProjection> {
-        unused_operation()
     }
 
     /// 本测试不恢复 Agent CLI。

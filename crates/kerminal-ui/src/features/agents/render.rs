@@ -172,7 +172,7 @@ impl AgentArchiveConfirmationContent {
 }
 
 impl Render for AgentArchiveConfirmationContent {
-    /// main 的自然高度封顶 288px，三段保留固定头尾与正文滚动；错误增长后仍由实测高度居中。
+    /// 保留固定头尾与有界正文滚动；文字来自活动应用色板，已打开弹框也可随主题同步刷新。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -181,11 +181,8 @@ impl Render for AgentArchiveConfirmationContent {
             .read(cx)
             .archive_confirmation_feedback(&self.owner);
         let theme = ThemeTokens::current(window, cx).for_tool_panel();
-        let dark = cx.read_global::<KitTheme, _>(|theme, _| {
-            theme.mode == gpui_kit::component::ThemeMode::Dark
-        });
-        let foreground = gpui_kit::rgb(if dark { 0xfafafa } else { 0x09090b });
-        let description_color = gpui_kit::rgb(if dark { 0xd4d4d8 } else { 0x52525b });
+        let foreground = theme.foreground;
+        let description_color = theme.muted;
         let title = self.owner.expected_title.clone();
         let runtime_description = self.runtime_description.clone();
         let cancel_parent = self.panel.clone();
@@ -363,7 +360,7 @@ impl AgentArchiveConfirmationFooter {
 }
 
 impl Render for AgentArchiveConfirmationFooter {
-    /// 失败保持原 owner 以供重试；按钮沿用 main 的右对齐、透明危险态及忙碌文案，不引入额外入口。
+    /// 失败保持原 owner 以供重试；透明危险态取自语义主题，避免不同应用色板下出现固定文字色。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -376,12 +373,9 @@ impl Render for AgentArchiveConfirmationFooter {
         let cancel_parent = parent.clone();
         let cancel_owner = owner.clone();
         let theme = ThemeTokens::current(window, cx).for_tool_panel();
-        let dark = cx.read_global::<KitTheme, _>(|theme, _| {
-            theme.mode == gpui_kit::component::ThemeMode::Dark
-        });
-        let cancel_color = gpui_kit::rgb(if dark { 0xd4d4d8 } else { 0x52525b });
-        let danger_color = gpui_kit::rgb(if dark { 0xfca5a5 } else { 0xdc2626 });
-        let danger_hover = gpui_kit::rgb(if dark { 0xfecaca } else { 0xb91c1c });
+        let cancel_color = theme.muted;
+        let danger_color = theme.error;
+        let danger_surface = theme.error.opacity(0.1);
         DialogFooter::new()
             .w_full()
             .flex_shrink_0()
@@ -414,10 +408,10 @@ impl Render for AgentArchiveConfirmationFooter {
                 Button::new("agent-archive-confirm")
                     .custom(
                         ButtonCustomVariant::new(cx)
-                            .foreground(danger_color.into())
-                            .hover_foreground(danger_hover.into())
-                            .hover(gpui_kit::rgb(0xef4444).opacity(0.1).into())
-                            .active(gpui_kit::rgb(0xef4444).opacity(0.1).into()),
+                            .foreground(danger_color)
+                            .hover_foreground(danger_color)
+                            .hover(danger_surface)
+                            .active(danger_surface),
                     )
                     .h(px(32.))
                     .px_3()

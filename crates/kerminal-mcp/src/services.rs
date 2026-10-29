@@ -11,12 +11,10 @@ use kerminal_application::{
     connections::{
         RemoteConnectionService, credentials::CredentialService, management::HostManagementService,
     },
-    diagnostics::DiagnosticsService,
     executor::ApplicationTaskExecutor,
-    files::FileService,
     operations::OperationsService,
     preferences::{ConfigurationValidationService, ProfileService},
-    sessions::{SessionService, logging::SessionLogService},
+    sessions::SessionService,
     transfers::TransferService,
 };
 use kerminal_domain::identity::AgentSessionId;
@@ -30,14 +28,11 @@ pub struct McpServices {
     pub(crate) remote_connections: Option<Arc<dyn RemoteConnectionService>>,
     pub(crate) host_management: Option<HostManagementService>,
     pub(crate) credentials: Option<CredentialService>,
-    pub(crate) files: Option<FileService>,
     pub(crate) transfers: Option<TransferService>,
     pub(crate) operations: Option<OperationsService>,
     pub(crate) commands: Option<CommandsService>,
     pub(crate) profiles: Option<ProfileService>,
     pub(crate) configuration_validation: Option<ConfigurationValidationService>,
-    pub(crate) diagnostics: Option<DiagnosticsService>,
-    pub(crate) session_logs: Option<SessionLogService>,
     pub(crate) task_executor: Option<ApplicationTaskExecutor>,
     pub(crate) agent_scope: Option<AgentSessionId>,
 }
@@ -51,14 +46,11 @@ impl McpServices {
             remote_connections: None,
             host_management: None,
             credentials: None,
-            files: None,
             transfers: None,
             operations: None,
             commands: None,
             profiles: None,
             configuration_validation: None,
-            diagnostics: None,
-            session_logs: None,
             task_executor: None,
             agent_scope: None,
         }
@@ -89,14 +81,13 @@ impl McpServices {
         self
     }
 
-    /// 注入同一应用构造的文件与传输用例，SFTP 和容器文件共用其能力边界。
-    pub fn with_files(mut self, files: FileService, transfers: TransferService) -> Self {
-        self.files = Some(files);
+    /// 只注入共享的传输队列，避免 MCP 为服务器文件操作再持有独立文件服务。
+    pub fn with_transfers(mut self, transfers: TransferService) -> Self {
         self.transfers = Some(transfers);
         self
     }
 
-    /// 注入容器、tmux、资源采样和端口转发共用的运维用例集合。
+    /// 注入应用的运维用例集合，以供端口转发复用唯一运行时。
     pub fn with_operations(mut self, operations: OperationsService) -> Self {
         self.operations = Some(operations);
         self
@@ -120,18 +111,6 @@ impl McpServices {
         validation: ConfigurationValidationService,
     ) -> Self {
         self.configuration_validation = Some(validation);
-        self
-    }
-
-    /// 注入诊断用例；脱敏、运行环境采集和固定目录归档均由 application adapter 负责。
-    pub fn with_diagnostics(mut self, diagnostics: DiagnosticsService) -> Self {
-        self.diagnostics = Some(diagnostics);
-        self
-    }
-
-    /// 注入真实终端输出录制用例；MCP 不自行打开日志文件或合成录制状态。
-    pub fn with_session_logs(mut self, session_logs: SessionLogService) -> Self {
-        self.session_logs = Some(session_logs);
         self
     }
 
@@ -167,13 +146,6 @@ impl McpServices {
         self.credentials
             .as_ref()
             .ok_or_else(|| AppError::unsupported("Credential vault capability unavailable"))
-    }
-
-    /// 要求统一文件用例存在，拒绝从 MCP 直接选择或操作协议 adapter。
-    pub(crate) fn require_files(&self) -> AppResult<&FileService> {
-        self.files
-            .as_ref()
-            .ok_or_else(|| AppError::unsupported("File capability unavailable"))
     }
 
     /// 要求统一传输队列用例存在，SFTP 和容器传输不可各自维护任务状态。
@@ -213,20 +185,6 @@ impl McpServices {
             .ok_or_else(|| AppError::unsupported("Configuration validation capability unavailable"))
     }
 
-    /// 要求诊断服务已装配，MCP 不自行收集宿主进程、配置或数据目录信息。
-    pub(crate) fn require_diagnostics(&self) -> AppResult<&DiagnosticsService> {
-        self.diagnostics
-            .as_ref()
-            .ok_or_else(|| AppError::unsupported("Diagnostics capability unavailable"))
-    }
-
-    /// 要求日志生命周期能力已装配，缺少时显式报告不可用而非伪造状态。
-    pub(crate) fn require_session_logs(&self) -> AppResult<&SessionLogService> {
-        self.session_logs
-            .as_ref()
-            .ok_or_else(|| AppError::unsupported("Terminal log capability unavailable"))
-    }
-
     /// 在桌面启动 MCP 前一次检查所有目录工具的运行态依赖，阻止部分装配却发布完整目录。
     pub fn validate_complete(&self) -> Result<(), McpServicesValidationError> {
         let mut missing = Vec::new();
@@ -242,9 +200,6 @@ impl McpServices {
         if self.credentials.is_none() {
             missing.push("credentials");
         }
-        if self.files.is_none() {
-            missing.push("files");
-        }
         if self.transfers.is_none() {
             missing.push("transfers");
         }
@@ -259,12 +214,6 @@ impl McpServices {
         }
         if self.configuration_validation.is_none() {
             missing.push("configuration_validation");
-        }
-        if self.diagnostics.is_none() {
-            missing.push("diagnostics");
-        }
-        if self.session_logs.is_none() {
-            missing.push("session_logs");
         }
         if self.task_executor.is_none() {
             missing.push("task_executor");

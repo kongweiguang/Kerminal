@@ -1837,6 +1837,123 @@ mod workspace_tabs_gpui_chrome {
         );
     }
 
+    /// 按下与释放之间允许真实重绘，避免同帧点击测试漏掉按钮状态在下一帧丢失的回归。
+    /// 同时覆盖三种主题、空标签栏及溢出布局；右键只打开选择器，不创建本地会话。
+    ///
+    /// @author kongweiguang
+    #[gpui::test]
+    fn create_terminal_click_survives_a_frame_between_press_and_release(cx: &mut TestAppContext) {
+        use kerminal_application::preferences::ThemeMode;
+
+        for (count, mode) in [
+            (0, ThemeMode::Light),
+            (2, ThemeMode::Dark),
+            (12, ThemeMode::System),
+        ] {
+            let (harness, visual) = fixture_with_tab_count(cx, count);
+            visual.update(|window, app| {
+                harness.update(app, |_, cx| {
+                    crate::theme::apply_theme_mode(mode, window.appearance(), cx);
+                });
+            });
+            draw(visual);
+            let bounds = visual
+                .debug_bounds("workspace-tabs-create-terminal")
+                .expect("create button is rendered in every tab layout");
+            let position = bounds.center();
+            let down = visual.update(|window, app| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        position,
+                        button: gpui::MouseButton::Left,
+                        ..Default::default()
+                    }),
+                    app,
+                )
+            });
+            assert!(
+                !down.propagate,
+                "the title-bar command must consume its press before native window handling"
+            );
+            draw(visual);
+            visual.update(|_, app| {
+                harness.read_with(app, |harness, _| {
+                    assert!(
+                        harness.create_events.borrow().is_empty(),
+                        "pressing alone must not create a terminal"
+                    );
+                });
+            });
+            visual.simulate_mouse_up(position, gpui::MouseButton::Left, Modifiers::default());
+            draw(visual);
+            visual.update(|_, app| {
+                harness.read_with(app, |harness, _| {
+                    assert_eq!(
+                        *harness.create_events.borrow(),
+                        vec![WorkspaceTabsCreateEvent::Local]
+                    );
+                });
+            });
+            visual.simulate_mouse_down(position, gpui::MouseButton::Right, Modifiers::default());
+            visual.simulate_mouse_up(position, gpui::MouseButton::Right, Modifiers::default());
+            draw(visual);
+            visual.update(|_, app| {
+                harness.read_with(app, |harness, app| {
+                    assert!(harness.tabs.read(app).is_create_target_picker_open());
+                    assert_eq!(
+                        *harness.create_events.borrow(),
+                        vec![WorkspaceTabsCreateEvent::Local]
+                    );
+                });
+            });
+        }
+    }
+
+    /// 键盘确认应与左键执行同一新建命令，不能被承载右键选择器的 Popover 抢走。
+    /// 空工作区只有加号参与 Tab 顺序；上下文菜单关闭后必须返回原按钮，允许继续键盘操作。
+    ///
+    /// @author kongweiguang
+    #[gpui::test]
+    fn create_terminal_keyboard_confirmation_matches_primary_click(cx: &mut TestAppContext) {
+        let (harness, visual) = fixture_with_tab_count(cx, 0);
+        visual.update(|window, app| window.focus_next(app));
+        draw(visual);
+        let trigger_focus = visual.update(|window, app| window.focused(app));
+        assert!(trigger_focus.is_some());
+        for (index, key) in ["enter", "space"].into_iter().enumerate() {
+            visual.simulate_keystrokes(key);
+            draw(visual);
+            visual.update(|_, app| {
+                harness.read_with(app, |harness, app| {
+                    assert_eq!(
+                        *harness.create_events.borrow(),
+                        vec![WorkspaceTabsCreateEvent::Local; index + 1]
+                    );
+                    assert!(!harness.tabs.read(app).is_create_target_picker_open());
+                });
+            });
+        }
+        visual.simulate_keystrokes("shift-f10");
+        draw(visual);
+        visual.update(|_, app| {
+            harness.read_with(app, |harness, app| {
+                assert!(harness.tabs.read(app).is_create_target_picker_open());
+                assert_eq!(
+                    *harness.create_events.borrow(),
+                    vec![WorkspaceTabsCreateEvent::Local; 2]
+                );
+            });
+        });
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        visual.update(|window, app| {
+            harness.read_with(app, |harness, app| {
+                assert!(!harness.tabs.read(app).is_create_target_picker_open());
+                assert_eq!(window.focused(app), trigger_focus);
+            });
+        });
+    }
+
     /// A click at the measured label center activates that TabId; the rounded active face stays within the label box without overlapping siblings.
     ///
     /// @author kongweiguang

@@ -17,126 +17,13 @@ const MAX_CONTEXT_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AgentSessionArgs {
-    agent_session_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentContextArgs {
     agent_session_id: String,
     #[serde(default)]
     max_bytes: Option<usize>,
 }
 
-/// 查询运行中的 Agent session，并返回与旧 IPC 一致的完整安全记录投影。
-pub(crate) async fn current_session(
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    if cancellation.is_cancelled() {
-        return terminal_tools::failure(AppError::cancelled("MCP request was cancelled"));
-    }
-    let args = match terminal_tools::parse_args::<AgentSessionArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return terminal_tools::failure(error),
-    };
-    let agent_id = match resolve_agent_id(services, Some(&args.agent_session_id)) {
-        Ok(id) => id,
-        Err(error) => return terminal_tools::failure(error),
-    };
-    if services.agent_scope.is_some()
-        && let Err(error) = terminal_tools::ensure_live_agent_scope(
-            services,
-            agent_id.clone(),
-            cancellation.clone(),
-        )
-        .await
-    {
-        return terminal_tools::failure(error);
-    }
-    let service = match services.agent_service() {
-        Ok(service) => service,
-        Err(error) => return terminal_tools::failure(error),
-    };
-    match service.record_projection(agent_id, cancellation).await {
-        Ok(record) => {
-            if let Some(recovery) = record.resume_recovery.as_ref() {
-                return terminal_tools::failure_with_data(
-                    AppError::outcome_unknown("Agent resume metadata needs readback"),
-                    super::agent_wire::resume_recovery_data(recovery),
-                );
-            }
-            let entity_id = record.session.agent_session_id.clone();
-            match super::agent_wire::session_record_value(&record) {
-                Ok(record) => terminal_tools::success(
-                    "已读取 Kerminal Agent 会话。".to_owned(),
-                    json!({ "agentSession": record }),
-                    vec![json!({ "type": "agentSession", "id": entity_id })],
-                ),
-                Err(error) => terminal_tools::failure(error),
-            }
-        }
-        Err(error) => terminal_tools::failure(error),
-    }
-}
-
-/// 解析 Agent 首选终端的显式 session id 与 live/stale 状态，不检索活动 Tab。
-pub(crate) async fn resolve_target(
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    if cancellation.is_cancelled() {
-        return terminal_tools::failure(AppError::cancelled("MCP request was cancelled"));
-    }
-    let args = match terminal_tools::parse_args::<AgentSessionArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return terminal_tools::failure(error),
-    };
-    let agent_id = match resolve_agent_id(services, Some(&args.agent_session_id)) {
-        Ok(id) => id,
-        Err(error) => return terminal_tools::failure(error),
-    };
-    if services.agent_scope.is_some()
-        && let Err(error) = terminal_tools::ensure_live_agent_scope(
-            services,
-            agent_id.clone(),
-            cancellation.clone(),
-        )
-        .await
-    {
-        return terminal_tools::failure(error);
-    }
-    let service = match services.agent_service() {
-        Ok(service) => service,
-        Err(error) => return terminal_tools::failure(error),
-    };
-    match service
-        .resolve_preferred_target(agent_id, cancellation)
-        .await
-    {
-        Ok(resolution) => {
-            let binding = match super::agent_wire::target_binding_value(&resolution) {
-                Ok(binding) => binding,
-                Err(error) => return terminal_tools::failure(error),
-            };
-            let entity = match super::agent_wire::target_binding_entity_value(&resolution) {
-                Ok(entity) => entity,
-                Err(error) => return terminal_tools::failure(error),
-            };
-            terminal_tools::success(
-                "已解析 Agent 首选终端绑定。".to_owned(),
-                json!({ "targetBinding": binding }),
-                vec![entity],
-            )
-        }
-        Err(error) => terminal_tools::failure(error),
-    }
-}
-
-/// 读取 Agent 会话及其绑定目标的有界终端上下文快照。
+/// 统一返回 Agent 记录、绑定和有界终端上下文，避免调用方拼接多个不同代次的查询。
 pub(crate) async fn target_context(
     services: &McpServices,
     arguments: Map<String, Value>,

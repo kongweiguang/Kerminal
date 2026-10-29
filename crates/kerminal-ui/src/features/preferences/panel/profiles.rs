@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    PreferencesPanel, PreferencesSection, ProfileTextField, parse_environment, profile_to_draft,
+    PreferencesEvent, PreferencesPanel, PreferencesSection, ProfileTextField, parse_environment,
+    profile_to_draft,
 };
 use crate::features::preferences::{
     ConfigDraft, DraftSnapshot, DraftStatus, DraftTransitionError, validate_profile,
@@ -98,7 +99,7 @@ impl PreferencesPanel {
         self.selected_profile_id = None;
         self.reset_profile_form(
             ProfileDraft {
-                id: None,
+                id: Some(uuid::Uuid::new_v4().to_string()),
                 name: String::new(),
                 shell: String::new(),
                 args: Vec::new(),
@@ -351,6 +352,7 @@ impl PreferencesPanel {
     ) {
         match result {
             Ok(saved) => {
+                cx.emit(PreferencesEvent::ProfilesChanged);
                 let id = saved.profile.id.clone();
                 if let Some(draft) = self.profile_draft.as_mut() {
                     let value = profile_to_draft(saved.profile.clone());
@@ -372,6 +374,7 @@ impl PreferencesPanel {
                         let _ = draft.save_conflicted();
                     } else if error.public_code() == PublicErrorCode::OutcomeUnknown {
                         let _ = draft.save_outcome_unknown();
+                        self.profile_unknown_readback = None;
                     } else {
                         let _ = draft.save_failed();
                     }
@@ -424,6 +427,92 @@ impl PreferencesPanel {
             let _ = draft.discard_changes();
         }
         self.load_profiles_again(cx);
+    }
+
+    /// 仅接受明确读回的版本；未知写入不会因此被描述为成功。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn use_profile_unknown_readback(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Some(current)) = self.profile_unknown_readback.take() else {
+            return;
+        };
+        self.install_profile(current, window, cx);
+        cx.emit(PreferencesEvent::ProfilesChanged);
+        self.profile_list_error = None;
+        self.status = Some(
+            crate::locale::text("已采用当前 Profile。", "Current profile adopted.").to_string(),
+        );
+        cx.notify();
+    }
+
+    /// 显式保留草稿并以读回 revision 重新比较；目标不存在时以同一 ID 重新创建，不自动提交。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn keep_profile_unknown_draft(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(readback) = self.profile_unknown_readback.take() else {
+            return;
+        };
+        let Some(draft) = self.profile_draft.as_mut() else {
+            return;
+        };
+        let value = draft.value().clone();
+        let (baseline, revision, is_default) = match readback {
+            Some(current) => (
+                profile_to_draft(current.profile.clone()),
+                Some(current.revision),
+                current.profile.is_default,
+            ),
+            None => (
+                ProfileDraft {
+                    id: value.id.clone(),
+                    name: String::new(),
+                    shell: String::new(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    sidebar_group_id: value.sidebar_group_id.clone(),
+                    sort_order: value.sort_order,
+                },
+                None,
+                false,
+            ),
+        };
+        if draft
+            .reload(DraftSnapshot {
+                value: baseline,
+                revision,
+            })
+            .is_err()
+            || draft.replace_value(value.clone()).is_err()
+        {
+            self.status = Some(
+                crate::locale::text(
+                    "无法恢复 Profile 草稿，请重新读取。",
+                    "Could not restore the profile draft. Reload it again.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        self.selected_profile_id = value.id;
+        self.selected_profile_is_default = is_default;
+        self.profile_list_error = None;
+        self.status = Some(
+            crate::locale::text(
+                "草稿已保留；核对后可再次保存。",
+                "Draft retained. Review it before saving again.",
+            )
+            .to_string(),
+        );
+        cx.notify();
     }
 
     /// 关闭 Profile 重载确认时保留当前草稿和外部冲突状态。
@@ -525,6 +614,7 @@ impl PreferencesPanel {
                 panel.profile_operation_running = false;
                 match result {
                     Ok(true) => {
+                        cx.emit(PreferencesEvent::ProfilesChanged);
                         panel.selected_profile_id = None;
                         panel.profile_draft = None;
                         panel.status = Some(crate::locale::text("Profile 已删除。", "Profile deleted.").to_string());
@@ -539,6 +629,7 @@ impl PreferencesPanel {
                     }
                     Err(error) => {
                         if error.public_code() == PublicErrorCode::OutcomeUnknown {
+                            panel.profile_delete_outcome_unknown = true;
                             if let Some(draft) = panel.profile_draft.as_mut() {
                                 draft.mark_outcome_unknown();
                             }
@@ -565,7 +656,16 @@ impl PreferencesPanel {
 
     /// 切换默认项提交整个 profile revision 集合，保证基础设施可原子维护唯一默认状态。
     pub(in crate::features::preferences) fn set_default_profile(&mut self, cx: &mut Context<Self>) {
-        if self.profile_operation_running {
+        if self.profile_operation_running
+            || self.profile_list_error.is_some()
+            || self.loading_profiles
+            || self.profile_draft.as_ref().is_some_and(|draft| {
+                matches!(
+                    draft.status(),
+                    DraftStatus::Saving | DraftStatus::OutcomeUnknown
+                )
+            })
+        {
             return;
         }
         let Some(id) = self.selected_profile_id.clone() else {
@@ -610,12 +710,14 @@ impl PreferencesPanel {
                 panel.profile_operation_running = false;
                 match result {
                     Ok(saved) => {
+                        cx.emit(PreferencesEvent::ProfilesChanged);
                         panel.selected_profile_id = Some(saved.profile.id);
                         panel.status = Some(crate::locale::text("默认 Profile 已更新。", "Default profile updated.").to_string());
                         panel.load_profiles_again(cx);
                     }
                     Err(error) => {
                         if error.public_code() == PublicErrorCode::OutcomeUnknown {
+                            panel.profile_default_outcome_unknown = true;
                             if let Some(draft) = panel.profile_draft.as_mut() {
                                 draft.mark_outcome_unknown();
                             }

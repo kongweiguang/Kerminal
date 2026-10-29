@@ -22,6 +22,7 @@ $script:DiagnosticsRoot = [IO.Path]::GetFullPath((Join-Path $script:RepositoryRo
 $script:ExpectedPages = @(
     'appearance',
     'terminal',
+    'profiles',
     'keywords',
     'suggestions',
     'sftp',
@@ -51,6 +52,17 @@ $script:ExpectedSyncActions = @(
     'sync-local-remote-roundtrip',
     'sync-failure-preserves-local',
     'sync-retry-confirms-remote'
+)
+$script:ExpectedMcpActions = @(
+    'mcp-timeout-retry-stops-original-owner',
+    'mcp-start-stop-light',
+    'mcp-start-stop-dark',
+    'mcp-start-stop-system'
+)
+$script:ExpectedProfileActions = @(
+    'create-profile-readback',
+    'edit-profile-readback',
+    'set-default-profile-readback'
 )
 $script:NativeDesktopLauncherSource = @'
 using System;
@@ -675,10 +687,40 @@ function Assert-SettingsParityReport {
         Assert-CaptureRecord -Capture $check.capture -RunRoot $RunRoot
     }
 
+    # 真实 listener 与原生按钮必须共同到达终态，不能只凭生成的截图宣称恢复成功。
+    $mcpChecks = $Report.PSObject.Properties['mcpChecks']
+    if ($null -eq $mcpChecks -or @($mcpChecks.Value).Count -ne $script:ExpectedMcpActions.Count) {
+        throw 'The report does not contain the complete MCP lifecycle.'
+    }
+    for ($index = 0; $index -lt $script:ExpectedMcpActions.Count; $index++) {
+        $check = $mcpChecks.Value[$index]
+        $action = $script:ExpectedMcpActions[$index]
+        if (-not $check.passed -or $check.action -cne $action -or
+            [string]::IsNullOrWhiteSpace([string]$check.expected) -or
+            $check.expected -cne $check.observed -or $null -eq $check.capture) {
+            throw "MCP lifecycle failed: $action"
+        }
+        $null = $expectedCaptureNames.Add([string]$check.capture.file)
+        Assert-CaptureRecord -Capture $check.capture -RunRoot $RunRoot
+    }
+
+    $profileChecks = $Report.PSObject.Properties['profileChecks']
+    if ($null -eq $profileChecks -or @($profileChecks.Value).Count -ne $script:ExpectedProfileActions.Count) {
+        throw 'The report does not contain the complete Profile lifecycle.'
+    }
+    for ($index = 0; $index -lt $script:ExpectedProfileActions.Count; $index++) {
+        $check = $profileChecks.Value[$index]
+        if (-not $check.passed -or $check.action -cne $script:ExpectedProfileActions[$index] -or
+            [string]::IsNullOrWhiteSpace([string]$check.expected) -or $check.expected -cne $check.observed) {
+            throw "Profile lifecycle failed: $($script:ExpectedProfileActions[$index])"
+        }
+    }
+
     foreach ($fileName in @(
         'settings-opened.png',
         'settings-functional-keyword-colors.png',
-        'settings-functional-keyword-color-picker.png'
+        'settings-functional-keyword-color-picker.png',
+        'settings-functional-profile.png'
     )) {
         $null = $expectedCaptureNames.Add($fileName)
     }

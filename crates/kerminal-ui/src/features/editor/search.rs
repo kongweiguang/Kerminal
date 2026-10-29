@@ -5,9 +5,8 @@
 use std::{ops::Range, sync::Arc, time::Duration};
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, HighlightStyle, Hsla, Window,
+    AppContext as _, Context, Entity, HighlightStyle, Window,
     component::input::{EditorState, TextDecoration},
-    rgb,
 };
 use kerminal_application::AppError;
 use kerminal_domain::files::FileEndpoint;
@@ -29,31 +28,22 @@ pub(super) struct SearchDecorationStyles {
 }
 
 impl SearchDecorationStyles {
-    /// 从同一套浅深主题令牌生成双色文本样式，保证颜色变更不会重扫文档。
+    /// 从应用色板生成双色文本样式并按实际对比度选前景，换色无需重扫文档或重建编辑器。
     pub(super) fn from_theme(theme: ThemeTokens) -> Self {
         let normal_background = theme.warning;
         let active_background = theme.accent;
         Self {
             normal: HighlightStyle {
-                color: Some(highlight_foreground(normal_background)),
+                color: Some(theme.foreground_on(normal_background)),
                 background_color: Some(normal_background),
                 ..Default::default()
             },
             active: HighlightStyle {
-                color: Some(highlight_foreground(active_background)),
+                color: Some(theme.foreground_on(active_background)),
                 background_color: Some(active_background),
                 ..Default::default()
             },
         }
-    }
-}
-
-/// 按令牌背景亮度选择黑白文字，避免普通或活动命中在浅深主题下失去对比。
-fn highlight_foreground(background: Hsla) -> Hsla {
-    if background.l >= 0.55 {
-        rgb(0x18181b).into()
-    } else {
-        rgb(0xffffff).into()
     }
 }
 

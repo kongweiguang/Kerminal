@@ -250,6 +250,7 @@ struct LocalHostInputBaseline {
 
 /// 仅保留被协议切换中断的默认目标意图；显式应用仍以发起时快照保护后续输入。
 pub(super) struct LocalHostDefaultRequest {
+    profile_id: Option<String>,
     explicit_override: Option<LocalHostInputBaseline>,
 }
 
@@ -692,7 +693,34 @@ impl ConnectionsPanel {
             return;
         };
         let expected = read_editor_baseline(editor, cx);
-        self.resolve_default_local_target(Some(expected), cx);
+        self.resolve_local_profile_target(None, Some(expected), cx);
+    }
+
+    /// 从同一 ProfileService 按 ID 读取最新启动字段，异步期间的新输入仍由逐字段门禁保护。
+    ///
+    /// @author kongweiguang
+    pub(super) fn use_local_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        let Some(editor) = self.local_hosts.editor.as_ref() else {
+            return;
+        };
+        let expected = read_editor_baseline(editor, cx);
+        self.resolve_local_profile_target(Some(profile_id), Some(expected), cx);
+    }
+
+    /// 只有启动字段完整匹配且唯一时才把输入标为某个 Profile，避免同名程序的不同参数被误认。
+    ///
+    /// @author kongweiguang
+    pub(super) fn selected_local_profile_id(&self, cx: &Context<Self>) -> Option<String> {
+        let editor = self.local_hosts.editor.as_ref()?;
+        let current = read_editor_baseline(editor, cx);
+        let mut matches = self.local_hosts.rows.iter().filter(|row| {
+            row.profile.shell == current.shell
+                && row.profile.cwd.as_deref().unwrap_or_default() == current.cwd
+                && row.profile.args.join("\n") == current.args
+                && format_environment(&row.profile.env) == current.env
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then(|| first.profile.id.clone())
     }
 
     /// 文件对话框回执只更新仍活动的可编辑本地主机输入；无效路径保留原草稿并给出可读错误。
@@ -719,8 +747,9 @@ impl ConnectionsPanel {
 
     /// 自动填充与显式切换共用同一请求；保留意图供协议返回重试，代次阻止旧回执重放。
     /// @author kongweiguang
-    fn resolve_default_local_target(
+    fn resolve_local_profile_target(
         &mut self,
+        profile_id: Option<String>,
         explicit_override: Option<LocalHostInputBaseline>,
         cx: &mut Context<Self>,
     ) {
@@ -744,6 +773,7 @@ impl ConnectionsPanel {
             return;
         };
         self.local_hosts.default_target_request = Some(LocalHostDefaultRequest {
+            profile_id: profile_id.clone(),
             explicit_override: explicit_override.clone(),
         });
         self.local_hosts.default_target_generation =
@@ -753,12 +783,24 @@ impl ConnectionsPanel {
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |_| async move { service.default_local_session_target().await })
+                .run(move |_| async move {
+                    match profile_id {
+                        Some(id) => service
+                            .local_session_target(&id)
+                            .await?
+                            .ok_or_else(|| AppError::not_found("Profile 已不存在，请重新读取")),
+                        None => service.default_local_session_target().await,
+                    }
+                })
                 .await;
             let _ = this.update_in(cx, move |panel, window, cx| {
                 if panel.local_hosts.default_target_generation != default_generation
                     || panel.local_hosts.editor_generation != editor_generation
-                    || panel.local_hosts.editor.as_ref().map(|editor| editor.profile_id.as_str())
+                    || panel
+                        .local_hosts
+                        .editor
+                        .as_ref()
+                        .map(|editor| editor.profile_id.as_str())
                         != Some(editor_id.as_str())
                     || panel.active_editor_kind != Some(ConnectionsEditorKind::Local)
                 {
@@ -770,7 +812,8 @@ impl ConnectionsPanel {
                         Ok((shell, args, cwd, env)) => {
                             if let Some(editor) = panel.local_hosts.editor.as_mut() {
                                 let current = read_editor_baseline(editor, cx);
-                                let projection = if let Some(expected) = explicit_override.as_ref() {
+                                let projection = if let Some(expected) = explicit_override.as_ref()
+                                {
                                     project_explicit_local_defaults(
                                         expected,
                                         &current,
@@ -795,24 +838,40 @@ impl ConnectionsPanel {
                                     )
                                 };
                                 if let Some(value) = projection.shell {
-                                    editor.shell.update(cx, |state, cx| state.set_value(value, window, cx));
+                                    editor
+                                        .shell
+                                        .update(cx, |state, cx| state.set_value(value, window, cx));
                                 }
                                 if let Some(value) = projection.cwd {
-                                    editor.cwd.update(cx, |state, cx| state.set_value(value, window, cx));
+                                    editor
+                                        .cwd
+                                        .update(cx, |state, cx| state.set_value(value, window, cx));
                                 }
                                 if let Some(value) = projection.args {
-                                    editor.args.update(cx, |state, cx| state.set_value(value, window, cx));
+                                    editor
+                                        .args
+                                        .update(cx, |state, cx| state.set_value(value, window, cx));
                                 }
                                 if let Some(value) = projection.env {
-                                    editor.env.update(cx, |state, cx| state.set_value(value, window, cx));
+                                    editor
+                                        .env
+                                        .update(cx, |state, cx| state.set_value(value, window, cx));
                                 }
                                 editor.baseline = projection.baseline;
                                 editor.dirty = editor.is_dirty(cx);
                             }
                             panel.status = Some(if explicit_override.is_some() {
-                                crate::locale::text("已应用默认终端 Profile；请求后的修改保持不变。", "The default terminal Profile was applied; edits made after the request were preserved.").to_string()
+                                crate::locale::text(
+                                    "已应用所选 Profile。",
+                                    "Selected profile applied.",
+                                )
+                                .to_string()
                             } else {
-                                crate::locale::text("系统默认目标已就绪；仅补全期间未修改的字段。", "System defaults are ready; only fields unchanged during lookup were filled.").to_string()
+                                crate::locale::text(
+                                    "已应用默认 Profile。",
+                                    "Default profile applied.",
+                                )
+                                .to_string()
                             });
                         }
                         Err(message) => panel.status = Some(message),
@@ -822,13 +881,11 @@ impl ConnectionsPanel {
                 panel.local_hosts.status = panel.status.clone();
                 cx.notify();
             });
-        }).detach();
+        })
+        .detach();
         self.status = Some(
-            crate::locale::text(
-                "正在读取默认终端 Profile…",
-                "Loading the default terminal Profile…",
-            )
-            .to_string(),
+            crate::locale::text("正在读取终端 Profile…", "Loading the terminal profile…")
+                .to_string(),
         );
         cx.notify();
     }
@@ -851,7 +908,7 @@ impl ConnectionsPanel {
     /// @author kongweiguang
     pub(super) fn resume_local_host_default_target(&mut self, cx: &mut Context<Self>) {
         if let Some(request) = self.local_hosts.default_target_request.take() {
-            self.resolve_default_local_target(request.explicit_override, cx);
+            self.resolve_local_profile_target(request.profile_id, request.explicit_override, cx);
         }
     }
 
@@ -2080,6 +2137,7 @@ impl ConnectionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.reload_local_hosts(cx);
         match action {
             LocalHostPendingAction::Create(group_id) => {
                 if group_id
@@ -2146,7 +2204,7 @@ impl ConnectionsPanel {
     /// 默认目标由 ProfileService 唯一解释，异步回执只补填仍符合当前意图的字段。
     /// @author kongweiguang
     fn start_default_local_target_resolution(&mut self, cx: &mut Context<Self>) {
-        self.resolve_default_local_target(None, cx);
+        self.resolve_local_profile_target(None, None, cx);
     }
 
     /// 基于稳定 Profile ID 读取最新快照；失败时保留现有编辑器，成功后才清理旧环境变量并替换。

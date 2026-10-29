@@ -25,7 +25,9 @@
 
 ## Settings
 
-`themeMode` 和 `interfaceDensity` 是顶层外观选项；界面语言、背景开关、背景适配方式、背景图片路径与透明度统一放在 `[appearance]` 下。`[terminal]` 保存字体、光标、色盘与滚屏缓冲。设置中暂未识别的扩展键由原文仓储保留。
+`themeMode` 和 `interfaceDensity` 是顶层外观选项；界面配色、语言、背景开关、背景适配方式、背景图片路径与透明度统一放在 `[appearance]` 下。`[terminal]` 保存字体、光标、色盘与滚屏缓冲。设置中暂未识别的扩展键由原文仓储保留。
+
+`[appearance].colorScheme` 是应用界面配色，可为 `kerminal`、`jetbrains`、`fleet`、`xcode`、`claude`、`vscode`，缺省为 `kerminal`；未知值属于无效配置。每套配色都提供浅色和深色，`themeMode` 为 `dark`、`light` 或 `system`，`system` 按系统明暗外观选择当前应用配色的对应版本。`[terminal].colorScheme` 和终端的浅深色盘是独立设置，修改应用配色不会修改终端颜色设置。旧文件缺少应用配色字段时直接使用默认值，读取不会改写文件。
 
 `[workbenchLayout]` 保存稳定的工作台用户意图：`hostSidebarCollapsed` 默认 `false`，`hostSidebarWidth` 默认 `220` 且范围为 `168`–`360`；`dockPanelWidths` 默认空表，右侧 Attached 工具共用 `360` 逻辑像素内容宽度，显式宽度范围为 `130`–`1360`；`bottomPanelHeight` 默认 `240` 且范围为 `180`–`4000`。
 
@@ -51,6 +53,7 @@ interfaceDensity = "compact"
 keybindings = [{ action = "terminal.paste", label = "粘贴到终端", description = "", binding = "", windowsBinding = "Ctrl+V", windowsAlternateBinding = "Ctrl+Shift+V", linuxBinding = "Ctrl+Shift+V", macBinding = "Cmd+V", scope = "terminal", editable = true }]
 
 [appearance]
+colorScheme = "kerminal"
 interfaceLanguage = "system"
 backgroundEnabled = false
 backgroundFit = "cover"

@@ -358,6 +358,7 @@ pub(super) async fn upload(
 }
 
 /// 启动 streaming worker 并并行推进 tar producer 与 stdin/output consumer，取消仍归原传输 owner。
+/// finish 回执结束后释放 stream 锁，再进入可能重试同一 owner 的失败清理。
 ///
 /// @author kongweiguang
 async fn send_archive(
@@ -491,7 +492,12 @@ async fn send_archive(
             retryable_after_cleanup: false,
         });
     }
-    let exit = match stream.lock().await.finish().await {
+    // 结束回执可能失败并需要再次锁定同一个 stream 清理；先结束锁的作用域，避免错误分支自锁。
+    let finish_result = {
+        let mut guard = stream.lock().await;
+        guard.finish().await
+    };
+    let exit = match finish_result {
         Ok(exit) => exit,
         Err(error) => {
             return Err(close_failed_stream_with_cleanup(

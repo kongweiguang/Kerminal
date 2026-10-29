@@ -73,7 +73,7 @@ impl Default for McpServerConfig {
 pub struct McpServer;
 
 impl McpServer {
-    /// 使用应用 runtime 启动 HTTP 服务；RMCP session worker 自行 spawn，故 factory 为每个服务对象登记生命周期令牌。
+    /// 复用应用 runtime 和固定工具目录；每个 RMCP worker 登记生命周期令牌以便统一回收。
     pub async fn start(
         runtime: &Handle,
         services: McpServices,

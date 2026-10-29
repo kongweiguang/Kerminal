@@ -12,6 +12,10 @@ use gpui_kit::{
 
 use crate::{theme::ThemeTokens, ui_backdrop};
 
+#[cfg(test)]
+#[path = "../tests/unit/context_menu_dispatch.rs"]
+mod context_menu_dispatch;
+
 /// 下拉菜单使用右侧勾选，并让已选项和当前键盘/鼠标项共享 main 的强调态。
 ///
 /// @author kongweiguang

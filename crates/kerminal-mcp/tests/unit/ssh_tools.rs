@@ -57,6 +57,33 @@ fn empty_selector_is_rejected_and_defaults_are_empty() {
     assert!(!selector.has_any());
 }
 
+/// 合并后的命令入口必须同时接受旧 hostId 请求和名称定位，且不扩展为接收连接密码。
+#[test]
+fn unified_command_accepts_both_selectors_and_rejects_inline_credentials() {
+    let direct: super::ResolvedCommandArgs = serde_json::from_value(serde_json::json!({
+        "hostId":"saved:fixture", "command":"pwd"
+    }))
+    .unwrap();
+    assert_eq!(
+        HostSelector::from_args(&direct).host_id.as_deref(),
+        Some("saved:fixture")
+    );
+    let named: super::ResolvedCommandArgs = serde_json::from_value(serde_json::json!({
+        "groupName":"测试", "name":"fixture", "command":"pwd"
+    }))
+    .unwrap();
+    let selector = HostSelector::from_args(&named);
+    assert!(selector.has_any());
+    assert_eq!(selector.group_name.as_deref(), Some("测试"));
+    assert_eq!(selector.name.as_deref(), Some("fixture"));
+    assert!(
+        serde_json::from_value::<super::ResolvedCommandArgs>(serde_json::json!({
+            "hostId":"saved:fixture", "command":"pwd", "password":"forbidden"
+        }))
+        .is_err()
+    );
+}
+
 /// 摘要副本隐藏最常见明文凭据，同时不改写实际捕获的 stdout 字段。
 #[test]
 fn summary_sample_masks_common_secret_assignments() {

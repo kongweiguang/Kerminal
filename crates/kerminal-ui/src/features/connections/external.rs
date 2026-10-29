@@ -494,6 +494,7 @@ pub(super) fn expected_fingerprint_matches(expected: &str, observed: &str) -> bo
 }
 
 /// 显示未注册目标的显式用户名步骤；没有默认账户、保存凭据或临时连接目标可继承，卡片宽度受根 modal 视口约束。
+/// 遮罩使用应用决策层令牌，保持浅深和自定义内置色板中的一致层次。
 ///
 /// @author kongweiguang
 pub(super) fn render_external_username_prompt(
@@ -516,7 +517,7 @@ pub(super) fn render_external_username_prompt(
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui_kit::hsla(0., 0., 0., 0.48))
+            .bg(theme.dialog_scrim)
             .child(
                 div()
                     .w_full()
@@ -589,6 +590,7 @@ pub(super) fn render_external_username_prompt(
 }
 
 /// 绘制一次性密码提示并说明保存匹配分类仅用于安全提示、不继承旧 Vault 凭据；卡片宽度受根 modal 视口约束。
+/// 遮罩与同级确认共用主题令牌，不把单一主题的黑色强度写入业务视图。
 ///
 /// @author kongweiguang
 pub(super) fn render_external_password_prompt(
@@ -608,7 +610,7 @@ pub(super) fn render_external_password_prompt(
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui_kit::hsla(0., 0., 0., 0.48))
+            .bg(theme.dialog_scrim)
             .child(
                 div()
                     .w_full()

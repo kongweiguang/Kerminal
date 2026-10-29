@@ -28,6 +28,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{composition::DesktopComposition, runtime::ApplicationRuntime};
 
+#[path = "settings_acceptance/app_theme.rs"]
+mod app_theme;
+#[path = "settings_acceptance/mcp.rs"]
+mod mcp;
+#[path = "settings_acceptance/profiles.rs"]
+mod profiles;
 #[path = "settings_acceptance/sync.rs"]
 mod sync;
 #[path = "settings_acceptance/workbench.rs"]
@@ -46,9 +52,10 @@ const MIN_HEIGHT: u32 = 600;
 const MAX_HEIGHT: u32 = 2160;
 const REPORT_FILE: &str = "report.json";
 
-const SETTINGS_PAGES: [(&str, &str); 11] = [
+const SETTINGS_PAGES: [(&str, &str); 12] = [
     ("appearance", "appearance"),
     ("terminal", "terminal"),
+    ("profiles", "profiles"),
     ("keywords", "keywords"),
     ("suggestions", "suggestions"),
     ("sftp", "sftp"),
@@ -100,6 +107,8 @@ struct AcceptanceReport {
     keyword_rule_check: SettingCheck,
     keyword_lifecycle_checks: Vec<KeywordLifecycleCheck>,
     sync_checks: Vec<SettingCheck>,
+    mcp_checks: Vec<SettingCheck>,
+    profile_checks: Vec<SettingCheck>,
     screenshots: Vec<CaptureRecord>,
 }
 
@@ -178,8 +187,13 @@ pub fn requested() -> bool {
         .is_some_and(|argument| argument == OsStr::new("--settings-acceptance"))
 }
 
-/// Runs production Root against owned local fixtures; setup/UI failures still shut down the same services.
+/// 专项入口优先分派到隔离的主题验收；其它情况下继续运行现有完整设置验收及资源收尾。
+///
+/// @author kongweiguang
 pub fn run() -> Result<(), Box<dyn Error>> {
+    if app_theme::requested() {
+        return app_theme::run();
+    }
     if workbench::requested() {
         return workbench::run();
     }
@@ -514,7 +528,8 @@ async fn resize_acceptance_window(
     }
 }
 
-/// 在隔离生产 Root 上使用真实快捷键和滚轮；紧凑窗口中入口及字段必须先进入可见区域。
+/// 在隔离生产 Root 上使用真实快捷键和滚轮；先保存 Profile，使三主题截图覆盖真实记录。
+/// 紧凑窗口中入口及字段必须先进入可见区域。
 ///
 /// @author kongweiguang
 async fn capture_settings(
@@ -557,6 +572,8 @@ async fn capture_settings(
     )
     .await?;
     let modal_generation = opened.modal_generation();
+    let profile_checks =
+        profiles::verify(cx, &root, window, &services, &context, &mut screenshots).await?;
     for (theme, name, selector) in THEMES {
         ensure_page(cx, &root, window, "appearance", "appearance").await?;
         reveal_settings_selector(cx, &root, window, "appearance", selector).await?;
@@ -649,6 +666,7 @@ async fn capture_settings(
         verify_language_select_escape(cx, &root, window, &context, &mut screenshots).await?;
     let disclosure_checks =
         capture_expanded_disclosures(cx, &root, window, &context, &mut screenshots).await?;
+    let mcp_checks = mcp::verify(cx, &root, window, &services, &context, &mut screenshots).await?;
 
     let mut density_checks = Vec::with_capacity(2);
     ensure_page(cx, &root, window, "appearance", "appearance").await?;
@@ -749,6 +767,8 @@ async fn capture_settings(
         keyword_rule_check,
         keyword_lifecycle_checks,
         sync_checks,
+        mcp_checks,
+        profile_checks,
         screenshots,
     };
     let report_path = context.output_directory.join(REPORT_FILE);
@@ -1668,7 +1688,9 @@ async fn reveal_navigation_selector(
     .into())
 }
 
-/// Bounds state waits and records safe runtime projections so sync/load failures remain diagnosable.
+/// 等待受限状态并在超时时输出安全运行态，便于区分未保存、主题投影和终端快照问题。
+///
+/// @author kongweiguang
 async fn wait_for_state<F>(
     cx: &mut AsyncApp,
     root: &Entity<RootView>,
@@ -1686,7 +1708,7 @@ where
         }
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
-                "settings state wait timed out: page={}, modal={}, ready={}, loading={}, draft_ready={}, dirty={}, theme={:?}, density={:?}, rules={:?}, language={:?}, selected_language={:?}, protocol_settled={}, sync_ready={}, sync_busy={}, sync_outcome={:?}, sync_error_present={}",
+                "settings state wait timed out: page={}, modal={}, ready={}, loading={}, draft_ready={}, dirty={}, theme={:?}, app_draft={:?}, app_applied={:?}, kit_matches={}, terminal_generation={}, rendered_terminal={}, sessions={}, density={:?}, rules={:?}, language={:?}, selected_language={:?}, protocol_settled={}, sync_ready={}, sync_busy={}, sync_outcome={:?}, sync_error_present={}",
                 state.page_id(),
                 state.modal_open(),
                 state.settings_ready(),
@@ -1694,6 +1716,12 @@ where
                 state.draft_ready(),
                 state.draft_dirty(),
                 state.draft_theme_mode(),
+                state.draft_app_color_scheme(),
+                state.applied_app_color_scheme(),
+                state.kit_theme_matches_app_color(),
+                state.terminal_palette_update_generation(),
+                state.rendered_terminal_palette().is_some(),
+                state.ready_local_session_ids().len(),
                 state.draft_density(),
                 state.draft_keyword_rule_count(),
                 state.draft_interface_language(),
@@ -1908,6 +1936,7 @@ fn settings_scroll_root(page_id: &str) -> Option<&'static str> {
     match page_id {
         "appearance" => Some("preferences-appearance"),
         "terminal" => Some("preferences-terminal"),
+        "profiles" => Some("preferences-profile-form-scroll"),
         "keywords" => Some("settings-keyword-highlights-panel"),
         "suggestions" => Some("settings-suggestions-panel"),
         "sftp" => Some("preferences-sftp"),
@@ -1970,7 +1999,10 @@ fn observed_settings_scroll_position(
     })
 }
 
-/// Focuses a real input, clears its value through keyboard events, then types through GPUI's key path.
+/// 点击后先绘制焦点交接帧，再通过真实按键清空和输入；隐藏窗口没有系统自动补帧，
+/// 不显式绘制会把文字送给上一帧的输入处理器，造成原生验收伪失败。
+///
+/// @author kongweiguang
 fn click_and_type(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
@@ -1978,6 +2010,12 @@ fn click_and_type(
     value: &str,
 ) -> Result<(), Box<dyn Error>> {
     click_selector(cx, window, selector)?;
+    window.update(cx, |_, window, app| {
+        ensure_hidden_window(window)?;
+        window.refresh();
+        draw_acceptance_frame(window, app);
+        Ok::<_, io::Error>(())
+    })??;
     press_key(cx, window, "secondary-a")?;
     press_key(cx, window, "backspace")?;
     window.update(cx, |_, window, app| {

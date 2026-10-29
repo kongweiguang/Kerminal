@@ -25,10 +25,7 @@ use kerminal_domain::{
 };
 use serde_json::{Value, json};
 
-use super::{
-    resume_recovery_data, session_record_value, target_binding_entity_value, target_binding_value,
-    target_context_value,
-};
+use super::{resume_recovery_data, target_context_value};
 
 /// 构造经领域构造器校验的固定业务值，使 wire 断言能够检查真实字段映射。
 fn record_fixture() -> (
@@ -177,16 +174,36 @@ fn record_fixture() -> (
     (projection, session, resolution)
 }
 
-/// 对比完整旧 AgentSessionRecord wire key 集合，并确认 launch env 未跨 MCP 暴露。
+/// 构造统一入口的真实上下文，避免为已下线的独立接口保留测试专用投影。
+fn context_fixture() -> AgentTargetContext {
+    let (record, session, target) = record_fixture();
+    AgentTargetContext {
+        session: AgentSessionView {
+            session,
+            terminal: None,
+            resume_recovery: None,
+            resume_capability: AgentResumeCapability::MetadataUnavailable,
+        },
+        record,
+        target,
+        snapshot: None,
+        captured_bytes: 0,
+        redacted: false,
+    }
+}
+
+/// 锁定统一上下文中完整 AgentSessionRecord 字段，并确认 launch env 未跨 MCP 暴露。
 ///
 /// @author kongweiguang
 #[test]
-fn current_session_keeps_full_legacy_record_shape_and_omits_launch_environment() {
-    let (projection, _, _) = record_fixture();
-    let value = session_record_value(&projection).expect("wire record must serialize");
+fn target_context_keeps_full_record_shape_and_omits_launch_environment() {
+    let context = context_fixture();
+    let response =
+        target_context_value(&context, Vec::new(), None, 0).expect("target context must serialize");
+    let value = &response["agentSession"];
 
     assert_eq!(
-        object_keys(&value),
+        object_keys(value),
         keys(&[
             "diagnostics",
             "mcpEndpoint",
@@ -320,13 +337,15 @@ fn current_session_keeps_full_legacy_record_shape_and_omits_launch_environment()
     assert!(value["paths"]["context"]["terminalSnapshotJson"].is_string());
 }
 
-/// 保留旧 AgentSession 对缺失可选 scope/target 的 null 编码，避免读取方区分语义漂移。
+/// 上下文中的 AgentSession 对缺失 scope/target 仍显式返回 null，避免字段语义漂移。
 #[test]
-fn current_session_preserves_null_optional_session_fields() {
-    let (mut projection, _, _) = record_fixture();
-    projection.session.scope = None;
-    projection.session.target = None;
-    let value = session_record_value(&projection).expect("wire record must serialize");
+fn target_context_preserves_null_optional_session_fields() {
+    let mut context = context_fixture();
+    context.record.session.scope = None;
+    context.record.session.target = None;
+    let response =
+        target_context_value(&context, Vec::new(), None, 0).expect("target context must serialize");
+    let value = &response["agentSession"];
 
     assert!(value["session"].get("scope").is_some());
     assert!(value["session"]["scope"].is_null());
@@ -334,15 +353,16 @@ fn current_session_preserves_null_optional_session_fields() {
     assert!(value["session"]["target"].is_null());
 }
 
-/// 对比旧 targetBinding snapshot 与 entity 字段名，并拒绝不完整的无绑定结果。
+/// 统一上下文区分无绑定和损坏的绑定，避免调用方把不完整的目标视为有效目标。
 #[test]
-fn target_resolution_keeps_legacy_snapshot_and_entity_names() {
-    let (_, _, resolution) = record_fixture();
-    let binding = target_binding_value(&resolution).expect("binding must serialize");
-    let entity = target_binding_entity_value(&resolution).expect("entity must serialize");
+fn target_context_preserves_binding_snapshot_and_unbound_status() {
+    let mut context = context_fixture();
+    let response =
+        target_context_value(&context, Vec::new(), None, 0).expect("target context must serialize");
+    let binding = &response["targetBinding"];
 
     assert_eq!(
-        object_keys(&binding),
+        object_keys(binding),
         keys(&[
             "agentSessionId",
             "bindingId",
@@ -361,21 +381,14 @@ fn target_resolution_keeps_legacy_snapshot_and_entity_names() {
     );
     assert_eq!(binding["status"], "live");
     assert_eq!(binding["updatedAtMs"], 1792200000003_u64);
-    assert_eq!(entity["type"], "agentTargetBinding");
-    assert_eq!(
-        object_keys(&entity),
-        keys(&["agentSessionId", "status", "terminalSessionId", "type"])
-    );
-    assert_eq!(
-        entity["terminalSessionId"],
-        binding["targetTerminalSessionId"]
-    );
-    assert_eq!(entity["status"], "live");
+    context.target.binding.pane_id = None;
+    assert!(target_context_value(&context, Vec::new(), None, 0).is_err());
 
-    let mut unbound = resolution;
-    unbound.status = AgentTargetLiveStatus::Unbound;
-    unbound.binding = AgentTargetBinding::unbound(18);
-    assert!(target_binding_value(&unbound).is_err());
+    context.target.status = AgentTargetLiveStatus::Unbound;
+    context.target.binding = AgentTargetBinding::unbound(18);
+    let unbound = target_context_value(&context, Vec::new(), None, 0)
+        .expect("unbound target context must serialize");
+    assert!(unbound["targetBinding"].is_null());
 }
 
 /// 锁定 target_context wire 字段；内部恢复能力不属于该 MCP 契约。

@@ -4,9 +4,8 @@ use std::path::PathBuf;
 
 use kerminal_domain::{
     files::{
-        ConflictPolicy, FileEndpoint, FileEntry, FileEntryKind, FilePreview, FileRevision,
-        TransferCommitSummary, TransferFailureKind, TransferKind, TransferPhase, TransferRequest,
-        TransferStatus, TransferSummary,
+        ConflictPolicy, FileEndpoint, TransferCommitSummary, TransferFailureKind, TransferKind,
+        TransferPhase, TransferRequest, TransferStatus, TransferSummary,
     },
     identity::{HostId, TransferId},
 };
@@ -74,7 +73,7 @@ fn legacy_transfer_request_maps_upload_direction() {
     assert_eq!(request.conflict_policy, ConflictPolicy::Overwrite);
 }
 
-/// 锁定旧版 transfer 响应中的 camelCase endpoint 字段，防止 Rust 字段名泄漏到 wire 契约。
+/// 锁定普通 SFTP 与容器队列的可跟踪目标和方向，防止已受理的容器传输退化为 unsupported。
 ///
 /// @author kongweiguang
 #[test]
@@ -129,6 +128,27 @@ fn transfer_projection_preserves_canonical_endpoint_and_result_fields() {
     summary.cleanup_pending = true;
     let pending_projection = transfer_projection(&summary);
     assert_eq!(pending_projection["cleanupPending"], true);
+    summary.request.source = FileEndpoint::Container {
+        host_id: Some(host_id.clone()),
+        runtime: ContainerRuntime::Docker,
+        container_id: "fixture-container".into(),
+        path: RemotePath::parse_container("/data/report.txt").unwrap(),
+    };
+    let container = transfer_projection(&summary);
+    assert_eq!(container["operation"], "download");
+    assert_eq!(container["transportMode"], "containerArchive");
+    assert_eq!(container["source"]["type"], "container");
+    assert_eq!(container["source"]["hostId"], host_id.as_str());
+    assert_eq!(container["source"]["containerId"], "fixture-container");
+    assert_eq!(container["source"]["runtime"], "docker");
+    assert_eq!(container["source"]["path"], "/data/report.txt");
+    std::mem::swap(
+        &mut summary.request.source,
+        &mut summary.request.destination,
+    );
+    let upload = transfer_projection(&summary);
+    assert_eq!(upload["operation"], "upload");
+    assert_eq!(upload["destination"], container["source"]);
 }
 
 /// 同一远端目录复制拒绝将目标嵌套进源路径或反向嵌套。
@@ -152,32 +172,10 @@ fn remote_directory_transfer_rejects_nested_paths() {
 #[test]
 fn remote_endpoint_normalizes_legacy_separators_and_rejects_root_mutation() {
     let host_id = HostId::new();
-    let endpoint = remote_endpoint(host_id.as_str(), r"\srv\logs", false)
+    let endpoint = remote_endpoint(host_id.as_str(), r"\srv\logs")
         .expect("legacy backslash path normalizes to POSIX separators");
     assert!(matches!(endpoint, FileEndpoint::Remote { path, .. } if path.as_str() == "/srv/logs"));
-    assert!(remote_endpoint(host_id.as_str(), "/", false).is_err());
-    assert!(remote_endpoint(host_id.as_str(), "/", true).is_ok());
-}
-
-/// 预览边界截断在多字节 UTF-8 码点时丢弃不完整尾部，而不产生替换字符。
-#[test]
-fn truncated_utf8_preview_drops_only_incomplete_tail() {
-    let preview = FilePreview {
-        endpoint: FileEndpoint::Local {
-            path: PathBuf::from("preview.txt"),
-        },
-        bytes: vec![b'a', 0xe4, 0xb8],
-        total_size: Some(4),
-        truncated: true,
-        binary: false,
-        revision: Some(FileRevision {
-            size: 4,
-            modified: None,
-            permissions: None,
-            content_digest: None,
-        }),
-    };
-    assert_eq!(preview_content(&preview), "a");
+    assert!(remote_endpoint(host_id.as_str(), "/").is_err());
 }
 
 /// 内部 Skipped 终态保持明确 wire 值，不能伪装成 succeeded 或 failed。
@@ -318,42 +316,6 @@ fn commit_unknown_projection_does_not_enable_retry() {
     assert_eq!(projected["commitSummary"]["outcome"], "partial");
     assert_eq!(projected["commitSummary"]["committedEntries"], 1);
     assert_eq!(projected["commitSummary"]["committedBytes"], 17);
-}
-
-/// 列表权限保持 ls 十位格式并区分 setuid、setgid、sticky 的大小写语义。
-#[test]
-fn permission_projection_keeps_file_type_and_special_bits() {
-    assert_eq!(permission_string(FileEntryKind::File, 0o4755), "-rwsr-xr-x");
-    assert_eq!(permission_string(FileEntryKind::File, 0o4644), "-rwSr--r--");
-    assert_eq!(
-        permission_string(FileEntryKind::Directory, 0o1777),
-        "drwxrwxrwt"
-    );
-}
-
-/// MCP 保留 raw wire 字段，并且仅输出领域适配器提供的值。
-#[test]
-fn file_entry_projection_preserves_optional_raw_line() {
-    let host_id = HostId::new();
-    let entry = FileEntry {
-        endpoint: FileEndpoint::remote(host_id, "/var/data/report.txt")
-            .expect("valid remote file path"),
-        name: "report.txt".to_owned(),
-        kind: FileEntryKind::File,
-        size: Some(4),
-        modified: None,
-        permissions: Some(0o640),
-        is_hidden: false,
-        raw: Some("-rw-r----- ? kong staff 4 @123 report.txt".to_owned()),
-    };
-    let value = file_entry_value(&entry).expect("remote entry projects to MCP");
-    assert_eq!(value["permissions"], "-rw-r-----");
-    assert_eq!(value["raw"], "-rw-r----- ? kong staff 4 @123 report.txt");
-
-    let mut without_raw = entry;
-    without_raw.raw = None;
-    let value = file_entry_value(&without_raw).expect("entry without source raw still projects");
-    assert!(value["raw"].is_null());
 }
 
 /// 只把 retry 操作中的未知提交结果映射为冻结的不可恢复错误族。

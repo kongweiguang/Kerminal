@@ -2,18 +2,18 @@
 //!
 //! @author kongweiguang
 
-use std::{ffi::OsString, time::Duration};
+use std::ffi::OsString;
 
 use kerminal_application::{
     AppError,
     agents::AgentTerminalSnapshotRequest,
     sessions::{
         CreateSessionRequest, PlainTextSnapshotRequest, SessionFilter, SessionRuntimeMetadata,
-        logging::{SessionLogStartRequest, redact_terminal_text},
+        logging::redact_terminal_text,
     },
 };
 use kerminal_domain::{
-    identity::{AgentSessionId, HostId, PaneId, SessionId},
+    identity::{AgentSessionId, HostId, SessionId},
     sessions::{
         LocalSessionTarget, SessionInfo, SessionLifecycle, SessionOwner, SessionTarget,
         SshInitialCommand, SshSessionTarget, TerminalSize,
@@ -96,24 +96,6 @@ struct ResizeArgs {
 struct ListArgs {
     #[serde(default)]
     agent_session_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LogArgs {
-    session_id: String,
-    #[serde(default)]
-    agent_session_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ReconnectArgs {
-    pane_id: String,
-    #[serde(default)]
-    agent_session_id: Option<String>,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
 }
 
 /// 创建后台 session；默认 shell 经共享 ProfileService 解析，明确传入 shell 时保留调用方选择且不创建 Agent TUI。
@@ -500,107 +482,6 @@ pub(crate) async fn close(
     }
 }
 
-/// 将日志录制状态映射到独立日志用例，并要求每次操作都关联实际存在的显式 session。
-pub(crate) async fn log(
-    tool_id: &str,
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    if cancellation.is_cancelled() {
-        return failure(AppError::cancelled("MCP request was cancelled"));
-    }
-    let args = match parse_args::<LogArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return failure(error),
-    };
-    let session_id = match SessionId::parse(&args.session_id) {
-        Ok(session_id) => session_id,
-        Err(_) => return failure(AppError::invalid("session id")),
-    };
-    let agent_id = match resolve_agent_scope(services, args.agent_session_id.as_deref()) {
-        Ok(agent_id) => agent_id,
-        Err(error) => return failure(error),
-    };
-    if let Some(agent_id) = agent_id
-        && let Err(error) = ensure_live_agent_scope(services, agent_id, cancellation.clone()).await
-    {
-        return failure(error);
-    }
-    let session = match services.sessions.list(SessionFilter::default()).await {
-        Ok(sessions) => sessions
-            .into_iter()
-            .find(|session| session.session_id == session_id),
-        Err(error) => return failure(error),
-    };
-    let Some(session) = session else {
-        return failure(AppError::not_found("Terminal session not found"));
-    };
-    let service = match services.require_session_logs() {
-        Ok(service) => service,
-        Err(error) => return failure(error),
-    };
-    let state = match tool_id {
-        "terminal.log.start" => {
-            let (shell, cwd) = match &session.target {
-                SessionTarget::Local(target) => (
-                    target.program.to_string_lossy().into_owned(),
-                    target
-                        .working_directory
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().into_owned()),
-                ),
-                SessionTarget::Ssh(target) => (
-                    "ssh".to_owned(),
-                    target
-                        .working_directory
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().into_owned()),
-                ),
-                SessionTarget::Telnet(_) => ("telnet".to_owned(), None),
-                SessionTarget::Serial(_) => ("serial".to_owned(), None),
-                SessionTarget::Container(_) => ("container".to_owned(), None),
-            };
-            service
-                .start(
-                    cancellation,
-                    SessionLogStartRequest {
-                        session_id: session_id.clone(),
-                        shell,
-                        cwd,
-                    },
-                )
-                .await
-        }
-        "terminal.log.stop" => service.stop(cancellation, session_id.clone()).await,
-        "terminal.log.state" => service.state(cancellation, session_id.clone()).await,
-        _ => return failure(AppError::invalid("Unknown terminal log tool")),
-    };
-    match state {
-        Ok(state) => {
-            let value = match serde_json::to_value(&state) {
-                Ok(value) => value,
-                Err(error) => {
-                    return failure(AppError::infrastructure_with_source(
-                        "Terminal log state serialization failed",
-                        error,
-                    ));
-                }
-            };
-            success(
-                match tool_id {
-                    "terminal.log.start" => "终端日志已启动。".to_owned(),
-                    "terminal.log.stop" => "终端日志已停止。".to_owned(),
-                    _ => "已读取终端日志状态。".to_owned(),
-                },
-                json!({ "sessionId": session_id.as_str(), "state": value }),
-                vec![json!({ "type": "terminalSession", "id": session_id.as_str() })],
-            )
-        }
-        Err(error) => failure(error),
-    }
-}
-
 /// 列出 runtime 中真实存在的会话；Agent scope 只校验自身存活，不缩小 global session 能力。
 pub(crate) async fn list(
     services: &McpServices,
@@ -658,92 +539,6 @@ pub(crate) async fn list(
         }),
         entities,
     )
-}
-
-/// 依据显式 pane 身份重连唯一已有会话；不查找其它 pane 或将失败目标改绑到当前 Tab。
-pub(crate) async fn reconnect(
-    services: &McpServices,
-    arguments: Map<String, Value>,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    if cancellation.is_cancelled() {
-        return failure(AppError::cancelled("MCP request was cancelled"));
-    }
-    let args = match parse_args::<ReconnectArgs>(arguments) {
-        Ok(args) => args,
-        Err(error) => return failure(error),
-    };
-    let agent_id = match resolve_agent_scope(services, args.agent_session_id.as_deref()) {
-        Ok(agent_id) => agent_id,
-        Err(error) => return failure(error),
-    };
-    if let Some(agent_id) = agent_id
-        && let Err(error) = ensure_live_agent_scope(services, agent_id, cancellation.clone()).await
-    {
-        return failure(error);
-    }
-    let pane_id = match PaneId::parse(&args.pane_id) {
-        Ok(pane_id) => pane_id,
-        Err(_) => return failure(AppError::invalid("pane id")),
-    };
-    let timeout_ms = args.timeout_ms.unwrap_or(30_000);
-    if !(1..=60_000).contains(&timeout_ms) {
-        return failure(AppError::invalid("timeoutMs must be between 1 and 60000"));
-    }
-    let sessions = match services.sessions.list(SessionFilter::default()).await {
-        Ok(sessions) if !cancellation.is_cancelled() => sessions,
-        Ok(_) => return failure(AppError::cancelled("MCP request was cancelled")),
-        Err(error) => return failure(error),
-    };
-    let Some(session) = sessions.iter().find(|session| {
-        matches!(&session.owner, SessionOwner::Ui { pane_id: owner, .. } if owner == &pane_id)
-    }) else {
-        return failure(AppError::not_found("The requested terminal pane does not exist"));
-    };
-    if session.lifecycle == SessionLifecycle::Running {
-        return failure(AppError::conflict(
-            "The requested terminal pane is already connected",
-        ));
-    }
-    if !matches!(
-        session.lifecycle,
-        SessionLifecycle::Exited | SessionLifecycle::Failed
-    ) {
-        return failure(AppError::conflict(
-            "The requested terminal pane is not reconnectable",
-        ));
-    }
-    let session_id = session.session_id.clone();
-    let reconnect_cancellation = cancellation.child_token();
-    let mut reconnect = Box::pin(
-        services
-            .sessions
-            .reconnect_cancellable(session_id, reconnect_cancellation.clone()),
-    );
-    let result = tokio::select! {
-        result = reconnect.as_mut() => result,
-        _ = cancellation.cancelled() => {
-            reconnect_cancellation.cancel();
-            let _ = reconnect.as_mut().await;
-            return failure(AppError::cancelled("MCP request was cancelled"));
-        }
-        _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
-            reconnect_cancellation.cancel();
-            let _ = reconnect.as_mut().await;
-            return failure(AppError::timeout("Terminal reconnect timed out"));
-        }
-    };
-    match result {
-        Ok(session) => {
-            let summary = session_summary(services, &session).await;
-            success(
-                "已重连指定终端 pane。".to_owned(),
-                json!({ "paneId": pane_id.as_str(), "session": summary }),
-                vec![json!({ "type": "terminalSession", "id": session.session_id.as_str() })],
-            )
-        }
-        Err(error) => failure(error),
-    }
 }
 
 /// 合并路由 scope 与显式 Agent ID；不同身份不得把会话查询扩展到另一 Agent。

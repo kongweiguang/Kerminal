@@ -4,7 +4,7 @@
 
 use gpui_kit::Context;
 use kerminal_application::configuration_changes::ConfigurationChangeMessage;
-use kerminal_application::preferences::{SettingsSnapshot, VersionedSettings};
+use kerminal_application::preferences::{SettingsSnapshot, VersionedProfile, VersionedSettings};
 use kerminal_domain::preferences::{ConfigRevision, ConfigurationMode};
 
 use crate::features::preferences::{ConfigDraft, DraftSnapshot, DraftStatus};
@@ -141,7 +141,7 @@ impl PreferencesPanel {
                         .run(move |_| async move { service.list_profiles().await })
                         .await;
                     let _ = this.update_in(cx, |panel, window, cx| {
-                        panel.finish_profile_load(result, generation, window, cx)
+                        panel.finish_profile_revision_check(result, generation, window, cx)
                     });
                 }
             }
@@ -456,27 +456,135 @@ impl PreferencesPanel {
         }
     }
 
-    /// 外部 Profile 变化只冲突当前 dirty 草稿；其余情况可通过 profile list typed 查询收敛。
+    /// watcher 查询不禁用表单；显式重载期间延后读取，避免旧回执取代用户的恢复动作。
+    ///
+    /// @author kongweiguang
     fn prepare_external_profile_change(&mut self) -> Option<u64> {
-        let Some(draft) = self.profile_draft.as_mut() else {
-            return Some(self.begin_profile_load());
+        if self.loading_profiles {
+            self.profiles_watch_pending = true;
+            return None;
+        }
+        self.profiles_watch_generation = self.profiles_watch_generation.wrapping_add(1).max(1);
+        self.profiles_watch_in_flight = true;
+        Some(self.profiles_watch_generation)
+    }
+
+    /// 被显式读取覆盖的监听通知在该读取结束后再次核对，不假设第一次快照已经包含后发修改。
+    ///
+    /// @author kongweiguang
+    pub(super) fn resume_deferred_profile_revision_check(&mut self, cx: &mut Context<Self>) {
+        if !self.profiles_watch_pending || self.loading_profiles {
+            return;
+        }
+        self.profiles_watch_pending = false;
+        let Some(generation) = self.prepare_external_profile_change() else {
+            return;
         };
-        match draft.status() {
-            super::super::DraftStatus::Saving | super::super::DraftStatus::OutcomeUnknown => None,
-            super::super::DraftStatus::ExternalConflict => None,
-            super::super::DraftStatus::Ready | super::super::DraftStatus::Failed => {
-                if draft.is_dirty() {
-                    draft.mark_external_change();
-                    self.profile_list_error = Some(crate::locale::text(
-                        "Profile 文件已被外部修改；本地草稿已保留，请重新读取后再保存。",
-                        "This profile changed outside the app. Your draft is preserved; reload before saving.",
-                    ).to_string());
-                    None
-                } else {
-                    Some(self.begin_profile_load())
+        let profiles = self.profiles.clone();
+        let executor = self.executor.clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .run(move |_| async move { profiles.list_profiles().await })
+                .await;
+            let _ = this.update_in(cx, |panel, window, cx| {
+                panel.finish_profile_revision_check(result, generation, window, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// 回执到达时重新比较当前选中项 revision；相同版本只更新列表，避免覆盖输入或误报自身回声。
+    /// 写入中与未知回执的草稿始终由原事务收尾，外部修改只对真正变化的 dirty Profile 标记冲突。
+    ///
+    /// @author kongweiguang
+    fn finish_profile_revision_check(
+        &mut self,
+        result: Result<Vec<VersionedProfile>, kerminal_application::AppError>,
+        generation: u64,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.profiles_watch_generation {
+            return;
+        }
+        self.profiles_watch_in_flight = false;
+        if self.loading_profiles {
+            self.profiles_watch_pending = true;
+            return;
+        }
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(error) => {
+                if !self
+                    .profile_draft
+                    .as_ref()
+                    .is_some_and(|draft| draft.status() == DraftStatus::OutcomeUnknown)
+                {
+                    self.profile_list_error = Some(super::localized_error(&error));
                 }
+                cx.notify();
+                return;
+            }
+        };
+        let protected = self.profile_operation_running
+            || self.profile_draft.as_ref().is_some_and(|draft| {
+                matches!(
+                    draft.status(),
+                    DraftStatus::Saving | DraftStatus::OutcomeUnknown
+                )
+            });
+        if protected {
+            self.profile_rows = rows;
+            cx.notify();
+            return;
+        }
+
+        let selected = self
+            .selected_profile_id
+            .as_deref()
+            .and_then(|id| rows.iter().find(|row| row.profile.id == id).cloned());
+        if let Some(draft) = self.profile_draft.as_mut() {
+            if self.selected_profile_id.is_none() {
+                self.profile_rows = rows;
+                cx.notify();
+                return;
+            }
+            let observed = selected.as_ref().map(|row| &row.revision);
+            if draft.revision().as_ref() == observed {
+                self.selected_profile_is_default =
+                    selected.as_ref().is_some_and(|row| row.profile.is_default);
+                self.profile_rows = rows;
+                if draft.status() != DraftStatus::ExternalConflict {
+                    self.profile_list_error = None;
+                }
+                cx.notify();
+                return;
+            }
+            if draft.is_dirty() || draft.status() == DraftStatus::ExternalConflict {
+                draft.mark_external_change();
+                self.profile_rows = rows;
+                self.profile_list_error = Some(crate::locale::text(
+                    "Profile 文件已被外部修改；本地草稿已保留，请重新读取后再保存。",
+                    "This profile changed outside the app. Your draft is preserved; reload before saving.",
+                ).to_string());
+                cx.notify();
+                return;
             }
         }
+
+        let selected = selected
+            .or_else(|| rows.iter().find(|row| row.profile.is_default).cloned())
+            .or_else(|| rows.first().cloned());
+        self.profile_rows = rows;
+        self.profile_list_error = None;
+        if let Some(profile) = selected {
+            self.install_profile(profile, window, cx);
+        } else {
+            self.selected_profile_id = None;
+            self.selected_profile_is_default = false;
+            self.profile_draft = None;
+        }
+        cx.notify();
     }
 }
 

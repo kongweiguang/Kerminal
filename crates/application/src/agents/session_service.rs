@@ -722,49 +722,6 @@ impl AgentSessionService {
         })
     }
 
-    /// 在同一操作门内读取记录和恢复状态；不暴露 launch 环境值，也不隐藏未确认的 CLI owner。
-    pub async fn record_projection(
-        &self,
-        id: AgentSessionId,
-        cancellation: CancellationToken,
-    ) -> AppResult<AgentSessionRecordProjection> {
-        let _gate = self
-            .acquire_operation(&cancellation, "Agent record lookup was cancelled")
-            .await?;
-        self.ensure_request_active(&cancellation, "Agent record lookup was cancelled")?;
-        let mut stored = self.read_session(id.clone(), &cancellation).await?;
-        let live = self.sessions.list(SessionFilter::default()).await?;
-        let terminal = find_agent_terminal(&live, &id);
-        let provider_snapshot = self
-            .await_cancellable(&cancellation, |token| {
-                self.workspace.read_provider_session(id.clone(), token)
-            })
-            .await?;
-        let recovery_before_target_resolution = self
-            .resume_recovery_for_view(&stored.session, terminal.as_ref(), &cancellation)
-            .await?;
-        if recovery_before_target_resolution.is_none() {
-            self.reconcile_cli_state(&mut stored, terminal.as_ref(), &cancellation)
-                .await?;
-            let (_resolution, _target) = self
-                .resolve_target_inner(&mut stored.session, &mut stored.revision, &cancellation)
-                .await?;
-        }
-        let resume_recovery = if recovery_before_target_resolution.is_some() {
-            recovery_before_target_resolution
-        } else {
-            self.resume_recovery_for_view(&stored.session, terminal.as_ref(), &cancellation)
-                .await?
-        };
-        self.project_session_record(
-            &stored.session,
-            provider_snapshot,
-            resume_recovery,
-            &cancellation,
-        )
-        .await
-    }
-
     /// 显式按 provider 持久恢复能力继续会话；普通 checkpoint 固化 target ID，未决恢复仍严格沿用原意图。
     ///
     /// @author kongweiguang
@@ -2960,15 +2917,6 @@ impl AgentService for AgentSessionService {
         cancellation: CancellationToken,
     ) -> AppResult<AgentSessionView> {
         AgentSessionService::get(self, agent_session_id, cancellation).await
-    }
-
-    /// 为跨边界 Agent 查询提供经过校验且排除环境变量秘密的记录视图。
-    async fn record_projection(
-        &self,
-        agent_session_id: AgentSessionId,
-        cancellation: CancellationToken,
-    ) -> AppResult<AgentSessionRecordProjection> {
-        AgentSessionService::record_projection(self, agent_session_id, cancellation).await
     }
 
     /// 显式恢复 session.toml 中持久化的 launch 快照，不重新读取当前 launcher 设置。

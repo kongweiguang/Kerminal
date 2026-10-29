@@ -12,7 +12,7 @@ use crate::{
     terminal_background::TerminalBackgroundSettings,
     terminal_interaction::TerminalInteractionPolicy,
     terminal_metrics::TerminalMetrics,
-    theme::{BackgroundMaterialSettings, ThemeTokens, apply_theme_mode},
+    theme::{BackgroundMaterialSettings, ThemeTokens, apply_app_theme},
 };
 
 /// 从完整设置快照派生当前工作台使用的有限运行态字段，避免 UI 事件各自解释配置语义。
@@ -39,7 +39,9 @@ pub(crate) struct InterfaceDensityMetrics {
 }
 
 impl InterfaceDensityMetrics {
-    /// 保持三个密度等级的间距和可见条高单调变化，终端与工具栏共用 main 的内容缩进。
+    /// 终端与群发栏共用较小的外围缩进，增加可用网格并保持单 pane、分屏的边缘对齐。
+    /// 其它间距和条高仍随密度单调变化，避免紧凑终端连带压缩导航与设置控件。
+    /// @author kongweiguang
     pub(crate) fn from_density(density: InterfaceDensity) -> Self {
         match density {
             InterfaceDensity::Compact => Self {
@@ -50,7 +52,7 @@ impl InterfaceDensityMetrics {
                 tab_bar_height: 34.0,
                 status_bar_height: 24.0,
                 tool_rail_padding_y: 8.0,
-                terminal_content_inset: 6.0,
+                terminal_content_inset: 4.0,
             },
             InterfaceDensity::Comfortable => Self {
                 item_gap: 12.0,
@@ -60,7 +62,7 @@ impl InterfaceDensityMetrics {
                 tab_bar_height: 38.0,
                 status_bar_height: 26.0,
                 tool_rail_padding_y: 12.0,
-                terminal_content_inset: 8.0,
+                terminal_content_inset: 6.0,
             },
             InterfaceDensity::Spacious => Self {
                 item_gap: 16.0,
@@ -70,7 +72,7 @@ impl InterfaceDensityMetrics {
                 tab_bar_height: 46.0,
                 status_bar_height: 32.0,
                 tool_rail_padding_y: 16.0,
-                terminal_content_inset: 12.0,
+                terminal_content_inset: 8.0,
             },
         }
     }
@@ -95,7 +97,35 @@ impl RuntimePreferences {
     }
 }
 
-/// 同一快照统一驱动主题、侧栏密度、locale 和现有终端，保存后的展示不依赖重新打开窗口。
+/// 配色和保存回声只更新呈现，避免重新测量终端、推进引擎 revision 或重置命令建议。
+/// 比较完整快照使未来新增设置也默认走既有完整投影，不因遗漏字段而静默跳过真实更新。
+///
+/// @author kongweiguang
+pub(super) fn app_palette_only_update(
+    previous: Option<&SettingsSnapshot>,
+    next: &SettingsSnapshot,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    let mut comparable = previous.clone();
+    comparable.app_color_scheme = next.app_color_scheme;
+    comparable == *next
+}
+
+/// Profile 保存回执仅刷新现有目录实体；已运行的 Tab、pane 和 session 保留原绑定。
+///
+/// @author kongweiguang
+pub(super) fn refresh_profile_directory(root: &mut RootView, cx: &mut Context<RootView>) {
+    if let Some(navigation) = root.host_navigation.clone() {
+        navigation.update(cx, |navigation, cx| navigation.reload(cx));
+    }
+    if let Some(connections) = root.connections_panel.clone() {
+        connections.update(cx, |connections, cx| connections.reload_local_hosts(cx));
+    }
+}
+
+/// 同一快照统一驱动主题和运行态；应用配色独立于终端设置，保存回声也不重复提交终端操作。
 ///
 /// @author kongweiguang
 pub(super) fn apply_snapshot(
@@ -104,50 +134,66 @@ pub(super) fn apply_snapshot(
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) {
-    let installed_font_families = window.text_system().all_font_names();
-    let runtime = RuntimePreferences::from_snapshot(&snapshot, &installed_font_families);
+    let palette_only = app_palette_only_update(root.settings_snapshot.as_ref(), &snapshot);
+    let runtime = if palette_only {
+        None
+    } else {
+        let installed_font_families = window.text_system().all_font_names();
+        Some(RuntimePreferences::from_snapshot(
+            &snapshot,
+            &installed_font_families,
+        ))
+    };
+    if let Some(runtime) = runtime.as_ref() {
+        root.theme_mode = runtime.theme_mode;
+        root.terminal_color_scheme = runtime.terminal_color_scheme;
+        root.terminal_metrics = runtime.terminal_metrics.clone();
+        root.terminal_scrollback = runtime.terminal_scrollback;
+        root.cursor_blink_enabled = runtime.cursor_blink_enabled;
+        if let Some(notifications) = &root.services.notifications
+            && let Err(error) = notifications.update_settings(snapshot.desktop_notifications)
+        {
+            root.status = Some(error.public_message().into());
+        }
+        if let Some(navigation) = root.host_navigation.as_ref() {
+            navigation.update(cx, |navigation, cx| {
+                navigation.set_interface_density(snapshot.interface_density, cx);
+            });
+        }
+        for files in root.files_pane.iter().chain(root.sftp_panel.iter()) {
+            files.update(cx, |files, cx| {
+                files.set_interface_density(snapshot.interface_density, cx);
+            });
+        }
+        for files in root.workspace_files.files_panes() {
+            files.update(cx, |files, cx| {
+                files.set_interface_density(snapshot.interface_density, cx);
+            });
+        }
+    }
     root.settings_snapshot = Some(snapshot.clone());
-    root.theme_mode = runtime.theme_mode;
-    root.terminal_color_scheme = runtime.terminal_color_scheme;
-    root.terminal_metrics = runtime.terminal_metrics;
-    root.terminal_scrollback = runtime.terminal_scrollback;
-    root.cursor_blink_enabled = runtime.cursor_blink_enabled;
-    if let Some(notifications) = &root.services.notifications
-        && let Err(error) = notifications.update_settings(snapshot.desktop_notifications)
-    {
-        root.status = Some(error.public_message().into());
-    }
-    if let Some(navigation) = root.host_navigation.as_ref() {
-        navigation.update(cx, |navigation, cx| {
-            navigation.set_interface_density(snapshot.interface_density, cx);
-        });
-    }
-    for files in root.files_pane.iter().chain(root.sftp_panel.iter()) {
-        files.update(cx, |files, cx| {
-            files.set_interface_density(snapshot.interface_density, cx);
-        });
-    }
-    for files in root.workspace_files.files_panes() {
-        files.update(cx, |files, cx| {
-            files.set_interface_density(snapshot.interface_density, cx);
-        });
-    }
-
-    apply_theme_mode(root.theme_mode, root.window_appearance, cx);
-    cx.set_global(BackgroundMaterialSettings::from_snapshot(&snapshot));
-    apply_window_background_appearance(window, ThemeTokens::current(window, cx).materials);
     root.window_appearance = window.appearance();
-    let previous_locale = crate::locale::current_language();
-    let applied_locale = crate::locale::apply_interface_language(
-        runtime.interface_language,
-        root.services.system_locale.as_deref().unwrap_or("en-US"),
+    cx.set_global(BackgroundMaterialSettings::from_snapshot(&snapshot));
+    apply_app_theme(
+        root.theme_mode,
+        snapshot.app_color_scheme,
+        root.window_appearance,
+        cx,
     );
-    if previous_locale != applied_locale {
-        refresh_cached_locales(root, window, cx);
+    apply_window_background_appearance(window, ThemeTokens::current(window, cx).materials);
+    if let Some(runtime) = runtime {
+        let previous_locale = crate::locale::current_language();
+        let applied_locale = crate::locale::apply_interface_language(
+            runtime.interface_language,
+            root.services.system_locale.as_deref().unwrap_or("en-US"),
+        );
+        if previous_locale != applied_locale {
+            refresh_cached_locales(root, window, cx);
+        }
+        refresh_keyword_rules(root, window, cx);
+        root.resize_active_terminal(window, cx);
+        root.queue_terminal_palette_update(cx);
     }
-    refresh_keyword_rules(root, window, cx);
-    root.resize_active_terminal(window, cx);
-    root.queue_terminal_palette_update(cx);
     cx.refresh_windows();
     cx.notify();
 }

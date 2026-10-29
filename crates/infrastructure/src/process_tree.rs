@@ -21,7 +21,7 @@ pub(crate) struct ProcessTreeGuard {
     _lifetime_guard: Option<Box<dyn Send + Sync + 'static>>,
 }
 
-/// Windows ConPTY spawn 前配置好的 kill-on-close Job；借用只活在原子 CreateProcess 调用期间。
+/// Windows ConPTY spawn 前配置好的 kill-on-close Job；普通程序原子加入，应用别名在首指令前加入。
 ///
 /// @author kongweiguang
 #[cfg(windows)]
@@ -82,7 +82,8 @@ impl PreparedWindowsJob {
         self.job.as_handle()
     }
 
-    /// 只调用 PTY 的 atomic Job-list 入口；默认不支持的后端会失败，绝不退回普通 spawn。
+    /// 只调用 PTY 的受管入口；普通程序原子加入 Job，Store 兼容路径也在恢复主线程前加入。
+    /// 不支持受管创建的后端仍拒绝启动，绝不退回可能遗留后代的普通 spawn。
     ///
     /// @author kongweiguang
     pub(crate) fn spawn_command(
@@ -93,7 +94,7 @@ impl PreparedWindowsJob {
         slave.spawn_command_in_job(command, self.borrowed_handle())
     }
 
-    /// 在 PTY child 已原子创建进 Job 后转交给既有树 guard，统一负责终止和 handle 生命周期。
+    /// 在 PTY child 已于首指令前加入 Job 后转交给既有树 guard，统一负责终止和 handle 生命周期。
     ///
     /// @author kongweiguang
     pub(crate) fn into_guard(

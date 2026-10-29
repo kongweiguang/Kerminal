@@ -18,7 +18,7 @@ use gpui_kit::{
 };
 use kerminal_application::preferences::{
     SettingsSnapshot, TerminalColorScheme, TerminalCursorStyle, TerminalFontWeight,
-    TerminalRightClickBehavior,
+    TerminalRightClickBehavior, ThemeMode,
 };
 use std::time::Duration;
 
@@ -181,7 +181,7 @@ impl PreferencesPanel {
         }
     }
 
-    /// 按 main 的 viewport md/xl 断点组合终端设置；窄窗使用自然高度避免卡片被 flex 压扁。
+    /// 按 main 的断点组合终端设置，并依据明暗策略选择终端预览，避免应用色板干扰终端。
     ///
     /// @author kongweiguang
     pub(super) fn render_terminal(
@@ -199,7 +199,14 @@ impl PreferencesPanel {
         let medium_layout = viewport_width >= 768.0;
         let large_layout = viewport_width >= 1024.0;
         let wide_layout = viewport_width >= 1280.0;
-        let is_dark = theme.background.l < 0.5;
+        let is_dark = match settings.theme_mode {
+            ThemeMode::Dark => true,
+            ThemeMode::Light => false,
+            ThemeMode::System => matches!(
+                window.appearance(),
+                gpui_kit::WindowAppearance::Dark | gpui_kit::WindowAppearance::VibrantDark
+            ),
+        };
         let resolved_font_family =
             TerminalMetrics::from_settings(&terminal, &window.text_system().all_font_names())
                 .font_family;
@@ -540,7 +547,14 @@ impl PreferencesPanel {
                 .child(interaction_grid)
                 .child(behavior_grid),
             )
-            .child(cursor_section(&terminal, locked, large_layout, theme, cx))
+            .child(cursor_section(
+                &terminal,
+                is_dark,
+                locked,
+                large_layout,
+                theme,
+                cx,
+            ))
             .children(
                 self.settings_issues
                     .iter()
@@ -1302,16 +1316,23 @@ pub(in crate::features::preferences) fn terminal_preview_colors(
     }
 }
 
-/// 按 main 的 viewport lg 断点改变光标样式列数，选择状态仍由用户偏好决定。
+/// 光标样式预览读取对应明暗模式的终端色盘，确保界面色板不会影响终端内容示例。
 ///
 /// @author kongweiguang
 fn cursor_section(
     terminal: &kerminal_application::preferences::TerminalSettings,
+    is_dark: bool,
     locked: bool,
     large_layout: bool,
     theme: ThemeTokens,
     cx: &mut Context<PreferencesPanel>,
 ) -> impl IntoElement {
+    let scheme = if is_dark {
+        terminal.dark_color_scheme
+    } else {
+        terminal.light_color_scheme
+    };
+    let colors = terminal_preview_colors(scheme, is_dark);
     let choices = [
         (
             TerminalCursorStyle::Block,
@@ -1395,6 +1416,7 @@ fn cursor_section(
                             style,
                             terminal.cursor_blink,
                             animation_id,
+                            colors,
                             theme,
                         )),
                 )
@@ -1421,13 +1443,14 @@ fn cursor_section(
     subpanel(crate::locale::text("光标形态", "Cursor style"), None, theme).child(cards)
 }
 
-/// 小型预览复刻 main 的终端标题栏、提示符和光标闪烁，并为循环动画保留稳定身份。
+/// 标题栏使用应用语义色，正文及光标从终端预览色盘读取，动画身份保持稳定。
 ///
 /// @author kongweiguang
 fn cursor_preview(
     style: TerminalCursorStyle,
     blink: bool,
     animation_id: &'static str,
+    colors: TerminalPreviewColors,
     theme: ThemeTokens,
 ) -> impl IntoElement {
     div()
@@ -1436,7 +1459,7 @@ fn cursor_preview(
         .rounded(theme.radius_sm)
         .border_1()
         .border_color(theme.border)
-        .bg(gpui_kit::rgb(0x0b1220))
+        .bg(gpui_kit::rgb(colors.background))
         .child(
             div()
                 .w_full()
@@ -1446,28 +1469,28 @@ fn cursor_preview(
                 .gap_1()
                 .px_3()
                 .border_b_1()
-                .border_color(gpui_kit::rgb(0xffffff).opacity(0.08))
-                .bg(gpui_kit::rgb(0xffffff).opacity(0.04))
+                .border_color(theme.border)
+                .bg(theme.panel)
                 .children([
                     div()
                         .size(px(6.))
                         .rounded_full()
-                        .bg(gpui_kit::rgb(0xfb7185).opacity(0.8)),
+                        .bg(theme.error.opacity(0.8)),
                     div()
                         .size(px(6.))
                         .rounded_full()
-                        .bg(gpui_kit::rgb(0xfcd34d).opacity(0.8)),
+                        .bg(theme.warning.opacity(0.8)),
                     div()
                         .size(px(6.))
                         .rounded_full()
-                        .bg(gpui_kit::rgb(0x34d399).opacity(0.8)),
+                        .bg(theme.success.opacity(0.8)),
                 ])
                 .child(
                     div()
                         .ml_2()
                         .text_size(px(10.))
                         .font_weight(theme.settings_medium_font_weight())
-                        .text_color(gpui_kit::rgb(0x71717a))
+                        .text_color(theme.muted)
                         .child("PROMPT"),
                 ),
         )
@@ -1480,17 +1503,17 @@ fn cursor_preview(
                 .font_family("monospace")
                 .text_size(px(11.))
                 .line_height(px(20.))
-                .text_color(gpui_kit::rgb(0xd4d4d8))
+                .text_color(gpui_kit::rgb(colors.foreground))
                 .child(
                     div()
                         .w_full()
-                        .text_color(gpui_kit::rgb(0x6ee7b7))
+                        .text_color(gpui_kit::rgb(colors.green))
                         .child("root@kerminal"),
                 )
                 .child(
                     div()
                         .w_full()
-                        .text_color(gpui_kit::rgb(0x71717a))
+                        .text_color(gpui_kit::rgb(colors.foreground).opacity(0.75))
                         .child("~/workspace"),
                 )
                 .child(
@@ -1500,10 +1523,10 @@ fn cursor_preview(
                         .items_end()
                         .child(
                             div()
-                                .text_color(gpui_kit::rgb(0x7dd3fc))
+                                .text_color(gpui_kit::rgb(colors.cyan))
                                 .child("$ edit cursor"),
                         )
-                        .child(cursor_marker(style, 0x38bdf8, blink, animation_id)),
+                        .child(cursor_marker(style, colors.cursor, blink, animation_id)),
                 ),
         )
 }

@@ -9,7 +9,7 @@ use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, EventEmitter, Focusable as _, IntoElement,
     KeyDownEvent, Render, StatefulInteractiveElement, Subscription, Window,
     component::{
-        Disableable, Icon, IconName,
+        Disableable, FocusableExt as _, Icon, IconName,
         button::{Button, ButtonCustomVariant, ButtonVariants as _},
         input::{Input, InputEvent, InputState},
         menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
@@ -45,6 +45,7 @@ const UNGROUPED_GROUP_ID: &str = "__ungrouped";
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HostNavigationLayoutMetrics {
     control_height: f32,
+    action_width: f32,
     header_gap: f32,
     header_padding_x: f32,
     header_padding_y: f32,
@@ -59,14 +60,15 @@ struct HostNavigationLayoutMetrics {
     icon_size: f32,
 }
 
-/// 密度映射复用 main 侧栏的控件、列表和行几何，避免 GPUI 侧栏出现另一套节奏。
+/// 图标按钮使用独立宽度，保留命中高度并把有限的侧栏空间优先留给搜索输入。
 /// @author kongweiguang
 fn host_navigation_layout_metrics(density: InterfaceDensity) -> HostNavigationLayoutMetrics {
     match density {
         InterfaceDensity::Compact => HostNavigationLayoutMetrics {
             control_height: 28.,
-            header_gap: 8.,
-            header_padding_x: 12.,
+            action_width: 24.,
+            header_gap: 6.,
+            header_padding_x: 10.,
             header_padding_y: 10.,
             row_height: 40.,
             group_header_height: 32.,
@@ -80,8 +82,9 @@ fn host_navigation_layout_metrics(density: InterfaceDensity) -> HostNavigationLa
         },
         InterfaceDensity::Comfortable => HostNavigationLayoutMetrics {
             control_height: 32.,
-            header_gap: 12.,
-            header_padding_x: 14.,
+            action_width: 26.,
+            header_gap: 8.,
+            header_padding_x: 12.,
             header_padding_y: 14.,
             row_height: 48.,
             group_header_height: 32.,
@@ -95,8 +98,9 @@ fn host_navigation_layout_metrics(density: InterfaceDensity) -> HostNavigationLa
         },
         InterfaceDensity::Spacious => HostNavigationLayoutMetrics {
             control_height: 36.,
-            header_gap: 14.,
-            header_padding_x: 16.,
+            action_width: 28.,
+            header_gap: 8.,
+            header_padding_x: 14.,
             header_padding_y: 16.,
             row_height: 54.,
             group_header_height: 32.,
@@ -124,15 +128,19 @@ pub enum HostNavigationEvent {
     ShowHostDetailsRequested { host_id: HostId },
     EditHostRequested { host_id: HostId },
     CopyHostRequested { host_id: HostId },
+    CopyHostAsSshRequested { host_id: HostId },
     DeleteHostRequested { host_id: HostId },
     ConnectRequested { host_id: HostId },
     OpenSftpRequested { host_id: HostId },
     CreateSftpTransferTabRequested { host_id: HostId },
+    OpenHostContainersRequested { host_id: HostId },
     PinnedContainerSelected { stable_id: String },
     PinnedContainerOpenRequested { stable_id: String },
     PinnedContainerRemoveRequested { stable_id: String },
+    PinnedContainerDetailsRequested { stable_id: String },
+    PinnedContainerFilesRequested { stable_id: String },
     OpenSftpWorkbenchRequested,
-    CreateHostInGroupRequested { group_id: String },
+    CreateHostRequested { group_id: Option<String> },
     CreateGroupRequested,
     RenameGroupRequested { group_id: String },
     DeleteGroupRequested { group_id: String },
@@ -185,6 +193,7 @@ enum HostAction {
     Details,
     Edit,
     Copy,
+    CopyAsSsh,
     Delete,
 }
 
@@ -263,7 +272,7 @@ impl HostNavigation {
         cx: &mut Context<Self>,
     ) -> Self {
         let search_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(crate::locale::text("搜索主机", "Search hosts"))
+            InputState::new(window, cx).placeholder(crate::locale::text("搜索", "Search"))
         });
         let search_subscription = cx.subscribe(&search_input, |navigation, input, event, cx| {
             if matches!(event, InputEvent::Change) {
@@ -309,7 +318,7 @@ impl HostNavigation {
     /// @author kongweiguang
     pub fn refresh_locale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_input.update(cx, |input, cx| {
-            input.set_placeholder(crate::locale::text("搜索主机", "Search hosts"), window, cx);
+            input.set_placeholder(crate::locale::text("搜索", "Search"), window, cx);
         });
         cx.notify();
     }
@@ -655,6 +664,42 @@ impl HostNavigation {
         cx.notify();
     }
 
+    /// 容器详情只接受仍存在的稳定 pin，不能从当前终端或同名容器猜测宿主身份。
+    /// @author kongweiguang
+    fn request_pinned_container_details(&mut self, stable_id: String, cx: &mut Context<Self>) {
+        if self
+            .pinned_containers
+            .iter()
+            .any(|container| container.stable_id() == stable_id)
+        {
+            cx.emit(HostNavigationEvent::PinnedContainerDetailsRequested { stable_id });
+        }
+    }
+
+    /// 固定容器文件入口传递稳定 pin，宿主与容器内路径的权限及连接检查留在 Root 文件流程。
+    /// @author kongweiguang
+    fn request_pinned_container_files(&mut self, stable_id: String, cx: &mut Context<Self>) {
+        if self
+            .pinned_containers
+            .iter()
+            .any(|container| container.stable_id() == stable_id)
+        {
+            cx.emit(HostNavigationEvent::PinnedContainerFilesRequested { stable_id });
+        }
+    }
+
+    /// 容器管理只面向明确的 SSH 宿主；Root 负责等待其真实会话就绪后再展开工具。
+    /// @author kongweiguang
+    fn request_host_containers(&mut self, host_id: HostId, cx: &mut Context<Self>) {
+        if self
+            .rows
+            .iter()
+            .any(|host| host.id == host_id && host.protocol == RemoteProtocol::Ssh)
+        {
+            cx.emit(HostNavigationEvent::OpenHostContainersRequested { host_id });
+        }
+    }
+
     /// 右键菜单只允许移除仍投影的 pin，避免过期菜单删除后续重加的目标。
     /// @author kongweiguang
     fn request_remove_pinned_container(&mut self, stable_id: String, cx: &mut Context<Self>) {
@@ -665,6 +710,39 @@ impl HostNavigation {
         {
             cx.emit(HostNavigationEvent::PinnedContainerRemoveRequested { stable_id });
         }
+    }
+
+    /// 新建连接显式携带所属分组；空白区与未分组目标不借用当前选择，也不提前建立会话。
+    /// @author kongweiguang
+    fn request_create_host(&mut self, group_id: Option<String>, cx: &mut Context<Self>) {
+        if self.recovery.mode == ConfigurationMode::ReadOnlyRecovery {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "配置只读恢复中，暂不能添加连接。",
+                    "Configuration is read-only during recovery; a connection cannot be added.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        if group_id
+            .as_ref()
+            .is_some_and(|id| !self.groups.iter().any(|group| &group.id == id))
+        {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "分组已变化，请刷新后重试。",
+                    "The group changed. Refresh and try again.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        cx.emit(HostNavigationEvent::CreateHostRequested { group_id });
     }
 
     /// 在指定分组新建本地主机；Root 将其路由到统一连接表单而非偏好页。
@@ -921,18 +999,31 @@ impl HostNavigation {
     }
 
     /// 主机管理菜单只发送稳定身份事件，由 Root 调用完整面板用例而不复制业务逻辑。
+    /// SFTP 转 SSH 再校验源协议，避免旧菜单作用在已被修改成其它协议的对象上。
+    /// @author kongweiguang
     fn request_host_action(&mut self, host_id: HostId, action: HostAction, cx: &mut Context<Self>) {
         self.select_host(host_id.clone(), cx);
         let event = match action {
             HostAction::Details => HostNavigationEvent::ShowHostDetailsRequested { host_id },
             HostAction::Edit => HostNavigationEvent::EditHostRequested { host_id },
             HostAction::Copy => HostNavigationEvent::CopyHostRequested { host_id },
+            HostAction::CopyAsSsh => {
+                if !self
+                    .rows
+                    .iter()
+                    .any(|host| host.id == host_id && host.protocol == RemoteProtocol::Sftp)
+                {
+                    return;
+                }
+                HostNavigationEvent::CopyHostAsSshRequested { host_id }
+            }
             HostAction::Delete => HostNavigationEvent::DeleteHostRequested { host_id },
         };
         cx.emit(event);
     }
 
     /// 分组写操作只接受真实 groups.toml 条目，避免把收藏或未分组筛选当作可写实体。
+    /// @author kongweiguang
     fn request_group_action(
         &mut self,
         group_id: String,
@@ -943,7 +1034,9 @@ impl HostNavigation {
             return;
         }
         let event = match action {
-            GroupAction::CreateHost => HostNavigationEvent::CreateHostInGroupRequested { group_id },
+            GroupAction::CreateHost => HostNavigationEvent::CreateHostRequested {
+                group_id: Some(group_id),
+            },
             GroupAction::Rename => HostNavigationEvent::RenameGroupRequested { group_id },
             GroupAction::Delete => HostNavigationEvent::DeleteGroupRequested { group_id },
         };
@@ -1267,7 +1360,7 @@ impl HostNavigation {
 }
 
 impl Render for HostNavigation {
-    /// 侧栏使用 main 的工作台主题与单行搜索工具栏；选择主机仍只改变详情，不绑定终端目标。
+    /// 侧栏使用 main 的工作台主题；背景菜单提供无分组的新建入口，不从当前选中行推断目标。
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.start_configuration_watch(cx);
@@ -1425,6 +1518,7 @@ impl Render for HostNavigation {
         let entity = cx.entity().clone();
         let local_entity = entity.clone();
         let group_entity = entity.clone();
+        let create_entity = entity.clone();
         let readonly = self.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
         content.context_menu(move |menu, _, _| {
             let refresh_entity = entity.clone();
@@ -1440,6 +1534,18 @@ impl Render for HostNavigation {
                 let create_local_entity = local_entity.clone();
                 menu = menu
                     .separator()
+                    .item(
+                        PopupMenuItem::new(crate::locale::text("添加连接…", "Add connection…"))
+                            .icon(gpui_kit::assets::IconName::Plus)
+                            .on_click({
+                                let create_entity = create_entity.clone();
+                                move |_, _, app| {
+                                    create_entity.update(app, |navigation, cx| {
+                                        navigation.request_create_host(None, cx);
+                                    });
+                                }
+                            }),
+                    )
                     .item(
                         PopupMenuItem::new(crate::locale::text("新建分组…", "New group…"))
                             .icon(gpui_kit::assets::IconName::FolderPlus)
@@ -1462,6 +1568,14 @@ impl Render for HostNavigation {
             menu
         })
     }
+}
+
+/// 菜单与树使用同一真实分组集合，旧的悬空引用不能成为新建或移动动作的目的组。
+/// @author kongweiguang
+fn effective_navigation_group(group_id: Option<&str>, groups: &[HostGroup]) -> Option<String> {
+    group_id
+        .filter(|id| groups.iter().any(|group| group.id == *id))
+        .map(str::to_owned)
 }
 
 /// 搜索只裁剪当前分组树，未知分组引用归入未分组，不附加“收藏/全部”伪分组筛选。
@@ -1839,7 +1953,8 @@ fn host_draft_for_group(host: &ManagedHost, group_id: Option<String>) -> HostDra
     }
 }
 
-/// main 的单行搜索工具栏保留常用的传输与分组操作，目录管理放在侧栏上下文菜单中。
+/// 搜索框取得按钮组以外的全部宽度；窄图标槽位保留控件高度，避免搜索被三枚方形按钮挤压。
+/// 刷新沿用同一异步加载门禁，按钮组只在相邻动作间保留小间距。
 /// @author kongweiguang
 fn render_navigation_header(
     navigation: &mut HostNavigation,
@@ -1861,7 +1976,7 @@ fn render_navigation_header(
         .h(px(metrics.control_height))
         .flex()
         .items_center()
-        .px_3()
+        .px_2()
         .rounded_lg()
         .border_1()
         .border_color(if search_focused {
@@ -1884,19 +1999,40 @@ fn render_navigation_header(
                 .appearance(false)
                 .w_full()
                 .min_w(px(0.))
+                .px_0()
+                .aria_label(crate::locale::text("搜索主机", "Search hosts"))
                 .prefix(div().text_color(theme.subtle).child(IconName::Search)),
         );
     let actions = div()
-        .w(px(68.))
+        .w(px(metrics.action_width * 3. + 4.))
         .flex_shrink_0()
         .flex()
-        .gap(px(4.))
+        .gap(px(2.))
         .items_center();
+    let actions = actions.child(
+        Button::new("host-navigation-refresh")
+            .compact()
+            .ghost()
+            .w(px(metrics.action_width))
+            .h(px(metrics.control_height))
+            .icon(IconName::RefreshCw)
+            .loading(navigation.loading)
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .color(theme.sidebar.opacity(0.))
+                    .foreground(theme.muted)
+                    .hover(theme.hover)
+                    .active(theme.selected),
+            )
+            .accessibility_label(crate::locale::text("刷新主机列表", "Refresh hosts"))
+            .tooltip(crate::locale::text("刷新主机列表", "Refresh hosts"))
+            .on_click(cx.listener(|navigation, _: &ClickEvent, _, cx| navigation.reload(cx))),
+    );
     let actions = actions.child(
         Button::new("host-navigation-sftp-workbench")
             .compact()
             .ghost()
-            .w(px(metrics.control_height))
+            .w(px(metrics.action_width))
             .h(px(metrics.control_height))
             .icon(gpui_kit::assets::IconName::ArrowLeftRight)
             .custom(
@@ -1919,7 +2055,7 @@ fn render_navigation_header(
         Button::new("host-navigation-toggle-groups")
             .compact()
             .ghost()
-            .w(px(metrics.control_height))
+            .w(px(metrics.action_width))
             .h(px(metrics.control_height))
             .icon(if all_collapsed {
                 gpui_kit::assets::IconName::ChevronsUpDown
@@ -2104,7 +2240,8 @@ struct HostGroupRenderItems {
 /// 分组标题保持紧凑并使用单一全行按钮，让 chevron、名称和计数共享圆角 hover、点击及键盘焦点。
 /// 右键菜单仍捕获稳定组 ID；行内容来自一个已按 order/name 合并的序列，不先分种类渲染。
 /// 点击任意行内位置只切换折叠状态，不增加行高或分拆命中区。
-/// 子行从同一 Window 获取 keyed focus，重绘或显示中央详情不会丢失键盘连接入口。
+/// 子行从同一 Window 获取 keyed focus，重绘或目录选中态更新不会丢失键盘连接入口。
+/// 置顶标记与名称同属左侧内容，数量独立靠右并保持单数字的圆形轮廓。
 /// @author kongweiguang
 fn render_host_group(
     navigation: &mut HostNavigation,
@@ -2161,39 +2298,51 @@ fn render_host_group(
             div()
                 .flex_1()
                 .min_w(px(0.))
-                .truncate()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(label.clone()),
-        )
-        .when(pinned, |header| {
-            header.child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(3.))
-                    .px_1()
-                    .rounded_full()
-                    .bg(theme.selected)
-                    .text_color(theme.accent)
-                    .text_size(theme.text_xs)
-                    .child(
-                        Icon::new(gpui_kit::assets::IconName::Pin)
-                            .size(px(10.))
-                            .text_color(theme.accent),
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .flex_shrink_1()
+                        .truncate()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(label.clone()),
+                )
+                .when(pinned, |label_row| {
+                    label_row.child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(3.))
+                            .px_1()
+                            .rounded_full()
+                            .bg(theme.selected)
+                            .text_color(theme.accent)
+                            .text_size(theme.text_xs)
+                            .child(
+                                Icon::new(gpui_kit::assets::IconName::Pin)
+                                    .size(px(10.))
+                                    .text_color(theme.accent),
+                            )
+                            .child(crate::locale::text("置顶", "Pinned")),
                     )
-                    .child(crate::locale::text("置顶", "Pinned")),
-            )
-        })
+                }),
+        )
         .child(
             div()
                 .min_w(px(22.))
+                .h(px(22.))
                 .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
                 .px_1()
                 .rounded_full()
                 .bg(theme.secondary)
-                .text_right()
+                .text_center()
                 .text_color(theme.muted)
                 .text_size(theme.text_xs)
                 .child(count.to_string()),
@@ -2262,8 +2411,8 @@ fn render_host_group(
     tree
 }
 
-/// 导航行复用 Kit 按钮的键盘与交互样式，并集中使用 main 对齐的行几何；这里不能设置 hover/active，
-/// Kit render 会在同一底层 Div 安装它们，重复安装会触发 GPUI 启动断言。
+/// 主机行用填充表达选择，鼠标焦点不绘制外圈；键盘导航使用内侧边线显示焦点。
+/// 这里不能设置 hover/active：Kit render 会在同一底层 Div 安装它们，重复安装会触发 GPUI 启动断言。
 /// @author kongweiguang
 fn navigation_row_button(
     id: impl Into<gpui_kit::ElementId>,
@@ -2273,6 +2422,8 @@ fn navigation_row_button(
 ) -> Button {
     Button::new(id)
         .ghost()
+        .focus_ring(false)
+        .focus_visible(|style| style.border_color(theme.accent))
         .w_full()
         .h(px(metrics.row_height))
         .px(px(metrics.row_padding_x))
@@ -2282,11 +2433,7 @@ fn navigation_row_button(
         .gap(px(metrics.row_gap))
         .rounded_lg()
         .border_1()
-        .border_color(if selected {
-            theme.accent
-        } else {
-            theme.sidebar.opacity(0.)
-        })
+        .border_color(theme.sidebar.opacity(0.))
         .bg(if selected {
             theme.selected
         } else {
@@ -2297,6 +2444,7 @@ fn navigation_row_button(
 
 /// 本地主机鼠标单击选择、双击或键盘确认打开；右键只展示菜单，避免浏览菜单便建立会话。
 /// Kit 按钮默认不在鼠标点击时聚焦，因此显式绑定稳定行焦点，支持先单击再按 Enter。
+/// 同组新建从目录快照解析有效组；已丢失的组引用与树中的未分组呈现一致。
 /// @author kongweiguang
 fn local_profile_row(
     row: VersionedProfile,
@@ -2320,6 +2468,7 @@ fn local_profile_row(
     let name = row.profile.name.clone();
     let accessible_name = name.clone();
     let shell = row.profile.shell.clone();
+    let group_id = row.profile.sidebar_group_id.clone();
     let entity = cx.entity().clone();
     let click_id = id.clone();
     navigation_row_button(
@@ -2382,7 +2531,7 @@ fn local_profile_row(
             }
         }),
     )
-    .context_menu(move |menu, _, _| {
+    .context_menu(move |menu, _, cx| {
         let open_entity = entity.clone();
         let open_id = id.clone();
         let mut menu = menu.item(
@@ -2395,6 +2544,21 @@ fn local_profile_row(
                 }),
         );
         if !readonly {
+            let create_entity = entity.clone();
+            let create_group =
+                effective_navigation_group(group_id.as_deref(), &entity.read(cx).groups);
+            menu = menu.separator().item(
+                PopupMenuItem::new(crate::locale::text(
+                    "添加同组连接…",
+                    "Add connection to this group…",
+                ))
+                .icon(gpui_kit::assets::IconName::FolderPlus)
+                .on_click(move |_, _, app| {
+                    create_entity.update(app, |navigation, cx| {
+                        navigation.request_create_host(create_group.clone(), cx);
+                    });
+                }),
+            );
             let edit_entity = entity.clone();
             let edit_id = id.clone();
             menu = menu.separator().item(
@@ -2540,6 +2704,7 @@ fn group_context_menu(
 
 /// 固定容器沿用主机行密度并缩进到 SSH 父行下，选择和打开通过稳定 pin ID 分开发出。
 /// 鼠标选择保留在同一行的键盘焦点，不能让 Enter 落入此前活动终端。
+/// 详情与打开终端使用不同事件，让管理操作绑定已固定的宿主、运行时和容器。
 /// @author kongweiguang
 fn pinned_container_row(
     navigation: &mut HostNavigation,
@@ -2567,6 +2732,10 @@ fn pinned_container_row(
     let open_id = stable_id.clone();
     let remove_entity = cx.entity().clone();
     let remove_id = stable_id.clone();
+    let details_entity = cx.entity().clone();
+    let details_id = stable_id.clone();
+    let files_entity = cx.entity().clone();
+    let files_id = stable_id.clone();
     let row = navigation_row_button(
         format!("host-navigation-container-{stable_id}"),
         selected,
@@ -2645,6 +2814,10 @@ fn pinned_container_row(
         let open_id = open_id.clone();
         let remove_entity = remove_entity.clone();
         let remove_id = remove_id.clone();
+        let details_entity = details_entity.clone();
+        let details_id = details_id.clone();
+        let files_entity = files_entity.clone();
+        let files_id = files_id.clone();
         let menu = menu.item(
             PopupMenuItem::new(crate::locale::text(
                 "打开容器终端",
@@ -2657,7 +2830,26 @@ fn pinned_container_row(
                 });
             }),
         );
-        menu.separator().item(
+        menu.item(
+            PopupMenuItem::new(crate::locale::text("查看容器详情", "Container details"))
+                .icon(gpui_kit::assets::IconName::Info)
+                .on_click(move |_, _, app| {
+                    details_entity.update(app, |navigation, cx| {
+                        navigation.request_pinned_container_details(details_id.clone(), cx);
+                    });
+                }),
+        )
+        .item(
+            PopupMenuItem::new(crate::locale::text("打开文件", "Open files"))
+                .icon(gpui_kit::assets::IconName::FolderOpen)
+                .on_click(move |_, _, app| {
+                    files_entity.update(app, |navigation, cx| {
+                        navigation.request_pinned_container_files(files_id.clone(), cx);
+                    });
+                }),
+        )
+        .separator()
+        .item(
             PopupMenuItem::new(crate::locale::text("从侧栏移除", "Remove from sidebar"))
                 .icon(gpui_kit::assets::IconName::Trash)
                 .on_click(move |_, _, app| {
@@ -2671,10 +2863,12 @@ fn pinned_container_row(
     div().w_full().pl_4().child(row)
 }
 
-/// 整行一次性构造连接行；右键只保留主机与传输动作，容器目标始终由活动终端确定。
+/// 整行一次性构造连接行；右键按协议提供连接、文件、容器与配置动作，始终绑定此行主机。
 /// 外层按钮占满可用宽度，选中与悬停色沿用主题令牌，协议动作仍绑定稳定 HostId。
-/// 键盘确认与鼠标双击共享明确连接意图，鼠标单击保持只展示详情。
+/// 键盘确认与鼠标双击共享明确连接意图，鼠标单击只更新目录选中态。
 /// 行焦点按 HostId 保持，点击后的 Enter 不依赖 Kit 默认禁止的鼠标聚焦行为。
+/// 状态点依附图标绘制，未打开会话用中性色，不占用名称或右侧列宽。
+/// 容器入口只对 SSH 可见，动作携带此行 HostId，不能借用当前其它标签的工具上下文。
 /// @author kongweiguang
 fn host_row(
     navigation: &mut HostNavigation,
@@ -2705,7 +2899,7 @@ fn host_row(
     let session_status = navigation.session_projection.get(&host_id).copied();
     let readonly = navigation.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
     let groups = navigation.groups.clone();
-    let current_group = host.group_id.clone();
+    let current_group = effective_navigation_group(host.group_id.as_deref(), &groups);
     let click_id = host_id.clone();
     let menu_entity = cx.entity().clone();
     let menu_id = host_id.clone();
@@ -2745,13 +2939,15 @@ fn host_row(
         div()
             .size(px(metrics.icon_size))
             .flex_shrink_0()
+            .relative()
             .rounded_lg()
             .flex()
             .items_center()
             .justify_center()
             .bg(theme.selected)
             .text_color(theme.accent)
-            .child(protocol_icon(protocol)),
+            .child(protocol_icon(protocol))
+            .child(session_status_dot(session_status, theme)),
     )
     .child(
         div()
@@ -2780,9 +2976,6 @@ fn host_row(
                     .child(endpoint),
             ),
     )
-    .when_some(session_status, |row, status| {
-        row.child(session_status_dot(status, theme))
-    })
     .when(pending, |row| {
         row.child(
             div()
@@ -2802,9 +2995,7 @@ fn host_row(
             format!("{name}; SFTP is disabled"),
         )
     })
-    .when_some(session_status, |row, status| {
-        row.tooltip(session_status_label(status))
-    })
+    .tooltip(session_status_label(session_status))
     .on_click(
         cx.listener(move |navigation, event: &ClickEvent, window, cx| {
             if is_open_gesture(event) {
@@ -2866,8 +3057,22 @@ fn host_row(
                     }),
             );
         }
-        if !readonly && let Some(group_id) = menu_group_id.clone() {
+        if protocol == RemoteProtocol::Ssh {
+            let container_entity = menu_entity.clone();
+            let container_id = menu_id.clone();
+            menu = menu.item(
+                PopupMenuItem::new(crate::locale::text("容器", "Containers"))
+                    .icon(gpui_kit::assets::IconName::Box)
+                    .on_click(move |_, _, app| {
+                        container_entity.update(app, |navigation, cx| {
+                            navigation.request_host_containers(container_id.clone(), cx);
+                        });
+                    }),
+            );
+        }
+        if !readonly {
             let group_entity = menu_entity.clone();
+            let group_id = menu_group_id.clone();
             menu = menu.item(
                 PopupMenuItem::new(crate::locale::text(
                     "添加同组连接…",
@@ -2876,11 +3081,7 @@ fn host_row(
                 .icon(gpui_kit::assets::IconName::FolderPlus)
                 .on_click(move |_, _, app| {
                     group_entity.update(app, |navigation, cx| {
-                        navigation.request_group_action(
-                            group_id.clone(),
-                            GroupAction::CreateHost,
-                            cx,
-                        )
+                        navigation.request_create_host(group_id.clone(), cx)
                     });
                 }),
             );
@@ -2941,7 +3142,27 @@ fn host_row(
                     });
                 }),
             );
-            if !pending {
+            if protocol == RemoteProtocol::Sftp {
+                let copy_entity = menu_entity.clone();
+                let copy_id = menu_id.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(crate::locale::text(
+                        "复制为 SSH 主机…",
+                        "Duplicate as SSH host…",
+                    ))
+                    .icon(gpui_kit::assets::IconName::Copy)
+                    .on_click(move |_, _, app| {
+                        copy_entity.update(app, |navigation, cx| {
+                            navigation.request_host_action(
+                                copy_id.clone(),
+                                HostAction::CopyAsSsh,
+                                cx,
+                            );
+                        });
+                    }),
+                );
+            }
+            if !pending && (current_group.is_some() || !groups.is_empty()) {
                 let move_entity = menu_entity.clone();
                 let move_id = menu_id.clone();
                 let destination_groups = groups.clone();
@@ -3083,29 +3304,43 @@ fn protocol_icon(protocol: RemoteProtocol) -> Icon {
     }
 }
 
-/// 用状态色显示当前可见会话阶段；没有运行态快照时不绘制状态点。
-fn session_status_dot(status: HostSessionStatus, theme: ThemeTokens) -> impl IntoElement {
+/// 点只反映工作区会话而非网络在线探测；绝对定位及背景环保持图标和文本布局稳定。
+/// @author kongweiguang
+fn session_status_dot(status: Option<HostSessionStatus>, theme: ThemeTokens) -> impl IntoElement {
     let color = match status {
-        HostSessionStatus::Opening => theme.warning,
-        HostSessionStatus::Ready => theme.success,
-        HostSessionStatus::Failed => theme.error,
+        Some(HostSessionStatus::Opening) => theme.warning,
+        Some(HostSessionStatus::Ready) => theme.success,
+        Some(HostSessionStatus::Failed) => theme.error,
+        None => theme.subtle,
     };
-    div().size(px(7.)).flex_shrink_0().rounded_full().bg(color)
+    div()
+        .absolute()
+        .top(px(-4.))
+        .right(px(-4.))
+        .size(px(14.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(theme.sidebar)
+        .child(div().size(px(10.)).rounded_full().bg(color))
 }
 
-/// 给行按钮提供与纯颜色点一致的可访问说明，状态只描述 Kerminal 当前 pane。
-fn session_status_label(status: HostSessionStatus) -> gpui_kit::SharedString {
+/// 提示仅描述当前工作区会话，避免将灰点解释为主机不可达。
+/// @author kongweiguang
+fn session_status_label(status: Option<HostSessionStatus>) -> gpui_kit::SharedString {
     match status {
-        HostSessionStatus::Opening => {
+        Some(HostSessionStatus::Opening) => {
             crate::locale::text("当前工作区正在连接此主机", "A workspace session is opening")
         }
-        HostSessionStatus::Ready => {
+        Some(HostSessionStatus::Ready) => {
             crate::locale::text("此主机当前有就绪会话", "This host has a ready session")
         }
-        HostSessionStatus::Failed => crate::locale::text(
+        Some(HostSessionStatus::Failed) => crate::locale::text(
             "此主机的会话打开失败",
             "A session for this host failed to open",
         ),
+        None => crate::locale::text("当前没有打开的会话", "No open workspace session"),
     }
 }
 

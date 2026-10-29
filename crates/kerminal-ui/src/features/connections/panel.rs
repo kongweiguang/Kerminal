@@ -169,6 +169,7 @@ pub enum ConnectionsEvent {
     ConnectRequested {
         host_id: HostId,
         target: SessionTarget,
+        intent_id: Option<String>,
     },
     ConnectLocalProfileRequested {
         profile_id: String,
@@ -265,6 +266,7 @@ pub(super) enum PendingAction {
     Terminal {
         host_id: HostId,
         target: SessionTarget,
+        intent_id: Option<String>,
     },
     Sftp {
         endpoint: FileEndpoint,
@@ -1031,6 +1033,8 @@ pub struct ConnectionsPanel {
     probe_request: ConnectionRequestEpoch,
     pub(super) pending_trust: Option<PendingTrust>,
     pub(super) connection_request: ConnectionRequestEpoch,
+    sidebar_container_intent: Option<String>,
+    sidebar_container_failure: Option<(String, String)>,
     pub(super) external_launch: Option<ExternalLaunchService>,
     pub(super) external_username_input: Entity<InputState>,
     pub(super) pending_external_username: Option<ExternalLaunchRequest>,
@@ -1147,6 +1151,8 @@ impl ConnectionsPanel {
             probe_request: ConnectionRequestEpoch::new(),
             pending_trust: None,
             connection_request: ConnectionRequestEpoch::new(),
+            sidebar_container_intent: None,
+            sidebar_container_failure: None,
             external_launch: None,
             external_username_input,
             pending_external_username: None,
@@ -2189,9 +2195,11 @@ impl ConnectionsPanel {
     pub(super) fn cancel_connection_request(&mut self) {
         self.connection_request.cancel();
         self.pending_trust = None;
+        self.sidebar_container_intent = None;
+        self.sidebar_container_failure = None;
     }
 
-    /// 将左栏的明确主机选择投影为中心详情；仅更新 UI 选择，不切换或新建会话。
+    /// 显式查看详情时复用面板选择；普通目录单击不进入此入口，也不切换或新建会话。
     ///
     /// @author kongweiguang
     pub fn select_host_id(&mut self, host_id: &HostId, cx: &mut Context<Self>) {
@@ -2203,6 +2211,42 @@ impl ConnectionsPanel {
     pub fn request_connect_host(&mut self, host_id: &HostId, cx: &mut Context<Self>) {
         self.select_host(host_id.clone(), cx);
         self.connect_selected(false, cx);
+    }
+
+    /// 保留侧栏容器请求的独立身份穿过多轮指纹预检，防止同主机的后续连接误消费回执。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn request_connect_host_for_container(
+        &mut self,
+        host_id: &HostId,
+        intent_id: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !host_rows_contain_protocol(
+            self.rows.iter().map(|host| (&host.id, host.protocol)),
+            host_id,
+            RemoteProtocol::Ssh,
+        ) {
+            return false;
+        }
+        self.select_host(host_id.clone(), cx);
+        self.connect_selected_with_destination(false, false, Some(intent_id), cx);
+        true
+    }
+
+    /// 组合根只需知道原预检是否仍有效；取消或失败后立即释放续接意图，不给信任确认设置超时。
+    /// @author kongweiguang
+    pub(crate) fn sidebar_container_intent_is_current(&self, intent_id: &str) -> bool {
+        self.sidebar_container_intent.as_deref() == Some(intent_id)
+    }
+
+    /// 错误只回投原侧栏请求；普通连接或后来请求不能借用旧失败，也不向 Root 暴露私有诊断。
+    /// @author kongweiguang
+    pub(crate) fn sidebar_container_failure(&self, intent_id: &str) -> Option<&str> {
+        self.sidebar_container_failure
+            .as_ref()
+            .filter(|(id, _)| id == intent_id)
+            .map(|(_, message)| message.as_str())
     }
 
     /// 使用菜单打开时捕获的协议校验当前面板快照，防止异步重载后同一 HostId 被解释为另一协议。
@@ -2252,17 +2296,6 @@ impl ConnectionsPanel {
         self.select_host(host_id.clone(), cx);
     }
 
-    /// 本地 Profile 选择时移除旧远程详情与待预检状态，避免 UI 残留造成目标误认。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn clear_host_selection(&mut self, cx: &mut Context<Self>) {
-        self.cancel_connection_request();
-        self.selected_host = None;
-        self.status = None;
-        self.presentation.show_host_details();
-        cx.notify();
-    }
-
     /// 左栏编辑动作复用当前列表快照与同一 revision CAS 表单。
     /// @author kongweiguang
     pub fn edit_saved_host(
@@ -2286,6 +2319,29 @@ impl ConnectionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.duplicate_saved_host_with_protocol(host_id, None, window, cx);
+    }
+
+    /// SFTP 可显式派生 SSH 新草稿，复用地址/分组等字段但不继承源凭据或覆盖源主机。
+    /// @author kongweiguang
+    pub fn duplicate_saved_host_as_ssh(
+        &mut self,
+        host_id: &HostId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.duplicate_saved_host_with_protocol(host_id, Some(RemoteProtocol::Ssh), window, cx);
+    }
+
+    /// 两类复制共享草稿替换、只读与存在性门禁；协议转换在构造干净基线前完成。
+    /// @author kongweiguang
+    fn duplicate_saved_host_with_protocol(
+        &mut self,
+        host_id: &HostId,
+        protocol: Option<RemoteProtocol>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.refuse_host_editor_replacement(cx) {
             return;
         }
@@ -2300,7 +2356,7 @@ impl ConnectionsPanel {
             cx.notify();
             return;
         }
-        let Some(host) = self.rows.iter().find(|row| &row.id == host_id).cloned() else {
+        let Some(mut host) = self.rows.iter().find(|row| &row.id == host_id).cloned() else {
             self.status = Some(
                 crate::locale::text(
                     "主机已不存在，请刷新列表。",
@@ -2311,6 +2367,20 @@ impl ConnectionsPanel {
             self.reload(cx);
             return;
         };
+        if let Some(protocol) = protocol {
+            if host.protocol != RemoteProtocol::Sftp {
+                self.status = Some(
+                    crate::locale::text(
+                        "源主机协议已变化，请刷新列表后重试。",
+                        "The source protocol changed. Refresh the list and try again.",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+            host.protocol = protocol;
+        }
         self.show_saved_host(host_id, cx);
         self.cancel_serial_port_scan();
         self.editor = Some(HostEditor::duplicate(&host, &self.groups, window, cx));
@@ -2958,14 +3028,14 @@ impl ConnectionsPanel {
     ///
     /// @author kongweiguang
     pub(super) fn connect_selected(&mut self, sftp: bool, cx: &mut Context<Self>) {
-        self.connect_selected_with_destination(sftp, false, cx);
+        self.connect_selected_with_destination(sftp, false, None, cx);
     }
 
     /// 保留现有协议和 host-key 检查，仅将 SSH 新传输意图记入待信任动作而非共享右栏面板。
     ///
     /// @author kongweiguang
     fn connect_selected_for_transfer_tab(&mut self, cx: &mut Context<Self>) {
-        self.connect_selected_with_destination(true, true, cx);
+        self.connect_selected_with_destination(true, true, None, cx);
     }
 
     /// 统一验证连接意图并在异步信任回执后恢复原消费端；SFTP 请求 ID 在首轮预检前发布，
@@ -2976,6 +3046,7 @@ impl ConnectionsPanel {
         &mut self,
         sftp: bool,
         create_transfer_tab: bool,
+        intent_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
         self.cancel_connection_request();
@@ -3053,6 +3124,7 @@ impl ConnectionsPanel {
             },
             (RemoteProtocol::Ssh, false) => PendingAction::Terminal {
                 host_id: host.id.clone(),
+                intent_id: intent_id.clone(),
                 target: SessionTarget::Ssh(SshSessionTarget {
                     host_id: host.id.clone(),
                     working_directory: None,
@@ -3061,6 +3133,7 @@ impl ConnectionsPanel {
             },
             (RemoteProtocol::Telnet, false) => PendingAction::Terminal {
                 host_id: host.id.clone(),
+                intent_id: intent_id.clone(),
                 target: SessionTarget::Telnet(TelnetSessionTarget {
                     host: host.endpoint.host.clone(),
                     port: host.endpoint.port,
@@ -3069,6 +3142,7 @@ impl ConnectionsPanel {
             (RemoteProtocol::Serial, false) => match host.serial.clone() {
                 Some(serial) => PendingAction::Terminal {
                     host_id: host.id.clone(),
+                    intent_id: intent_id.clone(),
                     target: SessionTarget::Serial(serial),
                 },
                 None => {
@@ -4551,6 +4625,11 @@ impl ConnectionsPanel {
         action: PendingAction,
         cx: &mut Context<Self>,
     ) {
+        self.sidebar_container_failure = None;
+        self.sidebar_container_intent = match &action {
+            PendingAction::Terminal { intent_id, .. } => intent_id.clone(),
+            _ => None,
+        };
         let (request_generation, request_cancellation) = self.begin_connection_request();
         let callback_cancellation = request_cancellation.clone();
         let mut peers = (0..jump_count)
@@ -4624,7 +4703,12 @@ impl ConnectionsPanel {
                         }
                         Ok(None) => panel.emit_action(action, cx),
                         Err(error) => {
-                            panel.status = Some(localized_error(&error));
+                            let message = localized_error(&error);
+                            panel.sidebar_container_failure = panel
+                                .sidebar_container_intent
+                                .take()
+                                .map(|id| (id, message.clone()));
+                            panel.status = Some(message);
                             cx.notify();
                         }
                     }
@@ -5115,9 +5199,15 @@ impl ConnectionsPanel {
     /// @author kongweiguang
     pub(super) fn emit_action(&mut self, action: PendingAction, cx: &mut Context<Self>) {
         match action {
-            PendingAction::Terminal { host_id, target } => {
-                cx.emit(ConnectionsEvent::ConnectRequested { host_id, target })
-            }
+            PendingAction::Terminal {
+                host_id,
+                target,
+                intent_id,
+            } => cx.emit(ConnectionsEvent::ConnectRequested {
+                host_id,
+                target,
+                intent_id,
+            }),
             PendingAction::Sftp {
                 endpoint,
                 request_id,
@@ -5277,11 +5367,17 @@ fn rdp_status_text(status: RdpLaunchStatus, lifecycle: RdpClientLifecycle) -> (S
 #[path = "../../../tests/unit/rdp_status.rs"]
 mod rdp_status_tests;
 
-/// 将受控错误文案按 Kit 当前语言映射，不把底层路径、命令或 source 暴露给界面。
+/// 将受控错误文案按 Kit 当前语言映射；已知 TCP 失败提供可操作指引，不暴露底层路径、命令或 source。
 /// @author kongweiguang
 pub(super) fn localized_error(error: &AppError) -> String {
-    let message = error.public_message();
+    let message = match error.public_message() {
+        "SSH TCP connection failed" => "无法连接 SSH 主机，请检查网络、地址和端口后重试。",
+        message => message,
+    };
     let english = match message {
+        "无法连接 SSH 主机，请检查网络、地址和端口后重试。" => {
+            "Cannot connect to the SSH host. Check the network, address and port, then retry."
+        }
         "主机名称必须为 1 到 128 个可见字符" => {
             "Host name must contain 1 to 128 visible characters"
         }

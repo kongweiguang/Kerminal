@@ -3,19 +3,79 @@
 //! @author kongweiguang
 
 use kerminal_application::preferences::{
-    BackgroundFit, InterfaceDensity, InterfaceLanguage, SettingsSnapshot, TerminalColorScheme,
-    TerminalCursorStyle, TerminalFontWeight, TerminalRightClickBehavior, ThemeMode,
+    AppColorScheme, BackgroundFit, InterfaceDensity, InterfaceLanguage, SettingsSnapshot,
+    TerminalColorScheme, TerminalCursorStyle, TerminalFontWeight, TerminalRightClickBehavior,
+    ThemeMode,
 };
 
 use crate::{
     root::preferences::{
-        InterfaceDensityMetrics, RuntimePreferences, background_settings_from_snapshot,
-        interaction_policy_from_snapshot, interface_density_metrics_from_snapshot,
+        InterfaceDensityMetrics, RuntimePreferences, app_palette_only_update,
+        background_settings_from_snapshot, interaction_policy_from_snapshot,
+        interface_density_metrics_from_snapshot,
     },
     terminal_background::TerminalBackgroundSettings,
     terminal_interaction::TerminalInteractionPolicy,
     theme::BackgroundMaterialSettings,
 };
+
+/// 真实设置入口据此跳过终端副作用；独立配色和确认保存的回声均不能让终端失效。
+///
+/// @author kongweiguang
+#[test]
+fn application_palette_changes_and_save_echoes_use_presentation_only_path() {
+    let baseline = SettingsSnapshot::default();
+    assert!(!app_palette_only_update(None, &baseline));
+    assert!(app_palette_only_update(Some(&baseline), &baseline));
+    for scheme in AppColorScheme::ALL {
+        let mut next = baseline.clone();
+        next.app_color_scheme = scheme;
+        assert!(app_palette_only_update(Some(&baseline), &next));
+        assert_eq!(next.terminal, baseline.terminal);
+    }
+}
+
+/// 配色与任意真实设置同时变化必须继续完整投影，不能遗漏字体、色盘或其它业务偏好。
+///
+/// @author kongweiguang
+#[test]
+fn palette_change_does_not_hide_other_runtime_changes() {
+    let baseline = SettingsSnapshot::default();
+    let mut next = baseline.clone();
+    next.app_color_scheme = AppColorScheme::Claude;
+    for changed in [
+        SettingsSnapshot {
+            theme_mode: ThemeMode::Light,
+            ..next.clone()
+        },
+        SettingsSnapshot {
+            interface_density: InterfaceDensity::Spacious,
+            ..next.clone()
+        },
+        SettingsSnapshot {
+            interface_language: InterfaceLanguage::EnUs,
+            ..next.clone()
+        },
+        SettingsSnapshot {
+            background_enabled: true,
+            ..next.clone()
+        },
+        SettingsSnapshot {
+            window_opacity: 60,
+            ..next.clone()
+        },
+    ] {
+        assert!(!app_palette_only_update(Some(&baseline), &changed));
+    }
+    next.terminal.font_size += 1;
+    assert!(!app_palette_only_update(Some(&baseline), &next));
+    next.terminal = baseline.terminal.clone();
+    next.terminal.dark_color_scheme = TerminalColorScheme::TokyoNight;
+    assert!(!app_palette_only_update(Some(&baseline), &next));
+    next.terminal = baseline.terminal.clone();
+    next.keybindings.clear();
+    assert!(!app_palette_only_update(Some(&baseline), &next));
+}
 
 /// 分别选择的浅深色盘必须被生产运行态消费，跟随系统切换也不能退回旧通用值。
 /// @author kongweiguang

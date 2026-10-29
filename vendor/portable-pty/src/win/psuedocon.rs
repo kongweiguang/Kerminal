@@ -13,9 +13,12 @@ use std::{mem, ptr};
 use winapi::shared::minwindef::DWORD;
 use winapi::shared::winerror::{HRESULT, S_OK};
 use winapi::um::handleapi::*;
+use winapi::um::jobapi2::AssignProcessToJobObject;
 use winapi::um::processthreadsapi::*;
+use winapi::um::synchapi::WaitForSingleObject;
 use winapi::um::winbase::{
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, WAIT_OBJECT_0,
 };
 use winapi::um::wincon::COORD;
 use winapi::um::winnt::HANDLE;
@@ -199,7 +202,7 @@ impl PsuedoCon {
         self.spawn_command_with_job(cmd, None)
     }
 
-    /// 在同一个 STARTUPINFOEX 属性表内同时设置 ConPTY 与 Job List，失败时不退回普通启动。
+    /// 普通程序使用 ConPTY 与 Job List 原子创建；Store 应用别名在挂起状态加入 Job 后才运行。
     ///
     /// @author kongweiguang
     pub fn spawn_command_in_job(
@@ -210,11 +213,9 @@ impl PsuedoCon {
         self.spawn_command_with_job(cmd, Some(job))
     }
 
-    /// 构造完整启动属性后只调用一次 CreateProcessW，让 Job 成员关系早于 child 首条指令；失败时保留系统错误链，不泄露命令行或工作目录。
-    ///
-    /// ConPTY 不能假定宿主标准流未重定向：启用 `STARTF_USESTDHANDLES` 并显式把三个标准句柄留空，
-    /// 可阻止控制台子进程把宿主的重定向流当作自己的标准流；`bInheritHandles` 仍为 false，
-    /// 避免把宿主的其它句柄传入子进程。ConPTY 与 Job 属性继续在同一个 `STARTUPINFOEXW` 中创建。
+    /// 普通程序原子加入 Job；应用别名直接挂起创建、分配 Job 后再恢复，绝不运行未受管 child。
+    /// 必须预判别名：失败的 Job List 创建会固定 Job 的嵌套关系，不能拿同一 Job 重试。
+    /// 参数、环境、工作目录和实际 shell 均保持原值，不用 cmd 代理导致 packaged child 逃逸。
     ///
     /// @author kongweiguang
     fn spawn_command_with_job(
@@ -222,6 +223,69 @@ impl PsuedoCon {
         cmd: CommandBuilder,
         job: Option<BorrowedHandle<'_>>,
     ) -> anyhow::Result<WinChild> {
+        let suspended = if job.is_some() && !cmd.is_default_prog() {
+            let (exe, _) = cmd.cmdline()?;
+            super::launcher::is_app_execution_alias(&exe)?
+        } else {
+            false
+        };
+        let pi = self.create_process(&cmd, job.filter(|_| !suspended), suspended)?;
+        // SAFETY: successful CreateProcessW returned these two independently owned handles.
+        let main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
+        let proc = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as _) };
+        if suspended {
+            let Some(job) = job else {
+                Self::discard_suspended_process(pi.hProcess)?;
+                anyhow::bail!("Suspended process has no Job owner");
+            };
+            // SAFETY: both handles remain owned throughout assignment; the main thread is suspended.
+            if unsafe { AssignProcessToJobObject(job.as_raw_handle() as _, pi.hProcess) } == 0 {
+                let error = IoError::last_os_error();
+                Self::discard_suspended_process(pi.hProcess)?;
+                return Err(Error::new(error).context("AssignProcessToJobObject failed"));
+            }
+            // SAFETY: the child is already owned by the kill-on-close Job before its first instruction.
+            if unsafe { ResumeThread(main_thread.as_raw_handle() as _) } == u32::MAX {
+                let error = IoError::last_os_error();
+                Self::discard_suspended_process(pi.hProcess)?;
+                return Err(Error::new(error).context("ResumeThread failed"));
+            }
+        }
+        Ok(WinChild {
+            proc: Mutex::new(proc),
+        })
+    }
+
+    /// 分配 Job 或恢复主线程失败时用原始进程句柄结束并确认退出，避免遗留永远挂起的半成品。
+    ///
+    /// @author kongweiguang
+    fn discard_suspended_process(process: HANDLE) -> anyhow::Result<()> {
+        // SAFETY: caller owns a PROCESS_INFORMATION handle with termination and synchronize rights.
+        let terminated = unsafe { TerminateProcess(process, 1) };
+        let error = IoError::last_os_error();
+        let waited = unsafe { WaitForSingleObject(process, 5_000) };
+        if waited != WAIT_OBJECT_0 {
+            if terminated == 0 {
+                return Err(Error::new(error).context("Terminate suspended process failed"));
+            }
+            anyhow::bail!("Waiting for suspended process cleanup failed");
+        }
+        Ok(())
+    }
+
+    /// 每次创建独立的命令行与属性表，避免 CreateProcessW 的可变缓冲区在不同启动请求之间共享。
+    ///
+    /// ConPTY 不能假定宿主标准流未重定向：启用 `STARTF_USESTDHANDLES` 并显式把三个标准句柄留空，
+    /// 可阻止控制台子进程把宿主的重定向流当作自己的标准流；`bInheritHandles` 仍为 false，
+    /// 避免把宿主的其它句柄传入子进程。ConPTY 与 Job 属性继续在同一个 `STARTUPINFOEXW` 中创建。
+    ///
+    /// @author kongweiguang
+    fn create_process(
+        &self,
+        cmd: &CommandBuilder,
+        job: Option<BorrowedHandle<'_>>,
+        suspended: bool,
+    ) -> anyhow::Result<PROCESS_INFORMATION> {
         let mut si: STARTUPINFOEXW = unsafe { mem::zeroed() };
         si.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
         si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
@@ -248,7 +312,9 @@ impl PsuedoCon {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 0,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                EXTENDED_STARTUPINFO_PRESENT
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | if suspended { CREATE_SUSPENDED } else { 0 },
                 cmd.environment_block().as_mut_slice().as_mut_ptr() as *mut _,
                 cwd.as_ref()
                     .map(|c| c.as_slice().as_ptr())
@@ -261,13 +327,6 @@ impl PsuedoCon {
             return Err(Error::new(IoError::last_os_error()).context("CreateProcessW failed"));
         }
 
-        // Make sure we close out the thread handle so we don't leak it;
-        // we do this simply by making it owned
-        let _main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
-        let proc = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as _) };
-
-        Ok(WinChild {
-            proc: Mutex::new(proc),
-        })
+        Ok(pi)
     }
 }

@@ -27,6 +27,10 @@ const REVISION_9_GUIDE: &str =
     include_str!("../../../../tests/fixtures/configuration/config-guide-v9.md");
 const REVISION_10_GUIDE: &str =
     include_str!("../../../../tests/fixtures/configuration/config-guide-v10.md");
+const REVISION_11_GUIDE: &str =
+    include_str!("../../../../tests/fixtures/configuration/config-guide-v11.md");
+const REVISION_12_GUIDE: &str =
+    include_str!("../../../../tests/fixtures/configuration/config-guide-v12.md");
 const HOST_V2_SERIAL: &str =
     include_str!("../../../../tests/fixtures/configuration/host-schema-v2-serial-migration.toml");
 const HOST_V3_SERIAL: &str =
@@ -1210,6 +1214,59 @@ fn frozen_revision_ten_guides_are_planned_for_current_upgrade() {
     }
 }
 
+/// 新增应用配色规则后，只有冻结的 revision 11 正文允许规划升级，用户改写仍保留。
+///
+/// @author kongweiguang
+#[test]
+fn frozen_revision_eleven_guide_upgrades_without_overwriting_user_edits() {
+    const { assert!(CONFIG_GUIDE_REVISION > 11) };
+    let digest = configuration::config_guide_digest(REVISION_11_GUIDE);
+    assert_eq!(digest, super::CONFIG_GUIDE_REVISION_11_SHA256);
+    let normalized = REVISION_11_GUIDE.replace("\r\n", "\n").replace('\r', "\n");
+
+    for body in [normalized.clone(), normalized.replace('\n', "\r\n")] {
+        for marked in [false, true] {
+            let original = if marked {
+                format!(
+                    "{}11 sha256={digest} -->\n{body}",
+                    configuration::CONFIG_GUIDE_MARKER_PREFIX
+                )
+            } else {
+                body.clone()
+            };
+            let root = tempdir().expect("创建隔离 revision 11 指南根");
+            write_fixture(root.path(), "kerminal-config.md", &original);
+            let edits = plan_configuration_migration(root.path()).expect("规划冻结指南升级");
+            let planned = edit(&edits, "kerminal-config.md").expect("冻结正文有升级计划");
+            assert_eq!(planned.before.as_deref(), Some(original.as_bytes()));
+            assert_eq!(planned.after, configuration::managed_config_guide());
+            assert_eq!(
+                fs::read(root.path().join("kerminal-config.md")).unwrap(),
+                original.as_bytes()
+            );
+        }
+    }
+
+    let custom = format!("{normalized}\n## User notes\nPreserve these notes.\n");
+    let custom_digest = configuration::config_guide_digest(&custom);
+    for original in [
+        custom.clone(),
+        format!(
+            "{}11 sha256={custom_digest} -->\n{custom}",
+            configuration::CONFIG_GUIDE_MARKER_PREFIX
+        ),
+    ] {
+        let root = tempdir().expect("创建隔离自定义指南根");
+        write_fixture(root.path(), "kerminal-config.md", &original);
+        let edits = plan_configuration_migration(root.path()).expect("检查自定义指南");
+        assert!(edit(&edits, "kerminal-config.md").is_none());
+        assert_eq!(
+            fs::read(root.path().join("kerminal-config.md")).unwrap(),
+            original.as_bytes()
+        );
+    }
+}
+
 /// 用户复制旧标记或重算摘要都不授予覆盖权；只有被冻结的原始正文可以进入升级计划。
 ///
 /// @author kongweiguang
@@ -1424,6 +1481,59 @@ fn conflicting_or_invalid_saved_host_options_are_not_silently_normalized() {
         assert!(plan_configuration_migration(root.path()).is_err());
         assert_eq!(
             fs::read(root.path().join("hosts/legacy-options.toml")).expect("源配置保留"),
+            original.as_bytes()
+        );
+    }
+}
+
+/// 新增 VS Code 配色规则后，只有冻结的 revision 12 正文允许规划升级，用户改写仍保留。
+///
+/// @author kongweiguang
+#[test]
+fn frozen_revision_twelve_guide_upgrades_without_overwriting_user_edits() {
+    const { assert!(CONFIG_GUIDE_REVISION > 12) };
+    let digest = configuration::config_guide_digest(REVISION_12_GUIDE);
+    assert_eq!(digest, super::CONFIG_GUIDE_REVISION_12_SHA256);
+    let normalized = REVISION_12_GUIDE.replace("\r\n", "\n").replace('\r', "\n");
+
+    for body in [normalized.clone(), normalized.replace('\n', "\r\n")] {
+        for marked in [false, true] {
+            let original = if marked {
+                format!(
+                    "{}12 sha256={digest} -->\n{body}",
+                    configuration::CONFIG_GUIDE_MARKER_PREFIX
+                )
+            } else {
+                body.clone()
+            };
+            let root = tempdir().expect("创建隔离 revision 12 指南根");
+            write_fixture(root.path(), "kerminal-config.md", &original);
+            let edits = plan_configuration_migration(root.path()).expect("规划冻结指南升级");
+            let planned = edit(&edits, "kerminal-config.md").expect("冻结正文有升级计划");
+            assert_eq!(planned.before.as_deref(), Some(original.as_bytes()));
+            assert_eq!(planned.after, configuration::managed_config_guide());
+            assert_eq!(
+                fs::read(root.path().join("kerminal-config.md")).unwrap(),
+                original.as_bytes()
+            );
+        }
+    }
+
+    let custom = format!("{normalized}\n## User notes\nPreserve these notes.\n");
+    let custom_digest = configuration::config_guide_digest(&custom);
+    for original in [
+        custom.clone(),
+        format!(
+            "{}12 sha256={custom_digest} -->\n{custom}",
+            configuration::CONFIG_GUIDE_MARKER_PREFIX
+        ),
+    ] {
+        let root = tempdir().expect("创建隔离自定义指南根");
+        write_fixture(root.path(), "kerminal-config.md", &original);
+        let edits = plan_configuration_migration(root.path()).expect("检查自定义指南");
+        assert!(edit(&edits, "kerminal-config.md").is_none());
+        assert_eq!(
+            fs::read(root.path().join("kerminal-config.md")).unwrap(),
             original.as_bytes()
         );
     }

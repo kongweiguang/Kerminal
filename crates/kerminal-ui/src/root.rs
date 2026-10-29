@@ -50,6 +50,7 @@ mod services;
 mod session_command_pump;
 mod session_queue;
 mod session_reconnect;
+mod sidebar_containers;
 mod snippet_editor;
 mod split_target_picker;
 mod tab_agent_panels;
@@ -820,6 +821,8 @@ pub struct RootView {
     sftp_workbench_close_after_batch: Option<Vec<TabId>>,
     /// 中央导航或 picker 新建表单推进意图代次；连接指纹模态的焦点变化保留本次 SFTP 意图。
     surface_navigation_generation: u64,
+    /// 仅在侧栏显式请求后保留 host 与 pane 身份；导航变化或请求替换立即失效。
+    pending_sidebar_container: Option<sidebar_containers::SidebarContainerRequest>,
     pending_sftp_navigation: Option<connections::SftpNavigationRequest>,
     /// 共享打开与独立传输共用最新意图身份，旧预检不得覆盖后续请求状态。
     latest_sftp_request_id: Option<String>,
@@ -2847,6 +2850,9 @@ impl RootView {
             &preferences_panel,
             window,
             |root, _panel, event, window, cx| match event {
+                PreferencesEvent::ProfilesChanged => {
+                    preferences::refresh_profile_directory(root, cx);
+                }
                 PreferencesEvent::SettingsLoaded(settings) => {
                     root.pending_tool_rail_placement_focus = None;
                     root.apply_settings_snapshot(settings.clone(), window, cx);
@@ -3256,6 +3262,9 @@ impl RootView {
         });
         let connections_editor_observer = connections_panel.as_ref().map(|panel| {
             cx.observe_in(panel, window, |root, panel, window, cx| {
+                if sidebar_containers::sync_preflight(root, panel.read(cx)) {
+                    cx.notify();
+                }
                 let (editor_open, prompt_open) = {
                     let panel = panel.read(cx);
                     (panel.editor_open(), panel.root_confirmation_active())
@@ -3507,6 +3516,7 @@ impl RootView {
             sftp_workbench_tab_open: false,
             sftp_workbench_close_after_batch: None,
             surface_navigation_generation: 0,
+            pending_sidebar_container: None,
             pending_sftp_navigation: None,
             latest_sftp_request_id: None,
             pending_sftp_transfer_navigation: None,
@@ -3969,7 +3979,8 @@ impl RootView {
         terminal_palette_for_mode(self.window_appearance, self.theme_mode, scheme)
     }
 
-    /// 同一快照驱动工作台与命令建议预览；布局有未确认手势时只更新持久基线。
+    /// 同一快照驱动工作台与命令建议预览；应用配色只刷新外观，保留输入、会话和建议上下文。
+    /// 布局有未确认手势时只更新持久基线，保存回声不重复执行其它设置副作用。
     ///
     /// @author kongweiguang
     fn apply_settings_snapshot(
@@ -3978,6 +3989,11 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if preferences::app_palette_only_update(self.settings_snapshot.as_ref(), &settings) {
+            preferences::apply_snapshot(self, settings, window, cx);
+            self.refresh_tool_rail_panel_theme(cx);
+            return;
+        }
         let layout = settings.workbench_layout.clone();
         let restore_layout = workbench::should_restore_workbench_layout(
             self.settings_snapshot

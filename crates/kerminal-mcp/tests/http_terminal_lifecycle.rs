@@ -163,14 +163,11 @@ fn production_service_validation_lists_all_missing_capabilities() {
             "remote_connections",
             "host_management",
             "credentials",
-            "files",
             "transfers",
             "operations",
             "commands",
             "profiles",
             "configuration_validation",
-            "diagnostics",
-            "session_logs",
             "task_executor",
         ]
     );
@@ -316,7 +313,125 @@ async fn open_incomplete_mcp_request(endpoint: &str) -> TcpStream {
     .expect("MCP begins reading the controlled request body before the test deadline")
 }
 
-/// 通过最小 application fake 隔离 PTY；先确认未完成 HTTP body 已准入，再检验超时保留 owner 与客户端在线重试关闭。
+/// 固定核心目录经真实 HTTP 检查发现与拒绝边界，已移除工具不能靠猜名重新调用。
+///
+/// @author kongweiguang
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_core_catalog_rejects_every_removed_tool() {
+    let expected_core = [
+        "kerminal.help",
+        "kerminal.runtime_snapshot",
+        "kerminal.config.validate",
+        "kerminal.host.upsert_with_credential",
+        "kerminal.vault.encrypt_secret",
+        "ssh.command",
+        "terminal.create",
+        "terminal.write",
+        "terminal.snapshot",
+        "terminal.resize",
+        "terminal.list",
+        "terminal.close",
+        "sftp.transfer.enqueue",
+        "sftp.transfer.list",
+        "sftp.transfer.cancel",
+        "sftp.transfer.retry",
+        "port_forward.create",
+        "port_forward.list",
+        "port_forward.close",
+        "history.search",
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    let sessions = Arc::new(FakeSessionService::default());
+    let mut server = McpServer::start(
+        &Handle::current(),
+        McpServices::new(sessions.clone()),
+        McpServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap(),
+    )
+    .await
+    .expect("server starts");
+    let client = ClientInfo::default()
+        .serve(StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(server.endpoint()),
+        ))
+        .await
+        .expect("handshake succeeds");
+    let listed = client
+        .peer()
+        .list_tools(None)
+        .await
+        .expect("discovery succeeds");
+    let names = listed
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_ref())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(names, expected_core);
+    assert_eq!(listed.tools.len(), 20);
+    assert!(listed.next_cursor.is_none());
+    assert_catalog_contract(&listed.tools);
+    let help = call(&client, "kerminal.help", json!({})).await;
+    assert_eq!(data(&help)["data"]["toolCounts"]["exposed"], 20);
+    assert!(data(&help)["data"].get("optionalToolGroups").is_none());
+    let config = call(&client, "kerminal.help", json!({"topic":"config"})).await;
+    assert_eq!(data(&config)["data"]["markdown"], CONFIG_GUIDE);
+    let ssh = call(&client, "kerminal.help", json!({"toolId":"ssh.command"})).await;
+    let schema = &data(&ssh)["data"]["toolReference"][0]["inputSchema"];
+    assert_eq!(schema["required"], json!(["command"]));
+    assert!(schema["properties"].get("hostId").is_some());
+    assert!(schema["properties"].get("groupName").is_some());
+    assert_eq!(
+        data(&ssh)["data"]["toolReference"][0]["exampleArguments"]["hostId"],
+        "<saved-host-id>"
+    );
+    for arguments in [
+        json!({"topic":"unknown"}),
+        json!({"topic":"config","toolId":"ssh.command"}),
+    ] {
+        assert_eq!(
+            call(&client, "kerminal.help", arguments).await.is_error,
+            Some(true)
+        );
+    }
+    let baseline: Value =
+        serde_json::from_str(include_str!("fixtures/mcp_catalog_v0_3_45.json")).unwrap();
+    let unavailable = baseline["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .filter(|name| !expected_core.contains(name))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        unavailable.len(),
+        50,
+        "49 deleted legacy IDs plus the scoped-only context tool"
+    );
+    for tool_id in unavailable {
+        let result = client
+            .peer()
+            .call_tool(CallToolRequestParams::new(tool_id.to_owned()))
+            .await;
+        assert!(
+            result.is_err(),
+            "{tool_id} must be rejected before dispatch"
+        );
+        let hidden = call(&client, "kerminal.help", json!({"toolId":tool_id})).await;
+        assert_eq!(
+            data(&hidden)["data"]["matchedToolCount"],
+            0,
+            "help must not advertise {tool_id}"
+        );
+    }
+    assert!(sessions.sessions.lock().await.is_empty());
+    client.cancel().await.expect("client closes");
+    server
+        .shutdown_until(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("server shuts down");
+}
+
+/// 通过最小 application fake 隔离 PTY；检验真实 HTTP 生命周期、超时保留 owner 与在线客户端关闭。
 ///
 /// @author kongweiguang
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -358,22 +473,22 @@ async fn rmcp_http_runs_headless_terminal_lifecycle_and_shutdowns_with_client_op
     }
     assert_catalog_contract(&tools);
 
-    let capabilities = call(&client, "kerminal.capabilities", json!({})).await;
-    assert_eq!(data(&capabilities)["data"]["toolCounts"]["exposed"], 69);
+    let capabilities = call(&client, "kerminal.help", json!({"topic":"overview"})).await;
+    assert_eq!(data(&capabilities)["data"]["toolCounts"]["exposed"], 20);
     assert_eq!(
         data(&capabilities)["data"]["hostPolicy"]["approvalOwner"],
         "MCP host 决定确认、权限、hook 与审计策略。"
     );
 
-    let config_guide = call(&client, "kerminal.config_guide", json!({})).await;
+    let config_guide = call(&client, "kerminal.help", json!({"topic":"config"})).await;
     assert_eq!(data(&config_guide)["data"]["markdown"], CONFIG_GUIDE);
 
-    let app_guide = call(&client, "kerminal.app_guide", json!({})).await;
+    let app_guide = call(&client, "kerminal.help", json!({"topic":"app"})).await;
     assert_app_guide_layout_contract(&data(&app_guide)["data"]);
 
     let help = call(
         &client,
-        "kerminal.tool_help",
+        "kerminal.help",
         json!({
             "toolId":"terminal.write", "includeSchemas":false
         }),
@@ -392,7 +507,7 @@ async fn rmcp_http_runs_headless_terminal_lifecycle_and_shutdowns_with_client_op
 
     let sftp_help = call(
         &client,
-        "kerminal.tool_help",
+        "kerminal.help",
         json!({"family":"sftp","includeSchemas":false}),
     )
     .await;
@@ -401,13 +516,10 @@ async fn rmcp_http_runs_headless_terminal_lifecycle_and_shutdowns_with_client_op
         .as_array()
         .expect("SFTP family help returns its current tool IDs");
     for tool_id in [
-        "sftp.rename",
-        "sftp.move",
-        "sftp.preview",
-        "sftp.delete",
-        "sftp.create_directory",
-        "sftp.chmod",
-        "sftp.transfer.clear_completed",
+        "sftp.transfer.enqueue",
+        "sftp.transfer.list",
+        "sftp.transfer.cancel",
+        "sftp.transfer.retry",
     ] {
         assert!(
             sftp_ids.iter().any(|id| id == tool_id),
@@ -415,12 +527,7 @@ async fn rmcp_http_runs_headless_terminal_lifecycle_and_shutdowns_with_client_op
         );
     }
 
-    let guide = call(
-        &client,
-        "kerminal.operation_guide",
-        json!({"intent":"terminal"}),
-    )
-    .await;
+    let guide = call(&client, "kerminal.help", json!({"intent":"terminal"})).await;
     assert_eq!(data(&guide)["data"]["intent"], "terminal");
     assert!(
         data(&guide)["data"]["workflow"]
@@ -428,106 +535,18 @@ async fn rmcp_http_runs_headless_terminal_lifecycle_and_shutdowns_with_client_op
             .is_some_and(|steps| !steps.is_empty())
     );
 
-    let container_guide = call(
-        &client,
-        "kerminal.operation_guide",
-        json!({"intent":"container"}),
-    )
-    .await;
+    let container_guide = call(&client, "kerminal.help", json!({"intent":"container"})).await;
     let container_guide_result = data(&container_guide);
     let container_guide_data = &container_guide_result["data"];
     let available_tools = container_guide_data["availableReferencedToolIds"]
         .as_array()
         .expect("container guide lists available tool IDs");
-    let expected_container_tools = [
-        "container.list",
-        "container.inspect",
-        "container.logs.tail",
-        "container.stats",
-        "container.start",
-        "container.stop",
-        "container.restart",
-        "container.remove",
-        "container.files.list",
-        "container.files.preview",
-        "container.files.write_text",
-        "container.files.create_directory",
-        "container.files.rename",
-        "container.files.chmod",
-        "container.files.delete",
-        "container.files.upload",
-        "container.files.download",
-        "sftp.transfer.list",
-        "sftp.transfer.retry",
-        "sftp.transfer.cancel",
-    ];
-    for tool_id in expected_container_tools {
-        assert!(
-            available_tools.iter().any(|id| id == tool_id),
-            "container guide exposes {tool_id}"
-        );
-        assert!(
-            container_guide_data["toolReference"]
-                .as_array()
-                .is_some_and(|tools| tools.iter().any(|tool| tool["toolId"] == tool_id)),
-            "container guide references {tool_id}"
-        );
-    }
-    assert!(
-        available_tools
-            .iter()
-            .any(|id| id == "container.files.preview")
-    );
-    assert!(
-        available_tools
-            .iter()
-            .any(|id| id == "container.files.write_text")
-    );
-    assert_eq!(
-        container_guide_data["containerTextWriteWorkflow"]["writeTool"],
-        "container.files.write_text"
-    );
-    assert!(
-        container_guide_data["toolReference"]
-            .as_array()
-            .is_some_and(|tools| {
-                tools
-                    .iter()
-                    .any(|tool| tool["toolId"] == "container.files.write_text")
-            })
-    );
+    assert_eq!(available_tools, &vec![json!("ssh.command")]);
+    assert!(container_guide_data["containerTextWriteWorkflow"].is_null());
     assert!(
         container_guide_data["workflow"]
             .as_array()
-            .is_some_and(|steps| {
-                steps
-                    .iter()
-                    .any(|step| step["toolId"] == "container.files.write_text")
-            })
-    );
-    let container_steps = container_guide_data["workflow"]
-        .as_array()
-        .expect("container guide has a workflow");
-    for tool_id in [
-        "container.files.upload",
-        "container.files.download",
-        "sftp.transfer.list",
-        "sftp.transfer.retry",
-        "sftp.transfer.cancel",
-    ] {
-        assert!(
-            container_steps.iter().any(|step| step["toolId"] == tool_id),
-            "container transfer workflow includes {tool_id}"
-        );
-    }
-    let transfer_poll = container_steps
-        .iter()
-        .find(|step| step["toolId"] == "sftp.transfer.list")
-        .expect("container transfer guide explains polling");
-    assert!(
-        transfer_poll["description"]
-            .as_str()
-            .is_some_and(|text| { text.contains("transferId") && text.contains("commitUnknown") })
+            .is_some_and(|steps| { steps.iter().all(|step| step["toolId"] == "ssh.command") })
     );
 
     let created = call(
@@ -732,327 +751,6 @@ async fn rmcp_http_runs_headless_terminal_lifecycle_and_shutdowns_with_client_op
     );
 }
 
-/// 通过真实 RMCP/HTTP handler 验证每类容器 DTO 的字段边界，并证明旧 union 类型本来接受的额外字段如今会在服务调用前拒绝。
-///
-/// @author kongweiguang
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn container_tool_arguments_reject_union_only_fields_before_services() {
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct FormerContainerUnionTypes {
-        path: Option<String>,
-        force: Option<bool>,
-        include_stopped: Option<bool>,
-        tail: Option<u32>,
-        content: Option<String>,
-    }
-
-    struct Case {
-        tool_id: &'static str,
-        valid: Value,
-        required: &'static [&'static str],
-        union_only_field: &'static str,
-        union_only_value: Value,
-        optional_field: &'static str,
-        optional_value: Value,
-    }
-
-    let cases = [
-        Case {
-            tool_id: "container.list",
-            valid: json!({ "hostId": "saved:one" }),
-            required: &["hostId"],
-            union_only_field: "path",
-            union_only_value: json!("/union-only"),
-            optional_field: "includeStopped",
-            optional_value: json!(false),
-        },
-        Case {
-            tool_id: "container.inspect",
-            valid: json!({ "hostId": "saved:one", "containerId": "r46-test" }),
-            required: &["hostId", "containerId"],
-            union_only_field: "force",
-            union_only_value: json!(false),
-            optional_field: "runtime",
-            optional_value: json!("docker"),
-        },
-        Case {
-            tool_id: "container.logs.tail",
-            valid: json!({ "hostId": "saved:one", "containerId": "r46-test" }),
-            required: &["hostId", "containerId"],
-            union_only_field: "includeStopped",
-            union_only_value: json!(false),
-            optional_field: "tail",
-            optional_value: json!(10),
-        },
-        Case {
-            tool_id: "container.remove",
-            valid: json!({ "hostId": "saved:one", "containerId": "r46-test" }),
-            required: &["hostId", "containerId"],
-            union_only_field: "tail",
-            union_only_value: json!(10),
-            optional_field: "force",
-            optional_value: json!(false),
-        },
-        Case {
-            tool_id: "container.files.list",
-            valid: json!({ "hostId": "saved:one", "containerId": "r46-test", "path": "/tmp" }),
-            required: &["hostId", "containerId", "path"],
-            union_only_field: "force",
-            union_only_value: json!(false),
-            optional_field: "runtime",
-            optional_value: json!("docker"),
-        },
-        Case {
-            tool_id: "container.files.preview",
-            valid: json!({ "hostId": "saved:one", "containerId": "r46-test", "path": "/tmp/file" }),
-            required: &["hostId", "containerId", "path"],
-            union_only_field: "content",
-            union_only_value: json!("union-only"),
-            optional_field: "maxBytes",
-            optional_value: json!(10),
-        },
-        Case {
-            tool_id: "container.files.write_text",
-            valid: json!({
-                "hostId": "saved:one", "containerId": "r46-test", "path": "/tmp/file",
-                "content": "text", "encoding": "utf-8", "create": false,
-                "overwriteOnConflict": true
-            }),
-            required: &[
-                "hostId",
-                "containerId",
-                "path",
-                "content",
-                "encoding",
-                "create",
-                "overwriteOnConflict",
-            ],
-            union_only_field: "tail",
-            union_only_value: json!(10),
-            optional_field: "expectedRevision",
-            optional_value: json!({ "size": 1 }),
-        },
-        Case {
-            tool_id: "container.files.rename",
-            valid: json!({
-                "hostId": "saved:one", "containerId": "r46-test",
-                "fromPath": "/tmp/a", "toPath": "/tmp/b"
-            }),
-            required: &["hostId", "containerId", "fromPath", "toPath"],
-            union_only_field: "path",
-            union_only_value: json!("/union-only"),
-            optional_field: "runtime",
-            optional_value: json!("docker"),
-        },
-        Case {
-            tool_id: "container.files.chmod",
-            valid: json!({
-                "hostId": "saved:one", "containerId": "r46-test", "path": "/tmp/file", "mode": "0644"
-            }),
-            required: &["hostId", "containerId", "path", "mode"],
-            union_only_field: "content",
-            union_only_value: json!("union-only"),
-            optional_field: "runtime",
-            optional_value: json!("docker"),
-        },
-        Case {
-            tool_id: "container.files.upload",
-            valid: json!({
-                "hostId": "saved:one", "containerId": "r46-test", "remotePath": "/tmp/file",
-                "localPath": "C:\\r46\\unused.txt", "kind": "file"
-            }),
-            required: &["hostId", "containerId", "remotePath", "localPath", "kind"],
-            union_only_field: "path",
-            union_only_value: json!("/union-only"),
-            optional_field: "runtime",
-            optional_value: json!("docker"),
-        },
-        Case {
-            tool_id: "container.files.delete",
-            valid: json!({
-                "hostId": "saved:one", "containerId": "r46-test", "path": "/tmp/file", "directory": false
-            }),
-            required: &["hostId", "containerId", "path", "directory"],
-            union_only_field: "tail",
-            union_only_value: json!(10),
-            optional_field: "runtime",
-            optional_value: json!("docker"),
-        },
-    ];
-
-    let sessions = Arc::new(FakeSessionService::default());
-    let mut server = McpServer::start(
-        &Handle::current(),
-        McpServices::new(sessions.clone())
-            .with_profiles(test_profile_service())
-            .with_commands(commands_service::empty_commands_service(sessions)),
-        McpServerConfig::new("127.0.0.1:0".parse::<SocketAddr>().expect("valid loopback"))
-            .expect("loopback is accepted"),
-    )
-    .await
-    .expect("MCP server starts");
-    let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(server.endpoint()),
-    );
-    let client = ClientInfo::default()
-        .serve(transport)
-        .await
-        .expect("MCP handshake succeeds");
-
-    for case in cases {
-        let valid = call(&client, case.tool_id, case.valid.clone()).await;
-        assert_ne!(
-            data(&valid)["errorKind"],
-            "invalid",
-            "omitted optional values are accepted for {}",
-            case.tool_id
-        );
-
-        let mut supplied_optional = case.valid.clone();
-        supplied_optional
-            .as_object_mut()
-            .expect("test argument is an object")
-            .insert(case.optional_field.to_owned(), case.optional_value.clone());
-        let accepted_optional = call(&client, case.tool_id, supplied_optional).await;
-        assert_ne!(
-            data(&accepted_optional)["errorKind"],
-            "invalid",
-            "valid optional value {} is accepted for {}",
-            case.optional_field,
-            case.tool_id
-        );
-
-        for required in case.required {
-            let mut missing = case.valid.clone();
-            missing
-                .as_object_mut()
-                .expect("test argument is an object")
-                .remove(*required);
-            let rejected = call(&client, case.tool_id, missing).await;
-            assert_eq!(
-                data(&rejected)["errorKind"],
-                "invalid",
-                "required field {required} is enforced for {}",
-                case.tool_id
-            );
-        }
-
-        let mut extra = case.valid.clone();
-        extra
-            .as_object_mut()
-            .expect("test argument is an object")
-            .insert(
-                case.union_only_field.to_owned(),
-                case.union_only_value.clone(),
-            );
-        let mut old_union_arguments = Map::new();
-        old_union_arguments.insert(
-            case.union_only_field.to_owned(),
-            case.union_only_value.clone(),
-        );
-        let old_union: FormerContainerUnionTypes =
-            serde_json::from_value(Value::Object(old_union_arguments))
-                .expect("the formerly shared union accepted this field with its actual value type");
-        match case.union_only_field {
-            "path" => assert_eq!(old_union.path.as_deref(), case.union_only_value.as_str()),
-            "force" => assert_eq!(old_union.force, case.union_only_value.as_bool()),
-            "includeStopped" => {
-                assert_eq!(old_union.include_stopped, case.union_only_value.as_bool())
-            }
-            "tail" => assert_eq!(
-                old_union.tail,
-                case.union_only_value
-                    .as_u64()
-                    .and_then(|value| u32::try_from(value).ok())
-            ),
-            "content" => {
-                assert_eq!(old_union.content.as_deref(), case.union_only_value.as_str())
-            }
-            _ => unreachable!("every union-only field has an old typed witness"),
-        }
-        let rejected = call(&client, case.tool_id, extra).await;
-        assert_eq!(
-            data(&rejected)["errorKind"],
-            "invalid",
-            "known union-only field {} is rejected for {} before optional services exist",
-            case.union_only_field,
-            case.tool_id
-        );
-
-        let mut explicit_null = case.valid.clone();
-        explicit_null
-            .as_object_mut()
-            .expect("test argument is an object")
-            .insert(case.optional_field.to_owned(), Value::Null);
-        let rejected = call(&client, case.tool_id, explicit_null).await;
-        assert_eq!(
-            data(&rejected)["errorKind"],
-            "invalid",
-            "optional non-null field {} rejects explicit null for {}",
-            case.optional_field,
-            case.tool_id
-        );
-    }
-
-    let valid_nested_revision = json!({
-        "hostId": "saved:one", "containerId": "r46-test", "path": "/tmp/file",
-        "content": "text", "encoding": "utf-8", "create": false,
-        "overwriteOnConflict": true,
-        "expectedRevision": { "size": 1 }
-    });
-    let valid = call(&client, "container.files.write_text", valid_nested_revision).await;
-    assert_ne!(
-        data(&valid)["errorKind"],
-        "invalid",
-        "nested revision optionals may be omitted"
-    );
-
-    let null_nested_revision = json!({
-        "hostId": "saved:one", "containerId": "r46-test", "path": "/tmp/file",
-        "content": "text", "encoding": "utf-8", "create": false,
-        "overwriteOnConflict": true,
-        "expectedRevision": { "size": 1, "modified": null }
-    });
-    let rejected = call(&client, "container.files.write_text", null_nested_revision).await;
-    assert_eq!(
-        data(&rejected)["errorKind"],
-        "invalid",
-        "nested revision options follow their non-null schema types"
-    );
-
-    for content in [String::new(), "  \t\n".to_owned()] {
-        let args = json!({
-            "hostId": "saved:one", "containerId": "r46-test", "path": "/tmp/file",
-            "content": content, "encoding": "utf-8", "create": false,
-            "overwriteOnConflict": true
-        });
-        let accepted_at_schema_boundary = call(&client, "container.files.write_text", args).await;
-        assert_ne!(
-            data(&accepted_at_schema_boundary)["errorKind"],
-            "invalid",
-            "an empty or whitespace-only String is schema-valid and reaches the missing service boundary"
-        );
-    }
-
-    for invalid_content in [Value::Null, json!(17)] {
-        let args = json!({
-            "hostId": "saved:one", "containerId": "r46-test", "path": "/tmp/file",
-            "content": invalid_content, "encoding": "utf-8", "create": false,
-            "overwriteOnConflict": true
-        });
-        let rejected = call(&client, "container.files.write_text", args).await;
-        assert_eq!(
-            data(&rejected)["errorKind"],
-            "invalid",
-            "present String content rejects null and non-String values"
-        );
-    }
-
-    let _ = client.cancel().await;
-    server.shutdown().await.expect("MCP server shuts down");
-}
-
 /// 验证 Agent 范围工具仅使用 session 身份，内部恢复能力不扩展 MCP 接口。
 ///
 /// @author kongweiguang
@@ -1136,6 +834,21 @@ async fn agent_scoped_resize_and_close_require_matching_scope_id_without_target_
         .expect("Agent-scoped MCP client connects");
     let mismatched_agent_id = AgentSessionId::new();
 
+    let listed = client
+        .peer()
+        .list_tools(None)
+        .await
+        .expect("scoped discovery succeeds");
+    assert_eq!(listed.tools.len(), 21);
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == "kerminal.agent.target_context")
+    );
+    let overview = call(&client, "kerminal.help", json!({})).await;
+    assert_eq!(data(&overview)["data"]["toolCounts"]["exposed"], 21);
+
     let rejected_resize = call(
         &client,
         "terminal.resize",
@@ -1218,7 +931,7 @@ async fn call(
         .expect("tool request reaches the server")
 }
 
-/// 固定兼容区域 ID 与工具族，并锁定右栏容器的活动 pane 说明及只读边界。
+/// 固定兼容区域与目标边界，同时确保默认工具布局不会被导航指南误报为不可调整。
 ///
 /// @author kongweiguang
 fn assert_app_guide_layout_contract(guide: &Value) {
@@ -1280,8 +993,7 @@ fn assert_app_guide_layout_contract(guide: &Value) {
         ("terminal-workspace", "terminal"),
         ("agent-and-tools", "agent-session"),
         ("agent-and-tools", "sftp"),
-        ("agent-and-tools", "container"),
-        ("agent-and-tools", "tmux"),
+        ("agent-and-tools", "ssh"),
         ("bottom-tools", "history"),
         ("configuration-workspace", "config"),
     ] {
@@ -1298,28 +1010,35 @@ fn assert_app_guide_layout_contract(guide: &Value) {
     let tools_purpose = area_purpose("agent-and-tools");
     assert!(!tools_purpose.contains("Context"));
     assert!(!tools_purpose.contains("更多工作区"));
-    assert!(tools_purpose.contains("容器工具固定在右侧"));
     let container_panel = &guide["containerPanel"];
     assert_eq!(container_panel["uiToolId"], "containers");
     assert_eq!(container_panel["location"], "right");
-    assert_eq!(container_panel["fixedPosition"], true);
+    assert_eq!(container_panel["fixedPosition"], false);
+    for action in ["右键菜单", "顺序", "显示状态", "内容打开位置"] {
+        assert!(
+            container_panel["customization"]
+                .as_str()
+                .unwrap()
+                .contains(action)
+        );
+    }
     assert_eq!(container_panel["defaultAfter"], "sftp");
-    assert_eq!(container_panel["binding"], "当前活动 pane 的已核实目标");
+    assert_eq!(
+        container_panel["binding"],
+        "当前活动 SSH pane 或文件 Tab 的已核实宿主"
+    );
     assert!(
         container_panel["hostMode"]
             .as_str()
             .unwrap()
-            .contains("本机或 SSH")
+            .contains("SSH pane 管理对应宿主")
     );
     let container_mode = container_panel["containerMode"].as_str().unwrap();
-    for read_only_section in ["概览", "资源", "日志"] {
-        assert!(container_mode.contains(read_only_section));
-    }
-    for forbidden_action in ["生命周期", "Compose", "exec", "文件操作"] {
-        assert!(container_mode.contains(forbidden_action));
+    for host_binding in ["创建时的 SSH 宿主", "文件 Tab 保留真实宿主身份"] {
+        assert!(container_mode.contains(host_binding));
     }
     let unavailable = container_panel["unavailable"].as_str().unwrap();
-    for reason in ["无有效终端", "身份不一致", "Telnet", "串口"] {
+    for reason in ["无有效目标", "身份不一致", "本机", "Telnet", "串口"] {
         assert!(unavailable.contains(reason));
     }
     assert!(unavailable.contains("不回退到左栏选中的主机"));
@@ -1329,10 +1048,7 @@ fn assert_app_guide_layout_contract(guide: &Value) {
     assert!(history_purpose.contains("不表示终端底部工具区"));
     assert_eq!(
         guide["sessionWorkspace"]["refreshTools"],
-        json!([
-            "kerminal.agent.current_session",
-            "kerminal.agent.target_context"
-        ])
+        json!(["terminal.list", "terminal.snapshot"])
     );
     let context_files = guide["sessionWorkspace"]["readFirst"]
         .as_array()
@@ -1346,71 +1062,57 @@ fn assert_app_guide_layout_contract(guide: &Value) {
     }
 }
 
-/// 将 live MCP catalog 与冻结旧版本逐字段比较，防止只保留 toolId 却漂移 schema 或安全提示。
+/// 固定核心目录仍核对独立旧版 schema；统一帮助和 SSH 定位入口按新契约验证。
 fn assert_catalog_contract(actual: &[Tool]) {
+    let current: Value = serde_json::from_str(include_str!("../resources/tool_catalog.json"))
+        .expect("current MCP catalog is valid JSON");
     let baseline: Value = serde_json::from_str(include_str!("fixtures/mcp_catalog_v0_3_45.json"))
-        .expect("frozen MCP catalog fixture is valid JSON");
-    assert_eq!(
-        baseline["sourceCommit"],
-        "17c5d4be46172ca508f92546bfae5fe5ef477f11"
-    );
-    let frozen_tools = baseline["tools"]
+        .expect("legacy fixture remains independent");
+    let expected = current["tools"]
         .as_array()
-        .expect("baseline tools are an array");
-    assert_eq!(
-        frozen_tools.len(),
-        69,
-        "baseline catalog is pinned to all 69 tool contracts"
-    );
-
-    let actual_names: Vec<_> = actual.iter().map(|tool| tool.name.as_ref()).collect();
-    let mut unique_names = actual_names.clone();
-    unique_names.sort_unstable();
-    unique_names.dedup();
-    assert_eq!(
-        actual_names.len(),
-        unique_names.len(),
-        "live catalog has duplicate tool ids"
-    );
-    let expected_names: Vec<_> = frozen_tools
+        .unwrap()
         .iter()
-        .filter(|expected| expected["enabled"] == true && expected["exposedToMcp"] == true)
-        .map(|expected| {
-            expected["name"]
-                .as_str()
-                .expect("baseline tool id is a string")
-        })
-        .collect();
-    assert_eq!(actual_names.len(), 69, "all baseline tools remain exposed");
+        .filter(|tool| tool["agentScoped"] != true)
+        .collect::<Vec<_>>();
+    let names = actual
+        .iter()
+        .map(|tool| tool.name.as_ref())
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), 20);
     assert_eq!(
-        actual_names, expected_names,
-        "live tool ids and order equal the complete frozen catalog"
-    );
-
-    for tool in actual {
-        let expected = frozen_tools
+        names,
+        expected
             .iter()
-            .find(|expected| expected["name"] == tool.name.as_ref())
-            .expect("every live tool exists in the frozen baseline");
-        assert_eq!(tool.title.as_deref(), expected["title"].as_str());
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>()
+    );
+    for (tool, expected) in actual.iter().zip(expected) {
         assert_eq!(
-            tool.description.as_deref(),
-            expected["description"].as_str()
+            serde_json::to_value(&tool.input_schema).unwrap(),
+            expected["inputSchema"]
         );
         assert_eq!(
-            serde_json::to_value(&tool.annotations).expect("tool annotations serialize"),
-            expected["annotations"],
-            "annotations remain compatible for {}",
-            tool.name,
+            serde_json::to_value(&tool.annotations).unwrap(),
+            expected["annotations"]
         );
-        assert_eq!(
-            serde_json::to_value(&tool.input_schema).expect("tool schema serializes"),
-            expected["inputSchema"],
-            "schema remains compatible for {}",
-            tool.name,
-        );
-        assert_eq!(expected["enabled"], true);
-        assert_eq!(expected["exposedToMcp"], true);
+        if tool.name != "kerminal.help" && tool.name != "ssh.command" {
+            let legacy = baseline["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|old| old["name"] == tool.name.as_ref())
+                .expect("retained tool has a legacy contract");
+            assert_eq!(
+                expected["inputSchema"], legacy["inputSchema"],
+                "{} keeps its schema",
+                tool.name
+            );
+            assert_eq!(
+                expected["annotations"], legacy["annotations"],
+                "{} keeps its annotations",
+                tool.name
+            );
+        }
     }
 }
 

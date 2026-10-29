@@ -4,7 +4,30 @@
 
 use crate::theme::{BackgroundMaterialSettings, BackgroundMaterials, ThemeTokens};
 use gpui_kit::WindowAppearance;
-use kerminal_application::preferences::ThemeMode;
+use kerminal_application::preferences::{AppColorScheme, ThemeMode};
+
+impl ThemeTokens {
+    /// 旧有组件测试采用默认色板，生产入口始终使用完整的配色身份。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn for_appearance(appearance: WindowAppearance) -> Self {
+        Self::for_scheme(appearance, ThemeMode::System, AppColorScheme::Kerminal)
+    }
+
+    /// 保持既有材料测试的默认配色语义，避免为测试向生产模块加入闲置入口。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn for_mode(appearance: WindowAppearance, mode: ThemeMode) -> Self {
+        Self::for_scheme(appearance, mode, AppColorScheme::Kerminal)
+    }
+
+    /// 从基色投影材料，测试不能复用已降低透明度的表面。
+    ///
+    /// @author kongweiguang
+    fn for_dark_with_materials(dark: bool, settings: BackgroundMaterialSettings) -> Self {
+        Self::for_palette_with_materials(dark, AppColorScheme::Kerminal, settings)
+    }
+}
 
 /// 有壁纸时只让全视口底色保持不透明，工作区材料必须透出图片。
 #[test]

@@ -954,7 +954,7 @@ impl RootView {
     /// 关闭仍经共享切换路径完成，以同步 Agent 搜索、Dock 宽度与工具专属状态。
     ///
     /// @author kongweiguang
-    fn show_compact_tool_panel(
+    pub(super) fn show_compact_tool_panel(
         &mut self,
         tool: ToolRailToolId,
         window: &mut Window,
@@ -1132,7 +1132,8 @@ fn panel_slot_mut(
 /// 窄屏工具抽屉从当前 Tab 活动工具派生，常规停靠宿主只处理精确 owner 冒泡到达的未消费 Escape。
 /// Root 确认、连接提示与 Kit 模态优先持有焦点；只暂停抽屉的焦点回收，保留 main 的模态背景。
 /// 主机弹层统一按 rem 缩放并夹紧视口；主机树插槽允许收缩，使内部滚动区能接收剩余高度。
-/// 工作台按 main 的局部色板呈现；标签区的唯一前导间距与抽屉按钮到分隔线的距离一致。
+/// 工作台与决策遮罩共用应用语义色板；侧栏细分隔保证终端自选背景或壁纸相近时仍有区域边界。
+/// 标签区的唯一前导间距与抽屉按钮到分隔线的距离一致。
 ///
 /// @author kongweiguang
 pub(super) fn render_workbench(
@@ -1388,6 +1389,8 @@ pub(super) fn render_workbench(
             .flex_col()
             .overflow_hidden()
             .bg(sidebar_background)
+            .border_r_1()
+            .border_color(theme.border)
             .text_color(theme.foreground)
             .child(host_navigation.map_or_else(
                 || {
@@ -2692,7 +2695,7 @@ pub(super) fn render_workbench(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.38))
+                    .bg(theme.dialog_scrim)
                     .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
                         root.request_close_connection_editor(window, cx);
                     }))
@@ -2770,11 +2773,7 @@ pub(super) fn render_workbench(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(if rail_dialog {
-                        theme.dialog_scrim
-                    } else {
-                        gpui_kit::hsla(0.0, 0.0, 0.0, 0.38)
-                    })
+                    .bg(theme.dialog_scrim)
                     .on_click(cx.listener(|root, _: &ClickEvent, _, cx| {
                         root.cancel_root_confirmation(cx);
                     }))

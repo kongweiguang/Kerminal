@@ -7,11 +7,11 @@ use std::{collections::BTreeMap, ffi::OsString, fs, path::PathBuf, sync::Arc};
 use kerminal_application::{
     AppError, PreferencesService, PublicErrorCode,
     preferences::{
-        BackgroundFit, CONFIG_GUIDE, CONFIG_GUIDE_REVISION, ConfigurationGuideStatus,
-        ConfigurationRepository, ConfigurationValidationRepository, ConfigurationValidationScope,
-        ConfigurationValidationService, ConfigurationValidationSeverity, DefaultLocalShellProvider,
-        InterfaceLanguage, ProfileRepository, ProfileService, SettingsSnapshot, ThemeMode,
-        ToolRailToolId,
+        AppColorScheme, BackgroundFit, CONFIG_GUIDE, CONFIG_GUIDE_REVISION,
+        ConfigurationGuideStatus, ConfigurationRepository, ConfigurationValidationRepository,
+        ConfigurationValidationScope, ConfigurationValidationService,
+        ConfigurationValidationSeverity, DefaultLocalShellProvider, InterfaceLanguage,
+        ProfileRepository, ProfileService, SettingsSnapshot, ThemeMode, ToolRailToolId,
     },
 };
 use kerminal_domain::{
@@ -683,6 +683,7 @@ async fn settings_guide_example_decodes_appearance_and_workbench_layout_fields()
         .and_then(toml::Value::as_table)
         .expect("外观字段位于 appearance 表");
     for key in [
+        "colorScheme",
         "interfaceLanguage",
         "backgroundEnabled",
         "backgroundFit",
@@ -702,6 +703,10 @@ async fn settings_guide_example_decodes_appearance_and_workbench_layout_fields()
         .and_then(|root| root.get_mut("appearance"))
         .and_then(toml::Value::as_table_mut)
         .expect("appearance 表可修改");
+    appearance.insert(
+        "colorScheme".to_owned(),
+        toml::Value::String("jetbrains".to_owned()),
+    );
     appearance.insert(
         "interfaceLanguage".to_owned(),
         toml::Value::String("zhCn".to_owned()),
@@ -733,6 +738,7 @@ async fn settings_guide_example_decodes_appearance_and_workbench_layout_fields()
         .await
         .expect("typed settings port 读取设置示例");
 
+    assert_eq!(loaded.settings.app_color_scheme, AppColorScheme::JetBrains);
     assert_eq!(loaded.settings.interface_language, InterfaceLanguage::ZhCn);
     assert!(loaded.settings.background_enabled);
     assert_eq!(loaded.settings.background_fit, BackgroundFit::Contain);
@@ -817,6 +823,42 @@ async fn configuration_validator_rejects_unknown_workbench_tool_id_without_rewri
     assert_eq!(report.diagnostics[0].path, "settings.toml");
     assert_eq!(
         fs::read(temp.0.join("settings.toml")).expect("读取仍受保护的原件"),
+        original.as_bytes()
+    );
+}
+
+/// 未知应用色板必须走既有只读恢复与 validator，原始用户文件不能因回退而被覆盖。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn unknown_app_color_scheme_is_reported_without_rewriting_configuration() {
+    let temp = TemporaryConfigRoot::new();
+    let original = "schema_version = 1\n[appearance]\ncolorScheme = \"future\" # preserve\n";
+    fs::write(temp.0.join("settings.toml"), original).expect("写入未知配色设置");
+    let store = ConfigurationStore::initialize(&temp.0).expect("初始化隔离配置根");
+    assert_eq!(
+        store.recovery_state().mode,
+        ConfigurationMode::ReadOnlyRecovery
+    );
+    let report = ConfigurationValidationService::new(Arc::new(store.clone()))
+        .validate(ConfigurationValidationScope::Settings)
+        .await
+        .expect("返回未知配色诊断");
+    assert!(!report.valid);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|item| item.path == "settings.toml")
+    );
+    assert!(
+        PreferencesService::new(Arc::new(store))
+            .load_settings()
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(temp.0.join("settings.toml")).unwrap(),
         original.as_bytes()
     );
 }
@@ -1007,6 +1049,78 @@ async fn typed_settings_roundtrip_preserves_supported_fields_and_unknown_fields(
         .and_then(|row| row.get("vendorMetadata"))
         .and_then(toml::Value::as_str);
     assert_eq!(vendor_metadata, Some("keep-me"));
+}
+
+/// 各应用色板独立往返并保留旧终端色盘、原始注释与扩展字段。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn app_color_schemes_roundtrip_without_changing_terminal_or_unknown_fields() {
+    let temp = TemporaryConfigRoot::new();
+    let original = concat!(
+        "schema_version = 1\n",
+        "[appearance]\n",
+        "interfaceLanguage = \"system\" # user note\n",
+        "vendorAppearance = \"keep\"\n",
+        "[terminal]\n",
+        "colorScheme = \"tokyoNight\"\n",
+        "lightColorScheme = \"github\"\n",
+        "darkColorScheme = \"solarized\"\n",
+    );
+    fs::write(temp.0.join("settings.toml"), original).expect("写入不含应用配色的旧设置");
+    let store = ConfigurationStore::initialize(&temp.0).expect("初始化隔离配置根");
+    let service = PreferencesService::new(Arc::new(store.clone()));
+    let mut current = service.load_settings().await.expect("加载旧设置");
+    assert_eq!(current.settings.app_color_scheme, AppColorScheme::Kerminal);
+    assert_eq!(
+        fs::read(temp.0.join("settings.toml")).unwrap(),
+        original.as_bytes()
+    );
+    let terminal = current.settings.terminal.clone();
+
+    for scheme in AppColorScheme::ALL {
+        current.settings.app_color_scheme = scheme;
+        let saved = service
+            .save_settings(current.settings, current.revision)
+            .await
+            .expect("按已读 revision 保存应用色板");
+        assert_eq!(saved.settings.app_color_scheme, scheme);
+        let reloaded = service.load_settings().await.expect("保存后重新读取");
+        assert_eq!(reloaded.settings.app_color_scheme, scheme);
+        assert_eq!(reloaded.settings.terminal, terminal);
+        let raw = fs::read_to_string(temp.0.join("settings.toml")).expect("读取保存后的设置");
+        assert!(raw.contains("interfaceLanguage = \"system\" # user note"));
+        assert!(raw.contains("vendorAppearance = \"keep\""));
+        let parsed: toml::Value = toml::from_str(&raw).expect("保存结果是合法 TOML");
+        assert_eq!(
+            parsed["appearance"]["colorScheme"].as_str(),
+            Some(scheme.as_str())
+        );
+        assert_eq!(
+            parsed["terminal"]["colorScheme"].as_str(),
+            Some("tokyoNight")
+        );
+        assert_eq!(
+            parsed["terminal"]["lightColorScheme"].as_str(),
+            Some("github")
+        );
+        assert_eq!(
+            parsed["terminal"]["darkColorScheme"].as_str(),
+            Some("solarized")
+        );
+        current = reloaded;
+    }
+
+    let reopened = ConfigurationStore::initialize(&temp.0).expect("重新打开隔离配置根");
+    let restored = PreferencesService::new(Arc::new(reopened))
+        .load_settings()
+        .await
+        .expect("重新打开后读取偏好");
+    assert_eq!(
+        restored.settings.app_color_scheme,
+        current.settings.app_color_scheme
+    );
+    assert_eq!(restored.settings.terminal, terminal);
 }
 
 /// 旧 SFTP 名称在运行时只作为未知字段保留，不再影响 typed 值或由 saver 特别删除。

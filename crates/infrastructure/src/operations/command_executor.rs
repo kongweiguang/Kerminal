@@ -467,11 +467,15 @@ async fn collect_buffered_stream(
 
 #[async_trait]
 impl ContainerStageCleanupCapability for ContainerStageCleanupCapabilityImpl {
-    /// 唯一创建命令固定到预签端点；任何不确定失败都保留 capability 供安全清理重试。
+    /// 唯一创建命令固定到预签端点；状态快照先释放同步锁，后续转换与异步命令由 operation 串行保护。
+    /// 任何不确定失败都保留 capability 供安全清理重试。
+    ///
+    /// @author kongweiguang
     async fn create_stage_until(&self, deadline: Instant) -> AppResult<StageCreationResult> {
         let _operation = self.operation.lock().await;
         self.close_pending_command(deadline).await?;
-        match *lock_recover(&self.phase) {
+        let phase = *lock_recover(&self.phase);
+        match phase {
             StageCapabilityPhase::Created => return Ok(StageCreationResult::Created),
             StageCapabilityPhase::Reserved => {
                 *lock_recover(&self.phase) = StageCapabilityPhase::CreationMayHaveStarted;

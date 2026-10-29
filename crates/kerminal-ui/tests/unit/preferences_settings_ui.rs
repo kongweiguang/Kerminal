@@ -5,6 +5,9 @@
 #[path = "preferences_color_sampling.rs"]
 mod color_sampling;
 
+#[path = "preferences_mcp.rs"]
+mod mcp;
+
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -51,6 +54,10 @@ struct MemorySettingsState {
     revision: Option<ConfigRevision>,
     next_revision: u64,
     save_count: usize,
+    profiles: Vec<VersionedProfile>,
+    profile_saves: usize,
+    unknown_after_profile_save: bool,
+    unknown_after_default_save: bool,
 }
 
 impl MemorySettingsRepository {
@@ -62,6 +69,10 @@ impl MemorySettingsRepository {
                 revision: None,
                 next_revision: 1,
                 save_count: 0,
+                profiles: Vec::new(),
+                profile_saves: 0,
+                unknown_after_profile_save: false,
+                unknown_after_default_save: false,
             })),
         }
     }
@@ -139,28 +150,81 @@ impl ConfigurationRepository for MemorySettingsRepository {
 
 #[async_trait]
 impl ProfileRepository for MemorySettingsRepository {
-    /// 连接列表在设置面板 fixture 中保持空集合，避免接触机器上的本地主机资料。
+    /// 两种读取接口共用内存快照，确保测试与机器上的本地主机资料隔离。
     async fn list_profiles(&self) -> AppResult<Vec<kerminal_domain::preferences::TerminalProfile>> {
-        Ok(Vec::new())
+        Ok(self
+            .list_versioned_profiles()
+            .await?
+            .into_iter()
+            .map(|row| row.profile)
+            .collect())
     }
 
-    /// 设置页导航不需要 Profile 数据；返回空列表阻止测试携带主机配置。
+    /// 返回隔离仓储中的实际版本，供设置页和主机弹框共同读取。
     async fn list_versioned_profiles(&self) -> AppResult<Vec<VersionedProfile>> {
-        Ok(Vec::new())
+        Ok(self
+            .state
+            .lock()
+            .expect("settings state is not poisoned")
+            .profiles
+            .clone())
     }
 
-    /// 非 Profile 场景严禁读取具体主机记录，发现越界调用时立即失败。
-    async fn get_profile(&self, _id: &str) -> AppResult<Option<VersionedProfile>> {
-        Err(AppError::unsupported("设置 UI fixture 不读取 Profile"))
+    /// 按稳定 ID 查找同一个测试仓储，避免测试路径依赖另一份假数据。
+    async fn get_profile(&self, id: &str) -> AppResult<Option<VersionedProfile>> {
+        Ok(self
+            .state
+            .lock()
+            .expect("settings state is not poisoned")
+            .profiles
+            .iter()
+            .find(|row| row.profile.id == id)
+            .cloned())
     }
 
-    /// 设置 UI fixture 不允许编辑或保存主机配置。
+    /// 模拟新建和修改的 CAS，未知回执发生在真实内存快照更新之后。
     async fn save_profile(
         &self,
-        _draft: ProfileDraft,
-        _expected_revision: Option<ConfigRevision>,
+        draft: ProfileDraft,
+        expected_revision: Option<ConfigRevision>,
     ) -> AppResult<VersionedProfile> {
-        Err(AppError::unsupported("设置 UI fixture 不保存 Profile"))
+        let mut state = self.state.lock().expect("settings state is not poisoned");
+        let id = draft
+            .id
+            .clone()
+            .expect("profile editor supplies a stable ID");
+        let index = state.profiles.iter().position(|row| row.profile.id == id);
+        if index.map(|index| state.profiles[index].revision.clone()) != expected_revision {
+            return Err(AppError::conflict("Profile revision changed"));
+        }
+        let is_default = index.is_some_and(|index| state.profiles[index].profile.is_default);
+        state.next_revision += 1;
+        state.profile_saves += 1;
+        let row = VersionedProfile {
+            profile: kerminal_domain::preferences::TerminalProfile {
+                id,
+                name: draft.name,
+                shell: draft.shell,
+                args: draft.args,
+                cwd: draft.cwd,
+                env: draft.env,
+                is_default,
+                sidebar_group_id: draft.sidebar_group_id,
+                sort_order: draft.sort_order,
+                created_at: "test".into(),
+                updated_at: "test".into(),
+            },
+            revision: ConfigRevision::from_sha256(format!("profile-ui-{}", state.next_revision)),
+        };
+        if let Some(index) = index {
+            state.profiles[index] = row.clone();
+        } else {
+            state.profiles.push(row.clone());
+        }
+        if std::mem::take(&mut state.unknown_after_profile_save) {
+            return Err(AppError::outcome_unknown("Profile save outcome unknown"));
+        }
+        Ok(row)
     }
 
     /// 设置 UI fixture 不允许删除主机配置。
@@ -172,13 +236,38 @@ impl ProfileRepository for MemorySettingsRepository {
         Err(AppError::unsupported("设置 UI fixture 不删除 Profile"))
     }
 
-    /// 设置 UI fixture 不允许切换默认主机配置。
+    /// 对完整列表 revision 做 CAS，模拟成功后回执未知的可恢复事务。
     async fn set_default_profile(
         &self,
-        _id: &str,
-        _expected_revisions: Vec<ProfileRevision>,
+        id: &str,
+        expected_revisions: Vec<ProfileRevision>,
     ) -> AppResult<VersionedProfile> {
-        Err(AppError::unsupported("设置 UI fixture 不切换 Profile"))
+        let mut state = self.state.lock().expect("settings state is not poisoned");
+        if expected_revisions.len() != state.profiles.len()
+            || state.profiles.iter().any(|row| {
+                !expected_revisions.iter().any(|revision| {
+                    revision.profile_id == row.profile.id && revision.revision == row.revision
+                })
+            })
+        {
+            return Err(AppError::conflict("Profile revisions changed"));
+        }
+        if !state.profiles.iter().any(|row| row.profile.id == id) {
+            return Err(AppError::not_found("Profile missing"));
+        }
+        for row in &mut state.profiles {
+            row.profile.is_default = row.profile.id == id;
+        }
+        let row = state
+            .profiles
+            .iter()
+            .find(|row| row.profile.id == id)
+            .expect("validated profile")
+            .clone();
+        if std::mem::take(&mut state.unknown_after_default_save) {
+            return Err(AppError::outcome_unknown("Default profile outcome unknown"));
+        }
+        Ok(row)
     }
 }
 
@@ -205,6 +294,19 @@ fn fixture(
     MemorySettingsRepository,
     &mut VisualTestContext,
 ) {
+    fixture_with_mcp(app, None)
+}
+
+/// 运行态由测试显式注入，仍使用生产面板和真实按钮，避免触碰用户机器上的 MCP listener。
+fn fixture_with_mcp(
+    app: &mut TestAppContext,
+    mcp_runtime: Option<Arc<dyn kerminal_application::mcp_runtime::McpRuntimeControl>>,
+) -> (
+    Runtime,
+    Entity<PreferencesPanel>,
+    MemorySettingsRepository,
+    &mut VisualTestContext,
+) {
     app.update(crate::init);
     let runtime = Builder::new_current_thread()
         .enable_all()
@@ -222,8 +324,8 @@ fn fixture(
         configuration_changes: None,
         external_protocol: None,
         configuration_directory: None,
-        mcp_runtime_available: false,
-        mcp_runtime: None,
+        mcp_runtime_available: mcp_runtime.is_some(),
+        mcp_runtime,
         executor,
     };
     let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -459,10 +561,10 @@ fn assert_not_rendered(visual: &mut VisualTestContext, selector: &str) {
     );
 }
 
-/// 真实导航按钮依次挂载 main 的 11 个页面，各页都必须进入其内容滚动区域。
+/// 真实导航按钮依次挂载全部设置页面，Profile 与其它页面使用同一滚动区域。
 /// @author kongweiguang
 #[gpui_kit::test]
-fn production_navigation_opens_all_eleven_settings_pages(app: &mut TestAppContext) {
+fn production_navigation_opens_all_settings_pages(app: &mut TestAppContext) {
     let (_runtime, _panel, _repository, visual) = fixture(app);
     for (navigation, control) in [
         (
@@ -470,6 +572,7 @@ fn production_navigation_opens_all_eleven_settings_pages(app: &mut TestAppContex
             "settings-interface-language-select",
         ),
         ("preferences-nav-terminal", "terminal-scheme-light-kerminal"),
+        ("preferences-nav-profiles", "profile-create"),
         ("preferences-nav-keywords", "keyword-new"),
         ("preferences-nav-suggestions", "suggestions-enabled"),
         ("preferences-nav-sftp", "preferences-sftp-advanced"),
@@ -483,9 +586,137 @@ fn production_navigation_opens_all_eleven_settings_pages(app: &mut TestAppContex
         ),
         ("preferences-nav-about", "settings-about-github"),
     ] {
+        scroll_until_visible(visual, navigation, "preferences-navigation-viewport", -8.);
         click(visual, navigation);
         assert_rendered(visual, control);
     }
+}
+
+/// 用户经实际控件创建和修改同一 Profile，再切换默认项；服务读取必须观察到完整新值。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn profile_page_creates_edits_and_selects_the_shared_default(app: &mut TestAppContext) {
+    let (runtime, panel, repository, visual) = fixture(app);
+    click(visual, "preferences-nav-profiles");
+    click(visual, "profile-create");
+    click(visual, "profile-name-field");
+    visual.simulate_input("Test PowerShell");
+    click(visual, "profile-shell-field");
+    visual.simulate_input("pwsh.exe");
+    scroll_until_visible(
+        visual,
+        "profile-save",
+        "preferences-profile-form-scroll",
+        -8.,
+    );
+    click(visual, "profile-save");
+    pump_runtime(&runtime, visual);
+    let id = {
+        let state = repository.state.lock().expect("test repository");
+        assert_eq!(state.profiles.len(), 1);
+        assert_eq!(state.profiles[0].profile.shell, "pwsh.exe");
+        state.profiles[0].profile.id.clone()
+    };
+    scroll_until_visible(
+        visual,
+        "profile-set-default",
+        "preferences-profile-form-scroll",
+        -8.,
+    );
+    click(visual, "profile-set-default");
+    pump_runtime(&runtime, visual);
+    assert!(
+        repository.state.lock().expect("test repository").profiles[0]
+            .profile
+            .is_default
+    );
+
+    scroll_until_visible(
+        visual,
+        "profile-name-field",
+        "preferences-profile-form-scroll",
+        8.,
+    );
+    click(visual, "profile-name-field");
+    visual.simulate_keystrokes("secondary-a backspace");
+    visual.simulate_input("Updated PowerShell");
+    scroll_until_visible(
+        visual,
+        "profile-save",
+        "preferences-profile-form-scroll",
+        -8.,
+    );
+    click(visual, "profile-save");
+    pump_runtime(&runtime, visual);
+    let profiles = ProfileService::new(Arc::new(repository.clone()), Arc::new(TestDefaultShell));
+    let current = runtime
+        .block_on(profiles.get_profile(&id))
+        .expect("read Profile")
+        .expect("saved Profile");
+    assert_eq!(current.profile.name, "Updated PowerShell");
+    assert!(current.profile.is_default);
+    let target = runtime
+        .block_on(profiles.default_local_session_target())
+        .expect("resolve default");
+    assert_eq!(target.program, OsString::from("pwsh.exe"));
+    assert_eq!(
+        visual.update(|_, cx| panel.read(cx).selected_profile_id.clone()),
+        Some(id)
+    );
+}
+
+/// 未知保存回执须由用户触发读回；匹配时确认，不重放写入。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn profile_unknown_save_requires_matching_readback(app: &mut TestAppContext) {
+    let (runtime, panel, repository, visual) = fixture(app);
+    click(visual, "preferences-nav-profiles");
+    click(visual, "profile-create");
+    click(visual, "profile-name-field");
+    visual.simulate_input("Unknown result");
+    click(visual, "profile-shell-field");
+    visual.simulate_input("cmd.exe");
+    repository
+        .state
+        .lock()
+        .expect("test repository")
+        .unknown_after_profile_save = true;
+    scroll_until_visible(
+        visual,
+        "profile-save",
+        "preferences-profile-form-scroll",
+        -8.,
+    );
+    click(visual, "profile-save");
+    pump_runtime(&runtime, visual);
+    assert_eq!(
+        visual.update(|_, cx| panel
+            .read(cx)
+            .profile_draft
+            .as_ref()
+            .map(|draft| draft.status())),
+        Some(super::DraftStatus::OutcomeUnknown)
+    );
+    click(visual, "profile-reload");
+    pump_runtime(&runtime, visual);
+    assert_eq!(
+        visual.update(|_, cx| panel
+            .read(cx)
+            .profile_draft
+            .as_ref()
+            .map(|draft| draft.status())),
+        Some(super::DraftStatus::Ready)
+    );
+    assert_eq!(
+        repository
+            .state
+            .lock()
+            .expect("test repository")
+            .profile_saves,
+        1
+    );
 }
 
 /// 搜索输入保持当前正文；点选 SFTP 结果后切页、定位并清除过滤条件。
@@ -592,6 +823,154 @@ fn appearance_theme_click_is_applied_and_persisted(app: &mut TestAppContext) {
     let (persisted, saves) = repository.snapshot();
     assert!(saves >= 1, "the production save use case must be called");
     assert_eq!(persisted.theme_mode, super::ThemeMode::Light);
+}
+
+/// 连续选择应用色板保留最后一个草稿并通过真实保存端口写入，不改变已有终端配置。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn app_color_scheme_selection_autosaves_without_changing_terminal(app: &mut TestAppContext) {
+    use kerminal_application::preferences::AppColorScheme;
+
+    let (runtime, panel, repository, visual) = fixture(app);
+    let terminal_before = repository.snapshot().0.terminal;
+    for selector in ["app-color-fleet", "app-color-claude", "app-color-vscode"] {
+        scroll_target_fully_into_content_clip(visual, &panel, selector);
+        click(visual, selector);
+    }
+
+    assert_eq!(
+        visual.update(|_, cx| panel.read(cx).settings_snapshot().unwrap().app_color_scheme),
+        AppColorScheme::VsCode
+    );
+    pump_runtime(&runtime, visual);
+    let (saved, saves) = repository.snapshot();
+    assert!(saves >= 1);
+    assert_eq!(saved.app_color_scheme, AppColorScheme::VsCode);
+    assert_eq!(saved.terminal, terminal_before);
+}
+
+/// 在生产单选组内发送方向键，验证焦点导航会选择下一项并在末项循环到首项。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn app_color_scheme_keyboard_navigation_changes_selection(app: &mut TestAppContext) {
+    use kerminal_application::preferences::AppColorScheme;
+
+    let (_runtime, panel, _repository, visual) = fixture(app);
+    // Base 单选的 Space 在按键释放时提交；dispatch_keystroke 只产生按下，必须派发完整物理序列。
+    let press = |visual: &mut VisualTestContext, key: &str| {
+        let keystroke = gpui_kit::Keystroke::parse(key).unwrap();
+        visual.simulate_event(gpui_kit::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        visual.simulate_event(gpui_kit::KeyUpEvent { keystroke });
+        draw(visual);
+    };
+    let radio_focused = |visual: &mut VisualTestContext, name: &str| {
+        draw(visual);
+        visual.update(|window, _| {
+            gpui_kit::base::test_support::snapshots(window)
+                .iter()
+                .any(|snapshot| {
+                    snapshot.role() == Some(gpui_kit::Role::RadioButton)
+                        && snapshot.label().is_some_and(|label| label.ends_with(name))
+                        && snapshot.focused() == Some(true)
+                })
+        })
+    };
+
+    // 独立面板夹具没有窗口级初始焦点；先点击真实输入，再从其 dispatch path 走 Tab。
+    click(visual, "preferences-search");
+    // Radio 点击保留原焦点；只使用真实 Tab 路径进入目标单选项。
+    let mut reached_jetbrains = false;
+    for _ in 0..128 {
+        if radio_focused(visual, "JetBrains") {
+            reached_jetbrains = true;
+            break;
+        }
+        press(visual, "tab");
+    }
+    assert!(reached_jetbrains, "Tab must reach the JetBrains radio");
+    press(visual, "space");
+    draw(visual);
+    assert_eq!(
+        visual.update(|_, cx| panel.read(cx).settings_snapshot().unwrap().app_color_scheme),
+        AppColorScheme::JetBrains
+    );
+
+    press(visual, "right");
+    draw(visual);
+    assert!(radio_focused(visual, "Fleet"));
+    assert_eq!(
+        visual.update(|_, cx| panel.read(cx).settings_snapshot().unwrap().app_color_scheme),
+        AppColorScheme::Fleet
+    );
+
+    press(visual, "right");
+    press(visual, "right");
+    draw(visual);
+    assert!(radio_focused(visual, "Claude"));
+    assert_eq!(
+        visual.update(|_, cx| panel.read(cx).settings_snapshot().unwrap().app_color_scheme),
+        AppColorScheme::Claude
+    );
+
+    press(visual, "right");
+    draw(visual);
+    assert!(radio_focused(visual, "VS Code"));
+    assert_eq!(
+        visual.update(|_, cx| panel.read(cx).settings_snapshot().unwrap().app_color_scheme),
+        AppColorScheme::VsCode
+    );
+
+    press(visual, "right");
+    draw(visual);
+    assert!(radio_focused(visual, "Kerminal"));
+    assert_eq!(
+        visual.update(|_, cx| panel.read(cx).settings_snapshot().unwrap().app_color_scheme),
+        AppColorScheme::Kerminal
+    );
+
+    press(visual, "tab");
+    draw(visual);
+    assert!(radio_focused(visual, "JetBrains"));
+    press(visual, "space");
+    draw(visual);
+    assert_eq!(
+        visual.update(|_, cx| panel.read(cx).settings_snapshot().unwrap().app_color_scheme),
+        AppColorScheme::JetBrains
+    );
+}
+
+/// 缩略卡随设置正文的实际宽度换行，窄窗口和宽窗口都不能越过内容区两侧。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn app_color_scheme_choices_fit_the_settings_content_width(app: &mut TestAppContext) {
+    let (_runtime, panel, _repository, visual) = fixture(app);
+    for window_size in [size(px(720.), px(600.)), size(px(1440.), px(900.))] {
+        visual.simulate_resize(window_size);
+        draw(visual);
+        let clip = visual.update(|_, cx| panel.read(cx).content_scroll.bounds());
+        for selector in [
+            "app-color-kerminal",
+            "app-color-jetbrains",
+            "app-color-fleet",
+            "app-color-xcode",
+            "app-color-claude",
+            "app-color-vscode",
+        ] {
+            let bounds = target_geometry(visual, selector).0;
+            assert!(
+                bounds.left().to_f64() + 0.75 >= clip.left().to_f64()
+                    && bounds.right().to_f64() <= clip.right().to_f64() + 0.75,
+                "{selector} exceeds the content width at {window_size:?}: {bounds:?}, {clip:?}"
+            );
+        }
+    }
 }
 
 /// main 保留关闭背景后的配置入口；开关切换仍即时应用并写回真实设置端口。

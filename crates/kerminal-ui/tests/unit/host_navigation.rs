@@ -386,7 +386,8 @@ fn unfiltered_navigation_keeps_all_hosts_in_the_group_tree() {
     assert_eq!(filtered_hosts(&hosts, &groups, "production group").len(), 2);
 }
 
-/// 已删除分组的 Profile 归入未分组投影，且仍可被搜索和打开，避免数据被导航隐藏。
+/// 已删除分组的 Profile 归入未分组投影；菜单新建沿用相同归一化，不能发出悬空组 ID。
+/// @author kongweiguang
 #[test]
 fn profiles_with_missing_group_remain_in_ungrouped_navigation() {
     let profiles = vec![
@@ -416,6 +417,15 @@ fn profiles_with_missing_group_remain_in_ungrouped_navigation() {
         Some("orphaned")
     );
     assert!(profile_group_is_ungrouped(Some("group:deleted"), &groups));
+    assert_eq!(
+        super::effective_navigation_group(Some("group:deleted"), &groups),
+        None
+    );
+    assert_eq!(super::effective_navigation_group(None, &groups), None);
+    assert_eq!(
+        super::effective_navigation_group(Some("group:dev"), &groups).as_deref(),
+        Some("group:dev")
+    );
 }
 
 /// 本地主机和远程连接使用同一排序；并列名称有稳定类型顺序但身份仍各自保留。
@@ -721,3 +731,6 @@ fn live_session_projection_prefers_ready_then_opening() {
         HostSessionStatus::Failed
     );
 }
+
+#[path = "host_navigation_menus.rs"]
+mod host_navigation_menus;

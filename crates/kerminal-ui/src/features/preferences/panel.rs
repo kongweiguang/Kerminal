@@ -76,6 +76,8 @@ use forms::{set_input, set_textarea};
 /// 偏好页面只向根视图发出已保存主题和返回意图，不直接重配整个工作台。
 #[derive(Clone, Debug, PartialEq)]
 pub enum PreferencesEvent {
+    /// 确认 Profile 配置变化后刷新共享目录，不触碰已有终端会话。
+    ProfilesChanged,
     /// 首次读取完成后向根视图提供完整运行设置，覆盖异步构造后的订阅时序。
     SettingsLoaded(SettingsSnapshot),
     /// 有效输入立即投影到工作台，持久化确认独立于运行态预览。
@@ -465,6 +467,10 @@ pub struct PreferencesPanel {
     pub(super) selected_profile_id: Option<String>,
     pub(super) selected_profile_is_default: bool,
     pub(super) profile_operation_running: bool,
+    pub(super) profile_advanced_open: bool,
+    pub(super) profile_default_outcome_unknown: bool,
+    pub(super) profile_delete_outcome_unknown: bool,
+    pub(super) profile_unknown_readback: Option<Option<VersionedProfile>>,
     pub(super) section: PreferencesSection,
     pub(super) navigation_search: Entity<InputState>,
     pub(super) navigation_search_query: String,
@@ -511,6 +517,9 @@ pub struct PreferencesPanel {
     pub(super) loading_profiles: bool,
     settings_load_generation: u64,
     profiles_load_generation: u64,
+    profiles_watch_generation: u64,
+    profiles_watch_in_flight: bool,
+    profiles_watch_pending: bool,
     pub(super) settings_load_started: bool,
     pub(super) profiles_load_started: bool,
     pub(super) close_confirmation: bool,
@@ -697,6 +706,10 @@ impl PreferencesPanel {
             selected_profile_id: None,
             selected_profile_is_default: false,
             profile_operation_running: false,
+            profile_advanced_open: false,
+            profile_default_outcome_unknown: false,
+            profile_delete_outcome_unknown: false,
+            profile_unknown_readback: None,
             section: PreferencesSection::Appearance,
             navigation_search,
             navigation_search_query: String::new(),
@@ -740,6 +753,9 @@ impl PreferencesPanel {
             loading_profiles: false,
             settings_load_generation: 0,
             profiles_load_generation: 0,
+            profiles_watch_generation: 0,
+            profiles_watch_in_flight: false,
+            profiles_watch_pending: false,
             settings_load_started: false,
             profiles_load_started: false,
             close_confirmation: false,
@@ -857,6 +873,7 @@ impl PreferencesPanel {
         self.navigation_search_query.clear();
         self.selected_navigation_target = None;
         self.pending_navigation_search_scroll = None;
+        self.profile_advanced_open = false;
         set_input(&self.navigation_search, String::new(), window, cx);
         self.reset_page_disclosures();
         self.content_scroll.scroll_to_top_of_item(0);
@@ -989,8 +1006,13 @@ impl PreferencesPanel {
         self.settings_load_generation
     }
 
-    /// Profile 列表读取也绑定独立代次，连续 watcher 通知只接受最后一次快照。
+    /// 显式列表读取与 watcher 回执互斥；被取代的监听读回在加载完成后重新核对。
+    ///
+    /// @author kongweiguang
     fn begin_profile_load(&mut self) -> u64 {
+        self.profiles_watch_pending |= self.profiles_watch_in_flight;
+        self.profiles_watch_in_flight = false;
+        self.profiles_watch_generation = self.profiles_watch_generation.wrapping_add(1).max(1);
         self.profiles_load_generation = self.profiles_load_generation.wrapping_add(1).max(1);
         self.loading_profiles = true;
         self.profiles_load_generation
@@ -1063,7 +1085,10 @@ impl PreferencesPanel {
         self.refresh_settings_issues();
     }
 
-    /// 安全地加载 profile 行并保留当前选择；空列表呈现显式的新建操作而不捏造默认项。
+    /// 列表读回以稳定 ID 核对未知写入；不匹配时保留草稿，不能把任意列表快照当作成功。
+    /// 默认项与删除操作只需确认当前列表事实，且多个默认标记时继续阻止事务。
+    ///
+    /// @author kongweiguang
     fn finish_profile_load(
         &mut self,
         result: Result<Vec<VersionedProfile>, AppError>,
@@ -1078,6 +1103,68 @@ impl PreferencesPanel {
         match result {
             Ok(rows) => {
                 self.profile_list_error = None;
+                if self.profile_default_outcome_unknown {
+                    if rows.iter().filter(|row| row.profile.is_default).count() > 1 {
+                        self.profile_rows = rows;
+                        self.profile_list_error = Some(crate::locale::text(
+                            "读回发现多个默认 Profile；请修复配置后再次读取。",
+                            "The readback contains multiple default profiles. Repair the configuration and reload.",
+                        ).to_string());
+                        self.resume_deferred_profile_revision_check(cx);
+                        cx.notify();
+                        return;
+                    }
+                    self.profile_default_outcome_unknown = false;
+                    cx.emit(PreferencesEvent::ProfilesChanged);
+                    self.status = Some(crate::locale::text(
+                        "已核对当前默认项，原操作未被重试。",
+                        "The current default was verified; the original operation was not retried.",
+                    ).to_string());
+                } else if self.profile_delete_outcome_unknown {
+                    self.profile_delete_outcome_unknown = false;
+                    cx.emit(PreferencesEvent::ProfilesChanged);
+                    self.status = Some(
+                        crate::locale::text(
+                            "已核对 Profile 列表，原删除操作未被重试。",
+                            "The profile list was verified; the original delete was not retried.",
+                        )
+                        .to_string(),
+                    );
+                } else if let Some(submitted) = self.profile_draft.as_ref().and_then(|draft| {
+                    (draft.status() == super::DraftStatus::OutcomeUnknown)
+                        .then(|| draft.pending_save_value().cloned())
+                        .flatten()
+                }) {
+                    let readback = submitted
+                        .id
+                        .as_deref()
+                        .and_then(|id| rows.iter().find(|row| row.profile.id == id).cloned());
+                    if readback
+                        .as_ref()
+                        .is_some_and(|row| profile_to_draft(row.profile.clone()) == submitted)
+                    {
+                        self.selected_profile_id = submitted.id;
+                        cx.emit(PreferencesEvent::ProfilesChanged);
+                        self.profile_unknown_readback = None;
+                        self.status = Some(
+                            crate::locale::text(
+                                "已核对并确认 Profile 保存结果。",
+                                "The profile save was verified.",
+                            )
+                            .to_string(),
+                        );
+                    } else {
+                        self.profile_rows = rows;
+                        self.profile_unknown_readback = Some(readback);
+                        self.profile_list_error = Some(crate::locale::text(
+                            "读回内容与提交内容不同；请选择采用当前版本或保留草稿继续。",
+                            "The readback differs from the submitted profile. Use the current version or keep the draft.",
+                        ).to_string());
+                        self.resume_deferred_profile_revision_check(cx);
+                        cx.notify();
+                        return;
+                    }
+                }
                 let requested = self.selected_profile_id.clone();
                 let selected = requested
                     .as_deref()
@@ -1090,26 +1177,13 @@ impl PreferencesPanel {
                     self.install_profile(profile, window, cx);
                 } else {
                     self.selected_profile_id = None;
-                    self.reset_profile_form(
-                        ProfileDraft {
-                            id: None,
-                            name: String::new(),
-                            shell: String::new(),
-                            args: Vec::new(),
-                            cwd: None,
-                            env: BTreeMap::new(),
-                            sidebar_group_id: None,
-                            sort_order: 0,
-                        },
-                        None,
-                        false,
-                        window,
-                        cx,
-                    );
+                    self.profile_draft = None;
+                    self.selected_profile_is_default = false;
                 }
             }
             Err(error) => self.profile_list_error = Some(localized_error(&error)),
         }
+        self.resume_deferred_profile_revision_check(cx);
         cx.notify();
     }
 

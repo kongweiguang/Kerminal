@@ -27,13 +27,13 @@ use kerminal_application::{
     },
     operations::{
         CommandExecutionLimits, CommandExecutionTarget, CommandInvocation, CommandStreamEvent,
-        OperationsCommandExecutor,
+        ContainerStageCleanupRequest, OperationsCommandExecutor,
     },
     sessions::SessionTransport,
 };
 use kerminal_domain::{
     connections::{ConnectionCapabilities, RemoteProtocol},
-    identity::HostId,
+    identity::{HostId, TransferId},
 };
 use kerminal_infrastructure::operations::StructuredOperationsCommandExecutor;
 use tokio_util::sync::CancellationToken;
@@ -45,6 +45,49 @@ const EMIT_READY_ENV: &str = "KERMINAL_TEST_COMMAND_EXECUTOR_EMIT_READY";
 const EMIT_LOCK_ENV: &str = "KERMINAL_TEST_COMMAND_EXECUTOR_EMIT_LOCK";
 
 struct UnusedRemoteConnections;
+
+/// 预留 capability 的创建必须越过同步状态锁并到达命令连接边界，旧缺陷的卡线程不能挂住整个测试进程。
+///
+/// @author kongweiguang
+#[test]
+fn stage_creation_releases_phase_lock_before_connecting() {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create isolated runtime");
+        let code = runtime.block_on(async {
+            let executor =
+                StructuredOperationsCommandExecutor::new(Arc::new(UnusedRemoteConnections));
+            let capability = executor
+                .reserve_container_stage_cleanup(ContainerStageCleanupRequest {
+                    transfer_id: TransferId::new(),
+                    staging_endpoint: kerminal_domain::files::FileEndpoint::Container {
+                        host_id: Some(HostId::new()),
+                        runtime: kerminal_domain::files::ContainerRuntime::Docker,
+                        container_id: "isolated-fixture".to_owned(),
+                        path: kerminal_domain::files::RemotePath::parse_container(
+                            "/tmp/.kerminal-stage",
+                        )
+                        .expect("valid stage path"),
+                    },
+                })
+                .expect("reserve isolated staging capability");
+            capability
+                .create_stage_until(tokio::time::Instant::now() + Duration::from_secs(3))
+                .await
+                .expect_err("the unused connector must reject after the phase transition")
+                .public_code()
+        });
+        sender.send(code).expect("deliver executor result");
+    });
+    let code = receiver
+        .recv_timeout(Duration::from_secs(8))
+        .expect("stage creation must not block on its own phase lock");
+    thread.join().expect("isolated runtime exits");
+    assert_eq!(code, kerminal_application::PublicErrorCode::Unsupported);
+}
 
 #[async_trait]
 impl RemoteConnectionService for UnusedRemoteConnections {

@@ -2,7 +2,14 @@
 //!
 //! @author kongweiguang
 
-use std::{cell::RefCell, collections::BTreeMap, future::Future, pin::Pin, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 use gpui_kit::{AppContext as _, Context, Entity, TestAppContext, VisualTestContext, Window};
 use kerminal_application::{
@@ -154,7 +161,9 @@ impl HostManagementRepository for ReadOnlyHostDirectory {
     }
 }
 
-struct NoRemoteConnections;
+struct NoRemoteConnections {
+    preflight_fails: bool,
+}
 
 impl RemoteConnectionService for NoRemoteConnections {
     /// 本回归只操作表单，任何连接请求均代表越过测试边界。
@@ -172,7 +181,7 @@ impl RemoteConnectionService for NoRemoteConnections {
         panic!("表单关闭回归不得建立远程连接")
     }
 
-    /// 表单初始化与取消不需要读取服务器指纹。
+    /// 表单初始化与取消不需要读取服务器指纹；仅失败反馈回归允许一次确定的离线失败。
     /// @author kongweiguang
     fn inspect_host_key<'a, 'f>(
         &'a self,
@@ -184,6 +193,13 @@ impl RemoteConnectionService for NoRemoteConnections {
         'a: 'f,
         Self: 'f,
     {
+        if self.preflight_fails {
+            return Box::pin(async {
+                Err(kerminal_application::AppError::infrastructure(
+                    "SSH TCP connection failed",
+                ))
+            });
+        }
         panic!("表单关闭回归不得探测主机密钥")
     }
 
@@ -219,6 +235,7 @@ impl RemoteConnectionService for NoRemoteConnections {
 /// 仅延迟默认 Profile 的读取回执，测试可控制异步填充值与用户编辑之间的先后顺序。
 struct DelayedProfileDirectory {
     release_default: Arc<Semaphore>,
+    selected: Option<(Arc<Mutex<VersionedProfile>>, Arc<Semaphore>)>,
 }
 
 impl ProfileRepository for DelayedProfileDirectory {
@@ -239,25 +256,38 @@ impl ProfileRepository for DelayedProfileDirectory {
         })
     }
 
-    /// 注入服务会加载列表；空目录与默认目标读取独立，避免用户资料进入测试。
+    /// 可选提供同一内存 Profile，列表和按 ID 读取共享真实测试仓储。
     /// @author kongweiguang
     fn list_versioned_profiles<'a, 'f>(&'a self) -> PortFuture<'f, Vec<VersionedProfile>>
     where
         'a: 'f,
         Self: 'f,
     {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async {
+            Ok(self
+                .selected
+                .as_ref()
+                .map(|(profile, _)| vec![profile.lock().unwrap().clone()])
+                .unwrap_or_default())
+        })
     }
 
-    /// 当前场景只有新建草稿，不允许隐式读取已有 Profile。
+    /// 显式选择 Profile 时等待测试释放，再读取仓储最新值以验证迟到回执门禁。
     /// @author kongweiguang
-    fn get_profile<'a, 'b, 'f>(&'a self, _: &'b str) -> PortFuture<'f, Option<VersionedProfile>>
+    fn get_profile<'a, 'b, 'f>(&'a self, id: &'b str) -> PortFuture<'f, Option<VersionedProfile>>
     where
         'a: 'f,
         'b: 'f,
         Self: 'f,
     {
-        panic!("新建本地表单回归不得读取已有 Profile")
+        Box::pin(async move {
+            let Some((profile, release)) = &self.selected else {
+                panic!("未选择 Profile 时不得读取")
+            };
+            release.acquire().await.expect("Profile gate").forget();
+            let current = profile.lock().unwrap().clone();
+            Ok((current.profile.id == id).then_some(current))
+        })
     }
 
     /// 回执和关闭验证均不得触发持久化，防止隐式保存掩盖脏态。
@@ -336,6 +366,7 @@ fn delayed_profiles() -> (ProfileService, Arc<Semaphore>) {
     let service = ProfileService::new(
         Arc::new(DelayedProfileDirectory {
             release_default: release_default.clone(),
+            selected: None,
         }),
         Arc::new(NoPlatformShellFallback),
     );
@@ -373,7 +404,9 @@ fn fixture_with_profiles(
         let panel = cx.new(|cx| {
             let panel = ConnectionsPanel::new(
                 hosts,
-                Arc::new(NoRemoteConnections),
+                Arc::new(NoRemoteConnections {
+                    preflight_fails: false,
+                }),
                 None,
                 executor,
                 ConfigurationRecoveryState {
@@ -449,6 +482,48 @@ fn close_clean_editor(panel: &Entity<ConnectionsPanel>, visual: &mut VisualTestC
         assert!(!panel.editor_open());
         assert_eq!(panel.active_editor_kind, None);
     });
+}
+
+/// SFTP 的 SSH 副本必须是新的干净草稿，复用 endpoint 而不修改源主机或触发保存。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn duplicate_sftp_as_ssh_preserves_endpoint_without_modifying_source(app: &mut TestAppContext) {
+    let mut source = existing_host();
+    source.protocol = RemoteProtocol::Sftp;
+    let id = source.id.clone();
+    let (_runtime, panel, visual) = fixture(app, vec![source.clone()], Vec::new());
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.duplicate_saved_host_as_ssh(&id, window, cx);
+    });
+    visual.update(|_, app| {
+        let panel = panel.read(app);
+        let editor = panel.editor.as_ref().expect("SSH copy editor");
+        assert_eq!(editor.protocol, RemoteProtocol::Ssh);
+        assert!(
+            editor.original.is_none(),
+            "the copy must not own source credentials or revision"
+        );
+        assert_eq!(
+            editor.inputs.host.read(app).value().as_str(),
+            source.endpoint.host
+        );
+        assert_eq!(
+            editor.inputs.port.read(app).value().as_str(),
+            source.endpoint.port.to_string()
+        );
+        assert_eq!(panel.rows[0].protocol, RemoteProtocol::Sftp);
+    });
+    close_clean_editor(&panel, visual);
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.duplicate_saved_host(&id, window, cx);
+    });
+    visual.update(|_, app| {
+        assert_eq!(
+            panel.read(app).editor.as_ref().unwrap().protocol,
+            RemoteProtocol::Sftp
+        )
+    });
+    close_clean_editor(&panel, visual);
 }
 
 /// 五种新建协议在真实输入控件完成初始化后均应可直接关闭。
@@ -955,11 +1030,167 @@ fn late_local_defaults_preserve_user_inputs_and_dirty_close_guard(app: &mut Test
     });
 }
 
+/// 本地主机菜单读取共享 Profile；确认时重新按 ID 读取，并保留请求期间用户继续修改的字段。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn local_host_picker_applies_latest_shared_profile_without_losing_edits(app: &mut TestAppContext) {
+    let release_default = Arc::new(Semaphore::new(0));
+    let release_selected = Arc::new(Semaphore::new(0));
+    let mut profile = default_profile();
+    profile.id = "stored-profile".into();
+    profile.name = "Stored Profile".into();
+    profile.is_default = false;
+    let row = Arc::new(Mutex::new(VersionedProfile {
+        profile,
+        revision: ConfigRevision::from_sha256("stored-revision".into()),
+    }));
+    let profiles = ProfileService::new(
+        Arc::new(DelayedProfileDirectory {
+            release_default: release_default.clone(),
+            selected: Some((row.clone(), release_selected.clone())),
+        }),
+        Arc::new(NoPlatformShellFallback),
+    );
+    let (runtime, panel, visual) =
+        fixture_with_profiles(app, Vec::new(), Vec::new(), Some(profiles));
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.begin_create_local_host(None, window, cx)
+    });
+    pump_runtime(&runtime, visual);
+    let picker = visual.update(|window, _| {
+        gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .find(|node| {
+                node.path()
+                    .iter()
+                    .any(|id| id == &gpui_kit::ElementId::from("connections-local-shell-picker"))
+            })
+            .expect("local Shell picker")
+            .bounds()
+            .center()
+    });
+    visual.simulate_click(picker, Default::default());
+    draw(visual);
+    let item = visual.update(|window, _| {
+        gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .find(|node| {
+                node.visible()
+                    && node.role() == Some(gpui_kit::Role::MenuItem)
+                    && node.label() == Some("Stored Profile")
+            })
+            .expect("saved Profile appears in Shell menu")
+            .bounds()
+            .center()
+    });
+    visual.simulate_click(item, Default::default());
+    draw(visual);
+    row.lock().unwrap().profile.shell = "C:\\updated\\pwsh.exe".into();
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel
+            .local_hosts
+            .editor
+            .as_ref()
+            .unwrap()
+            .cwd
+            .update(cx, |input, cx| {
+                input.replace_all("C:\\user-change", window, cx)
+            });
+    });
+    release_selected.add_permits(1);
+    pump_runtime(&runtime, visual);
+    visual.update(|_, app| {
+        let editor = panel.read(app).local_hosts.editor.as_ref().unwrap();
+        assert_eq!(
+            editor.shell.read(app).value().as_str(),
+            "C:\\updated\\pwsh.exe"
+        );
+        assert_eq!(editor.cwd.read(app).value().as_str(), "C:\\user-change");
+        assert_eq!(editor.args.read(app).value().as_str(), "-NoLogo");
+        assert_eq!(editor.env.read(app).value().as_str(), "FIXTURE=profile");
+    });
+    release_default.add_permits(1);
+    pump_runtime(&runtime, visual);
+    visual.update(|_, app| {
+        assert_eq!(
+            panel
+                .read(app)
+                .local_hosts
+                .editor
+                .as_ref()
+                .unwrap()
+                .shell
+                .read(app)
+                .value()
+                .as_str(),
+            "C:\\updated\\pwsh.exe"
+        )
+    });
+}
+
 #[path = "connections_editor_interactions.rs"]
 mod interaction_tests;
+
+/// 容器续接意图复用正式连接取消边界；取消后的预检不探测网络，也不能留下可接受的旧 ID。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn sidebar_container_preflight_cancel_releases_intent(app: &mut TestAppContext) {
+    let host = existing_host();
+    let (runtime, panel, visual) = fixture(app, vec![host.clone()], Vec::new());
+    update_panel(&panel, visual, |panel, _, cx| {
+        assert!(panel.request_connect_host_for_container(&host.id, "container-a".into(), cx));
+        assert!(panel.sidebar_container_intent_is_current("container-a"));
+        panel.cancel_pending_trust(cx);
+        assert!(!panel.sidebar_container_intent_is_current("container-a"));
+        assert!(!panel.request_connect_host_for_container(&HostId::new(), "missing".into(), cx));
+    });
+    pump_runtime(&runtime, visual);
+    visual.update(|_, app| {
+        let panel = panel.read(app);
+        assert!(!panel.sidebar_container_intent_is_current("container-a"));
+        assert!(panel.pending_trust.is_none());
+    });
+}
 
 #[path = "connections_probe_lifecycle.rs"]
 mod probe_lifecycle_tests;
 
 #[path = "connections_editor_scroll.rs"]
 mod scroll_tests;
+
+/// 后台预检失败保留原请求的本地化恢复指引；取消与后续请求清理旧反馈。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn sidebar_container_preflight_failure_is_bound_to_its_request(app: &mut TestAppContext) {
+    let host = existing_host();
+    let (runtime, panel, visual) = fixture(app, vec![host.clone()], Vec::new());
+    update_panel(&panel, visual, |panel, _, cx| {
+        panel.remote = Arc::new(NoRemoteConnections {
+            preflight_fails: true,
+        });
+        assert!(panel.request_connect_host_for_container(&host.id, "failed-container".into(), cx));
+    });
+    pump_runtime(&runtime, visual);
+    update_panel(&panel, visual, |panel, _, cx| {
+        assert!(!panel.sidebar_container_intent_is_current("failed-container"));
+        assert_eq!(
+            panel.sidebar_container_failure("failed-container"),
+            panel.status.as_deref()
+        );
+        assert_eq!(
+            panel.sidebar_container_failure("failed-container"),
+            Some(crate::locale::text(
+                "无法连接 SSH 主机，请检查网络、地址和端口后重试。",
+                "Cannot connect to the SSH host. Check the network, address and port, then retry."
+            ).as_ref())
+        );
+        assert!(panel.sidebar_container_failure("other-container").is_none());
+        panel.cancel_pending_trust(cx);
+        assert!(
+            panel
+                .sidebar_container_failure("failed-container")
+                .is_none()
+        );
+    });
+}

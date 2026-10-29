@@ -3,8 +3,8 @@
 //! @author kongweiguang
 
 #[cfg(target_os = "linux")]
-use super::parse_nvidia_smi_gpus;
-use super::parse_windows_gpu_json;
+use super::gpu::parse_nvidia_smi_gpus;
+use super::gpu::parse_windows_gpu_json;
 
 /// 验证 NVIDIA CLI 的 MiB、百分比和温度字段按实际单位映射。
 #[cfg(target_os = "linux")]

@@ -19,12 +19,14 @@ use kerminal_application::{
         CommandStreamState, ContainerStageCleanupCapability, ContainerStageCleanupRequest,
         OperationsCommandExecutor, OperationsCommandStream, StageCreationResult,
     },
-    transfers::{TransferQueueOptions, TransferService},
+    preferences::settings::SftpPerformanceSettings,
+    transfers::{SftpTransferPolicyStore, TransferQueueOptions, TransferService},
 };
 use kerminal_domain::files::{
     ConflictPolicy, ContainerRuntime, FileEndpoint, TransferFailureKind, TransferKind,
     TransferRequest, TransferStatus,
 };
+use kerminal_infrastructure::files::JsonTransferRecoveryRepository;
 use kerminal_infrastructure::operations::ContainerTransferBackend;
 use tokio::{
     runtime::Handle,
@@ -42,6 +44,8 @@ struct ExecutorReceipts {
 
 struct IncompleteThenCompleteExecutor {
     receipts: Arc<ExecutorReceipts>,
+    execution_fails: bool,
+    download_stream: bool,
 }
 
 #[async_trait]
@@ -78,7 +82,9 @@ impl OperationsCommandExecutor for IncompleteThenCompleteExecutor {
                 .last()
                 .map(String::as_str)
                 .unwrap_or_default();
-            if path == "/workspace" {
+            if self.download_stream && path == "/workspace/payload.bin" {
+                (b"file\n3\n".to_vec(), 0)
+            } else if path == "/workspace" {
                 (b"directory\n".to_vec(), 0)
             } else {
                 (b"missing\n".to_vec(), 0)
@@ -104,7 +110,9 @@ impl OperationsCommandExecutor for IncompleteThenCompleteExecutor {
         cancellation: CancellationToken,
     ) -> AppResult<OperationsCommandStream> {
         let attempt = self.receipts.streams.fetch_add(1, Ordering::AcqRel);
-        let input_incomplete = attempt == 0;
+        let execution_fails = self.execution_fails && (!self.download_stream || attempt == 0);
+        let download_stream = self.download_stream;
+        let input_incomplete = attempt == 0 && !execution_fails;
         let (events_tx, events_rx) = mpsc::channel::<CommandStreamEvent>(8);
         let (input_tx, mut input_rx) = mpsc::channel::<CommandStreamInputMessage>(8);
         let (completion_tx, completion_rx) =
@@ -114,6 +122,36 @@ impl OperationsCommandExecutor for IncompleteThenCompleteExecutor {
         let stream_cancellation = cancellation.child_token();
         let worker_cancellation = stream_cancellation.child_token();
         tokio::spawn(async move {
+            if download_stream {
+                let mut builder = tar::Builder::new(Vec::new());
+                let mut header = tar::Header::new_gnu();
+                header.set_size(3);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, "payload.bin", &b"abc"[..])
+                    .expect("build valid download archive");
+                let archive = builder.into_inner().expect("finish download archive");
+                events_tx
+                    .send(CommandStreamEvent::Stdout(archive))
+                    .await
+                    .expect("send download archive");
+                drop(events_tx);
+                completion_tx.send_replace(CommandStreamState::Complete(CommandStreamCompletion {
+                    execution: if execution_fails {
+                        Err(AppError::infrastructure("测试下载命令结束回执失败"))
+                    } else {
+                        Ok(CommandStreamExit {
+                            exit_code: Some(0),
+                            stderr: Vec::new(),
+                            stderr_truncated: false,
+                            input_complete: true,
+                        })
+                    },
+                    cleanup: Ok(()),
+                }));
+                return;
+            }
             let mut input_complete = false;
             loop {
                 let message = tokio::select! {
@@ -141,12 +179,16 @@ impl OperationsCommandExecutor for IncompleteThenCompleteExecutor {
             }
             drop(events_tx);
             completion_tx.send_replace(CommandStreamState::Complete(CommandStreamCompletion {
-                execution: Ok(CommandStreamExit {
-                    exit_code: Some(0),
-                    stderr: Vec::new(),
-                    stderr_truncated: false,
-                    input_complete,
-                }),
+                execution: if execution_fails {
+                    Err(AppError::infrastructure("测试命令结束回执失败"))
+                } else {
+                    Ok(CommandStreamExit {
+                        exit_code: Some(0),
+                        stderr: Vec::new(),
+                        stderr_truncated: false,
+                        input_complete,
+                    })
+                },
                 cleanup: Ok(()),
             }));
         });
@@ -279,6 +321,8 @@ async fn incomplete_archive_input_requires_cleanup_before_explicit_retry() {
     let receipts = Arc::new(ExecutorReceipts::default());
     let executor = Arc::new(IncompleteThenCompleteExecutor {
         receipts: receipts.clone(),
+        execution_fails: false,
+        download_stream: false,
     });
     let backend = Arc::new(ContainerTransferBackend::new(executor));
     let backend: Arc<dyn kerminal_application::transfers::TransferBackend> = backend;
@@ -359,4 +403,210 @@ async fn incomplete_archive_input_requires_cleanup_before_explicit_retry() {
         .shutdown_until(Instant::now() + Duration::from_secs(5))
         .await
         .expect("close transfer workers");
+}
+
+/// 完整输入后命令结束回执失败仍须进入可重试清理，不能在同一 stream 锁内再次等待自己。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn stream_finish_failure_releases_stream_before_cleanup() {
+    let source_root = tempfile::tempdir().expect("create isolated source directory");
+    let source = source_root.path().join("payload.bin");
+    fs::write(&source, b"finish error regression").expect("write isolated source file");
+    let request = TransferRequest {
+        source: FileEndpoint::Local { path: source },
+        destination: FileEndpoint::Container {
+            host_id: None,
+            runtime: ContainerRuntime::Podman,
+            container_id: "kerminal-test-fixture".to_owned(),
+            path: kerminal_domain::files::RemotePath::parse_container("/workspace/payload.bin")
+                .expect("valid normalized endpoint"),
+        },
+        kind: TransferKind::File,
+        conflict_policy: ConflictPolicy::Overwrite,
+        idle_timeout_seconds: None,
+    };
+    let receipts = Arc::new(ExecutorReceipts::default());
+    let executor = Arc::new(IncompleteThenCompleteExecutor {
+        receipts: receipts.clone(),
+        execution_fails: true,
+        download_stream: false,
+    });
+    let backend: Arc<dyn kerminal_application::transfers::TransferBackend> =
+        Arc::new(ContainerTransferBackend::new(executor));
+    let transfers = TransferService::new(
+        vec![backend],
+        Handle::current(),
+        TransferQueueOptions::default(),
+    )
+    .expect("create transfer queue");
+
+    let task = transfers.enqueue(request).await.expect("enqueue upload");
+    let failed = wait_for_status(&transfers, &task.id, TransferStatus::Failed)
+        .await
+        .expect("finish failure reaches a terminal state");
+    assert_eq!(failed.status, TransferStatus::Failed);
+    assert!(
+        failed.cleanup_pending,
+        "failed staging cleanup remains owned"
+    );
+    assert_eq!(receipts.target_commits.load(Ordering::Acquire), 0);
+    transfers
+        .retry_cleanup_until(&task.id, Instant::now() + Duration::from_secs(3))
+        .await
+        .expect("retained staging cleanup can be retried");
+    assert!(!transfers.get(&task.id).await.unwrap().cleanup_pending);
+    transfers
+        .shutdown_until(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("failure path releases the transfer worker");
+}
+
+/// 下载完成解包后命令回执若失败，清理必须释放 stream 锁并移除本机 staging，不得提交目标。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn download_finish_failure_releases_stream_before_cleanup() {
+    let root = tempfile::tempdir().expect("create isolated destination directory");
+    let destination = root.path().join("destination.bin");
+    let request = TransferRequest {
+        source: FileEndpoint::Container {
+            host_id: None,
+            runtime: ContainerRuntime::Podman,
+            container_id: "kerminal-test-fixture".to_owned(),
+            path: kerminal_domain::files::RemotePath::parse_container("/workspace/payload.bin")
+                .expect("valid normalized endpoint"),
+        },
+        destination: FileEndpoint::Local {
+            path: destination.clone(),
+        },
+        kind: TransferKind::File,
+        conflict_policy: ConflictPolicy::Overwrite,
+        idle_timeout_seconds: None,
+    };
+    let receipts = Arc::new(ExecutorReceipts::default());
+    let executor = Arc::new(IncompleteThenCompleteExecutor {
+        receipts,
+        execution_fails: true,
+        download_stream: true,
+    });
+    let backend: Arc<dyn kerminal_application::transfers::TransferBackend> =
+        Arc::new(ContainerTransferBackend::new(executor));
+    let transfers = TransferService::new(
+        vec![backend],
+        Handle::current(),
+        TransferQueueOptions::default(),
+    )
+    .expect("create transfer queue");
+
+    let task = transfers.enqueue(request).await.expect("enqueue download");
+    let failed = wait_for_status(&transfers, &task.id, TransferStatus::Failed)
+        .await
+        .expect("finish failure reaches a terminal state");
+    assert_eq!(failed.status, TransferStatus::Failed);
+    assert!(!failed.cleanup_pending);
+    assert!(
+        !destination.exists(),
+        "unconfirmed download must not commit"
+    );
+    assert_eq!(
+        fs::read_dir(root.path()).unwrap().count(),
+        0,
+        "staging directory must be removed"
+    );
+    transfers
+        .shutdown_until(Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("failure path releases the transfer worker");
+}
+
+/// 与真实 JSON 恢复仓储联用时，规范化操作路径不得改变覆盖、改名或重试的原请求目标身份。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn download_preserves_requested_identity_for_recovery_and_retry() {
+    for (policy, retry) in [
+        (ConflictPolicy::Overwrite, false),
+        (ConflictPolicy::Rename, false),
+        (ConflictPolicy::Overwrite, true),
+    ] {
+        let root = tempfile::tempdir().expect("create isolated download root");
+        let directory = root.path().join("files");
+        let nested = directory.join("nested");
+        fs::create_dir_all(&nested).expect("create non-canonical parent path");
+        let requested = nested.join("..").join("destination.bin");
+        if policy == ConflictPolicy::Rename {
+            fs::write(&requested, b"existing").expect("occupy rename target");
+        }
+        let request = TransferRequest {
+            source: FileEndpoint::Container {
+                host_id: None,
+                runtime: ContainerRuntime::Podman,
+                container_id: "kerminal-test-fixture".to_owned(),
+                path: kerminal_domain::files::RemotePath::parse_container("/workspace/payload.bin")
+                    .expect("valid source"),
+            },
+            destination: FileEndpoint::Local {
+                path: requested.clone(),
+            },
+            kind: TransferKind::File,
+            conflict_policy: policy,
+            idle_timeout_seconds: None,
+        };
+        let executor = Arc::new(IncompleteThenCompleteExecutor {
+            receipts: Arc::new(ExecutorReceipts::default()),
+            execution_fails: retry,
+            download_stream: true,
+        });
+        let backend: Arc<dyn kerminal_application::transfers::TransferBackend> =
+            Arc::new(ContainerTransferBackend::new(executor));
+        let transfers = TransferService::new_with_recovery_repository(
+            vec![backend],
+            Handle::current(),
+            TransferQueueOptions::default(),
+            SftpTransferPolicyStore::new(SftpPerformanceSettings::default()).unwrap(),
+            Arc::new(JsonTransferRecoveryRepository::new(
+                root.path().join("config"),
+            )),
+            None,
+        )
+        .expect("create queue with persistent recovery");
+
+        let first = transfers.enqueue(request).await.expect("enqueue download");
+        let task_id = if retry {
+            let failed = wait_for_status(&transfers, &first.id, TransferStatus::Failed)
+                .await
+                .expect("first download reports controlled stream failure");
+            assert_eq!(failed.status, TransferStatus::Failed);
+            assert!(failed.retryable && !failed.cleanup_pending);
+            transfers
+                .retry(&first.id)
+                .await
+                .expect("retry original destination")
+                .id
+        } else {
+            first.id
+        };
+        let result = wait_for_status(&transfers, &task_id, TransferStatus::Succeeded)
+            .await
+            .expect("download reaches terminal state");
+        assert_eq!(result.status, TransferStatus::Succeeded, "{result:?}");
+        let expected = if policy == ConflictPolicy::Rename {
+            assert_eq!(fs::read(&requested).unwrap(), b"existing");
+            requested.with_file_name("destination (1).bin")
+        } else {
+            requested
+        };
+        assert_eq!(
+            result.actual_destination,
+            Some(FileEndpoint::Local {
+                path: expected.clone()
+            })
+        );
+        assert_eq!(fs::read(expected).unwrap(), b"abc");
+        transfers
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("release transfer queue");
+    }
 }

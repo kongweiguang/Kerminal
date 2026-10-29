@@ -25,6 +25,7 @@ use super::{
     BackgroundFit, InterfaceDensity, ThemeMode,
     panel::{PreferencesPanel, ShortcutBindingField, ShortcutInputs, keyboard_platform},
     render::settings_error_banner,
+    render_app_palette::app_color_scheme_choices,
     validate_settings,
 };
 
@@ -167,8 +168,8 @@ impl PreferencesPanel {
             })
     }
 
-    /// 按 main 的 viewport xl 断点切换外观卡片列数，窄窗纵向使用自然高度以保留滚动内容。
-    /// 背景开关仍只影响工作台绘制，所有修改继续进入同一 typed 草稿和既有保存门禁。
+    /// 外观面板沿用 main 的列分布，色板选项按其实际容器宽度换行并使用当前明暗预览。
+    /// 背景和应用色板分别进入同一 typed 草稿，继续服从已有保存与恢复门禁。
     ///
     /// @author kongweiguang
     pub(super) fn render_appearance(
@@ -333,6 +334,18 @@ impl PreferencesPanel {
                                 }),
                                 cx,
                             )),
+                        theme,
+                    ))
+                    .child(form_row(
+                        crate::locale::text("应用配色", "App color scheme"),
+                        app_color_scheme_choices(
+                            settings.app_color_scheme,
+                            mode,
+                            window.appearance(),
+                            controls_locked,
+                            theme,
+                            cx,
+                        ),
                         theme,
                     ))
                     .child(percentage_control(

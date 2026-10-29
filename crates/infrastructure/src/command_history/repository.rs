@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::{io, path::Path, sync::Arc};
+use std::{io, sync::Arc};
 
 use async_trait::async_trait;
 use kerminal_application::{
@@ -35,7 +35,6 @@ const MAX_LIMIT: usize = 500;
 pub struct SqliteCommandHistoryRepository {
     pub(super) inner: Option<Arc<SqliteCommandHistoryInner>>,
     pub(super) availability: CommandHistoryAvailability,
-    database_file: std::path::PathBuf,
 }
 
 #[async_trait]
@@ -90,25 +89,17 @@ impl CommandHistoryRepository for SqliteCommandHistoryRepository {
 }
 
 impl SqliteCommandHistoryRepository {
-    /// 返回专用数据库路径供 diagnostics 使用；该访问器放在字段定义模块，避免扩大字段可见性。
-    pub fn database_file(&self) -> &Path {
-        &self.database_file
-    }
-
     /// 接收共享配置存储协调器，确保迁移、备份与其它持久化事务共用文件锁。
     pub fn open(storage: StorageCoordinator) -> Result<Self, CommandHistoryInitError> {
-        let database_file = storage.root().join("data").join("command.sqlite");
         let inner = open_inner(storage)?;
         Ok(Self {
             inner: Some(inner),
             availability: CommandHistoryAvailability::Available,
-            database_file,
         })
     }
 
     /// 初始化失败时保留 typed unavailable 状态，使终端与其它桌面能力仍可运行。
     pub fn open_or_unavailable(storage: StorageCoordinator) -> Self {
-        let database_file = storage.root().join("data").join("command.sqlite");
         match Self::open(storage) {
             Ok(repository) => repository,
             Err(error) => Self {
@@ -116,7 +107,6 @@ impl SqliteCommandHistoryRepository {
                 availability: CommandHistoryAvailability::Unavailable {
                     reason: super::unavailable_reason(&error),
                 },
-                database_file,
             },
         }
     }

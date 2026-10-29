@@ -890,6 +890,94 @@ async fn powershell_integration_runs_multiline_script_in_current_shell() {
         .expect("close PowerShell process tree");
 }
 
+/// 显式使用 Store 应用别名而非测试进程 PATH 中的另一份 pwsh，覆盖真实默认 Profile 的启动路径。
+/// 缺少 Store 安装时明确跳过；已安装却不能加入受管进程树时必须失败，不能换成其它 shell。
+/// 交互执行后持有真实 child 的句柄，再关闭会话确认退出，避免“能启动但关不掉”的半修复。
+///
+/// @author kongweiguang
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_store_alias_opens_managed_interactive_session() {
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        eprintln!("SKIP: LOCALAPPDATA is unavailable");
+        return;
+    };
+    let alias = std::path::PathBuf::from(local_app_data).join("Microsoft/WindowsApps/pwsh.exe");
+    if !alias.exists() {
+        eprintln!("SKIP: Store PowerShell alias is not installed");
+        return;
+    }
+    let service = service();
+    let info = service
+        .create(CreateSessionRequest {
+            target: SessionTarget::Local(LocalSessionTarget {
+                program: alias.into_os_string(),
+                args: vec![OsString::from("-NoLogo"), OsString::from("-NoProfile")],
+                working_directory: None,
+                environment: BTreeMap::new(),
+            }),
+            owner: SessionOwner::Mcp,
+            size: TerminalSize::new(80, 24, 0, 0).expect("valid grid"),
+            initial_palette: None,
+        })
+        .await
+        .unwrap_or_else(|error| {
+            let mut source = std::error::Error::source(&error);
+            let mut code = None;
+            let mut stages = Vec::new();
+            while let Some(cause) = source {
+                stages.push(cause.to_string());
+                if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+                    code = error.raw_os_error();
+                }
+                source = cause.source();
+            }
+            panic!("Store PowerShell must start in managed ConPTY (os_error={code:?}, stages={stages:?})");
+        });
+    wait_for_shell_prompt(service.as_ref(), &info.session_id).await;
+    let process_id = service
+        .runtime_metadata(info.session_id.clone())
+        .await
+        .expect("Store PowerShell metadata")
+        .process_id
+        .expect("Store PowerShell exposes its actual process ID");
+    let process_handle = open_native_child_handle(process_id)
+        .expect("retain the real Store PowerShell handle before closing");
+    let outcome = service
+        .execute_shell_command(
+            ShellCommandRequest {
+                session_id: info.session_id.clone(),
+                expected_ui_binding: None,
+                command_id: "store-alias-smoke".into(),
+                command: "[Console]::WriteLine('STORE_ALIAS_READY')".into(),
+                timeout: Duration::from_secs(20),
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    service
+        .close(info.session_id)
+        .await
+        .expect("close Store PowerShell");
+    let exited = wait_for_native_exit_code(
+        &process_handle,
+        tokio::time::Instant::now() + Duration::from_secs(3),
+    )
+    .await
+    .expect("observe Store PowerShell exit by its retained handle");
+    assert!(
+        exited.is_some(),
+        "closing the session reaps Store PowerShell"
+    );
+    assert_eq!(
+        outcome.expect("execute command in Store PowerShell"),
+        ShellCommandOutcome::Finished {
+            command_id: "store-alias-smoke".into(),
+            exit_code: 0,
+        }
+    );
+}
+
 /// 验证不带 target PATH 覆盖时，provider PATH 原样继承，PowerShell 仅按启动规则前置 PSHOME。
 /// 探测禁用用户 profile 且无窗口运行，测试后代也不得打断开发者的桌面操作。
 ///

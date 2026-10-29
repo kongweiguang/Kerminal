@@ -51,7 +51,6 @@ toml.workspace = true
 toml_edit.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-zip.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

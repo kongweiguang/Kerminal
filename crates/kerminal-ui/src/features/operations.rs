@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use self::{
     forms::OperationsInputs,
     state::{
-        DirtyOperationTargets, LatestRequestState, SectionSelection, SectionState,
+        DirtyOperationTargets, LatestRequestState, SectionPhase, SectionSelection, SectionState,
         ServerInfoHistory, ServerInfoPanel,
     },
 };
@@ -59,6 +59,15 @@ pub use container_panel::{
     ContainerPanelContext, ContainerPanelUnavailableReason, ContainerReadKind,
 };
 pub use state::ContainerMutationRequest;
+
+/// 固定项必须等同宿主列表确认目标，失败与仍在读取分开返回给侧栏请求。
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SidebarContainerReveal {
+    Waiting,
+    Opened,
+    Unavailable,
+}
 
 /// Root 对当前 pane context 的结论；Unavailable 与 Absent 必须区分，前者禁止选主机回退。
 ///
@@ -1165,6 +1174,65 @@ impl OperationsView {
     /// @author kongweiguang
     pub fn container_panel_context(&self) -> Option<&ContainerPanelContext> {
         self.container_panel_context.as_ref()
+    }
+
+    /// 侧栏固定项只在当前宿主、运行时和最新列表同时匹配后进入详情，复用现有 live-context 读取门禁。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn reveal_sidebar_container(
+        &mut self,
+        expected: &ContainerPanelContext,
+        target: &ContainerTarget,
+        cx: &mut Context<Self>,
+    ) -> SidebarContainerReveal {
+        if !self.active || self.container_panel_context.as_ref() != Some(expected) {
+            return SidebarContainerReveal::Waiting;
+        }
+        let host_matches = match expected {
+            ContainerPanelContext::Host { host_id, .. } => host_id == &target.host_id,
+            ContainerPanelContext::WorkspaceHost { host_id, .. } => {
+                target.host_id.as_ref() == Some(host_id)
+            }
+            _ => false,
+        };
+        if !host_matches || target.host_id.is_none() {
+            return SidebarContainerReveal::Unavailable;
+        }
+        if self.runtime != target.runtime {
+            self.select_runtime(target.runtime, cx);
+            return SidebarContainerReveal::Waiting;
+        }
+        if self.container_host.set_include_stopped(true) {
+            self.load_containers(cx);
+            return SidebarContainerReveal::Waiting;
+        }
+        match self.containers.phase() {
+            SectionPhase::NotLoaded | SectionPhase::Loading => SidebarContainerReveal::Waiting,
+            SectionPhase::Failed | SectionPhase::Cancelled => SidebarContainerReveal::Unavailable,
+            SectionPhase::Ready => {
+                if !self
+                    .containers
+                    .data()
+                    .is_some_and(|rows| rows.iter().any(|row| row.target == *target))
+                {
+                    return SidebarContainerReveal::Unavailable;
+                }
+                self.container_host.select_container_for_inspection(
+                    target.clone(),
+                    Some(render::container_panel::HostContainerTab::Details),
+                );
+                self.container_info_tab = ContainerReadKind::Inspect;
+                let ticket = self.container_action_ticket(Some(target.clone()));
+                self.request_container_read(
+                    target.clone(),
+                    ContainerReadKind::Inspect,
+                    &ticket,
+                    cx,
+                );
+                cx.notify();
+                SidebarContainerReveal::Opened
+            }
+        }
     }
 
     /// 将不再可见目标的最新回执有界保存；相同 Host/runtime 的旧反馈由新回执覆盖。

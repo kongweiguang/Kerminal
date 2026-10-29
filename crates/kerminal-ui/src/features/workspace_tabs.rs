@@ -898,6 +898,7 @@ impl WorkspaceTabs {
     }
 
     /// 右键 popover 的受控状态由标签栏 owner 管理；关闭清空旧查询，重开时始终从完整目录开始。
+    /// 焦点由 Popover 在真实开关时统一转移，避免键盘打开前先聚焦搜索框而丢失返回触发器的基线。
     ///
     /// @author kongweiguang
     pub(super) fn set_create_target_picker_open(
@@ -919,9 +920,6 @@ impl WorkspaceTabs {
         if let Some(input) = input {
             input.update(cx, |input, cx| {
                 input.set_value(String::new(), window, cx);
-                if open {
-                    input.focus(window, cx);
-                }
             });
         }
         cx.notify();

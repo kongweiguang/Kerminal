@@ -6,6 +6,7 @@ mod color_picker;
 mod draft;
 mod panel;
 mod render;
+mod render_app_palette;
 mod render_command_suggestions;
 mod render_connectivity;
 mod render_desktop_about;

@@ -30,6 +30,28 @@ enum Candidate {
     NotFound,
 }
 
+/// 按系统 reparse tag 识别应用执行别名，避免把所有 WindowsApps 路径或零字节文件误作 Store 入口。
+/// 输入是 cmdline 已解析、以 NUL 结尾的完整 exe；只查文件元数据，不展开或替换用户选定的程序。
+///
+/// @author kongweiguang
+pub(crate) fn is_app_execution_alias(exe: &[u16]) -> io::Result<bool> {
+    use winapi::um::fileapi::{FindClose, FindFirstFileW};
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::minwinbase::WIN32_FIND_DATAW;
+    use winapi::um::winnt::{FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_APPEXECLINK};
+
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    // SAFETY: cmdline supplies a NUL-terminated path; data is initialized and writable.
+    let search = unsafe { FindFirstFileW(exe.as_ptr(), &mut data) };
+    if search == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: this function owns the successful search handle and closes it exactly once.
+    unsafe { FindClose(search) };
+    Ok(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && data.dwReserved0 == IO_REPARSE_TAG_APPEXECLINK)
+}
+
 /// Resolves a command in PATH-directory then PATHEXT order without skipping a selected batch shim.
 ///
 /// An extensionless shebang file is not a Windows process image, so it is skipped while searching

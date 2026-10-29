@@ -1,4 +1,4 @@
-//! RMCP handler、冻结工具目录与具名用例路由。
+//! RMCP handler、按场景收敛的工具目录与具名用例路由。
 //!
 //! @author kongweiguang
 
@@ -21,8 +21,8 @@ use tokio_util::{sync::CancellationToken, task::task_tracker::TaskTrackerToken};
 use kerminal_domain::identity::AgentSessionId;
 
 use crate::{
-    McpServices, agent_tools, config_tools, diagnostics_tools, files_tools, guides_tools,
-    history_tools, operations_tools, ssh_tools, terminal_tools,
+    McpServices, agent_tools, config_tools, files_tools, guides_tools, history_tools,
+    port_forward_tools, ssh_tools, terminal_tools,
 };
 
 const TOOL_PAGE_SIZE: usize = 50;
@@ -39,6 +39,7 @@ struct ToolDefinition {
     annotations: CatalogAnnotations,
     enabled: bool,
     exposed_to_mcp: bool,
+    agent_scoped: bool,
     input_schema: Map<String, Value>,
 }
 
@@ -58,7 +59,7 @@ struct CatalogFixture {
     tools: Vec<ToolDefinition>,
 }
 
-/// 解析并缓存仓库内固定的 v0.3.45 契约，不读取用户配置或远程服务内容。
+/// 缓存固定核心目录，仅按当前 endpoint 的 Agent 上下文增加会话入口。
 fn frozen_catalog() -> &'static CatalogFixture {
     static CATALOG: OnceLock<CatalogFixture> = OnceLock::new();
     CATALOG.get_or_init(|| {
@@ -67,12 +68,12 @@ fn frozen_catalog() -> &'static CatalogFixture {
     })
 }
 
-/// 将 69 个受支持公开工具完整投影为 RMCP 类型，保持分页、schema 和安全注解的稳定性。
-fn tool_definitions() -> Vec<Tool> {
+/// 目录与调用门禁共用选择规则，避免隐藏工具仍可通过猜测名称执行。
+fn tool_definitions(services: &McpServices) -> Vec<Tool> {
     frozen_catalog()
         .tools
         .iter()
-        .filter(|definition| definition.enabled && definition.exposed_to_mcp)
+        .filter(|definition| tool_is_visible(definition, services))
         .map(|definition| {
             let _category = &definition.category;
             Tool::new(
@@ -92,18 +93,19 @@ fn tool_definitions() -> Vec<Tool> {
         .collect()
 }
 
-/// 返回供 discovery/help 复用的兼容目录投影，schema 与注解均来自同一冻结条目。
-pub(crate) fn tool_catalog_entries() -> Vec<Value> {
+/// 帮助仅描述当前 endpoint 可调用的工具，元数据与 tools/list 复用同一选择规则。
+pub(crate) fn tool_catalog_entries(services: &McpServices) -> Vec<Value> {
     frozen_catalog()
         .tools
         .iter()
-        .filter(|definition| definition.enabled && definition.exposed_to_mcp)
+        .filter(|definition| tool_is_visible(definition, services))
         .map(|definition| {
             json!({
                 "toolId": definition.name.as_str(),
                 "title": definition.title.as_str(),
                 "description": definition.description.as_str(),
                 "category": definition.category.as_str(),
+                "agentScoped": definition.agent_scoped,
                 "family": tool_family(&definition.name),
                 "inputSchema": &definition.input_schema,
                 "annotations": {
@@ -120,60 +122,17 @@ pub(crate) fn tool_catalog_entries() -> Vec<Value> {
 /// 以公开前缀归并工具族，令 help 和 guide 对外呈现同一套可发现名称。
 pub(crate) fn tool_family(tool_id: &str) -> &'static str {
     match tool_id {
-        "kerminal.capabilities"
-        | "kerminal.app_guide"
-        | "kerminal.config_guide"
-        | "kerminal.tool_help"
-        | "kerminal.operation_guide"
-        | "kerminal.runtime_snapshot" => "discovery",
-        "kerminal.agent.current_session"
-        | "kerminal.agent.target_context"
-        | "terminal.resolve_agent_target" => "agent-session",
+        "kerminal.help" | "kerminal.runtime_snapshot" => "discovery",
+        "kerminal.agent.target_context" => "agent-session",
         "kerminal.config.validate" => "config",
         "kerminal.host.upsert_with_credential" | "kerminal.vault.encrypt_secret" => "credentials",
-        "ssh.command" | "ssh.command_on_resolved_host" => "ssh",
-        "sftp.list"
-        | "sftp.rename"
-        | "sftp.move"
-        | "sftp.preview"
-        | "sftp.delete"
-        | "sftp.create_directory"
-        | "sftp.chmod"
-        | "sftp.transfer.enqueue"
+        "ssh.command" => "ssh",
+        "sftp.transfer.enqueue"
         | "sftp.transfer.list"
         | "sftp.transfer.cancel"
-        | "sftp.transfer.retry"
-        | "sftp.transfer.clear_completed" => "sftp",
-        "server_info.snapshot" => "server-info",
+        | "sftp.transfer.retry" => "sftp",
         "port_forward.create" | "port_forward.list" | "port_forward.close" => "port-forward",
-        "container.list"
-        | "container.inspect"
-        | "container.logs.tail"
-        | "container.stats"
-        | "container.start"
-        | "container.stop"
-        | "container.restart"
-        | "container.remove"
-        | "container.files.list"
-        | "container.files.preview"
-        | "container.files.write_text"
-        | "container.files.create_directory"
-        | "container.files.rename"
-        | "container.files.chmod"
-        | "container.files.upload"
-        | "container.files.download"
-        | "container.files.delete" => "container",
-        "tmux.probe"
-        | "tmux.list_sessions"
-        | "tmux.create_session"
-        | "tmux.rename_session"
-        | "tmux.kill_session"
-        | "tmux.list_windows"
-        | "tmux.list_panes"
-        | "tmux.capture_pane"
-        | "tmux.attach_plan" => "tmux",
         "history.search" => "history",
-        "diagnostics.runtime_health" | "diagnostics.create_bundle" => "diagnostics",
         _ => "terminal",
     }
 }
@@ -212,10 +171,10 @@ impl ServerHandler for KerminalMcpHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let tool_id = request.name.to_string();
-        if !is_catalog_tool(&tool_id) {
+        let services = self.scoped_services(&context);
+        if !is_catalog_tool(&tool_id, &services) {
             return Err(unknown_tool(&tool_id));
         }
-        let services = self.scoped_services(&context);
         let arguments = request.arguments.unwrap_or_default();
         let request_cancellation = context.ct.clone();
         let request_services = services.clone();
@@ -228,11 +187,11 @@ impl ServerHandler for KerminalMcpHandler {
         Ok(output)
     }
 
-    /// 按 RMCP cursor 返回冻结工具目录的固定大小页面，保持全部公开能力可发现。
+    /// 按 endpoint 的真实暴露集合分页，Agent 上下文工具只在会话 endpoint 出现。
     async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let offset = request
             .as_ref()
@@ -241,7 +200,7 @@ impl ServerHandler for KerminalMcpHandler {
             .transpose()
             .map_err(|_| invalid_cursor("Invalid tool pagination cursor"))?
             .unwrap_or(0);
-        let all_tools = tool_definitions();
+        let all_tools = tool_definitions(&self.scoped_services(&context));
         if offset > all_tools.len() {
             return Err(invalid_cursor("Tool pagination cursor is out of range"));
         }
@@ -280,12 +239,7 @@ async fn dispatch_tool(
     cancellation: CancellationToken,
 ) -> CallToolResult {
     match tool_id {
-        "kerminal.capabilities"
-        | "kerminal.app_guide"
-        | "kerminal.config_guide"
-        | "kerminal.tool_help"
-        | "kerminal.operation_guide"
-        | "kerminal.runtime_snapshot" => {
+        "kerminal.help" | "kerminal.runtime_snapshot" => {
             guides_tools::dispatch(tool_id, services, arguments, cancellation).await
         }
         "kerminal.config.validate" => {
@@ -294,79 +248,27 @@ async fn dispatch_tool(
         "terminal.create" => terminal_tools::create(services, arguments, cancellation).await,
         "terminal.write" => terminal_tools::write(services, arguments, cancellation).await,
         "terminal.snapshot" => terminal_tools::snapshot(services, arguments, cancellation).await,
-        "terminal.resolve_agent_target" => {
-            agent_tools::resolve_target(services, arguments, cancellation).await
-        }
-        "kerminal.agent.current_session" => {
-            agent_tools::current_session(services, arguments, cancellation).await
-        }
         "kerminal.agent.target_context" => {
             agent_tools::target_context(services, arguments, cancellation).await
         }
         "terminal.resize" => terminal_tools::resize(services, arguments, cancellation).await,
         "terminal.list" => terminal_tools::list(services, arguments, cancellation).await,
-        "terminal.reconnect" => terminal_tools::reconnect(services, arguments, cancellation).await,
         "terminal.close" => terminal_tools::close(services, arguments, cancellation).await,
-        "terminal.log.start" | "terminal.log.stop" | "terminal.log.state" => {
-            terminal_tools::log(tool_id, services, arguments, cancellation).await
-        }
         "kerminal.host.upsert_with_credential" | "kerminal.vault.encrypt_secret" => {
             crate::credentials_tools::dispatch(tool_id, services, arguments, cancellation).await
         }
-        "ssh.command" | "ssh.command_on_resolved_host" => {
-            ssh_tools::dispatch(tool_id, services, arguments, cancellation).await
-        }
-        "sftp.list"
-        | "sftp.rename"
-        | "sftp.move"
-        | "sftp.preview"
-        | "sftp.delete"
-        | "sftp.create_directory"
-        | "sftp.chmod"
-        | "sftp.transfer.enqueue"
+        "ssh.command" => ssh_tools::dispatch(tool_id, services, arguments, cancellation).await,
+        "sftp.transfer.enqueue"
         | "sftp.transfer.list"
         | "sftp.transfer.cancel"
-        | "sftp.transfer.retry"
-        | "sftp.transfer.clear_completed" => {
+        | "sftp.transfer.retry" => {
             files_tools::dispatch(tool_id, services, arguments, cancellation).await
         }
-        "server_info.snapshot"
-        | "port_forward.create"
-        | "port_forward.list"
-        | "port_forward.close"
-        | "container.list"
-        | "container.inspect"
-        | "container.logs.tail"
-        | "container.stats"
-        | "container.start"
-        | "container.stop"
-        | "container.restart"
-        | "container.remove"
-        | "container.files.list"
-        | "container.files.preview"
-        | "container.files.write_text"
-        | "container.files.create_directory"
-        | "container.files.rename"
-        | "container.files.chmod"
-        | "container.files.upload"
-        | "container.files.download"
-        | "container.files.delete"
-        | "tmux.probe"
-        | "tmux.list_sessions"
-        | "tmux.create_session"
-        | "tmux.rename_session"
-        | "tmux.kill_session"
-        | "tmux.list_windows"
-        | "tmux.list_panes"
-        | "tmux.capture_pane"
-        | "tmux.attach_plan" => {
-            operations_tools::dispatch(tool_id, services, arguments, cancellation).await
+        "port_forward.create" | "port_forward.list" | "port_forward.close" => {
+            port_forward_tools::dispatch(tool_id, services, arguments, cancellation).await
         }
         "history.search" => {
             history_tools::dispatch(tool_id, services, arguments, cancellation).await
-        }
-        "diagnostics.runtime_health" | "diagnostics.create_bundle" => {
-            diagnostics_tools::dispatch(tool_id, services, arguments, cancellation).await
         }
         _ => terminal_tools::failure(kerminal_application::AppError::unsupported(
             "MCP tool handler is not connected",
@@ -374,11 +276,19 @@ async fn dispatch_tool(
     }
 }
 
-/// 判断 toolId 是否属于冻结的公开工具目录，避免未知请求进入工具执行 envelope。
-fn is_catalog_tool(tool_id: &str) -> bool {
-    frozen_catalog().tools.iter().any(|definition| {
-        definition.enabled && definition.exposed_to_mcp && definition.name == tool_id
-    })
+/// 固定目录只区分全局核心与会话上下文，不再保留可重新启用的工具组。
+fn tool_is_visible(definition: &ToolDefinition, services: &McpServices) -> bool {
+    definition.enabled
+        && definition.exposed_to_mcp
+        && (!definition.agent_scoped || services.agent_scope.is_some())
+}
+
+/// 调用与发现共用固定目录；已删除工具及全局 endpoint 的会话入口均不能猜名调用。
+fn is_catalog_tool(tool_id: &str, services: &McpServices) -> bool {
+    frozen_catalog()
+        .tools
+        .iter()
+        .any(|definition| definition.name == tool_id && tool_is_visible(definition, services))
 }
 
 /// 未知 MCP method 使用协议级 METHOD_NOT_FOUND，不伪装成业务执行错误。

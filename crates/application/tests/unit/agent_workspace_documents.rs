@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-use super::codex_config;
+use super::{agent_instructions, codex_config};
 
 struct CodexConfigRepository {
     session_id: AgentSessionId,
@@ -134,6 +134,21 @@ fn codex_session() -> AgentSession {
         None,
     )
     .expect("测试会话应满足领域不变量")
+}
+
+/// 外部 Agent 新会话应发现实际保留的 SSH、传输和显式终端入口，不能被引导调用旧容器工具。
+///
+/// @author kongweiguang
+#[test]
+fn agent_instructions_reference_the_retained_runtime_tools() {
+    let session = codex_session();
+    let instructions = agent_instructions(&session, "http://127.0.0.1:37657/mcp/agents/test");
+    assert!(instructions.contains("`ssh.command`"));
+    assert!(instructions.contains("`sftp.transfer.enqueue`"));
+    assert!(instructions.contains("`sftp.transfer.list`"));
+    assert!(instructions.contains("`terminal.create`"));
+    assert!(!instructions.contains("`container.files."));
+    assert!(!instructions.contains("`tmux."));
 }
 
 /// 真实 patch 应只更新 Kerminal 管理字段，保留注释、其他 server 和未知扩展键。

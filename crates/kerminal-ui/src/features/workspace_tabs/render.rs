@@ -1046,6 +1046,8 @@ impl Render for WorkspaceTabs {
     /// 方向键/Home/End只在当前可见标签间移动焦点，并且仅显式移动时依真实 bounds 最小滚动；普通重绘保留手动位置。
     /// 拖拽边缘滚动由单个短间隔任务维持，松手、取消、失焦或源失效即退出。
     /// 加号单击发布本地新建意图，右键菜单在打开时读取左栏同源主机快照并保留分组。
+    /// 加号消费左键按下和点击，防止 Windows 标题栏默认处理接管按下、丢失后续释放；右键仍交给 Popover。
+    /// Enter/空格确认与左键共用本地新建意图；上下文菜单键与 Shift+F10 才打开主机选择器。
     /// 列表打开时读取完整投影，折叠组和屏外标签仍可按稳定 ID 激活，长列表沿用原生菜单滚动。
     /// Kit Input 没有 description builder，完整错误仍并入可访问名称和保存按钮提示。
     /// 空白未分组区域只在活动拖拽时扩张到组列末尾剩余空间；静止布局不显示独立未分组标题。
@@ -1400,8 +1402,27 @@ impl Render for WorkspaceTabs {
                         "Click to open a local terminal; right-click to choose a host",
                     ))
                     .tab_stop(true)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_action(cx.listener(
+                        |_, _: &gpui_kit::base::actions::Confirm, window, cx| {
+                            window.prevent_default();
+                            cx.emit(WorkspaceTabsCreateEvent::Local);
+                            cx.stop_propagation();
+                        },
+                    ))
+                    .on_key_down(cx.listener(|tabs, event: &KeyDownEvent, window, cx| {
+                        let stroke = &event.keystroke;
+                        let opens_picker = stroke.key.eq_ignore_ascii_case("contextmenu")
+                            || (stroke.key.eq_ignore_ascii_case("f10") && stroke.modifiers.shift);
+                        if opens_picker && !event.is_held {
+                            tabs.set_create_target_picker_open(true, window, cx);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        }
+                    }))
                     .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
                         cx.emit(WorkspaceTabsCreateEvent::Local);
+                        cx.stop_propagation();
                     })),
                 mouse_button: MouseButton::Right,
                 open: self.create_target_picker_open,

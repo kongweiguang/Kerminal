@@ -369,7 +369,7 @@ fn ensure_toml_table<'a>(parent: &'a mut Table, key: &str) -> AppResult<&'a mut 
         .ok_or_else(|| AppError::configuration_corrupt("Codex config.toml"))
 }
 
-/// 为所有 provider 写入 Kerminal Agent 工作规则，完整权限和审批由 Agent/MCP host 决定。
+/// 所有 provider 使用唯一 live 上下文入口与保留的运行态工具；审批仍由 host 决定。
 fn agent_instructions(session: &AgentSession, endpoint: &str) -> String {
     let id = session.agent_session_id.as_str();
     format!(
@@ -378,9 +378,11 @@ fn agent_instructions(session: &AgentSession, endpoint: &str) -> String {
 
 - This session has global Kerminal runtime access. Its preferred terminal is context only, not an authorization boundary.
 - Before using Kerminal, read `session.toml` and `context/mcp-endpoint.json`, `context/target-binding.json`, `context/terminal-snapshot.json`, and `context/workspace-snapshot.json`.
-- Refresh live state with `kerminal.agent.current_session` and `kerminal.agent.target_context`, passing `agentSessionId = "{id}"`.
+- Refresh live state with `kerminal.agent.target_context`, passing `agentSessionId = "{id}"`.
+- Use `kerminal.help` for tool discovery; `topic = "config"` returns configuration rules.
 - The session endpoint is `{endpoint}`. Use its MCP tools directly; the MCP host owns approval and audit policy.
 - External MCP defaults to background execution. A visible Tab is never required. When a preferred target is stale or missing, report that state and do not substitute another terminal.
+- Run non-interactive server commands with `ssh.command`. For local/remote file transfers use `sftp.transfer.enqueue`, then query `sftp.transfer.list` until completion. Container and tmux commands use `ssh.command`; their former dedicated MCP tools are unavailable.
 - For a new interactive shell, call `terminal.create`, then use its explicit `sessionId` for read/write and close it after the task. For target-bound work, refresh `kerminal.agent.target_context` first; ordinary Tab changes do not rebind this session.
 - Keep custom text outside the managed block below; Kerminal updates only this marked block.
 {BLOCK_END}
@@ -388,7 +390,7 @@ fn agent_instructions(session: &AgentSession, endpoint: &str) -> String {
     )
 }
 
-/// 为 Claude 提供 provider 入口并保持 Agent 规则由同一 AGENTS.md 提供。
+/// Claude 复用同一目标上下文规则，避免 provider 文档保留已移除工具造成循环重试。
 fn claude_instructions(endpoint: &str) -> String {
     format!(
         r#"{BLOCK_START}
@@ -396,7 +398,7 @@ fn claude_instructions(endpoint: &str) -> String {
 
 ## Claude Code
 
-- Follow `AGENTS.md` and refresh the live target with `kerminal.agent.current_session` / `kerminal.agent.target_context` before using a preferred terminal.
+- Follow `AGENTS.md` and refresh the live target with `kerminal.agent.target_context` before using a preferred terminal.
 - MCP host policy owns confirmation, approval, permissions, hooks, and audit. Kerminal adds no second prompt.
 - Use the session scoped Kerminal endpoint `{endpoint}`. A stale preferred target never falls back to another Tab.
 {BLOCK_END}

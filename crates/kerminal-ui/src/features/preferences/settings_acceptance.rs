@@ -6,7 +6,40 @@ use super::DraftStatus;
 use super::panel::{PreferencesPanel, PreferencesSection};
 use gpui_kit::{App, FocusHandle, Focusable as _};
 
+/// 仅供隔离原生验收读取的 Profile 状态，不提供修改入口。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProfileAcceptanceState {
+    pub(crate) id: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) shell: Option<String>,
+    pub(crate) dirty: bool,
+    pub(crate) pending: bool,
+    pub(crate) is_default: bool,
+    pub(crate) name_focus: FocusHandle,
+    pub(crate) shell_focus: FocusHandle,
+}
+
 impl PreferencesPanel {
+    /// 原生验收读取草稿、事务和真实输入焦点，避免向仍在重载的禁用输入框发送文字。
+    /// 实际保存仍由生产按钮和仓储执行。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn settings_acceptance_profile_state(&self, cx: &App) -> ProfileAcceptanceState {
+        let draft = self.profile_draft.as_ref();
+        ProfileAcceptanceState {
+            id: draft.and_then(|draft| draft.value().id.clone()),
+            name: draft.map(|draft| draft.value().name.clone()),
+            shell: draft.map(|draft| draft.value().shell.clone()),
+            dirty: draft.is_some_and(|draft| draft.is_dirty()),
+            pending: self.loading_profiles
+                || self.profile_operation_running
+                || draft.is_some_and(|draft| draft.status() != DraftStatus::Ready),
+            is_default: self.selected_profile_is_default,
+            name_focus: self.profile_inputs.name.focus_handle(cx),
+            shell_focus: self.profile_inputs.shell.focus_handle(cx),
+        }
+    }
+
     /// 同步按钮仅在真实仓库就绪且 Git/密钥操作空闲后可用于端到端点击。
     pub(crate) fn settings_acceptance_sync_ready(&self) -> bool {
         self.sync_status.as_ref().is_some_and(|status| {
@@ -90,6 +123,15 @@ impl PreferencesPanel {
         self.settings
             .as_ref()
             .map(|draft| theme_mode_id(draft.value().theme_mode))
+    }
+
+    /// 只读返回草稿色板标识，让原生验收区分预览与实际持久化回读。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn settings_acceptance_draft_app_color_scheme(&self) -> Option<&'static str> {
+        self.settings
+            .as_ref()
+            .map(|draft| draft.value().app_color_scheme.as_str())
     }
 
     /// Returns the draft density for save and readback assertions without mutating the panel.

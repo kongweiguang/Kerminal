@@ -723,7 +723,8 @@ impl PreferencesPanel {
         page.child(self.render_save_notice(theme))
     }
 
-    /// 连接摘要复用真实 listener；滚动根继承设置弹框表面，复制失败贴近入口并避免误报成功。
+    /// 连接摘要复用真实 listener；停止未完成时保留重试入口，避免误导用户启动第二个服务。
+    /// 复制失败贴近入口反馈；页面只呈现运行态，不混入无关设置保存提示。
     pub(super) fn render_mcp_settings(
         &mut self,
         theme: ThemeTokens,
@@ -731,10 +732,27 @@ impl PreferencesPanel {
     ) -> impl IntoElement {
         let snapshot = self.connectivity.current_mcp_snapshot();
         let busy = self.connectivity.mcp_operation.is_some();
-        let running = snapshot.state == McpRuntimeState::Running;
-        let status_label = mcp_state_label(snapshot.state);
-        let json = self.connectivity.pretty_client_json(&snapshot);
+        let state = if busy {
+            if self.connectivity.mcp_starting() {
+                McpRuntimeState::Starting
+            } else {
+                McpRuntimeState::Stopping
+            }
+        } else {
+            snapshot.state
+        };
+        let running = state == McpRuntimeState::Running;
+        let stopping = state == McpRuntimeState::Stopping;
+        let status_label = mcp_state_label(state, busy);
+        let json = if busy {
+            None
+        } else {
+            self.connectivity.pretty_client_json(&snapshot)
+        };
         let json_display = json.clone().unwrap_or_else(|| {
+            crate::locale::text("启动后显示", "Available after startup").to_string()
+        });
+        let endpoint_display = snapshot.endpoint.clone().unwrap_or_else(|| {
             crate::locale::text("启动后显示", "Available after startup").to_string()
         });
         let connection_summary = if running {
@@ -742,47 +760,46 @@ impl PreferencesPanel {
         } else {
             crate::locale::text("启动后可用", "Available after startup")
         };
-        let can_toggle = match snapshot.state {
-            McpRuntimeState::Unavailable => false,
+        let can_toggle = match state {
+            McpRuntimeState::Unavailable | McpRuntimeState::Starting => false,
             McpRuntimeState::Running | McpRuntimeState::Stopping => {
                 snapshot.endpoint.is_some() || snapshot.endpoint_sync_pending
             }
-            McpRuntimeState::Stopped
-            | McpRuntimeState::Starting
-            | McpRuntimeState::Synchronizing
-            | McpRuntimeState::Failed => true,
+            McpRuntimeState::Stopped | McpRuntimeState::Synchronizing | McpRuntimeState::Failed => {
+                true
+            }
         };
-        let status_color = mcp_state_color(theme, snapshot.state);
+        let status_color = mcp_state_color(theme, state);
         let toggle = Button::new("mcp-settings-toggle")
             .compact()
             .outline()
             .ghost()
             .icon(
-                Icon::new(if running {
+                Icon::new(if running || stopping {
                     IconName::PowerOff
                 } else {
                     IconName::Power
                 })
                 .size(px(16.)),
             )
-            .label(if busy {
-                if self.connectivity.mcp_starting() {
+            .label(if busy || state == McpRuntimeState::Starting {
+                if state == McpRuntimeState::Starting {
                     crate::locale::text("启动中…", "Starting…")
                 } else {
                     crate::locale::text("停止中…", "Stopping…")
                 }
             } else if running {
                 crate::locale::text("停止", "Stop")
+            } else if stopping {
+                crate::locale::text("重试停止", "Retry stop")
+            } else if state == McpRuntimeState::Synchronizing {
+                crate::locale::text("重试同步", "Retry sync")
             } else {
                 crate::locale::text("启动", "Start")
             })
             .disabled(busy || !can_toggle)
             .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                if panel.connectivity.current_mcp_snapshot().state == McpRuntimeState::Running {
-                    panel.connectivity.stop_mcp(cx);
-                } else {
-                    panel.connectivity.start_mcp(cx);
-                }
+                panel.connectivity.toggle_mcp(cx);
             }));
         let heading = div()
             .flex()
@@ -889,11 +906,7 @@ impl PreferencesPanel {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(render_info_row(
-                            "endpoint",
-                            snapshot.endpoint.as_deref().unwrap_or("启动后显示"),
-                            theme,
-                        ))
+                        .child(render_info_row("endpoint", &endpoint_display, theme))
                         .child(render_json_row(&json_display, theme))
                         .child(
                             Button::new("mcp-settings-copy-json")
@@ -958,7 +971,6 @@ impl PreferencesPanel {
                         )
                     }),
             )
-            .child(self.render_save_notice(theme))
     }
 
     /// 搜索定位应展开命中的原生 disclosure，而密钥编辑区始终可见，不维护重复展开状态。
@@ -1093,8 +1105,8 @@ fn render_json_row(value: &str, theme: ThemeTokens) -> impl IntoElement {
         )
 }
 
-/// 将 runtime 状态投影为稳定中文标签，不能把正在同步 endpoint 显示为已运行。
-fn mcp_state_label(state: McpRuntimeState) -> gpui_kit::SharedString {
+/// 将运行态与当前操作共同投影为状态，超时后明确保留待清理含义而不冒充仍在执行。
+fn mcp_state_label(state: McpRuntimeState, operation_pending: bool) -> gpui_kit::SharedString {
     match state {
         McpRuntimeState::Unavailable => crate::locale::text("不可用", "Unavailable"),
         McpRuntimeState::Stopped => crate::locale::text("已停止", "Stopped"),
@@ -1103,7 +1115,10 @@ fn mcp_state_label(state: McpRuntimeState) -> gpui_kit::SharedString {
             crate::locale::text("正在同步连接信息", "Synchronizing endpoint")
         }
         McpRuntimeState::Running => crate::locale::text("运行中", "Running"),
-        McpRuntimeState::Stopping => crate::locale::text("正在停止", "Stopping"),
+        McpRuntimeState::Stopping if operation_pending => {
+            crate::locale::text("正在停止", "Stopping")
+        }
+        McpRuntimeState::Stopping => crate::locale::text("停止未完成", "Cleanup pending"),
         McpRuntimeState::Failed => crate::locale::text("启动失败", "Failed"),
     }
 }
