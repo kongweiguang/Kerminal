@@ -4,15 +4,14 @@
 
 use chrono::{DateTime, Datelike, Local, Utc};
 use gpui_kit::{
-    AnyElement, App, ClickEvent, Context, DispatchPhase, ExternalPaths, InteractiveElement as _,
-    IntoElement, KeyDownEvent, MouseDownEvent, Pixels, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement as _, Window,
+    AnyElement, App, ClickEvent, Context, ExternalPaths, InteractiveElement as _, IntoElement,
+    KeyDownEvent, Pixels, SharedString, StatefulInteractiveElement as _, Window,
     base::v_virtual_list,
     canvas,
     component::{
-        ActiveTheme as _, Disableable as _, Icon, IconName,
-        button::{Button, ButtonVariants as _},
-        input::Input,
+        ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
+        button::{Button, ButtonCustomVariant, ButtonVariants as _},
+        input::{Input, InputGroup, InputGroupAddon, InputGroupText},
         menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
         scroll::ScrollableElement as _,
         tooltip::Tooltip,
@@ -28,20 +27,25 @@ use std::{cmp::Ordering, path::PathBuf, rc::Rc, sync::Arc};
 use crate::{locale, theme::ThemeTokens};
 use gpui_kit::assets::IconName as AssetIconName;
 
+use super::super::context_menu::{FileMenuSnapshot, FileMenuTarget, build_file_context_menu};
+#[cfg(test)]
+use super::super::context_menu::{select_context_entry, select_context_selection};
 use super::super::drag_drop::{
-    DropDirectorySnapshot, FileDragPreview, FileTransferDrag, external_drop_directory_ready,
-    external_paths_drop_is_allowed, internal_drop_is_allowed,
+    DropDirectorySnapshot, DropRejection, FileDragPreview, FileTransferDrag, copy_target_rejection,
+    drop_rejection_message, external_drop_directory_ready, external_paths_drop_is_allowed,
+    internal_drop_is_allowed,
 };
 use super::super::{FileSort, FileSortColumn};
-use super::{FilesPane, asset_icon_button, icon_button, icon_button_without_tooltip};
+use super::{FilesPane, asset_icon_button, icon_button};
 
 /// 单个目录面板的动作视图快照，宽窄布局共用同一份选择、目标和测量后的工具栏状态。
 ///
 /// @author kongweiguang
+#[derive(Clone, Copy)]
 struct FileActionsView<'a> {
     side: usize,
-    active: bool,
     copy_target_available: bool,
+    copy_target_rejection: Option<DropRejection>,
     transfer_submission_busy: bool,
     loading: bool,
     conflict_policy: ConflictPolicy,
@@ -49,14 +53,16 @@ struct FileActionsView<'a> {
     endpoint: &'a FileEndpoint,
     selected: Option<&'a FileEntry>,
     selected_count: usize,
+    has_transferable_selection: bool,
     has_remote_selection: bool,
     visible_count: usize,
     total_entry_count: usize,
+    file_count: usize,
+    directory_count: usize,
+    entry_filter: super::super::view_mode::FileEntryFilter,
     compact_layout: bool,
     show_hidden_files: bool,
     view_mode: super::super::view_mode::FilesViewMode,
-    can_go_back: bool,
-    can_go_forward: bool,
 }
 
 /// 一行文件展示所需的列表位置、选择状态和主题，事件仍回到 FilesPane 用例。
@@ -79,7 +85,7 @@ struct FileEntryRowView {
     theme: ThemeTokens,
 }
 
-/// 表头与目录行按 main 的列表容器断点显隐列：时间常驻，大小 400px 起，权限 540px 起。
+/// 表头与目录行共享断点：极窄时优先名称，320px 起显示时间，400px 起显示大小，540px 起显示权限。
 ///
 /// @author kongweiguang
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,6 +111,7 @@ struct FilePathBarView<'a> {
     path_input: &'a gpui_kit::Entity<gpui_kit::component::input::InputState>,
     side: usize,
     compact_layout: bool,
+    show_scheme: bool,
     show_terminal_follow: bool,
     bookmarks: Vec<super::super::FileBookmark>,
     bookmarks_loading: bool,
@@ -189,20 +196,20 @@ struct SortableHeadingView {
 }
 
 impl FileTableColumns {
-    /// 保留 main 默认的时间列，并复用 400px/540px 的大小与权限列断点。
+    /// 极窄面板隐藏时间以保留文件名，较宽时沿用 main 的大小和权限列断点。
     ///
     /// @author kongweiguang
     fn for_width(width: Pixels) -> Self {
         Self {
             size: width >= px(400.),
-            modified: true,
+            modified: width >= px(320.),
             permissions: width >= px(540.),
         }
     }
 }
 
 impl FileBrowserLayout {
-    /// 列宽按面板实际尺寸计算，工具栏命令保持固定图标尺寸。
+    /// 只按面板宽度投影元数据列；动作条固定为同一组高频按钮，不随宽度换组。
     ///
     /// @author kongweiguang
     fn for_width(width: Pixels) -> Self {
@@ -212,15 +219,37 @@ impl FileBrowserLayout {
     }
 }
 
-/// 视图按钮将三态入口收在稳定分组中，窄栏动作行换行时仍保持完整点击面积。
+/// 视图、类型筛选和窄栏次要动作共享菜单，保证目录栏缩窄时命令仍可访问。
 ///
 /// @author kongweiguang
-fn render_file_view_controls(
-    side: usize,
-    selected: super::super::view_mode::FilesViewMode,
+fn render_file_more_menu(
+    view: FileActionsView<'_>,
     theme: ThemeTokens,
     cx: &mut Context<FilesPane>,
 ) -> impl IntoElement {
+    use super::super::view_mode::{FileEntryFilter, FilesViewMode};
+
+    let FileActionsView {
+        side,
+        view_mode,
+        conflict_policy,
+        selected,
+        selected_count,
+        entry_filter,
+        total_entry_count,
+        file_count,
+        directory_count,
+        delete_confirmation,
+        endpoint,
+        has_remote_selection,
+        transfer_submission_busy,
+        ..
+    } = view;
+    let has_file =
+        selected_count == 1 && selected.is_some_and(|entry| entry.kind == FileEntryKind::File);
+    let has_selection = selected_count > 0;
+    let can_upload = !matches!(endpoint, FileEndpoint::Local { .. });
+    let entity = cx.entity().clone();
     let modes = [
         (
             super::super::view_mode::FilesViewMode::List,
@@ -232,44 +261,184 @@ fn render_file_view_controls(
             AssetIconName::ListTree,
             locale::text("树形视图", "Tree view"),
         ),
+    ];
+    let policies = [
         (
-            super::super::view_mode::FilesViewMode::Workspace,
-            AssetIconName::LayoutDashboard,
-            locale::text("编辑器工作区", "Editor workspace"),
+            ConflictPolicy::Rename,
+            locale::text("重命名同名项（默认）", "Rename conflicts (default)"),
+        ),
+        (
+            ConflictPolicy::Skip,
+            locale::text("跳过同名项", "Skip conflicts"),
+        ),
+        (
+            ConflictPolicy::Overwrite,
+            locale::text("覆盖文件；合并目录", "Overwrite files; merge folders"),
         ),
     ];
-    div()
-        .id(format!("files-view-modes-{side}"))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .gap_1()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary)
-        .children(modes.into_iter().map(|(target, icon, label)| {
-            let active = selected == target;
-            Button::new(format!("files-view-{side}-{target:?}"))
-                .compact()
-                .w(px(32.))
-                .h(px(32.))
-                .flex_shrink_0()
-                .when(active, Button::primary)
-                .when(!active, Button::ghost)
-                .icon(icon)
-                .tooltip(label.clone())
-                .accessibility_label(label)
-                .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
-                    pane.activate_side(side, cx);
-                    pane.set_file_view_mode(target, cx);
-                }))
-        }))
+    compact_toolbar_button(
+        Button::new(format!("files-more-menu-{side}")).compact(),
+        theme,
+        false,
+    )
+    .w(px(32.))
+    .h(px(32.))
+    .flex_shrink_0()
+    .debug_selector(move || format!("rr-files-more-menu-{side}"))
+    .icon(IconName::Ellipsis)
+    .tooltip(locale::text("更多文件操作", "More file actions"))
+    .accessibility_label(locale::text("更多文件操作", "More file actions"))
+    .dropdown_menu_with_anchor(
+        gpui_kit::Anchor::TopRight,
+        move |mut menu, window, menu_cx| {
+            menu = crate::ui_popup::dropdown_menu(menu, theme);
+            menu = menu
+                .item(PopupMenuItem::label(locale::text("文件视图", "File view")).disabled(true));
+            for (target, icon, label) in &modes {
+                let target = *target;
+                let icon = *icon;
+                let entity = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(label.clone())
+                        .icon(icon)
+                        .checked(view_mode == target)
+                        .on_click(move |_, _, app| {
+                            entity.update(app, |pane, cx| {
+                                pane.activate_side(side, cx);
+                                pane.set_file_view_mode(target, cx);
+                            });
+                        }),
+                );
+            }
+            if view_mode != FilesViewMode::Tree {
+                let filter_name = match entry_filter {
+                    FileEntryFilter::All => locale::text("全部", "All"),
+                    FileEntryFilter::Files => locale::text("文件", "Files"),
+                    FileEntryFilter::Directories => locale::text("目录", "Folders"),
+                };
+                let filter_label = locale::text(
+                    format!("文件类型：{filter_name}"),
+                    format!("File type: {filter_name}"),
+                );
+                let filter_entity = entity.clone();
+                menu =
+                    menu.separator()
+                        .submenu(filter_label, window, menu_cx, move |menu, _, _| {
+                            let mut menu = crate::ui_popup::dropdown_menu(menu, theme);
+                            for (filter, label) in [
+                                (
+                                    FileEntryFilter::All,
+                                    locale::text(
+                                        format!("全部 {total_entry_count}"),
+                                        format!("All {total_entry_count}"),
+                                    ),
+                                ),
+                                (
+                                    FileEntryFilter::Files,
+                                    locale::text(
+                                        format!("文件 {file_count}"),
+                                        format!("Files {file_count}"),
+                                    ),
+                                ),
+                                (
+                                    FileEntryFilter::Directories,
+                                    locale::text(
+                                        format!("目录 {directory_count}"),
+                                        format!("Folders {directory_count}"),
+                                    ),
+                                ),
+                            ] {
+                                let filter_entity = filter_entity.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(label)
+                                        .checked(entry_filter == filter)
+                                        .on_click(move |_, _, app| {
+                                            filter_entity.update(app, |pane, cx| {
+                                                pane.set_file_entry_filter(side, filter, cx)
+                                            });
+                                        }),
+                                );
+                            }
+                            menu
+                        });
+            }
+            menu = menu.separator();
+            let action = entity.clone();
+            menu = menu.item(
+                PopupMenuItem::new(if delete_confirmation {
+                    locale::text("确认删除所选项目", "Confirm deletion")
+                } else {
+                    locale::text("删除所选项目", "Delete selected items")
+                })
+                .danger()
+                .icon(Icon::new(AssetIconName::Trash))
+                .disabled(!has_selection)
+                .on_click(move |_, _, app| {
+                    action.update(app, |pane, cx| {
+                        pane.activate_side(side, cx);
+                        pane.delete_selected(cx);
+                    })
+                }),
+            );
+            if can_upload {
+                let action = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(locale::text("下载所选项目", "Download selected items"))
+                        .icon(Icon::new(AssetIconName::Download))
+                        .disabled(transfer_submission_busy || !has_remote_selection)
+                        .on_click(move |_, _, app| {
+                            action.update(app, |pane, cx| {
+                                pane.activate_side(side, cx);
+                                pane.prompt_download(cx);
+                            })
+                        }),
+                );
+            }
+            menu = menu.item(PopupMenuItem::separator()).item(
+                PopupMenuItem::label(locale::text(
+                    "以下设置只影响之后加入的任务",
+                    "These settings apply only to newly queued tasks",
+                ))
+                .disabled(true),
+            );
+            for (policy, label) in &policies {
+                let policy = *policy;
+                let entity = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(label.clone())
+                        .checked(conflict_policy == policy)
+                        .on_click(move |_, _, app| {
+                            entity.update(app, |pane, cx| pane.set_conflict_policy(policy, cx));
+                        }),
+                );
+            }
+            let open_entity = entity.clone();
+            menu = menu.item(PopupMenuItem::separator()).item(
+                PopupMenuItem::new(locale::text("在编辑器中打开", "Open in editor"))
+                    .icon(IconName::FileText)
+                    .disabled(!has_file)
+                    .on_click(move |_, _, app| {
+                        open_entity.update(app, |pane, cx| {
+                            pane.activate_side(side, cx);
+                            if let Some(entry) = pane.panels[side].selected.as_ref()
+                                && entry.kind == FileEntryKind::File
+                            {
+                                let endpoint = entry.endpoint.clone();
+                                pane.request_open_file(endpoint, cx);
+                            }
+                        });
+                    }),
+            );
+            menu
+        },
+    )
+    .offset(px(6.))
 }
 
 /// 路径和操作统一为两排；紧凑模式仅显示当前终端目标，工具栏和列按当前面板实际 bounds 分档。
 /// 紧凑右栏复用 rail 自身外壳，独立边框只属于文件列表卡；中央工作区继续用 endpoint 边界显示活动面板。
-/// 键盘焦点留在列表 owner；文件预览回流后在 viewport prepaint 中消费一次可见性意图。
+/// 键盘焦点留在列表 owner；键盘移动后直接滚动到活动行。
+/// 同目录刷新保留已提交清单；导航到其它目录时不冒用旧清单，忙态只由原刷新图标表达。
 ///
 /// @author kongweiguang
 pub(super) fn render_browser(
@@ -280,9 +449,9 @@ pub(super) fn render_browser(
     cx: &mut Context<FilesPane>,
 ) -> impl IntoElement {
     let path_input = pane.ensure_path_input(side, window, cx);
-    let shared_host_picker = side == 1 && pane.host_picker.enabled && !pane.compact_layout;
+    let shared_host_picker = pane.host_picker.enabled && !pane.compact_layout;
     let host_picker_header = shared_host_picker
-        .then(|| super::host_picker::render_selector_header(pane, theme, window, cx));
+        .then(|| super::host_picker::render_selector_header(pane, side, theme, window, cx));
     let layout_state = window.use_keyed_state(
         format!("files-browser-layout-{}-{side}", cx.entity_id().as_u64()),
         cx,
@@ -311,22 +480,32 @@ pub(super) fn render_browser(
     .inset_0();
     let selected_entries = pane.selected_entries(side);
     let selected_count = selected_entries.len();
-    let has_remote_selection = selected_entries
+    let has_transferable_selection = selected_entries
         .iter()
-        .any(|entry| !matches!(&entry.endpoint, FileEndpoint::Local { .. }));
+        .any(super::super::context_menu::is_transferable);
+    let has_remote_selection = selected_entries.iter().any(|entry| {
+        !matches!(&entry.endpoint, FileEndpoint::Local { .. })
+            && super::super::context_menu::is_transferable(entry)
+    });
     let panel = &pane.panels[side];
     let endpoint = panel.endpoint.clone();
+    let copy_target_rejection = copy_target_rejection(
+        selected_entries.iter(),
+        &endpoint,
+        &pane.panels[1 - side].endpoint,
+    );
     let toolbar_projection =
         FileBrowserToolbarProjection::for_endpoint(pane.compact_layout, &endpoint);
     let active = pane.active_side == side;
     let locked = side == 0 && pane.locked_left_host_id.is_some();
     let selected = panel.selected.clone();
     let panel_generation = panel.generation;
-    let directory_ready = external_drop_directory_ready(
-        &endpoint,
-        panel.listing.as_ref().map(|listing| &listing.directory),
-        panel.loading,
-    );
+    let directory_ready = !pane.host_picker.target_pending[side]
+        && external_drop_directory_ready(
+            &endpoint,
+            panel.listing.as_ref().map(|listing| &listing.directory),
+            panel.loading,
+        );
     let transfer_submission_busy = pane.transfer_submission_busy;
     let delete_confirmation = pane.delete_confirmation.as_ref().is_some_and(|confirmed| {
         confirmed.len() == selected_entries.len()
@@ -342,7 +521,13 @@ pub(super) fn render_browser(
     };
     let conflict_policy = pane.queue.conflict_policy;
     let loading = panel.loading;
-    let listing = panel.listing.clone();
+    let listing = panel
+        .listing
+        .as_ref()
+        .filter(|listing| {
+            &listing.directory == panel.requested_endpoint.as_ref().unwrap_or(&endpoint)
+        })
+        .cloned();
     let show_hidden_files = pane.show_hidden_files;
     let mut all_entries = listing
         .as_ref()
@@ -436,6 +621,7 @@ pub(super) fn render_browser(
     };
     let mut panel_view = div()
         .id(format!("files-browser-{side}"))
+        .debug_selector(move || format!("rr-files-browser-{side}"))
         .flex_1()
         .min_w(px(0.))
         .h_full()
@@ -460,7 +646,8 @@ pub(super) fn render_browser(
     let source_panel = &pane.panels[source_side_for_drop];
     let source_endpoint_for_drop = source_panel.endpoint.clone();
     let source_generation_for_drop = source_panel.generation;
-    let source_loading_for_drop = source_panel.loading;
+    let source_loading_for_drop =
+        source_panel.loading || pane.host_picker.target_pending[source_side_for_drop];
     let source_listing_directory_for_drop = source_panel
         .listing
         .as_ref()
@@ -469,6 +656,7 @@ pub(super) fn render_browser(
     let source_listing_for_validation = source_listing_directory_for_drop.clone();
     let source_endpoint_for_feedback = source_endpoint_for_drop;
     let source_listing_for_feedback = source_listing_directory_for_drop;
+    let pane_id_for_drop = cx.entity_id().as_u64();
     panel_view = panel_view
         .can_drop(move |payload, _, _| {
             if let Some(paths) = payload.downcast_ref::<ExternalPaths>() {
@@ -481,6 +669,7 @@ pub(super) fn render_browser(
             } else if let Some(drag) = payload.downcast_ref::<FileTransferDrag>() {
                 internal_drop_is_allowed(
                     drag,
+                    pane_id_for_drop,
                     source_side_for_drop,
                     DropDirectorySnapshot {
                         endpoint: &source_endpoint_for_validation,
@@ -512,6 +701,7 @@ pub(super) fn render_browser(
         .drag_over::<FileTransferDrag>(move |style, drag, _, _| {
             if internal_drop_is_allowed(
                 drag,
+                pane_id_for_drop,
                 source_side_for_drop,
                 DropDirectorySnapshot {
                     endpoint: &source_endpoint_for_feedback,
@@ -555,6 +745,7 @@ pub(super) fn render_browser(
             path_input: &path_input,
             side,
             compact_layout: pane.compact_layout,
+            show_scheme: !pane.compact_layout || columns.size,
             show_terminal_follow: toolbar_projection.show_terminal_follow,
             bookmarks: path_bookmarks,
             bookmarks_loading,
@@ -575,27 +766,25 @@ pub(super) fn render_browser(
     let actions_bar = render_file_actions(
         FileActionsView {
             side,
-            active,
-            copy_target_available: super::super::can_transfer_to_other_side(
-                pane.host_picker.enabled,
-                pane.host_picker.right_target_unselected,
-                side,
-            ),
+            copy_target_available: pane.can_transfer_selected_to_other_side(side),
+            copy_target_rejection,
             transfer_submission_busy: pane.transfer_submission_busy,
             conflict_policy,
             delete_confirmation,
             endpoint: &endpoint,
             selected: selected.as_ref(),
             selected_count,
+            has_transferable_selection,
             has_remote_selection,
             visible_count,
             total_entry_count: all_count,
+            file_count,
+            directory_count,
+            entry_filter: panel.entry_filter,
             compact_layout: pane.compact_layout,
             show_hidden_files,
             view_mode: pane.view_mode,
             loading,
-            can_go_back: panel.navigation_history.can_go_back(),
-            can_go_forward: panel.navigation_history.can_go_forward(),
         },
         theme,
         cx,
@@ -616,17 +805,6 @@ pub(super) fn render_browser(
             ),
         };
     }
-    panel_view = panel_view.when(!pane.compact_layout && !tree_mode, |panel_view| {
-        panel_view.child(render_file_kind_filter(
-            side,
-            panel.entry_filter,
-            all_count,
-            file_count,
-            directory_count,
-            theme,
-            cx,
-        ))
-    });
     let table_heading = render_table_heading(
         side,
         panel.sort,
@@ -647,8 +825,20 @@ pub(super) fn render_browser(
     .into_any_element();
 
     if tree_mode {
-        return panel_view
-            .child(table_heading)
+        let background_entity = cx.entity().clone();
+        let background_snapshot = FileMenuSnapshot {
+            side,
+            generation: panel_generation,
+            directory: endpoint.clone(),
+            show_hidden: show_hidden_files,
+            target: FileMenuTarget::Background,
+        };
+        let tree = div()
+            .id(format!("files-browser-tree-{side}"))
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
             .child(super::tree::render_tree_content(
                 pane,
                 side,
@@ -657,15 +847,30 @@ pub(super) fn render_browser(
                 show_hidden_files,
                 theme,
                 cx,
-            ));
+            ))
+            .context_menu(move |menu, _, app| {
+                build_file_context_menu(
+                    menu,
+                    theme,
+                    background_entity.clone(),
+                    background_snapshot.clone(),
+                    app,
+                )
+            });
+        return panel_view.child(table_heading).child(tree);
     }
 
     let keyboard_names = Arc::clone(&ordered_names);
     let keyboard_directory = endpoint.clone();
     let keyboard_generation = panel_generation;
+    let list_debug_selector = if pane.compact_layout {
+        format!("files-browser-list-{side}")
+    } else {
+        format!("central-files-browser-list-{side}")
+    };
     let mut list = div()
         .id(format!("files-browser-list-{side}"))
-        .debug_selector(move || format!("files-browser-list-{side}"))
+        .debug_selector(move || list_debug_selector.clone())
         .flex_1()
         .min_h(px(0.))
         .flex()
@@ -697,7 +902,6 @@ pub(super) fn render_browser(
                 );
                 cx.stop_propagation();
             } else if key == "enter" {
-                pane.panels[side].keyboard_scroll_intent.cancel();
                 if let Some(entry) = pane.keyboard_active_entry(
                     side,
                     keyboard_generation,
@@ -708,7 +912,6 @@ pub(super) fn render_browser(
                 }
                 cx.stop_propagation();
             } else if matches!(key.as_str(), "space" | " ") {
-                pane.panels[side].keyboard_scroll_intent.cancel();
                 if let Some(entry) = pane.keyboard_active_entry(
                     side,
                     keyboard_generation,
@@ -727,7 +930,6 @@ pub(super) fn render_browser(
                 }
                 cx.stop_propagation();
             } else if key == "a" && event.keystroke.modifiers.secondary() {
-                pane.panels[side].keyboard_scroll_intent.cancel();
                 let snapshot_is_current = pane.browser_action_snapshot_is_current(
                     side,
                     keyboard_generation,
@@ -755,104 +957,14 @@ pub(super) fn render_browser(
         }))
         .bg(theme.panel);
 
-    // The row viewport can shrink again when an asynchronous preview appears. This absolute
-    // prepaint child is deliberately first so the virtual list consumes its one-shot Nearest
-    // request using the final bounds in the same frame; captured pointer input cancels it.
-    if let Some(request) = panel
-        .keyboard_scroll_intent
-        .pending
-        .clone()
-        .filter(|request| !request.consumed.get())
-    {
-        let target_index = ordered_names
-            .iter()
-            .position(|name| name == &request.target_name);
-        let listing_is_current = !panel.loading
-            && panel
-                .listing
-                .as_ref()
-                .is_some_and(|listing| listing.directory == request.directory);
-        let scroll_snapshot = super::super::KeyboardScrollSnapshot {
-            panel_generation,
-            directory: endpoint.clone(),
-            listing_is_current,
-            active_name: keyboard_active_name.clone(),
-            selected_endpoint: selected.as_ref().map(|entry| entry.endpoint.clone()),
-            preview_generation: panel.preview_generation,
-            preview_pending: panel.preview_cancellation.is_some(),
-        };
-        let readiness = panel
-            .keyboard_scroll_intent
-            .readiness_for(request.revision, &scroll_snapshot);
-        let mut scroll_intent = panel.keyboard_scroll_intent.clone();
-        let scroll_intent_for_events = scroll_intent.clone();
-        let list_focus_handle = list_focus_handle.clone();
-        let list_scroll = panel.list_scroll.clone();
-        let scroll_revision = request.revision;
-        list = list.child(
-            canvas(
-                move |_, window, _app| {
-                    let has_list_focus = list_focus_handle.is_focused(window);
-                    let index = target_index;
-                    let should_scroll = has_list_focus
-                        && readiness == super::super::KeyboardScrollReadiness::Ready
-                        && index.is_some()
-                        && scroll_intent.consume_if_ready(scroll_revision, &scroll_snapshot);
-                    if should_scroll {
-                        list_scroll.scroll_to_item(
-                            index.expect("a ready keyboard scroll has a visible target"),
-                            gpui_kit::ScrollStrategy::Nearest,
-                        );
-                    }
-
-                    if !has_list_focus
-                        || index.is_none()
-                        || readiness == super::super::KeyboardScrollReadiness::Stale
-                        || should_scroll
-                    {
-                        scroll_intent.cancel_if_revision(scroll_revision);
-                    }
-                },
-                move |bounds, _, window, _| {
-                    let scroll_bounds = bounds;
-                    let mut scroll_intent_for_wheel = scroll_intent_for_events.clone();
-                    let mut scroll_intent_for_mouse_down = scroll_intent_for_events.clone();
-                    window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, _| {
-                        if phase == DispatchPhase::Capture
-                            && scroll_bounds.contains(&event.position)
-                        {
-                            scroll_intent_for_wheel.cancel_if_revision(scroll_revision);
-                        }
-                    });
-                    window.on_mouse_event(move |event: &MouseDownEvent, phase, _, _| {
-                        if phase == DispatchPhase::Capture && bounds.contains(&event.position) {
-                            scroll_intent_for_mouse_down.cancel_if_revision(scroll_revision);
-                        }
-                    });
-                },
-            )
-            .absolute()
-            .inset_0(),
-        );
-    }
-
     let trust_request = pane.current_host_key_trust_request();
     let host_key_trust_busy = trust_request.as_ref().is_some_and(|request| {
         endpoint.host_id() == Some(&request.host_id)
             && matches!(&endpoint, FileEndpoint::Remote { .. })
     });
-    if loading {
-        list = list.child(render_directory_state(
-            IconName::LoaderCircle,
-            locale::text("正在读取目录", "Reading directory"),
-            locale::text(
-                "文件与权限信息将显示在这里。",
-                "Files and permissions will appear here.",
-            ),
-            true,
-            None,
-            theme,
-        ));
+    if loading && listing.is_none() {
+        // 首次读取没有可信内容时保持列表框架，避免重复加载文案与工具栏争夺空间。
+        list = list.child(div().flex_1());
     } else if listing.is_none() {
         let trust_button = (pane.compact_layout
             && side == 1
@@ -976,169 +1088,20 @@ pub(super) fn render_browser(
     }
 
     let background_entity = cx.entity().clone();
-    let background_endpoint = endpoint.clone();
-    let background_generation = panel_generation;
-    let list = list.context_menu(move |mut menu, _, _| {
-        menu = crate::ui_popup::context_menu(menu, theme, None);
-        let action_entity = background_entity.clone();
-        let action_endpoint = background_endpoint.clone();
-        menu = menu.item(
-            PopupMenuItem::new(locale::text(
-                "工作区打开当前目录",
-                "Open current directory in workspace",
-            ))
-            .icon(Icon::new(AssetIconName::FileSearch))
-            .on_click(move |_, _, app| {
-                action_entity.update(app, |pane, cx| {
-                    if pane.browser_action_snapshot_is_current(
-                        side,
-                        background_generation,
-                        &action_endpoint,
-                    ) {
-                        pane.activate_side(side, cx);
-                        pane.set_file_view_mode(
-                            super::super::view_mode::FilesViewMode::Workspace,
-                            cx,
-                        );
-                    }
-                });
-            }),
-        );
-
-        if !matches!(&background_endpoint, FileEndpoint::Local { .. }) {
-            let action_entity = background_entity.clone();
-            let action_endpoint = background_endpoint.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text("上传文件", "Upload files"))
-                    .icon(Icon::new(AssetIconName::Upload))
-                    .on_click(move |_, _, app| {
-                        action_entity.update(app, |pane, cx| {
-                            if pane.browser_action_snapshot_is_current(
-                                side,
-                                background_generation,
-                                &action_endpoint,
-                            ) {
-                                pane.prompt_upload_files_to(action_endpoint.clone(), cx);
-                            }
-                        });
-                    }),
-            );
-
-            let action_entity = background_entity.clone();
-            let action_endpoint = background_endpoint.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text("上传文件夹", "Upload folder"))
-                    .icon(IconName::FolderOpen)
-                    .on_click(move |_, _, app| {
-                        action_entity.update(app, |pane, cx| {
-                            if pane.browser_action_snapshot_is_current(
-                                side,
-                                background_generation,
-                                &action_endpoint,
-                            ) {
-                                pane.prompt_upload_directories_to(action_endpoint.clone(), cx);
-                            }
-                        });
-                    }),
-            );
-        }
-
-        if matches!(&background_endpoint, FileEndpoint::Remote { .. }) {
-            let action_entity = background_entity.clone();
-            let action_endpoint = background_endpoint.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text("粘贴 SFTP 剪贴板", "Paste SFTP clipboard"))
-                    .icon(Icon::new(AssetIconName::ClipboardPaste))
-                    .on_click(move |_, _, app| {
-                        action_entity.update(app, |pane, cx| {
-                            if pane.browser_action_snapshot_is_current(
-                                side,
-                                background_generation,
-                                &action_endpoint,
-                            ) {
-                                pane.paste_remote_clipboard(action_endpoint.clone(), cx);
-                            }
-                        });
-                    }),
-            );
-        }
-
-        let action_entity = background_entity.clone();
-        let action_endpoint = background_endpoint.clone();
-        menu = menu.item(
-            PopupMenuItem::new(locale::text("新建目录", "New folder"))
-                .icon(Icon::new(AssetIconName::FolderPlus))
-                .on_click(move |_, window, app| {
-                    action_entity.update(app, |pane, cx| {
-                        if pane.browser_action_snapshot_is_current(
-                            side,
-                            background_generation,
-                            &action_endpoint,
-                        ) {
-                            pane.activate_side(side, cx);
-                            pane.prepare_create_directory(window, cx);
-                        }
-                    });
-                }),
-        );
-        menu = menu.item(PopupMenuItem::separator());
-
-        let action_entity = background_entity.clone();
-        let action_endpoint = background_endpoint.clone();
-        menu = menu.item(
-            PopupMenuItem::new(locale::text("刷新目录", "Refresh directory"))
-                .icon(IconName::RefreshCw)
-                .on_click(move |_, _, app| {
-                    action_entity.update(app, |pane, cx| {
-                        if pane.browser_action_snapshot_is_current(
-                            side,
-                            background_generation,
-                            &action_endpoint,
-                        ) {
-                            pane.refresh_panel(side, cx);
-                        }
-                    });
-                }),
-        );
-
-        let action_entity = background_entity.clone();
-        let action_endpoint = background_endpoint.clone();
-        menu = menu.item(
-            PopupMenuItem::new(if show_hidden_files {
-                locale::text("隐藏隐藏文件", "Hide hidden files")
-            } else {
-                locale::text("显示隐藏文件", "Show hidden files")
-            })
-            .checked(show_hidden_files)
-            .on_click(move |_, _, app| {
-                action_entity.update(app, |pane, cx| {
-                    if pane.browser_action_snapshot_is_current(
-                        side,
-                        background_generation,
-                        &action_endpoint,
-                    ) {
-                        pane.toggle_hidden_files(cx);
-                    }
-                });
-            }),
-        );
-
-        let action_entity = background_entity.clone();
-        let action_endpoint = background_endpoint.clone();
-        menu.item(
-            PopupMenuItem::new(locale::text("复制当前路径", "Copy current path"))
-                .icon(IconName::Copy)
-                .on_click(move |_, _, app| {
-                    action_entity.update(app, |pane, cx| {
-                        if pane.browser_action_snapshot_is_current(
-                            side,
-                            background_generation,
-                            &action_endpoint,
-                        ) {
-                            pane.copy_path_to_clipboard(&action_endpoint, cx);
-                        }
-                    });
-                }),
+    let background_snapshot = FileMenuSnapshot {
+        side,
+        generation: panel_generation,
+        directory: endpoint.clone(),
+        show_hidden: show_hidden_files,
+        target: FileMenuTarget::Background,
+    };
+    let list = list.context_menu(move |menu, _, app| {
+        build_file_context_menu(
+            menu,
+            theme,
+            background_entity.clone(),
+            background_snapshot.clone(),
+            app,
         )
     });
 
@@ -1237,9 +1200,10 @@ fn endpoint_short_label(
     }
 }
 
-/// 紧凑路径栏复用 main 的实色圆角外壳与紧凑节奏；按钮和 Enter 仍共用同一导航校验。
+/// 地址、跳转和书签保持同一条导航带；只有输入区域收缩，固定控件不会换行或挤成两排。
+/// 按钮和 Enter 共用导航校验，窄栏仍可通过编辑与完整路径提示访问长路径。
 /// 书签空态保留保存路径的提示，使图标操作在无数据时也可发现。
-/// 紧凑单行高度经 Styled 设置，绕开 Input 的多行专用 h，并保留中央路径栏原尺寸。
+/// InputGroup 独占地址边框和焦点态；键盘容器不裁切描边，宽窄布局共用同一几何契约。
 ///
 /// @author kongweiguang
 fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> impl IntoElement {
@@ -1248,6 +1212,7 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
         path_input,
         side,
         compact_layout,
+        show_scheme,
         show_terminal_follow,
         bookmarks,
         bookmarks_loading,
@@ -1267,69 +1232,59 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
     let full_path = endpoint_path(endpoint);
     let system_font_family = cx.theme().font_family.clone();
     let path_field = div()
-        .id(format!("files-path-{side}"))
-        .min_w(px(0.))
+        .id(format!("files-path-keyboard-{side}"))
+        .debug_selector(move || format!("rr-files-path-input-{side}"))
+        .min_w_0()
         .h(if compact_layout { px(34.) } else { px(32.) })
         .flex()
         .items_center()
-        .gap_2()
-        .overflow_hidden()
-        .when(!compact_layout, |field| {
-            field
-                .px_3()
+        .tooltip(move |window, cx| Tooltip::new(full_path.clone()).build(window, cx))
+        .on_key_down(cx.listener(move |pane, event: &KeyDownEvent, window, cx| {
+            match event.keystroke.key.to_ascii_lowercase().as_str() {
+                "enter" => {
+                    pane.commit_path_edit(side, cx);
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    pane.cancel_path_edit(side, window, cx);
+                    cx.stop_propagation();
+                }
+                _ => {}
+            }
+        }))
+        .child(
+            InputGroup::new(format!("files-path-{side}"))
+                .small()
+                .h_full()
                 .rounded_md()
-                .border_1()
                 .border_color(theme.border)
                 .bg(theme.background)
-        })
-        .tooltip(move |window, cx| Tooltip::new(full_path.clone()).build(window, cx))
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(theme.text_sm)
-                .text_color(theme.accent)
-                .child(scheme),
-        )
-        .child(
-            div()
-                .id(format!("files-path-keyboard-{side}"))
-                .flex_1()
-                .min_w(px(0.))
-                .h_full()
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .on_key_down(cx.listener(move |pane, event: &KeyDownEvent, window, cx| {
-                    match event.keystroke.key.to_ascii_lowercase().as_str() {
-                        "enter" => {
-                            pane.commit_path_edit(side, cx);
-                            cx.stop_propagation();
-                        }
-                        "escape" => {
-                            pane.cancel_path_edit(side, window, cx);
-                            cx.stop_propagation();
-                        }
-                        _ => {}
-                    }
-                }))
-                .child(
+                .input(
                     Input::new(path_input)
                         .w_full()
-                        .h(if compact_layout { px(34.) } else { px(30.) })
+                        .h_full()
                         .text_size(if compact_layout {
                             px(16.)
                         } else {
                             theme.text_sm
                         })
                         .when(compact_layout, |input| {
-                            gpui_kit::Styled::h(input, px(34.)).font_family(system_font_family)
-                        }),
-                ),
+                            input.font_family(system_font_family)
+                        })
+                        .aria_label(locale::text("目录路径", "Directory path")),
+                )
+                .when(show_scheme, |group| {
+                    group.addon(
+                        InputGroupAddon::new(format!("files-path-scheme-{side}"))
+                            .child(InputGroupText::new().text_color(theme.accent).child(scheme)),
+                    )
+                }),
         );
 
     let jump = Button::new(format!("files-path-jump-{side}"))
         .compact()
-        .w(px(32.))
+        .w_8()
+        .when(compact_layout, |button| button.w_6())
         .h(px(32.))
         .flex_shrink_0()
         .ghost()
@@ -1343,7 +1298,8 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
         .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| pane.commit_path_edit(side, cx)));
     let bookmark_toggle = Button::new(format!("files-bookmark-toggle-{side}"))
         .compact()
-        .w(px(32.))
+        .w_8()
+        .when(compact_layout, |button| button.w_6())
         .h(px(32.))
         .when(current_path_is_bookmarked, Button::primary)
         .when(!current_path_is_bookmarked, Button::ghost)
@@ -1414,7 +1370,7 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
                         let navigate_entity = entity.clone();
                         let remove_entity = entity.clone();
                         menu = menu.item(
-                            PopupMenuItem::element(move |_, _| {
+                            PopupMenuItem::element(move |_, cx| {
                                 let remove_entity = remove_entity.clone();
                                 let remove_path = remove_path.clone();
                                 let path = display_path.clone();
@@ -1435,6 +1391,12 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
                                         Button::new(format!("files-bookmark-remove-{side}-{path}"))
                                             .compact()
                                             .ghost()
+                                            .custom(
+                                                ButtonCustomVariant::new(cx)
+                                                    .foreground(theme.error)
+                                                    .hover(theme.error.opacity(0.1))
+                                                    .active(theme.error.opacity(0.16)),
+                                            )
                                             .w(px(28.))
                                             .h(px(28.))
                                             .flex_shrink_0()
@@ -1472,7 +1434,8 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
     let follow = show_terminal_follow.then(|| {
         Button::new(format!("files-follow-terminal-{side}"))
             .compact()
-            .w(px(32.))
+            .w_8()
+            .when(compact_layout, |button| button.w_6())
             .h(px(32.))
             .outline()
             .when(follow_terminal_directory, Button::primary)
@@ -1490,7 +1453,8 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
     let setup_follow = (show_terminal_follow && can_setup_directory_follow).then(|| {
         Button::new(format!("files-setup-follow-terminal-{side}"))
             .compact()
-            .w(px(32.))
+            .w_8()
+            .when(compact_layout, |button| button.w_6())
             .h(px(32.))
             .ghost()
             .outline()
@@ -1521,30 +1485,31 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
         .child(div().w(px(1.)).h(px(20.)).bg(theme.border))
         .child(bookmark_menu_button);
 
-    let mut path_controls = div()
+    let path_controls = div()
         .w_full()
+        .min_w_0()
+        .h_10()
         .flex()
+        .flex_nowrap()
         .items_center()
-        .gap_2()
+        .gap_1()
+        .when(compact_layout, |bar| {
+            bar.px_2()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.tool_panel_surface)
+        })
         .child(path_field.flex_1())
-        .child(bookmark_control)
         .child(jump)
-        .when_some(follow, |bar, follow| bar.child(follow))
-        .when_some(setup_follow, |bar, setup| bar.child(setup));
-    if compact_layout {
-        path_controls = path_controls
-            .h(px(50.))
-            .px(px(10.))
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.tool_panel_surface);
-    }
+        .child(bookmark_control.flex_shrink_0())
+        .when_some(follow, |bar, follow| bar.child(follow.flex_shrink_0()))
+        .when_some(setup_follow, |bar, setup| bar.child(setup.flex_shrink_0()));
 
     div()
         .id(format!("files-path-bar-{side}"))
         .w_full()
-        .h(if compact_layout { px(66.) } else { px(48.) })
+        .h_12()
         .flex_shrink_0()
         .px(if compact_layout { px(8.) } else { px(12.) })
         .flex()
@@ -1554,332 +1519,6 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
         })
         .bg(theme.panel)
         .child(path_controls)
-        .into_any_element()
-}
-
-/// 工具只调用既有文件用例；创建动作保留对象文字，冲突策略收进传输菜单，危险色仅在删除确认时出现。
-///
-/// @author kongweiguang
-fn render_file_actions(
-    view: FileActionsView<'_>,
-    theme: ThemeTokens,
-    cx: &mut Context<FilesPane>,
-) -> AnyElement {
-    if view.compact_layout {
-        return render_compact_file_actions(view, theme, cx);
-    }
-    let FileActionsView {
-        side,
-        active,
-        copy_target_available,
-        transfer_submission_busy,
-        loading,
-        conflict_policy,
-        delete_confirmation,
-        endpoint,
-        selected,
-        selected_count,
-        has_remote_selection,
-        visible_count,
-        show_hidden_files,
-        view_mode,
-        can_go_back,
-        can_go_forward,
-        ..
-    } = view;
-    let has_selection = selected_count > 0;
-    let has_file =
-        selected_count == 1 && selected.is_some_and(|entry| entry.kind == FileEntryKind::File);
-    let delete_label = if !has_selection {
-        locale::text("请先选择要删除的项目", "Select an item before deleting")
-    } else if delete_confirmation {
-        locale::text("再次点击确认删除", "Click again to confirm deletion")
-    } else {
-        locale::text(
-            "删除所选项目；再次点击确认",
-            "Delete selected item; click again to confirm",
-        )
-    };
-    let copy_label = if !copy_target_available {
-        locale::text("请先选择右侧主机", "Select a host on the right first")
-    } else if has_selection {
-        if side == 0 {
-            locale::text("复制到右侧", "Copy to right panel")
-        } else {
-            locale::text("复制到左侧", "Copy to left panel")
-        }
-    } else {
-        locale::text("请先选择要复制的项目", "Select an item to copy")
-    };
-    let rename_label = if has_selection {
-        locale::text("重命名所选项目", "Rename selected item")
-    } else {
-        locale::text("请先选择要重命名的项目", "Select an item before renaming")
-    };
-    let can_upload = !matches!(endpoint, FileEndpoint::Local { .. });
-    let can_download = has_remote_selection;
-    let back = icon_button(
-        format!("files-back-{side}"),
-        IconName::ArrowLeft,
-        locale::text("返回上一个目录", "Go back to the previous directory"),
-        !can_go_back,
-    )
-    .w(px(32.))
-    .h(px(32.))
-    .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| pane.navigate_back(side, cx)));
-    let forward = icon_button(
-        format!("files-forward-{side}"),
-        IconName::ArrowRight,
-        locale::text("前进到下一个目录", "Go forward to the next directory"),
-        !can_go_forward,
-    )
-    .w(px(32.))
-    .h(px(32.))
-    .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| pane.navigate_forward(side, cx)));
-    let parent = icon_button(
-        format!("files-parent-{side}"),
-        IconName::ArrowUp,
-        locale::text("上级目录", "Parent directory"),
-        super::super::parent_endpoint(endpoint).is_none(),
-    )
-    .w(px(32.))
-    .h(px(32.))
-    .flex_shrink_0()
-    .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| pane.navigate_parent(side, cx)));
-    let refresh = icon_button(
-        format!("files-refresh-{side}"),
-        IconName::RefreshCw,
-        locale::text("刷新目录", "Refresh directory"),
-        loading,
-    )
-    .w(px(32.))
-    .h(px(32.))
-    .loading(loading)
-    .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| pane.refresh_panel(side, cx)));
-    let mut actions = div()
-        .id(format!("files-actions-{side}"))
-        .w_full()
-        .h(px(40.))
-        .flex_shrink_0()
-        .px_3()
-        .flex()
-        .items_center()
-        .gap_2()
-        .overflow_x_scroll()
-        .border_b_1()
-        .border_color(theme.border)
-        .bg(theme.panel)
-        .child(back)
-        .child(forward)
-        .child(parent)
-        .child(refresh)
-        .child(
-            icon_button(
-                format!("files-new-folder-{side}"),
-                IconName::Plus,
-                locale::text("新建文件夹", "New folder"),
-                false,
-            )
-            .label(locale::text("新建文件夹", "New folder"))
-            .w_auto()
-            .h(px(32.))
-            .on_click(cx.listener(move |pane, _: &ClickEvent, window, cx| {
-                pane.activate_side(side, cx);
-                pane.prepare_create_directory(window, cx);
-            })),
-        )
-        .child(
-            Button::new(format!("files-rename-{side}"))
-                .compact()
-                .flex_shrink_0()
-                .h(px(32.))
-                .ghost()
-                .text_size(theme.text_xs)
-                .label(locale::text("重命名", "Rename"))
-                .tooltip(rename_label)
-                .disabled(!has_selection)
-                .on_click(cx.listener(move |pane, _: &ClickEvent, window, cx| {
-                    pane.activate_side(side, cx);
-                    pane.prepare_rename(window, cx);
-                })),
-        )
-        .child(
-            icon_button(
-                format!("files-delete-{side}"),
-                IconName::Delete,
-                delete_label,
-                !has_selection,
-            )
-            .w(px(32.))
-            .h(px(32.))
-            .when(delete_confirmation, Button::danger)
-            .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
-                pane.activate_side(side, cx);
-                pane.delete_selected(cx);
-            })),
-        )
-        .child(div().w(px(1.)).h(px(16.)).flex_shrink_0().bg(theme.border))
-        .child(
-            icon_button(
-                format!("files-copy-to-other-{side}"),
-                if side == 0 {
-                    IconName::ArrowRight
-                } else {
-                    IconName::ArrowLeft
-                },
-                if transfer_submission_busy {
-                    locale::text("正在准备传输…", "Preparing transfer…")
-                } else {
-                    copy_label
-                },
-                !copy_target_available || !has_selection || transfer_submission_busy,
-            )
-            .w(px(32.))
-            .h(px(32.))
-            .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
-                pane.activate_side(side, cx);
-                pane.transfer_selected(cx);
-            })),
-        );
-
-    if can_upload {
-        actions = actions.child(
-            icon_button(
-                "files-upload-current",
-                IconName::ArrowUp,
-                if transfer_submission_busy {
-                    locale::text("正在准备传输…", "Preparing transfer…")
-                } else {
-                    locale::text(
-                        "从本机选择文件传入此目录",
-                        "Choose local files to upload here",
-                    )
-                },
-                transfer_submission_busy,
-            )
-            .w(px(32.))
-            .h(px(32.))
-            .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
-                pane.activate_side(side, cx);
-                pane.prompt_upload(cx);
-            })),
-        );
-    }
-
-    actions = actions.child(
-        icon_button(
-            format!("files-toggle-hidden-{side}"),
-            if show_hidden_files {
-                IconName::Eye
-            } else {
-                IconName::EyeOff
-            },
-            if show_hidden_files {
-                locale::text("隐藏点文件", "Hide dotfiles")
-            } else {
-                locale::text("显示点文件", "Show dotfiles")
-            },
-            false,
-        )
-        .w(px(32.))
-        .h(px(32.))
-        .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| pane.toggle_hidden_files(cx))),
-    );
-
-    if can_upload {
-        actions = actions.child(
-            icon_button(
-                format!("files-download-{side}"),
-                IconName::ArrowDown,
-                if transfer_submission_busy {
-                    locale::text("正在准备传输…", "Preparing transfer…")
-                } else {
-                    locale::text(
-                        "下载所选项目到本机",
-                        "Download selected item to this device",
-                    )
-                },
-                transfer_submission_busy || !can_download,
-            )
-            .w(px(32.))
-            .h(px(32.))
-            .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
-                pane.activate_side(side, cx);
-                pane.prompt_download(cx);
-            })),
-        );
-    }
-
-    if active {
-        actions = actions.child(render_conflict_policy_menu(
-            side,
-            conflict_policy,
-            theme,
-            cx,
-        ));
-    }
-
-    let editor_tooltip = if has_file {
-        locale::text("在编辑器中打开", "Open in editor")
-    } else if has_selection {
-        locale::text(
-            "仅普通文件可在编辑器中打开",
-            "Only regular files can open in the editor",
-        )
-    } else {
-        locale::text(
-            "选择文件后在编辑器中打开",
-            "Select a file to open in the editor",
-        )
-    };
-    let open_editor_button = icon_button_without_tooltip(
-        format!("files-open-editor-{side}"),
-        IconName::FileText,
-        editor_tooltip.clone(),
-        !has_file,
-    )
-    .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
-        pane.activate_side(side, cx);
-        if let Some(entry) = pane.panels[side].selected.as_ref()
-            && entry.kind == FileEntryKind::File
-        {
-            cx.emit(super::super::OpenFileRequested {
-                endpoint: entry.endpoint.clone(),
-            });
-        }
-    }));
-    actions
-        .child(
-            div()
-                .id(format!("files-open-editor-tooltip-{side}"))
-                .w(px(32.))
-                .h(px(32.))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .tooltip(move |window, cx| Tooltip::new(editor_tooltip.clone()).build(window, cx))
-                .child(open_editor_button),
-        )
-        .child(div().flex_1().min_w(px(8.)))
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(if selected_count == 0 {
-                    locale::text(
-                        format!("{visible_count} 项"),
-                        format!("{visible_count} items"),
-                    )
-                } else {
-                    locale::text(
-                        format!("已选 {selected_count} / {visible_count}"),
-                        format!("{selected_count} / {visible_count} selected"),
-                    )
-                }),
-        )
-        .child(render_file_view_controls(side, view_mode, theme, cx))
         .into_any_element()
 }
 
@@ -1894,77 +1533,82 @@ fn compact_toolbar_button(button: Button, theme: ThemeTokens, disabled: bool) ->
         .when(disabled, |button| button.opacity(0.45))
 }
 
-/// 紧凑栏按 main 顺序展示操作；路径外壳留出 main 的上下间距，按钮继续使用 32px 点击区。
+/// 宽窄工作台共用 main 的高频动作条：上级、刷新、隐藏、上传、新建、传输、计数和更多。
+/// 历史、改名和删除等次要命令留在“…”菜单；路径外壳与 32px 点击区在两种布局保持一致。
+/// 两种布局始终只显示当前投影项数；类型、树展开范围和已选数在悬停说明中明确区分。
 ///
 /// @author kongweiguang
-fn render_compact_file_actions(
+fn render_file_actions(
     view: FileActionsView<'_>,
     theme: ThemeTokens,
     cx: &mut Context<FilesPane>,
 ) -> AnyElement {
     let FileActionsView {
         side,
+        copy_target_available,
+        copy_target_rejection,
         transfer_submission_busy,
         loading,
         endpoint,
         selected_count,
+        has_transferable_selection,
         has_remote_selection,
         visible_count,
-        total_entry_count,
+        entry_filter,
+        compact_layout,
         show_hidden_files,
         view_mode,
         ..
     } = view;
     let can_upload = !matches!(endpoint, FileEndpoint::Local { .. });
 
-    let mode_entity = cx.entity().clone();
-    let more = compact_toolbar_button(
-        Button::new(format!("files-view-mode-{side}")).compact(),
-        theme,
-        false,
-    )
-    .w(px(32.))
-    .h(px(32.))
-    .flex_shrink_0()
-    .icon(IconName::Ellipsis)
-    .tooltip(locale::text("切换文件视图", "Switch file view"))
-    .accessibility_label(locale::text("切换文件视图", "Switch file view"))
-    .debug_selector(|| "rr-files-view-menu".into())
-    .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, _, _| {
-        menu = crate::ui_popup::file_view_menu(menu, theme);
-        for (mode, label) in [
-            (
-                super::super::view_mode::FilesViewMode::List,
-                locale::text("列表模式", "List mode"),
-            ),
-            (
-                super::super::view_mode::FilesViewMode::Tree,
-                locale::text("树形模式", "Tree mode"),
-            ),
-            (
-                super::super::view_mode::FilesViewMode::Workspace,
-                locale::text("工作区模式", "Workspace mode"),
-            ),
-        ] {
-            let action_entity = mode_entity.clone();
-            menu = menu.item(
-                PopupMenuItem::new(label)
-                    .icon(match mode {
-                        super::super::view_mode::FilesViewMode::List => AssetIconName::List,
-                        super::super::view_mode::FilesViewMode::Tree => AssetIconName::ListTree,
-                        super::super::view_mode::FilesViewMode::Workspace => {
-                            AssetIconName::PanelRight
-                        }
-                    })
-                    .checked(view_mode == mode)
-                    .on_click(move |_, _, app| {
-                        action_entity.update(app, |pane, cx| pane.set_file_view_mode(mode, cx));
-                    }),
-            );
-        }
-        menu
-    })
-    .offset(px(6.));
+    let more_view = view;
+    let more: AnyElement = if !compact_layout {
+        render_file_more_menu(more_view, theme, cx).into_any_element()
+    } else {
+        let mode_entity = cx.entity().clone();
+        compact_toolbar_button(
+            Button::new(format!("files-view-mode-{side}")).compact(),
+            theme,
+            false,
+        )
+        .w(px(32.))
+        .h(px(32.))
+        .flex_shrink_0()
+        .icon(IconName::Ellipsis)
+        .tooltip(locale::text("切换文件视图", "Switch file view"))
+        .accessibility_label(locale::text("切换文件视图", "Switch file view"))
+        .debug_selector(|| "rr-files-view-menu".into())
+        .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, _, _| {
+            menu = crate::ui_popup::file_view_menu(menu, theme);
+            for (mode, label) in [
+                (
+                    super::super::view_mode::FilesViewMode::List,
+                    locale::text("列表模式", "List mode"),
+                ),
+                (
+                    super::super::view_mode::FilesViewMode::Tree,
+                    locale::text("树形模式", "Tree mode"),
+                ),
+            ] {
+                let action_entity = mode_entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(label)
+                        .icon(match mode {
+                            super::super::view_mode::FilesViewMode::List => AssetIconName::List,
+                            super::super::view_mode::FilesViewMode::Tree => AssetIconName::ListTree,
+                        })
+                        .checked(view_mode == mode)
+                        .on_click(move |_, _, app| {
+                            action_entity.update(app, |pane, cx| pane.set_file_view_mode(mode, cx));
+                        }),
+                );
+            }
+            menu
+        })
+        .offset(px(6.))
+        .into_any_element()
+    };
 
     let parent_disabled = super::super::parent_endpoint(endpoint).is_none();
     let parent = icon_button(
@@ -1985,30 +1629,40 @@ fn render_compact_file_actions(
         locale::text("刷新目录", "Refresh directory"),
         refresh_disabled,
     );
-    let refresh = compact_toolbar_button(refresh, theme, refresh_disabled)
+    let refresh = compact_toolbar_button(refresh, theme, false)
         .w(px(32.))
         .h(px(32.))
         .flex_shrink_0()
         .loading(refresh_disabled)
+        .loading_icon(IconName::RefreshCw)
         .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| pane.refresh_panel(side, cx)));
 
-    let count_label = if loading {
-        locale::text("刷新中", "Refreshing")
-    } else if selected_count == 0 {
-        locale::text(
-            format!("{visible_count} / {total_entry_count} 项"),
-            format!("{visible_count} / {total_entry_count} items"),
-        )
+    let count_scope = if view_mode == super::super::view_mode::FilesViewMode::Tree {
+        locale::text("展开项数：", "Expanded items: ")
     } else {
-        locale::text(
-            format!("{visible_count} / {total_entry_count} 项 · 已选 {selected_count}"),
-            format!("{visible_count} / {total_entry_count} items · {selected_count} selected"),
-        )
+        match entry_filter {
+            super::super::view_mode::FileEntryFilter::All => {
+                locale::text("当前显示项数：", "Visible items: ")
+            }
+            super::super::view_mode::FileEntryFilter::Files => {
+                locale::text("显示文件数：", "Visible files: ")
+            }
+            super::super::view_mode::FileEntryFilter::Directories => {
+                locale::text("显示目录数：", "Visible folders: ")
+            }
+        }
     };
-    let count_tooltip = count_label.clone();
+    let count_tooltip: SharedString = if selected_count == 0 {
+        format!("{count_scope}{visible_count}").into()
+    } else {
+        let selection_scope = locale::text(" · 已选项数：", " · Selected items: ");
+        format!("{count_scope}{visible_count}{selection_scope}{selected_count}").into()
+    };
+    let count_label: SharedString = visible_count.to_string().into();
 
     let mut actions = div()
         .id(format!("files-actions-{side}"))
+        .debug_selector(move || format!("rr-files-actions-{side}"))
         .w_full()
         .min_h(px(40.))
         .flex_shrink_0()
@@ -2122,11 +1776,60 @@ fn render_compact_file_actions(
             pane.prepare_create_directory(window, cx);
         })),
     );
-    if can_upload {
+    if compact_layout {
+        if can_upload {
+            actions = actions.child(
+                div()
+                    .id(format!("files-download-divider-{side}"))
+                    .debug_selector(move || format!("files-download-divider-{side}"))
+                    .w(px(1.))
+                    .h(px(16.))
+                    .flex_shrink_0()
+                    .bg(theme.border),
+            );
+            actions = actions.child(
+                compact_toolbar_button(
+                    icon_button(
+                        format!("files-download-{side}"),
+                        IconName::ArrowDown,
+                        locale::text("下载所选项目", "Download selected items"),
+                        transfer_submission_busy || !has_remote_selection,
+                    ),
+                    theme,
+                    transfer_submission_busy || !has_remote_selection,
+                )
+                .w(px(32.))
+                .h(px(32.))
+                .flex_shrink_0()
+                .debug_selector(move || format!("files-download-{side}"))
+                .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
+                    pane.activate_side(side, cx);
+                    pane.prompt_download(cx);
+                })),
+            );
+        }
+    } else {
+        let copy_label = if !copy_target_available {
+            locale::text("对侧目录尚未就绪", "The opposite directory is not ready")
+        } else if let Some(reason) = copy_target_rejection {
+            drop_rejection_message(reason).into()
+        } else if has_transferable_selection {
+            if side == 0 {
+                locale::text("复制到右侧", "Copy to right panel")
+            } else {
+                locale::text("复制到左侧", "Copy to left panel")
+            }
+        } else {
+            locale::text("请先选择要复制的项目", "Select an item to copy")
+        };
+        let copy_disabled = !copy_target_available
+            || copy_target_rejection.is_some()
+            || !has_transferable_selection
+            || transfer_submission_busy;
         actions = actions.child(
             div()
-                .id(format!("files-download-divider-{side}"))
-                .debug_selector(move || format!("files-download-divider-{side}"))
+                .id(format!("files-transfer-divider-{side}"))
+                .debug_selector(move || format!("files-transfer-divider-{side}"))
                 .w(px(1.))
                 .h(px(16.))
                 .flex_shrink_0()
@@ -2135,37 +1838,47 @@ fn render_compact_file_actions(
         actions = actions.child(
             compact_toolbar_button(
                 icon_button(
-                    format!("files-download-{side}"),
-                    IconName::ArrowDown,
-                    locale::text("下载所选项目", "Download selected items"),
-                    transfer_submission_busy || !has_remote_selection,
+                    format!("files-copy-to-other-{side}"),
+                    if side == 0 {
+                        IconName::ArrowRight
+                    } else {
+                        IconName::ArrowLeft
+                    },
+                    if transfer_submission_busy {
+                        locale::text("正在准备传输…", "Preparing transfer…")
+                    } else {
+                        copy_label
+                    },
+                    copy_disabled,
                 ),
                 theme,
-                transfer_submission_busy || !has_remote_selection,
+                copy_disabled,
             )
             .w(px(32.))
             .h(px(32.))
             .flex_shrink_0()
-            .debug_selector(move || format!("files-download-{side}"))
+            .debug_selector(move || format!("files-copy-to-other-{side}"))
             .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
                 pane.activate_side(side, cx);
-                pane.prompt_download(cx);
+                pane.transfer_selected(cx);
             })),
         );
     }
     actions
+        .child(div().flex_1().min_w(px(0.)))
         .child(
             div()
                 .id(format!("files-toolbar-count-{side}"))
+                .debug_selector(move || format!("files-toolbar-count-{side}"))
                 .w_auto()
                 .min_w(px(0.))
-                .max_w(px(120.))
-                .flex_1()
+                .max_w(px(160.))
                 .overflow_hidden()
+                .whitespace_nowrap()
                 .text_ellipsis()
                 .text_size(theme.text_xs)
                 .text_color(theme.subtle)
-                .aria_label(count_label.clone())
+                .aria_label(count_tooltip.clone())
                 .tooltip(move |window, cx| Tooltip::new(count_tooltip.clone()).build(window, cx))
                 .child(count_label),
         )
@@ -2214,79 +1927,6 @@ fn upload_menu_item(
             )
     })
     .on_click(on_click)
-}
-
-/// 将冲突策略放在可识别的传输偏好菜单中，所选值仍只影响之后加入队列的任务。
-///
-/// @author kongweiguang
-fn render_conflict_policy_menu(
-    side: usize,
-    selected: ConflictPolicy,
-    theme: ThemeTokens,
-    cx: &mut Context<FilesPane>,
-) -> impl IntoElement {
-    let policy_name = match selected {
-        ConflictPolicy::Rename => locale::text("重命名", "Rename"),
-        ConflictPolicy::Skip => locale::text("跳过", "Skip"),
-        ConflictPolicy::Overwrite => locale::text("覆盖", "Overwrite"),
-    };
-    let trigger_label = locale::text(
-        format!("传输 · {policy_name}"),
-        format!("Transfer · {policy_name}"),
-    );
-    let entity = cx.entity().clone();
-
-    Button::new(format!("files-transfer-preferences-{side}"))
-        .compact()
-        .ghost()
-        .h(px(32.))
-        .flex_shrink_0()
-        .text_size(theme.text_xs)
-        .icon(IconName::Settings2)
-        .label(trigger_label.clone())
-        .tooltip(locale::text(
-            format!("冲突策略：{policy_name}；只影响之后加入的任务。"),
-            format!("Conflict policy: {policy_name}; applies only to newly queued tasks."),
-        ))
-        .accessibility_label(trigger_label)
-        .dropdown_menu(move |mut menu, _, _| {
-            menu = crate::ui_popup::dropdown_menu(menu, theme);
-            menu = menu
-                .item(
-                    PopupMenuItem::label(locale::text(
-                        "以下设置只影响之后加入的任务",
-                        "These settings apply only to newly queued tasks",
-                    ))
-                    .disabled(true),
-                )
-                .item(PopupMenuItem::separator());
-
-            for (policy, label) in [
-                (
-                    ConflictPolicy::Rename,
-                    locale::text("重命名同名项（默认）", "Rename conflicts (default)"),
-                ),
-                (
-                    ConflictPolicy::Skip,
-                    locale::text("跳过同名项", "Skip conflicts"),
-                ),
-                (
-                    ConflictPolicy::Overwrite,
-                    locale::text("覆盖文件；合并目录", "Overwrite files; merge folders"),
-                ),
-            ] {
-                let entity = entity.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(label)
-                        .checked(policy == selected)
-                        .on_click(move |_, _, app| {
-                            entity.update(app, |pane, cx| pane.set_conflict_policy(policy, cx));
-                        }),
-                );
-            }
-            menu
-        })
-        .offset(px(6.))
 }
 
 /// 表头与目录行共享固定元数据宽度；紧凑右栏跟随 main 的本机时间格式，中央工作区保留 UTC 标示。
@@ -2387,95 +2027,6 @@ fn render_table_heading(
     heading
 }
 
-/// 类型计数按当前可见目录快照计算；过滤切换只改变列表投影，不触发额外目录请求。
-///
-/// @author kongweiguang
-fn render_file_kind_filter(
-    side: usize,
-    selected: super::super::view_mode::FileEntryFilter,
-    all_count: usize,
-    file_count: usize,
-    directory_count: usize,
-    theme: ThemeTokens,
-    cx: &mut Context<FilesPane>,
-) -> impl IntoElement {
-    div()
-        .id(format!("files-filter-{side}"))
-        .w_full()
-        .h(px(32.))
-        .px_2()
-        .flex()
-        .items_center()
-        .gap_1()
-        .border_b_1()
-        .border_color(theme.border)
-        .bg(theme.panel)
-        .child(render_file_kind_filter_button(
-            side,
-            super::super::view_mode::FileEntryFilter::All,
-            selected,
-            locale::text(format!("全部 {all_count}"), format!("All {all_count}")),
-            locale::text(
-                format!("显示全部 {all_count} 项"),
-                format!("Show all {all_count} items"),
-            ),
-            theme,
-            cx,
-        ))
-        .child(render_file_kind_filter_button(
-            side,
-            super::super::view_mode::FileEntryFilter::Files,
-            selected,
-            locale::text(format!("文件 {file_count}"), format!("Files {file_count}")),
-            locale::text(
-                format!("只显示 {file_count} 个文件"),
-                format!("Show only {file_count} files"),
-            ),
-            theme,
-            cx,
-        ))
-        .child(render_file_kind_filter_button(
-            side,
-            super::super::view_mode::FileEntryFilter::Directories,
-            selected,
-            locale::text(
-                format!("目录 {directory_count}"),
-                format!("Folders {directory_count}"),
-            ),
-            locale::text(
-                format!("只显示 {directory_count} 个目录"),
-                format!("Show only {directory_count} folders"),
-            ),
-            theme,
-            cx,
-        ))
-}
-
-/// 每个计数按钮保留键盘语义并沿用 Kit 的浅深主题按钮状态。
-///
-/// @author kongweiguang
-fn render_file_kind_filter_button(
-    side: usize,
-    filter: super::super::view_mode::FileEntryFilter,
-    selected: super::super::view_mode::FileEntryFilter,
-    label: gpui_kit::SharedString,
-    accessibility_label: gpui_kit::SharedString,
-    theme: ThemeTokens,
-    cx: &mut Context<FilesPane>,
-) -> Button {
-    let active = filter == selected;
-    Button::new(format!("files-filter-{side}-{filter:?}"))
-        .compact()
-        .text_size(theme.text_xs)
-        .when(active, Button::primary)
-        .when(!active, Button::ghost)
-        .label(label)
-        .accessibility_label(accessibility_label)
-        .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
-            pane.set_file_entry_filter(side, filter, cx)
-        }))
-}
-
 /// 可排序表头提供鼠标与键盘入口，并用方向符号说明当前顺序。
 ///
 /// @author kongweiguang
@@ -2531,7 +2082,7 @@ fn sortable_heading(view: SortableHeadingView, cx: &mut Context<FilesPane>) -> i
 }
 
 /// 元数据列挤压文件名时保留完整名称提示；紧凑行跟随 main 的本机时间，中央工作区继续显示 UTC。
-/// 实际行与虚拟列表共用同一密度行高，防止滚动几何错位。
+/// 实际行与虚拟列表共用同一密度行高，防止滚动几何错位；右键仅保留直接作用于文件的常用命令。
 ///
 /// @author kongweiguang
 fn render_entry(view: FileEntryRowView, cx: &mut Context<FilesPane>) -> AnyElement {
@@ -2577,20 +2128,26 @@ fn render_entry(view: FileEntryRowView, cx: &mut Context<FilesPane>) -> AnyEleme
     let modified_tooltip = format_file_modified_tooltip(&entry, compact_layout);
     let name = entry.name.clone();
     let name_tooltip = name.clone();
-    let context_entry = entry.clone();
-    let can_change_permissions =
-        matches!(entry.kind, FileEntryKind::File | FileEntryKind::Directory)
-            && entry.permissions.is_some()
-            && super::super::permissions::supports_posix_mode_endpoint(&entry.endpoint);
     let context_entity = cx.entity().clone();
-    let context_names = Arc::clone(&ordered_names);
-    let context_selected_entries = Arc::clone(&selected_drag_entries);
-    let context_multi_selection = selected && context_selected_entries.len() > 1;
-    let context_directory = source_directory.clone();
-    let context_generation = source_generation;
+    let context_snapshot = FileMenuSnapshot {
+        side,
+        generation: source_generation,
+        directory: source_directory.clone(),
+        show_hidden: show_hidden_files,
+        target: FileMenuTarget::List {
+            entry: entry.clone(),
+            selected: Arc::clone(&selected_drag_entries),
+            row_selected: selected,
+            ordered_names: Arc::clone(&ordered_names),
+        },
+    };
     let accessible_name = format!("{}, {}", entry.name, accessible_kind);
     let row_selector = format!("files-row-{side}-{name}");
-    let row_debug_selector = row_selector.clone();
+    let row_debug_selector = if compact_layout {
+        row_selector.clone()
+    } else {
+        format!("central-files-row-{side}-{name}")
+    };
     let click_entry = entry.clone();
     let double_click_entry = entry.clone();
     let click_names = Arc::clone(&ordered_names);
@@ -2699,6 +2256,7 @@ fn render_entry(view: FileEntryRowView, cx: &mut Context<FilesPane>) -> AnyEleme
     if matches!(entry.kind, FileEntryKind::File | FileEntryKind::Directory) {
         let drag_payload = if selected {
             FileTransferDrag::new(
+                cx.entity_id().as_u64(),
                 side,
                 source_directory,
                 source_generation,
@@ -2706,12 +2264,25 @@ fn render_entry(view: FileEntryRowView, cx: &mut Context<FilesPane>) -> AnyEleme
                 0,
             )
         } else {
-            FileTransferDrag::single(side, source_directory, source_generation, entry)
+            FileTransferDrag::single(
+                cx.entity_id().as_u64(),
+                side,
+                source_directory,
+                source_generation,
+                entry,
+            )
         };
-        row = row.on_drag(drag_payload, move |payload, _, _, app| {
+        row = row.on_drag(drag_payload, move |payload, cursor_offset, _, app| {
             let count = payload.selected_count();
-            app.new(move |_| FileDragPreview::new(count, theme))
+            app.new(move |_| FileDragPreview::new(count, cursor_offset, theme))
         });
+        #[cfg(target_os = "windows")]
+        {
+            let drag_entity = cx.entity().clone();
+            row = row.external_drag_payload(move |drag: &FileTransferDrag, _, app| {
+                drag_entity.update(app, |pane, cx| pane.external_drag_payload(drag, cx))
+            });
+        }
     }
     if columns.permissions {
         row = row.child(
@@ -2754,540 +2325,16 @@ fn render_entry(view: FileEntryRowView, cx: &mut Context<FilesPane>) -> AnyEleme
                 .child(modified),
         );
     }
-    row.context_menu(move |mut menu, _, _| {
-        menu = crate::ui_popup::context_menu(menu, theme, None);
-        if context_multi_selection {
-            let transferable_count = context_selected_entries
-                .iter()
-                .filter(|entry| {
-                    matches!(
-                        entry.kind,
-                        FileEntryKind::File | FileEntryKind::Directory | FileEntryKind::Symlink
-                    ) && !matches!(&entry.endpoint, FileEndpoint::Local { .. })
-                })
-                .count();
-            let selected_count = context_selected_entries.len();
-            let action_entity = context_entity.clone();
-            let action_selection = Arc::clone(&context_selected_entries);
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text(
-                    if transferable_count == selected_count {
-                        format!("下载选中 {selected_count} 项")
-                    } else {
-                        format!("下载可传输 {transferable_count} 项")
-                    },
-                    if transferable_count == selected_count {
-                        format!("Download {selected_count} selected items")
-                    } else {
-                        format!("Download {transferable_count} transferable items")
-                    },
-                ))
-                .icon(Icon::new(AssetIconName::Download))
-                .disabled(transferable_count == 0)
-                .on_click(move |_, _, app| {
-                    action_entity.update(app, |pane, cx| {
-                        if select_context_selection(
-                            pane,
-                            side,
-                            &action_selection,
-                            context_generation,
-                            &action_directory,
-                            cx,
-                        ) {
-                            pane.prompt_download(cx);
-                        }
-                    });
-                }),
-            );
-            menu = menu.item(PopupMenuItem::separator());
-
-            let action_entity = context_entity.clone();
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text("刷新目录", "Refresh directory"))
-                    .icon(IconName::RefreshCw)
-                    .on_click(move |_, _, app| {
-                        action_entity.update(app, |pane, cx| {
-                            if pane.browser_action_snapshot_is_current(
-                                side,
-                                context_generation,
-                                &action_directory,
-                            ) {
-                                pane.refresh_panel(side, cx);
-                            }
-                        });
-                    }),
-            );
-
-            let action_entity = context_entity.clone();
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(if show_hidden_files {
-                    locale::text("隐藏隐藏文件", "Hide hidden files")
-                } else {
-                    locale::text("显示隐藏文件", "Show hidden files")
-                })
-                .icon(if show_hidden_files {
-                    IconName::EyeOff
-                } else {
-                    IconName::Eye
-                })
-                .checked(show_hidden_files)
-                .on_click(move |_, _, app| {
-                    action_entity.update(app, |pane, cx| {
-                        if pane.browser_action_snapshot_is_current(
-                            side,
-                            context_generation,
-                            &action_directory,
-                        ) {
-                            pane.toggle_hidden_files(cx);
-                        }
-                    });
-                }),
-            );
-            menu = menu.item(PopupMenuItem::separator());
-
-            let action_entity = context_entity.clone();
-            let action_selection = Arc::clone(&context_selected_entries);
-            let action_directory = context_directory.clone();
-            return menu.item(
-                PopupMenuItem::new(locale::text(
-                    format!("删除选中 {selected_count} 项"),
-                    format!("Delete {selected_count} selected items"),
-                ))
-                .icon(Icon::new(AssetIconName::Trash))
-                .on_click(move |_, _, app| {
-                    action_entity.update(app, |pane, cx| {
-                        if select_context_selection(
-                            pane,
-                            side,
-                            &action_selection,
-                            context_generation,
-                            &action_directory,
-                            cx,
-                        ) {
-                            pane.delete_selected(cx);
-                        }
-                    });
-                }),
-            );
-        }
-
-        if context_entry.kind == FileEntryKind::Directory {
-            let action_entry = context_entry.clone();
-            let action_entity = context_entity.clone();
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text("打开", "Open"))
-                    .icon(IconName::FolderOpen)
-                    .on_click(move |_, _, app| {
-                        action_entity.update(app, |pane, cx| {
-                            if pane.browser_action_snapshot_is_current(
-                                side,
-                                context_generation,
-                                &action_directory,
-                            ) {
-                                pane.open_entry(side, action_entry.clone(), cx);
-                            }
-                        });
-                    }),
-            );
-            let action_entry = context_entry.clone();
-            let action_entity = context_entity.clone();
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text("工作区打开", "Open in workspace"))
-                    .icon(Icon::new(AssetIconName::FileSearch))
-                    .on_click(move |_, _, app| {
-                        action_entity.update(app, |pane, cx| {
-                            if pane.browser_action_snapshot_is_current(
-                                side,
-                                context_generation,
-                                &action_directory,
-                            ) {
-                                pane.activate_side(side, cx);
-                                pane.load_panel_at(side, action_entry.endpoint.clone(), cx);
-                                pane.set_file_view_mode(
-                                    super::super::view_mode::FilesViewMode::Workspace,
-                                    cx,
-                                );
-                            }
-                        });
-                    }),
-            );
-        } else {
-            let action_entity = context_entity.clone();
-            let action_entry = context_entry.clone();
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text("打开编辑器", "Open in editor"))
-                    .icon(Icon::new(AssetIconName::FileSearch))
-                    .disabled(context_entry.kind != FileEntryKind::File)
-                    .on_click(move |_, _, app| {
-                        action_entity.update(app, |pane, cx| {
-                            if pane.browser_action_snapshot_is_current(
-                                side,
-                                context_generation,
-                                &action_directory,
-                            ) {
-                                cx.emit(super::super::OpenFileRequested {
-                                    endpoint: action_entry.endpoint.clone(),
-                                });
-                            }
-                        });
-                    }),
-            );
-        }
-
-        let action_entry = context_entry.clone();
-        let action_entity = context_entity.clone();
-        let action_names = Arc::clone(&context_names);
-        let action_directory = context_directory.clone();
-        menu = menu.item(
-            PopupMenuItem::new(locale::text(
-                if context_entry.kind == FileEntryKind::Directory {
-                    "下载文件夹"
-                } else {
-                    "下载"
-                },
-                if context_entry.kind == FileEntryKind::Directory {
-                    "Download folder"
-                } else {
-                    "Download"
-                },
-            ))
-            .icon(Icon::new(AssetIconName::Download))
-            .disabled(
-                matches!(&context_entry.endpoint, FileEndpoint::Local { .. })
-                    || !matches!(
-                        context_entry.kind,
-                        FileEntryKind::File | FileEntryKind::Directory | FileEntryKind::Symlink
-                    ),
-            )
-            .on_click(move |_, _, app| {
-                action_entity.update(app, |pane, cx| {
-                    if select_context_entry(
-                        pane,
-                        side,
-                        action_entry.clone(),
-                        &action_names,
-                        context_generation,
-                        &action_directory,
-                        cx,
-                    ) {
-                        pane.prompt_download(cx);
-                    }
-                });
-            }),
-        );
-
-        if matches!(&context_entry.endpoint, FileEndpoint::Remote { .. }) {
-            let action_entry = context_entry.clone();
-            let action_entity = context_entity.clone();
-            let action_names = Arc::clone(&context_names);
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text("下载到剪贴板", "Download to clipboard"))
-                    .icon(Icon::new(AssetIconName::Download))
-                    .disabled(!matches!(
-                        context_entry.kind,
-                        FileEntryKind::File | FileEntryKind::Directory | FileEntryKind::Symlink
-                    ))
-                    .on_click(move |_, _, app| {
-                        action_entity.update(app, |pane, cx| {
-                            if select_context_entry(
-                                pane,
-                                side,
-                                action_entry.clone(),
-                                &action_names,
-                                context_generation,
-                                &action_directory,
-                                cx,
-                            ) {
-                                pane.request_remote_files_to_system_clipboard(
-                                    side,
-                                    Some(action_entry.clone()),
-                                    cx,
-                                );
-                            }
-                        });
-                    }),
-            );
-        }
-
-        if context_entry.kind == FileEntryKind::Directory
-            && !matches!(&context_entry.endpoint, FileEndpoint::Local { .. })
-        {
-            let action_entity = context_entity.clone();
-            let action_endpoint = context_entry.endpoint.clone();
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text(
-                    "上传文件到此目录",
-                    "Upload files into this folder",
-                ))
-                .icon(Icon::new(AssetIconName::Upload))
-                .on_click(move |_, _, app| {
-                    action_entity.update(app, |pane, cx| {
-                        if pane.browser_action_snapshot_is_current(
-                            side,
-                            context_generation,
-                            &action_directory,
-                        ) {
-                            pane.prompt_upload_files_to(action_endpoint.clone(), cx);
-                        }
-                    });
-                }),
-            );
-
-            let action_entity = context_entity.clone();
-            let action_endpoint = context_entry.endpoint.clone();
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text(
-                    "上传文件夹到此目录",
-                    "Upload folders into this folder",
-                ))
-                .icon(Icon::new(AssetIconName::FolderPlus))
-                .on_click(move |_, _, app| {
-                    action_entity.update(app, |pane, cx| {
-                        if pane.browser_action_snapshot_is_current(
-                            side,
-                            context_generation,
-                            &action_directory,
-                        ) {
-                            pane.prompt_upload_directories_to(action_endpoint.clone(), cx);
-                        }
-                    });
-                }),
-            );
-
-            if matches!(&context_entry.endpoint, FileEndpoint::Remote { .. }) {
-                let action_entity = context_entity.clone();
-                let action_endpoint = context_entry.endpoint.clone();
-                let action_directory = context_directory.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(locale::text("粘贴到此目录", "Paste into this folder"))
-                        .icon(Icon::new(AssetIconName::ClipboardPaste))
-                        .on_click(move |_, _, app| {
-                            action_entity.update(app, |pane, cx| {
-                                if pane.browser_action_snapshot_is_current(
-                                    side,
-                                    context_generation,
-                                    &action_directory,
-                                ) {
-                                    pane.paste_remote_clipboard(action_endpoint.clone(), cx);
-                                }
-                            });
-                        }),
-                );
-            }
-        }
-
-        menu = menu.item(PopupMenuItem::separator());
-        if matches!(&context_entry.endpoint, FileEndpoint::Remote { .. }) {
-            let action_entry = context_entry.clone();
-            let action_entity = context_entity.clone();
-            let action_names = Arc::clone(&context_names);
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text("复制项目", "Copy item"))
-                    .icon(IconName::Copy)
-                    .on_click(move |_, _, app| {
-                        action_entity.update(app, |pane, cx| {
-                            if select_context_entry(
-                                pane,
-                                side,
-                                action_entry.clone(),
-                                &action_names,
-                                context_generation,
-                                &action_directory,
-                                cx,
-                            ) {
-                                pane.copy_to_remote_clipboard(side, Some(action_entry.clone()), cx);
-                            }
-                        });
-                    }),
-            );
-        }
-
-        let action_entity = context_entity.clone();
-        let action_endpoint = context_entry.endpoint.clone();
-        let action_directory = context_directory.clone();
-        menu = menu.item(
-            PopupMenuItem::new(locale::text("复制路径", "Copy path"))
-                .icon(IconName::Copy)
-                .on_click(move |_, _, app| {
-                    action_entity.update(app, |pane, cx| {
-                        if pane.browser_action_snapshot_is_current(
-                            side,
-                            context_generation,
-                            &action_directory,
-                        ) {
-                            pane.copy_path_to_clipboard(&action_endpoint, cx);
-                        }
-                    });
-                }),
-        );
-
-        let action_entry = context_entry.clone();
-        let action_entity = context_entity.clone();
-        let action_names = Arc::clone(&context_names);
-        let action_directory = context_directory.clone();
-        menu = menu.item(
-            PopupMenuItem::new(locale::text("重命名", "Rename"))
-                .icon(Icon::new(AssetIconName::Pencil))
-                .on_click(move |_, window, app| {
-                    action_entity.update(app, |pane, cx| {
-                        if select_context_entry(
-                            pane,
-                            side,
-                            action_entry.clone(),
-                            &action_names,
-                            context_generation,
-                            &action_directory,
-                            cx,
-                        ) {
-                            pane.prepare_rename(window, cx);
-                        }
-                    });
-                }),
-        );
-
-        if can_change_permissions {
-            let action_entry = context_entry.clone();
-            let action_entity = context_entity.clone();
-            let action_names = Arc::clone(&context_names);
-            let action_directory = context_directory.clone();
-            menu = menu.item(
-                PopupMenuItem::new(locale::text("修改权限", "Change permissions"))
-                    .icon(Icon::new(AssetIconName::Pencil))
-                    .on_click(move |_, window, app| {
-                        action_entity.update(app, |pane, cx| {
-                            if select_context_entry(
-                                pane,
-                                side,
-                                action_entry.clone(),
-                                &action_names,
-                                context_generation,
-                                &action_directory,
-                                cx,
-                            ) {
-                                pane.prepare_permissions(side, window, cx);
-                            }
-                        });
-                    }),
-            );
-        }
-
-        menu = menu.item(PopupMenuItem::separator());
-        let action_entry = context_entry.clone();
-        let action_entity = context_entity.clone();
-        let action_names = Arc::clone(&context_names);
-        let action_directory = context_directory.clone();
-        menu = menu.item(
-            PopupMenuItem::new(locale::text(
-                if context_entry.kind == FileEntryKind::Directory {
-                    "删除目录"
-                } else {
-                    "删除"
-                },
-                if context_entry.kind == FileEntryKind::Directory {
-                    "Delete folder"
-                } else {
-                    "Delete"
-                },
-            ))
-            .icon(Icon::new(AssetIconName::Trash))
-            .on_click(move |_, _, app| {
-                action_entity.update(app, |pane, cx| {
-                    if select_context_entry(
-                        pane,
-                        side,
-                        action_entry.clone(),
-                        &action_names,
-                        context_generation,
-                        &action_directory,
-                        cx,
-                    ) {
-                        pane.delete_selected(cx);
-                    }
-                });
-            }),
-        );
-
-        menu
+    row.context_menu(move |menu, _, app| {
+        build_file_context_menu(
+            menu,
+            theme,
+            context_entity.clone(),
+            context_snapshot.clone(),
+            app,
+        )
     })
     .into_any_element()
-}
-
-/// 右键动作使用打开菜单时捕获的行和列表顺序，不读取之后可能变化的键盘选择。
-///
-/// @author kongweiguang
-fn select_context_entry(
-    pane: &mut FilesPane,
-    side: usize,
-    entry: FileEntry,
-    ordered_names: &[String],
-    generation: u64,
-    directory: &FileEndpoint,
-    cx: &mut Context<FilesPane>,
-) -> bool {
-    if !pane.browser_action_snapshot_is_current(side, generation, directory) {
-        return false;
-    }
-    let already_selected = pane
-        .panels
-        .get(side)
-        .is_some_and(|panel| panel.selection.contains(&entry.name));
-    pane.activate_side(side, cx);
-    if already_selected {
-        return true;
-    }
-    pane.select_entry(
-        side,
-        entry,
-        super::super::selection::SelectionGesture::Replace,
-        ordered_names,
-        cx,
-    );
-    true
-}
-
-/// 多选右键操作要求菜单打开时的 endpoint 集合仍一致，避免异步重绘后误删或误下另一组文件。
-///
-/// @author kongweiguang
-fn select_context_selection(
-    pane: &mut FilesPane,
-    side: usize,
-    expected: &[FileEntry],
-    generation: u64,
-    directory: &FileEndpoint,
-    cx: &mut Context<FilesPane>,
-) -> bool {
-    if !pane.browser_action_snapshot_is_current(side, generation, directory) {
-        return false;
-    }
-    let current = pane.selected_entries(side);
-    if current.len() != expected.len()
-        || current
-            .iter()
-            .zip(expected)
-            .any(|(left, right)| left.endpoint != right.endpoint)
-    {
-        pane.status = Some(
-            locale::text(
-                "右键菜单中的选择已变化，请重新打开菜单。",
-                "The context menu selection changed. Open the menu again.",
-            )
-            .to_string(),
-        );
-        cx.notify();
-        return false;
-    }
-    pane.activate_side(side, cx);
-    true
 }
 
 /// Local/SFTP 使用 Unix 纳秒，容器 stat 使用整秒；按端点单位解码并拒绝非法日历值。
@@ -3351,6 +2398,7 @@ fn format_file_modified_tooltip(entry: &FileEntry, compact_layout: bool) -> Stri
 }
 
 /// 空目录的新建入口保留图标与对象文字，让首次使用者无需悬停即可理解；仍复用既有创建动作。
+/// 引导短句限定在面板宽度内并居中，窄栏不因长句留下独立标点或越过列表边界。
 ///
 /// @author kongweiguang
 pub(super) fn render_empty_directory(
@@ -3395,6 +2443,10 @@ pub(super) fn render_empty_directory(
         )
         .child(
             div()
+                .w_full()
+                .min_w(px(0.))
+                .px_2()
+                .text_center()
                 .text_size(theme.text_xs)
                 .text_color(theme.subtle)
                 .child(if hidden_only {
@@ -3404,8 +2456,8 @@ pub(super) fn render_empty_directory(
                     )
                 } else {
                     locale::text(
-                        "可以新建文件夹，或从另一侧复制文件。",
-                        "Create a folder or copy files from the other pane.",
+                        "新建文件夹或复制文件到这里",
+                        "Create a folder or copy files here.",
                     )
                 }),
         )

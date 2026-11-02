@@ -11,7 +11,7 @@ use kerminal_application::{
         AppColorScheme, ConfigurationGuideStatus, ConfigurationRepository,
         ConfigurationValidationDiagnostic, ConfigurationValidationReport,
         ConfigurationValidationScope, ConfigurationValidationSeverity, KeybindingScope,
-        PreferencesService, SettingsRepository, SettingsSnapshot, ThemeMode,
+        PreferencesService, SettingsRepository, SettingsSnapshot, TerminalColorScheme, ThemeMode,
         ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId, VersionedSettings,
     },
 };
@@ -41,6 +41,33 @@ fn app_color_scheme_snapshot_defaults_and_wire_values_are_stable() {
         );
     }
     assert!(serde_json::from_str::<AppColorScheme>("\"future-palette\"").is_err());
+}
+
+/// 旧双主题只按首次有效外观归并一次，后续外观变化不能改变所选主题。
+///
+/// @author kongweiguang
+#[test]
+fn legacy_terminal_scheme_resolves_once_without_serializing_source_marker() {
+    for (dark, expected) in [
+        (false, TerminalColorScheme::Github),
+        (true, TerminalColorScheme::TokyoNight),
+    ] {
+        let mut terminal = SettingsSnapshot::default().terminal;
+        terminal.light_color_scheme = TerminalColorScheme::Github;
+        terminal.dark_color_scheme = TerminalColorScheme::TokyoNight;
+        terminal.legacy_color_scheme_missing = true;
+        let encoded = serde_json::to_value(&terminal).expect("encode terminal settings");
+        assert!(encoded.get("legacyColorSchemeMissing").is_none());
+
+        terminal.resolve_legacy_terminal_scheme(dark);
+        assert_eq!(terminal.color_scheme, expected);
+        assert_eq!(terminal.light_color_scheme, expected);
+        assert_eq!(terminal.dark_color_scheme, expected);
+        assert!(!terminal.legacy_color_scheme_missing);
+
+        terminal.resolve_legacy_terminal_scheme(!dark);
+        assert_eq!(terminal.color_scheme, expected);
+    }
 }
 use kerminal_domain::preferences::{
     ConfigDocument, ConfigDocumentPath, ConfigRevision, ConfigurationMode,
@@ -241,10 +268,6 @@ fn defaults_include_quick_open_and_command_palette_bindings() {
     assert_eq!(terminal_paste.binding, "");
     assert_eq!(terminal_paste.windows_binding, "Ctrl+V");
     assert_eq!(
-        terminal_paste.windows_alternate_binding.as_deref(),
-        Some("Ctrl+Shift+V")
-    );
-    assert_eq!(
         terminal_paste.linux_binding.as_deref(),
         Some("Ctrl+Shift+V")
     );
@@ -294,7 +317,6 @@ fn validated_settings_preserves_explicitly_disabled_paste_bindings() {
         .expect("paste default exists");
     paste.binding.clear();
     paste.windows_binding.clear();
-    paste.windows_alternate_binding = Some(String::new());
     paste.linux_binding = Some(String::new());
     paste.mac_binding.clear();
 
@@ -307,7 +329,6 @@ fn validated_settings_preserves_explicitly_disabled_paste_bindings() {
 
     assert!(paste.binding.is_empty());
     assert!(paste.windows_binding.is_empty());
-    assert_eq!(paste.windows_alternate_binding.as_deref(), Some(""));
     assert_eq!(paste.linux_binding.as_deref(), Some(""));
     assert!(paste.mac_binding.is_empty());
 }
@@ -324,15 +345,6 @@ fn optional_platform_bindings_obey_the_existing_length_limit() {
         .find(|binding| binding.action == "terminal.paste")
         .expect("paste default exists");
     paste.linux_binding = Some("x".repeat(129));
-    assert!(settings.validated().is_err());
-
-    let mut settings = SettingsSnapshot::default();
-    let paste = settings
-        .keybindings
-        .iter_mut()
-        .find(|binding| binding.action == "terminal.paste")
-        .expect("paste default exists");
-    paste.windows_alternate_binding = Some("x".repeat(129));
     assert!(settings.validated().is_err());
 }
 

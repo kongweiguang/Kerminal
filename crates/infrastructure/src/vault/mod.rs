@@ -5,6 +5,8 @@
 mod error;
 mod format;
 mod key_management;
+mod mcp_token;
+pub(crate) mod profile_migration;
 mod store;
 mod transaction;
 

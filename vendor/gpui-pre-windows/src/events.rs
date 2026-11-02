@@ -172,7 +172,7 @@ impl Drop for DrawWindowGuard<'_> {
 }
 
 impl WindowsWindowInner {
-    /// 路由窗口消息，并在原生焦点离开时先收尾固定的 IME 目标。
+    /// 路由窗口消息，优先消费原生拖动的取消键，并在焦点离开时收尾固定的 IME 目标。
     pub(crate) fn handle_msg(
         self: &Rc<Self>,
         handle: HWND,
@@ -180,6 +180,39 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if let Some(keyboard) = self.state.external_drag_keyboard.borrow().as_ref() {
+            if msg == WM_SETFOCUS || msg == WM_KILLFOCUS {
+                keyboard.focus_changed(msg == WM_SETFOCUS);
+            }
+            if wparam.0 == VK_ESCAPE.0 as usize {
+                let down = matches!(msg, WM_GPUI_KEYDOWN | WM_KEYDOWN | WM_SYSKEYDOWN);
+                let up = matches!(msg, WM_KEYUP | WM_SYSKEYUP);
+                let message_time = unsafe { GetMessageTime() } as u32;
+                let repeat = lparam.0 & (1 << 30) != 0;
+                if (down && keyboard.consume_key_down(message_time, repeat))
+                    || (up && keyboard.consume_key_up())
+                {
+                    if down {
+                        self.state.external_drag_preparing.set(false);
+                        if let Some(provider) = self.state.external_drag_provider.borrow().as_ref()
+                        {
+                            provider.cancel();
+                        }
+                    }
+                    return LRESULT(0);
+                }
+            }
+        }
+        // OLE 尚未接管前，原窗口的消息是区分释放再重新按下的权威来源。
+        let cancel_drag = matches!(
+            msg,
+            WM_LBUTTONUP | WM_CAPTURECHANGED | WM_CANCELMODE | WM_KILLFOCUS | WM_DESTROY | WM_CLOSE
+        ) || (msg == WM_GPUI_KEYDOWN && wparam.0 == VK_ESCAPE.0 as usize);
+        if cancel_drag && self.state.external_drag_preparing.replace(false) {
+            if let Some(provider) = self.state.external_drag_provider.borrow().as_ref() {
+                provider.cancel();
+            }
+        }
         let handled = match msg {
             // `DefWindowProc` answers `MA_NOACTIVATE` for a left click on `HTCAPTION`.
             // The activation is only triggered when `DefWindowProc` handles the following `WM_NCLBUTTONDOWN`.
@@ -562,6 +595,29 @@ impl WindowsWindowInner {
         };
         let x = lparam.signed_loword() as f32;
         let y = lparam.signed_hiword() as f32;
+        let mut client = RECT::default();
+        let in_client = unsafe { GetClientRect(handle, &mut client) }.is_ok()
+            && x >= 0.0
+            && y >= 0.0
+            && x < client.right as f32
+            && y < client.bottom as f32;
+        if self.state.external_drag_preparing.get()
+            && pressed_button == Some(MouseButton::Left)
+            && in_client
+        {
+            self.state.external_drag_preparing.set(false);
+            self.state.external_drag_restored.set(true);
+            self.state
+                .external_drag_generation
+                .set(self.state.external_drag_generation.get().wrapping_add(1));
+            if let Some(provider) = self.state.external_drag_provider.borrow_mut().take() {
+                provider.cancel();
+            }
+            func(PlatformInput::FileDrop(FileDropEvent::Entered {
+                position: logical_point(x, y, scale_factor),
+                paths: ExternalPaths(Default::default()),
+            }));
+        }
         let input = PlatformInput::MouseMove(MouseMoveEvent {
             position: logical_point(x, y, scale_factor),
             pressed_button,
@@ -710,6 +766,9 @@ impl WindowsWindowInner {
             click_count,
         });
         let handled = !func(input).propagate;
+        if button == MouseButton::Left && self.state.external_drag_restored.replace(false) {
+            func(PlatformInput::FileDrop(FileDropEvent::Ended));
+        }
         self.state.callbacks.input.set(Some(func));
 
         if handled { Some(0) } else { Some(1) }

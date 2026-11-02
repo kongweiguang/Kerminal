@@ -3,7 +3,13 @@
 //! @author kongweiguang
 
 use gpui_kit::Context;
-use kerminal_application::{PublicErrorCode, configuration_sync::ConfigurationSyncOutcome};
+use kerminal_application::{
+    PublicErrorCode,
+    configuration_sync::{
+        ConfigurationSyncOperationKind, ConfigurationSyncOperationResult, ConfigurationSyncOutcome,
+        ConfigurationSyncRunResult, SyncRepositoryState,
+    },
+};
 
 use super::PreferencesPanel;
 
@@ -120,7 +126,112 @@ impl PreferencesPanel {
         .detach();
     }
 
-    /// 结果未知时先更新远端引用并回读领先/落后状态，未取得完整回执前不重放同步写操作。
+    /// 显式继续已经解决的变基；不会自动推送或重放先前同步。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn continue_workspace_rebase(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_workspace_rebase(true, cx);
+    }
+
+    /// 用户确认后才中止当前变基，避免覆盖未确认的冲突处理。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn abort_workspace_rebase(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_workspace_rebase(false, cx);
+    }
+
+    /// 复用同步与密钥的单飞门禁；结果未知时先核对，不能重放任何 Git 写操作。
+    ///
+    /// @author kongweiguang
+    fn run_workspace_rebase(&mut self, continuing: bool, cx: &mut Context<Self>) {
+        if self.connectivity.sync_running
+            || self.sync_loading
+            || self.connectivity.key_loading
+            || self.connectivity.key_saving
+            || self.sync_outcome_unknown
+            || !self
+                .sync_status
+                .as_ref()
+                .is_some_and(|status| status.writable && status.rebase_in_progress)
+        {
+            return;
+        }
+        let Some(service) = self.configuration_sync.clone() else {
+            return;
+        };
+
+        self.connectivity.sync_running = true;
+        self.connectivity.sync_run_result = None;
+        self.sync_error = None;
+        self.sync_result = None;
+        let executor = self.executor.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .run(move |cancellation| async move {
+                    if continuing {
+                        service.continue_rebase(cancellation).await
+                    } else {
+                        service.abort_rebase(cancellation).await
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.connectivity.sync_running = false;
+                match result {
+                    Ok(result) => {
+                        panel.sync_outcome_unknown =
+                            result.outcome == ConfigurationSyncOutcome::OutcomeUnknown;
+                        panel.sync_result = Some(result.clone());
+                        panel.connectivity.sync_run_result = Some(ConfigurationSyncRunResult {
+                            outcome: result.outcome,
+                            summary: result.summary.clone(),
+                            stages: vec![result],
+                        });
+                    }
+                    Err(error) => {
+                        if error.public_code() == PublicErrorCode::OutcomeUnknown {
+                            panel.sync_outcome_unknown = true;
+                            panel.sync_result = Some(ConfigurationSyncOperationResult {
+                                kind: if continuing {
+                                    ConfigurationSyncOperationKind::ContinueRebase
+                                } else {
+                                    ConfigurationSyncOperationKind::AbortRebase
+                                },
+                                outcome: ConfigurationSyncOutcome::OutcomeUnknown,
+                                summary: error.public_message().to_owned(),
+                                affected_paths: Vec::new(),
+                                commit_hash: None,
+                            });
+                        }
+                        panel.sync_error = Some(super::localized_error(&error));
+                    }
+                }
+                let workspace_outcome_unknown = panel.sync_outcome_unknown;
+                panel.connectivity.resume_pending_documents(
+                    panel.vault_keys.clone(),
+                    panel.configuration_sync.clone(),
+                    workspace_outcome_unknown,
+                    cx,
+                );
+                if !panel.sync_outcome_unknown {
+                    panel.refresh_configuration_sync(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 结果未知时先回读本地状态；纯本地变基无需依赖网络，远端写操作须核对远端引用。
+    ///
+    /// @author kongweiguang
     fn verify_workspace_sync(&mut self, cx: &mut Context<Self>) {
         let Some(service) = self.configuration_sync.clone() else {
             self.sync_error = Some(
@@ -136,11 +247,30 @@ impl PreferencesPanel {
 
         self.connectivity.sync_running = true;
         self.sync_error = None;
+        let verifying_rebase = self.sync_result.as_ref().is_some_and(|result| {
+            result.outcome == ConfigurationSyncOutcome::OutcomeUnknown
+                && matches!(
+                    result.kind,
+                    ConfigurationSyncOperationKind::ContinueRebase
+                        | ConfigurationSyncOperationKind::AbortRebase
+                )
+        });
         let executor = self.executor.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |cancellation| async move {
+                    let local_status = service.status().await?;
+                    if local_status.repository == SyncRepositoryState::PendingBusy {
+                        return Ok((None, None));
+                    }
+                    if verifying_rebase
+                        || !local_status.git_available
+                        || local_status.repository == SyncRepositoryState::Missing
+                        || local_status.upstream.is_none()
+                    {
+                        return Ok((None, Some(local_status)));
+                    }
                     let fetch = service.fetch(cancellation).await?;
                     let status = if matches!(
                         fetch.outcome,
@@ -150,13 +280,13 @@ impl PreferencesPanel {
                     } else {
                         None
                     };
-                    Ok((fetch, status))
+                    Ok((Some(fetch), status))
                 })
                 .await;
             let _ = this.update(cx, |panel, cx| {
                 panel.connectivity.sync_running = false;
                 match result {
-                    Ok((fetch, Some(status))) => {
+                    Ok((Some(fetch), Some(status))) => {
                         let summary = crate::locale::text(
                             format!(
                                 "远端状态已刷新，本地领先 {}、落后 {}；核对后可重新同步。",
@@ -180,13 +310,51 @@ impl PreferencesPanel {
                             });
                         panel.sync_error = None;
                     }
-                    Ok((fetch, None)) => {
+                    Ok((None, Some(status))) => {
+                        let local_rebase_verified = verifying_rebase
+                            && status.git_available
+                            && status.repository != SyncRepositoryState::Missing;
+                        if local_rebase_verified {
+                            let summary = if status.rebase_in_progress {
+                                crate::locale::text(
+                                    "本地状态已刷新；变基仍在进行，请核对冲突后继续或中止。",
+                                    "Local status refreshed. The rebase is still in progress; review conflicts before continuing or aborting.",
+                                )
+                            } else {
+                                crate::locale::text(
+                                    "本地状态已刷新；变基不再进行，请核对分支与提交后再同步。",
+                                    "Local status refreshed. The rebase is no longer in progress; review the branch and commits before syncing.",
+                                )
+                            };
+                            panel.sync_outcome_unknown = false;
+                            panel.sync_result = None;
+                            panel.connectivity.sync_run_result = Some(ConfigurationSyncRunResult {
+                                outcome: ConfigurationSyncOutcome::Blocked,
+                                summary: summary.to_string(),
+                                stages: Vec::new(),
+                            });
+                            panel.sync_error = None;
+                        } else {
+                            panel.sync_error = Some(crate::locale::text(
+                                "无法核实上次同步；请恢复 Git 仓库和上游后重新核实。",
+                                "The previous sync could not be verified. Restore the Git repository and upstream, then verify again.",
+                            ).to_string());
+                        }
+                        panel.sync_status = Some(status);
+                    }
+                    Ok((Some(fetch), None)) => {
                         panel.connectivity.sync_run_result =
                             Some(kerminal_application::configuration_sync::ConfigurationSyncRunResult {
                                 outcome: fetch.outcome,
                                 summary: fetch.summary.clone(),
                                 stages: vec![fetch],
                             });
+                    }
+                    Ok((None, None)) => {
+                        panel.sync_error = Some(crate::locale::text(
+                            "上次 Git 操作仍在清理，请稍后重新核实。",
+                            "The previous Git operation is still cleaning up. Verify again later.",
+                        ).to_string());
                     }
                     Err(error) => panel.sync_error = Some(super::localized_error(&error)),
                 }
@@ -223,6 +391,7 @@ impl PreferencesPanel {
             self.refresh_vault_availability(cx);
         }
         self.connectivity.refresh_mcp(cx);
+        self.refresh_mcp_addresses(cx);
     }
 
     /// 每次重新打开设置时刷新运行态与工作区快照；在途或未知写入不会覆盖密钥草稿。
@@ -237,6 +406,7 @@ impl PreferencesPanel {
         self.refresh_external_protocol(cx);
         self.refresh_configuration_sync(cx);
         self.connectivity.refresh_mcp(cx);
+        self.refresh_mcp_addresses(cx);
         let workspace_outcome_unknown = self.sync_outcome_unknown;
         let loading_documents = self.connectivity.load_documents(
             self.vault_keys.clone(),

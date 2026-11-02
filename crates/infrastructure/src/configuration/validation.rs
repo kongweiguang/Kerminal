@@ -10,15 +10,19 @@ use std::path::{Path, PathBuf};
 
 use kerminal_application::AppResult;
 use kerminal_application::connections::management::{
-    host_note_is_valid, is_reserved_serial_host_tag,
+    host_note_is_valid, is_reserved_serial_host_tag, validate_local_environment_reference,
 };
 use kerminal_application::preferences::{
     ConfigurationValidationDiagnostic, ConfigurationValidationReport, ConfigurationValidationScope,
     ConfigurationValidationSeverity,
 };
-use kerminal_domain::preferences::{
-    ConfigDocumentPath, ConfigurationIssue, ConfigurationIssueKind, ConfigurationMode,
-    ConfigurationRecoveryState,
+use kerminal_domain::{
+    connections::CredentialRef,
+    identity::HostId,
+    preferences::{
+        ConfigDocumentPath, ConfigurationIssue, ConfigurationIssueKind, ConfigurationMode,
+        ConfigurationRecoveryState,
+    },
 };
 
 use super::{read_configuration_file, safe_relative_path, unreadable_issue};
@@ -826,7 +830,10 @@ pub(super) fn validate_document(
                         "主机必须显式声明 protocol",
                     )
                 })?;
-            if !matches!(protocol, "ssh" | "sftp" | "rdp" | "telnet" | "serial") {
+            if !matches!(
+                protocol,
+                "ssh" | "sftp" | "rdp" | "telnet" | "serial" | "local"
+            ) {
                 return Err(ValidationFailure::plain(
                     ConfigurationIssueKind::MalformedToml,
                     Some(1),
@@ -834,7 +841,11 @@ pub(super) fn validate_document(
                     "主机 protocol 不受支持",
                 ));
             }
-            validate_host_fields(table, protocol)?;
+            if protocol == "local" {
+                validate_local_host_fields(table)?;
+            } else {
+                validate_host_fields(table, protocol)?;
+            }
             if contains_inline_secret(&value) {
                 return Err(ValidationFailure::plain(
                     ConfigurationIssueKind::MalformedToml,
@@ -875,6 +886,9 @@ fn validate_settings_fields(source: &str) -> Result<(), ValidationFailure> {
 fn validate_profile_fields(
     table: &toml::map::Map<String, toml::Value>,
 ) -> Result<(), ValidationFailure> {
+    if table.contains_key("sidebar_group_id") {
+        return Err(invalid_configuration_shape("Profile 不支持主机分组"));
+    }
     let required = [
         ("id", ValueKind::String),
         ("name", ValueKind::String),
@@ -894,6 +908,129 @@ fn validate_profile_fields(
                 "profile 缺少有效必填字段",
             ));
         }
+    }
+    Ok(())
+}
+
+/// 本地主机不携带远程 endpoint、凭据或环境明文；环境引用必须属于同一个主机。
+///
+/// @author kongweiguang
+fn validate_local_host_fields(
+    table: &toml::map::Map<String, toml::Value>,
+) -> Result<(), ValidationFailure> {
+    validate_required_fields(
+        table,
+        &[
+            ("id", ValueKind::String),
+            ("name", ValueKind::String),
+            ("sort_order", ValueKind::Integer),
+            ("created_at", ValueKind::String),
+            ("updated_at", ValueKind::String),
+            ("local", ValueKind::Table),
+        ],
+        "本地主机字段缺失或类型无效",
+    )?;
+    validate_optional_fields(
+        table,
+        &[
+            ("group_id", ValueKind::String),
+            ("migration_origin", ValueKind::String),
+        ],
+        "本地主机元数据类型无效",
+    )?;
+    if [
+        "host",
+        "port",
+        "username",
+        "auth_type",
+        "credential_ref",
+        "secret_ref",
+        "key_passphrase_ref",
+        "serial",
+        "ssh_options",
+        "rdp_options",
+        "env",
+        "environment",
+    ]
+    .iter()
+    .any(|field| table.contains_key(*field))
+    {
+        return Err(invalid_configuration_shape(
+            "本地主机不能包含远程连接或环境明文",
+        ));
+    }
+    let Some(local) = table.get("local").and_then(toml::Value::as_table) else {
+        return Err(invalid_configuration_shape("本地主机启动配置无效"));
+    };
+    if local.contains_key("env") || local.contains_key("environment") {
+        return Err(invalid_configuration_shape(
+            "本地主机环境必须使用 vault 引用",
+        ));
+    }
+    validate_required_fields(
+        local,
+        &[
+            ("shell", ValueKind::String),
+            ("args", ValueKind::StringArray),
+        ],
+        "本地主机启动字段无效",
+    )?;
+    validate_optional_fields(
+        local,
+        &[
+            ("cwd", ValueKind::String),
+            ("environment_ref", ValueKind::String),
+        ],
+        "本地主机启动字段类型无效",
+    )?;
+    let shell = local
+        .get("shell")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default();
+    let name = table
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default();
+    if name.trim().is_empty()
+        || name.len() > 256
+        || name.contains('\0')
+        || shell.trim().is_empty()
+        || shell.len() > 1024
+        || shell.contains('\0')
+        || local
+            .get("cwd")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|cwd| cwd.len() > 4096 || cwd.contains('\0'))
+        || local
+            .get("args")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|args| {
+                args.iter().any(|arg| {
+                    arg.as_str()
+                        .is_none_or(|arg| arg.len() > 16 * 1024 || arg.contains('\0'))
+                })
+            })
+    {
+        return Err(invalid_configuration_shape("本地主机启动字段超出限制"));
+    }
+    if let Some(origin) = table.get("migration_origin").and_then(toml::Value::as_str)
+        && (origin.len() != 64
+            || !origin
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err(invalid_configuration_shape("本地主机迁移来源标记无效"));
+    }
+    if let Some(raw) = local.get("environment_ref").and_then(toml::Value::as_str) {
+        let host_id = table
+            .get("id")
+            .and_then(toml::Value::as_str)
+            .and_then(|id| HostId::parse(id).ok())
+            .ok_or_else(|| invalid_configuration_shape("本地主机标识无效"))?;
+        let reference = CredentialRef::new(raw)
+            .map_err(|_| invalid_configuration_shape("本地主机环境引用无效"))?;
+        validate_local_environment_reference(&host_id, &reference)
+            .map_err(|_| invalid_configuration_shape("本地主机环境引用不匹配"))?;
     }
     Ok(())
 }

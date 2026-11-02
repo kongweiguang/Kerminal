@@ -1,4 +1,4 @@
-//! 验证 Logs 生产历史列表的种子、分页、筛选、搜索、删除与清空闭环。
+//! 验证 Logs 生产历史列表、行内操作及原终端未提交输入。
 //!
 //! @author kongweiguang
 
@@ -9,7 +9,9 @@ use std::{
     io,
 };
 
-use gpui_kit::{AnyWindowHandle, AsyncApp, Entity};
+use gpui_kit::{AnyWindowHandle, AsyncApp, Entity, InputEvent as _};
+use gpui_pre::{KeyDownEvent, KeyUpEvent, Keystroke};
+use kerminal_application::preferences::ThemeMode;
 use kerminal_domain::{commands::CommandHistorySource, identity::HostId};
 use kerminal_ui::{RootView, features::commands::RightRailAcceptanceLogsSnapshot};
 
@@ -18,11 +20,15 @@ use super::{
     functional::{FunctionalRecord, checkpoint, poll_root},
 };
 
-const SEEDED_ENTRIES: usize = 10;
-const USER_ENTRIES: usize = 9;
-const FIRST_PAGE_ENTRIES: usize = 8;
+#[path = "functional_logs/native_actions.rs"]
+mod native_actions;
+use native_actions::{click_selector, verify_copy_with_clipboard_restore};
 
-/// 只在隔离 fixture pane 内串行执行 Logs 写入；每次变化都以生产 ready 与限定快照回读确认。
+const SEEDED_ENTRIES: usize = 24;
+const USER_ENTRIES: usize = 23;
+
+/// 只在隔离 fixture pane 内串行执行 Logs 写入；每次变化按实际窗口容量和限定快照回读确认。
+/// 复制及填入提示会改变可用高度，遍历前先结束旧反馈并重新建立分页基准。
 ///
 /// @author kongweiguang
 pub(super) async fn run(
@@ -70,9 +76,9 @@ pub(super) async fn run(
         &prefix,
         None,
         1,
-        2,
+        SEEDED_ENTRIES.div_ceil(first_page.page_size()).max(1),
         SEEDED_ENTRIES,
-        FIRST_PAGE_ENTRIES,
+        SEEDED_ENTRIES.min(first_page.page_size()),
     )?;
     checkpoint(
         cx,
@@ -80,37 +86,96 @@ pub(super) async fn run(
         capture,
         records,
         "logs-first-page",
-        "ten_seed_entries_show_eight_rows_on_first_page",
+        "seed_entries_fill_first_page_to_measured_panel_capacity",
     )
     .await?;
 
-    poll_root(cx, root, window, "选择 Logs 第二页", |root, _, cx| {
-        root.set_right_rail_acceptance_logs_page(host_id, run_id, 2, cx)
-            .map(|()| Some(()))
-    })
-    .await?;
-    let second_page = read_snapshot(cx, root, window, host_id, run_id).await?;
-    verify_snapshot(
-        &second_page,
-        run_id,
-        &prefix,
-        &prefix,
-        None,
-        2,
-        2,
-        SEEDED_ENTRIES,
-        SEEDED_ENTRIES - FIRST_PAGE_ENTRIES,
-    )?;
-    verify_seed_sources(&first_page, &second_page, &prefix, run_id)?;
-    checkpoint(
-        cx,
-        window,
-        capture,
-        records,
-        "logs-second-page",
-        "same_seed_has_two_rows_on_second_page_and_nine_user_one_tool_sources",
-    )
-    .await?;
+    for (mode, operation) in [
+        (ThemeMode::Light, "logs-layout-light"),
+        (ThemeMode::Dark, "logs-layout-dark"),
+        (ThemeMode::System, "logs-layout-system"),
+    ] {
+        window.update(cx, |_, _, app| {
+            root.update(app, |root, cx| {
+                root.set_right_rail_acceptance_theme(mode, cx)
+            })
+        })?;
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            operation,
+            "complete_rows_and_aligned_pagination_in_native_window",
+        )
+        .await?;
+        verify_history_geometry(cx, window, &first_page)?;
+    }
+    verify_copy_and_fill(cx, root, window, capture, records, run_id, &first_page).await?;
+
+    // 主动翻页结束填入反馈；复制提示仍可保留，不能复用操作前的容量和页数。
+    if read_snapshot(cx, root, window, host_id, run_id)
+        .await?
+        .page_count()
+        > 1
+    {
+        for page in [2, 1] {
+            poll_root(
+                cx,
+                root,
+                window,
+                "重建 Logs 遍历基准",
+                |root, _, cx| {
+                    root.set_right_rail_acceptance_logs_page(host_id, run_id, page, cx)
+                        .map(|()| Some(()))
+                },
+            )
+            .await?;
+            let settled = read_snapshot(cx, root, window, host_id, run_id).await?;
+            if settled.fill_confirmed() {
+                return Err(io::Error::other("主动翻页后仍保留旧填入成功提示").into());
+            }
+        }
+    }
+    let first_page = read_snapshot(cx, root, window, host_id, run_id).await?;
+
+    let mut remaining_pages = Vec::new();
+    for page in 2..=first_page.page_count() {
+        poll_root(cx, root, window, "选择 Logs 后续页", |root, _, cx| {
+            root.set_right_rail_acceptance_logs_page(host_id, run_id, page, cx)
+                .map(|()| Some(()))
+        })
+        .await?;
+        let page_snapshot = read_snapshot(cx, root, window, host_id, run_id).await?;
+        if page_snapshot.fill_confirmed() {
+            return Err(io::Error::other("主动翻页后仍保留旧填入成功提示").into());
+        }
+        verify_snapshot(
+            &page_snapshot,
+            run_id,
+            &prefix,
+            &prefix,
+            None,
+            page,
+            SEEDED_ENTRIES.div_ceil(page_snapshot.page_size()).max(1),
+            SEEDED_ENTRIES,
+            (SEEDED_ENTRIES - (page - 1) * page_snapshot.page_size())
+                .min(page_snapshot.page_size()),
+        )?;
+        remaining_pages.push(page_snapshot);
+    }
+    if !remaining_pages.is_empty() {
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            "logs-last-page",
+            "all_pages_partition_seed_entries_with_measured_capacity",
+        )
+        .await?;
+    }
+    verify_seed_sources(&first_page, &remaining_pages, &prefix, run_id)?;
 
     poll_root(cx, root, window, "筛选 User 来源", |root, _, cx| {
         root.set_right_rail_acceptance_logs_source(
@@ -130,9 +195,9 @@ pub(super) async fn run(
         &prefix,
         Some(CommandHistorySource::User),
         1,
-        2,
+        USER_ENTRIES.div_ceil(filtered.page_size()).max(1),
         USER_ENTRIES,
-        FIRST_PAGE_ENTRIES,
+        USER_ENTRIES.min(filtered.page_size()),
     )?;
     checkpoint(
         cx,
@@ -140,7 +205,7 @@ pub(super) async fn run(
         capture,
         records,
         "logs-user-filter",
-        "production_source_filter_returns_nine_user_entries",
+        "production_source_filter_returns_only_seed_user_entries",
     )
     .await?;
 
@@ -169,9 +234,9 @@ pub(super) async fn run(
         &user_query,
         Some(CommandHistorySource::User),
         1,
-        2,
+        USER_ENTRIES.div_ceil(searched.page_size()).max(1),
         USER_ENTRIES,
-        FIRST_PAGE_ENTRIES,
+        USER_ENTRIES.min(searched.page_size()),
     )?;
     checkpoint(
         cx,
@@ -194,9 +259,9 @@ pub(super) async fn run(
             &user_query,
             Some(CommandHistorySource::User),
             1,
-            expected_before.div_ceil(FIRST_PAGE_ENTRIES).max(1),
+            expected_before.div_ceil(before.page_size()).max(1),
             expected_before,
-            expected_before.min(FIRST_PAGE_ENTRIES),
+            expected_before.min(before.page_size()),
         )?;
         let entry = before
             .entries()
@@ -230,9 +295,9 @@ pub(super) async fn run(
             &user_query,
             Some(CommandHistorySource::User),
             1,
-            expected_after.div_ceil(FIRST_PAGE_ENTRIES).max(1),
+            expected_after.div_ceil(after.page_size()).max(1),
             expected_after,
-            expected_after.min(FIRST_PAGE_ENTRIES),
+            expected_after.min(after.page_size()),
         )?;
         if after
             .entries()
@@ -243,7 +308,7 @@ pub(super) async fn run(
         }
     }
     if deleted_ids.len() != USER_ENTRIES {
-        return Err(io::Error::other("Logs 未逐条删除全部九条 User 记录").into());
+        return Err(io::Error::other("Logs 未逐条删除全部 User 种子记录").into());
     }
     checkpoint(
         cx,
@@ -330,7 +395,141 @@ pub(super) async fn run(
     Ok(())
 }
 
-/// 先等待 Root 的 seed/query readiness，再取只包含本轮前缀的 production snapshot。
+/// 通过真实按钮点击验证复制及未提交填入，始终限定本轮 fixture 的记录、终端和光标。
+/// 成功提示会挤占列表空间，须在布局稳定后核对反馈与完整行，防止被动重排误作废操作。
+///
+/// @author kongweiguang
+async fn verify_copy_and_fill(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+    run_id: &str,
+    snapshot: &RightRailAcceptanceLogsSnapshot,
+) -> Result<(), Box<dyn Error>> {
+    let entry = snapshot
+        .entries()
+        .first()
+        .ok_or_else(|| io::Error::other("日志验收缺少可见的种子命令"))?;
+    let entry_id = entry.id().to_owned();
+    let command = entry.command().to_owned();
+    if !command.starts_with(snapshot.prefix()) || !command.is_ascii() {
+        return Err(io::Error::other("日志行内验收只接受本轮 ASCII 隔离种子").into());
+    }
+
+    let copied = verify_copy_with_clipboard_restore(cx, window, &entry_id, &command)?;
+    if copied {
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            "logs-copy",
+            "rendered_copy_button_wrote_seed_and_restored_original_clipboard",
+        )
+        .await?;
+    } else {
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            "logs-copy-not-tested",
+            "clipboard_formats_cannot_be_restored_without_loss_copy_not_tested",
+        )
+        .await?;
+    }
+
+    let host_id = &capture.fixture_host_id;
+    let original_line = poll_root(
+        cx,
+        root,
+        window,
+        "读取 Logs 原终端光标行",
+        |root, _, cx| root.right_rail_acceptance_logs_terminal_cursor_line(host_id, run_id, cx),
+    )
+    .await?;
+    let tail = &command[command.len().saturating_sub(24)..];
+    click_selector(cx, window, &format!("rr-logs-fill-{entry_id}"))?;
+    poll_root(
+        cx,
+        root,
+        window,
+        "等待历史填入原终端未提交光标行",
+        |root, _, cx| {
+            root.right_rail_acceptance_logs_terminal_cursor_line(host_id, run_id, cx)
+                .map(|line| line.filter(|line| line.ends_with(tail) && line != &original_line))
+        },
+    )
+    .await?;
+    poll_root(
+        cx,
+        root,
+        window,
+        "验证历史填入返回原终端焦点",
+        |root, window, cx| {
+            root.right_rail_acceptance_logs_terminal_focused(host_id, run_id, window, cx)
+                .map(|focused| focused.then_some(()))
+        },
+    )
+    .await?;
+    let evidence = checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "logs-fill-pending",
+        "rendered_fill_button_left_seed_at_original_terminal_cursor_without_enter",
+    )
+    .await;
+
+    let filled = read_snapshot(cx, root, window, host_id, run_id).await?;
+    if !filled.fill_confirmed() {
+        return Err(io::Error::other("历史填入成功提示在被动布局后丢失").into());
+    }
+    verify_history_geometry(cx, window, &filled)?;
+
+    // 后续验收复用同一隔离 pane；只在原 binding 仍持有焦点时清除未提交输入。
+    window.update(cx, |_, window, app| {
+        let focused = root
+            .update(app, |root, cx| {
+                root.right_rail_acceptance_logs_terminal_focused(host_id, run_id, window, cx)
+            })
+            .map_err(io::Error::other)?;
+        if !focused {
+            return Err(io::Error::other("原 fixture 终端焦点已变化，拒绝清除输入"));
+        }
+        let keystroke = Keystroke::parse("ctrl-u")
+            .map_err(|error| io::Error::other(format!("无法构造 Ctrl+U: {error}")))?;
+        let _ = window.dispatch_event(
+            KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            }
+            .to_platform_input(),
+            app,
+        );
+        let _ = window.dispatch_event(KeyUpEvent { keystroke }.to_platform_input(), app);
+        Ok::<_, io::Error>(())
+    })??;
+    poll_root(
+        cx,
+        root,
+        window,
+        "确认原 fixture 输入已清除",
+        |root, _, cx| {
+            root.right_rail_acceptance_logs_terminal_cursor_line(host_id, run_id, cx)
+                .map(|line| line.filter(|line| line == &original_line))
+        },
+    )
+    .await?;
+    evidence?;
+    Ok(())
+}
+
+/// 查询完成后再等两个连续帧的分页投影一致，避免首次布局调整容量后仍拿旧行数检查新画面。
 ///
 /// @author kongweiguang
 async fn read_snapshot(
@@ -340,20 +539,38 @@ async fn read_snapshot(
     host_id: &HostId,
     run_id: &str,
 ) -> Result<RightRailAcceptanceLogsSnapshot, Box<dyn Error>> {
-    poll_root(
-        cx,
-        root,
-        window,
-        "等待 Logs 生产查询回读",
-        |root, _, cx| {
-            if !root.right_rail_acceptance_logs_ready(host_id, run_id, cx)? {
-                return Ok(None);
-            }
-            root.right_rail_acceptance_logs_snapshot(host_id, run_id, cx)
-                .map(Some)
-        },
-    )
-    .await
+    let mut previous: Option<RightRailAcceptanceLogsSnapshot> = None;
+    loop {
+        let snapshot = poll_root(
+            cx,
+            root,
+            window,
+            "等待 Logs 生产查询与布局回读",
+            |root, _, cx| {
+                if !root.right_rail_acceptance_logs_ready(host_id, run_id, cx)? {
+                    return Ok(None);
+                }
+                root.right_rail_acceptance_logs_snapshot(host_id, run_id, cx)
+                    .map(Some)
+            },
+        )
+        .await?;
+        if previous.as_ref().is_some_and(|previous| {
+            previous.page() == snapshot.page()
+                && previous.page_size() == snapshot.page_size()
+                && previous.total_entries() == snapshot.total_entries()
+                && previous.query() == snapshot.query()
+                && previous.source() == snapshot.source()
+                && previous
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.id())
+                    .eq(snapshot.entries().iter().map(|entry| entry.id()))
+        }) {
+            return Ok(snapshot);
+        }
+        previous = Some(snapshot);
+    }
 }
 
 /// 核对 seed、查询键、来源、分页边界和当前页，避免仅凭操作请求认定功能成功。
@@ -398,12 +615,63 @@ fn verify_snapshot(
     Ok(())
 }
 
-/// 合并两页真实记录验证 seed 命令集合及 9 User/1 Tool 来源，不假设列表排序顺序。
+/// 用当前帧的真实 bounds 检查完整行、列表利用率和分页中线，防止快照条数正确但实际裁切或错位。
+///
+/// @author kongweiguang
+fn verify_history_geometry(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    snapshot: &RightRailAcceptanceLogsSnapshot,
+) -> Result<(), Box<dyn Error>> {
+    window.update(cx, |_, window, _| {
+        let bounds = |selector: &str| {
+            window
+                .debug_selector_bounds(selector)
+                .ok_or_else(|| io::Error::other(format!("缺少历史布局 selector {selector}")))
+        };
+        let list = bounds("rr-logs-list")?;
+        let card = bounds("rr-logs-card")?;
+        let rounding = gpui_kit::px(1.);
+        for entry in snapshot.entries() {
+            let row = bounds(&format!("rr-logs-row-{}", entry.id()))?;
+            if row.top() < list.top() - rounding || row.bottom() > list.bottom() + rounding {
+                return Err(io::Error::other("历史分页含未完整显示的命令行"));
+            }
+        }
+        if let Some(first) = snapshot.entries().first() {
+            let row = bounds(&format!("rr-logs-row-{}", first.id()))?;
+            if snapshot.page_count() > 1
+                && list.size.height - row.size.height * snapshot.page_size() as f32
+                    >= row.size.height + rounding
+            {
+                return Err(io::Error::other("历史列表仍空留一整行以上的可用高度"));
+            }
+        }
+        if snapshot.page_count() > 1 {
+            let footer = bounds("rr-logs-pagination")?;
+            let previous = bounds("rr-logs-previous")?;
+            let label = bounds("rr-logs-page-label")?;
+            let next = bounds("rr-logs-next")?;
+            if (previous.center().y - label.center().y).abs() > rounding
+                || (next.center().y - label.center().y).abs() > rounding
+                || (footer.bottom() - card.bottom()).abs() > gpui_kit::px(2.)
+                || (footer.left() - list.left()).abs() > rounding
+                || (footer.right() - list.right()).abs() > rounding
+            {
+                return Err(io::Error::other("历史分页未与列表边缘及按钮中线对齐"));
+            }
+        }
+        Ok::<_, io::Error>(())
+    })??;
+    Ok(())
+}
+
+/// 合并所有实际页面验证种子集合与来源，确保动态容量不会漏页或重复展示记录。
 ///
 /// @author kongweiguang
 fn verify_seed_sources(
     first_page: &RightRailAcceptanceLogsSnapshot,
-    second_page: &RightRailAcceptanceLogsSnapshot,
+    remaining_pages: &[RightRailAcceptanceLogsSnapshot],
     prefix: &str,
     run_id: &str,
 ) -> Result<(), io::Error> {
@@ -418,13 +686,17 @@ fn verify_seed_sources(
 
     let mut actual = HashMap::with_capacity(SEEDED_ENTRIES);
     let mut ids = HashSet::with_capacity(SEEDED_ENTRIES);
-    for entry in first_page.entries().iter().chain(second_page.entries()) {
+    for entry in first_page
+        .entries()
+        .iter()
+        .chain(remaining_pages.iter().flat_map(|page| page.entries()))
+    {
         actual.insert(entry.command().to_owned(), entry.source());
         ids.insert(entry.id().to_owned());
     }
     if actual != expected || ids.len() != SEEDED_ENTRIES {
         return Err(io::Error::other(format!(
-            "Logs seed {run_id} 未回读到唯一的九条 User 与一条 Tool 记录"
+            "Logs seed {run_id} 未回读到完整且唯一的 User 与 Tool 种子记录"
         )));
     }
     Ok(())

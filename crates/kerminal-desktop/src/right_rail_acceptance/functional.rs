@@ -4,6 +4,7 @@
 
 use super::*;
 use gpui_kit::Window;
+use gpui_pre::{InputEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,7 +76,258 @@ pub(super) async fn checkpoint(
     Ok(())
 }
 
-/// 名称由本轮输出目录派生且只能在 manifest 的精确 SFTP 目录内使用，失败后由归属 fixture 清理兜底。
+/// 同一窗口事件循环内绘制刷新中状态，避免快速 SFTP 回执掩盖列表闪烁。
+///
+/// @author kongweiguang
+fn capture_refresh_in_flight(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    operation: &'static str,
+) -> Result<(CaptureRecord, usize), Box<dyn Error>> {
+    let path = capture
+        .output_directory
+        .join(format!("functional-{operation}.png"));
+    let host = &capture.fixture_host_id;
+    let directory = capture.remote_sftp_directory.as_str();
+    let result = window.update(cx, |_, window, app| {
+        let clear = window.draw(app);
+        clear.clear(app);
+        let before_state = root
+            .update(app, |root, cx| {
+                root.right_rail_acceptance_sftp_refresh_snapshot(host, directory, cx)
+            })
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("Fixture listing is unavailable before refresh"))?;
+        if before_state.0 || before_state.1 == 0 || !before_state.2 {
+            return Err(io::Error::other(
+                "Fixture listing or operation status is not ready before refresh",
+            ));
+        }
+        let row = "files-row-1-fixture-readme.txt";
+        if window.debug_selector_bounds(row).is_none() {
+            return Err(io::Error::other(
+                "Fixture file row is not visible before refresh",
+            ));
+        }
+        let button_id = gpui_kit::ElementId::from("files-refresh-1");
+        let button = gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .find(|item| item.path().contains(&button_id))
+            .ok_or_else(|| io::Error::other("Refresh button is not mounted"))?;
+        if button.disabled() == Some(true) || !button.supports_click() {
+            return Err(io::Error::other(
+                "Refresh button is not enabled before refresh",
+            ));
+        }
+        let download = window
+            .debug_selector_bounds("files-download-1")
+            .ok_or_else(|| io::Error::other("Download button geometry is unavailable"))?;
+        let more = window
+            .debug_selector_bounds("rr-files-view-menu")
+            .ok_or_else(|| io::Error::other("File view menu geometry is unavailable"))?;
+        let scale = window.scale_factor();
+        let left = (download.right().as_f32() * scale).ceil() as u32;
+        let right = (more.left().as_f32() * scale).floor() as u32;
+        let top = (download.top().as_f32() * scale).ceil() as u32;
+        let bottom = (download.bottom().as_f32() * scale).floor() as u32;
+        let before_image = window.render_to_image().map_err(io::Error::other)?;
+        if right <= left
+            || bottom <= top
+            || right > before_image.width()
+            || bottom > before_image.height()
+        {
+            return Err(io::Error::other(
+                "Refresh count comparison region is invalid",
+            ));
+        }
+        let position = button.bounds().center();
+        for event in [
+            MouseMoveEvent {
+                position,
+                ..MouseMoveEvent::default()
+            }
+            .to_platform_input(),
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..MouseDownEvent::default()
+            }
+            .to_platform_input(),
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..MouseUpEvent::default()
+            }
+            .to_platform_input(),
+        ] {
+            let _ = window.dispatch_event(event, app);
+        }
+        let during = root
+            .update(app, |root, cx| {
+                root.right_rail_acceptance_sftp_refresh_snapshot(host, directory, cx)
+            })
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("Refresh discarded the committed fixture listing"))?;
+        if !during.0 || during.1 != before_state.1 || !during.2 {
+            return Err(io::Error::other(
+                "Refresh did not retain listing and quiet operation status",
+            ));
+        }
+        let clear = window.draw(app);
+        clear.clear(app);
+        if window.debug_selector_bounds(row).is_none() {
+            return Err(io::Error::other(
+                "Refresh removed the visible fixture file row",
+            ));
+        }
+        let busy_button = gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .find(|item| item.path().contains(&button_id))
+            .ok_or_else(|| io::Error::other("Refresh button disappeared while loading"))?;
+        if busy_button.supports_click() {
+            return Err(io::Error::other(
+                "Refresh button still exposes click while the request is pending",
+            ));
+        }
+        for event in [
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..MouseDownEvent::default()
+            }
+            .to_platform_input(),
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..MouseUpEvent::default()
+            }
+            .to_platform_input(),
+        ] {
+            let _ = window.dispatch_event(event, app);
+        }
+        let after_retry = root
+            .update(app, |root, cx| {
+                root.right_rail_acceptance_sftp_refresh_snapshot(host, directory, cx)
+            })
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("Repeated refresh discarded the committed listing"))?;
+        if !after_retry.0 || after_retry.3 != during.3 {
+            return Err(io::Error::other(
+                "Busy refresh accepted a duplicate request",
+            ));
+        }
+        let image = window.render_to_image().map_err(io::Error::other)?;
+        for y in top..bottom {
+            for x in left..right {
+                if before_image.get_pixel(x, y) != image.get_pixel(x, y) {
+                    return Err(io::Error::other(
+                        "Refresh changed the visible item count region",
+                    ));
+                }
+            }
+        }
+        let width = image.width();
+        let height = image.height();
+        let pixel_sha256 = format!("{:x}", Sha256::digest(image.as_raw()));
+        image.save(&path).map_err(io::Error::other)?;
+        Ok::<_, io::Error>((
+            CaptureRecord {
+                file: path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .ok_or_else(|| io::Error::other("Invalid refresh screenshot path"))?
+                    .to_owned(),
+                width,
+                height,
+                pixel_sha256,
+            },
+            before_state.1,
+        ))
+    })??;
+    Ok(result)
+}
+
+/// 独立专项只检查同目录刷新，在浅色、深色和跟随系统主题下等待真实回执。
+///
+/// @author kongweiguang
+async fn run_refresh_only(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+) -> Result<Vec<FunctionalRecord>, Box<dyn Error>> {
+    let host = &capture.fixture_host_id;
+    let directory = capture.remote_sftp_directory.as_str();
+    window.update(cx, |_, window, app| {
+        root.update(app, |root, cx| {
+            root.activate_right_rail_tool_for_acceptance(ToolRailToolId::Sftp, window, cx)
+        });
+    })?;
+    navigate_and_wait_for_sftp_directory(cx, root, window, host, directory).await?;
+    let mut records = Vec::new();
+    for (mode, name) in RIGHT_RAIL_THEMES {
+        window.update(cx, |_, _, app| {
+            root.update(app, |root, cx| {
+                root.set_right_rail_acceptance_theme(mode, cx)
+            })
+        })?;
+        let _ = frame_signature(cx, window)?;
+        let (busy, settled) = match name {
+            "light" => ("sftp-refresh-light-loading", "sftp-refresh-light-settled"),
+            "dark" => ("sftp-refresh-dark-loading", "sftp-refresh-dark-settled"),
+            "system" => ("sftp-refresh-system-loading", "sftp-refresh-system-settled"),
+            _ => return Err(io::Error::other("Unknown refresh acceptance theme").into()),
+        };
+        let (evidence, count) = capture_refresh_in_flight(cx, root, window, capture, busy)?;
+        records.push(FunctionalRecord {
+            operation: busy,
+            outcome: "same_directory_row_count_and_quiet_status_retained_while_button_busy",
+            evidence,
+        });
+        poll_root(
+            cx,
+            root,
+            window,
+            "same-directory refresh completion",
+            |root, _, cx| {
+                let Some((loading, current_count, no_status, _generation)) =
+                    root.right_rail_acceptance_sftp_refresh_snapshot(host, directory, cx)?
+                else {
+                    return Ok(None);
+                };
+                if loading {
+                    return Ok(None);
+                }
+                if current_count != count || !no_status {
+                    return Err(
+                        "Refresh completed with changed fixture count or operation status"
+                            .to_owned(),
+                    );
+                }
+                Ok(Some(()))
+            },
+        )
+        .await?;
+        checkpoint(
+            cx,
+            window,
+            capture,
+            &mut records,
+            settled,
+            "same_directory_refresh_completed_without_success_footer",
+        )
+        .await?;
+    }
+    Ok(records)
+}
+
+/// 名称绑定本轮精确 SFTP fixture，目录创建后实测右键菜单，失败后由归属 fixture 清理兜底。
 ///
 /// @author kongweiguang
 async fn run_files(
@@ -130,6 +382,22 @@ async fn run_files(
         records,
         "sftp-created",
         "created_directory_returned_by_production_listing",
+    )
+    .await?;
+    super::functional_transfer_workspace::reveal_file_row(
+        cx,
+        window,
+        capture,
+        "files-browser-list-1",
+        &format!("files-row-1-{name}"),
+        "created-directory-menu",
+    )
+    .await?;
+    super::menus::assert_file_context_menu(
+        cx,
+        window,
+        &format!("files-row-1-{name}"),
+        Some(&capture.output_directory.join("sftp-file-menu-focus.json")),
     )
     .await?;
     poll_root(cx, root, window, "打开重命名", |root, window, cx| {
@@ -346,10 +614,12 @@ pub(super) async fn run(
     run_files(cx, root, window, capture, &mut records).await?;
     super::functional_transfers::run(cx, root, window, capture, &mut records, &services.executor)
         .await?;
+    super::functional_transfer_workspace::run(cx, root, window, capture, &mut records, services)
+        .await?;
     run_tmux(cx, root, window, capture, &mut records).await?;
     super::functional_tmux_attach::run(cx, root, window, capture, &mut records).await?;
     super::functional_logs::run(cx, root, window, capture, &mut records).await?;
-    super::functional_forwarding::run(cx, root, window, capture, &mut records).await?;
+    super::functional_forwarding::run(cx, root, window, capture, &mut records, services).await?;
     let files = services
         .files
         .as_ref()
@@ -366,5 +636,32 @@ pub(super) async fn run(
     .await?;
     super::functional_containers::run(cx, root, window, capture, &mut records).await?;
     super::functional_snippets::run(cx, root, window, capture, &mut records).await?;
+    Ok(records)
+}
+
+/// 与完整验收共享原目录操作和传输/编辑器闭环；任一步失败仍中止且不生成成功报告。
+///
+/// @author kongweiguang
+pub(super) async fn run_sftp_only(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    services: &kerminal_ui::AppServices,
+) -> Result<Vec<FunctionalRecord>, Box<dyn Error>> {
+    if std::env::var_os("KERMINAL_RIGHT_RAIL_REFRESH_ONLY").is_some() {
+        return run_refresh_only(cx, root, window, capture).await;
+    }
+    window.update(cx, |_, _, app| {
+        root.update(app, |root, cx| {
+            root.set_right_rail_acceptance_theme(ThemeMode::Light, cx)
+        })
+    })?;
+    let mut records = Vec::new();
+    run_files(cx, root, window, capture, &mut records).await?;
+    super::functional_transfers::run(cx, root, window, capture, &mut records, &services.executor)
+        .await?;
+    super::functional_transfer_workspace::run(cx, root, window, capture, &mut records, services)
+        .await?;
     Ok(records)
 }

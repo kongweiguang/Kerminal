@@ -21,8 +21,8 @@ use gpui_kit::{
 use kerminal_domain::{
     identity::HostId,
     operations::{
-        ComposeProjectTarget, ContainerAction, ContainerRuntime, ContainerStats, ContainerStatus,
-        ContainerSummary, ContainerTarget,
+        ComposeAction, ComposeProjectTarget, ContainerAction, ContainerRuntime, ContainerStats,
+        ContainerStatus, ContainerSummary, ContainerTarget,
     },
 };
 
@@ -65,7 +65,7 @@ impl OperationsView {
     /// includeStopped 是立即生效的列表查询条件；只在值变化后重读，避免重复开请求。
     ///
     /// @author kongweiguang
-    pub(super) fn set_host_container_include_stopped(
+    pub(in crate::features::operations) fn set_host_container_include_stopped(
         &mut self,
         include_stopped: bool,
         cx: &mut Context<Self>,
@@ -476,7 +476,7 @@ fn render_host(
 }
 
 /// 宿主列表只展示当前 binding/runtime 的数据；Compose 标题与展开子行共用卡片边界，避免视觉上失去项目归属。
-/// 搜索框通过 Styled 设置单行高度，不依赖 Input 的多行专用 h。
+/// 搜索框通过 Styled 设置单行高度；无实际反馈时不插入空节点，以免刷新改变列表的 flex 间距。
 ///
 /// @author kongweiguang
 fn render_host_list(
@@ -485,7 +485,9 @@ fn render_host_list(
     cx: &mut Context<OperationsView>,
 ) -> AnyElement {
     let ticket = view.container_action_ticket(None);
-    let busy = view.busy;
+    let busy = view.busy
+        || view.container_write_scope_blocked()
+        || view.containers.phase() != super::super::state::SectionPhase::Ready;
     let runtime = view.runtime;
     let rows = view.containers.data().cloned().unwrap_or_default();
     let status_filter = if view.container_host.include_stopped() {
@@ -510,7 +512,16 @@ fn render_host_list(
         view.containers.phase(),
         super::super::state::SectionPhase::NotLoaded | super::super::state::SectionPhase::Loading
     );
-    let summary = container_summary(&rows, &groups, loading, view.containers.error().is_some());
+    let summary = view.containers.data().map_or_else(String::new, |_| {
+        container_summary(&rows, &groups, false, false)
+    });
+    let empty_result =
+        view.containers.data().is_some() && filtered.is_empty() && retained.is_empty();
+    let show_list_feedback = !loading
+        && (view.containers.error().is_some()
+            || view.containers.phase() == super::super::state::SectionPhase::Cancelled
+            || (view.containers.phase() == super::super::state::SectionPhase::Ready
+                && empty_result));
     let runtime_entity = cx.entity().clone();
     let runtime_ticket = ticket.clone();
     let runtime_menu_theme = theme;
@@ -593,25 +604,16 @@ fn render_host_list(
                 .unwrap_or_else(|| host_id.as_str().into())
         },
     );
-    let host_subtitle = view.host_target.as_ref().map_or_else(
-        || crate::locale::text("本机容器运行时", "Local container runtime"),
-        |host_id| {
-            view.host_subtitles
-                .get(host_id)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let fallback = format!("SSH · {}", host_id.as_str());
-                    crate::locale::text(fallback.clone(), fallback)
-                })
-        },
-    );
     let refresh_ticket = ticket.clone();
     let refresh_button = icon_button(
         "container-panel-refresh",
         gpui_kit::assets::IconName::RefreshCw,
         crate::locale::text("刷新容器列表", "Refresh containers"),
     )
-    .disabled(loading || busy)
+    .debug_selector(|| "rr-containers-refresh".to_owned())
+    .loading(loading)
+    .loading_icon(gpui_kit::assets::IconName::RefreshCw)
+    .disabled(loading || view.busy)
     .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
         view.request_container_panel_refresh(runtime, &refresh_ticket, cx);
     }));
@@ -633,26 +635,13 @@ fn render_host_list(
                         .justify_between()
                         .gap_2()
                         .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(theme.text_sm)
-                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                        .child(host_name),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(theme.text_xs)
-                                        .text_color(theme.muted)
-                                        .child(host_subtitle),
-                                ),
+                            div().min_w_0().flex_1().flex().flex_col().gap_1().child(
+                                div()
+                                    .truncate()
+                                    .text_size(theme.text_sm)
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .child(host_name),
+                            ),
                         )
                         .child(refresh_button),
                 )
@@ -660,10 +649,7 @@ fn render_host_list(
                     div()
                         .w_full()
                         .min_w_0()
-                        .px_3()
-                        .py_2()
-                        .rounded_lg()
-                        .bg(theme.sidebar)
+                        .h(px(18.))
                         .text_size(theme.text_xs)
                         .text_color(theme.muted)
                         .child(summary),
@@ -725,12 +711,15 @@ fn render_host_list(
                 ),
         )
         .children(view.compact_operation_feedback(theme))
-        .child(super::section_feedback(
-            &view.containers,
-            view.containers.data().is_some() && filtered.is_empty() && retained.is_empty(),
-            crate::locale::text("尚未读取容器列表。", "Container list has not been loaded."),
-            theme,
-        ));
+        .children(container_success_notice(view, theme))
+        .when(show_list_feedback, |body| {
+            body.child(super::section_feedback(
+                &view.containers,
+                empty_result,
+                crate::locale::text("尚未读取容器列表。", "Container list has not been loaded."),
+                theme,
+            ))
+        });
 
     let mut container_list = div().w_full().min_w_0().flex().flex_col().gap_1p5();
     if group_mode == ContainerHostGroupMode::Compose {
@@ -755,15 +744,14 @@ fn render_host_list(
         .sum::<usize>();
     let inspector_theme = theme.for_inspector();
     let mut standalone_heading_added = false;
-    for (group_index, group) in groups.into_iter().enumerate() {
+    for group in groups {
         if group.compose_group {
             if let Some(target) = group.target.as_ref() {
+                let group_key = compose_project_element_key(target);
                 let expanded = view.container_host.is_project_expanded(target);
                 let project_target = target.clone();
-                let select_target = project_target.clone();
                 let expand_target = project_target.clone();
                 let yaml_target = project_target.clone();
-                let select_ticket = ticket.clone();
                 let expand_ticket = ticket.clone();
                 let yaml_ticket = ticket.clone();
                 let running = group
@@ -783,51 +771,74 @@ fn render_host_list(
                     theme.muted
                 };
                 let project_selected = view.container_host.is_project_selected(target);
-                let select_button = Button::new(format!("container-project-{group_index}"))
+                let toggle_selector = format!("rr-compose-toggle-{group_key}");
+                let select_button = Button::new(format!("container-project-{group_key}"))
                     .compact()
                     .ghost()
-                    .label(target.project.clone())
+                    .tab_stop(true)
+                    .debug_selector(move || toggle_selector)
+                    .accessibility_label(crate::locale::text(
+                        format!(
+                            "{} Compose 项目 {}",
+                            if expanded { "折叠" } else { "展开" },
+                            target.project
+                        ),
+                        format!(
+                            "{} Compose project {}",
+                            if expanded { "Collapse" } else { "Expand" },
+                            target.project
+                        ),
+                    ))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(gpui_kit::component::Icon::new(if expanded {
+                                gpui_kit::assets::IconName::ChevronDown
+                            } else {
+                                gpui_kit::assets::IconName::ChevronRight
+                            }))
+                            .child(div().size_2().rounded_full().bg(project_status_color))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_left()
+                                    .child(target.project.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px_2()
+                                    .py(px(2.))
+                                    .rounded_full()
+                                    .bg(inspector_theme.secondary)
+                                    .text_size(theme.text_xs)
+                                    .text_color(theme.muted)
+                                    .child(format!("{running}/{}", group.containers.len())),
+                            ),
+                    )
+                    .min_w_0()
                     .flex_1()
                     .text_color(theme.foreground)
                     .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                        if !view.container_action_ticket_is_current(&select_ticket, None) {
-                            return;
+                        if view.container_action_ticket_is_current(&expand_ticket, None) {
+                            view.container_host
+                                .toggle_project_expanded(expand_target.clone());
+                            cx.notify();
                         }
-                        view.container_host.select_project(select_target.clone());
-                        cx.notify();
                     }));
-                let expand_button = icon_button(
-                    format!("container-project-expand-{group_index}"),
-                    if expanded {
-                        gpui_kit::assets::IconName::ChevronDown
-                    } else {
-                        gpui_kit::assets::IconName::ChevronRight
-                    },
-                    crate::locale::text(
-                        if expanded {
-                            "折叠 Compose 项目"
-                        } else {
-                            "展开 Compose 项目"
-                        },
-                        if expanded {
-                            "Collapse Compose project"
-                        } else {
-                            "Expand Compose project"
-                        },
-                    ),
-                )
-                .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                    if view.container_action_ticket_is_current(&expand_ticket, None) {
-                        view.container_host
-                            .toggle_project_expanded(expand_target.clone());
-                        cx.notify();
-                    }
-                }));
+                let yaml_selector = format!("rr-compose-yaml-{group_key}");
                 let yaml_button = icon_button(
-                    format!("container-project-yaml-{group_index}"),
+                    format!("container-project-yaml-{group_key}"),
                     gpui_kit::assets::IconName::FileCode,
                     crate::locale::text("打开 Compose YAML", "Open Compose YAML"),
                 )
+                .debug_selector(move || yaml_selector)
                 .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                     if !view.container_action_ticket_is_current(&yaml_ticket, None) {
                         return;
@@ -858,21 +869,23 @@ fn render_host_list(
                     .when(!project_selected, |row| {
                         row.hover(|style| style.bg(theme.surface_hover()))
                     })
-                    .child(expand_button)
-                    .child(div().size_2().rounded_full().bg(project_status_color))
                     .child(select_button)
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .px_2()
-                            .py(px(2.))
-                            .rounded_full()
-                            .bg(inspector_theme.secondary)
-                            .text_size(theme.text_xs)
-                            .text_color(theme.muted)
-                            .child(format!("{running}/{}", group.containers.len())),
-                    )
-                    .child(yaml_button);
+                    .child(yaml_button)
+                    .child(compose_actions_menu(
+                        target,
+                        &ticket,
+                        busy || !view.compose_mutation_allowed(target),
+                        view.container_mutations.compose_loading(target),
+                        theme,
+                        format!("container-project-more-{group_key}"),
+                        cx,
+                    ))
+                    .children(container_cancel_button(
+                        view,
+                        view.container_mutations.compose_executing(target),
+                        format!("container-project-cancel-{group_key}"),
+                        cx,
+                    ));
                 let mut project_card = div()
                     .w_full()
                     .min_w_0()
@@ -891,12 +904,15 @@ fn render_host_list(
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap(px(6.))
                         .border_t_1()
                         .border_color(theme.border)
                         .p(px(6.))
                         .bg(theme.subtle_background());
-                    for container in group.containers {
+                    for (index, container) in group.containers.into_iter().enumerate() {
+                        if index > 0 {
+                            project_containers =
+                                project_containers.child(div().w_full().h(px(1.)).bg(theme.border));
+                        }
                         project_containers = project_containers.child(render_host_container_row(
                             view, container, true, false, busy, theme, cx,
                         ));
@@ -950,6 +966,22 @@ fn render_host_list(
         true,
     )
     .into_any_element()
+}
+
+/// 列表可能因状态刷新重新排序，控件身份必须随完整项目而不是行序号移动。
+///
+/// @author kongweiguang
+fn compose_project_element_key(target: &ComposeProjectTarget) -> String {
+    format!(
+        "{:?}",
+        (
+            target.host_id.as_ref().map(|host| host.as_str()),
+            target.runtime,
+            &target.project,
+            &target.working_dir,
+            &target.config_files,
+        )
+    )
 }
 
 /// 按 main 的 Compose、状态与平铺模式投影分组，完整 Compose target 才能进入项目详情。
@@ -1199,6 +1231,7 @@ fn container_group_heading(
 }
 
 /// 容器行只显示主操作，日志、固定和生命周期命令留在更多菜单，详情和监控由 inspector 页签承载。
+/// 行身份使用完整容器 ID，避免短 ID 冲突或刷新重排时的测试目标漂移。
 ///
 /// @author kongweiguang
 fn render_host_container_row(
@@ -1213,6 +1246,7 @@ fn render_host_container_row(
     let target = container.target.clone();
     let ticket = view.container_action_ticket(Some(target.clone()));
     let selected = view.container_host.is_container_selected(&target);
+    let pending = view.container_mutations.container_loading(&target);
     let row_id = container.short_id.clone();
     let display_name = if project_detail {
         &container.name
@@ -1245,9 +1279,11 @@ fn render_host_container_row(
     let title_ticket = ticket.clone();
     let title_status = container.status;
     let title_project_detail = project_detail;
+    let row_selector = format!("rr-container-row-{}", target.container_id);
     let title = Button::new(format!("container-row-name-{row_id}"))
         .compact()
         .ghost()
+        .debug_selector(move || row_selector)
         .label(display_name.to_owned())
         .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
             if !view.container_action_ticket_is_current(&title_ticket, Some(&title_target)) {
@@ -1427,8 +1463,15 @@ fn render_host_container_row(
             &container,
             &ticket,
             busy,
+            pending,
             theme,
             format!("container-more-{row_id}"),
+            cx,
+        ));
+        actions = actions.children(container_cancel_button(
+            view,
+            view.container_mutations.container_executing(&target),
+            format!("container-cancel-{row_id}"),
             cx,
         ));
     }
@@ -1459,18 +1502,20 @@ fn can_run_host_container_action(status: ContainerStatus, action: ContainerActio
     }
 }
 
-/// 容器行菜单保留日志、固定和生命周期入口；详情与监控通过 inspector 页签切换。
+/// 容器行菜单按查看、辅助操作和生命周期分组；详情页不重复自身入口。
 ///
 /// @author kongweiguang
 fn container_actions_menu(
     container: &kerminal_domain::operations::ContainerSummary,
     ticket: &super::super::container_panel::ContainerPanelActionTicket,
     busy: bool,
+    pending: bool,
     theme: ThemeTokens,
     id: String,
     cx: &mut Context<OperationsView>,
-) -> impl IntoElement {
+) -> impl IntoElement + 'static {
     let entity = cx.entity().clone();
+    let show_details = id != "container-inspector-more";
     let target = container.target.clone();
     let debug_selector = format!("rr-container-more-{}", target.container_id);
     let container_name = container.name.clone();
@@ -1489,12 +1534,31 @@ fn container_actions_menu(
     .w_7()
     .rounded_lg()
     .debug_selector(move || debug_selector)
-    .disabled(busy)
+    .loading(pending)
     .dropdown_menu(move |mut menu, _, _| {
         menu = crate::ui_popup::context_menu(menu, theme, Some(px(176.)));
+        if show_details {
+            menu = menu.item(
+                PopupMenuItem::new(crate::locale::text("查看详情", "View details"))
+                    .icon(gpui_kit::assets::IconName::Info)
+                    .on_click({
+                        let target = target.clone();
+                        let ticket = menu_ticket.clone();
+                        let entity = entity.clone();
+                        move |_, _, app| {
+                            entity.update(app, |view, cx| {
+                                if view.container_action_ticket_is_current(&ticket, Some(&target)) {
+                                    view.open_host_container_inspector(target.clone(), None, cx);
+                                }
+                            });
+                        }
+                    }),
+            );
+        }
         menu = menu.item(
             PopupMenuItem::new(crate::locale::text("日志", "Logs"))
                 .icon(gpui_kit::assets::IconName::ScrollText)
+                .disabled(busy)
                 .on_click({
                     let target = target.clone();
                     let ticket = menu_ticket.clone();
@@ -1546,14 +1610,6 @@ fn container_actions_menu(
             };
             let enabled = can_run_host_container_action(status, action);
             let is_destructive = matches!(action, ContainerAction::Stop | ContainerAction::Remove);
-            let action_id = match action {
-                ContainerAction::Start => "start",
-                ContainerAction::Stop => "stop",
-                ContainerAction::Restart => "restart",
-                ContainerAction::Remove => "remove",
-            };
-            let action_name = target.container_id.clone();
-            let action_text = label.clone();
             let on_click = move |_: &ClickEvent,
                                  window: &mut gpui_kit::Window,
                                  app: &mut gpui_kit::App| {
@@ -1587,34 +1643,159 @@ fn container_actions_menu(
                     cx.notify();
                 });
             };
-            let item = if is_destructive {
-                PopupMenuItem::element(move |_, _| {
-                    div()
-                        .id(format!("container-menu-{action_id}-{action_name}"))
-                        .aria_label(action_text.clone())
-                        .w_full()
-                        .h_auto()
-                        .min_h(px(20.))
-                        .py(px(6.))
-                        .pl_1()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_size(px(13.))
-                        .line_height(px(20.))
-                        .text_color(theme.error)
-                        .child(action_text.clone())
-                })
-                .icon(gpui_kit::component::Icon::new(icon).text_color(theme.error))
-            } else {
-                PopupMenuItem::new(label).icon(icon)
-            };
-            let item = item.disabled(!enabled || busy).on_click(on_click);
+            let item = PopupMenuItem::new(label)
+                .icon(icon)
+                .when(is_destructive, |item| item.danger())
+                .disabled(!enabled || busy)
+                .on_click(on_click);
             menu = menu.item(item);
         }
         menu
     })
     .offset(px(6.))
+}
+
+/// 项目菜单与容器菜单使用同一尺寸、分组和危险色；查看详情不依赖写操作可用性。
+///
+/// @author kongweiguang
+fn compose_actions_menu(
+    target: &ComposeProjectTarget,
+    ticket: &super::super::container_panel::ContainerPanelActionTicket,
+    disabled: bool,
+    loading: bool,
+    theme: ThemeTokens,
+    id: String,
+    cx: &mut Context<OperationsView>,
+) -> impl IntoElement + 'static {
+    let entity = cx.entity().clone();
+    let show_details = id != "container-project-inspector-more";
+    let debug_selector = if id == "container-project-inspector-more" {
+        "rr-compose-project-more".to_owned()
+    } else {
+        format!(
+            "rr-compose-project-more-{}",
+            compose_project_element_key(target)
+        )
+    };
+    let target = target.clone();
+    let ticket = ticket.clone();
+    icon_button(
+        id,
+        gpui_kit::assets::IconName::Ellipsis,
+        crate::locale::text(
+            format!("更多 Compose 项目操作 {}", target.project),
+            format!("More actions for Compose project {}", target.project),
+        ),
+    )
+    .h_7()
+    .w_7()
+    .rounded_lg()
+    .loading(loading)
+    .debug_selector(move || debug_selector)
+    .dropdown_menu(move |mut menu, _, _| {
+        menu = crate::ui_popup::context_menu(menu, theme, Some(px(176.)));
+        if show_details {
+            menu = menu.item(
+                PopupMenuItem::new(crate::locale::text("查看详情", "View details"))
+                    .icon(gpui_kit::assets::IconName::Info)
+                    .on_click({
+                        let entity = entity.clone();
+                        let target = target.clone();
+                        let ticket = ticket.clone();
+                        move |_, _, app| {
+                            entity.update(app, |view, cx| {
+                                if view.container_action_ticket_is_current(&ticket, None) {
+                                    view.container_host.select_project(target.clone());
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }),
+            );
+            menu = menu.item(PopupMenuItem::separator());
+        }
+        for (action, zh, en, icon) in [
+            (
+                ComposeAction::Up,
+                "启动",
+                "Start",
+                gpui_kit::assets::IconName::Play,
+            ),
+            (
+                ComposeAction::Stop,
+                "停止",
+                "Stop",
+                gpui_kit::assets::IconName::Square,
+            ),
+            (
+                ComposeAction::Restart,
+                "重启",
+                "Restart",
+                gpui_kit::assets::IconName::RotateCw,
+            ),
+            (
+                ComposeAction::Down,
+                "拆除",
+                "Remove",
+                gpui_kit::assets::IconName::Trash,
+            ),
+        ] {
+            let entity = entity.clone();
+            let target = target.clone();
+            let ticket = ticket.clone();
+            let label = crate::locale::text(zh, en);
+            let is_destructive = matches!(action, ComposeAction::Stop | ComposeAction::Down);
+            let item = PopupMenuItem::new(label)
+                .icon(icon)
+                .when(is_destructive, |item| item.danger())
+                .disabled(disabled)
+                .on_click(move |_, _, app| {
+                    entity.update(app, |view, cx| {
+                        view.request_compose_mutation(target.clone(), action, &ticket, cx);
+                    });
+                });
+            menu = menu.item(item);
+        }
+        menu
+    })
+    .offset(px(6.))
+}
+
+/// 已确认回执使用轻量成功色，失败和待核对仍沿用现有错误提示。
+///
+/// @author kongweiguang
+fn container_success_notice(view: &OperationsView, theme: ThemeTokens) -> Option<AnyElement> {
+    view.container_success_notice.as_ref().map(|message| {
+        div()
+            .w_full()
+            .min_w_0()
+            .text_size(theme.text_xs)
+            .text_color(theme.success)
+            .child(message.clone())
+            .into_any_element()
+    })
+}
+
+/// 取消只发送协作信号，动画保留到服务回执；不能把取消点击当作远端已停止。
+///
+/// @author kongweiguang
+fn container_cancel_button(
+    view: &OperationsView,
+    loading: bool,
+    id: String,
+    cx: &mut Context<OperationsView>,
+) -> Option<AnyElement> {
+    let cancellation = view.mutation_cancellation.as_ref().filter(|_| loading)?;
+    Some(
+        icon_button(
+            id,
+            gpui_kit::assets::IconName::X,
+            crate::locale::text("取消容器操作", "Cancel container operation"),
+        )
+        .disabled(cancellation.is_cancelled())
+        .on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.cancel_operation_mutation(cx)))
+        .into_any_element(),
+    )
 }
 
 /// 生命周期菜单在不同入口共用同一套动词。
@@ -1629,7 +1810,7 @@ fn container_action_label(action: ContainerAction) -> gpui_kit::SharedString {
     }
 }
 
-/// Compose inspector 延续主版的 Overview / Containers / YAML 三个 tab，文件仍由 Root 打开。
+/// Compose 详情保留概览和容器页；YAML 在同一侧栏以工具按钮进入并按所选文件刷新。
 ///
 /// @author kongweiguang
 fn render_host_project(
@@ -1662,17 +1843,17 @@ fn render_host_project(
             group.containers.len(),
         )
     });
-    let primary_path = display_metadata
-        .config_paths
-        .first()
-        .cloned()
+    let selected_tab = view.container_host.project_tab();
+    let primary_path = (selected_tab == ComposeProjectTab::Yaml)
+        .then(|| view.compose_yaml.selected_path().map(str::to_owned))
+        .flatten()
+        .or_else(|| display_metadata.config_paths.first().cloned())
         .or_else(|| target.config_files.first().cloned())
         .or_else(|| (!target.working_dir.trim().is_empty()).then(|| target.working_dir.clone()))
         .unwrap_or_else(|| {
             crate::locale::text("未发现 Compose YAML 路径", "No Compose YAML path found")
                 .to_string()
         });
-    let selected_tab = view.container_host.project_tab();
     let mut tabs = div().w_full().min_w_0().flex().gap_1();
     for (tab, label, id) in [
         (
@@ -1685,30 +1866,17 @@ fn render_host_project(
             crate::locale::text("容器", "Containers"),
             "containers",
         ),
-        (
-            ComposeProjectTab::Yaml,
-            crate::locale::text("YAML", "YAML"),
-            "yaml",
-        ),
     ] {
-        let tab_target = target.clone();
         let tab_ticket = ticket.clone();
         let button = Button::new(format!("container-project-tab-{id}"))
             .compact()
+            .debug_selector(move || format!("rr-compose-tab-{id}"))
             .label(label)
             .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                 if !view.container_action_ticket_is_current(&tab_ticket, None) {
                     return;
                 }
                 view.container_host.set_project_tab(tab);
-                if tab == ComposeProjectTab::Yaml {
-                    super::compose_yaml::request_preview_for_selected_path(
-                        view,
-                        &tab_target,
-                        &tab_ticket,
-                        cx,
-                    );
-                }
                 cx.notify();
             }));
         tabs = tabs.child(if selected_tab == tab {
@@ -1719,7 +1887,43 @@ fn render_host_project(
     }
 
     let back_ticket = ticket.clone();
+    let back_target = target.clone();
     let refresh_ticket = ticket.clone();
+    let refresh_target = target.clone();
+    let yaml_ticket = ticket.clone();
+    let yaml_target = target.clone();
+    let yaml_selected = selected_tab == ComposeProjectTab::Yaml;
+    let refreshing = if yaml_selected {
+        view.compose_yaml.is_loading()
+    } else {
+        view.containers.phase() == super::super::state::SectionPhase::Loading
+    };
+    let copy_path = if yaml_selected && view.compose_yaml.selected_path().is_some() {
+        let copy_ticket = ticket.clone();
+        let copy_target = target.clone();
+        Some(
+            icon_button(
+                "container-project-copy-yaml-path",
+                gpui_kit::assets::IconName::Copy,
+                crate::locale::text("复制 Compose YAML 路径", "Copy Compose YAML path"),
+            )
+            .tooltip(crate::locale::text("复制 YAML 路径", "Copy YAML path"))
+            .debug_selector(|| "rr-compose-copy-yaml-path".to_owned())
+            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+                if !view.container_action_ticket_is_current(&copy_ticket, None)
+                    || view.container_host.project_tab() != ComposeProjectTab::Yaml
+                    || !matches!(view.container_host.page(), ContainerHostPage::ComposeProject { target } if target == &copy_target)
+                {
+                    return;
+                }
+                if let Some(path) = view.compose_yaml.selected_path() {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(path.to_owned()));
+                }
+            })),
+        )
+    } else {
+        None
+    };
     let header = div()
         .w_full()
         .flex()
@@ -1729,11 +1933,22 @@ fn render_host_project(
             icon_button(
                 "container-project-back",
                 gpui_kit::assets::IconName::ArrowLeft,
-                crate::locale::text("返回容器列表", "Back to containers"),
+                if yaml_selected {
+                    crate::locale::text("返回 Compose 详情", "Back to Compose details")
+                } else {
+                    crate::locale::text("返回容器列表", "Back to containers")
+                },
             )
+            .debug_selector(|| "rr-compose-back".to_owned())
             .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                if view.container_action_ticket_is_current(&back_ticket, None) {
-                    view.container_host.navigate_to_list();
+                if view.container_action_ticket_is_current(&back_ticket, None)
+                    && matches!(view.container_host.page(), ContainerHostPage::ComposeProject { target } if target == &back_target)
+                {
+                    if view.container_host.project_tab() == ComposeProjectTab::Yaml {
+                        view.container_host.set_project_tab(ComposeProjectTab::Overview);
+                    } else {
+                        view.container_host.navigate_to_list();
+                    }
                     cx.notify();
                 }
             })),
@@ -1781,13 +1996,69 @@ fn render_host_project(
             icon_button(
                 "container-project-refresh",
                 gpui_kit::assets::IconName::RefreshCw,
-                crate::locale::text("刷新容器列表", "Refresh containers"),
+                if yaml_selected {
+                    crate::locale::text("刷新 Compose YAML", "Refresh Compose YAML")
+                } else {
+                    crate::locale::text("刷新容器列表", "Refresh containers")
+                },
             )
-            .disabled(view.busy)
+            .debug_selector(|| "rr-compose-refresh".to_owned())
+            .loading(refreshing)
+            .loading_icon(gpui_kit::assets::IconName::RefreshCw)
+            .disabled(view.busy || refreshing)
             .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                view.request_container_panel_refresh(view.runtime, &refresh_ticket, cx);
+                if !view.container_action_ticket_is_current(&refresh_ticket, None)
+                    || !matches!(view.container_host.page(), ContainerHostPage::ComposeProject { target } if target == &refresh_target)
+                {
+                    return;
+                }
+                if view.container_host.project_tab() == ComposeProjectTab::Yaml {
+                    super::compose_yaml::request_preview_for_selected_path(view, &refresh_target, &refresh_ticket, cx);
+                } else {
+                    view.request_container_panel_refresh(view.runtime, &refresh_ticket, cx);
+                }
             })),
-        );
+        )
+        .child(
+            icon_button(
+                "container-project-inspector-yaml",
+                gpui_kit::assets::IconName::FileCode,
+                crate::locale::text("查看 Compose YAML", "View Compose YAML"),
+            )
+            .tooltip(crate::locale::text("Compose YAML", "Compose YAML"))
+            .debug_selector(|| "rr-compose-yaml".to_owned())
+            .selected(yaml_selected)
+            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+                if !view.container_action_ticket_is_current(&yaml_ticket, None)
+                    || !matches!(view.container_host.page(), ContainerHostPage::ComposeProject { target } if target == &yaml_target)
+                {
+                    return;
+                }
+                if view.container_host.project_tab() == ComposeProjectTab::Yaml {
+                    view.container_host.set_project_tab(ComposeProjectTab::Overview);
+                } else {
+                    view.container_host.set_project_tab(ComposeProjectTab::Yaml);
+                    super::compose_yaml::request_preview_for_selected_path(view, &yaml_target, &yaml_ticket, cx);
+                }
+                cx.notify();
+            })),
+        )
+        .children(copy_path)
+        .child(compose_actions_menu(
+            &target,
+            &ticket,
+            view.busy || !view.compose_mutation_allowed(&target),
+            view.container_mutations.compose_loading(&target),
+            theme,
+            "container-project-inspector-more".to_owned(),
+            cx,
+        ))
+        .children(container_cancel_button(
+            view,
+            view.container_mutations.compose_executing(&target),
+            "container-project-inspector-cancel".to_owned(),
+            cx,
+        ));
     let header = header.mb_1().border_b_1().border_color(theme.border).pb_2();
 
     let mut body = div()
@@ -1796,13 +2067,16 @@ fn render_host_project(
         .flex()
         .flex_col()
         .gap_2()
+        .when(
+            view.compact_layout && selected_tab == ComposeProjectTab::Yaml,
+            |body| body.flex_1().min_h_0(),
+        )
         .child(header)
         .child(tabs)
-        .children(view.compact_operation_feedback(theme));
+        .children(view.compact_operation_feedback(theme))
+        .children(container_success_notice(view, theme));
     match (selected_tab, project) {
-        (_, None) if view.containers.phase() == super::super::state::SectionPhase::Loading => {
-            body = body.child(loading_label(theme));
-        }
+        (_, None) if view.containers.phase() == super::super::state::SectionPhase::Loading => {}
         (_, None) => {
             body = body.child(container_read_error_row(
                 &crate::locale::text(
@@ -1841,12 +2115,13 @@ fn render_host_project(
             ));
         }
     }
-    super::section_page(
+    super::section_page_with_fill(
         crate::locale::text("宿主容器", "Host containers"),
         body,
         theme,
         true,
         true,
+        view.compact_layout && selected_tab == ComposeProjectTab::Yaml,
     )
     .into_any_element()
 }
@@ -2288,7 +2563,7 @@ fn render_host_container(
                 .h_8()
                 .w_8()
                 .rounded_lg()
-                .disabled(view.busy)
+                .disabled(view.busy || view.container_write_scope_blocked())
                 .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                     view.request_container_exec(terminal_target.clone(), &terminal_ticket, cx);
                 })),
@@ -2307,7 +2582,7 @@ fn render_host_container(
                 .h_8()
                 .w_8()
                 .rounded_lg()
-                .disabled(view.busy)
+                .disabled(view.busy || view.container_write_scope_blocked())
                 .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                     view.request_container_mutation(
                         ContainerMutationRequest {
@@ -2324,9 +2599,18 @@ fn render_host_container(
         header = header.child(container_actions_menu(
             container,
             &ticket,
-            view.busy,
+            view.busy
+                || view.container_write_scope_blocked()
+                || view.containers.phase() != super::super::state::SectionPhase::Ready,
+            view.container_mutations.container_loading(&target),
             theme,
             "container-inspector-more".to_owned(),
+            cx,
+        ));
+        header = header.children(container_cancel_button(
+            view,
+            view.container_mutations.container_executing(&target),
+            "container-inspector-cancel".to_owned(),
             cx,
         ));
     }
@@ -2359,6 +2643,7 @@ fn render_host_container(
         let button = Button::new(format!("container-inspector-tab-{tab:?}"))
             .compact()
             .ghost()
+            .debug_selector(move || format!("rr-container-tab-{tab:?}"))
             .selected(selected)
             .h_7()
             .flex_1()
@@ -2391,20 +2676,45 @@ fn render_host_container(
     }
     let refresh_target = target.clone();
     let refresh_ticket = ticket.clone();
-    let refresh_label = crate::locale::text("刷新容器信息", "Refresh container info");
+    let list_ticket = view.container_action_ticket(None);
+    let needs_list_refresh = view.container_write_scope_blocked() || container.is_none();
+    let list_loading = view.containers.phase() == super::super::state::SectionPhase::Loading;
+    let refresh_label = if needs_list_refresh {
+        crate::locale::text("刷新容器列表", "Refresh container list")
+    } else {
+        crate::locale::text("刷新容器信息", "Refresh container info")
+    };
     let refresh_button = icon_button(
         "container-inspector-refresh",
         gpui_kit::assets::IconName::RefreshCw,
         refresh_label.clone(),
     )
+    .debug_selector(|| "rr-container-refresh".to_owned())
     .h_8()
     .w_8()
     .rounded_lg()
     .tooltip(refresh_label)
-    .loading(selected_tab_loading)
+    .loading(if needs_list_refresh {
+        list_loading
+    } else {
+        selected_tab_loading
+    })
     .loading_icon(gpui_kit::assets::IconName::RefreshCw)
-    .disabled(container.is_none() || selected_tab_loading)
+    .disabled(if needs_list_refresh {
+        view.busy || list_loading
+    } else {
+        container.is_none() || selected_tab_loading
+    })
     .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+        if view.container_write_scope_blocked()
+            || !view
+                .containers
+                .data()
+                .is_some_and(|rows| rows.iter().any(|row| row.target == refresh_target))
+        {
+            view.request_container_panel_refresh(view.runtime, &list_ticket, cx);
+            return;
+        }
         if !view.container_action_ticket_is_current(&refresh_ticket, Some(&refresh_target)) {
             return;
         }
@@ -2439,28 +2749,21 @@ fn render_host_container(
         .gap_2()
         .child(header)
         .child(tabs_row)
-        .children(view.compact_operation_feedback(theme));
+        .children(view.compact_operation_feedback(theme))
+        .children(container_success_notice(view, theme));
     if container.is_none() {
-        let missing_container =
-            if view.containers.phase() == super::super::state::SectionPhase::Loading {
-                loading_label(theme).into_any_element()
-            } else {
-                container_read_error_row(
-                    &crate::locale::text(
-                        "所选容器已不存在，请返回列表刷新状态。",
-                        "The selected container no longer exists. Return to the list and refresh.",
-                    ),
-                    theme,
-                )
-                .into_any_element()
-            };
-        body = body.child(missing_container);
+        if view.containers.phase() != super::super::state::SectionPhase::Loading {
+            body = body.child(container_read_error_row(
+                &crate::locale::text(
+                    "所选容器已不存在，请返回列表刷新状态。",
+                    "The selected container no longer exists. Return to the list and refresh.",
+                ),
+                theme,
+            ));
+        }
     } else {
         match selected_tab {
             HostContainerTab::Details => {
-                if view.container_inspect.phase() == super::super::DetailReadPhase::Loading {
-                    body = body.child(loading_label(theme));
-                }
                 if let Some(message) = view.container_inspect.feedback() {
                     body = body.child(container_read_error_row(message, theme));
                 }
@@ -2473,28 +2776,19 @@ fn render_host_container(
                 }
             }
             HostContainerTab::Stats => {
-                if view.container_output.phase() == super::super::DetailReadPhase::Loading {
-                    body = body.child(loading_label(theme));
-                }
                 if let Some(message) = view.container_output.feedback() {
                     body = body.child(container_read_error_row(message, theme));
-                }
-                if view.container_output.data().is_some()
-                    && matches!(
-                        view.container_output.phase(),
-                        super::super::DetailReadPhase::Loading
-                            | super::super::DetailReadPhase::Failed
-                            | super::super::DetailReadPhase::Cancelled
-                    )
-                {
-                    body = body.child(stale_snapshot_hint(theme));
                 }
                 let stats = view
                     .container_output
                     .data()
                     .and_then(|output| output.stats())
                     .filter(|stats| stats.target == target);
-                body = body.child(container_stats_panel(stats, theme));
+                if stats.is_some()
+                    || view.container_output.phase() == super::super::DetailReadPhase::Ready
+                {
+                    body = body.child(container_stats_panel(stats, theme));
+                }
             }
         }
     }
@@ -2508,7 +2802,7 @@ fn render_host_container(
     .into_any_element()
 }
 
-/// main 的监控面板直接展示结构化字段；原始 stats 只用于独立滚动的排障区域。
+/// 监控面板保留全部原始字段，正文随页面滚动并在窄栏按内容折行。
 ///
 /// @author kongweiguang
 fn container_stats_panel(stats: Option<&ContainerStats>, theme: ThemeTokens) -> AnyElement {
@@ -2558,24 +2852,35 @@ fn container_stats_panel(stats: Option<&ContainerStats>, theme: ThemeTokens) -> 
         .child(
             div()
                 .id("container-inspector-stats-raw")
+                .debug_selector(|| "rr-container-stats-raw".to_owned())
                 .w_full()
                 .min_w_0()
-                .max_h(px(112.))
-                .overflow_scroll()
                 .p_2()
                 .rounded_xl()
                 .bg(inspector_theme.secondary)
                 .text_size(px(11.))
                 .font_family("monospace")
-                .whitespace_nowrap()
+                .whitespace_normal()
                 .text_color(theme.muted)
                 .child(if display.raw.trim().is_empty() {
                     crate::locale::text("暂无 stats 数据。", "No stats data available.")
                 } else {
-                    display.raw.into()
+                    super::add_container_detail_soft_breaks(&format_container_stats_raw(
+                        &display.raw,
+                    ))
+                    .into()
                 }),
         )
         .into_any_element()
+}
+
+/// 仅对有效 JSON 做可读格式化；异常原文保持完整，避免诊断信息被解析失败吞掉。
+///
+/// @author kongweiguang
+fn format_container_stats_raw(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or_else(|_| raw.to_owned())
 }
 
 /// stats 的缺失值统一显示为横线，保持 main 的指标排序且不解析原始 JSON。
@@ -2746,21 +3051,8 @@ fn render_container_info(
 
     match selected {
         ContainerReadKind::Inspect => {
-            if view.container_inspect.phase() == super::super::DetailReadPhase::Loading {
-                body = body.child(loading_label(theme));
-            }
             if let Some(message) = view.container_inspect.feedback() {
                 body = body.child(container_read_error_row(message, theme));
-            }
-            if view.container_inspect.data().is_some()
-                && matches!(
-                    view.container_inspect.phase(),
-                    super::super::DetailReadPhase::Loading
-                        | super::super::DetailReadPhase::Failed
-                        | super::super::DetailReadPhase::Cancelled
-                )
-            {
-                body = body.child(stale_snapshot_hint(theme));
             }
             if let Some(details) = view.container_inspect.data() {
                 let details = details.clone();
@@ -2774,21 +3066,8 @@ fn render_container_info(
             }
         }
         ContainerReadKind::Stats | ContainerReadKind::Logs => {
-            if view.container_output.phase() == super::super::DetailReadPhase::Loading {
-                body = body.child(loading_label(theme));
-            }
             if let Some(message) = view.container_output.feedback() {
                 body = body.child(container_read_error_row(message, theme));
-            }
-            if view.container_output.data().is_some()
-                && matches!(
-                    view.container_output.phase(),
-                    super::super::DetailReadPhase::Loading
-                        | super::super::DetailReadPhase::Failed
-                        | super::super::DetailReadPhase::Cancelled
-                )
-            {
-                body = body.child(stale_snapshot_hint(theme));
             }
             if let Some(output) = view.container_output.data() {
                 let output = output.display_text();
@@ -2857,17 +3136,6 @@ fn status_pill(text: String, status: ContainerStatus, theme: ThemeTokens) -> imp
         .child(text)
 }
 
-/// 统一加载提示，避免不同分页使用不同语气或布局。
-///
-/// @author kongweiguang
-fn loading_label(theme: ThemeTokens) -> impl IntoElement {
-    div()
-        .w_full()
-        .text_size(theme.text_xs)
-        .text_color(theme.muted)
-        .child(crate::locale::text("正在读取…", "Loading…"))
-}
-
 /// 只读页错误使用主题错误色并在窄栏显式折行，避免完整原因被裁切后无法判断如何重试。
 ///
 /// @author kongweiguang
@@ -2882,20 +3150,6 @@ fn container_read_error_row(message: &str, theme: ThemeTokens) -> impl IntoEleme
         .text_size(theme.text_xs)
         .text_color(theme.error)
         .child(display_message)
-}
-
-/// 读取失败或取消时保留快照，但明确提示它不是本次读取的新结果。
-///
-/// @author kongweiguang
-fn stale_snapshot_hint(theme: ThemeTokens) -> impl IntoElement {
-    div()
-        .w_full()
-        .text_size(theme.text_xs)
-        .text_color(theme.muted)
-        .child(crate::locale::text(
-            "下方保留最近一次成功读取的快照。",
-            "Showing the last successful snapshot below.",
-        ))
 }
 
 /// 复制按钮贴近已加载内容并标明其范围，避免图标隐藏具体复制对象。

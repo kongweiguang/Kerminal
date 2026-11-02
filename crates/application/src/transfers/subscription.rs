@@ -12,11 +12,22 @@ pub(crate) async fn receive_transfer_wakeup(
     receiver: &mut broadcast::Receiver<TransferQueueEvent>,
     cancellation: &CancellationToken,
 ) -> Option<()> {
+    receive_transfer_event(receiver, cancellation)
+        .await
+        .map(|_| ())
+}
+
+/// 保留清理事件与丢帧事实，避免观察者仅凭剩余快照漏掉短暂完成的目录写入。
+pub(crate) async fn receive_transfer_event(
+    receiver: &mut broadcast::Receiver<TransferQueueEvent>,
+    cancellation: &CancellationToken,
+) -> Option<TransferQueueEvent> {
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => None,
         event = receiver.recv() => match event {
-            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => Some(()),
+            Ok(event) => Some(event),
+            Err(broadcast::error::RecvError::Lagged(_)) => Some(TransferQueueEvent::Resync),
             Err(broadcast::error::RecvError::Closed) => None,
         }
     }

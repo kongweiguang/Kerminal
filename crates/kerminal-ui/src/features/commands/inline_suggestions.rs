@@ -1,12 +1,15 @@
 //! Inline/menu 建议的短暂输入投影与安全接受计划。
 //!
-//! 控制器只维护 GPUI 已明确观察到的输入，不从终端回显、快照或 readline 状态反推命令行。
+//! 可信 Shell 编辑快照是实际输入的权威来源；绝不从终端回显重建命令行。
 //!
 //! @author kongweiguang
+
+use std::fmt;
 
 use kerminal_application::{
     commands::{TerminalSuggestionBatch, TerminalSuggestionQuery},
     sessions::{
+        SHELL_EDITING_MAX_INPUT_CHARACTERS, SHELL_EDITING_MAX_SUFFIX_BYTES, ShellEditingSnapshot,
         TerminalCommandAvailability, TerminalCommandContext, TerminalCommandContextVersion,
         UiSessionBinding,
     },
@@ -18,17 +21,16 @@ use kerminal_domain::{
     },
     sessions::SessionOwner,
 };
-use kerminal_terminal::input::{
-    InputModifiers, KeyPhase, TerminalInputEvent, TerminalKey, TerminalKeyEvent,
-};
+use kerminal_terminal::input::{InputModifiers, KeyPhase, TerminalInputEvent, TerminalKey};
 use tokio_util::sync::CancellationToken;
+use unicode_segmentation::UnicodeSegmentation;
 
-const MAX_INPUT_CHARACTERS: usize = 4_000;
+const MAX_INPUT_CHARACTERS: usize = SHELL_EDITING_MAX_INPUT_CHARACTERS;
 const MAX_INPUT_BYTES: usize = 32_000;
-const MAX_ACCEPT_KEY_EVENTS: usize = 1_024;
+const MAX_CANDIDATES: usize = 20;
 
 /// 接受结果固定原始 UI owner 和终端版本；调用方逐个写入时必须沿用返回的新版本。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TerminalSuggestionAcceptance {
     pub binding: UiSessionBinding,
     pub expected_context: TerminalCommandContextVersion,
@@ -42,6 +44,27 @@ pub struct TerminalSuggestionAcceptance {
     pub cursor_after: usize,
     pub replacement_text: String,
     pub events: Vec<TerminalInputEvent>,
+    /// 写入必须使用产生该候选的真实快照，缺失时 UI 不得退回旧的投影写入路径。
+    pub shell_snapshot: Option<ShellEditingSnapshot>,
+}
+
+impl fmt::Debug for TerminalSuggestionAcceptance {
+    /// 接受计划可能包含未提交凭据；诊断只展示身份与长度，不打印正文或候选标识。
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalSuggestionAcceptance")
+            .field("binding", &self.binding)
+            .field("expected_context", &self.expected_context)
+            .field("request_generation", &self.request_generation)
+            .field("provider", &self.provider)
+            .field("activation", &self.activation)
+            .field("input_before", &"[redacted]")
+            .field("input_after", &"[redacted]")
+            .field("replacement_text", &"[redacted]")
+            .field("event_count", &self.events.len())
+            .field("shell_snapshot", &self.shell_snapshot)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +89,8 @@ pub struct InlineSuggestionController {
     query: Option<TerminalSuggestionQuery>,
     batch: Option<TerminalSuggestionBatch>,
     query_cancellation: Option<CancellationToken>,
+    /// 输入已经入队但尚无最终 ACK 时，旧查询可用于保留菜单状态，却不能再次接受结果。
+    suspended: bool,
     next_request_generation: u64,
 }
 
@@ -128,6 +153,43 @@ impl InlineSuggestionController {
             self.clear();
             return None;
         }
+        self.make_query(input, cursor, mode)
+    }
+
+    /// 精确匹配的 Shell 读回可以恢复未知行，但不能改变旧命令生命周期 context 的含义。
+    pub fn update_shell_snapshot(
+        &mut self,
+        context: &TerminalCommandContext,
+        snapshot: &ShellEditingSnapshot,
+        mode: SuggestionQueryMode,
+    ) -> Option<(TerminalSuggestionQuery, CancellationToken)> {
+        if snapshot.binding != binding_for(context)
+            || snapshot.context != context.version()
+            || !matches!(&context.owner, SessionOwner::Ui { .. })
+            || !context.prompt_ready
+            || context.alternate_screen
+            || !valid_input(&snapshot.input, snapshot.cursor)
+        {
+            self.clear();
+            return None;
+        }
+        self.projection = Some(Projection {
+            binding: snapshot.binding.clone(),
+            version: snapshot.context,
+            input: snapshot.input.clone(),
+            cursor: snapshot.cursor,
+            mode,
+        });
+        self.make_query(snapshot.input.clone(), snapshot.cursor, mode)
+    }
+
+    /// 只有已校验的输入可分配查询代次；统一入口确保旧 provider 令牌先被撤销。
+    fn make_query(
+        &mut self,
+        input: String,
+        cursor: usize,
+        mode: SuggestionQueryMode,
+    ) -> Option<(TerminalSuggestionQuery, CancellationToken)> {
         self.cancel_query();
         self.next_request_generation = self.next_request_generation.wrapping_add(1).max(1);
 
@@ -202,6 +264,9 @@ impl InlineSuggestionController {
 
     /// 仅接受与活动查询和最新 session/prompt/input 版本完全一致的 provider 结果。
     pub fn apply_batch(&mut self, mut batch: TerminalSuggestionBatch) -> bool {
+        if !self.is_request_active() {
+            return false;
+        }
         let Some(query) = self.query.as_ref() else {
             return false;
         };
@@ -221,7 +286,11 @@ impl InlineSuggestionController {
                     || query.mode == SuggestionQueryMode::Menu)
                 && candidate.allowed_presentations.contains(&presentation)
                 && valid_candidate(candidate, &query.input)
+                && (candidate.activation == CommandSuggestionActivation::OpenSnippetPanel
+                    && query.mode == SuggestionQueryMode::Menu
+                    || appendable_suffix(candidate, query).is_some())
         });
+        batch.candidates.truncate(MAX_CANDIDATES);
         self.batch = Some(batch);
         true
     }
@@ -246,6 +315,9 @@ impl InlineSuggestionController {
         candidate_id: &str,
         partial_accept: bool,
     ) -> Option<TerminalSuggestionAcceptance> {
+        if !self.is_request_active() {
+            return None;
+        }
         let query = self.query.as_ref()?;
         let projection = self.projection.as_ref()?;
         let batch = self.batch.as_ref()?;
@@ -283,6 +355,7 @@ impl InlineSuggestionController {
             cursor_after,
             replacement_text,
             events,
+            shell_snapshot: None,
         };
         self.batch = None;
         self.cancel_query();
@@ -304,6 +377,31 @@ impl InlineSuggestionController {
         }
         self.query = None;
         self.batch = None;
+        self.suspended = false;
+    }
+
+    /// 输入入队后立即撤销当前结果，但保留菜单模式，直到同一 FIFO 的最新回执重建查询。
+    pub fn suspend_query(&mut self) {
+        if let Some(cancellation) = self.query_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.batch = None;
+        self.suspended = true;
+    }
+
+    /// 被撤销的代次不能接收迟到结果，也不能用旧输入重新打开查询。
+    pub fn is_request_active(&self) -> bool {
+        !self.suspended
+            && self.query.is_some()
+            && self
+                .query_cancellation
+                .as_ref()
+                .is_some_and(|cancellation| !cancellation.is_cancelled())
+    }
+
+    /// 菜单快捷键在输入尚未回执时必须等待，避免用旧投影新建合法查询。
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
     }
 }
 
@@ -367,7 +465,34 @@ fn presentation_for(mode: SuggestionQueryMode) -> SuggestionPresentation {
     }
 }
 
-/// 只按候选声明的下一个 Unicode scalar boundary 执行部分接受。
+/// 只展示原文严格匹配且 writer 可追加的后缀；Unicode 字符数和 UTF-8 字节数分别校验。
+pub(crate) fn appendable_suffix<'a>(
+    candidate: &'a CommandSuggestionCandidate,
+    query: &TerminalSuggestionQuery,
+) -> Option<&'a str> {
+    if candidate.activation != CommandSuggestionActivation::Insert
+        || query.cursor != query.input.chars().count()
+        || candidate.replacement_range.end != query.cursor
+        || candidate.replacement_range.start > query.cursor
+    {
+        return None;
+    }
+    let typed = query
+        .input
+        .chars()
+        .skip(candidate.replacement_range.start)
+        .collect::<String>();
+    candidate
+        .replacement_text
+        .strip_prefix(&typed)
+        .filter(|suffix| {
+            !suffix.is_empty()
+                && suffix.len() <= SHELL_EDITING_MAX_SUFFIX_BYTES
+                && query.cursor + suffix.chars().count() <= SHELL_EDITING_MAX_INPUT_CHARACTERS
+        })
+}
+
+/// 按候选声明的 Unicode scalar 边界分段，但不得把组合字符截断在字素内部。
 fn accepted_replacement_end(
     candidate: &CommandSuggestionCandidate,
     query: &TerminalSuggestionQuery,
@@ -385,12 +510,38 @@ fn accepted_replacement_end(
         .accept_boundaries
         .iter()
         .copied()
-        .filter(|boundary| *boundary > typed_length && *boundary < total)
+        .filter(|boundary| {
+            *boundary > typed_length
+                && *boundary < total
+                && candidate
+                    .replacement_text
+                    .grapheme_indices(true)
+                    .any(|(offset, _)| {
+                        candidate.replacement_text[..offset].chars().count() == *boundary
+                    })
+                && !ends_with_unpaired_escape(&candidate.replacement_text, *boundary)
+        })
         .min()
         .unwrap_or(total)
 }
 
-/// 用显式光标键/退格和有界 paste 实现 range edit，避免 Kitty 全键模式丢弃合成 Text。
+/// Shell 路径中的反斜杠和 PowerShell 反引号可能转义后续字符，不能把它们单独追加。
+fn ends_with_unpaired_escape(text: &str, boundary: usize) -> bool {
+    let prefix = text.chars().take(boundary).collect::<Vec<_>>();
+    let Some(&last) = prefix.last() else {
+        return false;
+    };
+    matches!(last, '\\' | '`')
+        && prefix
+            .iter()
+            .rev()
+            .take_while(|character| **character == last)
+            .count()
+            % 2
+            == 1
+}
+
+/// 仅生成一个后缀粘贴事件，不移动光标、不删除内容，也绝不隐式执行命令。
 fn build_edit_plan(
     query: &TerminalSuggestionQuery,
     candidate: &CommandSuggestionCandidate,
@@ -398,55 +549,28 @@ fn build_edit_plan(
 ) -> Option<(String, usize, Vec<TerminalInputEvent>)> {
     let start = candidate.replacement_range.start;
     let end = candidate.replacement_range.end;
-    let current = query.input.chars().collect::<Vec<_>>();
-    if start > end || end > current.len() || !valid_input(&query.input, query.cursor) {
+    if start > end || !valid_input(&query.input, query.cursor) {
         return None;
     }
     if candidate.activation == CommandSuggestionActivation::OpenSnippetPanel {
         return Some((query.input.clone(), query.cursor, Vec::new()));
     }
-
-    let movement_count = query.cursor.abs_diff(end);
-    let delete_count = end - start;
-    let text_count = usize::from(!replacement_text.is_empty());
-    if movement_count
-        .saturating_add(delete_count)
-        .saturating_add(text_count)
-        > MAX_ACCEPT_KEY_EVENTS
-    {
-        return None;
-    }
-
-    let mut events = Vec::with_capacity(movement_count + delete_count + text_count);
-    let movement_key = if query.cursor > end {
-        TerminalKey::Left
-    } else {
-        TerminalKey::Right
-    };
-    events.extend((0..movement_count).map(|_| key_event(movement_key)));
-    events.extend((0..delete_count).map(|_| key_event(TerminalKey::Backspace)));
-    if !replacement_text.is_empty() {
-        events.push(TerminalInputEvent::Paste(replacement_text.to_owned()));
-    }
-
-    let mut updated = String::with_capacity(query.input.len() + replacement_text.len());
-    updated.extend(current[..start].iter().copied());
-    updated.push_str(replacement_text);
-    updated.extend(current[end..].iter().copied());
-    let cursor_after = start + replacement_text.chars().count();
+    appendable_suffix(candidate, query)?;
+    let typed = query.input.chars().skip(start).collect::<String>();
+    let suffix = replacement_text
+        .strip_prefix(&typed)
+        .filter(|text| !text.is_empty())?;
+    let mut updated = query.input.clone();
+    updated.push_str(suffix);
+    let cursor_after = query.cursor + suffix.chars().count();
     if !valid_input(&updated, cursor_after) {
         return None;
     }
-    Some((updated, cursor_after, events))
-}
-
-/// 统一使用无修饰的按下事件，避免平台按键状态污染 shell 的 replacement 操作。
-fn key_event(key: TerminalKey) -> TerminalInputEvent {
-    TerminalInputEvent::Key(TerminalKeyEvent {
-        key,
-        phase: KeyPhase::Press,
-        modifiers: InputModifiers::default(),
-    })
+    Some((
+        updated,
+        cursor_after,
+        vec![TerminalInputEvent::Paste(suffix.to_owned())],
+    ))
 }
 
 /// 通过一次可信 context 初始化空行投影；会话目标仍由 binding 独立持有。

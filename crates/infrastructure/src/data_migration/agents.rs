@@ -3,6 +3,7 @@
 //! @author kongweiguang
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
@@ -15,9 +16,9 @@ use kerminal_application::{
 };
 use kerminal_domain::{
     agents::{
-        AgentDomainError, AgentLauncherKey, AgentProvider, AgentProviderSession, AgentSession,
-        AgentSessionLaunch, AgentSessionScope, AgentSessionStatus, AgentTargetBinding,
-        AgentTargetLiveStatus,
+        AgentLaunchPermissionMode, AgentLauncherKey, AgentProvider, AgentProviderSession,
+        AgentSession, AgentSessionLaunch, AgentSessionScope, AgentSessionStatus,
+        AgentTargetBinding, AgentTargetLiveStatus,
     },
     identity::{AgentSessionId, PaneId, SessionId, TabId},
 };
@@ -67,6 +68,8 @@ struct AgentSessionDocument {
     agent_id: AgentProvider,
     #[serde(default)]
     launcher_key: Option<AgentLauncherKey>,
+    #[serde(default)]
+    permission_mode: Option<AgentLaunchPermissionMode>,
     title: String,
     created_at: String,
     updated_at: String,
@@ -81,11 +84,12 @@ struct AgentSessionDocument {
 }
 
 impl AgentSessionDocument {
-    /// 复用 AgentSession::restore 校验 schema、launch、provider key 和 Ready 目标定义。
+    /// 与普通 Store 一样按实际 argv 校验显式权限；旧文件缺省时仍由领域推断，避免误报或改变策略。
     ///
     /// @author kongweiguang
-    fn restore(self) -> Result<AgentSession, AgentDomainError> {
-        AgentSession::restore(
+    fn restore(self) -> AppResult<AgentSession> {
+        let permission_mode = self.permission_mode;
+        let session = AgentSession::restore(
             self.schema_version,
             self.agent_session_id,
             self.agent_id,
@@ -100,6 +104,11 @@ impl AgentSessionDocument {
             self.scope.map(AgentSessionScope::from),
             self.target.map(AgentTargetBinding::from),
         )
+        .map_err(|_| migration_corrupt())?;
+        if permission_mode.is_some_and(|mode| mode != session.permission_mode) {
+            return Err(migration_corrupt());
+        }
+        Ok(session)
     }
 }
 
@@ -163,10 +172,11 @@ impl From<AgentSessionTargetDocument> for AgentTargetBinding {
     }
 }
 
-/// 按固定 Agent 路径生成一组 CAS 前后字节；函数只读磁盘，提交、备份与恢复由 migration core 统一负责。
-///
-/// @author kongweiguang
-pub(super) fn plan_agent_migration(root: &Path) -> AppResult<Vec<FileEdit>> {
+/// 已知 Profile 映射贯穿每个会话；未知 Agent 扩展与引用仍保留原文。
+pub(super) fn plan_agent_migration_with_profiles(
+    root: &Path,
+    profile_mapping: &BTreeMap<String, String>,
+) -> AppResult<Vec<FileEdit>> {
     let Some(canonical_root) = canonical_root_if_present(root)? else {
         return Ok(Vec::new());
     };
@@ -216,6 +226,7 @@ pub(super) fn plan_agent_migration(root: &Path) -> AppResult<Vec<FileEdit>> {
             &id,
             &mut read_bytes,
             &mut edits,
+            profile_mapping,
         )?;
     }
     Ok(edits)
@@ -311,7 +322,7 @@ fn contains_agent_stage(directory: &Path) -> AppResult<bool> {
     Ok(false)
 }
 
-/// 校验当前 session/provider 身份，并把目标字段别名与运行态引用一起生成精确 CAS edit。
+/// 先校验 session/provider 身份和权限一致性，再为旧字段与运行态引用生成精确 CAS edit。
 ///
 /// @author kongweiguang
 fn plan_one_session(
@@ -320,6 +331,7 @@ fn plan_one_session(
     expected_id: &AgentSessionId,
     read_bytes: &mut usize,
     edits: &mut Vec<FileEdit>,
+    profile_mapping: &BTreeMap<String, String>,
 ) -> AppResult<()> {
     let session_bytes = read_required_document(
         canonical_root,
@@ -332,7 +344,7 @@ fn plan_one_session(
     let session_file: AgentSessionDocument =
         toml::from_str(session_text).map_err(|_| migration_corrupt())?;
     let scope_was_missing = session_file.scope.is_none();
-    let mut session = session_file.restore().map_err(|_| migration_corrupt())?;
+    let mut session = session_file.restore()?;
     if session.agent_session_id.as_str() != expected_id.as_str() {
         return Err(migration_corrupt());
     }
@@ -360,6 +372,7 @@ fn plan_one_session(
         .parse::<DocumentMut>()
         .map_err(|_| migration_corrupt())?;
     let mut session_changed = normalize_target_aliases(&mut document)?;
+    session_changed |= remap_session_profile_target(&mut document, profile_mapping)?;
     session_changed |= normalize_session_scope(
         &mut document,
         session.scope.as_ref().ok_or_else(migration_corrupt)?,
@@ -396,7 +409,7 @@ fn plan_one_session(
         Path::new("context/target-binding.json"),
         read_bytes,
         edits,
-        migrate_target_binding_context,
+        |bytes, id| migrate_target_binding_context_with_profiles(bytes, id, profile_mapping),
     )?;
     plan_context_edit(
         canonical_root,
@@ -408,6 +421,34 @@ fn plan_one_session(
         migrate_terminal_snapshot_context,
     )?;
     Ok(())
+}
+
+/// 会话只改明确的 profile: 目标并保留 TOML 注释，其他 target_ref 不按字符串猜测。
+fn remap_session_profile_target(
+    document: &mut DocumentMut,
+    mapping: &BTreeMap<String, String>,
+) -> AppResult<bool> {
+    let Some(target) = document.get_mut("target") else {
+        return Ok(false);
+    };
+    let table = target.as_table_like_mut().ok_or_else(migration_corrupt)?;
+    let replacement = table
+        .get("target_ref")
+        .and_then(Item::as_str)
+        .and_then(|reference| {
+            super::workspace::remap_reference(reference, "profile:", mapping, false)
+        });
+    let Some(replacement) = replacement else {
+        return Ok(false);
+    };
+    let current = table
+        .get_mut("target_ref")
+        .and_then(Item::as_value_mut)
+        .ok_or_else(migration_corrupt)?;
+    let decor = current.decor().clone();
+    *current = TomlValue::from(replacement);
+    current.decor_mut().clone_from(&decor);
+    Ok(true)
 }
 
 /// 仅在迁移边界把 session.toml target 的旧字段名改成 store 当前严格接受的 snake_case。
@@ -772,7 +813,12 @@ fn validate_legacy_mcp_endpoint(endpoint: &str, id: &AgentSessionId) -> AppResul
 /// 将旧 Ready target 快照降为 stale，并清除 Agent CLI runtime owner；保留目标证据与未知 JSON 字段。
 ///
 /// @author kongweiguang
-fn migrate_target_binding_context(bytes: &[u8], id: &AgentSessionId) -> AppResult<Option<Vec<u8>>> {
+/// 恢复 Agent target 上明确的 Profile 引用，同时延续现有 stale 转换和内容校验。
+fn migrate_target_binding_context_with_profiles(
+    bytes: &[u8],
+    id: &AgentSessionId,
+    profile_mapping: &BTreeMap<String, String>,
+) -> AppResult<Option<Vec<u8>>> {
     let (mut document, header_changed) = parse_context_json(bytes, id)?;
     let object = document.as_object_mut().ok_or_else(migration_corrupt)?;
     let scope = object.get("scope").ok_or_else(migration_corrupt)?;
@@ -795,6 +841,16 @@ fn migrate_target_binding_context(bytes: &[u8], id: &AgentSessionId) -> AppResul
         .as_object_mut()
         .ok_or_else(migration_corrupt)?;
     let mut changed = header_changed;
+    if let Some(next) = binding_object
+        .get("targetRef")
+        .and_then(Value::as_str)
+        .and_then(|reference| {
+            super::workspace::remap_reference(reference, "profile:", profile_mapping, false)
+        })
+    {
+        binding_object.insert("targetRef".to_owned(), Value::String(next));
+        changed = true;
+    }
     if binding.status == AgentTargetLiveStatus::Ready {
         binding_object.insert("status".to_owned(), Value::String("stale".to_owned()));
         binding_object.insert("stale".to_owned(), Value::Bool(true));

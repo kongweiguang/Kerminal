@@ -761,6 +761,13 @@ impl DirtyOperationTargets {
         }
     }
 
+    /// 恢复面板可见性时只核对确有变更的原目标，普通窗口激活不使已读快照失效。
+    ///
+    /// @author kongweiguang
+    pub(super) fn tmux_is_dirty(&self, host_id: &Option<HostId>) -> bool {
+        self.tmux_hosts.contains(host_id)
+    }
+
     /// tmux 清单成功刷新后清除对应 host 的脏标记。
     pub(super) fn tmux_refreshed(&mut self, host_id: &Option<HostId>) {
         self.tmux_hosts.retain(|host| host != host_id);
@@ -897,6 +904,13 @@ impl<T> SectionState<T> {
     /// 返回区块加载阶段，调用方据此分别呈现空、加载、成功或错误状态。
     pub(super) const fn phase(&self) -> SectionPhase {
         self.phase
+    }
+
+    /// 验收只读请求代次，以真实生产读取判断折叠操作是否意外发起刷新。
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub(super) const fn acceptance_request_id(&self) -> u64 {
+        self.request_id
     }
 
     /// 返回最后一次读取失败的脱敏展示文本。

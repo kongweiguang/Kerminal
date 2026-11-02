@@ -16,7 +16,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui_kit::{AnyWindowHandle, AsyncApp, Entity};
+use gpui_kit::{AnyWindowHandle, AsyncApp, Bounds, ElementId, Entity, Pixels};
+use gpui_pre::{InputEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+use kerminal_application::{
+    preferences::ThemeMode,
+    sessions::{
+        ShellCommandOutcome, ShellCommandRequest, TerminalCommandAvailability, UiSessionBinding,
+    },
+};
 use kerminal_domain::{
     identity::HostId,
     operations::{
@@ -24,7 +31,10 @@ use kerminal_domain::{
         ProxyProtocol, RemoteAccessScope,
     },
 };
-use kerminal_ui::RootView;
+use kerminal_ui::{
+    AppServices, RootView,
+    features::operations::proxy_panel::{ProxyCurrentApplication, ProxyCurrentAvailability},
+};
 
 use super::{
     RightRailCaptureContext, ToolRailToolId, activate_dialog_tool,
@@ -69,6 +79,7 @@ enum ForwardProbe {
     RemoteSocks {
         bind_port: u16,
         destination_port: u16,
+        expected_body: &'static str,
     },
 }
 
@@ -83,7 +94,7 @@ enum CleanupReadback {
     State(ForwardState),
 }
 
-/// 通过生产新增表单依次创建 Local、Dynamic、Remote、RemoteDynamic，并验证数据面和资源回收。
+/// 通过生产新增表单依次验证四种隧道，远端 SOCKS 还须在同一 fixture shell 回读代理变量。
 ///
 /// @author kongweiguang
 pub(super) async fn run(
@@ -92,6 +103,7 @@ pub(super) async fn run(
     window: AnyWindowHandle,
     capture: &RightRailCaptureContext,
     records: &mut Vec<FunctionalRecord>,
+    services: &kerminal_ui::AppServices,
 ) -> Result<(), Box<dyn Error>> {
     let host_id = &capture.fixture_host_id;
     let run_id = capture
@@ -124,6 +136,7 @@ pub(super) async fn run(
         window,
         capture,
         records,
+        services,
         ForwardCase {
             config: local_config,
             label: "local",
@@ -148,6 +161,7 @@ pub(super) async fn run(
         window,
         capture,
         records,
+        services,
         ForwardCase {
             config: socks_config,
             label: "dynamic-local",
@@ -174,6 +188,7 @@ pub(super) async fn run(
         window,
         capture,
         records,
+        services,
         ForwardCase {
             config: remote_config,
             label: "remote",
@@ -185,6 +200,7 @@ pub(super) async fn run(
     )
     .await?;
 
+    verify_client_only_fixture(cx, local_http.port).await?;
     let remote_socks_bind = unused_remote_loopback_port(cx).await?;
     let remote_socks_config = acceptance_config(
         host_id,
@@ -199,12 +215,14 @@ pub(super) async fn run(
         window,
         capture,
         records,
+        services,
         ForwardCase {
             config: remote_socks_config,
             label: "dynamic-remote",
             probe: ForwardProbe::RemoteSocks {
                 bind_port: remote_socks_bind,
-                destination_port: capture.container_target_port,
+                destination_port: local_http.port,
+                expected_body: "fixture-local-ok",
             },
         },
     )
@@ -240,6 +258,7 @@ async fn verify_add_form_cancel(
         "production_local_forward_form_opened_before_cancel",
     )
     .await?;
+    verify_forward_form_feedback(cx, root, window, capture, records).await?;
     poll_root(
         cx,
         root,
@@ -275,6 +294,169 @@ async fn verify_add_form_cancel(
     .await
 }
 
+/// 三主题都通过真实提交按钮触发端口错误，表单保留且 toast 不遮挡底部操作。
+///
+/// @author kongweiguang
+async fn verify_forward_form_feedback(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+) -> Result<(), Box<dyn Error>> {
+    let host = &capture.fixture_host_id;
+    let input_id = window.update(cx, |_, window, app| {
+        root.update(app, |root, cx| {
+            root.right_rail_acceptance_invalid_forward_port(host, window, cx)
+        })
+    })??;
+    let submit_id: ElementId = "forward-start".into();
+    let cancel_id: ElementId = "forward-cancel".into();
+    for (mode, operation) in [
+        (ThemeMode::Light, "forward-form-error-light"),
+        (ThemeMode::Dark, "forward-form-error-dark"),
+        (ThemeMode::System, "forward-form-error-system"),
+    ] {
+        window.update(cx, |_, _, app| {
+            root.update(app, |root, cx| {
+                root.set_right_rail_acceptance_theme(mode, cx);
+                root.clear_right_rail_acceptance_forward_form_status(host, cx)
+            })
+        })??;
+        let _ = super::frame_signature(cx, window)?;
+        let before = (
+            observed_bounds(cx, window, &input_id)?,
+            observed_bounds(cx, window, &submit_id)?,
+            observed_bounds(cx, window, &cancel_id)?,
+        );
+        click_observed_control(cx, window, &submit_id)?;
+        poll_root(
+            cx,
+            root,
+            window,
+            "隧道表单校验错误",
+            |root, _, _| {
+                root.right_rail_acceptance_forward_form_status(host)
+                    .map(|message| message.filter(|message| !message.trim().is_empty()))
+            },
+        )
+        .await?;
+        let _ = super::frame_signature(cx, window)?;
+        let after = (
+            observed_bounds(cx, window, &input_id)?,
+            observed_bounds(cx, window, &submit_id)?,
+            observed_bounds(cx, window, &cancel_id)?,
+        );
+        if !same_bounds(before.0, after.0)
+            || !same_bounds(before.1, after.1)
+            || !same_bounds(before.2, after.2)
+        {
+            return Err(io::Error::other("表单错误改变了字段或页脚按钮位置").into());
+        }
+        let toast = window
+            .update(cx, |_, window, _| {
+                window.debug_selector_bounds("rr-workbench-feedback-toast")
+            })?
+            .ok_or_else(|| io::Error::other("表单校验后的 toast 不在当前绘制帧"))?;
+        if overlaps(toast, after.1) || overlaps(toast, after.2) {
+            return Err(io::Error::other("表单错误 toast 遮挡提交或取消按钮").into());
+        }
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            operation,
+            "invalid_port_kept_form_geometry_and_visible_unobstructed_toast",
+        )
+        .await?;
+    }
+    window.update(cx, |_, _, app| {
+        root.update(app, |root, cx| {
+            root.set_right_rail_acceptance_theme(ThemeMode::Light, cx);
+            root.clear_right_rail_acceptance_forward_form_status(host, cx)
+        })
+    })??;
+    Ok(())
+}
+
+/// 使用 Kit 的当前帧节点识别真实输入或按钮；不可见节点不能作为布局证据。
+///
+/// @author kongweiguang
+fn observed_bounds(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    id: &ElementId,
+) -> Result<Bounds<Pixels>, Box<dyn Error>> {
+    window
+        .update(cx, |_, window, _| {
+            let node = gpui_kit::base::test_support::find(window, &[], id)
+                .ok_or_else(|| io::Error::other(format!("缺少验收控件 {id:?}")))?;
+            if !node.visible() {
+                return Err(io::Error::other(format!("验收控件不可见 {id:?}")));
+            }
+            Ok(node.bounds())
+        })?
+        .map_err(Into::into)
+}
+
+/// 只向私有窗口发送控件中心点击，确保校验经过真实按钮事件。
+///
+/// @author kongweiguang
+fn click_observed_control(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    id: &ElementId,
+) -> Result<(), Box<dyn Error>> {
+    let position = observed_bounds(cx, window, id)?.center();
+    window.update(cx, |_, window, app| {
+        for event in [
+            MouseMoveEvent {
+                position,
+                ..MouseMoveEvent::default()
+            }
+            .to_platform_input(),
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..MouseDownEvent::default()
+            }
+            .to_platform_input(),
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..MouseUpEvent::default()
+            }
+            .to_platform_input(),
+        ] {
+            let _ = window.dispatch_event(event, app);
+        }
+    })?;
+    Ok(())
+}
+
+/// 仅容忍浮点绘制舍入，避免把可见布局跳动当作稳定。
+///
+/// @author kongweiguang
+fn same_bounds(first: Bounds<Pixels>, second: Bounds<Pixels>) -> bool {
+    (first.origin.x.as_f32() - second.origin.x.as_f32()).abs() < 0.05
+        && (first.origin.y.as_f32() - second.origin.y.as_f32()).abs() < 0.05
+        && (first.size.width.as_f32() - second.size.width.as_f32()).abs() < 0.05
+        && (first.size.height.as_f32() - second.size.height.as_f32()).abs() < 0.05
+}
+
+/// 直接比较两矩形交叉，避免通过 toast 所在层级猜测底层按钮是否被遮挡。
+///
+/// @author kongweiguang
+fn overlaps(first: Bounds<Pixels>, second: Bounds<Pixels>) -> bool {
+    first.origin.x < second.origin.x + second.size.width
+        && second.origin.x < first.origin.x + first.size.width
+        && first.origin.y < second.origin.y + second.size.height
+        && second.origin.y < first.origin.y + first.size.height
+}
+
 /// 为每种类型使用独立名称与配置，并在任何生命周期失败后按同一 ID 清理资源。
 ///
 /// @author kongweiguang
@@ -284,6 +466,7 @@ async fn run_forward_case(
     window: AnyWindowHandle,
     capture: &RightRailCaptureContext,
     records: &mut Vec<FunctionalRecord>,
+    services: &AppServices,
     case: ForwardCase,
 ) -> Result<(), Box<dyn Error>> {
     let ForwardCase {
@@ -316,7 +499,8 @@ async fn run_forward_case(
         label,
         probe,
     };
-    let lifecycle = run_forward_lifecycle(cx, root, window, capture, records, &fixture).await;
+    let lifecycle =
+        run_forward_lifecycle(cx, root, window, capture, records, services, &fixture).await;
     if let Err(primary_error) = lifecycle {
         if let Err(cleanup_error) = cleanup_forward(cx, root, window, &fixture).await {
             return Err(io::Error::other(format!(
@@ -330,7 +514,7 @@ async fn run_forward_case(
     Ok(())
 }
 
-/// 保存后启动同一 fixture 定义、验证真实协议结果、停止验证端口关闭并读回删除。
+/// 保存后验证真实协议、停止及确认删除；远端代理恢复验证必须跨越原定义删除。
 ///
 /// @author kongweiguang
 async fn run_forward_lifecycle(
@@ -339,6 +523,7 @@ async fn run_forward_lifecycle(
     window: AnyWindowHandle,
     capture: &RightRailCaptureContext,
     records: &mut Vec<FunctionalRecord>,
+    services: &AppServices,
     fixture: &ForwardFixture,
 ) -> Result<(), Box<dyn Error>> {
     checkpoint(
@@ -350,6 +535,9 @@ async fn run_forward_lifecycle(
         "production_snapshot_returned_unique_stopped_forward_id",
     )
     .await?;
+    if fixture.label == "dynamic-remote" {
+        verify_proxy_unavailable_notice(cx, root, window, capture, records, fixture).await?;
+    }
     poll_root(
         cx,
         root,
@@ -387,6 +575,11 @@ async fn run_forward_lifecycle(
         "real_http_or_socks5_connect_returned_expected_fixture_body",
     )
     .await?;
+    let proxy_binding = if fixture.label == "dynamic-remote" {
+        Some(verify_proxy_application(cx, root, window, capture, records, services, fixture).await?)
+    } else {
+        None
+    };
 
     poll_root(
         cx,
@@ -426,6 +619,66 @@ async fn run_forward_lifecycle(
     )
     .await?;
 
+    if fixture.label == "local" {
+        open_forward_delete_confirmation(cx, root, window, fixture).await?;
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            "forward-delete-confirmation",
+            "production_delete_confirmation_opened_for_exact_forward",
+        )
+        .await?;
+        poll_root(
+            cx,
+            root,
+            window,
+            "取消 fixture 隧道删除确认",
+            |root, _, cx| {
+                root.cancel_right_rail_acceptance_forward_delete(
+                    &fixture.config,
+                    &fixture.forward_id,
+                    cx,
+                )
+                .map(|cancelled| cancelled.then_some(()))
+            },
+        )
+        .await?;
+        poll_root(
+            cx,
+            root,
+            window,
+            "确认取消后原定义仍处于停止态",
+            |root, _, cx| {
+                if root.right_rail_acceptance_forward_delete_confirmation_ready(
+                    &fixture.config,
+                    &fixture.forward_id,
+                    cx,
+                )? {
+                    return Ok(None);
+                }
+                root.right_rail_acceptance_forward_state_ready(
+                    &fixture.config,
+                    &fixture.forward_id,
+                    ForwardState::Stopped,
+                    cx,
+                )
+                .map(|ready| ready.then_some(()))
+            },
+        )
+        .await?;
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            "forward-delete-cancelled",
+            "same_forward_definition_remains_stopped_after_cancel",
+        )
+        .await?;
+    }
+    open_forward_delete_confirmation(cx, root, window, fixture).await?;
     poll_root(
         cx,
         root,
@@ -457,7 +710,863 @@ async fn run_forward_lifecycle(
         "production_snapshot_no_longer_contains_fixture_forward_id_or_name",
     )
     .await?;
+    if let Some(binding) = proxy_binding {
+        verify_proxy_restoration(
+            cx,
+            root,
+            window,
+            capture,
+            records,
+            services,
+            (fixture, binding),
+        )
+        .await?;
+    }
     Ok(())
+}
+
+/// 停止态的明确拒绝必须产生一次新的工作区提示，不能由旧状态或卡片文案冒充。
+///
+/// @author kongweiguang
+async fn verify_proxy_unavailable_notice(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+    fixture: &ForwardFixture,
+) -> Result<(), Box<dyn Error>> {
+    window.update(cx, |_, _, app| {
+        root.update(app, |root, cx| {
+            root.clear_right_rail_acceptance_forward_status(&fixture.config, cx)
+        })
+    })??;
+    click_proxy_menu_item(
+        cx,
+        window,
+        fixture,
+        &["应用到当前终端", "Apply to current terminal"],
+    )
+    .await?;
+    poll_root(
+        cx,
+        root,
+        window,
+        "停止态代理错误提示",
+        |root, _, _| {
+            root.right_rail_acceptance_forward_status(&fixture.config)
+                .map(|message| message.filter(|message| !message.trim().is_empty()))
+        },
+    )
+    .await?;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "forward-proxy-error-toast",
+        "stopped_proxy_action_reported_in_workbench_feedback",
+    )
+    .await?;
+    window.update(cx, |_, _, app| {
+        root.update(app, |root, cx| {
+            root.clear_right_rail_acceptance_forward_status(&fixture.config, cx)
+        })
+    })??;
+    Ok(())
+}
+
+/// 在相同 SSH pane 设置互不相同的原值，再由生产菜单应用并用真实 shell 环境验证。
+///
+/// @author kongweiguang
+async fn verify_proxy_application(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+    services: &AppServices,
+    fixture: &ForwardFixture,
+) -> Result<UiSessionBinding, Box<dyn Error>> {
+    let binding = wait_proxy_state(
+        cx,
+        root,
+        window,
+        fixture,
+        ProxyCurrentApplication::NotApplied,
+        None,
+    )
+    .await?;
+    run_fixture_shell(
+        services,
+        &binding,
+        "seed",
+        "export ALL_PROXY='rr-original-upper' all_proxy='rr-original-lower'",
+    )
+    .await?;
+    refresh_proxy_projection(cx, root, window, fixture)?;
+    let fresh = wait_proxy_state(
+        cx,
+        root,
+        window,
+        fixture,
+        ProxyCurrentApplication::NotApplied,
+        None,
+    )
+    .await?;
+    if fresh != binding {
+        return Err(io::Error::other("设置原始环境期间 fixture 终端已换代").into());
+    }
+
+    for (mode, name, operation) in [
+        (ThemeMode::Light, "light", "forward-proxy-light"),
+        (ThemeMode::Dark, "dark", "forward-proxy-dark"),
+        (ThemeMode::System, "system", "forward-proxy-system"),
+    ] {
+        window.update(cx, |_, _, app| {
+            root.update(app, |root, cx| {
+                root.set_right_rail_acceptance_theme(mode, cx)
+            })
+        })?;
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            operation,
+            "active_remote_socks_panel_in_selected_theme",
+        )
+        .await?;
+        super::menus::capture_menu(
+            cx,
+            window,
+            &capture.output_directory,
+            name,
+            "remote SOCKS menu",
+            "forward-proxy",
+            &format!("rr-forward-more-{}", fixture.forward_id),
+        )
+        .await?;
+    }
+    window.update(cx, |_, _, app| {
+        root.update(app, |root, cx| {
+            root.set_right_rail_acceptance_theme(ThemeMode::Light, cx)
+        })
+    })?;
+    click_proxy_menu_item(
+        cx,
+        window,
+        fixture,
+        &["应用到当前终端", "Apply to current terminal"],
+    )
+    .await?;
+    let applied = wait_proxy_state(
+        cx,
+        root,
+        window,
+        fixture,
+        ProxyCurrentApplication::Applied,
+        Some(&fixture.forward_id),
+    )
+    .await;
+    if applied.is_err() {
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            "forward-proxy-apply-failed",
+            "fixture_terminal_after_proxy_application_timeout",
+        )
+        .await?;
+        let endpoint = format!(
+            "socks5h://{}:{}",
+            fixture.config.bind.host, fixture.config.bind.port
+        );
+        let check = format!(
+            "[ \"$(printenv ALL_PROXY)\" = '{endpoint}' ] && [ \"$(printenv all_proxy)\" = '{endpoint}' ]"
+        );
+        let actual = run_fixture_shell(services, &binding, "diagnostic-applied", &check).await;
+        eprintln!("fixture shell proxy values after timeout: {actual:?}");
+    }
+    let applied = applied?;
+    if applied != binding {
+        return Err(io::Error::other("代理应用到了不同的 fixture 终端").into());
+    }
+    let endpoint = format!(
+        "socks5h://{}:{}",
+        fixture.config.bind.host, fixture.config.bind.port
+    );
+    let check = format!(
+        "[ \"$(printenv ALL_PROXY)\" = '{endpoint}' ] && [ \"$(printenv all_proxy)\" = '{endpoint}' ]"
+    );
+    run_fixture_shell(services, &binding, "applied", &check).await?;
+    let text = window.update(cx, |_, _, app| {
+        root.update(app, |root, _| {
+            root.right_rail_acceptance_forward_terminal_text(&fixture.config)
+        })
+    })??;
+    if text.is_some_and(|text| text.contains("\\137\\137\\113\\105\\122")) {
+        return Err(io::Error::other("终端仍显示长串八进制代理命令").into());
+    }
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "forward-proxy-applied",
+        "same_fixture_shell_exports_both_actual_socks_proxy_values",
+    )
+    .await?;
+    capture_proxy_result_themes(cx, root, window, capture, records, fixture, true).await?;
+    verify_refresh_stability(
+        cx,
+        root,
+        window,
+        capture,
+        records,
+        fixture,
+        (&binding, false),
+    )
+    .await?;
+    Ok(binding)
+}
+
+/// 隧道删除后仍需在原 pane 显式恢复，并用子进程环境验证大小写两项原值均已恢复。
+///
+/// @author kongweiguang
+async fn verify_proxy_restoration(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+    services: &AppServices,
+    target: (&ForwardFixture, UiSessionBinding),
+) -> Result<(), Box<dyn Error>> {
+    let (fixture, binding) = target;
+    let endpoint = format!(
+        "socks5h://{}:{}",
+        fixture.config.bind.host, fixture.config.bind.port
+    );
+    let still_applied = format!(
+        "[ \"$(printenv ALL_PROXY)\" = '{endpoint}' ] && [ \"$(printenv all_proxy)\" = '{endpoint}' ]"
+    );
+    run_fixture_shell(services, &binding, "after-delete", &still_applied).await?;
+    refresh_proxy_projection(cx, root, window, fixture)?;
+    let current = wait_proxy_state(
+        cx,
+        root,
+        window,
+        fixture,
+        ProxyCurrentApplication::Applied,
+        Some(&fixture.forward_id),
+    )
+    .await?;
+    if current != binding {
+        return Err(io::Error::other("删除后代理恢复绑定发生变化").into());
+    }
+    verify_refresh_stability(
+        cx,
+        root,
+        window,
+        capture,
+        records,
+        fixture,
+        (&binding, true),
+    )
+    .await?;
+    let _ = super::frame_signature(cx, window)?;
+    super::menus::click_selector(cx, window, "rr-forward-orphan-recovery")?;
+    let restored = wait_proxy_state(
+        cx,
+        root,
+        window,
+        fixture,
+        ProxyCurrentApplication::NotApplied,
+        None,
+    )
+    .await?;
+    if restored != binding {
+        return Err(io::Error::other("代理恢复到了不同的 fixture 终端").into());
+    }
+    run_fixture_shell(services, &binding, "restored", "[ \"$(printenv ALL_PROXY)\" = 'rr-original-upper' ] && [ \"$(printenv all_proxy)\" = 'rr-original-lower' ]").await?;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "forward-proxy-restored-after-delete",
+        "original_fixture_shell_environment_restored_after_forward_deletion",
+    )
+    .await?;
+    capture_proxy_result_themes(cx, root, window, capture, records, fixture, false).await?;
+    Ok(())
+}
+
+/// 同一终端和同一转发状态逐个切换主题；恢复后的原行已删除，故不伪造菜单截图。
+///
+/// @author kongweiguang
+async fn capture_proxy_result_themes(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+    fixture: &ForwardFixture,
+    applied: bool,
+) -> Result<(), Box<dyn Error>> {
+    let themes = if applied {
+        [
+            (ThemeMode::Light, "light", "forward-applied-light"),
+            (ThemeMode::Dark, "dark", "forward-applied-dark"),
+            (ThemeMode::System, "system", "forward-applied-system"),
+        ]
+    } else {
+        [
+            (ThemeMode::Light, "light", "forward-restored-light"),
+            (ThemeMode::Dark, "dark", "forward-restored-dark"),
+            (ThemeMode::System, "system", "forward-restored-system"),
+        ]
+    };
+    for (mode, name, operation) in themes {
+        window.update(cx, |_, _, app| {
+            root.update(app, |root, cx| {
+                root.set_right_rail_acceptance_theme(mode, cx)
+            })
+        })?;
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            operation,
+            if applied {
+                "proxy_applied_to_fixture_terminal"
+            } else {
+                "original_proxy_environment_restored"
+            },
+        )
+        .await?;
+        if applied {
+            super::menus::capture_menu(
+                cx,
+                window,
+                &capture.output_directory,
+                name,
+                "applied remote SOCKS menu",
+                "forward-proxy-applied",
+                &format!("rr-forward-more-{}", fixture.forward_id),
+            )
+            .await?;
+        }
+    }
+    window.update(cx, |_, _, app| {
+        root.update(app, |root, cx| {
+            root.set_right_rail_acceptance_theme(ThemeMode::Light, cx)
+        })
+    })?;
+    Ok(())
+}
+
+/// 点击真实刷新并立即重读代理门禁；原恢复动作在读取中只禁用，不丢失绑定或移动位置。
+///
+/// @author kongweiguang
+async fn verify_refresh_stability(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+    fixture: &ForwardFixture,
+    target: (&UiSessionBinding, bool),
+) -> Result<(), Box<dyn Error>> {
+    let (binding, orphan) = target;
+    poll_root(
+        cx,
+        root,
+        window,
+        "刷新前代理动作就绪",
+        |root, _, cx| {
+            let loading =
+                root.right_rail_acceptance_forward_loading(&fixture.config.host_id, cx)?;
+            let action = root.right_rail_acceptance_proxy_action(
+                &fixture.config,
+                &fixture.forward_id,
+                binding,
+                cx,
+            )?;
+            Ok((!loading && action == (false, true)).then_some(()))
+        },
+    )
+    .await?;
+    let selector = if orphan {
+        "rr-forward-orphan-recovery".to_owned()
+    } else {
+        format!("rr-forward-more-{}", fixture.forward_id)
+    };
+    let _ = super::frame_signature(cx, window)?;
+    let path = capture.output_directory.join(if orphan {
+        "forward-orphan-refresh-loading.png"
+    } else {
+        "forward-refresh-loading.png"
+    });
+    window.update(cx, |_, window, app| {
+        let before_refresh = window
+            .debug_selector_bounds("rr-forwards-refresh")
+            .ok_or_else(|| io::Error::other("缺少隧道刷新按钮"))?;
+        let before_action = window
+            .debug_selector_bounds(&selector)
+            .ok_or_else(|| io::Error::other("刷新前缺少原代理动作"))?;
+        let orphan_id: ElementId = "operations-forward-orphan-recovery".into();
+        if orphan {
+            let node = gpui_kit::base::test_support::find(window, &[], &orphan_id)
+                .ok_or_else(|| io::Error::other("刷新前恢复按钮未绘制"))?;
+            if !node.supports_click() {
+                return Err(io::Error::other("刷新前恢复按钮不可点击"));
+            }
+        }
+        let position = before_refresh.center();
+        for event in [
+            MouseMoveEvent {
+                position,
+                ..MouseMoveEvent::default()
+            }
+            .to_platform_input(),
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..MouseDownEvent::default()
+            }
+            .to_platform_input(),
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                click_count: 1,
+                ..MouseUpEvent::default()
+            }
+            .to_platform_input(),
+        ] {
+            let _ = window.dispatch_event(event, app);
+        }
+        let (loading, action) = root
+            .update(app, |root, cx| {
+                let loading =
+                    root.right_rail_acceptance_forward_loading(&fixture.config.host_id, cx)?;
+                root.refresh_right_rail_acceptance_proxy(&fixture.config, cx)?;
+                let action = root.right_rail_acceptance_proxy_action(
+                    &fixture.config,
+                    &fixture.forward_id,
+                    binding,
+                    cx,
+                )?;
+                Ok::<_, String>((loading, action))
+            })
+            .map_err(io::Error::other)?;
+        if !loading || action != (true, true) {
+            return Err(io::Error::other(format!(
+                "刷新未保留原恢复动作与忙碌门禁：loading={loading}, action={action:?}"
+            )));
+        }
+        let clear = window.draw(app);
+        clear.clear(app);
+        let after_refresh = window
+            .debug_selector_bounds("rr-forwards-refresh")
+            .ok_or_else(|| io::Error::other("刷新期间按钮消失"))?;
+        let after_action = window
+            .debug_selector_bounds(&selector)
+            .ok_or_else(|| io::Error::other("刷新期间原代理动作消失"))?;
+        if !same_bounds(before_refresh, after_refresh) || !same_bounds(before_action, after_action)
+        {
+            return Err(io::Error::other("刷新期间按钮或原代理动作发生位移"));
+        }
+        if orphan {
+            let node = gpui_kit::base::test_support::find(window, &[], &orphan_id)
+                .ok_or_else(|| io::Error::other("刷新期间恢复按钮未绘制"))?;
+            // Kit's AccessKit node omits the disabled flag; its Click action is
+            // the observable distinction between an enabled and disabled Button.
+            if node.supports_click() {
+                return Err(io::Error::other(format!(
+                    "刷新期间恢复按钮仍支持点击：disabled={:?}",
+                    node.disabled()
+                )));
+            }
+            let position = after_action.center();
+            for event in [
+                MouseMoveEvent {
+                    position,
+                    ..MouseMoveEvent::default()
+                }
+                .to_platform_input(),
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count: 1,
+                    ..MouseDownEvent::default()
+                }
+                .to_platform_input(),
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count: 1,
+                    ..MouseUpEvent::default()
+                }
+                .to_platform_input(),
+            ] {
+                let _ = window.dispatch_event(event, app);
+            }
+            let action = root
+                .update(app, |root, cx| {
+                    root.right_rail_acceptance_proxy_action(
+                        &fixture.config,
+                        &fixture.forward_id,
+                        binding,
+                        cx,
+                    )
+                })
+                .map_err(io::Error::other)?;
+            if action != (true, true) {
+                return Err(io::Error::other(format!(
+                    "刷新期间点击改变了原恢复事务：action={action:?}"
+                )));
+            }
+        }
+        window
+            .render_to_image()
+            .map_err(io::Error::other)?
+            .save(&path)
+            .map_err(io::Error::other)?;
+        Ok::<_, io::Error>(())
+    })??;
+    poll_root(cx, root, window, "原代理刷新回执", |root, _, cx| {
+        let loading = root.right_rail_acceptance_forward_loading(&fixture.config.host_id, cx)?;
+        let action = root.right_rail_acceptance_proxy_action(
+            &fixture.config,
+            &fixture.forward_id,
+            binding,
+            cx,
+        )?;
+        Ok((!loading && action == (false, true)).then_some(()))
+    })
+    .await?;
+    let _ = super::frame_signature(cx, window)?;
+    window.update(cx, |_, window, _| {
+        window
+            .debug_selector_bounds(&selector)
+            .ok_or_else(|| io::Error::other("刷新回执后原代理动作消失"))
+    })??;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        if orphan {
+            "forward-orphan-refresh-stable"
+        } else {
+            "forward-proxy-refresh-stable"
+        },
+        "same_binding_recovery_action_preserved_during_and_after_refresh",
+    )
+    .await?;
+    Ok(())
+}
+
+/// 只读状态必须同时满足提示符就绪、指定应用态和原转发身份；超时保留最近快照以区分执行与提示符问题。
+///
+/// @author kongweiguang
+async fn wait_proxy_state(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    fixture: &ForwardFixture,
+    application: ProxyCurrentApplication,
+    expected_recovery: Option<&str>,
+) -> Result<UiSessionBinding, Box<dyn Error>> {
+    let mut latest = String::new();
+    let result = poll_root(
+        cx,
+        root,
+        window,
+        "代理回读和终端提示符",
+        |root, _, cx| {
+            let state =
+                root.right_rail_acceptance_proxy_session(&fixture.config, &fixture.forward_id, cx)?;
+            let status = root.right_rail_acceptance_forward_status(&fixture.config)?;
+            latest = format!("state={state:?}, status={status:?}");
+            Ok(state.and_then(|(session, recovery, _)| {
+                (session.application == application
+                    && session.availability == ProxyCurrentAvailability::Ready
+                    && recovery.as_deref() == expected_recovery)
+                    .then_some(session.binding)
+            }))
+        },
+    )
+    .await;
+    result.map_err(|error| {
+        io::Error::other(format!("{error}; expected={application:?}, last={latest}")).into()
+    })
+}
+
+/// 主动更新当前 panel 后等待权威快照，避免测试自身的只读 shell 命令留下旧提示符投影。
+///
+/// @author kongweiguang
+fn refresh_proxy_projection(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    fixture: &ForwardFixture,
+) -> Result<(), Box<dyn Error>> {
+    window.update(cx, |_, _, app| {
+        root.update(app, |root, cx| {
+            root.refresh_right_rail_acceptance_proxy(&fixture.config, cx)
+        })
+    })??;
+    Ok(())
+}
+
+/// 在精确 UI binding 上执行 fixture 命令并等待新提示符；只重试注入前的明确拒绝，未知结果绝不重放。
+///
+/// @author kongweiguang
+async fn run_fixture_shell(
+    services: &AppServices,
+    binding: &UiSessionBinding,
+    label: &'static str,
+    command: &str,
+) -> Result<(), Box<dyn Error>> {
+    let sessions = Arc::clone(&services.sessions);
+    let binding = binding.clone();
+    let command = command.to_owned();
+    let outcome = services
+        .executor
+        .run(move |cancellation| async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (epoch, outcome) = loop {
+                let epoch =
+                    wait_fixture_prompt(sessions.as_ref(), &binding, None, deadline, &cancellation)
+                        .await?;
+                let request = ShellCommandRequest {
+                    session_id: binding.session_id.clone(),
+                    expected_ui_binding: Some(binding.clone()),
+                    command_id: format!("rr-proxy-{label}"),
+                    command: command.clone(),
+                    timeout: Duration::from_secs(20),
+                };
+                match sessions
+                    .execute_shell_command(request, cancellation.clone())
+                    .await
+                {
+                    Ok(outcome) => break (epoch, outcome),
+                    Err(error)
+                        if matches!(
+                            error.public_code(),
+                            kerminal_application::PublicErrorCode::Conflict
+                                | kerminal_application::PublicErrorCode::CapabilityNotSupported
+                        ) && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            if matches!(outcome, ShellCommandOutcome::Finished { exit_code: 0, .. }) {
+                wait_fixture_prompt(
+                    sessions.as_ref(),
+                    &binding,
+                    Some(epoch),
+                    deadline,
+                    &cancellation,
+                )
+                .await?;
+            }
+            Ok(outcome)
+        })
+        .await?;
+    if !matches!(outcome, ShellCommandOutcome::Finished { exit_code: 0, .. }) {
+        return Err(
+            io::Error::other(format!("fixture shell {label} 校验失败：{outcome:?}")).into(),
+        );
+    }
+    Ok(())
+}
+
+/// 完成回执早于下个 OSC 133 提示符时等待新 epoch，期间始终验证原会话身份和截止时间。
+///
+/// @author kongweiguang
+async fn wait_fixture_prompt(
+    sessions: &dyn kerminal_application::SessionService,
+    binding: &UiSessionBinding,
+    previous_epoch: Option<u64>,
+    deadline: tokio::time::Instant,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> kerminal_application::AppResult<u64> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(kerminal_application::AppError::cancelled(
+                "fixture shell probe cancelled",
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(kerminal_application::AppError::timeout(
+                "fixture shell prompt",
+            ));
+        }
+        let context = sessions
+            .terminal_command_context(binding.session_id.clone())
+            .await?;
+        if context.session_id != binding.session_id
+            || context.owner != binding.owner
+            || context.session_generation != binding.session_generation
+        {
+            return Err(kerminal_application::AppError::conflict(
+                "fixture shell binding changed",
+            ));
+        }
+        if context.availability == TerminalCommandAvailability::Available
+            && context.prompt_ready
+            && context.prompt_line_empty
+            && !context.alternate_screen
+            && previous_epoch.is_none_or(|epoch| context.prompt_epoch > epoch)
+        {
+            return Ok(context.prompt_epoch);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// 通过真实菜单项的无障碍标签和窗口内鼠标事件触发，防止测试绕过产品菜单接线。
+///
+/// @author kongweiguang
+async fn click_proxy_menu_item(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    fixture: &ForwardFixture,
+    expected_labels: &[&str],
+) -> Result<(), Box<dyn Error>> {
+    let _ = super::frame_signature(cx, window)?;
+    super::menus::click_selector(
+        cx,
+        window,
+        &format!("rr-forward-more-{}", fixture.forward_id),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = super::frame_signature(cx, window)?;
+        let result = window.update(cx, |_, window, app| {
+            let items = gpui_kit::base::test_support::snapshots(window)
+                .into_iter()
+                .filter(|node| node.role() == Some(gpui_pre::Role::MenuItem))
+                .collect::<Vec<_>>();
+            if items
+                .iter()
+                .filter_map(|node| node.label())
+                .any(|label| label.contains("上次操作") || label.contains("Last operation"))
+            {
+                return Err(io::Error::other("代理菜单仍包含上次操作提示"));
+            }
+            let Some(item) = items.iter().find(|node| {
+                node.label()
+                    .is_some_and(|label| expected_labels.contains(&label))
+            }) else {
+                return Ok(false);
+            };
+            if item.disabled() == Some(true) || !item.visible() {
+                return Err(io::Error::other(format!(
+                    "代理菜单项不可用：{expected_labels:?}"
+                )));
+            }
+            let position = item.bounds().center();
+            for event in [
+                MouseMoveEvent {
+                    position,
+                    ..MouseMoveEvent::default()
+                }
+                .to_platform_input(),
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count: 1,
+                    ..MouseDownEvent::default()
+                }
+                .to_platform_input(),
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count: 1,
+                    ..MouseUpEvent::default()
+                }
+                .to_platform_input(),
+            ] {
+                let _ = window.dispatch_event(event, app);
+            }
+            Ok(true)
+        })??;
+        if result {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                io::Error::other(format!("等待代理菜单项超时：{expected_labels:?}")).into(),
+            );
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+    }
+}
+
+/// 打开或复用原 fixture 的生产删除确认，并等待对应 Root 弹层挂载。
+///
+/// @author kongweiguang
+async fn open_forward_delete_confirmation(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    fixture: &ForwardFixture,
+) -> Result<(), Box<dyn Error>> {
+    let already_open = window
+        .update(cx, |_, _, app| {
+            root.update(app, |root, root_cx| {
+                root.right_rail_acceptance_forward_delete_confirmation_ready(
+                    &fixture.config,
+                    &fixture.forward_id,
+                    root_cx,
+                )
+            })
+        })?
+        .map_err(io::Error::other)?;
+    if !already_open {
+        poll_root(
+            cx,
+            root,
+            window,
+            "打开 fixture 隧道删除确认",
+            |root, _, cx| {
+                root.open_right_rail_acceptance_forward_delete(
+                    &fixture.config,
+                    &fixture.forward_id,
+                    cx,
+                )
+                .map(|opened| opened.then_some(()))
+            },
+        )
+        .await?;
+    }
+    poll_root(
+        cx,
+        root,
+        window,
+        "回读 fixture 隧道删除确认",
+        |root, _, cx| {
+            root.right_rail_acceptance_forward_delete_confirmation_ready(
+                &fixture.config,
+                &fixture.forward_id,
+                cx,
+            )
+            .map(|ready| ready.then_some(()))
+        },
+    )
+    .await
 }
 
 /// 异常后先回读删除/运行状态，再按原 ID 停止失败或活动资源并确认删除，避免重放未知请求。
@@ -543,6 +1652,7 @@ async fn cleanup_forward(
         return Err(io::Error::other("fixture 隧道状态未知；拒绝尝试删除").into());
     }
 
+    open_forward_delete_confirmation(cx, root, window, fixture).await?;
     poll_root(
         cx,
         root,
@@ -602,11 +1712,27 @@ async fn verify_active_data_plane(
         ForwardProbe::RemoteSocks {
             bind_port,
             destination_port,
+            expected_body,
         } => {
             verify_wsl_listener_open(cx, bind_port).await?;
-            verify_socks_http(cx, bind_port, destination_port, "fixture-ok").await
+            verify_wsl_socks_http(cx, bind_port, destination_port, expected_body).await
         }
     }
+}
+
+/// 先证明本机 fixture 正常且 WSL 不能直接连接同一回环端口，避免共享 localhost 掩盖错误出口。
+///
+/// @author kongweiguang
+async fn verify_client_only_fixture(cx: &mut AsyncApp, port: u16) -> Result<(), Box<dyn Error>> {
+    cx.background_executor()
+        .spawn(async move {
+            read_http_at(port, "fixture-local-ok")?;
+            wsl_listener_probe(port, false).map_err(|error| {
+                io::Error::other(format!("本机 fixture 不能证明与 SSH 侧隔离：{error}"))
+            })
+        })
+        .await?;
+    Ok(())
 }
 
 /// 停止后本机 listener 必须拒绝 TCP；远端 listener 必须从 fixture WSL 清单和 loopback 消失。
@@ -659,6 +1785,25 @@ async fn verify_socks_http(
                 socks5_connect(&mut stream, destination_port)?;
                 write_http_request(&mut stream)?;
                 verify_http_response(&mut stream, expected_body)
+            })
+        })
+        .await?;
+    Ok(())
+}
+
+/// 从 SSH fixture 一侧发起 SOCKS CONNECT，确保数据真正经过远端监听器返回本机目标。
+///
+/// @author kongweiguang
+async fn verify_wsl_socks_http(
+    cx: &mut AsyncApp,
+    socks_port: u16,
+    destination_port: u16,
+    expected_body: &'static str,
+) -> Result<(), Box<dyn Error>> {
+    cx.background_executor()
+        .spawn(async move {
+            retry_until_fixture_response(|| {
+                wsl_socks_http_probe(socks_port, destination_port, expected_body)
             })
         })
         .await?;
@@ -1069,6 +2214,66 @@ printf RR_HTTP_OK"#
         Err(io::Error::other(
             "fixture WSL 远端 HTTP 探针没有确认预期正文",
         ))
+    }
+}
+
+/// 通过 WSL 内的标准库完成 SOCKS5 协商和 HTTP 正文核对，不借用 Windows 的端口映射。
+///
+/// @author kongweiguang
+fn wsl_socks_http_probe(
+    socks_port: u16,
+    destination_port: u16,
+    expected_body: &str,
+) -> Result<(), io::Error> {
+    if expected_body != "fixture-local-ok" {
+        return Err(io::Error::other("远端 SOCKS 只允许本轮本机 fixture 响应"));
+    }
+    let script = format!(
+        r#"python3 - {socks_port} {destination_port} <<'PY'
+import socket, struct, sys
+def exact(sock, size):
+    data = b''
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise RuntimeError('SOCKS stream closed')
+        data += chunk
+    return data
+s = socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=4)
+s.settimeout(4)
+s.sendall(b'\x05\x01\x00')
+if exact(s, 2) != b'\x05\x00':
+    raise RuntimeError('SOCKS authentication rejected')
+s.sendall(b'\x05\x01\x00\x01\x7f\x00\x00\x01' + struct.pack('!H', int(sys.argv[2])))
+reply = exact(s, 4)
+if reply[:3] != b'\x05\x00\x00':
+    raise RuntimeError('SOCKS CONNECT failed')
+if reply[3] == 1:
+    exact(s, 6)
+elif reply[3] == 4:
+    exact(s, 18)
+elif reply[3] == 3:
+    exact(s, exact(s, 1)[0] + 2)
+else:
+    raise RuntimeError('invalid SOCKS address type')
+s.sendall(b'GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+response = bytearray()
+while len(response) < 16384:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    response.extend(chunk)
+s.close()
+headers, body = bytes(response).split(b'\r\n\r\n', 1)
+if not headers.startswith(b'HTTP/1.0 200 ') or body.strip() != b'fixture-local-ok':
+    raise RuntimeError('unexpected client fixture response')
+print('RR_SOCKS_HTTP_OK')
+PY"#
+    );
+    if run_fixture_wsl(&script)?.contains("RR_SOCKS_HTTP_OK") {
+        Ok(())
+    } else {
+        Err(io::Error::other("fixture WSL SOCKS 探针未确认本机正文"))
     }
 }
 

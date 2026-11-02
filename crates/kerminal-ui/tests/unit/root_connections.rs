@@ -99,6 +99,7 @@ fn sftp_host_creation_return_requires_original_workbench_source() {
         workbench_tab_id: workbench_tab_id.clone(),
         navigation_generation: 12,
         saved_host: Some((HostId::new(), true)),
+        origin: None,
     };
 
     assert!(sftp_host_creation_source_is_current(

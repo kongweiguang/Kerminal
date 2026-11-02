@@ -100,6 +100,7 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     };
     let config_directory = output_directory.join("config");
     fs::create_dir(&config_directory)?;
+    drop(seed_isolated_mcp_port(&config_directory)?);
     let runtime = ApplicationRuntime::new()?;
     let mut composition = match runtime.block_on(DesktopComposition::build(
         runtime.handle(),

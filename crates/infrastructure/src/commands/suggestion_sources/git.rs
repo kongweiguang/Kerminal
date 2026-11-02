@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use kerminal_application::AppResult;
+use kerminal_application::{AppError, AppResult};
 use kerminal_domain::{
     commands::{CommandSuggestionCandidate, CommandSuggestionRequest, SuggestionProviderKind},
     identity::HostId,
@@ -12,7 +12,7 @@ use kerminal_domain::{
 
 use super::{
     MAX_GIT_REFS, RemoteCommandSuggestionProvider, candidate, command_cache_key_for_git,
-    prefix_score, quote,
+    prefix_score,
     syntax::{ParsedPrefix, ShellFamily},
 };
 
@@ -187,7 +187,12 @@ async fn git_refs(
     let host_id = query.host_id;
     let cancellation = query.cancellation;
     let operation_deadline = query.operation_deadline;
-    if query.lease.is_none() {
+    if query.lease.is_none()
+        || !request
+            .cwd
+            .as_deref()
+            .is_some_and(super::is_absolute_remote_cwd)
+    {
         return Ok(None);
     }
     let key = command_cache_key_for_git(host_id, request);
@@ -195,13 +200,13 @@ async fn git_refs(
         return Ok(Some(refs));
     }
     if provider.git_refs.is_backing_off(&key).await {
-        return Ok(None);
+        return Err(AppError::infrastructure("远端 Git 引用暂不可用"));
     }
     let gate = provider.git_refs.gate(&key);
     let guard = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(kerminal_application::AppError::cancelled("Git 建议查询已取消")),
-        _ = tokio::time::sleep_until(operation_deadline) => return Ok(None),
+        _ = tokio::time::sleep_until(operation_deadline) => return Err(AppError::timeout("远端 Git 引用查询超时")),
         guard = super::cache::lock_gate(gate, cancellation) => guard,
     };
     let Some(_guard) = guard else {
@@ -213,7 +218,7 @@ async fn git_refs(
         return Ok(Some(refs));
     }
     if provider.git_refs.is_backing_off(&key).await {
-        return Ok(None);
+        return Err(AppError::infrastructure("远端 Git 引用暂不可用"));
     }
 
     let output = provider
@@ -234,20 +239,32 @@ async fn git_refs(
                 working_directory: request.cwd.clone(),
             },
         )
-        .await?;
+        .await;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            if !cancellation.is_cancelled() {
+                provider
+                    .git_refs
+                    .mark_failure(key, super::REMOTE_FAILURE_BACKOFF)
+                    .await;
+            }
+            return Err(error);
+        }
+    };
     let Some(output) = output else {
         provider
             .git_refs
             .mark_failure(key, super::REMOTE_FAILURE_BACKOFF)
             .await;
-        return Ok(None);
+        return Err(AppError::infrastructure("远端 Git 引用查询失败"));
     };
     let Ok(output) = std::str::from_utf8(&output) else {
         provider
             .git_refs
             .mark_failure(key, super::REMOTE_FAILURE_BACKOFF)
             .await;
-        return Ok(None);
+        return Err(AppError::infrastructure("远端 Git 引用编码无效"));
     };
     let mut refs = output
         .lines()
@@ -272,7 +289,12 @@ async fn git_remotes(
     let host_id = query.host_id;
     let cancellation = query.cancellation;
     let operation_deadline = query.operation_deadline;
-    if query.lease.is_none() {
+    if query.lease.is_none()
+        || !request
+            .cwd
+            .as_deref()
+            .is_some_and(super::is_absolute_remote_cwd)
+    {
         return Ok(None);
     }
     let key = command_cache_key_for_git(host_id, request);
@@ -280,13 +302,13 @@ async fn git_remotes(
         return Ok(Some(remotes));
     }
     if provider.git_remotes.is_backing_off(&key).await {
-        return Ok(None);
+        return Err(AppError::infrastructure("远端 Git remote 暂不可用"));
     }
     let gate = provider.git_remotes.gate(&key);
     let guard = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(kerminal_application::AppError::cancelled("Git 建议查询已取消")),
-        _ = tokio::time::sleep_until(operation_deadline) => return Ok(None),
+        _ = tokio::time::sleep_until(operation_deadline) => return Err(AppError::timeout("远端 Git remote 查询超时")),
         guard = super::cache::lock_gate(gate, cancellation) => guard,
     };
     let Some(_guard) = guard else {
@@ -298,7 +320,7 @@ async fn git_remotes(
         return Ok(Some(remotes));
     }
     if provider.git_remotes.is_backing_off(&key).await {
-        return Ok(None);
+        return Err(AppError::infrastructure("远端 Git remote 暂不可用"));
     }
 
     let output = provider
@@ -311,20 +333,32 @@ async fn git_remotes(
                 working_directory: request.cwd.clone(),
             },
         )
-        .await?;
+        .await;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            if !cancellation.is_cancelled() {
+                provider
+                    .git_remotes
+                    .mark_failure(key, super::REMOTE_FAILURE_BACKOFF)
+                    .await;
+            }
+            return Err(error);
+        }
+    };
     let Some(output) = output else {
         provider
             .git_remotes
             .mark_failure(key, super::REMOTE_FAILURE_BACKOFF)
             .await;
-        return Ok(None);
+        return Err(AppError::infrastructure("远端 Git remote 查询失败"));
     };
     let Ok(output) = std::str::from_utf8(&output) else {
         provider
             .git_remotes
             .mark_failure(key, super::REMOTE_FAILURE_BACKOFF)
             .await;
-        return Ok(None);
+        return Err(AppError::infrastructure("远端 Git remote 编码无效"));
     };
     let mut remotes = output
         .lines()
@@ -344,18 +378,11 @@ async fn git_remotes(
 /// 安全 ASCII Git token 保持旧版裸替换；命令选项前缀不作为引用建议，其他名称走现有转义器。
 ///
 /// @author kongweiguang
-fn quote_git_reference(reference: &str, shell: ShellFamily) -> Option<String> {
+fn quote_git_reference(reference: &str, _shell: ShellFamily) -> Option<&str> {
     if reference.starts_with('-') {
         return None;
     }
-    let legacy_safe = reference.chars().all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '/' | '_' | '-' | '.')
-    });
-    if legacy_safe {
-        Some(reference.to_owned())
-    } else {
-        quote(reference, shell)
-    }
+    Some(reference)
 }
 
 /// 把 refs 中匹配前缀的名称绑定到用户光标位置，同时避免 shell 元字符执行。
@@ -373,7 +400,9 @@ fn ref_candidates(
     refs.iter()
         .filter(|reference| reference.starts_with(typed))
         .filter_map(|reference| {
-            let replacement = quote_git_reference(reference, shell)?;
+            let value = quote_git_reference(reference, shell)?;
+            let replacement =
+                super::syntax::append_literal(&request.input, request.cursor, prefix, value)?;
             Some(candidate(
                 super::CandidateContext {
                     request,
@@ -406,7 +435,8 @@ fn static_candidates(
         .copied()
         .filter(|choice| choice.starts_with(typed))
         .filter_map(|choice| {
-            let replacement = quote(choice, prefix.shell)?;
+            let replacement =
+                super::syntax::append_literal(&request.input, request.cursor, prefix, choice)?;
             Some(candidate(
                 super::CandidateContext {
                     request,

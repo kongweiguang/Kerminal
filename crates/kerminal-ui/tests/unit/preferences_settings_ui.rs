@@ -8,6 +8,9 @@ mod color_sampling;
 #[path = "preferences_mcp.rs"]
 mod mcp;
 
+#[path = "preferences_keyword_regressions.rs"]
+mod keyword_regressions;
+
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -38,11 +41,20 @@ use kerminal_domain::{
 use tokio::runtime::{Builder, Runtime};
 
 use super::render_desktop_about::{
-    GPUI_ONLY_SHORTCUT_ACTIONS, MAIN_SHORTCUT_PRESENTATIONS, display_repository_url,
+    MAIN_SHORTCUT_PRESENTATIONS, display_repository_url, display_shortcut,
     main_settings_shortcut_visible, main_shortcut_order, main_shortcut_presentation,
     shortcut_display_scope,
 };
-use super::{PreferencesPanel, PreferencesPanelServices};
+use super::{KeyboardPlatform, PreferencesPanel, PreferencesPanelServices};
+
+/// 附加动作的预期清单属于回归输入，不在生产渲染模块保留测试专用常量。
+const GPUI_ONLY_SHORTCUT_ACTIONS: [&str; 5] = [
+    "terminal.search",
+    "workspace.quickOpen",
+    "workspace.commandPalette",
+    "application.quit",
+    "terminal.paste",
+];
 
 #[derive(Clone)]
 struct MemorySettingsRepository {
@@ -54,6 +66,8 @@ struct MemorySettingsState {
     revision: Option<ConfigRevision>,
     next_revision: u64,
     save_count: usize,
+    save_attempt_count: usize,
+    fail_next_settings_save: bool,
     profiles: Vec<VersionedProfile>,
     profile_saves: usize,
     unknown_after_profile_save: bool,
@@ -69,6 +83,8 @@ impl MemorySettingsRepository {
                 revision: None,
                 next_revision: 1,
                 save_count: 0,
+                save_attempt_count: 0,
+                fail_next_settings_save: false,
                 profiles: Vec::new(),
                 profile_saves: 0,
                 unknown_after_profile_save: false,
@@ -81,6 +97,20 @@ impl MemorySettingsRepository {
     fn snapshot(&self) -> (SettingsSnapshot, usize) {
         let state = self.state.lock().expect("settings state is not poisoned");
         (state.settings.clone(), state.save_count)
+    }
+
+    /// 只让下一次真实保存请求失败，以验证界面保留草稿并可通过重试恢复。
+    ///
+    /// @author kongweiguang
+    fn fail_next_settings_save(&self) {
+        self.state.lock().unwrap().fail_next_settings_save = true;
+    }
+
+    /// 将失败与成功请求一起计数，防止自动重试或重复点击被误判为一次提交。
+    ///
+    /// @author kongweiguang
+    fn save_attempt_count(&self) -> usize {
+        self.state.lock().unwrap().save_attempt_count
     }
 }
 
@@ -95,13 +125,19 @@ impl SettingsRepository for MemorySettingsRepository {
         })
     }
 
-    /// 按 revision 接受设置写入，任何旧基线覆盖都会在测试仓储显式失败。
+    /// 每次请求先记录真实尝试，再按可控故障和 revision 决定提交，避免失败伪装成写入成功。
+    ///
+    /// @author kongweiguang
     async fn save_settings(
         &self,
         settings: SettingsSnapshot,
         expected_revision: Option<ConfigRevision>,
     ) -> AppResult<VersionedSettings> {
         let mut state = self.state.lock().expect("settings state is not poisoned");
+        state.save_attempt_count += 1;
+        if std::mem::take(&mut state.fail_next_settings_save) {
+            return Err(AppError::infrastructure("模拟设置写入失败"));
+        }
         if state.revision != expected_revision {
             return Err(AppError::conflict("测试设置 revision 已变化"));
         }
@@ -390,7 +426,8 @@ fn observed_element(
     })
 }
 
-/// 保留 snapshot 的裁剪可见性；无 snapshot 时只使用生产 debug selector 记录的真实布局 bounds。
+/// 关键词控件必须完整进入所属滚动区，避免 Kit 的部分可见状态使中心点击落在裁剪区外。
+/// 其它控件保留 snapshot 语义；无 snapshot 时只使用生产 debug selector 的真实布局 bounds。
 ///
 /// @author kongweiguang
 fn target_geometry(visual: &mut VisualTestContext, selector: &str) -> (Bounds<Pixels>, bool) {
@@ -404,7 +441,22 @@ fn target_geometry(visual: &mut VisualTestContext, selector: &str) -> (Bounds<Pi
                 .min_by_key(|snapshot| snapshot.path().len())
         });
         if let Some(snapshot) = snapshot {
-            return (snapshot.bounds(), snapshot.visible());
+            let mut visible = snapshot.visible();
+            for (container, selector) in [
+                ("keyword-rule-list-scroll", "keyword-rule-list-viewport"),
+                (
+                    "keyword-rule-editor-content",
+                    "keyword-rule-editor-viewport",
+                ),
+            ] {
+                if snapshot.path().contains(&ElementId::from(container))
+                    && let Some(clip) = window.debug_selector_bounds(selector)
+                {
+                    let clip = clip.intersect(&window.visual_viewport_bounds());
+                    visible &= bounds_within_viewport(snapshot.bounds(), clip);
+                }
+            }
+            return (snapshot.bounds(), visible);
         }
 
         let bounds = window.debug_selector_bounds(selector).unwrap_or_else(|| {
@@ -441,7 +493,7 @@ fn click(visual: &mut VisualTestContext, selector: &str) {
     draw(visual);
 }
 
-/// 仅在真实 snapshot 或 debug bounds 尚未进入视口时滚动；起点也允许使用 debug selector，不改写滚动偏移。
+/// 每步按当前帧重取滚轮落点，避免外层滚动后继续向旧坐标发事件；不直接改写滚动偏移。
 ///
 /// @author kongweiguang
 fn scroll_until_visible(
@@ -450,11 +502,18 @@ fn scroll_until_visible(
     anchor: &str,
     delta_y: f32,
 ) {
-    let position = target_geometry(visual, anchor).0.center();
     for _ in 0..32 {
         if target_geometry(visual, selector).1 {
             return;
         }
+        let bounds = target_geometry(visual, anchor).0;
+        let viewport = visual.update(|window, _| window.visual_viewport_bounds());
+        let clipped = bounds.intersect(&viewport);
+        let position = if clipped.size.width > px(0.) && clipped.size.height > px(0.) {
+            clipped.center()
+        } else {
+            viewport.center()
+        };
         visual.simulate_event(ScrollWheelEvent {
             position,
             delta: ScrollDelta::Lines(point(0., delta_y)),
@@ -571,7 +630,7 @@ fn production_navigation_opens_all_settings_pages(app: &mut TestAppContext) {
             "preferences-nav-appearance",
             "settings-interface-language-select",
         ),
-        ("preferences-nav-terminal", "terminal-scheme-light-kerminal"),
+        ("preferences-nav-terminal", "terminal-scheme-kerminal"),
         ("preferences-nav-profiles", "profile-create"),
         ("preferences-nav-keywords", "keyword-new"),
         ("preferences-nav-suggestions", "suggestions-enabled"),
@@ -745,13 +804,11 @@ fn search_changes_page_only_after_a_real_result_click(app: &mut TestAppContext) 
     assert!(visual.update(|_, cx| { panel.read(cx).navigation_search_query.is_empty() }));
 }
 
-/// 窗口尺寸变化与纵向滚动不能挤掉 renderer 折叠的 44px 命中区或阻断真实展开事件。
+/// 不同窗口尺寸都能选择统一终端主题，旧 renderer 控件不再出现在生产页面。
 /// @author kongweiguang
 #[gpui_kit::test]
-fn terminal_renderer_disclosure_keeps_its_hit_area_and_scroll_interaction(
-    app: &mut TestAppContext,
-) {
-    let (_runtime, panel, _repository, visual) = fixture(app);
+fn terminal_theme_selector_works_without_renderer_disclosure(app: &mut TestAppContext) {
+    let (runtime, panel, repository, visual) = fixture(app);
 
     for window_size in [size(px(1440.), px(900.)), size(px(800.), px(600.))] {
         visual.simulate_resize(window_size);
@@ -761,28 +818,398 @@ fn terminal_renderer_disclosure_keeps_its_hit_area_and_scroll_interaction(
         visual.update(|_, cx| panel.read(cx).content_scroll.scroll_to_top_of_item(0));
         draw(visual);
 
-        let (bounds, clip) =
-            scroll_target_fully_into_content_clip(visual, &panel, "terminal-renderer-disclosure");
-        assert!(
-            bounds.size.height.to_f64() >= 44.,
-            "renderer disclosure must retain its 44px hit area at {window_size:?}; bounds={bounds:?}, clip={clip:?}"
-        );
-        assert!(
-            bounds_within_viewport(bounds, clip),
-            "renderer disclosure center must be inside the production content clip at {window_size:?}; bounds={bounds:?}, clip={clip:?}"
-        );
-
-        click(visual, "terminal-renderer-disclosure");
-        assert!(
-            visual.update(|_, cx| panel.read(cx).terminal_renderer_open),
-            "renderer disclosure click did not expand at {window_size:?}; bounds={bounds:?}, clip={clip:?}"
-        );
-        click(visual, "terminal-renderer-disclosure");
-        assert!(
-            !visual.update(|_, cx| panel.read(cx).terminal_renderer_open),
-            "renderer disclosure click did not collapse at {window_size:?}; bounds={bounds:?}, clip={clip:?}"
+        assert_not_rendered(visual, "terminal-renderer-disclosure");
+        scroll_target_fully_into_content_clip(visual, &panel, "terminal-scheme-github");
+        click(visual, "terminal-scheme-github");
+        pump_runtime(&runtime, visual);
+        assert_eq!(
+            repository.snapshot().0.terminal.color_scheme,
+            kerminal_application::preferences::TerminalColorScheme::Github
         );
     }
+}
+
+/// 观察预览事件而非只比较最终布尔值，防止开关与整行冒泡各触发一次却恰好写入同一值。
+struct TerminalPreviewObserver {
+    _subscription: gpui_kit::Subscription,
+}
+
+/// 指针直接点击、行点击和键盘激活各只能产生一次预览，并在防抖后写入同一设置仓储。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn terminal_selection_copy_switch_row_and_keyboard_activate_once(app: &mut TestAppContext) {
+    let (runtime, panel, repository, visual) = fixture(app);
+    visual.simulate_resize(size(px(1440.), px(900.)));
+    draw(visual);
+    click(visual, "preferences-nav-terminal");
+    scroll_target_fully_into_content_clip(visual, &panel, "terminal-selection-copy");
+
+    let previews = std::rc::Rc::new(std::cell::Cell::new(0));
+    let _observer = visual.update(|_, cx| {
+        let previews = previews.clone();
+        cx.new(|cx| {
+            let subscription = cx.subscribe(
+                &panel,
+                move |_: &mut TerminalPreviewObserver, _, event: &super::PreferencesEvent, _| {
+                    if matches!(event, super::PreferencesEvent::SettingsPreview(_)) {
+                        previews.set(previews.get() + 1);
+                    }
+                },
+            );
+            TerminalPreviewObserver {
+                _subscription: subscription,
+            }
+        })
+    });
+
+    let original = repository.snapshot().0.terminal.selection_copy;
+    click(visual, "terminal-selection-copy");
+    assert_eq!(previews.get(), 1, "switch click emits exactly one preview");
+    assert_eq!(
+        visual.update(|_, cx| panel
+            .read(cx)
+            .settings_snapshot()
+            .unwrap()
+            .terminal
+            .selection_copy),
+        !original
+    );
+    assert_eq!(
+        observed_element(visual, "terminal-selection-copy").focused(),
+        Some(true)
+    );
+    pump_runtime(&runtime, visual);
+    assert_eq!(repository.snapshot().0.terminal.selection_copy, !original);
+
+    // 开关在释放 Space 时提交，测试完整按键序列并保留真实焦点路径。
+    let keystroke = gpui_kit::Keystroke::parse("space").unwrap();
+    visual.simulate_event(gpui_kit::KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    visual.simulate_event(gpui_kit::KeyUpEvent { keystroke });
+    draw(visual);
+    assert_eq!(previews.get(), 2, "keyboard emits exactly one preview");
+    assert_eq!(
+        visual.update(|_, cx| panel
+            .read(cx)
+            .settings_snapshot()
+            .unwrap()
+            .terminal
+            .selection_copy),
+        original
+    );
+    pump_runtime(&runtime, visual);
+    assert_eq!(repository.snapshot().0.terminal.selection_copy, original);
+
+    let row = visual.update(|window, _| {
+        window
+            .debug_selector_bounds("terminal-selection-copy-row")
+            .expect("selection copy row exposes its actual bounds")
+    });
+    let switch = target_geometry(visual, "terminal-selection-copy").0;
+    let position = point(row.left() + px(8.), row.center().y);
+    assert!(row.contains(&position) && !switch.contains(&position));
+    visual.simulate_mouse_move(position, None, Default::default());
+    draw(visual);
+    visual.simulate_mouse_down(position, MouseButton::Left, Default::default());
+    draw(visual);
+    visual.simulate_mouse_up(position, MouseButton::Left, Default::default());
+    draw(visual);
+    assert_eq!(previews.get(), 3, "row click emits exactly one preview");
+    assert_eq!(
+        visual.update(|_, cx| panel
+            .read(cx)
+            .settings_snapshot()
+            .unwrap()
+            .terminal
+            .selection_copy),
+        !original
+    );
+    pump_runtime(&runtime, visual);
+    assert_eq!(repository.snapshot().0.terminal.selection_copy, !original);
+}
+
+/// 光标形态和闪烁必须进入同一草稿，避免连续修改时较早的保存回执覆盖另一项。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn terminal_cursor_choices_and_blink_share_persisted_draft(app: &mut TestAppContext) {
+    use kerminal_application::preferences::TerminalCursorStyle;
+
+    let (runtime, panel, repository, visual) = fixture(app);
+    visual.simulate_resize(size(px(1440.), px(900.)));
+    draw(visual);
+    click(visual, "preferences-nav-terminal");
+    let original_blink = repository.snapshot().0.terminal.cursor_blink;
+    scroll_target_fully_into_content_clip(visual, &panel, "terminal-cursor-blink");
+    click(visual, "terminal-cursor-blink");
+
+    for (selector, style) in [
+        ("terminal-cursor-block", TerminalCursorStyle::Block),
+        ("terminal-cursor-bar", TerminalCursorStyle::Bar),
+        ("terminal-cursor-underline", TerminalCursorStyle::Underline),
+    ] {
+        visual.update(|_, cx| panel.read(cx).content_scroll.scroll_to_top_of_item(0));
+        draw(visual);
+        scroll_target_fully_into_content_clip(visual, &panel, selector);
+        click(visual, selector);
+        let draft = visual.update(|_, cx| panel.read(cx).settings_snapshot().unwrap().terminal);
+        assert_eq!(draft.cursor_style, style);
+        assert_eq!(draft.cursor_blink, !original_blink);
+        pump_runtime(&runtime, visual);
+        let saved = repository.snapshot().0.terminal;
+        assert_eq!(saved.cursor_style, style);
+        assert_eq!(saved.cursor_blink, !original_blink);
+    }
+}
+
+/// 只读恢复期间拒绝终端控件操作并保留已有草稿；恢复写入后明确编辑才重新提交。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn terminal_switch_preserves_draft_during_read_only_recovery(app: &mut TestAppContext) {
+    let (runtime, panel, repository, visual) = fixture(app);
+    visual.simulate_resize(size(px(1440.), px(900.)));
+    draw(visual);
+    click(visual, "preferences-nav-terminal");
+    scroll_target_fully_into_content_clip(visual, &panel, "terminal-selection-copy");
+    let original = repository.snapshot().0.terminal.selection_copy;
+    click(visual, "terminal-selection-copy");
+
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.recovery.mode = ConfigurationMode::ReadOnlyRecovery;
+            cx.notify();
+        });
+    });
+    visual.update(|_, cx| panel.read(cx).content_scroll.scroll_to_top_of_item(0));
+    draw(visual);
+    scroll_target_fully_into_content_clip(visual, &panel, "terminal-selection-copy");
+    click(visual, "terminal-selection-copy");
+    assert_eq!(
+        visual.update(|_, cx| panel
+            .read(cx)
+            .settings_snapshot()
+            .unwrap()
+            .terminal
+            .selection_copy),
+        !original
+    );
+    pump_runtime(&runtime, visual);
+    assert_eq!(repository.snapshot().0.terminal.selection_copy, original);
+
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.recovery.mode = ConfigurationMode::ReadWrite;
+            cx.notify();
+        });
+    });
+    visual.update(|_, cx| panel.read(cx).content_scroll.scroll_to_top_of_item(0));
+    draw(visual);
+    scroll_target_fully_into_content_clip(visual, &panel, "terminal-selection-copy");
+    click(visual, "terminal-selection-copy");
+    click(visual, "terminal-selection-copy");
+    pump_runtime(&runtime, visual);
+    assert_eq!(repository.snapshot().0.terminal.selection_copy, !original);
+}
+
+/// 数值控件同时有加减按钮和输入框，按父 ID 查找真实输入叶子以免点击到步进按钮。
+///
+/// @author kongweiguang
+fn click_terminal_number_input(
+    visual: &mut VisualTestContext,
+    panel: &Entity<PreferencesPanel>,
+    selector: &str,
+) -> Bounds<Pixels> {
+    visual.update(|_, cx| panel.read(cx).content_scroll.scroll_to_top_of_item(0));
+    draw(visual);
+    scroll_target_fully_into_content_clip(visual, panel, selector);
+    let selector_id = ElementId::from(selector.to_owned());
+    let bounds = visual.update(|window, _| {
+        let inputs = gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .filter(|snapshot| {
+                snapshot.path().contains(&selector_id)
+                    && matches!(
+                        snapshot.path().last(),
+                        Some(ElementId::Name(name) | ElementId::NamedInteger(name, _))
+                            if name.as_ref() == "input"
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 1, "{selector} must own one text input");
+        assert!(inputs[0].visible());
+        inputs[0].bounds()
+    });
+    let position = bounds.center();
+    visual.simulate_mouse_move(position, None, Default::default());
+    draw(visual);
+    visual.simulate_mouse_down(position, MouseButton::Left, Default::default());
+    draw(visual);
+    visual.simulate_mouse_up(position, MouseButton::Left, Default::default());
+    draw(visual);
+    bounds
+}
+
+/// 格式错误和超出范围都必须在字段旁可见并阻止提交；修正后保留的其他设置一起保存。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn terminal_invalid_numbers_remain_visible_and_recover(app: &mut TestAppContext) {
+    let (runtime, panel, repository, visual) = fixture(app);
+    visual.simulate_resize(size(px(1440.), px(900.)));
+    draw(visual);
+    click(visual, "preferences-nav-terminal");
+    let (original, initial_saves) = repository.snapshot();
+    scroll_target_fully_into_content_clip(visual, &panel, "terminal-selection-copy");
+    click(visual, "terminal-selection-copy");
+
+    let font_bounds = click_terminal_number_input(visual, &panel, "terminal-font-size");
+    visual.simulate_keystrokes("secondary-a backspace");
+    visual.simulate_input("abc");
+    draw(visual);
+    assert!(visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .settings_input_errors
+            .contains_key("font_size")
+    }));
+    let error_bounds = visual.update(|window, _| {
+        window
+            .debug_selector_bounds("terminal-font_size-error")
+            .expect("font-size error is rendered beside its input")
+    });
+    assert!(error_bounds.top() >= font_bounds.bottom());
+    assert!(visual.update(|window, _| {
+        window
+            .debug_selector_bounds("terminal-save-status")
+            .is_some()
+    }));
+    pump_runtime(&runtime, visual);
+    let (saved, saves) = repository.snapshot();
+    assert_eq!(saves, initial_saves);
+    assert_eq!(
+        saved.terminal.selection_copy,
+        original.terminal.selection_copy
+    );
+    assert_eq!(saved.terminal.font_size, original.terminal.font_size);
+    assert_eq!(
+        visual.update(|_, cx| panel
+            .read(cx)
+            .settings_snapshot()
+            .unwrap()
+            .terminal
+            .selection_copy),
+        !original.terminal.selection_copy
+    );
+
+    visual.simulate_input("18");
+    draw(visual);
+    assert!(!visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .settings_input_errors
+            .contains_key("font_size")
+    }));
+    assert!(visual.update(|window, _| {
+        window
+            .debug_selector_bounds("terminal-font_size-error")
+            .is_none()
+    }));
+    pump_runtime(&runtime, visual);
+    let (saved, saves) = repository.snapshot();
+    assert_eq!(saves, initial_saves + 1);
+    assert_eq!(saved.terminal.font_size, 18);
+    assert_eq!(
+        saved.terminal.selection_copy,
+        !original.terminal.selection_copy
+    );
+
+    let line_bounds = click_terminal_number_input(visual, &panel, "terminal-line-height");
+    visual.simulate_keystrokes("secondary-a backspace");
+    visual.simulate_input("2.0");
+    draw(visual);
+    assert!(visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .settings_issues
+            .iter()
+            .any(|issue| issue.kind == super::SettingsIssueKind::InvalidLineHeight)
+    }));
+    let error_bounds = visual.update(|window, _| {
+        window
+            .debug_selector_bounds("terminal-line_height-error")
+            .expect("line-height error is rendered beside its input")
+    });
+    assert!(error_bounds.top() >= line_bounds.bottom());
+    pump_runtime(&runtime, visual);
+    let (still_saved, still_saves) = repository.snapshot();
+    assert_eq!(still_saves, saves);
+    assert_eq!(still_saved.terminal.line_height, saved.terminal.line_height);
+
+    visual.simulate_keystrokes("secondary-a backspace");
+    visual.simulate_input("1.5");
+    draw(visual);
+    assert!(visual.update(|window, _| {
+        window
+            .debug_selector_bounds("terminal-line_height-error")
+            .is_none()
+    }));
+    pump_runtime(&runtime, visual);
+    let (saved, final_saves) = repository.snapshot();
+    assert_eq!(final_saves, saves + 1);
+    assert_eq!(saved.terminal.line_height, 1.5);
+}
+
+/// 模拟真实仓储失败后从固定状态栏重试，必须保留原草稿并只再提交一次。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn terminal_failed_save_retains_draft_and_retry_persists(app: &mut TestAppContext) {
+    let (runtime, panel, repository, visual) = fixture(app);
+    visual.simulate_resize(size(px(1440.), px(900.)));
+    draw(visual);
+    click(visual, "preferences-nav-terminal");
+    scroll_target_fully_into_content_clip(visual, &panel, "terminal-selection-copy");
+    let (original, initial_saves) = repository.snapshot();
+    let initial_attempts = repository.save_attempt_count();
+    repository.fail_next_settings_save();
+    click(visual, "terminal-selection-copy");
+    pump_runtime(&runtime, visual);
+
+    assert_eq!(repository.save_attempt_count(), initial_attempts + 1);
+    assert_eq!(repository.snapshot().1, initial_saves);
+    assert_eq!(
+        repository.snapshot().0.terminal.selection_copy,
+        original.terminal.selection_copy
+    );
+    assert!(visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let draft = panel.settings.as_ref().expect("settings loaded");
+        draft.status() == super::DraftStatus::Failed
+            && draft.is_dirty()
+            && draft.value().terminal.selection_copy != original.terminal.selection_copy
+    }));
+    assert_rendered(visual, "terminal-retry-save");
+
+    click(visual, "terminal-retry-save");
+    pump_runtime(&runtime, visual);
+    assert_eq!(repository.save_attempt_count(), initial_attempts + 2);
+    let (saved, final_saves) = repository.snapshot();
+    assert_eq!(final_saves, initial_saves + 1);
+    assert_eq!(
+        saved.terminal.selection_copy,
+        !original.terminal.selection_copy
+    );
+    assert!(visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let draft = panel.settings.as_ref().expect("settings loaded");
+        draft.status() == super::DraftStatus::Ready && !draft.is_dirty()
+    }));
+    assert_not_rendered(visual, "terminal-retry-save");
 }
 
 /// 生产视图密度项必须对应 main 的纵向全宽选项，避免退化为水平分段按钮。
@@ -1517,76 +1944,185 @@ fn escape_dismisses_keyword_color_picker_without_cancelling_rule_editor(app: &mu
     );
 }
 
-/// 快捷键平台切换只改变当前列表投影，Windows/macOS 控件均保持可操作。
+/// 三个平台标签共用录制操作；每个标签只写入自己的字段，恢复默认也不覆盖其他平台。
 /// @author kongweiguang
 #[gpui_kit::test]
-fn shortcut_platform_can_switch_between_windows_and_macos(app: &mut TestAppContext) {
+fn shortcut_platform_tabs_record_and_reset_their_own_binding(app: &mut TestAppContext) {
     let (runtime, _panel, repository, visual) = fixture(app);
     click(visual, "preferences-nav-shortcuts");
-    assert_rendered(visual, "settings-shortcut-platform-windows");
+    for platform in ["windows", "linux", "macos"] {
+        assert_rendered(visual, &format!("settings-shortcut-platform-{platform}"));
+    }
 
-    click(visual, "settings-shortcut-platform-macos");
-    scroll_until_visible(
-        visual,
-        "shortcut-input-settings.open-macos",
-        "settings-shortcut-platform-macos",
-        -8.,
-    );
-    click(visual, "shortcut-input-settings.open-macos");
-    visual.simulate_keystrokes("secondary-a backspace");
-    visual.simulate_input("Cmd+Shift+F12");
-    draw(visual);
-    pump_runtime(&runtime, visual);
-    let (persisted, saves) = repository.snapshot();
-    let settings_open = persisted
-        .keybindings
-        .iter()
-        .find(|binding| binding.action == "settings.open")
-        .expect("settings.open binding exists");
-    assert_eq!(settings_open.mac_binding, "Cmd+Shift+F12");
-    assert_eq!(settings_open.windows_binding, "Ctrl+Alt+S");
-    assert!(saves >= 1);
+    let settings_open = |persisted: &SettingsSnapshot| {
+        persisted
+            .keybindings
+            .iter()
+            .find(|binding| binding.action == "settings.open")
+            .cloned()
+            .expect("settings.open binding exists")
+    };
+    let defaults = SettingsSnapshot::default();
+    let default_settings_open = settings_open(&defaults);
 
-    click(visual, "shortcut-reset-settings.open");
-    pump_runtime(&runtime, visual);
-    let default_settings_open = SettingsSnapshot::default()
-        .keybindings
-        .into_iter()
-        .find(|binding| binding.action == "settings.open")
-        .expect("settings.open default exists");
-    let reset_settings_open = repository
-        .snapshot()
-        .0
-        .keybindings
-        .into_iter()
-        .find(|binding| binding.action == "settings.open")
-        .expect("settings.open binding exists after reset");
-    assert_eq!(
-        reset_settings_open.mac_binding,
-        default_settings_open.mac_binding
-    );
-    assert_eq!(
-        reset_settings_open.windows_binding,
-        default_settings_open.windows_binding
-    );
+    for platform in ["linux", "macos"] {
+        let platform_selector = format!("settings-shortcut-platform-{platform}");
+        let record = format!("shortcut-record-settings.open-{platform}");
+        let confirm = format!("shortcut-confirm-settings.open-{platform}");
+        scroll_until_visible(visual, &platform_selector, "settings-shortcut-header", -8.);
+        click(visual, &platform_selector);
+        let before = settings_open(&repository.snapshot().0);
+        scroll_until_visible(visual, &record, &platform_selector, -8.);
+        assert_rendered(visual, &record);
+        click(visual, &record);
+        visual.simulate_keystrokes("ctrl-shift-f12");
+        draw(visual);
+        click(visual, &confirm);
+        pump_runtime(&runtime, visual);
+
+        let recorded = settings_open(&repository.snapshot().0);
+        match platform {
+            "linux" => {
+                assert_eq!(recorded.linux_binding.as_deref(), Some("ctrl-shift-f12"));
+                assert_eq!(recorded.windows_binding, before.windows_binding);
+                assert_eq!(recorded.mac_binding, before.mac_binding);
+            }
+            _ => {
+                assert_eq!(recorded.mac_binding, "ctrl-shift-f12");
+                assert_eq!(recorded.windows_binding, before.windows_binding);
+                assert_eq!(recorded.linux_binding, before.linux_binding);
+            }
+        }
+    }
+    assert!(repository.snapshot().1 >= 2);
+
+    for platform in ["linux", "macos"] {
+        let platform_selector = format!("settings-shortcut-platform-{platform}");
+        scroll_until_visible(visual, &platform_selector, "settings-shortcut-header", -8.);
+        click(visual, &platform_selector);
+        let before_reset = settings_open(&repository.snapshot().0);
+        click(visual, "shortcut-reset-settings.open");
+        pump_runtime(&runtime, visual);
+        let reset = settings_open(&repository.snapshot().0);
+        match platform {
+            "linux" => {
+                assert_eq!(reset.linux_binding, default_settings_open.linux_binding);
+                assert_eq!(reset.mac_binding, before_reset.mac_binding);
+            }
+            _ => {
+                assert_eq!(reset.mac_binding, default_settings_open.mac_binding);
+                assert_eq!(reset.linux_binding, before_reset.linux_binding);
+            }
+        }
+        assert_eq!(reset.windows_binding, before_reset.windows_binding);
+    }
 
     scroll_until_visible(
         visual,
         "settings-shortcut-platform-windows",
-        "shortcut-input-settings.open-macos",
+        "settings-shortcut-header",
         8.,
     );
     click(visual, "settings-shortcut-platform-windows");
-    scroll_until_visible(
-        visual,
-        "shortcut-input-settings.open-windows",
-        "settings-shortcut-platform-windows",
-        -8.,
-    );
-    assert_rendered(visual, "shortcut-input-settings.open-windows");
+    assert_rendered(visual, "shortcut-record-settings.open-windows");
 }
 
-/// 生产快捷键视图按 main 分组顺序展示 16 项，同时 GPUI 专属动作仍保留在设置快照。
+/// 录制和追加 chord 只在确认后写入；Escape 取消后仍保留上次生效的绑定。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn shortcut_recording_confirms_chords_and_preserves_binding_on_cancel(app: &mut TestAppContext) {
+    let (runtime, panel, repository, visual) = fixture(app);
+    click(visual, "preferences-nav-shortcuts");
+    let (platform, first, second) = if cfg!(target_os = "macos") {
+        ("macos", "cmd-shift-f12", "cmd-shift-f11")
+    } else if cfg!(target_os = "linux") {
+        ("linux", "ctrl-shift-f12", "ctrl-shift-f11")
+    } else {
+        ("windows", "ctrl-shift-f12", "ctrl-shift-f11")
+    };
+    let record = format!("shortcut-record-settings.open-{platform}");
+    let add = format!("shortcut-add-stroke-settings.open-{platform}");
+    let confirm = format!("shortcut-confirm-settings.open-{platform}");
+    scroll_until_visible(visual, &record, "settings-shortcut-header", -8.);
+    click(visual, &record);
+    visual.simulate_keystrokes(first);
+    draw(visual);
+    assert!(visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .shortcut_capture
+            .as_ref()
+            .is_some_and(|capture| !capture.recording)
+    }));
+    assert_eq!(
+        repository.snapshot().1,
+        0,
+        "recording is not a settings edit"
+    );
+    click(visual, &add);
+    visual.simulate_keystrokes(second);
+    draw(visual);
+    click(visual, &confirm);
+    pump_runtime(&runtime, visual);
+    let selected_binding = |settings: &SettingsSnapshot| {
+        let binding = settings
+            .keybindings
+            .iter()
+            .find(|binding| binding.action == "settings.open")
+            .unwrap();
+        match platform {
+            "macos" => binding.mac_binding.clone(),
+            "linux" => binding.linux_binding.clone().unwrap_or_default(),
+            _ => binding.windows_binding.clone(),
+        }
+    };
+    let expected = format!("{first} {second}");
+    assert_eq!(selected_binding(&repository.snapshot().0), expected);
+
+    scroll_until_visible(visual, &record, "settings-shortcut-header", -8.);
+    click(visual, &record);
+    visual.simulate_keystrokes(first);
+    visual.simulate_keystrokes("tab");
+    assert!(visual.update(|_, cx| panel.read(cx).shortcut_capture.is_some()));
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+    assert!(visual.update(|_, cx| panel.read(cx).shortcut_capture.is_none()));
+    assert_eq!(selected_binding(&repository.snapshot().0), expected);
+}
+
+/// 冲突组合只显示错误并保留旧绑定，不会进入设置预览或触发自动保存。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn shortcut_recording_rejects_existing_binding_without_saving(app: &mut TestAppContext) {
+    let (_runtime, panel, repository, visual) = fixture(app);
+    click(visual, "preferences-nav-shortcuts");
+    let (platform, conflict) = if cfg!(target_os = "macos") {
+        ("macos", "cmd-shift-t")
+    } else if cfg!(target_os = "linux") {
+        ("linux", "ctrl-shift-t")
+    } else {
+        ("windows", "ctrl-shift-t")
+    };
+    let record = format!("shortcut-record-settings.open-{platform}");
+    let confirm = format!("shortcut-confirm-settings.open-{platform}");
+    scroll_until_visible(visual, &record, "settings-shortcut-header", -8.);
+    click(visual, &record);
+    visual.simulate_keystrokes(conflict);
+    draw(visual);
+    click(visual, &confirm);
+    assert!(visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .shortcut_capture
+            .as_ref()
+            .is_some_and(|capture| capture.error.is_some())
+    }));
+    assert_eq!(repository.snapshot().1, 0);
+}
+
+/// 已知动作按真实作用域排列，GPUI 专属动作也必须出现在可编辑目录中。
 /// @author kongweiguang
 #[gpui_kit::test]
 fn shortcut_list_matches_main_catalog_and_preserves_gpui_bindings(app: &mut TestAppContext) {
@@ -1626,7 +2162,7 @@ fn shortcut_list_matches_main_catalog_and_preserves_gpui_bindings(app: &mut Test
     );
 
     for action in GPUI_ONLY_SHORTCUT_ACTIONS {
-        assert_not_rendered(visual, &format!("shortcut-row-{action}"));
+        let _ = observed_element(visual, &format!("shortcut-row-{action}"));
     }
     let configured_actions = visual.update(|_, cx| {
         panel
@@ -1645,7 +2181,7 @@ fn shortcut_list_matches_main_catalog_and_preserves_gpui_bindings(app: &mut Test
     }));
 }
 
-/// main 的 16 个动作保持原顺序，GPUI 专属展示过滤不删除运行态绑定或自定义动作。
+/// main 的动作文案保持原顺序，GPUI 专属和自定义动作都允许在页面显示。
 /// @author kongweiguang
 #[test]
 fn main_shortcut_projection_preserves_catalog_and_runtime_actions() {
@@ -1677,7 +2213,7 @@ fn main_shortcut_projection_preserves_catalog_and_runtime_actions() {
         assert_eq!(main_shortcut_order(action), Some(index));
     }
     for action in GPUI_ONLY_SHORTCUT_ACTIONS {
-        assert!(!main_settings_shortcut_visible(action));
+        assert!(main_settings_shortcut_visible(action));
         assert!(
             SettingsSnapshot::default()
                 .keybindings
@@ -1698,13 +2234,47 @@ fn main_shortcut_projection_preserves_catalog_and_runtime_actions() {
     assert_eq!(command_history.description_zh, "打开当前终端的命令历史。");
 }
 
-/// main 已登记动作使用固定作用域，自定义动作继续保留自己的配置作用域。
+/// 展示层统一按键写法，持久化值仍保持 GPUI 规范串。
+/// @author kongweiguang
+#[test]
+fn shortcut_display_uses_consistent_platform_notation() {
+    assert_eq!(
+        display_shortcut("ctrl-shift-f12", KeyboardPlatform::Windows),
+        "Ctrl+Shift+F12"
+    );
+    assert_eq!(
+        display_shortcut("Cmd+Shift+[", KeyboardPlatform::Mac),
+        "Cmd+Shift+["
+    );
+    assert_eq!(
+        display_shortcut("ctrl-alt-down", KeyboardPlatform::Linux),
+        "Ctrl+Alt+Down"
+    );
+    assert_eq!(
+        display_shortcut("Option+F12", KeyboardPlatform::Mac),
+        "Option+F12"
+    );
+    assert_eq!(
+        display_shortcut("ctrl-space", KeyboardPlatform::Windows),
+        "Ctrl+Space"
+    );
+    assert_eq!(
+        display_shortcut("ctrl-shift-f11 ctrl-shift-f12", KeyboardPlatform::Windows),
+        "Ctrl+Shift+F11 Ctrl+Shift+F12"
+    );
+    assert_eq!(
+        display_shortcut("not-a-key", KeyboardPlatform::Windows),
+        "not-a-key"
+    );
+}
+
+/// 已知和自定义动作都按运行态实际使用的配置作用域分组。
 /// @author kongweiguang
 #[test]
 fn shortcut_scope_projection_only_overrides_catalogued_actions() {
     assert!(matches!(
         shortcut_display_scope("terminal.newTab", KeybindingScope::Global),
-        KeybindingScope::Workspace
+        KeybindingScope::Global
     ));
     assert!(matches!(
         shortcut_display_scope("custom.provider.action", KeybindingScope::Terminal),
@@ -1712,13 +2282,13 @@ fn shortcut_scope_projection_only_overrides_catalogued_actions() {
     ));
 }
 
-/// About 仓库文字隐藏传输协议和 clone 后缀，打开动作仍使用原始地址。
+/// About 仓库文字保留 HTTPS 前缀，仅去掉 Git clone 后缀。
 /// @author kongweiguang
 #[test]
 fn repository_label_hides_transport_and_clone_suffix() {
     assert_eq!(
         display_repository_url("https://github.com/kongweiguang/Kerminal.git"),
-        "github.com/kongweiguang/Kerminal"
+        "https://github.com/kongweiguang/Kerminal"
     );
 }
 

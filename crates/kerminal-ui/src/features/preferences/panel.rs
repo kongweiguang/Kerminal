@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, Focusable as _, SharedString, Subscription,
-    Window,
+    AnyWindowHandle, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
+    SharedString, Subscription, Window,
     component::{
         input::{InputEvent, InputState, TextareaState},
         searchable_list::SearchableListItem,
@@ -22,7 +22,7 @@ use kerminal_application::{
         ConfigurationSyncOperationResult, ConfigurationSyncService, ConfigurationSyncStatus,
     },
     connections::credentials::{VaultKeyAvailability, VaultKeyManagementService},
-    connections::management::{HostGroup, HostGroupSnapshot, HostManagementService},
+    connections::management::HostManagementService,
     platform::ExternalProtocolService,
     preferences::{
         AgentLauncherSettings, InterfaceLanguage, PreferencesService, ProfileDraft, ProfileService,
@@ -55,6 +55,9 @@ mod custom_agent;
 mod desktop_about;
 #[path = "panel/forms.rs"]
 mod forms;
+#[path = "panel/mcp.rs"]
+mod mcp;
+pub(in crate::features::preferences) use mcp::McpConfigTarget;
 #[path = "panel/profiles.rs"]
 mod profiles;
 #[path = "panel/protocol.rs"]
@@ -63,6 +66,8 @@ pub(super) mod protocol;
 mod recovery;
 #[path = "panel/settings.rs"]
 mod settings;
+#[path = "panel/shortcut_capture.rs"]
+mod shortcut_capture;
 #[path = "panel/sync.rs"]
 mod sync;
 #[path = "panel/terminal.rs"]
@@ -113,6 +118,10 @@ pub enum PreferencesEvent {
     },
     /// 用户完成 dirty-close 选择后请求 Root 恢复打开设置前的工作区页面。
     CloseRequested,
+    /// 确认层显隐变化时更新 Root 焦点陷阱，避免同时注册父子陷阱。
+    LeaveConfirmationChanged,
+    /// 未保存草稿需要退出确认；Root 确保设置窗口可见并保留当前退出意图。
+    QuitConfirmationRequested,
     /// 用户确认丢弃偏好草稿后，根视图继续检查其它编辑器并串行执行退出。
     QuitConfirmed,
     /// 用户取消偏好草稿的退出确认，RootView 保留当前应用状态。
@@ -158,70 +167,6 @@ pub(super) enum RecoveryDirectoryStatus {
 #[derive(Clone)]
 pub(super) struct InterfaceLanguageOption {
     value: InterfaceLanguage,
-}
-
-/// 本地 Profile 的分组选择值携带稳定 group ID，显示文字只用于搜索和辅助技术。
-#[derive(Clone)]
-pub(super) struct ProfileGroupOption {
-    id: Option<String>,
-    name: ProfileGroupName,
-}
-
-#[derive(Clone)]
-pub(super) enum ProfileGroupName {
-    Ungrouped,
-    Missing(String),
-    Named(SharedString),
-}
-
-impl SearchableListItem for ProfileGroupOption {
-    type Value = Option<String>;
-
-    /// 搜索结果展示可读分组名；通用选项在读取时本地化，避免切换语言重建 Select。
-    ///
-    /// @author kongweiguang
-    fn title(&self) -> SharedString {
-        match &self.name {
-            ProfileGroupName::Ungrouped => crate::locale::text("未分组", "Ungrouped"),
-            ProfileGroupName::Missing(id) => crate::locale::text(
-                format!("已删除分组（{id}）"),
-                format!("Missing group ({id})"),
-            ),
-            ProfileGroupName::Named(name) => name.clone(),
-        }
-    }
-
-    /// Profile TOML 保存的是分组 ID，不把本地化显示名持久化。
-    /// @author kongweiguang
-    fn value(&self) -> &Self::Value {
-        &self.id
-    }
-}
-
-/// “未分组”和失效组名称按当前 locale 生成，真实分组按 HostManagementService 快照列出。
-/// @author kongweiguang
-pub(super) fn profile_group_options(
-    groups: &[HostGroup],
-    selected_group_id: Option<&str>,
-) -> Vec<ProfileGroupOption> {
-    let stale_group =
-        selected_group_id.filter(|selected| !groups.iter().any(|group| group.id == *selected));
-    let mut options = Vec::with_capacity(groups.len() + 1 + usize::from(stale_group.is_some()));
-    options.push(ProfileGroupOption {
-        id: None,
-        name: ProfileGroupName::Ungrouped,
-    });
-    if let Some(id) = stale_group {
-        options.push(ProfileGroupOption {
-            id: Some(id.to_owned()),
-            name: ProfileGroupName::Missing(id.to_owned()),
-        });
-    }
-    options.extend(groups.iter().map(|group| ProfileGroupOption {
-        id: Some(group.id.clone()),
-        name: ProfileGroupName::Named(SharedString::from(group.name.clone())),
-    }));
-    options
 }
 
 impl SearchableListItem for InterfaceLanguageOption {
@@ -369,21 +314,67 @@ pub(super) enum AgentLauncherTextField {
     Command,
 }
 
-/// 单个快捷键的三平台受控输入；Windows 主键与备用键同属一列，避免压缩平台列宽。
-pub(super) struct ShortcutInputs {
-    pub(super) action: String,
-    pub(super) windows: Entity<InputState>,
-    pub(super) windows_alternate: Entity<InputState>,
-    pub(super) linux: Entity<InputState>,
-    pub(super) mac: Entity<InputState>,
-}
-
-/// 平台快捷键字段区分 Windows 主键、备用键、Linux 与 macOS，保留 Option 的缺省/显式空值语义。
+/// 平台快捷键字段区分 Windows、Linux 与 macOS，保留 Option 的缺省/显式空值语义。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ShortcutBindingField {
     Windows,
-    WindowsAlternate,
     Linux,
     Mac,
+}
+
+/// 平台绑定写入意图；只有 Linux 允许清除覆盖并恢复 Windows 字段回退。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::features::preferences) enum ShortcutBindingUpdate {
+    /// 为该平台写入明确的按键组合。
+    Set(String),
+    /// 仅 Linux：删除专用覆盖，重新跟随回退语义。
+    Inherit,
+}
+
+impl ShortcutBindingField {
+    /// 由设置页平台还原持久字段，避免调用方按字符串或位置猜测。
+    ///
+    /// @author kongweiguang
+    pub(super) const fn from_editor_platform(platform: super::KeyboardPlatform) -> Self {
+        match platform {
+            super::KeyboardPlatform::Windows => Self::Windows,
+            super::KeyboardPlatform::Linux => Self::Linux,
+            super::KeyboardPlatform::Mac => Self::Mac,
+        }
+    }
+
+    /// 设置页选项与持久字段共用同一枚举身份，避免渲染和写入各维护一份映射。
+    ///
+    /// @author kongweiguang
+    pub(super) const fn editor_platform(self) -> super::KeyboardPlatform {
+        match self {
+            Self::Windows => super::KeyboardPlatform::Windows,
+            Self::Linux => super::KeyboardPlatform::Linux,
+            Self::Mac => super::KeyboardPlatform::Mac,
+        }
+    }
+
+    /// 录制、恢复默认和冲突校验必须命中同一个平台快照，避免跨平台误判。
+    ///
+    /// @author kongweiguang
+    pub(super) const fn platform(self) -> crate::keybindings::KeybindingPlatform {
+        match self {
+            Self::Windows => crate::keybindings::KeybindingPlatform::Windows,
+            Self::Linux => crate::keybindings::KeybindingPlatform::Linux,
+            Self::Mac => crate::keybindings::KeybindingPlatform::Mac,
+        }
+    }
+
+    /// 错误键使用稳定的配置字段名，不跟随界面语言或平台名称变化。
+    ///
+    /// @author kongweiguang
+    pub(super) const fn key(self) -> &'static str {
+        match self {
+            Self::Windows => "windows",
+            Self::Linux => "linux",
+            Self::Mac => "macos",
+        }
+    }
 }
 
 /// 固定设置字段使用 GPUI Kit 输入状态，便于在异步 reload/save 后同步控件值。
@@ -419,6 +410,36 @@ pub(super) struct AgentLauncherInputs {
     pub(super) command: Entity<InputState>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum LeaveConfirmation {
+    Close,
+    Quit,
+}
+
+/// 每种确认各自拥有焦点身份和恢复目标，避免迟到回调覆盖后来的弹层。
+pub(super) struct LeaveConfirmationFocus {
+    pub(super) container: FocusHandle,
+    pub(super) keep_editing: FocusHandle,
+    pub(super) discard: FocusHandle,
+    return_focus: Option<FocusHandle>,
+    generation: u64,
+}
+
+impl LeaveConfirmationFocus {
+    /// 焦点句柄在面板生命周期内稳定，按钮可在弹层首次绘制后立即接收焦点。
+    ///
+    /// @author kongweiguang
+    fn new(cx: &mut Context<PreferencesPanel>) -> Self {
+        Self {
+            container: cx.focus_handle(),
+            keep_editing: cx.focus_handle().tab_stop(true),
+            discard: cx.focus_handle().tab_stop(true),
+            return_focus: None,
+            generation: 0,
+        }
+    }
+}
+
 /// settings 与 Profile 页面状态只保存 typed 快照和 opaque revision，文件访问由 application 负责。
 pub struct PreferencesPanel {
     screen_color_sampling: color_sampling::ScreenColorSamplingState,
@@ -426,8 +447,12 @@ pub struct PreferencesPanel {
     pub(super) keyword_editor: terminal::KeywordEditorState,
     pub(super) suggestion_selects: terminal::SuggestionSelects,
     pub(super) connectivity: connectivity::ConnectivityState,
+    pub(super) mcp_settings: mcp::McpSettingsState,
     pub(super) desktop_about: desktop_about::DesktopAboutState,
     pub(super) shortcut_platform: super::KeyboardPlatform,
+    pub(super) shortcut_capture: Option<shortcut_capture::ShortcutCapture>,
+    pub(super) shortcut_capture_subscription: Option<Subscription>,
+    pub(super) shortcut_field_errors: BTreeMap<String, String>,
     pub(super) inline_updates: Option<Entity<crate::features::updates::UpdatesPanel>>,
     pub(super) _inline_updates_subscription: Option<Subscription>,
     preferences: PreferencesService,
@@ -456,13 +481,6 @@ pub struct PreferencesPanel {
     pub(super) theme_mode: super::ThemeMode,
     pub(super) settings: Option<ConfigDraft<SettingsSnapshot, Option<ConfigRevision>>>,
     pub(super) profile_rows: Vec<VersionedProfile>,
-    pub(super) profile_groups: Vec<HostGroup>,
-    pub(super) profile_group_select: Entity<SelectState<Vec<ProfileGroupOption>>>,
-    pub(super) _profile_group_subscription: Subscription,
-    pub(super) profile_group_loading: bool,
-    pub(super) profile_groups_load_started: bool,
-    profile_groups_load_generation: u64,
-    pub(super) profile_group_error: Option<String>,
     pub(super) profile_draft: Option<ConfigDraft<ProfileDraft, Option<ConfigRevision>>>,
     pub(super) selected_profile_id: Option<String>,
     pub(super) selected_profile_is_default: bool,
@@ -482,9 +500,12 @@ pub struct PreferencesPanel {
     pub(super) window_opacity_slider: Entity<SliderState>,
     pub(super) _appearance_control_subscriptions: Vec<Subscription>,
     pub(super) content_scroll: gpui_kit::ScrollHandle,
+    settings_window: AnyWindowHandle,
+    pub(super) settings_panel_focus: FocusHandle,
     pub(super) settings_content_focus: gpui_kit::FocusHandle,
     pub(super) settings_close_focus: gpui_kit::FocusHandle,
-    pub(super) terminal_renderer_open: bool,
+    pub(super) close_confirmation_focus: LeaveConfirmationFocus,
+    pub(super) quit_confirmation_focus: LeaveConfirmationFocus,
     pub(super) sftp_advanced_open: bool,
     pub(super) vault_availability: Option<VaultKeyAvailability>,
     pub(super) vault_loading: bool,
@@ -500,7 +521,6 @@ pub struct PreferencesPanel {
     pub(super) settings_inputs: SettingsInputs,
     pub(super) profile_inputs: ProfileInputs,
     pub(super) agent_launcher_inputs: AgentLauncherInputs,
-    pub(super) shortcut_inputs: Vec<ShortcutInputs>,
     pub(super) settings_input_errors: BTreeMap<&'static str, String>,
     pub(super) profile_input_errors: BTreeMap<&'static str, String>,
     pub(super) settings_issues: Vec<SettingsIssue>,
@@ -528,13 +548,11 @@ pub struct PreferencesPanel {
     pub(super) profile_reload_confirmation: bool,
     pub(super) profile_delete_confirmation: bool,
     pub(super) pending_profile_selection: Option<Option<String>>,
-    pub(super) pending_profile_group_id: Option<Option<String>>,
     pub(super) profile_list_error: Option<String>,
     pub(super) settings_error: Option<String>,
     // 订阅对象只用于保持 GPUI 输入监听存活；订阅本身不需要被主动读取。
     pub(super) _settings_subscriptions: Vec<Subscription>,
     pub(super) _profile_subscriptions: Vec<Subscription>,
-    pub(super) shortcut_subscriptions: Vec<Subscription>,
     pub(super) _agent_launcher_subscriptions: Vec<Subscription>,
     pub(super) custom_agent_name: String,
     pub(super) custom_agent_command: String,
@@ -558,7 +576,7 @@ pub(crate) struct PreferencesPanelServices {
 }
 
 impl PreferencesPanel {
-    /// 使用 composition root 注入的服务；输入实体保持原生焦点和 IME，快捷键平台在 macOS 默认选 Mac、其它桌面选 Windows。
+    /// 使用 composition root 注入的服务；输入和确认焦点由面板保留，避免重绘丢失身份。
     ///
     /// @author kongweiguang
     pub(crate) fn new(
@@ -580,21 +598,12 @@ impl PreferencesPanel {
         } = services;
         let keyword_editor = terminal::KeywordEditorState::new(window, cx);
         let suggestion_selects = terminal::SuggestionSelects::new(window, cx);
+        let mcp_settings = mcp::McpSettingsState::new(window, cx);
         let connectivity =
             connectivity::ConnectivityState::new(mcp_runtime, executor.clone(), window, cx);
         let (settings_inputs, settings_subscriptions) = Self::create_settings_inputs(window, cx);
         Self::configure_settings_number_inputs(&settings_inputs, window, cx);
         let (profile_inputs, profile_subscriptions) = Self::create_profile_inputs(window, cx);
-        let profile_group_select =
-            cx.new(|cx| SelectState::new(profile_group_options(&[], None), None, window, cx));
-        let profile_group_subscription = cx.subscribe(
-            &profile_group_select,
-            |panel, _, event: &SelectEvent<Vec<ProfileGroupOption>>, cx| {
-                if let SelectEvent::Confirm(Some(group_id)) = event {
-                    panel.update_profile_group(group_id.clone(), cx);
-                }
-            },
-        );
         let (agent_launcher_inputs, agent_launcher_subscriptions) =
             Self::create_agent_launcher_inputs(window, cx);
         let interface_language_select =
@@ -663,11 +672,11 @@ impl PreferencesPanel {
             suggestion_selects,
             connectivity,
             desktop_about: desktop_about::DesktopAboutState::default(),
-            shortcut_platform: if cfg!(target_os = "macos") {
-                super::KeyboardPlatform::Mac
-            } else {
-                super::KeyboardPlatform::Windows
-            },
+            shortcut_platform: keyboard_platform(),
+            mcp_settings,
+            shortcut_capture: None,
+            shortcut_capture_subscription: None,
+            shortcut_field_errors: BTreeMap::new(),
             inline_updates: None,
             _inline_updates_subscription: None,
             recovery: preferences.recovery_state(),
@@ -695,13 +704,6 @@ impl PreferencesPanel {
             settings: None,
             theme_mode: super::ThemeMode::System,
             profile_rows: Vec::new(),
-            profile_groups: Vec::new(),
-            profile_group_select,
-            _profile_group_subscription: profile_group_subscription,
-            profile_group_loading: false,
-            profile_groups_load_started: false,
-            profile_groups_load_generation: 0,
-            profile_group_error: None,
             profile_draft: None,
             selected_profile_id: None,
             selected_profile_is_default: false,
@@ -721,9 +723,12 @@ impl PreferencesPanel {
             window_opacity_slider,
             _appearance_control_subscriptions: appearance_control_subscriptions,
             content_scroll: gpui_kit::ScrollHandle::new(),
+            settings_window: window.window_handle(),
+            settings_panel_focus: cx.focus_handle(),
             settings_content_focus: cx.focus_handle(),
             settings_close_focus: cx.focus_handle(),
-            terminal_renderer_open: false,
+            close_confirmation_focus: LeaveConfirmationFocus::new(cx),
+            quit_confirmation_focus: LeaveConfirmationFocus::new(cx),
             sftp_advanced_open: false,
             vault_availability: None,
             vault_loading: false,
@@ -739,7 +744,6 @@ impl PreferencesPanel {
             settings_inputs,
             profile_inputs,
             agent_launcher_inputs,
-            shortcut_inputs: Vec::new(),
             settings_input_errors: BTreeMap::new(),
             profile_input_errors: BTreeMap::new(),
             settings_issues: Vec::new(),
@@ -764,12 +768,10 @@ impl PreferencesPanel {
             profile_reload_confirmation: false,
             profile_delete_confirmation: false,
             pending_profile_selection: None,
-            pending_profile_group_id: None,
             profile_list_error: None,
             settings_error: None,
             _settings_subscriptions: settings_subscriptions,
             _profile_subscriptions: profile_subscriptions,
-            shortcut_subscriptions: Vec::new(),
             _agent_launcher_subscriptions: agent_launcher_subscriptions,
             custom_agent_name: String::new(),
             custom_agent_command: String::new(),
@@ -780,24 +782,23 @@ impl PreferencesPanel {
         panel
     }
 
-    /// 连接同一主机分组用例；Profile 只保存 group ID，不在偏好面板复制配置仓储。
+    /// 保留组合根注入接口供本地主机入口使用；Profile 模板自身不再拥有分组。
     /// @author kongweiguang
     pub fn with_host_management_service(mut self, service: HostManagementService) -> Self {
         self.host_management = Some(service);
         self
     }
 
-    /// 从 Profile 侧栏入口打开指定本地草稿，组 ID 原样进入现有 CAS 保存流程。
+    /// 旧入口兼容打开未分组模板，组身份只属于主机，不能写回 Profile 草稿。
     /// @author kongweiguang
     pub fn begin_local_profile_editor(
         &mut self,
-        group_id: Option<String>,
+        _group_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.section = PreferencesSection::Profiles;
-        self.ensure_profile_groups_loaded(cx);
-        self.request_profile_selection_in_group(None, Some(group_id), window, cx);
+        self.select_section(PreferencesSection::Profiles, cx);
+        self.request_profile_selection(None, window, cx);
         self.selected_navigation_target = None;
         cx.notify();
     }
@@ -850,17 +851,149 @@ impl PreferencesPanel {
         self.select_section(PreferencesSection::Shortcuts, cx);
     }
 
-    /// main 无 autofocus 字段时聚焦首个关闭按钮，保持初始 Tab 顺序且隔离后层终端输入。
+    /// 离开确认优先于普通面板获得焦点，迟到的入口不能覆盖确认内已有的用户选择。
     ///
     /// @author kongweiguang
     pub(crate) fn focus_initial_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.settings_close_focus, cx);
+        let confirmation = if self.quit_confirmation {
+            Some(&self.quit_confirmation_focus)
+        } else if self.close_confirmation {
+            Some(&self.close_confirmation_focus)
+        } else {
+            None
+        };
+        if let Some(focus) = confirmation {
+            if !focus.container.contains_focused(window, cx) {
+                window.focus(&focus.keep_editing, cx);
+            }
+        } else {
+            window.focus(&self.settings_close_focus, cx);
+        }
     }
 
-    /// 显式搜索动作聚焦搜索框；普通打开沿用 main 的关闭按钮初始焦点。
+    /// Root 据此只保留最内层陷阱，避免 Kit 无序选择嵌套焦点范围。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn has_leave_confirmation(&self) -> bool {
+        self.close_confirmation || self.quit_confirmation
+    }
+
+    /// 创建确认后捕获可恢复的面板内焦点，并仅在同一代确认仍位于顶层时转移焦点。
+    ///
+    /// @author kongweiguang
+    pub(super) fn schedule_leave_confirmation_focus(
+        &mut self,
+        confirmation: LeaveConfirmation,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = match confirmation {
+            LeaveConfirmation::Close => &mut self.close_confirmation_focus,
+            LeaveConfirmation::Quit => &mut self.quit_confirmation_focus,
+        };
+        focus.generation = focus.generation.wrapping_add(1);
+        let generation = focus.generation;
+        cx.emit(PreferencesEvent::LeaveConfirmationChanged);
+        let owner = cx.weak_entity();
+        let window_handle = self.settings_window;
+        cx.defer(move |app| {
+            let _ = window_handle.update(app, |_, window, app| {
+                let _ = owner.update(app, |panel, cx| {
+                    if !panel.is_current_leave_confirmation(confirmation, generation) {
+                        return;
+                    }
+                    let return_focus = window
+                        .focused(cx)
+                        .filter(|focus| panel.settings_panel_focus.contains(focus, window));
+                    let focus = match confirmation {
+                        LeaveConfirmation::Close => &mut panel.close_confirmation_focus,
+                        LeaveConfirmation::Quit => &mut panel.quit_confirmation_focus,
+                    };
+                    if !focus.container.contains_focused(window, cx) {
+                        focus.return_focus = return_focus;
+                    }
+                    cx.on_next_frame(window, move |panel, window, cx| {
+                        if panel.is_current_leave_confirmation(confirmation, generation) {
+                            panel.focus_initial_control(window, cx);
+                        }
+                    });
+                });
+            });
+        });
+    }
+
+    /// 仅处理同一代且仍在最上层的确认，旧帧回调不得抢走新弹层焦点。
+    ///
+    /// @author kongweiguang
+    fn is_current_leave_confirmation(
+        &self,
+        confirmation: LeaveConfirmation,
+        generation: u64,
+    ) -> bool {
+        match confirmation {
+            LeaveConfirmation::Close => {
+                self.close_confirmation
+                    && !self.quit_confirmation
+                    && self.close_confirmation_focus.generation == generation
+            }
+            LeaveConfirmation::Quit => {
+                self.quit_confirmation && self.quit_confirmation_focus.generation == generation
+            }
+        }
+    }
+
+    /// 只有原确认仍持有焦点时才恢复，避免被其它 Root 模态阻挡的取消抢焦点。
+    ///
+    /// @author kongweiguang
+    pub(super) fn restore_leave_confirmation_focus(
+        &mut self,
+        confirmation: LeaveConfirmation,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = match confirmation {
+            LeaveConfirmation::Close => &mut self.close_confirmation_focus,
+            LeaveConfirmation::Quit => &mut self.quit_confirmation_focus,
+        };
+        focus.generation = focus.generation.wrapping_add(1);
+        let container = focus.container.clone();
+        let return_focus = focus.return_focus.take();
+        cx.emit(PreferencesEvent::LeaveConfirmationChanged);
+        let window_handle = self.settings_window;
+        let owner = cx.weak_entity();
+        cx.defer(move |app| {
+            let _ = window_handle.update(app, |_, window, app| {
+                let _ = owner.update(app, |panel, cx| {
+                    if !container.contains_focused(window, cx) {
+                        return;
+                    }
+                    if panel.has_leave_confirmation() {
+                        panel.focus_initial_control(window, cx);
+                    } else if let Some(focus) = return_focus
+                        .filter(|focus| panel.settings_panel_focus.contains(focus, window))
+                    {
+                        window.focus(&focus, cx);
+                    } else {
+                        window.focus(&panel.settings_close_focus, cx);
+                    }
+                });
+            });
+        });
+    }
+
+    /// 搜索快捷键不能穿透离开确认；仅无确认时将焦点交给搜索框。
     ///
     /// @author kongweiguang
     pub fn focus_navigation_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_leave_confirmation() {
+            let container = if self.quit_confirmation {
+                &self.quit_confirmation_focus.container
+            } else {
+                &self.close_confirmation_focus.container
+            };
+            if !container.contains_focused(window, cx) {
+                self.focus_initial_control(window, cx);
+            }
+            return;
+        }
         let focus = self.navigation_search.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
     }
@@ -869,6 +1002,7 @@ impl PreferencesPanel {
     ///
     /// @author kongweiguang
     pub(crate) fn begin_modal_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_shortcut_capture(cx);
         self.section = PreferencesSection::Appearance;
         self.navigation_search_query.clear();
         self.selected_navigation_target = None;
@@ -887,7 +1021,6 @@ impl PreferencesPanel {
     /// @author kongweiguang
     pub(super) fn reset_page_disclosures(&mut self) {
         self.screen_color_sampling.cancel();
-        self.terminal_renderer_open = false;
         self.sftp_advanced_open = false;
         self.desktop_about.advanced_expanded = false;
         self.connectivity.external_compatibility_expanded = false;
@@ -909,7 +1042,7 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 子控件先消费浮层 Escape；到达面板后撤销确认或关闭设置，与 main 遮罩语义一致。
+    /// 子控件先消费浮层 Escape；到达面板后撤销确认并恢复焦点，避免越过草稿保护。
     ///
     /// @author kongweiguang
     pub fn handle_escape(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -949,6 +1082,9 @@ impl PreferencesPanel {
     pub(super) fn select_section(&mut self, section: PreferencesSection, cx: &mut Context<Self>) {
         if self.section == section && self.selected_navigation_target.is_none() {
             return;
+        }
+        if section != PreferencesSection::Shortcuts {
+            self.cancel_shortcut_capture(cx);
         }
         self.section = section;
         self.selected_navigation_target = None;
@@ -1034,7 +1170,8 @@ impl PreferencesPanel {
         let reloading = self.settings.is_some();
         self.loading_settings = false;
         match result {
-            Ok(versioned) => {
+            Ok(mut versioned) => {
+                Self::resolve_legacy_terminal_theme(&mut versioned.settings, window, cx);
                 let previous_theme_mode = self.theme_mode;
                 let loaded_theme_mode = versioned.settings.theme_mode;
                 let loaded_settings = versioned.settings.clone();
@@ -1062,19 +1199,21 @@ impl PreferencesPanel {
     /// @author kongweiguang
     fn install_settings(
         &mut self,
-        versioned: VersionedSettings,
+        mut versioned: VersionedSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        Self::resolve_legacy_terminal_theme(&mut versioned.settings, window, cx);
         let snapshot = DraftSnapshot {
             value: versioned.settings,
             revision: versioned.revision,
         };
         self.settings_autosave.reset();
         self.sync_settings_inputs(&snapshot.value, window, cx);
+        self.mcp_settings.sync(&snapshot.value.mcp, window, cx);
         self.theme_mode = snapshot.value.theme_mode;
         self.settings_input_errors.clear();
-        self.rebuild_shortcut_inputs(&snapshot.value, window, cx);
+        self.shortcut_field_errors.clear();
         self.reconcile_keyword_editor(
             &snapshot.value.terminal.keyword_highlights.rules,
             window,
@@ -1083,6 +1222,21 @@ impl PreferencesPanel {
         self.settings = Some(ConfigDraft::new(snapshot));
         // 读取与外部重载也经过同一 GPUI parser 诊断，避免只在用户编辑后才暴露无效配置。
         self.refresh_settings_issues();
+    }
+
+    /// 旧浅深配置只在建立 CAS 草稿前按真实外观归并；读取不会写磁盘，后续保存沿用同一主题身份。
+    ///
+    /// @author kongweiguang
+    fn resolve_legacy_terminal_theme(
+        settings: &mut SettingsSnapshot,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        super::legacy_terminal_theme::resolve_legacy_terminal_theme(
+            settings,
+            window.appearance(),
+            cx,
+        );
     }
 
     /// 列表读回以稳定 ID 核对未知写入；不匹配时保留草稿，不能把任意列表快照当作成功。
@@ -1184,88 +1338,6 @@ impl PreferencesPanel {
             Err(error) => self.profile_list_error = Some(localized_error(&error)),
         }
         self.resume_deferred_profile_revision_check(cx);
-        cx.notify();
-    }
-
-    /// Profile 分组选项来自主机目录的已验证快照；加载失败时保留旧快照并显式提示。
-    /// @author kongweiguang
-    pub(super) fn ensure_profile_groups_loaded(&mut self, cx: &mut Context<Self>) {
-        if !self.profile_groups_load_started {
-            self.profile_groups_load_started = true;
-            self.reload_profile_groups(cx);
-        }
-    }
-
-    /// 重新读取组目录并递增代次，迟到的旧结果不能覆盖 watcher 后发起的新查询。
-    /// @author kongweiguang
-    pub(super) fn reload_profile_groups(&mut self, cx: &mut Context<Self>) {
-        let Some(service) = self.host_management.clone() else {
-            self.profile_group_error = Some(
-                crate::locale::text(
-                    "主机分组服务不可用，Profile 只能保存为未分组。",
-                    "Host groups are unavailable; profiles can only be saved ungrouped.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        };
-        self.profile_groups_load_started = true;
-        self.profile_groups_load_generation =
-            self.profile_groups_load_generation.wrapping_add(1).max(1);
-        let generation = self.profile_groups_load_generation;
-        self.profile_group_loading = true;
-        let executor = self.executor.clone();
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(move |_| async move { service.load_groups().await })
-                .await;
-            let _ = this.update_in(cx, |panel, window, cx| {
-                panel.finish_profile_groups(result, generation, window, cx);
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// 按最新组快照更新 Select，同时把失效引用作为显式选项保留，避免静默换组。
-    /// @author kongweiguang
-    fn finish_profile_groups(
-        &mut self,
-        result: Result<HostGroupSnapshot, AppError>,
-        generation: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if generation != self.profile_groups_load_generation {
-            return;
-        }
-        self.profile_group_loading = false;
-        match result {
-            Ok(snapshot) => {
-                self.profile_groups = snapshot.groups;
-                self.profile_group_error = None;
-            }
-            Err(error) => self.profile_group_error = Some(localized_error(&error)),
-        }
-        let selected_group_id = self
-            .profile_draft
-            .as_ref()
-            .and_then(|draft| draft.value().sidebar_group_id.clone());
-        let options = profile_group_options(&self.profile_groups, selected_group_id.as_deref());
-        self.profile_group_select.update(cx, |select, cx| {
-            select.set_items(options, window, cx);
-            select.set_selected_value(&selected_group_id, window, cx);
-        });
-        if selected_group_id
-            .as_deref()
-            .is_some_and(|selected| !self.profile_groups.iter().any(|group| group.id == selected))
-        {
-            self.profile_group_error = Some(crate::locale::text(
-                "当前 Profile 引用了已删除分组；请选择新分组或未分组后再保存。",
-                "This profile refers to a deleted group. Choose another group or Ungrouped before saving.",
-            ).to_string());
-        }
         cx.notify();
     }
 
@@ -1436,12 +1508,6 @@ impl PreferencesPanel {
         cx: &mut Context<Self>,
     ) {
         self.sync_profile_inputs(&value, window, cx);
-        let selected_group_id = value.sidebar_group_id.clone();
-        let options = profile_group_options(&self.profile_groups, selected_group_id.as_deref());
-        self.profile_group_select.update(cx, |select, cx| {
-            select.set_items(options, window, cx);
-            select.set_selected_value(&selected_group_id, window, cx);
-        });
         self.profile_draft = Some(ConfigDraft::new(DraftSnapshot { value, revision }));
         self.selected_profile_is_default = is_default;
         self.profile_input_errors.clear();

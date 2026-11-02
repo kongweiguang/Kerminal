@@ -25,8 +25,10 @@ use gpui_kit::{FontWeight, point, px};
 use kerminal_application::preferences::{
     TerminalCursorStyle, TerminalFontWeight, TerminalSettings,
 };
-use kerminal_terminal::snapshot::TerminalCursorShape;
-use terminal_metrics::{TerminalMetrics, effective_cursor_shape, font_weight};
+use kerminal_terminal::snapshot::{TerminalCursor, TerminalCursorShape};
+use terminal_metrics::{
+    TerminalMetrics, cursor_visible_in_phase, effective_cursor_shape, font_weight,
+};
 
 /// 用模拟的 GPUI 字体清单构造度量，让外置测试验证字体选择而不依赖机器安装内容。
 ///
@@ -118,6 +120,20 @@ fn font_family_uses_first_installed_css_candidate() {
     assert_eq!(metrics.font_family.as_ref(), "SF Mono");
 }
 
+/// 系统字体列表可能包含逗号，完整族名必须先于旧 CSS 回退链解析。
+///
+/// @author kongweiguang
+#[test]
+fn font_family_prefers_exact_installed_name_with_comma() {
+    let settings = TerminalSettings {
+        font_family: "Family, Mono".to_owned(),
+        ..TerminalSettings::default()
+    };
+    let installed_font_families = ["Family, Mono"].map(str::to_owned);
+    let metrics = TerminalMetrics::from_settings(&settings, &installed_font_families);
+    assert_eq!(metrics.font_family.as_ref(), "Family, Mono");
+}
+
 /// 在配置列表全缺失时，只选 GPUI 实际列出的平台等宽候选。
 ///
 /// @author kongweiguang
@@ -180,4 +196,30 @@ fn configured_cursor_style_yields_to_terminal_style() {
         ),
         TerminalCursorShape::Underline
     );
+}
+
+/// 覆盖用户默认、终端显式常亮/闪烁和关闭偏好，避免计时器接入后仍被默认协议值屏蔽。
+///
+/// @author kongweiguang
+#[test]
+fn cursor_blink_respects_user_default_and_explicit_terminal_state() {
+    let mut cursor = TerminalCursor {
+        row: 0,
+        column: 0,
+        shape: TerminalCursorShape::Block,
+        style_from_terminal: false,
+        blink_from_terminal: false,
+        blinking: false,
+        visible: true,
+    };
+    assert!(!cursor_visible_in_phase(&cursor, true, false));
+    assert!(cursor_visible_in_phase(&cursor, true, true));
+    assert!(cursor_visible_in_phase(&cursor, false, false));
+
+    cursor.blink_from_terminal = true;
+    assert!(cursor_visible_in_phase(&cursor, true, false));
+    cursor.blinking = true;
+    assert!(!cursor_visible_in_phase(&cursor, true, false));
+    assert!(cursor_visible_in_phase(&cursor, true, true));
+    assert!(cursor_visible_in_phase(&cursor, false, false));
 }

@@ -4,13 +4,12 @@
 
 use kerminal_domain::files::FileEntryKind;
 
-/// 列表、惰性树与编辑器工作区概览共享文件端点与传输队列，不复制业务状态。
+/// 列表与惰性树共享文件端点与传输队列，不复制业务状态。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum FilesViewMode {
     #[default]
     List,
     Tree,
-    Workspace,
 }
 
 /// 文件列表过滤只控制可见集合，不改变目录读取结果或 endpoint 选择身份。

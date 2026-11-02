@@ -1,4 +1,4 @@
-//! 设置页内的外部启动与 MCP 状态；页面直接呈现复用的运行时服务。
+//! 设置页内的外部启动与协议注册状态。
 //!
 //! @author kongweiguang
 
@@ -14,33 +14,30 @@ use gpui_kit::{
     prelude::*,
     px,
 };
-use kerminal_application::{mcp_runtime::McpRuntimeState, preferences::ExternalLaunchToolSetting};
+use kerminal_application::preferences::ExternalLaunchToolSetting;
 
 use crate::theme::ThemeTokens;
 
 use super::panel::PreferencesPanel;
 
 const LAUNCH_COMMANDS: [(&str, &str); 9] = [
-    (
-        "PuTTY 参数",
-        "kerminal.exe -ssh ${USER}@${HOST} -P ${PORT} -pw \"<PASSWORD_FROM_PLATFORM>\"",
-    ),
+    ("PuTTY 参数", "kerminal.exe -ssh ${USER}@${HOST} -P ${PORT}"),
     (
         "MobaXterm 参数",
         "kerminal.exe -newtab \"ssh -p ${PORT} ${USER}@${HOST}\"",
     ),
     (
         "Xshell 参数",
-        "kerminal.exe -url \"ssh://${USER}:<PASSWORD_FROM_PLATFORM>@${HOST}:${PORT}\"",
+        "kerminal.exe -url \"ssh://${USER}@${HOST}:${PORT}\"",
     ),
     (
         "SecureCRT 参数",
-        "kerminal.exe /SSH2 /L ${USER} /P ${PORT} /PASSWORD \"<PASSWORD_FROM_PLATFORM>\" ${HOST}",
+        "kerminal.exe /SSH2 /L ${USER} /P ${PORT} ${HOST}",
     ),
     ("OpenSSH 参数", "kerminal.exe -p ${PORT} -l ${USER} ${HOST}"),
     (
         "WinSCP / FileZilla SFTP URL",
-        "kerminal.exe \"sftp://${USER}:<PASSWORD_FROM_PLATFORM>@${HOST}:${PORT}/path/\"",
+        "kerminal.exe \"sftp://${USER}@${HOST}:${PORT}/path/\"",
     ),
     (
         "Kerminal flags",
@@ -48,7 +45,7 @@ const LAUNCH_COMMANDS: [(&str, &str); 9] = [
     ),
     (
         "Kerminal JSON",
-        "kerminal.exe --external-ssh-json {\"host\":\"${HOST}\",\"port\":${PORT},\"username\":\"${USER}\"}",
+        "kerminal.exe --external-ssh-json \"{\\\"host\\\":\\\"${HOST}\\\",\\\"port\\\":${PORT},\\\"username\\\":\\\"${USER}\\\"}\"",
     ),
     (
         "Kerminal URL",
@@ -60,7 +57,7 @@ const LAUNCH_SOURCES: [(ExternalLaunchToolSetting, &str, &str); 7] = [
     (
         ExternalLaunchToolSetting::Putty,
         "PuTTY",
-        "PuTTY / Plink 参数 persona。",
+        "PuTTY / Plink 连接参数。",
     ),
     (
         ExternalLaunchToolSetting::Mobaxterm,
@@ -70,7 +67,7 @@ const LAUNCH_SOURCES: [(ExternalLaunchToolSetting, &str, &str); 7] = [
     (
         ExternalLaunchToolSetting::Xshell,
         "Xshell",
-        "Xshell ssh:// URL 或 b64 参数。",
+        "Xshell ssh:// URL 参数。",
     ),
     (
         ExternalLaunchToolSetting::Securecrt,
@@ -305,8 +302,8 @@ impl PreferencesPanel {
                         .child(Icon::new(IconName::ShieldAlert).size(px(16.)).text_color(theme.warning))
                         .child(div().text_size(theme.text_xs).text_color(theme.warning)
                             .child(crate::locale::text(
-                                "外部传入的密码和私钥口令仅用于当前会话，不写入连接配置。",
-                                "Passwords and key passphrases from external launch requests are used only for the current session and are not saved in connection settings.",
+                                "外部启动参数不接受密码和密钥口令。",
+                                "External launch arguments cannot contain passwords or key passphrases.",
                             ))))
                     .child(
                         div()
@@ -723,256 +720,6 @@ impl PreferencesPanel {
         page.child(self.render_save_notice(theme))
     }
 
-    /// 连接摘要复用真实 listener；停止未完成时保留重试入口，避免误导用户启动第二个服务。
-    /// 复制失败贴近入口反馈；页面只呈现运行态，不混入无关设置保存提示。
-    pub(super) fn render_mcp_settings(
-        &mut self,
-        theme: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let snapshot = self.connectivity.current_mcp_snapshot();
-        let busy = self.connectivity.mcp_operation.is_some();
-        let state = if busy {
-            if self.connectivity.mcp_starting() {
-                McpRuntimeState::Starting
-            } else {
-                McpRuntimeState::Stopping
-            }
-        } else {
-            snapshot.state
-        };
-        let running = state == McpRuntimeState::Running;
-        let stopping = state == McpRuntimeState::Stopping;
-        let status_label = mcp_state_label(state, busy);
-        let json = if busy {
-            None
-        } else {
-            self.connectivity.pretty_client_json(&snapshot)
-        };
-        let json_display = json.clone().unwrap_or_else(|| {
-            crate::locale::text("启动后显示", "Available after startup").to_string()
-        });
-        let endpoint_display = snapshot.endpoint.clone().unwrap_or_else(|| {
-            crate::locale::text("启动后显示", "Available after startup").to_string()
-        });
-        let connection_summary = if running {
-            crate::locale::text("本机 HTTP", "Local HTTP")
-        } else {
-            crate::locale::text("启动后可用", "Available after startup")
-        };
-        let can_toggle = match state {
-            McpRuntimeState::Unavailable | McpRuntimeState::Starting => false,
-            McpRuntimeState::Running | McpRuntimeState::Stopping => {
-                snapshot.endpoint.is_some() || snapshot.endpoint_sync_pending
-            }
-            McpRuntimeState::Stopped | McpRuntimeState::Synchronizing | McpRuntimeState::Failed => {
-                true
-            }
-        };
-        let status_color = mcp_state_color(theme, state);
-        let toggle = Button::new("mcp-settings-toggle")
-            .compact()
-            .outline()
-            .ghost()
-            .icon(
-                Icon::new(if running || stopping {
-                    IconName::PowerOff
-                } else {
-                    IconName::Power
-                })
-                .size(px(16.)),
-            )
-            .label(if busy || state == McpRuntimeState::Starting {
-                if state == McpRuntimeState::Starting {
-                    crate::locale::text("启动中…", "Starting…")
-                } else {
-                    crate::locale::text("停止中…", "Stopping…")
-                }
-            } else if running {
-                crate::locale::text("停止", "Stop")
-            } else if stopping {
-                crate::locale::text("重试停止", "Retry stop")
-            } else if state == McpRuntimeState::Synchronizing {
-                crate::locale::text("重试同步", "Retry sync")
-            } else {
-                crate::locale::text("启动", "Start")
-            })
-            .disabled(busy || !can_toggle)
-            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                panel.connectivity.toggle_mcp(cx);
-            }));
-        let heading = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Icon::new(IconName::Server)
-                            .size(px(16.))
-                            .text_color(theme.accent),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme.text_sm)
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .child("MCP"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .px_3()
-                            .py_1()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(status_color.opacity(0.25))
-                            .bg(status_color.opacity(0.10))
-                            .text_size(theme.text_xs)
-                            .text_color(status_color)
-                            .child(status_label),
-                    )
-                    .child(toggle),
-            );
-        let connection_toggle = div()
-            .w_full()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.panel)
-            .child(
-                Button::new("mcp-connection-info-toggle")
-                    .custom(super::render_settings::settings_ghost_variant(theme, cx))
-                    .w_full()
-                    .h(px(44.))
-                    .px_0()
-                    .py_0()
-                    .toggled(self.connectivity.mcp_connection_expanded)
-                    .accessibility_label(crate::locale::text("连接信息", "Connection information"))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_h(px(44.))
-                            .px_3()
-                            .py_2()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                Icon::new(if self.connectivity.mcp_connection_expanded {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .size(px(16.))
-                                .text_color(theme.muted),
-                            )
-                            .child(
-                                div().min_w(px(0.)).flex_1().text_size(theme.text_sm).child(
-                                    crate::locale::text("连接信息", "Connection information"),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .min_w(px(0.))
-                                    .max_w(px(240.))
-                                    .truncate()
-                                    .text_size(theme.text_xs)
-                                    .text_color(theme.muted)
-                                    .child(connection_summary),
-                            ),
-                    )
-                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                        panel.connectivity.mcp_connection_expanded =
-                            !panel.connectivity.mcp_connection_expanded;
-                        cx.notify();
-                    })),
-            )
-            .when(self.connectivity.mcp_connection_expanded, |section| {
-                section.child(
-                    div()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .p_3()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .child(render_info_row("endpoint", &endpoint_display, theme))
-                        .child(render_json_row(&json_display, theme))
-                        .child(
-                            Button::new("mcp-settings-copy-json")
-                                .compact()
-                                .label(if self.connectivity.mcp_copied {
-                                    crate::locale::text("已复制", "Copied")
-                                } else {
-                                    crate::locale::text("复制 JSON", "Copy JSON")
-                                })
-                                .icon(
-                                    Icon::new(if self.connectivity.mcp_copied {
-                                        IconName::Check
-                                    } else {
-                                        IconName::Copy
-                                    })
-                                    .size(px(14.)),
-                                )
-                                .disabled(json.is_none())
-                                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                    panel.connectivity.copy_mcp_json(cx)
-                                })),
-                        ),
-                )
-            });
-
-        div()
-            .id("preferences-mcp-settings")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&self.content_scroll)
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                settings_card(theme)
-                    .child(heading)
-                    .child(connection_toggle)
-                    .when_some(self.connectivity.mcp_copy_error.clone(), |card, error| {
-                        card.child(
-                            div()
-                                .text_size(theme.text_xs)
-                                .text_color(theme.error)
-                                .child(error),
-                        )
-                    })
-                    .when_some(self.connectivity.mcp_status.clone(), |card, status| {
-                        card.child(
-                            div()
-                                .text_size(theme.text_xs)
-                                .text_color(
-                                    if self.connectivity.mcp_status_is_error
-                                        || snapshot.failure_reason.is_some()
-                                        || snapshot.unavailable_reason.is_some()
-                                    {
-                                        theme.error
-                                    } else {
-                                        theme.muted
-                                    },
-                                )
-                                .child(status),
-                        )
-                    }),
-            )
-    }
-
     /// 搜索定位应展开命中的原生 disclosure，而密钥编辑区始终可见，不维护重复展开状态。
     pub(in crate::features::preferences) fn reveal_connectivity_target(
         &mut self,
@@ -1049,88 +796,4 @@ fn settings_card(theme: ThemeTokens) -> gpui_kit::Div {
         .border_1()
         .border_color(theme.border)
         .bg(theme.panel)
-}
-
-/// 呈现 endpoint 标签和值，长地址换行而不挤出同步面板。
-fn render_info_row(label: &'static str, value: &str, theme: ThemeTokens) -> impl IntoElement {
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(label),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w(px(0.))
-                .font_family("monospace")
-                .text_size(px(11.))
-                .child(value.to_owned()),
-        )
-}
-
-/// JSON 保留缩进和滚动边界，避免端口或 token 在显示区横向撑开页面。
-fn render_json_row(value: &str, theme: ThemeTokens) -> impl IntoElement {
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child("JSON"),
-        )
-        .child(
-            div()
-                .id("mcp-json-preview")
-                .w_full()
-                .max_h(px(176.))
-                .overflow_y_scroll()
-                .overflow_x_scroll()
-                .p_3()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.background)
-                .font_family("monospace")
-                .text_size(px(11.))
-                .child(value.to_owned()),
-        )
-}
-
-/// 将运行态与当前操作共同投影为状态，超时后明确保留待清理含义而不冒充仍在执行。
-fn mcp_state_label(state: McpRuntimeState, operation_pending: bool) -> gpui_kit::SharedString {
-    match state {
-        McpRuntimeState::Unavailable => crate::locale::text("不可用", "Unavailable"),
-        McpRuntimeState::Stopped => crate::locale::text("已停止", "Stopped"),
-        McpRuntimeState::Starting => crate::locale::text("正在启动", "Starting"),
-        McpRuntimeState::Synchronizing => {
-            crate::locale::text("正在同步连接信息", "Synchronizing endpoint")
-        }
-        McpRuntimeState::Running => crate::locale::text("运行中", "Running"),
-        McpRuntimeState::Stopping if operation_pending => {
-            crate::locale::text("正在停止", "Stopping")
-        }
-        McpRuntimeState::Stopping => crate::locale::text("停止未完成", "Cleanup pending"),
-        McpRuntimeState::Failed => crate::locale::text("启动失败", "Failed"),
-    }
-}
-
-/// 状态色只作辅助信息，标签仍完整表达 loading、失败与不可用类别。
-fn mcp_state_color(theme: ThemeTokens, state: McpRuntimeState) -> gpui_kit::Hsla {
-    match state {
-        McpRuntimeState::Running => theme.success,
-        McpRuntimeState::Failed | McpRuntimeState::Unavailable => theme.error,
-        McpRuntimeState::Starting | McpRuntimeState::Synchronizing | McpRuntimeState::Stopping => {
-            theme.warning
-        }
-        McpRuntimeState::Stopped => theme.muted,
-    }
 }

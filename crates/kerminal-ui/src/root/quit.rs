@@ -776,6 +776,48 @@ impl RootView {
         cx.emit(RootViewEvent::QuitReady { intent });
     }
 
+    /// 隐藏面板仍可能持有失败后的草稿，退出确认必须可见且保留原退出身份。
+    /// 其它模态占用呈现或按键入口时取消本次退出；只由排队的取消事件清理原意图，防止旧回执撤销新请求。
+    ///
+    /// @author kongweiguang
+    pub(super) fn show_preferences_quit_confirmation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !quit_preparation_is_running(self.host_lifecycle, self.host_shutdown_requested)
+            || self.pending_quit_intent.is_none()
+        {
+            return;
+        }
+        if self.connections_modal_open
+            || self.connection_prompt_modal_open
+            || self.root_confirmation_owner.is_some()
+            || self.snippet_editor_modal_open
+            || self.quick_open_modal_open
+            || self.custom_agent_manager.is_some()
+            || self
+                .tool_rail_customizer
+                .as_ref()
+                .is_some_and(|dialog| dialog.read(cx).is_open())
+            || self.split_target_picker.read(cx).is_open()
+            || self
+                .workspace_tabs_view
+                .read(cx)
+                .is_create_target_picker_open()
+        {
+            self.preferences_panel
+                .update(cx, |panel, cx| panel.cancel_quit(cx));
+            self.status = Some(crate::locale::text(
+                "请先处理当前弹框，再退出并检查设置草稿。",
+                "Finish the current dialog, then quit again to review unsaved settings.",
+            ));
+            cx.notify();
+            return;
+        }
+        self.open_preferences_modal(window, cx);
+    }
+
     /// 丢稿决定只在宿主派发前继续门禁；迟到的取消回执不能撤销已经发生的资源收尾。
     ///
     /// @author kongweiguang

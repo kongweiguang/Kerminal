@@ -42,6 +42,8 @@ pub enum PopupMenuItem {
         label: SharedString,
         disabled: bool,
         checked: bool,
+        /// Destructive command: the label and icon use the theme danger color.
+        danger: bool,
         is_link: bool,
         action: Option<Box<dyn Action>>,
         // For link item
@@ -75,6 +77,7 @@ impl PopupMenuItem {
             label: label.into(),
             disabled: false,
             checked: false,
+            danger: false,
             action: None,
             is_link: false,
             handler: None,
@@ -191,6 +194,24 @@ impl PopupMenuItem {
         self
     }
 
+    /// Mark the item as a destructive command such as delete, stop, or close.
+    ///
+    /// The label and icon then use the theme danger color; a disabled destructive item falls back
+    /// to the muted foreground so an unavailable command never reads as actionable.
+    ///
+    /// Only works for [`PopupMenuItem::Item`].
+    ///
+    /// @author kongweiguang
+    pub fn danger(mut self) -> Self {
+        match &mut self {
+            PopupMenuItem::Item { danger, .. } => {
+                *danger = true;
+            }
+            _ => {}
+        }
+        self
+    }
+
     /// Add a click handler for the menu item.
     ///
     /// Only works for [`PopupMenuItem::Item`] and [`PopupMenuItem::ElementItem`].
@@ -219,6 +240,7 @@ impl PopupMenuItem {
             label: label.into(),
             disabled: false,
             checked: false,
+            danger: false,
             action: None,
             is_link: true,
             handler: Some(Rc::new(move |_, _, cx| cx.open_url(&href))),
@@ -1407,11 +1429,17 @@ impl PopupMenu {
                 action,
                 disabled,
                 is_link,
+                danger,
                 ..
             } => {
                 let show_link_icon = *is_link && self.external_link_icon;
                 let action = action.as_ref().map(|action| action.boxed_clone());
                 let key = self.render_key_binding(action, window, cx);
+                let danger_text = danger_text_color(*danger, *disabled, cx.theme());
+                let icon = icon.clone().map(|icon| match danger_text {
+                    Some(color) => icon.text_color(color),
+                    None => icon,
+                });
 
                 this.when(!disabled, |this| {
                     this.on_click(
@@ -1419,12 +1447,22 @@ impl PopupMenu {
                     )
                 })
                 .disabled(*disabled)
+                // 危险命令按 main 的规则用低透明危险底色表达悬停和键盘选中，普通条目仍沿用菜单自身的 hover 样式。
+                .when(*danger && !*disabled, |this| {
+                    this.interactive_style(
+                        div()
+                            .bg(cx.theme().danger.opacity(0.12))
+                            .text_color(cx.theme().danger)
+                            .style()
+                            .clone(),
+                    )
+                })
                 .h(item_height)
                 .gap_x_1()
                 .children(Self::render_icon(
                     has_left_icon,
                     is_left_check,
-                    icon.clone(),
+                    icon,
                     window,
                     cx,
                 ))
@@ -1443,6 +1481,7 @@ impl PopupMenu {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
+                                    .when_some(danger_text, |this, color| this.text_color(color))
                                     .child(label.clone()),
                             )
                         })
@@ -1461,6 +1500,9 @@ impl PopupMenu {
                                             .overflow_hidden()
                                             .whitespace_nowrap()
                                             .text_ellipsis()
+                                            .when_some(danger_text, |this, color| {
+                                                this.text_color(color)
+                                            })
                                             .child(label.clone()),
                                     )
                                     .child(
@@ -1553,6 +1595,19 @@ struct RenderOptions {
     has_left_icon: bool,
     check_side: Side,
     radius: Pixels,
+}
+
+/// 危险命令文本色：可用时使用主题危险色，禁用时回退弱化前景色，避免不可执行命令仍显得可点击。
+///
+/// @author kongweiguang
+fn danger_text_color(danger: bool, disabled: bool, theme: &crate::Theme) -> Option<gpui::Hsla> {
+    danger.then(|| {
+        if disabled {
+            theme.muted_foreground
+        } else {
+            theme.danger
+        }
+    })
 }
 
 impl Render for PopupMenu {
@@ -1681,5 +1736,23 @@ mod tests {
         );
         assert_eq!(PopupMenuItem::separator().a11y_label(), None);
         assert_eq!(PopupMenuItem::element(|_, _| div()).a11y_label(), None);
+    }
+
+    /// 危险命令只在可用时使用危险色；禁用后必须回退弱化色，且普通条目不受影响。
+    #[gpui::test]
+    fn danger_items_use_theme_danger_color_only_when_actionable(cx: &mut gpui::TestAppContext) {
+        let (danger, muted) = cx.update(|cx| (cx.theme().danger, cx.theme().muted_foreground));
+
+        assert_eq!(danger_text_color(false, false, cx.theme()), None);
+        assert_eq!(danger_text_color(true, false, cx.theme()), Some(danger));
+        assert_eq!(danger_text_color(true, true, cx.theme()), Some(muted));
+        assert!(matches!(
+            PopupMenuItem::new("Delete").danger(),
+            PopupMenuItem::Item { danger: true, .. }
+        ));
+        assert!(matches!(
+            PopupMenuItem::new("Open"),
+            PopupMenuItem::Item { danger: false, .. }
+        ));
     }
 }

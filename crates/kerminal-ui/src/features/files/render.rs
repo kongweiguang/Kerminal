@@ -1,21 +1,20 @@
-//! 文件浏览器、预览和传输任务的 GPUI 绘制。
+//! 文件浏览器和传输任务的 GPUI 绘制。
 //!
 //! @author kongweiguang
 
 pub(super) mod browser;
 mod host_picker;
-mod permissions;
 mod transfers;
 mod tree;
-mod workspace;
 
 use gpui_kit::{
     AnyElement, ClickEvent, Context, ElementId, InteractiveElement as _, IntoElement, Render,
-    SharedString, StatefulInteractiveElement as _, Window,
+    SharedString, StatefulInteractiveElement as _, Window, canvas,
     component::{
         Disableable as _, Icon, IconName, Sizable as _,
         button::{Button, ButtonVariants as _},
         input::Input,
+        resizable::{h_resizable, resizable_panel, v_resizable},
         tooltip::Tooltip,
     },
     div,
@@ -28,13 +27,17 @@ use crate::{locale, theme::ThemeTokens};
 
 use super::{FilesPane, NameAction, bookmark_endpoint, endpoint_name};
 
+const FILES_WORKBENCH_MIN_COLUMN_WIDTH: f32 = 200.;
+const FILES_WORKBENCH_STACK_THRESHOLD: f32 = FILES_WORKBENCH_MIN_COLUMN_WIDTH * 2. + 20.;
+
 impl Render for FilesPane {
-    /// 宽工作区保留 shell 材质以露出全局壁纸；紧凑右栏只投影 main 的工具面板色阶，避免改动共享 Kit 主题。
+    /// 工作区按自身测量宽度选择双列或极窄双行；紧凑右栏保持独立的主题和目标语义。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_name_input(window, cx);
-        self.ensure_host_search_input(window, cx);
+        self.ensure_host_search_input(super::FilePaneSide::Left, window, cx);
+        self.ensure_host_search_input(super::FilePaneSide::Right, window, cx);
         self.permissions.ensure_input(window, cx);
         let visible_side = if self.compact_layout {
             1
@@ -52,13 +55,13 @@ impl Render for FilesPane {
         } else {
             theme
         };
-        let empty_remote_target = self.host_picker.enabled
-            && self.host_picker.right_target_unselected
-            && !self.compact_layout;
+        let empty_target = [0, 1].map(|side| {
+            self.host_picker.enabled
+                && self.host_picker.target_unselected[side]
+                && !self.compact_layout
+        });
         let browser_area = if self.compact_layout {
-            if self.view_mode == super::view_mode::FilesViewMode::Workspace {
-                workspace::render_workspace_overview(self, theme, cx)
-            } else if !self.compact_target_is_available() {
+            if !self.compact_target_is_available() {
                 render_compact_no_terminal_target(theme)
             } else {
                 div()
@@ -71,20 +74,48 @@ impl Render for FilesPane {
                     .child(browser::render_browser(self, 1, window, theme, cx))
                     .into_any_element()
             }
-        } else if self.view_mode == super::view_mode::FilesViewMode::Workspace {
-            workspace::render_workspace_overview(self, theme, cx)
         } else {
-            let area = div()
-                .id("files-browser-area-wide")
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .gap_1()
-                .px_1()
-                .py_1()
-                .overflow_hidden()
-                .child(browser::render_browser(self, 0, window, theme, cx));
-            let right_side = if empty_remote_target {
+            let pane_id = cx.entity_id().as_u64();
+            let orientation = window.use_keyed_state(
+                format!("files-workbench-orientation-{pane_id}"),
+                cx,
+                |_, _| false,
+            );
+            let stacked = *orientation.read(cx);
+            let measurement = canvas(
+                move |bounds, _, app| {
+                    let next = bounds.size.width < px(FILES_WORKBENCH_STACK_THRESHOLD);
+                    if *orientation.read(app) != next {
+                        app.defer(move |app| {
+                            orientation.update(app, |stacked, cx| {
+                                *stacked = next;
+                                cx.notify();
+                            });
+                        });
+                    }
+                },
+                |_, (), _, _| {},
+            )
+            .absolute()
+            .inset_0();
+            let split_id = format!(
+                "files-workbench-split-{pane_id}-{}",
+                if stacked { "vertical" } else { "horizontal" }
+            );
+            let minimum_extent = if stacked {
+                px(160.)
+            } else {
+                px(FILES_WORKBENCH_MIN_COLUMN_WIDTH)
+            };
+            let left_side = if empty_target[0] {
+                host_picker::render_empty_target(self, 0, theme, window, cx)
+            } else {
+                browser::render_browser(self, 0, window, theme, cx).into_any_element()
+            };
+            let left_pane = resizable_panel()
+                .size_range(minimum_extent..px(4_000.))
+                .child(left_side);
+            let right_side = if empty_target[1] {
                 div()
                     .id("files-right-workbench")
                     .flex_1()
@@ -93,7 +124,7 @@ impl Render for FilesPane {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .child(host_picker::render_empty_target(self, theme, window, cx))
+                    .child(host_picker::render_empty_target(self, 1, theme, window, cx))
                     .into_any_element()
             } else {
                 div()
@@ -107,7 +138,28 @@ impl Render for FilesPane {
                     .child(browser::render_browser(self, 1, window, theme, cx))
                     .into_any_element()
             };
-            area.child(right_side).into_any_element()
+            let right_pane = resizable_panel()
+                .size_range(minimum_extent..px(4_000.))
+                .child(right_side);
+            let split = if stacked {
+                v_resizable(split_id).child(left_pane).child(right_pane)
+            } else {
+                h_resizable(split_id).child(left_pane).child(right_pane)
+            };
+            div()
+                .id("files-browser-area-wide")
+                .debug_selector(|| "files-browser-area-wide".to_owned())
+                .flex_1()
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .flex()
+                .px_1()
+                .py_1()
+                .relative()
+                .overflow_hidden()
+                .child(split)
+                .child(measurement)
+                .into_any_element()
         };
         let mut pane = div()
             .id("files-pane")
@@ -121,34 +173,19 @@ impl Render for FilesPane {
                 theme.materials.shell
             })
             .text_color(theme.foreground);
-        // 右栏在浏览状态下省去重复标题；工作区状态仍保留返回入口。
-        let show_header = self.host_picker.enabled
-            || self.view_mode == super::view_mode::FilesViewMode::Workspace;
+        // 右栏在浏览状态下省去重复标题；传输台仍保留刷新入口。
+        let show_header = self.host_picker.enabled;
         if show_header {
             pane = pane.child(render_header(self, theme, cx));
         }
         pane = pane
             .child(browser_area)
-            .child(render_name_action(self, theme, cx))
-            .child(render_selection_details(self, theme, cx));
+            .child(render_name_action(self, theme, cx));
         if !self.compact_layout {
             pane = pane.child(render_bookmarks(self, theme, cx));
         }
-        let empty_compact_queue = self.compact_layout
-            && self.queue.archive_loaded
-            && self.transfer_rows.is_empty()
-            && self.transfer_recovery_rows.is_empty()
-            && self.queue.archive_records.is_empty()
-            && !self.queue.archive_loading
-            && self.queue.archive_error.is_none()
-            && !self.queue.recovery_list_loading
-            && self.queue.recovery_list_error.is_none()
-            && !self.queue.history_expanded
-            && !self.queue.is_clearing_completed_history();
-        // 仅在已确认没有可浏览的历史或恢复材料时省去右栏空队列；加载与错误仍可见。
-        if !empty_compact_queue {
-            pane = pane.child(transfers::render_transfers(self, theme, cx));
-        }
+        // 传输区只展示当前任务和必要恢复操作，不暴露冷档入口。
+        pane = pane.child(transfers::render_transfers(self, theme, cx));
         if let Some(details) = render_status_details(self, theme) {
             pane = pane.child(details);
         }
@@ -159,7 +196,8 @@ impl Render for FilesPane {
     }
 }
 
-/// 普通浏览标题留给端点和路径栏；仅工作台操作或工作区返回入口需要独立总栏。
+/// 普通浏览标题留给端点和路径栏；仅传输台操作需要独立总栏。
+/// 工作台刷新复用原图标的忙态并阻止连点，避免短暂文案和重复后台请求。
 ///
 /// @author kongweiguang
 fn render_header(
@@ -168,9 +206,8 @@ fn render_header(
     cx: &mut Context<FilesPane>,
 ) -> impl IntoElement {
     let workbench = pane.host_picker.enabled;
-    let workspace = pane.view_mode == super::view_mode::FilesViewMode::Workspace;
     let title = if workbench {
-        locale::text("SFTP 传输", "SFTP Transfer")
+        locale::text("传输台", "Transfers")
     } else {
         locale::text("文件", "Files")
     };
@@ -183,65 +220,40 @@ fn render_header(
         .gap_2()
         .border_b_1()
         .border_color(theme.border)
-        .bg(theme.materials.chrome);
-    if !workspace || workbench {
-        header = header
-            .child(
-                div()
-                    .text_color(theme.accent)
-                    .text_size(theme.text_sm)
-                    .child(if workbench {
-                        Icon::new(gpui_kit::assets::IconName::ArrowLeftRight)
-                    } else {
-                        Icon::new(gpui_kit::assets::IconName::FolderOpen)
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(theme.text_xs)
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .child(title),
-            );
-    }
-    if workspace {
-        header = header.child(
-            Button::new("files-toggle-workspace-overview")
-                .compact()
-                .ghost()
+        .bg(theme.materials.chrome)
+        .child(
+            div()
+                .text_color(theme.accent)
+                .text_size(theme.text_sm)
+                .child(if workbench {
+                    Icon::new(gpui_kit::assets::IconName::ArrowLeftRight)
+                } else {
+                    Icon::new(gpui_kit::assets::IconName::FolderOpen)
+                }),
+        )
+        .child(
+            div()
                 .text_size(theme.text_xs)
-                .label(locale::text("返回文件", "Back to files"))
-                .on_click(
-                    cx.listener(|pane, _: &ClickEvent, _, cx| pane.toggle_workspace_overview(cx)),
-                ),
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .child(title),
         );
-    }
     header = header.child(div().flex_1());
     if workbench {
-        let clearable = transfers::clearable_history_count(&pane.transfer_rows);
-        let clearing = pane.queue.is_clearing_completed_history();
-        header = header
-            .child(
-                icon_button(
-                    "files-workbench-refresh",
-                    IconName::RefreshCw,
-                    locale::text("刷新文件与传输", "Refresh files and transfers"),
-                    false,
-                )
-                .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| pane.refresh_workbench(cx))),
+        let refreshing =
+            pane.panels.iter().any(|panel| panel.loading) || pane.queue.recovery_list_loading;
+        header = header.child(
+            icon_button(
+                "files-workbench-refresh",
+                IconName::RefreshCw,
+                locale::text("刷新文件与传输", "Refresh files and transfers"),
+                refreshing,
             )
-            .child(
-                asset_icon_button(
-                    "files-workbench-clear-completed",
-                    gpui_kit::assets::IconName::Trash,
-                    locale::text("清理已完成传输", "Clear completed transfers"),
-                    clearable == 0 || clearing,
-                )
-                .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
-                    pane.clear_completed_transfer_history(cx)
-                })),
-            );
+            .loading(refreshing)
+            .loading_icon(IconName::RefreshCw)
+            .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| pane.refresh_workbench(cx))),
+        );
     }
-    if !pane.compact_layout && !workbench && !workspace {
+    if !pane.compact_layout && !workbench {
         header = header.child(
             div()
                 .min_w(px(0.))
@@ -348,85 +360,6 @@ fn render_name_action(
     )
 }
 
-/// 属性和预览跟随当前焦点条目展示，批量勾选语义仍由目录工具栏独立处理。
-///
-/// @author kongweiguang
-fn render_selection_details(
-    pane: &mut FilesPane,
-    theme: ThemeTokens,
-    cx: &mut Context<FilesPane>,
-) -> AnyElement {
-    let side = if pane.compact_layout {
-        1
-    } else {
-        pane.active_side
-    };
-    if pane.panels[side].selected.is_none() {
-        return div().h(px(0.)).into_any_element();
-    }
-    let details = div()
-        .id("files-selection-details-scroll")
-        .w_full()
-        .flex_shrink_0()
-        .px_2()
-        .pb_1()
-        .gap_1();
-    if pane.compact_layout {
-        details
-            .flex()
-            .flex_col()
-            .max_h(px(136.))
-            .overflow_y_scroll()
-            .child(permissions::render_permissions(pane, theme, cx))
-            .child(render_preview(pane, theme))
-            .into_any_element()
-    } else {
-        details
-            .flex()
-            .items_stretch()
-            .child(permissions::render_permissions(pane, theme, cx))
-            .child(render_preview(pane, theme))
-            .into_any_element()
-    }
-}
-
-/// 文件预览使用有界片段，未选中或尚未完成时不保留空白大面板。
-///
-/// @author kongweiguang
-fn render_preview(pane: &FilesPane, theme: ThemeTokens) -> AnyElement {
-    let Some(preview) = &pane.preview else {
-        return div().h(px(0.)).into_any_element();
-    };
-    let summary = if preview.binary {
-        locale::text("二进制文件 · 不显示正文", "Binary file · contents hidden").to_string()
-    } else {
-        let text = String::from_utf8_lossy(&preview.bytes);
-        let suffix = if preview.truncated {
-            locale::text("\n…预览已截断", "\n…preview truncated").to_string()
-        } else {
-            String::new()
-        };
-        format!("{text}{suffix}")
-    };
-    div()
-        .id("files-preview")
-        .flex_1()
-        .min_w(px(0.))
-        .h(px(48.))
-        .w_full()
-        .px_3()
-        .py_2()
-        .overflow_hidden()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary)
-        .text_size(theme.text_xs)
-        .text_color(theme.foreground)
-        .child(summary)
-        .into_any_element()
-}
-
 /// 当前 endpoint 作用域的书签作为快速路径入口显示；12px 标签不被压缩，窄栏通过横向滚动保留入口。
 /// 书签导航留在当前面板，避免恢复后的左侧远端目录被误送到右侧。
 ///
@@ -492,7 +425,7 @@ fn render_bookmarks(
     row.into_any_element()
 }
 
-/// 仅存在实际操作反馈时显示底栏；空闲状态不占用工作区高度，长错误仍可展开查看。
+/// 必要反馈可展开或主动关闭；普通成功由对象状态呈现，不产生额外底栏。
 ///
 /// @author kongweiguang
 fn render_status(
@@ -559,6 +492,18 @@ fn render_status(
                     .child(status),
             )
             .children(details_button)
+            .child(
+                Button::new("files-dismiss-status")
+                    .compact()
+                    .ghost()
+                    .icon(IconName::Close)
+                    .accessibility_label(locale::text("关闭操作提示", "Dismiss operation message"))
+                    .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
+                        pane.status = None;
+                        pane.status_details_expanded = false;
+                        cx.notify();
+                    })),
+            )
             .into_any_element(),
     )
 }

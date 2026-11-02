@@ -176,6 +176,66 @@ fn selecting_another_config_path_replaces_the_pending_request() {
     assert_eq!(state.selected_path(), Some(second_path.as_str()));
 }
 
+/// 同一文件刷新不抹掉可见内容；切换文件时立即隐藏旧快照，避免误把它展示为新路径。
+///
+/// @author kongweiguang
+#[test]
+fn refresh_keeps_same_path_preview_but_switching_paths_clears_it() {
+    let project = project("web", "/srv/web");
+    let first_path = &project.config_files[0];
+    let second_path = &project.config_files[1];
+    let first_endpoint = endpoint(project.host_id.as_ref().unwrap(), first_path);
+    let second_endpoint = endpoint(project.host_id.as_ref().unwrap(), second_path);
+    let mut state = ComposeYamlPreviewState::default();
+    state.select_project(&project);
+    state.preview = Some(file_preview(first_endpoint.clone(), b"services:\n", false));
+
+    let first_id = state
+        .begin_request(
+            &project,
+            first_path,
+            first_endpoint.clone(),
+            action_ticket(1),
+        )
+        .expect("refresh request");
+    assert_eq!(state.preview().unwrap().endpoint, first_endpoint);
+
+    let second_id = state
+        .begin_request(
+            &project,
+            second_path,
+            second_endpoint.clone(),
+            action_ticket(1),
+        )
+        .expect("path change request");
+    assert!(state.preview().is_none());
+    assert!(!state.response_matches(first_id, &first_endpoint));
+    assert!(state.response_matches(second_id, &second_endpoint));
+}
+
+/// 路径无法定位时保留选中项和错误，并作废前一份预览回执。
+///
+/// @author kongweiguang
+#[test]
+fn invalid_selected_path_replaces_pending_preview_with_error() {
+    let project = project("web", "/srv/web");
+    let first_path = project.config_files[0].clone();
+    let second_path = project.config_files[1].clone();
+    let endpoint = endpoint(project.host_id.as_ref().unwrap(), &first_path);
+    let mut state = ComposeYamlPreviewState::default();
+    state.select_project(&project);
+    let request_id = state
+        .begin_request(&project, &first_path, endpoint.clone(), action_ticket(1))
+        .unwrap();
+
+    state.fail_selected_path(&second_path, "unresolvable".to_owned());
+
+    assert_eq!(state.selected_path(), Some(second_path.as_str()));
+    assert_eq!(state.error(), Some("unresolvable"));
+    assert!(!state.is_loading());
+    assert!(!state.response_matches(request_id, &endpoint));
+}
+
 /// binary 标记和非法 UTF-8 都不会将字节替换后冒充用户可读的 YAML 文本。
 ///
 /// @author kongweiguang

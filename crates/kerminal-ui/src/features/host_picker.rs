@@ -8,7 +8,7 @@ use gpui_kit::{
     AnyElement, App, Context, ElementId, FocusHandle, IntoElement, MouseButton, RenderOnce,
     ScrollHandle, SharedString, StyleRefinement, Window,
     assets::IconName,
-    base::Selectable,
+    base::{Selectable, TestSupportExt},
     component::{
         input::{Enter, Input, InputState},
         popover::{Popover, PopoverState},
@@ -75,7 +75,7 @@ pub(crate) struct HostPickerPopoverProjection {
 /// 键盘高亮按稳定 option key 保存，搜索变化时安全退回首个可见项。
 ///
 /// @author kongweiguang
-struct HostPickerListKeyboardState {
+pub(crate) struct HostPickerListKeyboardState {
     active_key: Option<String>,
     scroll: ScrollHandle,
 }
@@ -130,6 +130,8 @@ type HostPickerSelect<T> = Rc<dyn Fn(T, &mut Window, &mut App)>;
 pub(crate) struct HostPickerList<T: Clone + 'static> {
     id: SharedString,
     search_input: Option<gpui_kit::Entity<InputState>>,
+    external_search_input: bool,
+    keyboard_state: Option<gpui_kit::Entity<HostPickerListKeyboardState>>,
     query: String,
     groups: Vec<HostPickerGroup>,
     options: Vec<HostPickerOption<T>>,
@@ -151,6 +153,8 @@ impl<T: Clone + 'static> HostPickerList<T> {
         Self {
             id: id.into(),
             search_input: None,
+            external_search_input: false,
+            keyboard_state: None,
             query: String::new(),
             groups: Vec::new(),
             options,
@@ -166,6 +170,20 @@ impl<T: Clone + 'static> HostPickerList<T> {
     /// @author kongweiguang
     pub(crate) fn search_input(mut self, input: gpui_kit::Entity<InputState>) -> Self {
         self.search_input = Some(input);
+        self
+    }
+
+    /// 外部搜索框与结果列表共享键盘状态，但列表不重复挂载同一个输入实体。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn external_search_input(
+        mut self,
+        input: gpui_kit::Entity<InputState>,
+        keyboard_state: gpui_kit::Entity<HostPickerListKeyboardState>,
+    ) -> Self {
+        self.search_input = Some(input);
+        self.external_search_input = true;
+        self.keyboard_state = Some(keyboard_state);
         self
     }
 
@@ -213,46 +231,122 @@ impl<T: Clone + 'static> HostPickerList<T> {
     ///
     /// @author kongweiguang
     fn grouped_options(&self) -> Vec<(String, SharedString, Vec<HostPickerOption<T>>)> {
-        let known_ids = self
-            .groups
-            .iter()
-            .map(|group| group.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let mut result = Vec::new();
-        for group in &self.groups {
-            let options = self
-                .options
-                .iter()
-                .filter(|option| {
-                    option.group_id.as_deref() == Some(group.id.as_str())
-                        && option_matches_query(option, &self.query, Some(&group.title))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if !options.is_empty() {
-                result.push((format!("group:{}", group.id), group.title.clone(), options));
-            }
-        }
-        let ungrouped = self
-            .options
+        grouped_host_picker_options(&self.options, &self.groups, &self.query)
+    }
+}
+
+/// 结果列表与外置搜索框共用过滤和分组顺序，避免键盘选中与可见结果错位。
+///
+/// @author kongweiguang
+fn grouped_host_picker_options<T: Clone>(
+    all_options: &[HostPickerOption<T>],
+    groups: &[HostPickerGroup],
+    query: &str,
+) -> Vec<(String, SharedString, Vec<HostPickerOption<T>>)> {
+    let known_ids = groups
+        .iter()
+        .map(|group| group.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut result = Vec::new();
+    for group in groups {
+        let options = all_options
             .iter()
             .filter(|option| {
-                option
-                    .group_id
-                    .as_deref()
-                    .is_none_or(|group_id| !known_ids.contains(group_id))
-                    && option_matches_query(option, &self.query, None)
+                option.group_id.as_deref() == Some(group.id.as_str())
+                    && option_matches_query(option, query, Some(&group.title))
             })
             .cloned()
             .collect::<Vec<_>>();
-        if !ungrouped.is_empty() {
-            result.push((
-                "ungrouped".to_owned(),
-                crate::locale::text("未分组", "Ungrouped"),
-                ungrouped,
-            ));
+        if !options.is_empty() {
+            result.push((format!("group:{}", group.id), group.title.clone(), options));
         }
-        result
+    }
+    let ungrouped = all_options
+        .iter()
+        .filter(|option| {
+            option
+                .group_id
+                .as_deref()
+                .is_none_or(|group_id| !known_ids.contains(group_id))
+                && option_matches_query(option, query, None)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !ungrouped.is_empty() {
+        result.push((
+            "ungrouped".to_owned(),
+            crate::locale::text("未分组", "Ungrouped"),
+            ungrouped,
+        ));
+    }
+    result
+}
+
+/// 外置输入框只拦截列表导航键；选择结果仍由业务 owner 执行。
+pub(crate) enum HostPickerExternalKey<T> {
+    Ignore,
+    Handled,
+    Select(T),
+}
+
+/// 搜索快照由调用方冻结，键盘选择与当前绘制的结果使用同一数据。
+pub(crate) struct HostPickerSearchProjection<'a, T> {
+    pub(crate) options: &'a [HostPickerOption<T>],
+    pub(crate) groups: &'a [HostPickerGroup],
+    pub(crate) query: &'a str,
+}
+
+/// 与列表使用同一键盘状态、过滤规则和滚动行号，并保留中文输入法组合按键。
+///
+/// @author kongweiguang
+pub(crate) fn handle_external_host_picker_key<T: Clone>(
+    key: &str,
+    keyboard_state: &gpui_kit::Entity<HostPickerListKeyboardState>,
+    input: &gpui_kit::Entity<InputState>,
+    projection: HostPickerSearchProjection<'_, T>,
+    has_message: bool,
+    cx: &mut App,
+) -> HostPickerExternalKey<T> {
+    let grouped =
+        grouped_host_picker_options(projection.options, projection.groups, projection.query);
+    let mut visible = Vec::new();
+    let mut scroll_indices = Vec::new();
+    let mut child_index = if has_message { 1 } else { 0 };
+    for (_, _, options) in grouped {
+        child_index += 1;
+        for option in options {
+            visible.push(option);
+            scroll_indices.push(child_index);
+            child_index += 1;
+        }
+    }
+    if visible.is_empty() {
+        return HostPickerExternalKey::Ignore;
+    }
+    let current = keyboard_state
+        .read(cx)
+        .active_key
+        .as_deref()
+        .and_then(|active| {
+            visible
+                .iter()
+                .position(|option| option.key.as_ref() == active)
+        })
+        .unwrap_or(0);
+    match host_picker_key_action(key, current, visible.len(), input.read(cx).is_composing()) {
+        HostPickerKeyAction::Ignore => HostPickerExternalKey::Ignore,
+        HostPickerKeyAction::Select => {
+            HostPickerExternalKey::Select(visible[current].target.clone())
+        }
+        HostPickerKeyAction::MoveTo(next) => {
+            let key = visible[next].key.to_string();
+            keyboard_state.update(cx, |state, cx| {
+                state.active_key = Some(key);
+                state.scroll.scroll_to_item(scroll_indices[next]);
+                cx.notify();
+            });
+            HostPickerExternalKey::Handled
+        }
     }
 }
 
@@ -285,6 +379,7 @@ fn option_matches_query<T>(
 impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
     /// 按活动应用主题渲染紧凑列表；缺省投影也保留用户色板，不从系统外观重建默认配色。
     /// 捕获阶段先处理方向键与回车，避免输入控件的按键处理抢走列表导航。
+    /// 行的可访问选中状态与高亮样式共用同一状态，供辅助技术和绘制回归读取。
     ///
     /// @author kongweiguang
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -297,10 +392,11 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
             .flat_map(|(_, _, options)| options.iter())
             .cloned()
             .collect::<Vec<_>>();
-        let keyboard_state =
+        let keyboard_state = self.keyboard_state.clone().unwrap_or_else(|| {
             window.use_keyed_state(format!("{}-keyboard-state", self.id), cx, |_, _| {
                 HostPickerListKeyboardState::default()
-            });
+            })
+        });
         let active_key = keyboard_state
             .read(cx)
             .active_key
@@ -423,7 +519,9 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
                 cx.stop_propagation();
             });
 
-        if let Some(search_input) = self.search_input {
+        if !self.external_search_input
+            && let Some(search_input) = self.search_input
+        {
             panel = panel.child(
                 div()
                     .id(format!("{}-search", self.id))
@@ -526,6 +624,8 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
                     .child(title),
             );
             for option in options {
+                let option_selector = format!("{}-option-{}", self.id, option.key);
+                let option_debug_selector = option_selector.clone();
                 let target = option.target.clone();
                 let click_select = self.on_select.clone();
                 let click_state = keyboard_state.clone();
@@ -564,7 +664,8 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
                 }
                 list = list.child(
                     div()
-                        .id(format!("{}-option-{}", self.id, option.key))
+                        .id(option_selector)
+                        .debug_selector(move || option_debug_selector.clone())
                         .w_full()
                         .min_w(px(0.))
                         .min_h(px(46.))
@@ -599,7 +700,8 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
                                 .flex_shrink_0()
                                 .text_color(theme.subtle)
                                 .child(IconName::ArrowRight),
-                        ),
+                        )
+                        .test_support(),
                 );
             }
         }
@@ -625,7 +727,7 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
 pub(crate) struct HostPickerPopoverConfig<T, F, C> {
     pub(crate) id: ElementId,
     pub(crate) trigger: T,
-    pub(crate) mouse_button: MouseButton,
+    pub(crate) mouse_button: Option<MouseButton>,
     pub(crate) open: bool,
     pub(crate) trigger_style: StyleRefinement,
     pub(crate) focus_handle: Option<FocusHandle>,
@@ -656,7 +758,8 @@ where
     } = config;
     let popover = Popover::new(id)
         .trigger(trigger)
-        .mouse_button(mouse_button)
+        .trigger_on_mouse_down(mouse_button.is_some())
+        .when_some(mouse_button, |popover, button| popover.mouse_button(button))
         .open(open)
         .trigger_style(trigger_style)
         .overlay_closable(true)

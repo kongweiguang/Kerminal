@@ -3,17 +3,18 @@
 //! @author kongweiguang
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use gpui_kit::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
+use gpui_kit::{App, AppContext as _, Context, Entity, SharedString, Subscription, Window};
 use kerminal_application::{
     AppError, AppResult,
-    files::clipboard_download::RemoteClipboardSource,
+    platform::external_launch::ExternalTargetLease,
+    preferences::ToolRailToolId,
     workspace::{
-        WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTargetRef,
+        WorkspaceFileAccess, WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTargetRef,
         WorkspaceTargetUnavailableReason,
     },
 };
@@ -23,13 +24,12 @@ use kerminal_domain::{
 };
 
 use crate::features::{
-    editor::EditorWorkspaceProjection,
+    editor::{EditorWorkspaceProjection, FileEditorWorkspace},
     files::{
         ActivateEditorFileRequested, CreateSftpHostRequested, FilesPane, FilesPaneEvent,
         OpenFileRequested, SftpHostKeyTrustRequested, SftpHostRequested,
-        WorkspaceOverviewRequested,
     },
-    workspace_controller::{WorkspaceRestoreFailure, WorkspaceRestoreItemId},
+    workspace_controller::{WorkspaceController, WorkspaceRestoreFailure, WorkspaceRestoreItemId},
     workspace_tabs::WorkspaceFileTabAction,
 };
 use tokio_util::sync::CancellationToken;
@@ -86,30 +86,51 @@ struct WorkspaceFileTabRuntime {
     endpoint: Option<FileEndpoint>,
     files_pane: Option<Entity<FilesPane>>,
     files_subscriptions: Option<FilesPaneSubscriptions>,
+    external_target_lease: Option<ExternalTargetLease>,
+    transient: bool,
+    /// 保存门禁占用时保留最新的双侧意图，不让目录已经变化却悄悄丢失恢复位置。
+    pending_transfer_endpoints: Option<(FileEndpoint, Option<FileEndpoint>)>,
+}
+
+impl WorkspaceFileTabRuntime {
+    /// 有真实运行态端点时只比较该端点；尚未装配时才解析可恢复描述，避免临时目标被误当成本机文件。
+    ///
+    /// @author kongweiguang
+    fn matches_file_endpoint(&self, endpoint: &FileEndpoint) -> bool {
+        let WorkspaceSessionTab::WorkspaceFile {
+            target,
+            path,
+            source,
+            ..
+        } = &self.tab
+        else {
+            return false;
+        };
+        match self.endpoint.as_ref() {
+            Some(current) => current == endpoint,
+            None => workspace_file_endpoint_parts(target, path, *source)
+                .is_ok_and(|current| &current == endpoint),
+        }
+    }
 }
 
 /// 一个 FilesPane 的 Root 桥接和删除观察器同生共灭，避免工作区标签漏接安全边界。
 pub(super) struct FilesPaneSubscriptions {
     _open_file: Subscription,
-    _workspace_overview: Subscription,
     _activate_editor_file: Subscription,
     _sftp_host: Subscription,
     _sftp_host_key_trust: Subscription,
     _create_sftp_host: Subscription,
     _delete_confirmation_observer: Subscription,
     _pane_events: Subscription,
-    clipboard_download_tasks: FilesPaneTaskRegistry,
     host_key_trust_tasks: FilesPaneTaskRegistry,
 }
 
 type FilesPaneTaskRegistry = Arc<Mutex<HashMap<u64, CancellationToken>>>;
 
 impl Drop for FilesPaneSubscriptions {
-    /// 释放桥接时取消该 pane 的读取与未提交信任；已开始写入的信任用例仍须完成原端点回读。
+    /// 释放桥接时取消该面板的未提交信任；已开始写入仍须等待原端点回读。
     fn drop(&mut self) {
-        for cancellation in lock_files_pane_tasks(&self.clipboard_download_tasks).values() {
-            cancellation.cancel();
-        }
         for cancellation in lock_files_pane_tasks(&self.host_key_trust_tasks).values() {
             cancellation.cancel();
         }
@@ -142,7 +163,7 @@ pub(super) enum WorkspaceFileRestoreState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SftpTransferEndpoints {
     pub left: FileEndpoint,
-    pub right: FileEndpoint,
+    pub right: Option<FileEndpoint>,
     pub locked_left_host_id: Option<HostId>,
     pub initial_right_selection: Option<String>,
 }
@@ -173,6 +194,9 @@ impl WorkspaceFileRuntime {
                     endpoint: None,
                     files_pane: None,
                     files_subscriptions: None,
+                    external_target_lease: None,
+                    transient: false,
+                    pending_transfer_endpoints: None,
                 },
             );
         }
@@ -231,9 +255,147 @@ impl WorkspaceFileRuntime {
                 endpoint: None,
                 files_pane: None,
                 files_subscriptions: None,
+                external_target_lease: None,
+                transient: false,
+                pending_transfer_endpoints: None,
             },
         );
         true
+    }
+
+    /// 活动文件沿用已验证的端点；临时目标由独立 lease 保活，持久恢复仍走严格 descriptor 校验。
+    ///
+    /// @author kongweiguang
+    pub(super) fn register_open_file_tab(
+        &mut self,
+        tab: WorkspaceSessionTab,
+        endpoint: FileEndpoint,
+        external_target_lease: Option<ExternalTargetLease>,
+        transient: bool,
+    ) -> bool {
+        let id = tab.id().clone();
+        if !self.register_pending_file_tab(tab) {
+            return false;
+        }
+        if let Some(runtime) = self.tabs.get_mut(&id) {
+            runtime.endpoint = Some(endpoint);
+            runtime.external_target_lease = external_target_lease;
+            runtime.transient = transient;
+        }
+        true
+    }
+
+    /// 完整 endpoint 决定导航身份；已恢复、待恢复和失败描述都不能按来源创建新的别名。
+    ///
+    /// @author kongweiguang
+    pub(super) fn tab_for_endpoint(&self, endpoint: &FileEndpoint) -> Option<TabId> {
+        self.tabs
+            .iter()
+            .find_map(|(id, runtime)| runtime.matches_file_endpoint(endpoint).then(|| id.clone()))
+    }
+
+    /// 把同一标签收紧为只读；编辑器与快照在单次更新内协调，失败恢复原策略且不改变正文。
+    ///
+    /// @author kongweiguang
+    pub(super) fn restrict_file_to_readonly(
+        &mut self,
+        controller: &mut WorkspaceController,
+        editor: &Entity<FileEditorWorkspace>,
+        tab_id: &TabId,
+        endpoint: &FileEndpoint,
+        cx: &mut App,
+    ) -> AppResult<bool> {
+        let runtime = self
+            .tabs
+            .get_mut(tab_id)
+            .ok_or_else(|| AppError::not_found("工作区文件标签不存在"))?;
+        if !runtime.matches_file_endpoint(endpoint) {
+            return Err(AppError::conflict("工作区文件目标已变化"));
+        }
+        let WorkspaceSessionTab::WorkspaceFile {
+            target: runtime_target,
+            path: runtime_path,
+            source: runtime_source,
+            access: runtime_access,
+            ..
+        } = &mut runtime.tab
+        else {
+            return Err(AppError::conflict("工作区标签不是文件"));
+        };
+        let original = controller.snapshot().clone();
+        let mut candidate = original.clone();
+        let Some(WorkspaceSessionTab::WorkspaceFile {
+            target,
+            path,
+            source,
+            access,
+            ..
+        }) = candidate
+            .terminal_tabs
+            .iter_mut()
+            .find(|tab| tab.id() == tab_id)
+        else {
+            return Err(AppError::conflict("工作区文件描述已变化"));
+        };
+        if target != runtime_target
+            || path != runtime_path
+            || source != runtime_source
+            || access != runtime_access
+        {
+            return Err(AppError::conflict("工作区文件描述与运行状态不一致"));
+        }
+        let changed = *access != WorkspaceFileAccess::Readonly;
+        *access = WorkspaceFileAccess::Readonly;
+
+        // 先检查 controller 的资源和保存门禁；随后编辑器事务不会产生并发 Root 回调。
+        controller.synchronize_snapshot(original)?;
+        editor.update(cx, |workspace, cx| {
+            let old_policy = workspace.workspace_file_readonly_before_restriction(endpoint, cx)?;
+            if old_policy == Some(false) {
+                workspace.set_workspace_file_readonly(endpoint, true, cx)?;
+            }
+            if let Err(error) = controller.synchronize_snapshot(candidate) {
+                if old_policy == Some(false) {
+                    workspace
+                        .set_workspace_file_readonly(endpoint, false, cx)
+                        .map_err(|_| AppError::conflict("工作区文件只读状态回滚失败"))?;
+                }
+                return Err(error);
+            }
+            *runtime_access = WorkspaceFileAccess::Readonly;
+            Ok(changed)
+        })
+    }
+
+    /// 仅把已经装配成功的文件别名交给关闭协调，尚未恢复的标签不能被空投影误删。
+    ///
+    /// @author kongweiguang
+    pub(super) fn ready_file_endpoints(&self) -> Vec<(TabId, FileEndpoint)> {
+        self.tabs
+            .iter()
+            .filter_map(|(id, runtime)| {
+                if runtime.status != WorkspaceFileRestoreState::Ready
+                    || !matches!(runtime.tab, WorkspaceSessionTab::WorkspaceFile { .. })
+                {
+                    return None;
+                }
+                runtime
+                    .endpoint
+                    .clone()
+                    .map(|endpoint| (id.clone(), endpoint))
+            })
+            .collect()
+    }
+
+    /// 本机容器没有可恢复的宿主身份；与 external 文件一起从唯一持久化投影排除。
+    ///
+    /// @author kongweiguang
+    pub(super) fn transient_tab_ids(&self) -> BTreeSet<TabId> {
+        self.tabs
+            .iter()
+            .filter(|(_, runtime)| runtime.transient)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// 返回尚未执行的 ID，顺序固定以便启动恢复可复现且不依赖 HashMap 随机迭代。
@@ -252,6 +414,20 @@ impl WorkspaceFileRuntime {
         self.tabs.get(tab_id)?.files_pane.clone()
     }
 
+    /// 每个独立传输标签拥有不同 FilesPane；通过实体身份定位，不能使用后台活动标签猜测。
+    ///
+    /// @author kongweiguang
+    fn transfer_tab_for_pane(&self, pane: &Entity<FilesPane>) -> Option<TabId> {
+        self.tabs.iter().find_map(|(id, runtime)| {
+            (matches!(runtime.tab, WorkspaceSessionTab::SftpTransfer { .. })
+                && runtime
+                    .files_pane
+                    .as_ref()
+                    .is_some_and(|current| current.entity_id() == pane.entity_id()))
+            .then(|| id.clone())
+        })
+    }
+
     /// 收集当前已恢复的文件面板实体，供语言切换更新缓存控件而不重建每个 workspace tab。
     ///
     /// @author kongweiguang
@@ -267,6 +443,37 @@ impl WorkspaceFileRuntime {
         self.tabs.get(tab_id)?.endpoint.clone()
     }
 
+    /// 文件 Tab 为右栏提供父目录及自身连接所有权，不借用已关闭的来源终端或重建 session binding。
+    /// 紧凑浏览器仅支持本机与 SFTP；容器仍使用专用浏览入口，临时目标必须持有精确匹配的 lease。
+    ///
+    /// @author kongweiguang
+    pub(super) fn file_browser_target(
+        &self,
+        tab_id: &TabId,
+    ) -> Option<(FileEndpoint, Option<ExternalTargetLease>)> {
+        let runtime = self.tabs.get(tab_id)?;
+        if !matches!(runtime.tab, WorkspaceSessionTab::WorkspaceFile { .. }) {
+            return None;
+        }
+        let endpoint = runtime.endpoint.as_ref()?;
+        match endpoint {
+            FileEndpoint::Local { .. } if runtime.external_target_lease.is_none() => {}
+            FileEndpoint::Remote { host_id, .. } => {
+                let lease = runtime.external_target_lease.as_ref();
+                if lease.is_some_and(|lease| lease.host_id() != host_id)
+                    || (host_id.as_str().starts_with("external:") && lease.is_none())
+                {
+                    return None;
+                }
+            }
+            FileEndpoint::Local { .. } | FileEndpoint::Container { .. } => return None,
+        }
+        Some((
+            crate::features::files::parent_endpoint(endpoint)?,
+            runtime.external_target_lease.clone(),
+        ))
+    }
+
     /// 关闭一个 workspace 别名前确认是否仍有其它标签引用同一编辑文档。
     pub fn has_other_workspace_file_endpoint(
         &self,
@@ -278,22 +485,15 @@ impl WorkspaceFileRuntime {
         })
     }
 
-    /// 多个 tab 共享同一 endpoint 时只读策略取最严格值，防止活动 alias 放宽已声明限制。
+    /// 多个 tab 共享同一 endpoint 时只读策略取最严格值，且与导航使用相同的端点识别边界。
+    ///
+    /// @author kongweiguang
     pub fn workspace_file_requires_readonly(&self, endpoint: &FileEndpoint) -> bool {
         self.tabs.values().any(|tab| {
-            let WorkspaceSessionTab::WorkspaceFile {
-                target,
-                path,
-                access,
-                source,
-                ..
-            } = &tab.tab
-            else {
+            let WorkspaceSessionTab::WorkspaceFile { access, .. } = &tab.tab else {
                 return false;
             };
-            *access == kerminal_application::workspace::WorkspaceFileAccess::Readonly
-                && workspace_file_endpoint_parts(target, path, *source)
-                    .is_ok_and(|resolved| &resolved == endpoint)
+            *access == WorkspaceFileAccess::Readonly && tab.matches_file_endpoint(endpoint)
         })
     }
 
@@ -313,7 +513,7 @@ impl WorkspaceFileRuntime {
         Ok(())
     }
 
-    /// 只有显式用户重试才能重新执行失败的文件目标解析或面板装配。
+    /// 只有显式重试才能重新装配；临时文件必须保留不可由持久 descriptor 重建的原始端点。
     pub fn retry_failed_tab(&mut self, tab_id: &TabId) -> bool {
         let Some(tab) = self.tabs.get_mut(tab_id) else {
             return false;
@@ -322,7 +522,9 @@ impl WorkspaceFileRuntime {
             return false;
         }
         tab.status = WorkspaceFileRestoreState::Pending;
-        tab.endpoint = None;
+        if !tab.transient {
+            tab.endpoint = None;
+        }
         true
     }
 
@@ -365,9 +567,132 @@ impl WorkspaceFileRuntime {
 }
 
 impl RootView {
+    /// 文件面板上报的是完整双端点；共享工作台不属于可持久标签，因此只同步对应的独立实例。
+    ///
+    /// @author kongweiguang
+    fn sync_sftp_transfer_endpoints(
+        &mut self,
+        pane: &Entity<FilesPane>,
+        left: &FileEndpoint,
+        right: &Option<FileEndpoint>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_id) = self.workspace_files.transfer_tab_for_pane(pane) else {
+            return;
+        };
+        let Some(runtime) = self.workspace_files.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        let endpoints = (left.clone(), right.clone());
+        if runtime.pending_transfer_endpoints.as_ref() == Some(&endpoints) {
+            return;
+        }
+        runtime.pending_transfer_endpoints = Some(endpoints);
+        if self.flush_pending_sftp_transfer_endpoints(cx) {
+            self.refresh_workspace_views(cx);
+            self.persist_workspace_snapshot(cx);
+        }
+    }
+
+    /// 只在 controller 允许普通变更时同步待保存端点；关闭标签后不会重建描述或重试未知提交。
+    ///
+    /// @author kongweiguang
+    pub(super) fn flush_pending_sftp_transfer_endpoints(&mut self, cx: &mut Context<Self>) -> bool {
+        let pending = self
+            .workspace_files
+            .tabs
+            .iter()
+            .filter_map(|(tab_id, runtime)| {
+                (runtime.files_pane.is_some()
+                    && matches!(runtime.tab, WorkspaceSessionTab::SftpTransfer { .. }))
+                .then(|| {
+                    runtime
+                        .pending_transfer_endpoints
+                        .clone()
+                        .map(|endpoints| (tab_id.clone(), endpoints))
+                })
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return false;
+        }
+        let Some(controller) = self.workspace_controller.as_mut() else {
+            self.status = Some(crate::locale::text(
+                "文件目录已更改，但工作区未就绪，当前位置尚未保存。",
+                "File directories changed, but the workspace is unavailable. Their positions are not saved yet.",
+            ));
+            cx.notify();
+            return false;
+        };
+        let mut snapshot = controller.snapshot().clone();
+        let mut changed_tabs = Vec::new();
+        for (tab_id, (left, right)) in &pending {
+            let Some(tab) = snapshot
+                .terminal_tabs
+                .iter_mut()
+                .find(|tab| tab.id() == tab_id)
+            else {
+                continue;
+            };
+            match update_sftp_transfer_descriptor(tab, left, right) {
+                Ok(()) => changed_tabs.push((tab_id.clone(), tab.clone())),
+                Err(error) => {
+                    self.status = Some(crate::locale::text(
+                        format!("当前位置尚未保存：{}", error.public_message()),
+                        format!(
+                            "The current position is not saved: {}",
+                            error.public_message()
+                        ),
+                    ));
+                    cx.notify();
+                    return false;
+                }
+            }
+        }
+        if changed_tabs.is_empty() {
+            return false;
+        }
+        let changed = match controller.synchronize_snapshot(snapshot) {
+            Ok(crate::features::workspace_controller::WorkspaceControllerEffect::Changed {
+                ..
+            }) => true,
+            Ok(crate::features::workspace_controller::WorkspaceControllerEffect::Unchanged) => {
+                false
+            }
+            Ok(
+                crate::features::workspace_controller::WorkspaceControllerEffect::ResourceOperation(
+                    _,
+                ),
+            ) => return false,
+            Err(error) => {
+                self.status = Some(crate::locale::text(
+                    format!(
+                        "文件目录已更改，当前位置尚未保存：{}",
+                        error.public_message()
+                    ),
+                    format!(
+                        "File directories changed but are not saved yet: {}",
+                        error.public_message()
+                    ),
+                ));
+                cx.notify();
+                return false;
+            }
+        };
+        for (tab_id, tab) in changed_tabs {
+            if let Some(runtime) = self.workspace_files.tabs.get_mut(&tab_id) {
+                runtime.tab = tab;
+                runtime.pending_transfer_endpoints = None;
+            }
+        }
+        changed
+    }
+
     /// 为每个文件视图绑定同一组 typed Root 桥接；缓存中的右栏面板不能回投导航或开启根确认。
-    /// 主机选择仅受理共享工作台的显式意图，复用保存连接的信任预检，不让文件视图自行建连接。
+    /// 主机选择复用连接预检并绑定发起的共享工作台或独立标签，不让文件视图自行建连接。
     /// 新建主机同样交给 Root 捕获来源身份，保存成功不依赖当时的后台活动传输标签。
+    /// 仅当前紧凑 SFTP 抽屉的成功文件导航收起目标标签遮罩，目录、失败及其它来源保留原视图。
     ///
     /// @author kongweiguang
     pub(super) fn subscribe_files_pane_events(
@@ -375,8 +700,6 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> FilesPaneSubscriptions {
-        let clipboard_download_tasks = Arc::new(Mutex::new(HashMap::new()));
-        let event_download_tasks = clipboard_download_tasks.clone();
         let host_key_trust_tasks = Arc::new(Mutex::new(HashMap::new()));
         let event_trust_tasks = host_key_trust_tasks.clone();
         let open_file = cx.subscribe_in(
@@ -386,17 +709,18 @@ impl RootView {
                 if root.is_cached_sftp_panel(source) {
                     return;
                 }
-                root.open_file_endpoint(event.endpoint.clone(), window, cx);
-            },
-        );
-        let workspace_overview = cx.subscribe_in(
-            pane,
-            window,
-            |root, source, event: &WorkspaceOverviewRequested, _, cx| {
-                if root.is_cached_sftp_panel(source) {
-                    return;
+                let from_compact_sftp = root.compact_tool_drawer_open
+                    && root.tool_rail_rendered_compact == (true, Some(ToolRailToolId::Sftp))
+                    && root.sftp_panel.as_ref().is_some_and(|pane| pane == source);
+                let accepted = root.open_file_endpoint_with_lease(
+                    event.endpoint.clone(),
+                    event.external_target_lease.clone(),
+                    window,
+                    cx,
+                );
+                if accepted && from_compact_sftp {
+                    root.reveal_file_from_compact_sftp(&event.endpoint, window, cx);
                 }
-                root.return_editor_workspace_projection(source.clone(), event.generation, cx);
             },
         );
         let activate_editor_file = cx.subscribe_in(
@@ -412,16 +736,12 @@ impl RootView {
         let sftp_host = cx.subscribe_in(
             pane,
             window,
-            |root, source, event: &SftpHostRequested, window, cx| {
-                if root.files_pane.as_ref() != Some(source) {
-                    return;
-                }
-                super::connections::handle_host_navigation_event(
-                    root,
-                    &crate::features::connections::HostNavigationEvent::OpenSftpRequested {
-                        host_id: event.host_id.clone(),
-                    },
-                    window,
+            |root, source, event: &SftpHostRequested, _, cx| {
+                root.request_file_sftp_host(
+                    source,
+                    event.side,
+                    event.generation,
+                    event.host_id.clone(),
                     cx,
                 );
             },
@@ -429,11 +749,14 @@ impl RootView {
         let create_sftp_host = cx.subscribe_in(
             pane,
             window,
-            |root, source, _: &CreateSftpHostRequested, window, cx| {
-                if root.files_pane.as_ref() != Some(source) {
-                    return;
-                }
-                root.begin_create_sftp_host_from_workbench(window, cx);
+            |root, source, event: &CreateSftpHostRequested, window, cx| {
+                root.begin_create_sftp_host_from_workbench(
+                    source,
+                    event.side,
+                    event.generation,
+                    window,
+                    cx,
+                );
             },
         );
         let sftp_host_key_trust = cx.subscribe_in(
@@ -472,36 +795,72 @@ impl RootView {
                     FilesPaneEvent::SetupTerminalDirectoryFollow { binding } => {
                         root.setup_terminal_directory_follow(source.clone(), binding.clone(), cx);
                     }
-                    FilesPaneEvent::CopyRemoteFilesToClipboard {
-                        request_id,
-                        sources,
-                    } => {
-                        root.start_clipboard_download(
-                            source.clone(),
-                            *request_id,
-                            sources.clone(),
-                            event_download_tasks.clone(),
-                            cx,
-                        );
+                    FilesPaneEvent::TransferEndpointsChanged { left, right } => {
+                        root.sync_sftp_transfer_endpoints(source, left, right, cx);
                     }
-                    FilesPaneEvent::CancelClipboardDownload { request_id } => {
-                        root.cancel_clipboard_download(*request_id, &event_download_tasks);
+                    FilesPaneEvent::CancelHostSelection { side, generation } => {
+                        root.cancel_file_sftp_selection(source, *side, *generation, cx);
                     }
                 }
             },
         );
         FilesPaneSubscriptions {
             _open_file: open_file,
-            _workspace_overview: workspace_overview,
             _activate_editor_file: activate_editor_file,
             _sftp_host: sftp_host,
             _sftp_host_key_trust: sftp_host_key_trust,
             _create_sftp_host: create_sftp_host,
             _delete_confirmation_observer: delete_confirmation_observer,
             _pane_events: pane_events,
-            clipboard_download_tasks,
             host_key_trust_tasks,
         }
+    }
+
+    /// 已接受的文件导航只隐藏目标标签的临时遮罩；旧面板、失败和宽窗不改变工具状态。
+    /// 菜单焦点结束后仅向当前编辑器或工作区交接，不能恢复到打开抽屉前的旧终端。
+    ///
+    /// @author kongweiguang
+    fn reveal_file_from_compact_sftp(
+        &mut self,
+        endpoint: &FileEndpoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_id) = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.snapshot().active_tab_id.clone())
+            .filter(|tab_id| {
+                self.workspace_files.tab_for_endpoint(endpoint).as_ref() == Some(tab_id)
+            })
+        else {
+            return;
+        };
+        if self.center_panel != CenterPanel::Editor
+            || !self.compact_tool_drawer_open
+            || self.tool_rail_rendered_compact != (true, Some(ToolRailToolId::Sftp))
+        {
+            return;
+        }
+        let return_to_editor = self
+            .compact_drawer_focus_handle
+            .contains_focused(window, cx)
+            && !self.tool_panel_overlay_focus_is_blocked(window, cx);
+        self.tool_rail_state
+            .hide_compact_drawer_for_tab(Some(&tab_id));
+        self.compact_tool_drawer_open = false;
+        self.compact_drawer_return_focus = None;
+        if return_to_editor {
+            let focused = self.file_editor_workspace.clone().is_some_and(|editor| {
+                editor.update(cx, |workspace, cx| {
+                    workspace.focus_active_editor(window, cx)
+                })
+            });
+            if !focused {
+                window.focus(&self.focus_handle, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// 只提交文件栏冻结的主机信任意图；应用用例负责逐跳绑定与未知结果回读，回执仍交还原 pane。
@@ -566,74 +925,6 @@ impl RootView {
         .detach();
     }
 
-    /// 用事件冻结的远端来源启动唯一 clipboard 用例；完成永远回写同一 pane 和 request id。
-    ///
-    /// @author kongweiguang
-    fn start_clipboard_download(
-        &mut self,
-        source: Entity<FilesPane>,
-        request_id: u64,
-        sources: Vec<RemoteClipboardSource>,
-        tasks: FilesPaneTaskRegistry,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(service) = self.services.file_clipboard_download.clone() else {
-            let error = crate::locale::text(
-                "系统文件剪贴板服务不可用。",
-                "The system file clipboard service is unavailable.",
-            )
-            .to_string();
-            source.update(cx, |pane, cx| {
-                pane.complete_clipboard_download(request_id, Err(error), cx);
-            });
-            return;
-        };
-
-        let cancellation = CancellationToken::new();
-        {
-            let mut active = lock_files_pane_tasks(&tasks);
-            for previous in active.values() {
-                previous.cancel();
-            }
-            active.clear();
-            active.insert(request_id, cancellation.clone());
-        }
-
-        let executor = self.services.executor.clone();
-        cx.spawn(async move |_, cx| {
-            let result = executor
-                .run_cancellable(cancellation, move |operation_cancellation| async move {
-                    service
-                        .copy_remote_files_to_clipboard(operation_cancellation, sources)
-                        .await
-                })
-                .await
-                .map_err(|_| {
-                    crate::locale::text(
-                        "无法将远程项目复制到系统剪贴板。请确认连接后重试。",
-                        "Unable to copy remote items to the system clipboard. Check the connection and retry.",
-                    )
-                    .to_string()
-                });
-            cx.update(|app| {
-                source.update(app, |pane, cx| {
-                    pane.complete_clipboard_download(request_id, result, cx);
-                })
-            });
-            lock_files_pane_tasks(&tasks).remove(&request_id);
-        })
-        .detach();
-    }
-
-    /// 取消指定 pane/request 的传输；请求票据不会影响同 pane 的新任务或其它 FilesPane。
-    ///
-    /// @author kongweiguang
-    fn cancel_clipboard_download(&mut self, request_id: u64, tasks: &FilesPaneTaskRegistry) {
-        if let Some(cancellation) = lock_files_pane_tasks(tasks).get(&request_id) {
-            cancellation.cancel();
-        }
-    }
-
     /// 安装只使用按钮点击时冻结的 SSH binding；切 Tab 后仍完成原主机请求，不改投当前选择。
     /// @author kongweiguang
     fn setup_terminal_directory_follow(
@@ -691,30 +982,7 @@ impl RootView {
         .detach();
     }
 
-    /// 只读复制当前 Editor 投影并原样回带 request generation，Files 会丢弃过期响应。
-    ///
-    /// @author kongweiguang
-    pub(super) fn return_editor_workspace_projection(
-        &mut self,
-        source: Entity<FilesPane>,
-        generation: u64,
-        cx: &mut Context<Self>,
-    ) {
-        let snapshot = self
-            .file_editor_workspace
-            .as_ref()
-            .map(|editor| editor.read(cx).workspace_projection())
-            .unwrap_or(EditorWorkspaceProjection {
-                revision: 0,
-                tabs: Vec::new(),
-                active_endpoint: None,
-            });
-        source.update(cx, |files, cx| {
-            files.set_workspace_projection(snapshot, generation, cx);
-        });
-    }
-
-    /// 将编辑器状态推给独立面板；最后一个临时编辑页关闭后只返回原本选中的终端，不创建或改绑会话。
+    /// 将编辑器的当前投影同步到标签导航；最后一个编辑页关闭后只返回原本选中的终端，不创建或改绑会话。
     ///
     /// @author kongweiguang
     pub(super) fn push_editor_workspace_projection(
@@ -723,6 +991,7 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sync_editor_navigation(&projection, window, cx);
         let active_tab_is_terminal = self
             .workspace_controller
             .as_ref()
@@ -744,18 +1013,6 @@ impl RootView {
         {
             self.set_center_panel(CenterPanel::Terminal, window, cx);
         }
-        for files in self.files_pane.iter().chain(self.sftp_panel.iter()) {
-            let snapshot = projection.clone();
-            files.update(cx, |files, cx| {
-                files.set_live_workspace_projection(snapshot, cx);
-            });
-        }
-        for files in self.workspace_files.files_panes() {
-            let snapshot = projection.clone();
-            files.update(cx, |files, cx| {
-                files.set_live_workspace_projection(snapshot, cx);
-            });
-        }
     }
 
     /// 只切换仍存在的编辑器 endpoint；关闭后的 Files 列表项不会重开文件或更换中心页。
@@ -775,9 +1032,17 @@ impl RootView {
             if !editor_projection_contains_endpoint(&projection, &endpoint) {
                 return false;
             }
-            workspace.activate_open_file(endpoint, cx)
+            workspace.activate_open_file(endpoint.clone(), cx)
         });
         if activated {
+            if let Some(id) = self.workspace_files.tab_for_endpoint(&endpoint) {
+                let event =
+                    crate::features::workspace_tabs::WorkspaceTabEvent::Activate(id.clone());
+                if self.handle_workspace_tab_event(&event, window, cx) {
+                    self.activate_workspace_tab(&id, window, cx);
+                }
+                return;
+            }
             self.set_center_panel(CenterPanel::Editor, window, cx);
         }
     }
@@ -798,7 +1063,7 @@ impl RootView {
         }
     }
 
-    /// 激活或延迟创建单个非终端资源；所有失败都保留原 descriptor 并更新可见状态。
+    /// 延迟创建资源时仅由当前主导航决定活动缓冲；后台恢复不抢导航，失败保留原 descriptor。
     pub(super) fn ensure_workspace_file_tab(
         &mut self,
         tab_id: &TabId,
@@ -831,7 +1096,12 @@ impl RootView {
                 source,
                 ..
             } => {
-                let endpoint = match workspace_file_endpoint_parts(&target, &path, source) {
+                let resolved = self
+                    .workspace_files
+                    .file_endpoint(tab_id)
+                    .map(Ok)
+                    .unwrap_or_else(|| workspace_file_endpoint_parts(&target, &path, source));
+                let endpoint = match resolved {
                     Ok(endpoint) => endpoint,
                     Err(issue) => {
                         self.finish_workspace_file_restore(
@@ -859,8 +1129,14 @@ impl RootView {
                     );
                     return;
                 };
+                let activate = self
+                    .workspace_controller
+                    .as_ref()
+                    .is_some_and(|controller| {
+                        controller.snapshot().active_tab_id.as_ref() == Some(tab_id)
+                    });
                 let result = editor.update(cx, |workspace, cx| {
-                    workspace.open_workspace_file(endpoint.clone(), title, readonly, cx)
+                    workspace.open_workspace_file(endpoint.clone(), title, readonly, activate, cx)
                 });
                 match result {
                     Ok(()) => self.finish_workspace_file_restore(
@@ -946,13 +1222,14 @@ impl RootView {
             .workspace_file_requires_readonly(&endpoint);
         if let Some(editor) = self.file_editor_workspace.clone() {
             let result = editor.update(cx, |workspace, cx| {
-                workspace.open_workspace_file(endpoint, title.clone(), readonly, cx)
+                workspace.open_workspace_file(endpoint, title.clone(), readonly, true, cx)
             });
             if let Err(error) = result {
                 self.status = Some(error.public_message().into());
                 cx.notify();
                 return;
             }
+            self.cancel_visible_transfer_preparation(cx);
             self.center_panel = CenterPanel::Editor;
             cx.notify();
         }
@@ -1040,6 +1317,12 @@ impl RootView {
 
         let executor = self.services.executor.clone();
         let right_endpoint = endpoints.right.clone();
+        // 空右侧只为实体构造提供内部占位，open_workspace_transfer 不加载该路径。
+        let initial_endpoint = right_endpoint
+            .clone()
+            .unwrap_or_else(|| FileEndpoint::Local {
+                path: local_root.clone(),
+            });
         let target_name_lookup = crate::features::files::FileTargetNameLookup::new(
             self.services.hosts.clone(),
             self.services.operations.clone(),
@@ -1050,7 +1333,7 @@ impl RootView {
                 transfers,
                 executor,
                 target_name_lookup,
-                right_endpoint.clone(),
+                initial_endpoint,
             )
         });
         let density = super::preferences::current_interface_density(self);
@@ -1059,7 +1342,7 @@ impl RootView {
             files.open_workspace_transfer(
                 endpoints.left.clone(),
                 right_endpoint,
-                endpoints.locked_left_host_id.clone(),
+                None,
                 endpoints.initial_right_selection.clone(),
                 cx,
             )
@@ -1073,6 +1356,7 @@ impl RootView {
             );
             return;
         }
+        pane.update(cx, |files, cx| files.set_host_picker_enabled(true, cx));
         let subscriptions = Self::subscribe_files_pane_events(&pane, window, cx);
         self.workspace_files
             .set_files_pane(tab_id, pane, subscriptions);
@@ -1234,6 +1518,74 @@ fn workspace_file_endpoint_parts(
     }
 }
 
+/// 持久描述只接受可恢复的本机和已保存 SFTP 目标；临时连接与容器不得借用旧主机身份。
+///
+/// @author kongweiguang
+fn stored_sftp_transfer_endpoint(endpoint: &FileEndpoint) -> AppResult<(Option<HostId>, String)> {
+    match endpoint {
+        FileEndpoint::Local { path } => {
+            let path = path
+                .to_str()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| AppError::invalid("本机路径无法无损保存"))?;
+            Ok((None, path.to_owned()))
+        }
+        FileEndpoint::Remote { host_id, path } if !host_id.as_str().starts_with("external:") => {
+            Ok((Some(host_id.clone()), path.as_str().to_owned()))
+        }
+        FileEndpoint::Remote { .. } | FileEndpoint::Container { .. } => {
+            Err(AppError::invalid("当前端点不能保存为 SFTP 传输标签"))
+        }
+    }
+}
+
+/// 更新已有 v3 字段并清除旧锁定；标签标题、分组和用户未涉及的快照字段均由原描述持有。
+///
+/// @author kongweiguang
+fn update_sftp_transfer_descriptor(
+    tab: &mut WorkspaceSessionTab,
+    left: &FileEndpoint,
+    right: &Option<FileEndpoint>,
+) -> AppResult<()> {
+    let (left_host, left_path) = stored_sftp_transfer_endpoint(left)?;
+    let (right_host, right_path) = match right {
+        Some(endpoint) => {
+            let (host, path) = stored_sftp_transfer_endpoint(endpoint)?;
+            (host, Some(path))
+        }
+        None => (None, None),
+    };
+    let WorkspaceSessionTab::SftpTransfer {
+        machine_id,
+        left_host_id,
+        locked_left_host_id,
+        right_host_id,
+        external_launch_id,
+        initial_left_path,
+        initial_right_path,
+        initial_right_selection,
+        ..
+    } = tab
+    else {
+        return Err(AppError::conflict("工作区标签不再是 SFTP 传输标签"));
+    };
+    if external_launch_id.is_some() {
+        return Err(AppError::invalid("临时连接不能写入可恢复工作区"));
+    }
+    *machine_id = right_host
+        .as_ref()
+        .or(left_host.as_ref())
+        .map(|host| host.as_str().to_owned())
+        .unwrap_or_else(|| "local".to_owned());
+    *left_host_id = left_host;
+    *locked_left_host_id = None;
+    *right_host_id = right_host;
+    *initial_left_path = Some(left_path);
+    *initial_right_path = right_path;
+    *initial_right_selection = None;
+    Ok(())
+}
+
 /// 按可选左右起始路径构造端点；旧快照缺少左路径时保留原有本地工作区根目录语义。
 ///
 /// @author kongweiguang
@@ -1288,19 +1640,17 @@ fn sftp_transfer_endpoints(
         },
     };
     let right = match right_host_id {
-        Some(host_id) => FileEndpoint::Remote {
+        Some(host_id) => Some(FileEndpoint::Remote {
             host_id: host_id.clone(),
             path: RemotePath::parse(initial_right_path.as_deref().unwrap_or("/"))
                 .map_err(|_| WorkspaceFileRestoreIssue::InvalidPath)?,
-        },
-        None => FileEndpoint::Local {
-            path: initial_right_path
-                .as_deref()
-                .filter(|path| !path.trim().is_empty())
-                .map(Path::new)
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| local_root.to_path_buf()),
-        },
+        }),
+        None => initial_right_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .map(|path| FileEndpoint::Local {
+                path: Path::new(path).to_path_buf(),
+            }),
     };
     Ok(SftpTransferEndpoints {
         left,
@@ -1378,6 +1728,22 @@ fn workspace_file_action_endpoint(
     let runtime_tab = runtime.tabs.get(tab_id)?;
     if runtime_tab.status != WorkspaceFileRestoreState::Ready || runtime_tab.tab.id() != tab_id {
         return None;
+    }
+    if runtime_tab.transient {
+        let WorkspaceSessionTab::WorkspaceFile {
+            target: registered_target,
+            path: registered_path,
+            source: registered_source,
+            ..
+        } = &runtime_tab.tab
+        else {
+            return None;
+        };
+        return (target == registered_target
+            && path == registered_path
+            && source == registered_source)
+            .then(|| runtime_tab.endpoint.clone())
+            .flatten();
     }
     let endpoint = workspace_file_endpoint_parts(target, path, *source).ok()?;
     (runtime_tab.endpoint.as_ref() == Some(&endpoint)).then_some(endpoint)
@@ -1459,3 +1825,7 @@ impl WorkspaceFileRestoreIssue {
 #[cfg(test)]
 #[path = "../../tests/unit/root_workspace_files.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/root_workspace_file_access.rs"]
+mod file_access_tests;

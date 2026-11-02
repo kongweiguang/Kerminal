@@ -277,6 +277,69 @@ fn dry_run_keeps_an_existing_root_byte_for_byte() {
     assert_eq!(snapshot(root.path()), before);
 }
 
+/// 正式 console 导入必须保留参数边界、结构化结果和幂等性，不启动桌面窗口。
+#[test]
+fn profile_import_console_previews_and_imports_once() {
+    let fixture = tempfile::tempdir().expect("隔离导入数据根");
+    let source = fixture.path().join("旧来源 目录");
+    let target = fixture.path().join("新目标 目录");
+    fs::create_dir_all(source.join("profiles")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(
+        source.join("profiles/work.toml"),
+        concat!(
+            "schema_version = 1\nid = \"work\"\nname = \"Work\"\nshell = \"cmd.exe\"\nargs = []\n",
+            "env = { PASSWORD = \"isolated-import-secret\" }\nis_default = true\nsort_order = 0\n",
+            "created_at = \"1\"\nupdated_at = \"1\"\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        target.join(".kerminal-format.toml"),
+        b"data_format = 4\nmigration_contract = 3\n",
+    )
+    .unwrap();
+    let source_before = snapshot(&source);
+    let target_before = snapshot(&target);
+    let invoke = |mode| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kerminal-migrate"));
+        command.args([
+            OsStr::new("--import-legacy-profiles"),
+            source.as_os_str(),
+            OsStr::new("--target"),
+            target.as_os_str(),
+            OsStr::new(mode),
+        ]);
+        run_bounded(command)
+    };
+    let preview = invoke("--dry-run");
+    assert!(preview.status.success());
+    let preview_document = document(&preview);
+    assert_eq!(preview_document["preview"]["newProfiles"], 1);
+    assert_eq!(preview_document["preview"]["newHosts"], 1);
+    assert!(!String::from_utf8_lossy(&preview.stdout).contains("isolated-import-secret"));
+    assert_eq!(snapshot(&source), source_before);
+    assert_eq!(snapshot(&target), target_before);
+
+    let applied = invoke("--apply");
+    assert!(applied.status.success());
+    assert_eq!(document(&applied)["report"]["outcome"], "migrated");
+    assert_eq!(snapshot(&source), source_before);
+    let committed = snapshot(&target);
+    let repeated = invoke("--apply");
+    assert!(repeated.status.success());
+    assert_eq!(document(&repeated)["report"]["outcome"], "alreadyCurrent");
+    assert_eq!(snapshot(&target), committed);
+
+    let invalid = run_bounded({
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kerminal-migrate"));
+        command.args([OsStr::new("--import-legacy-profiles"), source.as_os_str()]);
+        command
+    });
+    assert_eq!(invalid.status.code(), Some(2));
+    assert_eq!(document(&invalid)["code"], "invalid_arguments");
+}
+
 /// 参数错误先于根解析与迁移执行，错误 JSON 不回显未知输入或潜在敏感路径。
 ///
 /// @author kongweiguang

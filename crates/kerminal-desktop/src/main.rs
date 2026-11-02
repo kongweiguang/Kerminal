@@ -23,11 +23,13 @@ mod fonts;
 mod host_coordinator;
 mod logging;
 mod platform_lifecycle;
+mod profile_import;
 #[cfg(feature = "right-rail-acceptance")]
 mod right_rail_acceptance;
 mod runtime;
 #[cfg(feature = "right-rail-acceptance")]
 mod settings_acceptance;
+mod update_configuration;
 
 use std::{
     error::Error,
@@ -96,13 +98,35 @@ type StartupError = Arc<Mutex<Option<String>>>;
 #[action(name = "kerminal.requestQuit", no_json, no_register)]
 struct MacApplicationQuit;
 
-/// 解析根目录后先完成同一 Rust 迁移用例；失败时不得初始化 runtime、单实例、日志或业务服务。
+/// 验收入口先限定隔离环境；普通启动先完成同一 Rust 迁移用例，失败时不得初始化业务服务。
 ///
 /// @author kongweiguang
 fn main() {
     // 离线校验必须早于配置迁移和桌面初始化；脚本只能读取显式指定的根目录。
     if let Some(exit_code) = configuration_validation::run_from_args(std::env::args_os().skip(1)) {
         std::process::exit(exit_code);
+    }
+    // 导入只接收显式来源、目标与执行模式，不能让普通启动触及旧版真实数据。
+    if let Some(exit_code) = profile_import::run_from_args(std::env::args_os().skip(1)) {
+        std::process::exit(exit_code);
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--right-rail-drag-acceptance")
+    {
+        #[cfg(all(windows, feature = "right-rail-acceptance"))]
+        {
+            if let Err(error) = right_rail_acceptance::run_drag_acceptance() {
+                eprintln!("右栏拖拽验收运行失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(all(windows, feature = "right-rail-acceptance")))]
+        {
+            eprintln!("右栏拖拽验收仅在启用 right-rail-acceptance 的 Windows 构建中可用。");
+            std::process::exit(2);
+        }
     }
     #[cfg(feature = "right-rail-acceptance")]
     let settings_acceptance_requested = settings_acceptance::requested();

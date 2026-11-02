@@ -1907,7 +1907,10 @@ async fn authenticate_peer(
     }
 }
 
-/// 使用系统 SSH agent 逐个尝试身份；私钥不离开 agent，Windows 优先连接 OpenSSH named pipe。
+/// 使用系统 SSH agent 逐个尝试身份；不可用的认证提供方映射为稳定认证错误，保留脱敏诊断源。
+/// 私钥不离开 agent，Windows 优先连接 OpenSSH named pipe。
+///
+/// @author kongweiguang
 async fn authenticate_agent(
     session: &Arc<RusshPeerSession>,
     cancel: &CancellationToken,
@@ -1918,7 +1921,7 @@ async fn authenticate_agent(
         _ = cancel.cancelled() => return Err(AppError::cancelled("SSH agent connection cancelled")),
         result = tokio::time::timeout(connect_timeout(timeout_ms), AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")) => match result {
             Ok(Ok(agent)) => agent,
-            Ok(Err(error)) => return Err(AppError::infrastructure_with_source("SSH agent connection failed", error)),
+            Ok(Err(error)) => return Err(unavailable_ssh_agent(error)),
             Err(_) => return Err(AppError::timeout("SSH agent connection")),
         }
     };
@@ -1927,7 +1930,7 @@ async fn authenticate_agent(
         _ = cancel.cancelled() => return Err(AppError::cancelled("SSH agent connection cancelled")),
         result = tokio::time::timeout(connect_timeout(timeout_ms), AgentClient::connect_env()) => match result {
             Ok(Ok(agent)) => agent,
-            Ok(Err(error)) => return Err(AppError::infrastructure_with_source("SSH agent connection failed", error)),
+            Ok(Err(error)) => return Err(unavailable_ssh_agent(error)),
             Err(_) => return Err(AppError::timeout("SSH agent connection")),
         }
     };
@@ -1942,7 +1945,7 @@ async fn authenticate_agent(
             _ = cancel.cancelled() => return Err(AppError::cancelled("SSH agent identity request cancelled")),
             result = tokio::time::timeout(connect_timeout(timeout_ms), agent.request_identities()) => match result {
                 Ok(Ok(identities)) => identities,
-                Ok(Err(error)) => return Err(AppError::infrastructure_with_source("SSH agent identity request failed", error)),
+                Ok(Err(error)) => return Err(unavailable_ssh_agent(error)),
                 Err(_) => return Err(AppError::timeout("SSH agent identity request")),
             }
         };
@@ -1963,6 +1966,13 @@ async fn authenticate_agent(
         }
         Err(AppError::authentication_failed())
     }
+}
+
+/// 将认证提供方不可用转为稳定认证分类，底层原因仅留在受控的诊断链中。
+///
+/// @author kongweiguang
+fn unavailable_ssh_agent(error: impl std::error::Error + Send + Sync + 'static) -> AppError {
+    AppError::authentication_failed().with_source(error)
 }
 
 /// 使用 Tokio TCP stream 连接最外层 endpoint，超时与用户取消均可中止网络拨号。
@@ -2209,6 +2219,10 @@ fn is_expected_local_disconnect(
 #[cfg(test)]
 #[path = "../../tests/unit/ssh_disconnect.rs"]
 mod disconnect_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/ssh_agent_error.rs"]
+mod agent_error_tests;
 
 #[cfg(test)]
 #[path = "../../tests/unit/ssh_proxy_reference.rs"]

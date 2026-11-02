@@ -5,8 +5,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
+    path::Path,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -83,6 +84,8 @@ struct TransferServiceInner {
     recovery_repository: Arc<dyn TransferRecoveryRepository>,
     host_management: Option<Arc<HostManagementService>>,
     records: Mutex<BTreeMap<TransferId, TransferRecord>>,
+    /// 标记会随历史快照收缩，所有视图都能区分暂存准备与最终目标复制。
+    drag_staging_ids: StdMutex<HashMap<TransferId, bool>>,
     host_slots: Mutex<HashMap<HostId, Arc<Semaphore>>>,
     global_slots: Arc<Semaphore>,
     events: broadcast::Sender<TransferQueueEvent>,
@@ -96,6 +99,10 @@ struct TransferServiceInner {
 
 struct TransferRecord {
     task: TransferTask,
+    /// 重启后仍需要区分暂存准备和最终目标传输。
+    drag_staging: bool,
+    /// 有效拖动仍持有暂存，不能人工清除对应队列记录。
+    drag_evidence_pending: bool,
     checkpoint: Option<TransferCheckpoint>,
     staging_ownership: Vec<TransferStagingOwnership>,
     sftp_policy: Option<SftpTransferPolicySnapshot>,
@@ -266,6 +273,7 @@ impl TransferService {
                 recovery_repository,
                 host_management,
                 records: Mutex::new(BTreeMap::new()),
+                drag_staging_ids: StdMutex::new(HashMap::new()),
                 host_slots: Mutex::new(HashMap::new()),
                 global_slots: Arc::new(Semaphore::new(options.max_concurrent)),
                 events,
@@ -283,7 +291,7 @@ impl TransferService {
     ///
     /// @author kongweiguang
     pub async fn enqueue(&self, request: TransferRequest) -> AppResult<TransferSummary> {
-        self.enqueue_inner(request, None).await
+        self.enqueue_inner(request, None, false).await
     }
 
     /// 为一次性外部连接显式保留活动传输 scope，普通 MCP/保存主机请求不能冒用该入口。
@@ -300,7 +308,60 @@ impl TransferService {
             return Err(AppError::invalid("临时外部目标与传输端点不匹配"));
         }
         let retained_lease = lease.retain()?;
-        self.enqueue_inner(request, Some(retained_lease)).await
+        self.enqueue_inner(request, Some(retained_lease), false)
+            .await
+    }
+
+    /// 暂存任务在发布首个队列快照前标记用途，避免界面把准备结果当作系统目标复制。
+    ///
+    /// @author kongweiguang
+    pub async fn enqueue_drag_staging(
+        &self,
+        request: TransferRequest,
+        lease: Option<&ExternalTargetLease>,
+    ) -> AppResult<TransferSummary> {
+        if !matches!(
+            &request.destination,
+            kerminal_domain::files::FileEndpoint::Local { .. }
+        ) {
+            return Err(AppError::invalid("拖出准备只能暂存到本机"));
+        }
+        let retained = match lease {
+            Some(lease) => {
+                let host = external_host_for_request(&request)?
+                    .ok_or_else(|| AppError::invalid("传输请求没有使用临时外部目标"))?;
+                if &host != lease.host_id() {
+                    return Err(AppError::invalid("临时外部目标与传输端点不匹配"));
+                }
+                Some(lease.retain()?)
+            }
+            None => None,
+        };
+        self.enqueue_inner(request, retained, true).await
+    }
+
+    /// 标记仅描述当前内存队列中的任务，不从临时路径名称猜测传输目的。
+    ///
+    /// @author kongweiguang
+    pub fn is_drag_staging(&self, id: &TransferId) -> bool {
+        self.inner
+            .drag_staging_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(id)
+    }
+
+    /// 活跃目标持有拖出副本时，界面不能将该任务标成可清除历史。
+    ///
+    /// @author kongweiguang
+    pub fn is_drag_staging_pending_delivery(&self, id: &TransferId) -> bool {
+        self.inner
+            .drag_staging_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// 校验请求并固化本任务保护阈值，把临时 scope 放入 worker 所属记录以隔离 pane 生命周期。
@@ -311,6 +372,7 @@ impl TransferService {
         &self,
         request: TransferRequest,
         external_target_lease: Option<ExternalTargetLease>,
+        drag_staging: bool,
     ) -> AppResult<TransferSummary> {
         let _intake = self.inner.intake_lock.lock().await;
         self.ensure_open()?;
@@ -371,6 +433,8 @@ impl TransferService {
             }
             let record = TransferRecord {
                 task,
+                drag_staging,
+                drag_evidence_pending: drag_staging,
                 checkpoint: None,
                 staging_ownership: Vec::new(),
                 sftp_policy,
@@ -393,6 +457,13 @@ impl TransferService {
             self.persist_recovery_record(&record).await?;
             let summary = record.summary();
             records.insert(id.clone(), record);
+            if drag_staging {
+                self.inner
+                    .drag_staging_ids
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(id.clone(), true);
+            }
             publish(&self.inner.events);
             // 首次返回值与列表查询共用同一快照，避免默认保护值在两处出现差异。
             summary
@@ -401,15 +472,19 @@ impl TransferService {
         Ok(summary)
     }
 
-    /// 返回当前保留的任务快照；事件频道只作唤醒通知，调用方以此查询重建完整状态。
+    /// 返回入队时间倒序的权威快照；UUID 不表达时间，重试作为新任务拥有新序号。
+    ///
+    /// @author kongweiguang
     pub async fn list(&self) -> Vec<TransferSummary> {
+        let records = self.inner.records.lock().await;
         self.inner
-            .records
+            .drag_staging_ids
             .lock()
-            .await
-            .values()
-            .map(|record| record.summary())
-            .collect()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|id, _| records.contains_key(id));
+        let mut ordered = records.values().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|record| std::cmp::Reverse(record.sequence));
+        ordered.into_iter().map(|record| record.summary()).collect()
     }
 
     /// 恢复项只读加载，不恢复 worker 或 SSH lease；活跃任务仍由普通队列独占展示。
@@ -422,7 +497,8 @@ impl TransferService {
         recovery.retain(|record| {
             records.get(&record.id).is_none_or(|live| {
                 is_terminal(live.task.status())
-                    && (live.task.failure_kind() == Some(TransferFailureKind::CommitUnknown)
+                    && ((live.drag_staging && !live.drag_evidence_pending)
+                        || live.task.failure_kind() == Some(TransferFailureKind::CommitUnknown)
                         || live.cleanup_owner.is_some())
             })
         });
@@ -508,6 +584,16 @@ impl TransferService {
         {
             return Err(AppError::conflict("原传输仍有资源 owner，请先重试清理"));
         }
+        if self
+            .inner
+            .records
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|live| live.drag_evidence_pending)
+        {
+            return Err(AppError::conflict("拖出仍在使用准备副本，暂不能归档"));
+        }
         self.inner
             .recovery_repository
             .archive(id, cancellation)
@@ -523,6 +609,11 @@ impl TransferService {
                     .is_none_or(|worker| worker.is_finished())
         }) {
             records.remove(id);
+            self.inner
+                .drag_staging_ids
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(id);
         }
         publish(&self.inner.events);
         Ok(())
@@ -593,7 +684,8 @@ impl TransferService {
         if matches!(
             summary.status,
             TransferStatus::Succeeded | TransferStatus::Skipped | TransferStatus::Unchanged
-        ) && record.cleanup_owner.is_none()
+        ) && !record.drag_staging
+            && record.cleanup_owner.is_none()
             && record.attempt_finished
         {
             return self
@@ -621,6 +713,7 @@ impl TransferService {
                 TransferRecoveryRecord {
                     id: summary.id,
                     request: summary.request,
+                    drag_staging: record.drag_staging,
                     actual_destination: summary.actual_destination,
                     checkpoint,
                     staging_ownership: record.staging_ownership.clone(),
@@ -650,6 +743,111 @@ impl TransferService {
             .get(id)
             .map(|record| record.summary())
             .ok_or_else(|| AppError::not_found("传输任务不存在"))
+    }
+
+    /// 暂存交接需要等待后端整个尝试退出，终态提交回执本身不证明资源已经收尾。
+    ///
+    /// @author kongweiguang
+    pub async fn get_settled(&self, id: &TransferId) -> AppResult<Option<TransferSummary>> {
+        let records = self.inner.records.lock().await;
+        let record = records
+            .get(id)
+            .ok_or_else(|| AppError::not_found("传输任务不存在"))?;
+        Ok(
+            (record.attempt_finished && is_terminal(record.task.status()))
+                .then(|| record.summary()),
+        )
+    }
+
+    /// 拖出目录只能在每个任务都已结束且不存在未知提交或待清理 owner 后删除。
+    ///
+    /// @author kongweiguang
+    pub async fn validate_drag_staging_release(&self, directory: &Path) -> AppResult<()> {
+        let records = self.inner.records.lock().await;
+        for record in records
+            .values()
+            .filter(|record| is_drag_record_in_directory(record, directory))
+        {
+            if !record.attempt_finished
+                || !is_terminal(record.task.status())
+                || record.cleanup_owner.is_some()
+                || record.task.failure_kind() == Some(TransferFailureKind::CommitUnknown)
+            {
+                return Err(AppError::outcome_unknown(
+                    "拖出准备的传输或清理仍未确认结束",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 本机暂存已删除后才移除持久恢复记录，部分失败保留剩余事实以供人工核对。
+    ///
+    /// @author kongweiguang
+    pub async fn release_drag_staging_evidence(&self, directory: &Path) -> AppResult<()> {
+        let _shutdown = self.inner.shutdown_lock.lock().await;
+        let _intake = self.inner.intake_lock.lock().await;
+        let mut records = self.inner.records.lock().await;
+        let ids = records
+            .iter()
+            .filter(|(_, record)| is_drag_record_in_directory(record, directory))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            let record = records
+                .get(&id)
+                .ok_or_else(|| AppError::not_found("拖出准备记录不存在"))?;
+            if !record.attempt_finished
+                || !is_terminal(record.task.status())
+                || record.cleanup_owner.is_some()
+                || record.task.failure_kind() == Some(TransferFailureKind::CommitUnknown)
+            {
+                return Err(AppError::outcome_unknown(
+                    "拖出准备的传输或清理仍未确认结束",
+                ));
+            }
+            self.inner
+                .recovery_repository
+                .remove(&id, CancellationToken::new())
+                .await?;
+            if let Some(record) = records.get_mut(&id) {
+                record.drag_evidence_pending = false;
+            }
+            if let Some(pending) = self
+                .inner
+                .drag_staging_ids
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_mut(&id)
+            {
+                *pending = false;
+            }
+        }
+        publish(&self.inner.events);
+        Ok(())
+    }
+
+    /// 结果未知时保留全部持久证据并让恢复列表可见，包括迟到完成的旧代拖动。
+    ///
+    /// @author kongweiguang
+    pub async fn expose_drag_staging_evidence(&self, directory: &Path) {
+        let mut records = self.inner.records.lock().await;
+        for (id, record) in records
+            .iter_mut()
+            .filter(|(_, record)| is_drag_record_in_directory(record, directory))
+        {
+            record.drag_evidence_pending = false;
+            if let Some(pending) = self
+                .inner
+                .drag_staging_ids
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_mut(id)
+            {
+                *pending = false;
+            }
+        }
+        publish(&self.inner.events);
     }
 
     /// 先 join 可清理终态任务的 worker，再移除历史；删除线性化前可取消，并保留待核对提交与待清理 owner。
@@ -802,8 +1000,16 @@ impl TransferService {
                 })
             })
             .collect::<Vec<_>>();
-        for id in &removed {
-            records.remove(id);
+        {
+            let mut markers = self
+                .inner
+                .drag_staging_ids
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for id in &removed {
+                records.remove(id);
+                markers.remove(id);
+            }
         }
         let remaining = records.len();
         if !removed.is_empty() {
@@ -914,6 +1120,9 @@ impl TransferService {
         id: &TransferId,
         external_lease: Option<&ExternalTargetLease>,
     ) -> AppResult<TransferSummary> {
+        if self.is_drag_staging(id) {
+            return Err(AppError::conflict("拖出准备已结束，请重新拖动以创建新任务"));
+        }
         let _intake = self.inner.intake_lock.lock().await;
         self.ensure_open()?;
         let successor = TransferId::new();
@@ -991,6 +1200,8 @@ impl TransferService {
             }
             let record = TransferRecord {
                 task,
+                drag_staging: false,
+                drag_evidence_pending: false,
                 checkpoint,
                 staging_ownership,
                 sftp_policy,
@@ -1234,6 +1445,7 @@ impl TransferService {
             if self.persist_recovery_record(record).await.is_err() {
                 tracing::error!(transfer_id = %id, "传输终态恢复材料未确认保存；保留提交前证据等待核对");
             }
+            publish(&self.inner.events);
         }
     }
 
@@ -1992,7 +2204,11 @@ impl TransferService {
         record.checkpoint = None;
         record.phase = None;
         publish(&self.inner.events);
-        prune_history(&mut records, self.inner.options.max_history);
+        prune_history(
+            &mut records,
+            self.inner.options.max_history,
+            &self.inner.drag_staging_ids,
+        );
         Ok(summary)
     }
 
@@ -2012,7 +2228,11 @@ impl TransferService {
         record.no_changes_finalized = true;
         record.phase = None;
         publish(&self.inner.events);
-        prune_history(&mut records, self.inner.options.max_history);
+        prune_history(
+            &mut records,
+            self.inner.options.max_history,
+            &self.inner.drag_staging_ids,
+        );
         Ok(summary)
     }
 
@@ -2061,7 +2281,11 @@ impl TransferService {
             Some(_) => return Err(AppError::conflict("清理 owner 已变化，拒绝陈旧释放回执")),
             None => return Ok(()),
         }
-        prune_history(&mut records, self.inner.options.max_history);
+        prune_history(
+            &mut records,
+            self.inner.options.max_history,
+            &self.inner.drag_staging_ids,
+        );
         Ok(())
     }
 
@@ -2234,7 +2458,11 @@ impl TransferService {
             record.checkpoint = None;
             record.external_target_lease.take();
             publish(&self.inner.events);
-            prune_history(&mut records, self.inner.options.max_history);
+            prune_history(
+                &mut records,
+                self.inner.options.max_history,
+                &self.inner.drag_staging_ids,
+            );
             return;
         }
         let commit_unknown = record.task.commit_item_in_progress();
@@ -2328,7 +2556,11 @@ impl TransferService {
             record.external_target_lease.take();
         }
         publish(&self.inner.events);
-        prune_history(&mut records, self.inner.options.max_history);
+        prune_history(
+            &mut records,
+            self.inner.options.max_history,
+            &self.inner.drag_staging_ids,
+        );
     }
 
     /// 后端确认资源释放后才确认取消；提交期间或已有未知结果时保留目标 scope 供回读。
@@ -2380,7 +2612,11 @@ impl TransferService {
             record.external_target_lease.take();
         }
         publish(&self.inner.events);
-        prune_history(&mut records, self.inner.options.max_history);
+        prune_history(
+            &mut records,
+            self.inner.options.max_history,
+            &self.inner.drag_staging_ids,
+        );
     }
 
     /// worker 异常按提交边界落入安全终态；记录锁等待服从同一个退出 deadline。
@@ -2449,11 +2685,20 @@ fn is_terminal(status: TransferStatus) -> bool {
     )
 }
 
+/// 目录来自本次唯一暂存 owner，只匹配其直接子项，不依据名字猜测任务用途。
+///
+/// @author kongweiguang
+fn is_drag_record_in_directory(record: &TransferRecord, directory: &Path) -> bool {
+    record.drag_staging
+        && matches!(&record.task.request().destination, kerminal_domain::files::FileEndpoint::Local { path } if path.parent() == Some(directory))
+}
+
 /// 统一判定手动清理与自动裁剪可移除的历史，保留待人工核对或仍持有资源引用的记录。
 ///
 /// @author kongweiguang
 fn is_removable_history_record(record: &TransferRecord) -> bool {
     is_terminal(record.task.status())
+        && !record.drag_evidence_pending
         && record.cleanup_owner.is_none()
         && record.external_target_lease.is_none()
         && record.task.failure_kind() != Some(TransferFailureKind::CommitUnknown)
@@ -2624,9 +2869,14 @@ fn same_parent_directory(
 }
 
 /// 仅裁剪普通终态历史；未知提交、待清理 owner 和临时目标租约必须留在队列供恢复或核对。
+/// 删除记录时同步释放拖出标记，不依赖视图下一次读取；调用方始终先持 records 锁再取标记锁。
 ///
 /// @author kongweiguang
-fn prune_history(records: &mut BTreeMap<TransferId, TransferRecord>, max_history: usize) {
+fn prune_history(
+    records: &mut BTreeMap<TransferId, TransferRecord>,
+    max_history: usize,
+    drag_staging_ids: &StdMutex<HashMap<TransferId, bool>>,
+) {
     let mut terminal = records
         .iter()
         .filter(|(_, record)| {
@@ -2643,8 +2893,12 @@ fn prune_history(records: &mut BTreeMap<TransferId, TransferRecord>, max_history
     }
     terminal.sort_unstable_by_key(|(sequence, _)| *sequence);
     let excess = terminal.len().saturating_sub(max_history);
+    let mut markers = drag_staging_ids
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     for (_, id) in terminal.into_iter().take(excess) {
         records.remove(&id);
+        markers.remove(&id);
     }
 }
 

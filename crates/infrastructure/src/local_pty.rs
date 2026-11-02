@@ -114,6 +114,7 @@ impl SessionTransportFactory for LocalPtySessionTransportFactory {
             shell_dialect,
             process_id,
             shell_integration_enabled,
+            shell_editing_nonce,
         ) = spawn_local_process(target.clone(), size, cancel.clone()).await?;
         let (exit_sender, exit_receiver) = watch::channel(None);
         let closing = Arc::new(AtomicBool::new(false));
@@ -160,7 +161,8 @@ impl SessionTransportFactory for LocalPtySessionTransportFactory {
         let transport = SessionTransport::new(reader_stream, writer_bridge, control)
             .with_shell_dialect(shell_dialect)
             .with_process_id(process_id)
-            .with_shell_integration_enabled(shell_integration_enabled);
+            .with_shell_integration_enabled(shell_integration_enabled)
+            .with_shell_editing_nonce(shell_editing_nonce);
         if cancel.is_cancelled() {
             return Err(SessionTransportOpenError::with_cleanup(
                 AppError::cancelled("本地终端创建已取消"),
@@ -212,6 +214,7 @@ async fn spawn_local_process(
         RemoteShellDialect,
         Option<u32>,
         bool,
+        Option<String>,
     ),
     SessionTransportOpenError,
 > {
@@ -337,6 +340,7 @@ async fn spawn_local_process(
             startup.dialect,
             process_id,
             shell_integration_enabled,
+            startup.editing_nonce,
         ))
     })
     .await

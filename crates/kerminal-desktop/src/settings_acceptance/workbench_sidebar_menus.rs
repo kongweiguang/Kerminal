@@ -7,7 +7,6 @@ use super::*;
 /// 每个主题使用生产菜单和真正的编辑器入口，截图与动作结果分别保留，避免用静态像素替代接线。
 pub(super) async fn capture(
     cx: &mut AsyncApp,
-    root: &Entity<RootView>,
     window: AnyWindowHandle,
     directory: &Path,
     theme: &str,
@@ -55,6 +54,20 @@ pub(super) async fn capture(
             return Err(
                 io::Error::other(format!("{target} menu lacks {wanted:?}: {labels:?}")).into(),
             );
+        }
+        if target == "host" {
+            for (removed_zh, removed_en) in [
+                ("查看连接详情", "Connection details"),
+                ("容器", "Containers"),
+            ] {
+                let removed = kerminal_ui::locale::text(removed_zh, removed_en).to_string();
+                if labels.contains(&removed) {
+                    return Err(io::Error::other(format!(
+                        "{target} menu retained removed action {removed:?}: {labels:?}"
+                    ))
+                    .into());
+                }
+            }
         }
         let refresh = kerminal_ui::locale::text("刷新主机列表", "Refresh hosts").to_string();
         if target != "background" && labels.contains(&refresh) {
@@ -120,89 +133,6 @@ pub(super) async fn capture(
     fs::write(
         directory.join(format!("sidebar-menus-{theme}.json")),
         serde_json::to_vec_pretty(&records)?,
-    )?;
-    if theme == "system" {
-        capture_connection_failure(cx, root, window, directory).await?;
-    }
-    Ok(())
-}
-
-/// 使用拒绝连接的本机隔离地址覆盖后台预检失败，验证本地化恢复指引可见且不借用本地终端。
-/// @author kongweiguang
-async fn capture_connection_failure(
-    cx: &mut AsyncApp,
-    root: &Entity<RootView>,
-    window: AnyWindowHandle,
-    directory: &Path,
-) -> Result<(), Box<dyn Error>> {
-    let (before_local, before_status) = root.read_with(cx, |root, _| {
-        (
-            root.workbench_acceptance_local_state(),
-            root.workbench_acceptance_terminal_creation_state().2,
-        )
-    });
-    right_click(
-        cx,
-        window,
-        &format!("host-navigation-host-{WORKBENCH_HOST_ID}"),
-    )?;
-    wait_for_menu(cx, window, true).await?;
-    click_menu_label(cx, window, &kerminal_ui::locale::text("容器", "Containers"))?;
-    let deadline = Instant::now() + ACTION_TIMEOUT;
-    let message = loop {
-        window.update(cx, |_, window, app| {
-            window.refresh();
-            draw_acceptance_frame(window, app);
-        })?;
-        let (busy, owner, status) = root.read_with(cx, |root, _| {
-            root.workbench_acceptance_terminal_creation_state()
-        });
-        if !busy
-            && !owner
-            && status != before_status
-            && let Some(message) = status
-        {
-            break message;
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::other(
-                "sidebar container preflight failure was not visible in the workbench",
-            )
-            .into());
-        }
-        cx.background_executor().timer(POLL_INTERVAL).await;
-    };
-    let expected = kerminal_ui::locale::text(
-        "无法连接 SSH 主机，请检查网络、地址和端口后重试。",
-        "Cannot connect to the SSH host. Check the network, address and port, then retry.",
-    );
-    if message != expected.as_ref() {
-        return Err(io::Error::other(format!(
-            "sidebar failure did not show the localized recovery guidance: {message:?}"
-        ))
-        .into());
-    }
-    let after_local = root.read_with(cx, |root, _| root.workbench_acceptance_local_state());
-    if before_local != after_local {
-        return Err(io::Error::other(
-            "failed SSH container request changed the local terminal sessions",
-        )
-        .into());
-    }
-    let capture = save_frame(
-        cx,
-        window,
-        directory.join("sidebar-container-preflight-failure.png"),
-    )?;
-    fs::write(
-        directory.join("sidebar-container-preflight-failure.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "workbenchFailureVisible": true,
-            "terminalCreationIdle": true,
-            "localSessionsUnchanged": true,
-            "message": message,
-            "capture": capture,
-        }))?,
     )?;
     Ok(())
 }

@@ -1,12 +1,14 @@
 //! Window roots and presentation-layer plugins.
+//!
+//! @author kongweiguang
 use crate::input::Copy;
 use crate::{StyledExt, TextSelectionLayer};
 use gpui::{
-    AnyElement, AnyView, App, AppContext, ClipboardItem, Context, Div, Entity, Global,
+    AnyElement, AnyView, App, AppContext, ClipboardItem, Context, Div, ElementId, Entity, Global,
     InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, Stateful, StyleRefinement,
     Styled, Window, actions, div,
 };
-use std::{any::TypeId, rc::Rc};
+use std::{any::TypeId, collections::HashSet, rc::Rc};
 
 actions!(root, [Tab, TabPrev]);
 const CONTEXT: &str = "Root";
@@ -191,6 +193,10 @@ impl Root {
             .expect("window must have a Base Root");
         root.update(cx, |root, cx| f(root, window, cx))
     }
+    /// 在当前已绘制的有限 Tab 顺序中完成一轮查找，避免密集页面超过固定步数后泄露焦点。
+    /// 记录所有外部焦点状态，兼容共享句柄产生的不经过入口的环；没有可用目标时恢复原焦点。
+    ///
+    /// @author kongweiguang
     fn on_action_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
         // Check if we're inside a focus trap
         if let Some(container_focus_handle) = crate::active_focus_trap(window, cx) {
@@ -204,19 +210,16 @@ impl Root {
             if !container_focus_handle.contains_focused(window, cx) {
                 // We jumped out of the trap - need to cycle back to the beginning
                 // Find the first focusable element in the trap by continuing to focus_next
-                let mut attempts = 0;
-                const MAX_ATTEMPTS: usize = 100; // Prevent infinite loop
+                let mut visited = HashSet::new();
 
-                while !container_focus_handle.contains_focused(window, cx)
-                    && attempts < MAX_ATTEMPTS
-                {
-                    window.focus_next(cx);
-                    attempts += 1;
-
-                    // If we cycled back to where we started, restore original focus
-                    if window.focused(cx) == before_focus {
+                while !container_focus_handle.contains_focused(window, cx) {
+                    if !visited.insert(window.focused(cx).as_ref().map(ElementId::from)) {
+                        if let Some(before_focus) = before_focus {
+                            window.focus(&before_focus, cx);
+                        }
                         break;
                     }
+                    window.focus_next(cx);
                 }
             }
             return;
@@ -226,6 +229,10 @@ impl Root {
         window.focus_next(cx);
     }
 
+    /// 反向导航也按完整有限循环判断边界，保持大量背景控件下的 Shift+Tab 与 Tab 对称。
+    /// 共享句柄造成重复状态或当前 trap 没有可聚焦目标时保留入口焦点，避免 UI 线程死循环。
+    ///
+    /// @author kongweiguang
     fn on_action_tab_prev(&mut self, _: &TabPrev, window: &mut Window, cx: &mut Context<Self>) {
         // Check if we're inside a focus trap
         if let Some(container_focus_handle) = crate::active_focus_trap(window, cx) {
@@ -239,19 +246,16 @@ impl Root {
             if !container_focus_handle.contains_focused(window, cx) {
                 // We jumped out of the trap - need to cycle back to the end
                 // Find the last focusable element in the trap by continuing to focus_prev
-                let mut attempts = 0;
-                const MAX_ATTEMPTS: usize = 100; // Prevent infinite loop
+                let mut visited = HashSet::new();
 
-                while !container_focus_handle.contains_focused(window, cx)
-                    && attempts < MAX_ATTEMPTS
-                {
-                    window.focus_prev(cx);
-                    attempts += 1;
-
-                    // If we cycled back to where we started, restore original focus
-                    if window.focused(cx) == before_focus {
+                while !container_focus_handle.contains_focused(window, cx) {
+                    if !visited.insert(window.focused(cx).as_ref().map(ElementId::from)) {
+                        if let Some(before_focus) = before_focus {
+                            window.focus(&before_focus, cx);
+                        }
                         break;
                     }
+                    window.focus_prev(cx);
                 }
             }
             return;

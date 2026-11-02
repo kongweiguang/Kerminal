@@ -233,6 +233,7 @@ impl AgentArchiveConfirmationOwner {
 struct AgentLifecycleOperation {
     target_id: AgentSessionId,
     selected_before: Option<AgentSessionId>,
+    select_after_success: bool,
     terminal_feedback_reset: AgentTerminalFeedbackReset,
     pending: (&'static str, &'static str),
     success: (&'static str, &'static str),
@@ -308,6 +309,8 @@ pub struct AgentsPanel {
     launcher_selection_error: Option<String>,
     launcher_generation: u64,
     context_preview: Option<String>,
+    context_preview_owner: Option<AgentSessionId>,
+    context_preview_target: Option<AgentTargetBinding>,
     context_preview_generation: u64,
     context_preview_loading: bool,
     theme_mode: kerminal_application::preferences::ThemeMode,
@@ -316,6 +319,7 @@ pub struct AgentsPanel {
     operation_cancellation: Option<CancellationToken>,
     loading: bool,
     sessions_verified: bool,
+    history_load_error: Option<String>,
     status: Option<String>,
     terminal_feedback: Vec<AgentTerminalFeedback>,
     launcher_setup_prompt: bool,
@@ -388,6 +392,8 @@ impl AgentsPanel {
             launcher_selection_error: None,
             launcher_generation: 0,
             context_preview: None,
+            context_preview_owner: None,
+            context_preview_target: None,
             context_preview_generation: 0,
             context_preview_loading: false,
             theme_mode: kerminal_application::preferences::ThemeMode::System,
@@ -396,6 +402,7 @@ impl AgentsPanel {
             operation_cancellation: None,
             loading: false,
             sessions_verified: false,
+            history_load_error: None,
             status: None,
             terminal_feedback: Vec::new(),
             launcher_setup_prompt: false,
@@ -670,12 +677,14 @@ impl AgentsPanel {
             .map(|terminal| terminal.session_id.clone())
     }
 
-    /// 作废旧选择的预览响应，并结束预览专属忙碌状态，避免迟到结果覆盖新会话。
+    /// 作废旧预览 owner 的响应，并结束预览专属忙碌状态，避免迟到结果覆盖新会话。
     ///
     /// @author kongweiguang
     fn invalidate_context_preview(&mut self) {
         self.context_preview_generation = self.context_preview_generation.wrapping_add(1).max(1);
         self.context_preview = None;
+        self.context_preview_owner = None;
+        self.context_preview_target = None;
         if self.context_preview_loading {
             self.context_preview_loading = false;
             self.busy = false;

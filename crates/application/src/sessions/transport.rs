@@ -125,6 +125,8 @@ pub struct SessionTransport {
     pub process_id: Option<u32>,
     /// Provider 确认 hook 已准备或已注入；不代表 PTY 已送达首次 prompt marker。
     pub shell_integration_enabled: bool,
+    /// 仅与本次 bootstrap 配对的编辑协议 nonce；未经预先绑定的消息不具备能力证明。
+    pub shell_editing_nonce: Option<String>,
 }
 
 impl SessionTransport {
@@ -144,6 +146,7 @@ impl SessionTransport {
             shell_dialect: RemoteShellDialect::Unknown,
             process_id: None,
             shell_integration_enabled: false,
+            shell_editing_nonce: None,
         }
     }
 
@@ -168,6 +171,14 @@ impl SessionTransport {
     /// @author kongweiguang
     pub fn with_shell_integration_enabled(mut self, enabled: bool) -> Self {
         self.shell_integration_enabled = enabled;
+        self
+    }
+
+    /// 保留启动时独立生成的 nonce，以便 reader 拒绝旧连接或无关 Shell 的私有消息。
+    ///
+    /// @author kongweiguang
+    pub fn with_shell_editing_nonce(mut self, nonce: Option<String>) -> Self {
+        self.shell_editing_nonce = nonce;
         self
     }
 }

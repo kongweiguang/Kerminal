@@ -2,6 +2,9 @@
 //!
 //! @author kongweiguang
 
+mod container_presentation;
+#[cfg(windows)]
+mod drag;
 mod functional;
 mod functional_agent;
 mod functional_compose;
@@ -10,11 +13,15 @@ mod functional_forwarding;
 mod functional_logs;
 mod functional_snippets;
 mod functional_tmux_attach;
+mod functional_transfer_restart;
+mod functional_transfer_workspace;
 mod functional_transfers;
 pub(crate) mod isolation;
 mod menus;
 mod shell;
+mod snippet_feedback;
 mod snippet_import;
+mod tmux_presentation;
 
 use std::{
     error::Error,
@@ -92,6 +99,10 @@ struct AcceptanceReport {
     window_height: f32,
     functional: Vec<functional::FunctionalRecord>,
     themes: Vec<ThemeCaptureRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tmux_presentations: Vec<StateCaptureRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    container_presentations: Vec<container_presentation::ContainerThemeCaptureRecord>,
 }
 
 #[derive(Serialize)]
@@ -104,6 +115,7 @@ struct ThemeCaptureRecord {
     states: Vec<StateCaptureRecord>,
     dialogs: Vec<DialogCaptureRecord>,
     menus: Vec<menus::MenuCaptureRecord>,
+    snippet_feedback: snippet_feedback::SnippetFeedbackRecord,
 }
 
 #[derive(Serialize)]
@@ -156,16 +168,23 @@ struct StateCaptureMetadata {
 struct AcceptanceOptions {
     output_directory: Option<PathBuf>,
     fixture_config_directory: Option<PathBuf>,
+    fixture_manifest: Option<PathBuf>,
     window_width: Option<u32>,
     window_height: Option<u32>,
     functional_only: bool,
     capture_only: bool,
+    sftp_functional_only: bool,
+    long_fixture_host_names: bool,
+    transfer_restart_prepare: bool,
+    transfer_restart_verify: Option<PathBuf>,
 }
 
 /// 跨主题截图共享的 fixture 绑定、输出位置和窗口尺寸快照。
 struct RightRailCaptureContext {
     output_directory: PathBuf,
+    config_directory: PathBuf,
     fixture_config_source: PathBuf,
+    fixture_manifest_path: Option<PathBuf>,
     fixture_host_id: HostId,
     remote_sftp_directory: String,
     local_files_root: PathBuf,
@@ -176,6 +195,8 @@ struct RightRailCaptureContext {
     requested_bounds_size: Option<(f32, f32)>,
     functional_only: bool,
     capture_only: bool,
+    sftp_functional_only: bool,
+    transfer_restart: Option<functional_transfer_restart::Phase>,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +210,14 @@ struct FixtureManifest {
     container_target_port: u16,
 }
 
+/// 专项窗口仅允许在已验证的私有桌面启动，不改变普通应用或隐藏验收窗口的行为。
+///
+/// @author kongweiguang
+#[cfg(windows)]
+pub(super) fn run_drag_acceptance() -> Result<(), Box<dyn Error>> {
+    drag::run()
+}
+
 /// 只从隔离 fixture 读取配置并复制到新输出目录，用户配置不进入验收 Composition。
 ///
 /// @author kongweiguang
@@ -198,7 +227,25 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     let requested_window_height = options.window_height;
     let functional_only = options.functional_only;
     let capture_only = options.capture_only;
-    let fixture_manifest = read_fixture_manifest()?;
+    let sftp_functional_only = options.sftp_functional_only;
+    let restart_requested =
+        options.transfer_restart_prepare || options.transfer_restart_verify.is_some();
+    if restart_requested && options.fixture_config_directory.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "重启验收只接受清单指定的 fixture 配置",
+        )
+        .into());
+    }
+    let fixture_manifest_path = options
+        .fixture_manifest
+        .as_ref()
+        .map(fs::canonicalize)
+        .transpose()?;
+    let fixture_manifest = match options.fixture_manifest.as_deref() {
+        Some(path) => read_fixture_manifest_from(Some(path))?,
+        None => read_fixture_manifest()?,
+    };
     let remote_sftp_directory = fixture_manifest.remote_sftp_directory.clone();
     let local_files_root = fixture_manifest.local_files_root.clone();
     let fixture_container_name = fixture_manifest.container_name.clone();
@@ -211,13 +258,39 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| Path::new("target").join("acceptance").join("right-rail"));
     reject_user_configuration_output_path(&output_base)?;
     reject_fixture_output_overlap(&fixture_config_source, &output_base)?;
+    if restart_requested {
+        functional_transfer_restart::validate_output_request(
+            &options.output_directory,
+            fixture_manifest_path.as_deref(),
+        )?;
+    }
     let output_directory = match options.output_directory {
         Some(path) => create_requested_output_directory(&path)?,
         None => create_unique_output_directory(output_base)?,
     };
-    let config_directory = output_directory.join("config");
-    fs::create_dir(&config_directory)?;
-    copy_fixture_configuration(&fixture_config_source, &config_directory)?;
+    let (config_directory, transfer_restart) =
+        if let Some(previous) = options.transfer_restart_verify {
+            let (config, receipt) = functional_transfer_restart::resolve_previous_run(
+                &previous,
+                fixture_manifest_path
+                    .as_deref()
+                    .expect("validated manifest"),
+            )?;
+            (
+                config,
+                Some(functional_transfer_restart::Phase::Verify(Box::new(
+                    receipt,
+                ))),
+            )
+        } else {
+            let config = output_directory.join("config");
+            fs::create_dir(&config)?;
+            copy_fixture_configuration(&fixture_config_source, &config)?;
+            let phase = options
+                .transfer_restart_prepare
+                .then_some(functional_transfer_restart::Phase::Prepare);
+            (config, phase)
+        };
     let fixture_host_id = HostId::parse(FIXTURE_HOST_ID)?;
 
     let runtime = ApplicationRuntime::new()?;
@@ -225,32 +298,50 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
         runtime.handle(),
         &config_directory,
     ))?;
-    let ui_result = catch_unwind(AssertUnwindSafe(|| {
-        run_hidden_window(
-            composition.app_services(),
-            RightRailCaptureContext {
-                output_directory: output_directory.clone(),
-                fixture_config_source,
-                fixture_host_id,
-                remote_sftp_directory,
-                local_files_root,
-                fixture_container_name,
-                container_target_port,
-                requested_window_width,
-                requested_window_height,
-                requested_bounds_size: None,
-                functional_only,
-                capture_only,
-            },
+    let fixture_result = if options.long_fixture_host_names {
+        runtime.block_on(
+            functional_transfer_workspace::prepare_long_fixture_host_names(
+                &composition.app_services(),
+            ),
         )
-    }))
-    .unwrap_or_else(|_| Err(io::Error::other("GPUI 右栏验收事件循环意外终止").into()));
+    } else {
+        Ok(())
+    };
+    let ui_result = fixture_result.and_then(|()| {
+        catch_unwind(AssertUnwindSafe(|| {
+            run_hidden_window(
+                composition.app_services(),
+                RightRailCaptureContext {
+                    output_directory: output_directory.clone(),
+                    config_directory,
+                    fixture_config_source,
+                    fixture_manifest_path,
+                    fixture_host_id,
+                    remote_sftp_directory,
+                    local_files_root,
+                    fixture_container_name,
+                    container_target_port,
+                    requested_window_width,
+                    requested_window_height,
+                    requested_bounds_size: None,
+                    functional_only,
+                    capture_only,
+                    sftp_functional_only,
+                    transfer_restart,
+                },
+            )
+        }))
+        .unwrap_or_else(|_| Err(io::Error::other("GPUI 右栏验收事件循环意外终止").into()))
+    });
     let shutdown_result = runtime
         .block_on(composition.shutdown_until(tokio::time::Instant::now() + SHUTDOWN_TIMEOUT));
     runtime.shutdown();
 
     ui_result?;
     shutdown_result?;
+    if options.transfer_restart_prepare {
+        functional_transfer_restart::finish_prepare(&output_directory)?;
+    }
     println!("右栏验收截图和报告：{}", output_directory.display());
     Ok(())
 }
@@ -259,11 +350,71 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
 ///
 /// @author kongweiguang
 fn requested_options() -> Result<AcceptanceOptions, io::Error> {
-    let mut arguments = std::env::args_os().skip(2);
+    parse_options(std::env::args_os().skip(2))
+}
+
+/// 从显式参数流解析互斥子模式，使拼写错误或重复选项不会静默扩大验收范围。
+///
+/// @author kongweiguang
+fn parse_options(
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<AcceptanceOptions, io::Error> {
+    let mut arguments = arguments.into_iter();
     let mut options = AcceptanceOptions::default();
     while let Some(flag) = arguments.next() {
+        if flag == OsStr::new("--long-fixture-host-names") {
+            if options.long_fixture_host_names {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "长主机名验收选项不能重复",
+                ));
+            }
+            options.long_fixture_host_names = true;
+            continue;
+        }
+        if flag == OsStr::new("--transfer-restart-prepare") {
+            if options.capture_only
+                || options.functional_only
+                || options.sftp_functional_only
+                || options.transfer_restart_prepare
+                || options.transfer_restart_verify.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "验收子模式不能重复或混用",
+                ));
+            }
+            options.transfer_restart_prepare = true;
+            continue;
+        }
+        if flag == OsStr::new("--transfer-restart-verify") {
+            if options.capture_only
+                || options.functional_only
+                || options.sftp_functional_only
+                || options.transfer_restart_prepare
+                || options.transfer_restart_verify.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "验收子模式不能重复或混用",
+                ));
+            }
+            let previous = arguments.next().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--transfer-restart-verify 缺少准备阶段目录",
+                )
+            })?;
+            options.transfer_restart_verify = Some(PathBuf::from(previous));
+            continue;
+        }
         if flag == OsStr::new("--capture-only") {
-            if options.capture_only || options.functional_only {
+            if options.capture_only
+                || options.functional_only
+                || options.sftp_functional_only
+                || options.transfer_restart_prepare
+                || options.transfer_restart_verify.is_some()
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "验收子模式不能重复或混用",
@@ -273,13 +424,33 @@ fn requested_options() -> Result<AcceptanceOptions, io::Error> {
             continue;
         }
         if flag == OsStr::new("--functional-only") {
-            if options.functional_only || options.capture_only {
+            if options.functional_only
+                || options.capture_only
+                || options.sftp_functional_only
+                || options.transfer_restart_prepare
+                || options.transfer_restart_verify.is_some()
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "验收子模式不能重复或混用",
                 ));
             }
             options.functional_only = true;
+            continue;
+        }
+        if flag == OsStr::new("--sftp-functional-only") {
+            if options.sftp_functional_only
+                || options.functional_only
+                || options.capture_only
+                || options.transfer_restart_prepare
+                || options.transfer_restart_verify.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "验收子模式不能重复或混用",
+                ));
+            }
+            options.sftp_functional_only = true;
             continue;
         }
         if flag == OsStr::new("--width") {
@@ -328,10 +499,12 @@ fn requested_options() -> Result<AcceptanceOptions, io::Error> {
             &mut options.output_directory
         } else if flag == OsStr::new("--fixture-config-dir") {
             &mut options.fixture_config_directory
+        } else if flag == OsStr::new("--fixture-manifest") {
+            &mut options.fixture_manifest
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "仅支持 --right-rail-acceptance [--output-dir <新目录>] [--fixture-config-dir <隔离配置目录>] [--width <逻辑像素>] [--height <逻辑像素>] [--functional-only | --capture-only]",
+                "仅支持 --right-rail-acceptance [--output-dir <新目录>] [--fixture-config-dir <隔离配置目录>] [--fixture-manifest <绝对路径>] [--width <逻辑像素>] [--height <逻辑像素>] [--long-fixture-host-names] [--functional-only | --capture-only | --sftp-functional-only | --transfer-restart-prepare | --transfer-restart-verify <准备阶段目录>]",
             ));
         };
         if slot.is_some() {
@@ -347,6 +520,12 @@ fn requested_options() -> Result<AcceptanceOptions, io::Error> {
             ));
         };
         *slot = Some(PathBuf::from(path));
+    }
+    if options.long_fixture_host_names && !options.sftp_functional_only {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "长主机名仅用于 SFTP 专项验收",
+        ));
     }
     Ok(options)
 }
@@ -417,7 +596,26 @@ fn resolve_fixture_config_directory(
 ///
 /// @author kongweiguang
 fn read_fixture_manifest() -> Result<FixtureManifest, Box<dyn Error>> {
-    let mut manifest: FixtureManifest = serde_json::from_slice(&fs::read(FIXTURE_MANIFEST)?)?;
+    read_fixture_manifest_from(None)
+}
+
+/// 自定义清单仅用于独立验收实例，并沿用默认清单的目录身份校验。
+///
+/// @author kongweiguang
+fn read_fixture_manifest_from(requested: Option<&Path>) -> Result<FixtureManifest, Box<dyn Error>> {
+    let manifest_path = match requested {
+        Some(path) if !path.is_absolute() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fixture manifest 必须使用绝对路径",
+            )
+            .into());
+        }
+        Some(path) => fs::canonicalize(path)?,
+        None => fs::canonicalize(FIXTURE_MANIFEST)?,
+    };
+    reject_user_configuration_directory(&manifest_path)?;
+    let mut manifest: FixtureManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
     if manifest.state != "ready" {
         return Err(io::Error::other("隔离 SSH fixture 尚未就绪").into());
     }
@@ -448,24 +646,48 @@ fn read_fixture_manifest() -> Result<FixtureManifest, Box<dyn Error>> {
         .into());
     }
     manifest.remote_sftp_directory = remote_path.to_string();
-    manifest.local_files_root = resolve_fixture_local_files_root(&manifest.local_files_root)?;
+    manifest.local_files_root =
+        resolve_fixture_local_files_root(&manifest_path, &manifest.local_files_root)?;
     Ok(manifest)
 }
 
 /// 规范化后只接受 manifest 同目录下的专用 local-files 目录，防止 fixture 输入指向用户文件。
 ///
 /// @author kongweiguang
-fn resolve_fixture_local_files_root(requested: &Path) -> Result<PathBuf, io::Error> {
+fn resolve_fixture_local_files_root(
+    manifest_path: &Path,
+    requested: &Path,
+) -> Result<PathBuf, io::Error> {
     if !requested.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "fixture 本地文件目录必须是绝对路径",
         ));
     }
-    let fixture_root = Path::new(FIXTURE_MANIFEST)
+    let fixture_root = manifest_path
         .parent()
         .ok_or_else(|| io::Error::other("fixture manifest 缺少父目录"))?;
-    let expected = fs::canonicalize(fixture_root.join("local-files"))?;
+    let fixture_local_files = fixture_root.join("local-files");
+    let metadata = fs::symlink_metadata(&fixture_local_files)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fixture 本地文件目录不能是链接或重解析点",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture 本地文件目录不能是重解析点",
+            ));
+        }
+    }
+    let expected = fs::canonicalize(fixture_local_files)?;
     let root = fs::canonicalize(requested)?;
     if !root.is_dir() || root != expected {
         return Err(io::Error::new(
@@ -473,6 +695,7 @@ fn resolve_fixture_local_files_root(requested: &Path) -> Result<PathBuf, io::Err
             "右栏验收本地文件只能使用隔离 fixture 的 local-files 目录",
         ));
     }
+    reject_user_configuration_directory(&root)?;
     Ok(root)
 }
 
@@ -693,7 +916,9 @@ fn run_hidden_window(
 ) -> Result<(), Box<dyn Error>> {
     let RightRailCaptureContext {
         output_directory,
+        config_directory,
         fixture_config_source,
+        fixture_manifest_path,
         fixture_host_id,
         remote_sftp_directory,
         local_files_root,
@@ -703,6 +928,8 @@ fn run_hidden_window(
         requested_window_height,
         functional_only,
         capture_only,
+        sftp_functional_only,
+        transfer_restart,
         ..
     } = capture;
     let failure = Arc::new(Mutex::new(None::<String>));
@@ -761,14 +988,17 @@ fn run_hidden_window(
                 let capture_root = root.clone();
                 let capture_services = services.clone();
                 let capture_failure = Arc::clone(&failure_for_app);
+                let graceful_restart_exit = transfer_restart.is_some();
                 cx.spawn(async move |cx| {
                     let result = capture_right_rail(
                         cx,
-                        capture_root,
+                        capture_root.clone(),
                         window_handle,
                         RightRailCaptureContext {
                             output_directory,
+                            config_directory,
                             fixture_config_source,
+                            fixture_manifest_path,
                             fixture_host_id,
                             remote_sftp_directory,
                             local_files_root,
@@ -778,12 +1008,24 @@ fn run_hidden_window(
                             requested_window_height,
                             functional_only,
                             capture_only,
+                            sftp_functional_only,
+                            transfer_restart,
                             requested_bounds_size: requested_bounds_size
                                 .map(|size| (size.width.as_f32(), size.height.as_f32())),
                         },
                         capture_services,
                     )
                     .await;
+                    let result = if result.is_ok() && graceful_restart_exit {
+                        functional_transfer_restart::request_graceful_exit(
+                            cx,
+                            &capture_root,
+                            window_handle,
+                        )
+                        .await
+                    } else {
+                        result
+                    };
                     if let Err(error) = result {
                         set_failure(&capture_failure, error.to_string());
                     }
@@ -957,7 +1199,11 @@ async fn wait_for_window_size(
 /// 按生产 Root 动作捕获三种主题及右栏面板，保留请求尺寸与实测窗口尺寸的独立口径。
 /// 受控文件准备沿用组合根的共享 services，避免验收另建执行器或绕开生产文件端口。
 /// 工具操作后再验收自定义保存和 Tab 隔离，并恢复设置，避免布局草稿污染前面的主题对照。
-/// 子模式允许在同一候选上独立重跑视觉或数据闭环；诊断环境开关只改变检查顺序，不跳过任何检查。
+/// 子模式明确标记视觉、全部功能或 SFTP 功能范围；每个选定流程保留原有全部检查。
+/// 日志专用环境开关仅在功能子模式生效，并单独标记回执，避免无关采样和 Agent 端口阻断布局回归。
+/// 隧道专用开关同样只作用于功能模式，保留默认完整验收流程。
+/// 容器专项只在截图模式执行，并单独登记范围，不依赖其他工具的采样与交互。
+/// 片段专项仅作用于截图模式并独立标记范围，不替代其他工具的完整验收。
 ///
 /// @author kongweiguang
 async fn capture_right_rail(
@@ -973,21 +1219,76 @@ async fn capture_right_rail(
     let requested_window_width = capture.requested_window_width;
     let requested_window_height = capture.requested_window_height;
     let requested_bounds_size = capture.requested_bounds_size;
+    let restart_requested = capture.transfer_restart.is_some();
     wait_for_window_size(cx, window, requested_bounds_size).await?;
-    wait_for_fixture_connection(cx, &root, window, fixture_host_id).await?;
+    if !matches!(
+        &capture.transfer_restart,
+        Some(functional_transfer_restart::Phase::Verify(_))
+    ) {
+        wait_for_fixture_connection(cx, &root, window, fixture_host_id).await?;
+    }
     let mut themes = Vec::with_capacity(RIGHT_RAIL_THEMES.len());
-    if !capture.functional_only {
+    let tmux_only =
+        capture.capture_only && std::env::var_os("KERMINAL_RIGHT_RAIL_TMUX_ONLY").is_some();
+    let snippets_only =
+        capture.capture_only && std::env::var_os("KERMINAL_RIGHT_RAIL_SNIPPETS_ONLY").is_some();
+    let containers_only =
+        capture.capture_only && std::env::var_os("KERMINAL_RIGHT_RAIL_CONTAINERS_ONLY").is_some();
+    if u8::from(tmux_only) + u8::from(snippets_only) + u8::from(containers_only) > 1 {
+        return Err(io::Error::other("右栏专项验收只能指定一个工具").into());
+    }
+    let tmux_presentations = if tmux_only {
+        tmux_presentation::capture_themes(cx, &root, window, &capture).await?
+    } else {
+        Vec::new()
+    };
+    let container_presentations = if containers_only {
+        container_presentation::capture_themes(cx, &root, window, &capture).await?
+    } else {
+        Vec::new()
+    };
+    if !tmux_only
+        && !containers_only
+        && !capture.functional_only
+        && !capture.sftp_functional_only
+        && !restart_requested
+    {
         for (mode, theme_name) in RIGHT_RAIL_THEMES {
             themes.push(capture_theme(cx, &root, window, &capture, mode, theme_name).await?);
         }
     }
-    if !capture.functional_only
+    if !tmux_only
+        && !containers_only
+        && !capture.functional_only
+        && !capture.sftp_functional_only
+        && !restart_requested
         && themes[0].baseline.pixel_sha256 == themes[1].baseline.pixel_sha256
     {
         return Err(io::Error::other("浅色和深色主题的基线截图完全相同").into());
     }
     let mut functional = Vec::new();
-    if !capture.capture_only {
+    let logs_only =
+        capture.functional_only && std::env::var_os("KERMINAL_RIGHT_RAIL_LOGS_ONLY").is_some();
+    let ports_only =
+        capture.functional_only && std::env::var_os("KERMINAL_RIGHT_RAIL_PORTS_ONLY").is_some();
+    if let Some(phase) = &capture.transfer_restart {
+        functional_transfer_restart::run(
+            cx,
+            &root,
+            window,
+            &capture,
+            &mut functional,
+            &services,
+            phase,
+        )
+        .await?;
+    } else if capture.sftp_functional_only {
+        functional.extend(functional::run_sftp_only(cx, &root, window, &capture, &services).await?);
+    } else if logs_only {
+        functional_logs::run(cx, &root, window, &capture, &mut functional).await?;
+    } else if ports_only {
+        functional_forwarding::run(cx, &root, window, &capture, &mut functional, &services).await?;
+    } else if !capture.capture_only {
         let shell_first = std::env::var_os("KERMINAL_RIGHT_RAIL_SHELL_FIRST").is_some();
         if shell_first {
             shell::run(cx, &root, window, &capture, &mut functional).await?;
@@ -997,11 +1298,13 @@ async fn capture_right_rail(
             shell::run(cx, &root, window, &capture, &mut functional).await?;
         }
     }
-    window.update(cx, |_, window, app| {
-        root.update(app, |root, root_cx| {
-            root.close_right_rail_acceptance_panels(window, root_cx);
-        });
-    })?;
+    if !restart_requested {
+        window.update(cx, |_, window, app| {
+            root.update(app, |root, root_cx| {
+                root.close_right_rail_acceptance_panels(window, root_cx);
+            });
+        })?;
+    }
 
     let (window_visible, window_active, window_width, window_height, native_isolation) =
         window.update(cx, |_, window, _| {
@@ -1035,7 +1338,29 @@ async fn capture_right_rail(
 
     let report = AcceptanceReport {
         schema_version: 6,
-        capture_mode: if capture.capture_only {
+        capture_mode: if matches!(
+            &capture.transfer_restart,
+            Some(functional_transfer_restart::Phase::Prepare)
+        ) {
+            "native_transfer_restart_prepare"
+        } else if matches!(
+            &capture.transfer_restart,
+            Some(functional_transfer_restart::Phase::Verify(_))
+        ) {
+            "native_transfer_restart_verify"
+        } else if containers_only {
+            "native_containers_compose_yaml_and_menus_three_themes_read_only"
+        } else if snippets_only {
+            "native_snippet_refresh_preview_cancel_and_three_theme_layout"
+        } else if tmux_only {
+            "native_tmux_refresh_and_static_quickref_three_themes"
+        } else if capture.sftp_functional_only {
+            "native_sftp_functional_actions_without_theme_capture"
+        } else if logs_only {
+            "native_command_history_actions_and_three_theme_layout"
+        } else if ports_only {
+            "native_ssh_tunnel_actions_and_three_theme_layout"
+        } else if capture.capture_only {
             "native_panels_menus_dialogs_and_target_bound_states_without_functional_writes"
         } else if capture.functional_only {
             "native_functional_actions_without_theme_capture"
@@ -1043,10 +1368,7 @@ async fn capture_right_rail(
             "root_actions_native_keyboard_panels_dialogs_and_target_bound_states_without_os_input"
         },
         capture_backend: "native_window_render_to_image",
-        config_directory: output_directory
-            .join("config")
-            .to_string_lossy()
-            .into_owned(),
+        config_directory: capture.config_directory.to_string_lossy().into_owned(),
         fixture_config_source: fixture_config_source.to_string_lossy().into_owned(),
         fixture_host_id: FIXTURE_HOST_ID.to_owned(),
         fixture_host_key_policy: "existing_known_hosts_required_no_automatic_trust",
@@ -1066,6 +1388,8 @@ async fn capture_right_rail(
         window_height,
         functional,
         themes,
+        tmux_presentations,
+        container_presentations,
     };
     let bytes = serde_json::to_vec_pretty(&report)?;
     fs::write(output_directory.join("report.json"), bytes)?;
@@ -1100,10 +1424,9 @@ async fn activate_dialog_tool(
     wait_for_panel_readiness(cx, root, window, tool, fixture_host_id, tool_name).await
 }
 
-/// Resets the active panel, applies the requested Root theme, and records its baseline and tool states.
-/// Pixel stability and deferred semantic focus are awaited independently; the driver never assigns focus to satisfy a gate.
-/// Each dialog opens from its owning panel, retaining production layout and readiness constraints.
-/// Visibility checks follow a rendered frame so compact layouts cannot mistake stale slot projections for the opened drawer.
+/// 每种主题独立验证真实面板和弹层，SFTP 路径与书签的同行几何也逐主题检查。
+/// 片段专项单独产出真实交互证据，完整验收仍保留其他工具的全部断言。
+/// 像素稳定和延迟焦点分别等待，不以主动赋焦或旧帧冒充生产窗口就绪。
 ///
 /// @author kongweiguang
 async fn capture_theme(
@@ -1133,6 +1456,19 @@ async fn capture_theme(
         "theme baseline",
     )
     .await?;
+    if capture.capture_only && std::env::var_os("KERMINAL_RIGHT_RAIL_SNIPPETS_ONLY").is_some() {
+        let snippet_feedback = snippet_feedback::run(cx, root, window, capture, theme_name).await?;
+        return Ok(ThemeCaptureRecord {
+            mode: theme_name,
+            window_appearance,
+            baseline,
+            panels: Vec::new(),
+            states: Vec::new(),
+            dialogs: Vec::new(),
+            menus: Vec::new(),
+            snippet_feedback,
+        });
+    }
     let mut panels = Vec::with_capacity(RIGHT_RAIL_TOOLS.len());
     let mut menus = Vec::new();
     let mut tmux_collapsed_signatures = None;
@@ -1162,6 +1498,7 @@ async fn capture_theme(
                 remote_sftp_directory,
             )
             .await?;
+            functional_transfers::assert_compact_path_controls(cx, window)?;
         } else {
             wait_for_panel_readiness(cx, root, window, tool, fixture_host_id, tool_name).await?;
         }
@@ -1231,6 +1568,8 @@ async fn capture_theme(
             );
         }
     }
+
+    let snippet_feedback = snippet_feedback::run(cx, root, window, capture, theme_name).await?;
 
     // Capture the modal-owned snippet flows before target-bound state probes can fail independently.
     let mut snippet_dialogs = Vec::with_capacity(3);
@@ -1360,85 +1699,16 @@ async fn capture_theme(
         );
     }
 
-    activate_dialog_tool(
+    container_presentation::capture_container_states(
         cx,
         root,
         window,
-        ToolRailToolId::Containers,
-        fixture_host_id,
-        "containers",
+        capture,
+        theme_name,
+        &baseline.pixel_sha256,
+        (&mut states, &mut menus),
     )
     .await?;
-    let container_id = wait_for_acceptance_value(
-        cx,
-        root,
-        window,
-        "running container target",
-        |root, root_cx| {
-            root.right_rail_acceptance_container_target_id(
-                fixture_host_id,
-                &capture.fixture_container_name,
-                root_cx,
-            )
-        },
-    )
-    .await?;
-    for (page, surface) in [
-        ("details", "container-details"),
-        ("stats", "container-monitor"),
-    ] {
-        window
-            .update(cx, |_, _, app| {
-                root.update(app, |root, root_cx| {
-                    root.open_right_rail_acceptance_container_page(
-                        fixture_host_id,
-                        &container_id,
-                        page,
-                        root_cx,
-                    )
-                })
-            })?
-            .map_err(io::Error::other)?;
-        wait_for_acceptance_state(cx, root, window, surface, |root, root_cx| {
-            root.right_rail_acceptance_container_page_ready(
-                fixture_host_id,
-                &container_id,
-                page,
-                root_cx,
-            )
-        })
-        .await?;
-        states.push(
-            capture_state(
-                cx,
-                window,
-                output_directory,
-                &baseline.pixel_sha256,
-                StateCaptureMetadata {
-                    theme_name,
-                    surface,
-                    host_id: fixture_host_id.as_str().to_owned(),
-                    target_id: Some(container_id.clone()),
-                    interaction: "acceptance_navigation_and_production_container_read",
-                },
-            )
-            .await?,
-        );
-        if page == "details" {
-            menus.push(
-                menus::capture_menu(
-                    cx,
-                    window,
-                    output_directory,
-                    theme_name,
-                    "container-actions",
-                    "container-actions",
-                    &format!("rr-container-more-{container_id}"),
-                )
-                .await?,
-            );
-        }
-    }
 
     activate_dialog_tool(
         cx,
@@ -1457,6 +1727,28 @@ async fn capture_theme(
     wait_for_acceptance_state(cx, root, window, "tmux session target", |root, root_cx| {
         root.right_rail_acceptance_tmux_session_ready(fixture_host_id, &session_id, root_cx)
     })
+    .await?;
+    let expanded = window.update(cx, |_, _, app| {
+        root.update(app, |root, root_cx| {
+            root.set_right_rail_acceptance_tmux_session_expanded(
+                fixture_host_id,
+                &session_id,
+                false,
+                root_cx,
+            )
+        })
+    })?;
+    expanded.map_err(io::Error::other)?;
+    tmux_presentation::check_refresh_and_quickref(
+        cx,
+        root,
+        window,
+        capture,
+        theme_name,
+        &baseline.pixel_sha256,
+        &session_id,
+        &mut states,
+    )
     .await?;
     let expanded = window.update(cx, |_, _, app| {
         root.update(app, |root, root_cx| {
@@ -1783,6 +2075,7 @@ async fn capture_theme(
         states,
         dialogs,
         menus,
+        snippet_feedback,
     })
 }
 
@@ -2332,3 +2625,7 @@ fn set_failure(failure: &Mutex<Option<String>>, message: String) {
         *slot = Some(message);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/right_rail_acceptance_args.rs"]
+mod option_tests;

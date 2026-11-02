@@ -223,6 +223,7 @@ pub(super) async fn make_ssh_terminal_transport(
     validate_terminal_command(&request)?;
     let mut initial_messages = VecDeque::new();
     let mut shell_integration_enabled = false;
+    let mut shell_editing_nonce = None;
     let setup = async {
         send_channel_request(
             channel.request_pty(
@@ -318,6 +319,7 @@ pub(super) async fn make_ssh_terminal_transport(
             }
             if let Some(startup) = startup {
                 let startup_integration_enabled = startup.shell_integration_enabled;
+                let startup_editing_nonce = startup.editing_nonce;
                 send_channel_request(
                     channel.exec(true, startup.exec_command.into_bytes()),
                     request_timeout,
@@ -333,6 +335,7 @@ pub(super) async fn make_ssh_terminal_transport(
                 )
                 .await?;
                 shell_integration_enabled = startup_integration_enabled;
+                shell_editing_nonce = startup_editing_nonce;
             } else {
                 send_channel_request(
                     channel.request_shell(true),
@@ -404,7 +407,8 @@ pub(super) async fn make_ssh_terminal_transport(
     };
     Ok(SessionTransport::new(reader, channel_writer, control)
         .with_shell_dialect(dialect)
-        .with_shell_integration_enabled(shell_integration_enabled))
+        .with_shell_integration_enabled(shell_integration_enabled)
+        .with_shell_editing_nonce(shell_editing_nonce))
 }
 
 /// 把已结束的 exact SSH channel 的 shutdown 收口为幂等成功，同时保留普通写入的真实错误。

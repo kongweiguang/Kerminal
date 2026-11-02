@@ -145,12 +145,13 @@ impl HistoryScope {
     }
 }
 
-/// Logs 每页展示八项，原始查询最多读取一百项，页面索引始终保持在有效范围内。
+/// 动态容量和页码一起夹紧；搜索、删除、窗口缩放与验收读取必须使用同一页范围。
 ///
 /// @author kongweiguang
-pub(super) fn page_window(page: usize, total: usize) -> (usize, usize, usize) {
-    let page_count = total.div_ceil(PAGE_SIZE).max(1);
+pub(super) fn page_window(page: usize, total: usize, page_size: usize) -> (usize, usize, usize) {
+    let page_size = page_size.max(1);
+    let page_count = total.div_ceil(page_size).max(1);
     let page = page.clamp(1, page_count);
-    let start = (page - 1) * PAGE_SIZE;
-    (page, start, (start + PAGE_SIZE).min(total))
+    let start = (page - 1) * page_size;
+    (page, start, (start + page_size).min(total))
 }

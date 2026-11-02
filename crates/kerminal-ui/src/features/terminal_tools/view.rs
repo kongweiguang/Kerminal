@@ -1575,6 +1575,7 @@ impl TerminalToolsView {
 
 impl Render for TerminalToolsView {
     /// 搜索栏只由 pane 顶部 overlay 挂载；右栏保留搜索开关及其它真实工具投影。
+    /// 命令识别数据继续供导航与其它工具使用；此处只挂载用户仍可配置的搜索、广播和日志。
     /// 所有副作用仍经 Root 和 Application 服务，避免同一搜索 Entity 被重复渲染。
     ///
     /// @author kongweiguang
@@ -1583,15 +1584,10 @@ impl Render for TerminalToolsView {
         let selection = self.selection.clone();
         let broadcast = self.broadcast.clone();
         let logs = self.logs.clone();
-        let command_blocks = self.command_blocks.clone();
         let keyword_error = self.keyword_error.clone();
         let show_search = self.search_visible;
         let show_broadcast = self.broadcast_visible;
         let show_logs = self.log_available && self.session_id.is_some();
-        let has_command_blocks = super::command_blocks::command_block_timeline_visible(
-            self.command_block_rail_visible,
-            !self.command_blocks.read(cx).is_empty(),
-        );
         let search_label = if show_search {
             crate::locale::text("收起搜索", "Hide search")
         } else {
@@ -1673,9 +1669,6 @@ impl Render for TerminalToolsView {
         }
         if show_logs {
             content = content.child(logs);
-        }
-        if has_command_blocks {
-            content = content.child(command_blocks);
         }
         panel.child(content)
     }

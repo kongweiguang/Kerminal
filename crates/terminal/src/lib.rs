@@ -6,6 +6,7 @@ mod cursor_style;
 pub mod engine;
 pub mod input;
 pub mod output_capture;
+pub mod shell_editing;
 pub mod shell_integration;
 pub mod snapshot;
 

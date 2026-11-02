@@ -42,12 +42,12 @@ pub(super) struct TransferQueueUi {
 }
 
 impl Default for TransferQueueUi {
-    /// 默认不加载无限历史；归档只保留一页，Rename 避免未经明确选择覆盖目标。
+    /// 默认展开当前队列以便观察进度；Rename 避免未经明确选择覆盖目标。
     /// @author kongweiguang
     fn default() -> Self {
         Self {
             conflict_policy: ConflictPolicy::Rename,
-            history_expanded: false,
+            history_expanded: true,
             cleanup_retry: None,
             clear_completed_cancellation: None,
             recovery_cancellation: None,
@@ -345,14 +345,11 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 展开或折叠终态和冷档历史；未归档的未知提交和 cleanup_pending 始终由 renderer 保留。
+    /// 展开完整任务列表；冷档按需独立打开，避免每次展开都触发磁盘读取。
     ///
     /// @author kongweiguang
     pub(super) fn toggle_transfer_history(&mut self, cx: &mut Context<Self>) {
         self.queue.history_expanded = !self.queue.history_expanded;
-        if self.queue.history_expanded {
-            self.load_transfer_archive_page(None, cx);
-        }
         cx.notify();
     }
 

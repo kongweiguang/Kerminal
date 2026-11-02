@@ -330,6 +330,10 @@ fn confirmed_projection_resumes_only_after_terminal_owner_has_stopped() {
 #[test]
 fn terminal_projection_does_not_hide_failure_or_cancellation_feedback() {
     assert!(is_terminal_success_notice("Agent CLI 已启动。"));
+    assert!(is_terminal_success_notice("已切回运行中的 Agent 会话。"));
+    assert!(is_terminal_success_notice(
+        "Returned to the running Agent chat."
+    ));
     assert!(!is_terminal_success_notice("已请求取消，正在等待实际结果…"));
     assert!(!is_terminal_success_notice("Agent 操作失败"));
     assert!(!is_terminal_success_notice("恢复结果未知"));
@@ -356,12 +360,11 @@ fn launcher_setup_help_preserves_cancel_and_unknown_outcome_boundaries() {
     ));
 }
 
-/// 无选中会话不显示空操作菜单；恢复待核对的有效会话仍保留核对入口。
+/// 历史行的恢复待核对会话仍保留核对入口，且不会当作可继续会话。
 ///
 /// @author kongweiguang
 #[test]
-fn actions_menu_requires_a_valid_selection_but_keeps_unresolved_recovery_accessible() {
-    assert!(!should_render_actions_menu(None));
+fn history_actions_keep_unresolved_recovery_accessible() {
     for status in [
         AgentResumeRecoveryStatus::Pending,
         AgentResumeRecoveryStatus::Unknown,
@@ -376,9 +379,43 @@ fn actions_menu_requires_a_valid_selection_but_keeps_unresolved_recovery_accessi
                 .clone(),
             status,
         });
-        assert!(should_render_actions_menu(Some(&view)));
         assert!(agent_can_reconcile(&view));
+        assert!(!agent_can_resume(&view));
     }
+}
+
+/// 预览必须匹配原会话和完整绑定；切换代次、归档或会话消失时丢弃迟到结果。
+///
+/// @author kongweiguang
+#[test]
+fn context_preview_rejects_changed_agent_or_binding() {
+    let mut view = recovery_view(SessionLifecycle::Running);
+    view.session.target = Some(AgentTargetBinding::unbound(7));
+    let id = view.session.agent_session_id.clone();
+    let expected = view.session.target.clone();
+    let matches = |candidate: Option<&AgentSessionView>| {
+        super::super::actions::context_preview_target_matches(&id, expected.as_ref(), candidate)
+    };
+    assert!(matches(Some(&view)));
+    assert!(!matches(None));
+    let mut changed_target = view.clone();
+    changed_target.session.target = Some(AgentTargetBinding::unbound(8));
+    assert!(!matches(Some(&changed_target)));
+    let mut refreshed_target = view.clone();
+    let binding = refreshed_target
+        .session
+        .target
+        .as_mut()
+        .expect("bound fixture");
+    binding.binding_id = Some("recovered-binding-id".to_owned());
+    binding.last_seen_at = Some("2026-10-29T00:00:00Z".to_owned());
+    assert!(matches(Some(&refreshed_target)));
+    let mut changed_agent = view.clone();
+    changed_agent.session.agent_session_id = AgentSessionId::new();
+    assert!(!matches(Some(&changed_agent)));
+    let mut archived = view;
+    archived.session.status = AgentSessionStatus::Archived;
+    assert!(!matches(Some(&archived)));
 }
 
 /// 正常状态要求明确零码成功；非零/信号保留失败，缺少或矛盾回执不冒称成功。
@@ -517,11 +554,11 @@ fn visible_continue_uses_existing_resume_gate() {
     assert!(!should_render_continue(Some(&unresolved)));
 }
 
-/// 独立状态行保留退出/运行信息时，picker 不再把同一状态挤进会话标题。
+/// 标题保持会话名；正常运行不额外占用顶栏，异常和退出状态仍由状态行表达。
 ///
 /// @author kongweiguang
 #[test]
-fn session_picker_separates_title_from_visible_terminal_status() {
+fn session_picker_keeps_title_without_redundant_running_status() {
     let running = recovery_view(SessionLifecycle::Running);
     assert_eq!(session_picker_label(&running, true), running.session.title);
 
@@ -529,9 +566,7 @@ fn session_picker_separates_title_from_visible_terminal_status() {
     assert!(inline.starts_with(&running.session.title));
     assert!(inline.ends_with(&lifecycle_label(&running)));
 
-    let status = terminal_header_status_row(Some(&running), true, None, false)
-        .expect("active terminal keeps a visible status row");
-    assert_eq!(status.message, lifecycle_label(&running));
+    assert!(terminal_header_status_row(Some(&running), true, None, false).is_none());
 }
 
 /// 只有已核实 provider 恢复能力才暴露 Continue；未知或明确不支持仍保留历史新建入口。

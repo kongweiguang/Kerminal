@@ -50,10 +50,25 @@ impl CommandHistoryRepository for SqliteCommandHistoryRepository {
         request: CommandHistoryListRequest,
     ) -> AppResult<Vec<CommandHistoryEntry>> {
         let repository = self.clone();
-        task::spawn_blocking(move || repository.list_sync(request))
+        task::spawn_blocking(move || repository.list_sync(request, None))
             .await
             .map_err(|source| {
                 AppError::infrastructure_with_source("查询命令历史任务失败", source)
+            })?
+    }
+
+    /// 前缀比较在 SQLite 截断前完成，独立于历史面板的包含搜索和大小写规则。
+    async fn list_prefix(
+        &self,
+        mut request: CommandHistoryListRequest,
+        prefix: String,
+    ) -> AppResult<Vec<CommandHistoryEntry>> {
+        request.query = None;
+        let repository = self.clone();
+        task::spawn_blocking(move || repository.list_sync(request, Some(prefix)))
+            .await
+            .map_err(|source| {
+                AppError::infrastructure_with_source("查询命令历史前缀任务失败", source)
             })?
     }
 
@@ -135,8 +150,12 @@ impl SqliteCommandHistoryRepository {
         }
     }
 
-    /// 执行参数化查询，转义 LIKE 元字符并将 SQL 解析限制在稳定字段集合内。
-    fn list_sync(&self, request: CommandHistoryListRequest) -> AppResult<Vec<CommandHistoryEntry>> {
+    /// 普通搜索保留原 LIKE 行为；可选前缀按 UTF-8 字节精确比较且先于结果上限。
+    fn list_sync(
+        &self,
+        request: CommandHistoryListRequest,
+        prefix: Option<String>,
+    ) -> AppResult<Vec<CommandHistoryEntry>> {
         let query = request
             .query
             .as_deref()
@@ -160,7 +179,8 @@ impl SqliteCommandHistoryRepository {
                      OR lower(coalesce(shell, '')) LIKE ?6 ESCAPE '\\'
                      OR lower(coalesce(remote_host_id, '')) LIKE ?6 ESCAPE '\\'
                      OR lower(coalesce(pane_id, '')) LIKE ?6 ESCAPE '\\')
-                 ORDER BY created_at DESC, rowid DESC LIMIT ?7",
+                   AND (?7 IS NULL OR substr(CAST(command AS BLOB), 1, length(CAST(?7 AS BLOB))) = CAST(?7 AS BLOB))
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?8",
             )
             .map_err(|source| map_sqlite_error("准备命令历史查询失败", source))?;
         let rows = statement
@@ -172,6 +192,7 @@ impl SqliteCommandHistoryRepository {
                     request.remote_host_id.as_ref().map(HostId::as_str),
                     request.session_id.as_ref().map(SessionId::as_str),
                     query,
+                    prefix,
                     limit,
                 ],
                 history_from_row,

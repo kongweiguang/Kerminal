@@ -71,6 +71,36 @@ fn settings_reject_empty_key_and_invalid_version() {
     assert!(matches!(invalid_version, Err(AppError::Invalid { .. })));
 }
 
+/// 发布装配使用 SDK 能实际解析的信任根，不能把非空占位符当成有效公钥。
+#[test]
+fn release_config_checks_sdk_public_key_and_https() {
+    let key = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc5QjdDMkI5MTlDRDBBOUEKUldTYUNzMFp1Y0szZWJYTEN0Q0hyREpHMlc5T3FuVkJyUElrb3NrRVFvYThEMUI0QldMZ0E0Vm8K";
+    assert!(
+        UpdaterSettings::from_release_config(
+            "0.4.0",
+            "https://updates.invalid/kerminal-updater.json",
+            key,
+        )
+        .is_ok()
+    );
+    assert!(
+        UpdaterSettings::from_release_config(
+            "0.4.0",
+            "http://updates.invalid/kerminal-updater.json",
+            key,
+        )
+        .is_err()
+    );
+    assert!(
+        UpdaterSettings::from_release_config(
+            "0.4.0",
+            "https://updates.invalid/kerminal-updater.json",
+            "placeholder",
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn settings_reject_unbounded_timeout_and_size() {
     // 请求时限和更新体积都是产品策略，不接受零值或无界配置。
@@ -95,13 +125,13 @@ fn settings_reject_unbounded_timeout_and_size() {
 }
 
 #[test]
-fn appimage_only_update_runtime_matches_current_platform() {
-    // Linux DEB 必须走系统包管理器；SDK 的自更新原位替换只对 AppImage 有效。
+fn update_runtime_requires_a_supported_installation_shape() {
+    // Linux DEB 由系统包管理器处理，测试二进制不是 Windows 安装器或 macOS app bundle。
     let supported = UpdaterSettings::supports_current_runtime();
     #[cfg(target_os = "linux")]
     assert_eq!(supported, std::env::var_os("APPIMAGE").is_some());
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    assert!(supported);
+    assert!(!supported);
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     assert!(!supported);
 

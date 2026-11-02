@@ -32,14 +32,14 @@ impl FilesPane {
         }
     }
 
-    /// 只有紧凑栏的新建、重命名和权限操作提升到 Root 弹框；删除继续共用其危险确认。
+    /// 只有紧凑栏的新建/重命名提升到 Root 弹框；权限编辑在所有布局统一走显式弹框。
     ///
     /// @author kongweiguang
     pub(crate) fn pending_global_dialog(&self) -> bool {
         self.pending_transfer_conflict_count().is_some()
             || self.delete_confirmation.is_some()
-            || (self.compact_layout
-                && (self.name_action.is_some() || self.permission_dialog_target.is_some()))
+            || self.permission_dialog_target.is_some()
+            || (self.compact_layout && self.name_action.is_some())
     }
 
     /// main 默认先聚焦标题栏关闭按钮；显式持有同一句柄，避免依赖 Button 内部嵌套元素键。
@@ -179,7 +179,7 @@ impl FilesPane {
         self.name_action_target = None;
         self.name_action_busy = false;
         self.delete_confirmation = None;
-        self.permission_dialog_target = self.compact_layout.then_some((side, entry.endpoint));
+        self.permission_dialog_target = Some((side, entry.endpoint));
         self.status = None;
         cx.notify();
     }

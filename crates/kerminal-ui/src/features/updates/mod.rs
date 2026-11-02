@@ -892,13 +892,13 @@ fn localized(zh_cn: &str, en_us: &str) -> String {
 /// 把 adapter 的固定不可用原因映射成当前界面的双语提示，不把源地址或密钥写进状态。
 fn localized_unavailable(reason: &'static str) -> String {
     match reason {
-        "此构建尚未配置更新源和签名公钥" => localized(
-            "此构建尚未配置更新源和签名公钥；恢复记录仍可查看。",
-            "This build has no update feed or signing key; recovery records remain available.",
+        "此构建没有有效的更新源或签名公钥" => localized(
+            "此构建没有有效的更新源或签名公钥；恢复记录仍可查看。",
+            "This build has no valid update feed or signing key; recovery records remain available.",
         ),
         "当前安装形态不支持应用内自动更新" => localized(
-            "当前安装形态不支持应用内更新；可通过系统包管理器更新。",
-            "In-app updates are not supported for this installation type.",
+            "当前安装形态不支持应用内更新；可使用正式安装包或系统包管理器。",
+            "Use an official installer or system package manager to update this installation.",
         ),
         "当前系统无法确定更新目标" => localized(
             "当前系统无法确定更新目标；恢复记录仍可查看。",

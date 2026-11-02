@@ -21,7 +21,8 @@ use super::{
 };
 
 impl AgentSessionService {
-    /// 按当前右栏归属和稳定目标身份过滤历史；无候选目标时当前目标视图必须为空，不能把缺省误当作全匹配。
+    /// 历史按会话的稳定归属筛选，避免终端重连或目标变化后复用的会话从列表消失。
+    /// 候选只用于新建与显式绑定，普通历史读取不改变已保存的首选终端。
     ///
     /// @author kongweiguang
     pub async fn history(
@@ -45,17 +46,11 @@ impl AgentSessionService {
             }
             all_count += 1;
             let in_scope = session_history_scope(session)? == request.scope;
-            let same_candidate = request.target_candidate.as_ref().is_some_and(|candidate| {
-                session
-                    .target
-                    .as_ref()
-                    .is_some_and(|binding| binding.points_to_same_session(candidate))
-            });
-            if in_scope && same_candidate {
+            if in_scope {
                 current_target_count += 1;
             }
             match request.mode {
-                AgentHistoryMode::CurrentTarget if in_scope && same_candidate => {
+                AgentHistoryMode::CurrentTarget if in_scope => {
                     visible_session_ids.push(session.agent_session_id.clone());
                 }
                 AgentHistoryMode::All => {

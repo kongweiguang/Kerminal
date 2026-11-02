@@ -17,11 +17,11 @@ use crate::{
     },
     sessions::{
         CreateSessionRequest, PlainTextSnapshot, PlainTextSnapshotRequest, RenderSnapshot,
-        RenderSnapshotRequest, SessionFilter, SessionRuntimeMetadata, SessionService,
-        SessionSubscription, ShellCommandOutcome, ShellCommandRequest, TerminalCommandContext,
-        TerminalSearchRequest, TerminalSearchResult, TerminalSelection, TerminalWriteReceipt,
-        UiCommandLineRequest, UiSessionBinding, UiTerminalCommandSubmissionReceipt,
-        UiTerminalCommandSubmissionRequest,
+        RenderSnapshotRequest, SessionChange, SessionChangeKind, SessionFilter,
+        SessionRuntimeMetadata, SessionService, SessionSubscription, ShellCommandOutcome,
+        ShellCommandRequest, TerminalCommandContext, TerminalSearchRequest, TerminalSearchResult,
+        TerminalSelection, TerminalWriteReceipt, UiCommandLineRequest, UiSessionBinding,
+        UiTerminalCommandSubmissionReceipt, UiTerminalCommandSubmissionRequest,
     },
 };
 use async_trait::async_trait;
@@ -41,7 +41,7 @@ use kerminal_domain::{
 use std::collections::VecDeque;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio_util::sync::CancellationToken;
@@ -285,6 +285,9 @@ struct ReceiptSessionService {
     shell_results: AsyncMutex<VecDeque<TestShellCommandResult>>,
     shell_commands: Mutex<Vec<String>>,
     shell_bindings: Mutex<Vec<Option<UiSessionBinding>>>,
+    changes: watch::Sender<SessionChange>,
+    pause_after_next_shell: AtomicBool,
+    pause_after_shell_count: AtomicUsize,
     list_calls: AtomicUsize,
     context_calls: AtomicUsize,
 }
@@ -314,6 +317,13 @@ impl ReceiptSessionService {
             shell_results: AsyncMutex::new(VecDeque::new()),
             shell_commands: Mutex::new(Vec::new()),
             shell_bindings: Mutex::new(Vec::new()),
+            changes: watch::channel(SessionChange {
+                revision: 0,
+                kind: SessionChangeKind::Output,
+            })
+            .0,
+            pause_after_next_shell: AtomicBool::new(false),
+            pause_after_shell_count: AtomicUsize::new(0),
             list_calls: AtomicUsize::new(0),
             context_calls: AtomicUsize::new(0),
         }
@@ -324,6 +334,27 @@ impl ReceiptSessionService {
     /// @author kongweiguang
     async fn queue_shell_results(&self, results: impl IntoIterator<Item = TestShellCommandResult>) {
         *self.shell_results.lock().await = results.into_iter().collect();
+    }
+
+    /// 用 watch 模拟 D 与 B 分开到达，测试不依赖真实终端或睡眠轮询。
+    ///
+    /// @author kongweiguang
+    async fn set_prompt_ready(&self, ready: bool, advance_input: bool) {
+        let mut context = self.command_context.lock().await;
+        context.prompt_ready = ready;
+        context.prompt_line_empty = ready;
+        context.availability = if ready {
+            crate::sessions::TerminalCommandAvailability::Available
+        } else {
+            crate::sessions::TerminalCommandAvailability::Unavailable(
+                crate::sessions::TerminalCommandUnavailableReason::PromptNotReady,
+            )
+        };
+        if advance_input {
+            context.input_generation += 1;
+        }
+        drop(context);
+        self.changes.send_modify(|change| change.revision += 1);
     }
 
     /// 仅返回 fake 实际收到的脚本副本，用于证明核对不会重放 apply 或 restore。
@@ -719,12 +750,12 @@ impl SessionService for ReceiptSessionService {
         unused_endpoint()
     }
 
-    /// 本测试不订阅实时终端事件。
+    /// 复用可控 watch，确保提示符先于订阅到达时仍能从当前快照恢复。
     async fn subscribe(&self, _session_id: SessionId) -> AppResult<SessionSubscription> {
-        unused_endpoint()
+        Ok(SessionSubscription::from_receiver(self.changes.subscribe()))
     }
 
-    /// 用预设结果驱动受管 shell 调用，保留每条脚本以证明未知结果只被核对。
+    /// 用预设结果驱动受管 shell 调用，并可使指定探针的 D 与 B 分离。
     ///
     /// @author kongweiguang
     async fn execute_shell_command(
@@ -737,10 +768,19 @@ impl SessionService for ReceiptSessionService {
             .lock()
             .expect("session test mutex should not be poisoned")
             .push(request.expected_ui_binding.clone());
-        self.shell_commands
-            .lock()
-            .expect("session test mutex should not be poisoned")
-            .push(request.command);
+        let command_count = {
+            let mut commands = self
+                .shell_commands
+                .lock()
+                .expect("session test mutex should not be poisoned");
+            commands.push(request.command);
+            commands.len()
+        };
+        if self.pause_after_next_shell.swap(false, Ordering::SeqCst)
+            || self.pause_after_shell_count.load(Ordering::SeqCst) == command_count
+        {
+            self.set_prompt_ready(false, false).await;
+        }
         match self.shell_results.lock().await.pop_front() {
             Some(TestShellCommandResult::Finished(exit_code)) => {
                 Ok(ShellCommandOutcome::Finished {
@@ -950,6 +990,241 @@ async fn stopped_forward_keeps_same_binding_recovery_available() {
             .iter()
             .all(|binding| binding.as_ref() == Some(&fixture.binding))
     );
+}
+
+/// 代理回读等待 D 之后的 B，且每个探针结束后都重新等待同一会话的下一提示符。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn proxy_recovery_waits_for_each_prompt_after_command_completion() {
+    let fixture = proxy_recovery_fixture().await;
+    stop_after_confirmed_proxy_apply(&fixture).await;
+    fixture.sessions.set_prompt_ready(false, false).await;
+    fixture
+        .sessions
+        .queue_shell_results([
+            TestShellCommandResult::Finished(1),
+            TestShellCommandResult::Finished(1),
+            TestShellCommandResult::Finished(0),
+            TestShellCommandResult::Finished(0),
+            TestShellCommandResult::Finished(0),
+            TestShellCommandResult::Finished(0),
+        ])
+        .await;
+    fixture
+        .sessions
+        .pause_after_next_shell
+        .store(true, Ordering::SeqCst);
+
+    let operation = fixture
+        .proxy
+        .reconcile_unique_current_application(fixture.binding.clone(), CancellationToken::new());
+    tokio::pin!(operation);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut operation)
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.sessions.shell_commands().len(), 1);
+
+    fixture.sessions.set_prompt_ready(true, false).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut operation)
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.sessions.shell_commands().len(), 2);
+    fixture.sessions.set_prompt_ready(true, false).await;
+
+    let result = operation
+        .await
+        .expect("reconciliation completes")
+        .expect("the original transaction remains tracked");
+    assert_eq!(result.outcome, TerminalProxyReconcileOutcome::Applied);
+    assert_eq!(fixture.sessions.shell_commands().len(), 7);
+}
+
+/// 最后一个探针完成后仍要等 B，避免调用方收到 Applied 时终端尚未回到可操作状态。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn proxy_recovery_waits_for_prompt_after_final_probe() {
+    let fixture = proxy_recovery_fixture().await;
+    stop_after_confirmed_proxy_apply(&fixture).await;
+    fixture
+        .sessions
+        .queue_shell_results([
+            TestShellCommandResult::Finished(1),
+            TestShellCommandResult::Finished(1),
+            TestShellCommandResult::Finished(0),
+            TestShellCommandResult::Finished(0),
+            TestShellCommandResult::Finished(0),
+            TestShellCommandResult::Finished(0),
+        ])
+        .await;
+    fixture
+        .sessions
+        .pause_after_shell_count
+        .store(7, Ordering::SeqCst);
+
+    let operation = fixture
+        .proxy
+        .reconcile_unique_current_application(fixture.binding.clone(), CancellationToken::new());
+    tokio::pin!(operation);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut operation)
+            .await
+            .is_err(),
+        "the final D cannot be returned as ready before its following B"
+    );
+    assert_eq!(fixture.sessions.shell_commands().len(), 7);
+    fixture.sessions.set_prompt_ready(true, false).await;
+    let result = operation
+        .await
+        .expect("reconciliation completes after B")
+        .expect("the original transaction remains tracked");
+    assert_eq!(result.outcome, TerminalProxyReconcileOutcome::Applied);
+    assert!(fixture.sessions.command_context.lock().await.prompt_ready);
+}
+
+/// active 探针完成后的等待中一旦有新输入，整条回读链立即停止，不向新提示符发送 backups 探针。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn proxy_recovery_stops_after_input_changes_during_active_probe() {
+    let fixture = proxy_recovery_fixture().await;
+    stop_after_confirmed_proxy_apply(&fixture).await;
+    fixture
+        .sessions
+        .queue_shell_results([
+            TestShellCommandResult::Finished(1),
+            TestShellCommandResult::Finished(1),
+            TestShellCommandResult::Finished(0),
+            TestShellCommandResult::Finished(0),
+        ])
+        .await;
+    fixture
+        .sessions
+        .pause_after_shell_count
+        .store(4, Ordering::SeqCst);
+    let operation = fixture
+        .proxy
+        .reconcile_unique_current_application(fixture.binding.clone(), CancellationToken::new());
+    tokio::pin!(operation);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut operation)
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.sessions.shell_commands().len(), 4);
+    fixture.sessions.set_prompt_ready(true, true).await;
+    let result = operation
+        .await
+        .expect("the changed input returns a typed result")
+        .expect("the original transaction remains tracked");
+    assert_eq!(
+        result.outcome,
+        TerminalProxyReconcileOutcome::NotAvailable {
+            reason: TerminalProxyUnavailableReason::PromptNotReady,
+        }
+    );
+    assert_eq!(fixture.sessions.shell_commands().len(), 4);
+}
+
+/// active 探针回执未知时保留原事务，不把后续只读命令发到可能已变化的 shell。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn proxy_recovery_stops_after_unknown_active_probe() {
+    let fixture = proxy_recovery_fixture().await;
+    stop_after_confirmed_proxy_apply(&fixture).await;
+    fixture
+        .sessions
+        .queue_shell_results([
+            TestShellCommandResult::Finished(1),
+            TestShellCommandResult::Finished(1),
+            TestShellCommandResult::Unknown(
+                crate::sessions::ShellCommandUnknownReason::MissingCompletion,
+            ),
+            TestShellCommandResult::Finished(0),
+        ])
+        .await;
+    let result = fixture
+        .proxy
+        .reconcile_unique_current_application(fixture.binding.clone(), CancellationToken::new())
+        .await
+        .expect("unknown active probe returns a typed result")
+        .expect("the original transaction remains tracked");
+    assert_eq!(
+        result.outcome,
+        TerminalProxyReconcileOutcome::Unknown {
+            reason: crate::sessions::ShellCommandUnknownReason::MissingCompletion,
+        }
+    );
+    assert_eq!(fixture.sessions.shell_commands().len(), 4);
+}
+
+/// 用户在等待下一提示符期间输入后，旧回读不得向变化过的终端注入探针。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn proxy_recovery_does_not_probe_after_input_changes_while_waiting() {
+    let fixture = proxy_recovery_fixture().await;
+    stop_after_confirmed_proxy_apply(&fixture).await;
+    fixture.sessions.set_prompt_ready(false, false).await;
+    let operation = fixture
+        .proxy
+        .reconcile_unique_current_application(fixture.binding.clone(), CancellationToken::new());
+    tokio::pin!(operation);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut operation)
+            .await
+            .is_err()
+    );
+    fixture.sessions.set_prompt_ready(true, true).await;
+    let result = operation
+        .await
+        .expect("the changed input returns a typed result")
+        .expect("the original transaction remains tracked");
+    assert_eq!(
+        result.outcome,
+        TerminalProxyReconcileOutcome::NotAvailable {
+            reason: TerminalProxyUnavailableReason::PromptNotReady,
+        }
+    );
+    assert_eq!(fixture.sessions.shell_commands().len(), 1);
+}
+
+/// 等待提示符时取消不会提交探针，未知事务仍保留供之后核对。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn proxy_recovery_can_cancel_while_waiting_for_prompt() {
+    let fixture = proxy_recovery_fixture().await;
+    stop_after_confirmed_proxy_apply(&fixture).await;
+    fixture.sessions.set_prompt_ready(false, false).await;
+    let cancellation = CancellationToken::new();
+    let operation = fixture
+        .proxy
+        .reconcile_unique_current_application(fixture.binding.clone(), cancellation.clone());
+    tokio::pin!(operation);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), &mut operation)
+            .await
+            .is_err()
+    );
+    cancellation.cancel();
+    let result = operation
+        .await
+        .expect("cancellation returns a typed result")
+        .expect("the original transaction remains tracked");
+    assert_eq!(
+        result.outcome,
+        TerminalProxyReconcileOutcome::Unknown {
+            reason: crate::sessions::ShellCommandUnknownReason::Cancelled,
+        }
+    );
+    assert_eq!(fixture.sessions.shell_commands().len(), 1);
 }
 
 /// Wrong generation neither discovers nor mutates the prior generation's recovery record.

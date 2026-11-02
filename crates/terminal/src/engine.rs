@@ -1287,6 +1287,7 @@ impl TerminalEngine {
                 CursorShape::Hidden => TerminalCursorShape::Block,
             },
             style_from_terminal: self.cursor_style_tracker.is_terminal_styled(),
+            blink_from_terminal: self.cursor_style_tracker.is_terminal_blink_styled(),
             blinking: self.term.cursor_style().blinking,
             visible: renderable.cursor.shape != CursorShape::Hidden && cursor_row_visible,
         };

@@ -17,9 +17,30 @@ use kerminal_domain::{
 
 use crate::root::workbench::{
     ToolRailPanelSlots, ToolRailPanelState, attached_dock_default_width,
-    compact_tool_drawer_should_be_visible, focused_workspace_pane, sidebar_expansion_needs_drawer,
-    tool_rail_button_height, tool_rail_label, tool_rail_partition_min_height,
+    compact_tool_drawer_should_be_visible, focused_workspace_pane, forward_form_status_bottom,
+    forward_form_status_on_top, sidebar_expansion_needs_drawer, tool_rail_button_height,
+    tool_rail_label, tool_rail_partition_min_height,
 };
+
+/// 只在原隧道表单最上层时抬高通知；认证等更高优先级界面仍遮住并暂停提示。
+///
+/// @author kongweiguang
+#[test]
+fn forward_form_status_respects_modal_ownership_and_priority() {
+    assert!(forward_form_status_on_top(true, true, false));
+    assert!(!forward_form_status_on_top(false, true, false));
+    assert!(!forward_form_status_on_top(true, false, false));
+    assert!(!forward_form_status_on_top(true, true, true));
+}
+
+/// 状态浮层避开表单单行和窄窗双行页脚，不改变表单布局高度。
+///
+/// @author kongweiguang
+#[test]
+fn forward_form_status_clears_the_footer_in_wide_and_narrow_layouts() {
+    assert_eq!(forward_form_status_bottom(988.), 80.);
+    assert_eq!(forward_form_status_bottom(360.), 124.);
+}
 
 /// 展开主机栏导致空间不足时必须立即给出目录抽屉，显式收起或宽窗不会补开。
 ///

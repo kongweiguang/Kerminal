@@ -264,9 +264,9 @@ fn remote_menu_new_connection_uses_clicked_group(app: &mut TestAppContext) {
     }
 }
 
-/// 协议菜单按能力裁剪，容器与 SFTP 转 SSH 的点击事件保留被右击的准确主机身份。
+/// 协议菜单不再提供主机容器入口；SFTP 转 SSH 的点击事件保留被右击的准确主机身份。
 #[gpui_kit::test]
-fn protocol_menu_actions_route_the_clicked_host(app: &mut TestAppContext) {
+fn protocol_menu_omits_containers_and_routes_sftp_copy(app: &mut TestAppContext) {
     init(app);
     for protocol in [
         RemoteProtocol::Ssh,
@@ -286,50 +286,101 @@ fn protocol_menu_actions_route_the_clicked_host(app: &mut TestAppContext) {
             events.clone(),
         );
         let labels = open_menu(visual, &selector);
-        let container = crate::locale::text("容器", "Containers").to_string();
+        assert!(
+            !labels.contains(&crate::locale::text("容器", "Containers").to_string()),
+            "主机右键不得提供容器入口"
+        );
         let copy_ssh =
             crate::locale::text("复制为 SSH 主机…", "Duplicate as SSH host…").to_string();
-        assert_eq!(labels.contains(&container), protocol == RemoteProtocol::Ssh);
         assert_eq!(labels.contains(&copy_ssh), protocol == RemoteProtocol::Sftp);
         if protocol == RemoteProtocol::Serial {
             assert!(!labels.contains(
                 &crate::locale::text("复制主机 IP / 主机名", "Copy host IP / hostname").to_string()
             ));
-            continue;
         }
-        let (label, expected) = if protocol == RemoteProtocol::Ssh {
-            (
-                container,
-                HostNavigationEvent::OpenHostContainersRequested { host_id: id },
-            )
-        } else {
-            (
-                copy_ssh,
-                HostNavigationEvent::CopyHostAsSshRequested { host_id: id },
-            )
-        };
-        click_menu_item(visual, &label);
-        assert!(
-            events.borrow().contains(&expected),
-            "菜单动作必须携带原行身份"
-        );
+        if protocol == RemoteProtocol::Sftp {
+            click_menu_item(visual, &copy_ssh);
+            let events = events.borrow();
+            assert_eq!(
+                events.first(),
+                Some(&HostNavigationEvent::HostSelected {
+                    host_id: id.clone()
+                }),
+            );
+            assert_eq!(
+                events.last(),
+                Some(&HostNavigationEvent::CopyHostAsSshRequested { host_id: id }),
+            );
+        }
     }
 }
 
-/// 只读恢复隐藏配置写入，但保留可查看的详情，并通过真实点击验证事件仍可送达。
+/// 快速打开和上下文导航只接受当前目录中的主机；失效快照不得清空选择或发出导航事件。
 #[gpui_kit::test]
-fn readonly_host_menu_retains_only_usable_read_actions(app: &mut TestAppContext) {
+fn external_host_selection_rejects_stale_snapshot(app: &mut TestAppContext) {
     init(app);
     let row = super::host("fixture", "fixture.invalid", None, false, &[]);
-    let id = row.id.clone();
-    let selector = format!("host-navigation-host-{}", id.as_str());
+    let host_id = row.id.clone();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let (runtime, navigation, _subscription, visual) = fixture(
+        app,
+        vec![row],
+        Vec::new(),
+        ConfigurationMode::ReadWrite,
+        events.clone(),
+    );
+
+    let selected = visual.update(|_, app| {
+        navigation.update(app, |navigation, cx| {
+            navigation.select_host_from_external(&host_id, cx)
+        })
+    });
+    assert!(selected);
+    assert_eq!(
+        &*events.borrow(),
+        &[HostNavigationEvent::HostSelected {
+            host_id: host_id.clone()
+        }],
+    );
+
+    events.borrow_mut().clear();
+    let stale_host_id = HostId::new();
+    let selected = visual.update(|_, app| {
+        navigation.update(app, |navigation, cx| {
+            navigation.select_host_from_external(&stale_host_id, cx)
+        })
+    });
+    assert!(!selected);
+    assert!(events.borrow().is_empty());
+    visual.update(|_, app| {
+        let navigation = navigation.read(app);
+        assert_eq!(navigation.selected_host.as_ref(), Some(&host_id));
+        assert!(
+            navigation
+                .feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.is_error)
+        );
+    });
+    for _ in 0..4 {
+        visual.run_until_parked();
+        runtime.block_on(tokio::task::yield_now());
+    }
+}
+
+/// 只读恢复隐藏配置写入，也不提供已移除的连接详情入口。
+#[gpui_kit::test]
+fn readonly_host_menu_hides_configuration_writes(app: &mut TestAppContext) {
+    init(app);
+    let row = super::host("fixture", "fixture.invalid", None, false, &[]);
+    let selector = format!("host-navigation-host-{}", row.id.as_str());
     let events = Rc::new(RefCell::new(Vec::new()));
     let (_runtime, _navigation, _subscription, visual) = fixture(
         app,
         vec![row],
         Vec::new(),
         ConfigurationMode::ReadOnlyRecovery,
-        events.clone(),
+        events,
     );
     let labels = open_menu(visual, &selector);
     for (zh, en) in [
@@ -337,16 +388,10 @@ fn readonly_host_menu_retains_only_usable_read_actions(app: &mut TestAppContext)
         ("编辑…", "Edit…"),
         ("复制主机配置…", "Copy host configuration…"),
         ("删除主机…", "Delete host…"),
+        ("查看连接详情", "Connection details"),
     ] {
         assert!(!labels.contains(&crate::locale::text(zh, en).to_string()));
     }
-    let details = crate::locale::text("查看连接详情", "Connection details");
-    click_menu_item(visual, &details);
-    assert!(
-        events
-            .borrow()
-            .contains(&HostNavigationEvent::ShowHostDetailsRequested { host_id: id })
-    );
 }
 
 /// 本地 Profile 取它所在的真实分组，悬空引用与无分组都不能泄露失效的组 ID。

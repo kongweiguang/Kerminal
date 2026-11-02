@@ -123,7 +123,10 @@ impl ExternalTemporaryTargetRegistry for ExternalRuntimeRegistry {
         ExternalTargetLease::new_registered(host_id, Arc::new(self.clone()))
     }
 
-    /// 密码只按本次 external host ID 写入零化内存槽，不允许与持久化主机共享引用。
+    /// 用户明确输入密码时允许临时 SSH agent 目标改用本次密码；显式私钥不能被隐式替换。
+    /// 凭据只写入该 external host 的零化内存槽，不与持久化主机共享引用。
+    ///
+    /// @author kongweiguang
     async fn set_password(&self, host_id: &HostId, password: Zeroizing<String>) -> AppResult<()> {
         if password.is_empty()
             || password.len() > MAX_PASSWORD_BYTES
@@ -139,7 +142,18 @@ impl ExternalTemporaryTargetRegistry for ExternalRuntimeRegistry {
             .get_mut(host_id)
             .ok_or_else(|| AppError::not_found("临时外部连接已关闭"))?;
         if entry.password_reference.is_none() {
-            return Err(AppError::invalid("此临时连接未请求密码认证"));
+            if entry.profile.protocol != RemoteProtocol::Ssh
+                || !matches!(
+                    &entry.profile.authentication,
+                    Some(SshAuthentication::Agent)
+                )
+            {
+                return Err(AppError::invalid("此临时连接不支持切换为密码认证"));
+            }
+            let (authentication, reference) =
+                authentication_for(host_id, ExternalAuthenticationHint::PasswordPrompt)?;
+            entry.profile.authentication = Some(authentication);
+            entry.password_reference = reference;
         }
         entry.password = Some(password);
         Ok(())

@@ -259,11 +259,14 @@ fn tab_separator(
 /// 滚动内容必须能收缩到宿主剩余宽度并在两轴裁切，不能盖住左侧折叠入口或右端列表。
 /// 列表按钮放在此 viewport 之外；滚轮与自动定位继续共用原 ScrollHandle，不新增导航状态。
 /// 滚动 API 要求有身份的 Stateful 元素；稳定 ID 只在此设置一次，调用方不再重复包装。
+/// 验收 feature 额外暴露真实滚动裁切边界，防止屏外标签的调试坐标误导原生点击。
 ///
 /// @author kongweiguang
 pub(super) fn workspace_tabs_scroll_viewport() -> gpui_kit::Stateful<gpui_kit::Div> {
-    div()
-        .id("workspace-tabs-scroll-area")
+    let viewport = div().id("workspace-tabs-scroll-area");
+    #[cfg(feature = "right-rail-acceptance")]
+    let viewport = viewport.debug_selector(|| "workspace-tabs-scroll-area".to_owned());
+    viewport
         .flex_1()
         .min_w(px(0.))
         .h_full()
@@ -1043,7 +1046,7 @@ impl Render for WorkspaceTabs {
     /// 错误态关闭 Input 焦点环以保留错误边框，并让输入/错误摘要在窄栏收缩，保存与取消控件保持可见。
     /// 只有真实溢出才显示列表入口；无溢出时 + 位于最后标签后，溢出时固定在列表入口右侧。
     /// 滚动轨道撑满标题栏并居中子项，使尾随 + 与轨道外的列表/新建按钮使用同一条垂直中线。
-    /// 方向键/Home/End只在当前可见标签间移动焦点，并且仅显式移动时依真实 bounds 最小滚动；普通重绘保留手动位置。
+    /// 方向键/Home/End只在当前可见标签间移动焦点；活动选择等待 picker 布局稳定后再最小滚动，手动滚动优先。
     /// 拖拽边缘滚动由单个短间隔任务维持，松手、取消、失焦或源失效即退出。
     /// 加号单击发布本地新建意图，右键菜单在打开时读取左栏同源主机快照并保留分组。
     /// 加号消费左键按下和点击，防止 Windows 标题栏默认处理接管按下、丢失后续释放；右键仍交给 Popover。
@@ -1059,6 +1062,7 @@ impl Render for WorkspaceTabs {
         self.reconcile_tab_focus_handles(cx);
         let theme = ThemeTokens::current(window, cx).for_workbench();
         let scroll_max = self.scroll_handle.max_offset().x;
+        let offset_before_layout = self.scroll_handle.offset();
         let picker_visible = self.show_tab_picker;
         let pending_tab_reveal = self.pending_tab_reveal.clone();
         let tab_reveal_bounds = Rc::new(RefCell::new(None));
@@ -1067,19 +1071,24 @@ impl Render for WorkspaceTabs {
         let callback_bounds = tab_reveal_bounds.clone();
         let pending_for_callback = pending_tab_reveal.clone();
         window.on_next_frame(move |window, app| {
-            // 预绘制得到真实标签边界；若偏移已变化则视为用户手动滚动并放弃旧请求。
-            let measured_max_offset = scroll_handle.max_offset().x;
-            let max_changed = measured_max_offset != scroll_max;
+            // prepaint 会按新内容夹紧旧偏移，只有精确匹配该夹紧结果才保留自动定位。
+            let measured_max_offset = scroll_handle.max_offset();
+            let max_changed = measured_max_offset.x != scroll_max;
             let next_picker_visible =
-                workspace_tab_picker_should_show(measured_max_offset, picker_visible);
+                workspace_tab_picker_should_show(measured_max_offset.x, picker_visible);
             let picker_changed = next_picker_visible != picker_visible;
             if max_changed || picker_changed || pending_for_callback.is_some() {
                 let measured_tab = *callback_bounds.borrow();
                 let viewport = scroll_handle.bounds();
                 let current_offset = scroll_handle.offset();
-                let may_reveal = pending_for_callback
-                    .as_ref()
-                    .is_some_and(|pending| pending.expected_offset == current_offset);
+                let clamped_offset = gpui_kit::point(
+                    offset_before_layout.x.clamp(-measured_max_offset.x, px(0.)),
+                    offset_before_layout.y.clamp(-measured_max_offset.y, px(0.)),
+                );
+                let may_reveal = pending_for_callback.as_ref().is_some_and(|pending| {
+                    pending.expected_offset == offset_before_layout
+                        && current_offset == clamped_offset
+                });
                 let next_offset = measured_tab.map(|tab| {
                     super::minimal_active_tab_reveal_offset(current_offset, viewport, tab)
                 });
@@ -1093,16 +1102,24 @@ impl Render for WorkspaceTabs {
                         tabs.pending_tab_reveal.as_ref().is_some_and(|current| {
                             current.tab_id == pending.tab_id
                                 && current.generation == pending.generation
+                                && current.expected_offset == pending.expected_offset
                         })
                     });
-                    if pending_is_current {
+                    if pending_is_current && picker_state_is_current {
                         let target_is_current =
                             pending_for_callback.as_ref().is_some_and(|pending| {
                                 match pending.reason {
-                                    super::TabRevealReason::ActiveSelection => tabs
-                                        .projection
-                                        .iter()
-                                        .any(|tab| tab.active && tab.id == pending.tab_id),
+                                    super::TabRevealReason::ActiveSelection => {
+                                        tabs.projection.iter().any(|tab| {
+                                            tab.active
+                                                && tab.id == pending.tab_id
+                                                && !tab.group_id.as_ref().is_some_and(|group_id| {
+                                                    tabs.groups.iter().any(|group| {
+                                                        &group.id == group_id && group.collapsed
+                                                    })
+                                                })
+                                        })
+                                    }
                                     super::TabRevealReason::KeyboardFocus => {
                                         let target_is_visible = tabs
                                             .projection
@@ -1127,14 +1144,21 @@ impl Render for WorkspaceTabs {
                                     }
                                 }
                             });
-                        tabs.pending_tab_reveal = None;
-                        if may_reveal
-                            && target_is_current
+                        if !may_reveal || !target_is_current {
+                            tabs.pending_tab_reveal = None;
+                        } else if picker_changed {
+                            // picker 改变视口宽度，下一帧必须使用新布局的边界。
+                            if let Some(pending) = tabs.pending_tab_reveal.as_mut() {
+                                pending.expected_offset = current_offset;
+                            }
+                        } else if viewport.size.width > px(0.)
                             && let Some(next_offset) = next_offset
-                            && next_offset != current_offset
                         {
-                            scroll_handle.set_offset(next_offset);
-                            cx.notify();
+                            tabs.pending_tab_reveal = None;
+                            if next_offset != current_offset {
+                                scroll_handle.set_offset(next_offset);
+                                cx.notify();
+                            }
                         }
                     }
                     if max_changed || picker_was_updated {
@@ -1424,7 +1448,7 @@ impl Render for WorkspaceTabs {
                         cx.emit(WorkspaceTabsCreateEvent::Local);
                         cx.stop_propagation();
                     })),
-                mouse_button: MouseButton::Right,
+                mouse_button: Some(MouseButton::Right),
                 open: self.create_target_picker_open,
                 trigger_style: StyleRefinement::default()
                     .w(px(WORKSPACE_TAB_BUTTON_WIDTH))
@@ -1438,7 +1462,16 @@ impl Render for WorkspaceTabs {
                 },
                 content: create_content,
             });
-            let viewport = workspace_tabs_scroll_viewport().track_scroll(&self.scroll_handle);
+            let viewport = workspace_tabs_scroll_viewport()
+                .track_scroll(&self.scroll_handle)
+                .on_scroll_wheel(cx.listener(|tabs, _, _, _| {
+                    if tabs.pending_tab_reveal.is_some() {
+                        super::invalidate_tab_reveal(
+                            &mut tabs.tab_reveal_generation,
+                            &mut tabs.pending_tab_reveal,
+                        );
+                    }
+                }));
             let tab_bar = if self.show_tab_picker {
                 let tab_list_label = crate::locale::text("标签列表", "Tab list");
                 let picker_entity = tabs_entity;

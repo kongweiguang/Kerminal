@@ -19,11 +19,24 @@ use crate::root::workspace_files::{
     FilesWorkspaceSelection, WorkspaceFileRestoreIssue, WorkspaceFileRestoreState,
     WorkspaceFileRuntime, editor_projection_contains_endpoint, sftp_transfer_endpoints,
     sftp_transfer_tab_for_host, should_return_to_terminal_after_editor_close,
-    workspace_file_action_endpoint, workspace_file_endpoint_parts, workspace_file_full_path,
+    update_sftp_transfer_descriptor, workspace_file_action_endpoint, workspace_file_endpoint_parts,
+    workspace_file_full_path,
 };
 use crate::root::{
     CenterPanel, TerminalTargetRequest, is_generated_terminal_pane_title, terminal_tab_title,
 };
+
+impl WorkspaceFileRuntime {
+    /// 只读测试中暂存的双端点，验证 CAS 门禁没有丢弃面板的最新选择。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn pending_transfer_endpoints(
+        &self,
+        tab_id: &TabId,
+    ) -> Option<(FileEndpoint, Option<FileEndpoint>)> {
+        self.tabs.get(tab_id)?.pending_transfer_endpoints.clone()
+    }
+}
 
 /// 关闭当前传输页后跟随 reducer 的后继传输标签，不能继续引用已释放的面板。
 ///
@@ -392,10 +405,10 @@ fn sftp_transfer_restores_both_endpoints_and_selection() {
     );
     assert_eq!(
         endpoints.right,
-        FileEndpoint::Remote {
+        Some(FileEndpoint::Remote {
             host_id: right_host,
             path: RemotePath::parse("/srv/releases").expect("right path"),
-        }
+        })
     );
     assert_eq!(endpoints.locked_left_host_id, Some(locked_left));
     assert_eq!(
@@ -463,7 +476,9 @@ fn new_host_transfer_tab_preserves_exact_host_path_and_pending_tab_identity() {
     assert_eq!(runtime.pending_tab_ids(), vec![existing_id, tab_id]);
 }
 
-/// SFTP 左右端都恢复各自快照路径；外部 launch 与全无目标的 tab 明确失败。
+/// SFTP 旧描述缺少右侧目标时恢复为空态，临时连接仍不能当作可恢复标签。
+///
+/// @author kongweiguang
 #[test]
 fn sftp_transfer_local_path_and_ephemeral_target_are_handled_explicitly() {
     let local_tab = WorkspaceSessionTab::SftpTransfer {
@@ -502,19 +517,14 @@ fn sftp_transfer_local_path_and_ephemeral_target_are_handled_explicitly() {
         initial_right_selection: None,
     };
     let local_pair = sftp_transfer_endpoints(&local_pair_tab, Path::new("C:/workspace"))
-        .expect("hostless transfer workspace uses its two local panels");
+        .expect("hostless transfer workspace keeps an unselected right side");
     assert_eq!(
         local_pair.left,
         FileEndpoint::Local {
             path: "C:/workspace".into()
         }
     );
-    assert_eq!(
-        local_pair.right,
-        FileEndpoint::Local {
-            path: "C:/workspace".into()
-        }
-    );
+    assert_eq!(local_pair.right, None);
 
     let external_tab = WorkspaceSessionTab::SftpTransfer {
         id: TabId::new(),
@@ -535,6 +545,76 @@ fn sftp_transfer_local_path_and_ephemeral_target_are_handled_explicitly() {
     );
 }
 
+/// 右侧本机与未选择写出不同的 v3 组合，旧锁仅负责初始来源且下一次变更后解除。
+///
+/// @author kongweiguang
+#[test]
+fn transfer_descriptor_roundtrips_local_remote_and_unselected_targets() {
+    let left_host = HostId::parse("new-left").expect("valid host");
+    let old_host = HostId::parse("old-left").expect("valid host");
+    let right_host = HostId::parse("new-right").expect("valid host");
+    let mut tab = WorkspaceSessionTab::SftpTransfer {
+        id: TabId::new(),
+        tab_group_id: None,
+        title: "My transfer".to_owned(),
+        machine_id: "old-left".to_owned(),
+        left_host_id: None,
+        locked_left_host_id: Some(old_host),
+        right_host_id: Some(right_host.clone()),
+        external_launch_id: None,
+        initial_left_path: Some("/old".to_owned()),
+        initial_right_path: Some("/old-right".to_owned()),
+        initial_right_selection: Some("stale-file".to_owned()),
+    };
+    let left = FileEndpoint::Remote {
+        host_id: left_host,
+        path: RemotePath::parse("/srv/source").expect("valid path"),
+    };
+    let remote_right = FileEndpoint::Remote {
+        host_id: right_host,
+        path: RemotePath::parse("/srv/destination").expect("valid path"),
+    };
+    let local_right = FileEndpoint::Local {
+        path: "C:/destination".into(),
+    };
+
+    for right in [Some(remote_right), Some(local_right), None] {
+        update_sftp_transfer_descriptor(&mut tab, &left, &right).expect("persistable endpoints");
+        let restored = sftp_transfer_endpoints(&tab, Path::new("C:/workspace"))
+            .expect("updated descriptor restores");
+        assert_eq!(restored.left, left);
+        assert_eq!(restored.right, right);
+        assert!(restored.locked_left_host_id.is_none());
+        assert!(restored.initial_right_selection.is_none());
+        assert_eq!(tab.title(), "My transfer");
+    }
+}
+
+/// 不能把临时连接写成可恢复主机；校验失败不得部分修改原标签描述。
+///
+/// @author kongweiguang
+#[test]
+fn transfer_descriptor_rejects_temporary_target_without_mutating_tab() {
+    let host = HostId::parse("saved-host").expect("valid host");
+    let mut tab = sftp_transfer_tab_for_host(
+        TabId::new(),
+        host,
+        None,
+        &RemotePath::parse("/").expect("root"),
+        "Transfer",
+    );
+    let original = tab.clone();
+    let left = FileEndpoint::Local {
+        path: "C:/source".into(),
+    };
+    let right = Some(FileEndpoint::Remote {
+        host_id: HostId::parse("external:temporary").expect("external identity"),
+        path: RemotePath::parse("/tmp").expect("valid path"),
+    });
+    assert!(update_sftp_transfer_descriptor(&mut tab, &left, &right).is_err());
+    assert_eq!(tab, original);
+}
+
 /// 只读策略在同 endpoint 的多个工作区标签间取严格值，不能由可编辑别名放宽。
 #[test]
 fn duplicate_workspace_file_endpoint_keeps_readonly_alias() {
@@ -550,6 +630,56 @@ fn duplicate_workspace_file_endpoint_keeps_readonly_alias() {
     };
 
     assert!(runtime.workspace_file_requires_readonly(&endpoint));
+}
+
+/// 两种来源及待恢复、失败状态都按完整端点复用，不能将其它主机的同名路径合并。
+///
+/// @author kongweiguang
+#[test]
+fn pending_and_failed_file_descriptors_match_endpoint_across_sources() {
+    let host = HostId::parse("host-a").unwrap();
+    let endpoint = FileEndpoint::Remote {
+        host_id: host.clone(),
+        path: RemotePath::parse("/srv/compose.yaml").unwrap(),
+    };
+    let other_host = FileEndpoint::Remote {
+        host_id: HostId::parse("host-b").unwrap(),
+        path: RemotePath::parse("/srv/compose.yaml").unwrap(),
+    };
+    for (source, access) in [
+        (WorkspaceFileSource::Sftp, WorkspaceFileAccess::Editable),
+        (
+            WorkspaceFileSource::ComposeYaml,
+            WorkspaceFileAccess::Readonly,
+        ),
+    ] {
+        let id = TabId::new();
+        let tab = WorkspaceSessionTab::WorkspaceFile {
+            id: id.clone(),
+            tab_group_id: None,
+            title: "compose.yaml".to_owned(),
+            machine_id: host.as_str().to_owned(),
+            target: WorkspaceTargetRef::Ssh {
+                host_id: host.clone(),
+            },
+            path: "/srv/compose.yaml".to_owned(),
+            root_path: None,
+            access,
+            source,
+        };
+        let mut runtime = WorkspaceFileRuntime::from_snapshot(&snapshot_with_tabs(vec![tab]));
+        assert_eq!(runtime.tab_for_endpoint(&endpoint), Some(id.clone()));
+        assert_eq!(runtime.tab_for_endpoint(&other_host), None);
+        runtime.set_result(
+            &id,
+            Err((
+                crate::features::workspace_controller::WorkspaceRestoreFailure::ResourceFailure,
+                "fixture restore failure".into(),
+            )),
+        );
+        assert_eq!(runtime.tab_for_endpoint(&endpoint), Some(id));
+        assert_eq!(runtime.tab_for_endpoint(&other_host), None);
+    }
 }
 
 /// 快照只允許首次安裝；未完成 Root 关闭门禁前拒绝替换并保留原 TabId 映射。
@@ -596,6 +726,36 @@ fn retry_changes_failed_tab_back_to_pending() {
         runtime.restore_state(&tab_id),
         Some(&WorkspaceFileRestoreState::Pending)
     );
+}
+
+/// 本机容器没有可持久恢复的宿主身份，显式重试必须沿用本轮 runtime 的真实端点。
+///
+/// @author kongweiguang
+#[test]
+fn transient_file_retry_keeps_the_original_endpoint() {
+    let tab_id = TabId::new();
+    let mut tab = local_workspace_file(tab_id.clone(), WorkspaceFileAccess::Editable);
+    if let WorkspaceSessionTab::WorkspaceFile { source, .. } = &mut tab {
+        *source = kerminal_application::workspace::WorkspaceFileSource::Container;
+    }
+    let endpoint = FileEndpoint::Container {
+        host_id: None,
+        runtime: kerminal_domain::files::ContainerRuntime::Docker,
+        container_id: "ephemeral-container".to_owned(),
+        path: RemotePath::parse("/etc/app.txt").expect("fixture path"),
+    };
+    let mut runtime = WorkspaceFileRuntime::from_snapshot(&snapshot_with_tabs(Vec::new()));
+    assert!(runtime.register_open_file_tab(tab, endpoint.clone(), None, true));
+    runtime.set_result(
+        &tab_id,
+        Err((
+            crate::features::workspace_controller::WorkspaceRestoreFailure::ResourceFailure,
+            "temporarily unavailable".into(),
+        )),
+    );
+    assert!(runtime.retry_failed_tab(&tab_id));
+    assert_eq!(runtime.file_endpoint(&tab_id), Some(endpoint));
+    assert!(runtime.transient_tab_ids().contains(&tab_id));
 }
 
 /// Editor 行回执只接受仍打开的 endpoint，迟到的 Files 点击不能重新打开已关闭文件。

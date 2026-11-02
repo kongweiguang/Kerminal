@@ -8,8 +8,8 @@ use gpui_kit::{
     assets::IconName,
     canvas,
     component::{
-        Disableable, Icon,
-        button::{Button, ButtonVariants},
+        Disableable, Icon, WindowExt as _,
+        button::{Button, ButtonVariant, ButtonVariants},
         input::Textarea,
     },
     div, point,
@@ -22,10 +22,12 @@ use kerminal_application::configuration_sync::{
 
 use crate::theme::ThemeTokens;
 
-use super::panel::PreferencesPanel;
+use super::panel::{PreferencesPanel, RecoveryDirectoryStatus};
 
 impl PreferencesPanel {
-    /// 按 main 的页面结构展示同步；透明滚动根继承弹框表面，按钮状态由真实同步用例校验。
+    /// 用真实仓库状态约束同步和恢复入口，避免缺上游或变基冲突被显示为远端同步成功。
+    ///
+    /// @author kongweiguang
     pub(super) fn render_configuration_sync(
         &mut self,
         theme: ThemeTokens,
@@ -39,9 +41,35 @@ impl PreferencesPanel {
         let busy = sync_busy || self.connectivity.key_loading || self.connectivity.key_saving;
         let sync_available = self.sync_outcome_unknown
             || status.as_ref().is_some_and(|status| {
-                status.git_available && status.repository != SyncRepositoryState::Missing
+                status.git_available
+                    && status.writable
+                    && !status.rebase_in_progress
+                    && status.conflicts.is_empty()
+                    && matches!(
+                        status.repository,
+                        SyncRepositoryState::Ready | SyncRepositoryState::NoUpstream
+                    )
             });
         let can_sync = !busy && sync_available && !service_missing;
+        let rebase_in_progress = status
+            .as_ref()
+            .is_some_and(|status| status.rebase_in_progress);
+        let conflicts = status
+            .as_ref()
+            .map_or_else(Vec::new, |status| status.conflicts.clone());
+        let can_rebase = !busy
+            && !self.sync_outcome_unknown
+            && status
+                .as_ref()
+                .is_some_and(|status| status.writable && status.rebase_in_progress);
+        let directory_pending = matches!(
+            self.recovery_directory_status.as_ref(),
+            Some(RecoveryDirectoryStatus::Requesting)
+        );
+        let directory_error = match self.recovery_directory_status.as_ref() {
+            Some(RecoveryDirectoryStatus::Failed(message)) => Some(message.clone()),
+            _ => None,
+        };
         let sync_result = self.connectivity.sync_run_result.clone();
         let key_path = workspace.as_ref().map(|info| info.vault_key_path.as_str());
         let root_path = workspace.as_ref().map(|info| info.workspace_root.as_str());
@@ -97,10 +125,35 @@ impl PreferencesPanel {
                                     .child(crate::locale::text("同步", "Sync")))
                                 .child(div().max_w(px(620.)).text_size(theme.text_xs).text_color(theme.muted)
                                     .child(crate::locale::text(
-                                        "仅同步 Kerminal 工作区配置。同步会先拉取远程内容，再提交本地变更。",
-                                        "Syncs Kerminal workspace configuration. It pulls remote changes first, then commits local changes.",
+                                        "先提交本地配置，再拉取远端并推送待同步的提交。",
+                                        "Commit local configuration, then pull and push pending commits.",
                                     ))))
                             .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(Button::new("workspace-sync-open-directory")
+                                        .compact()
+                                        .outline()
+                                        .icon(Icon::new(IconName::FolderOpen).size(px(14.)))
+                                        .label(crate::locale::text("配置文件夹", "Config folder"))
+                                        .disabled(self.configuration_directory.is_none() || directory_pending)
+                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                            panel.open_recovery_configuration_directory(cx);
+                                        })))
+                                    .child(Button::new("workspace-sync-refresh-status")
+                                        .compact()
+                                        .outline()
+                                        .icon(Icon::new(IconName::Activity).size(px(14.)))
+                                        .label(crate::locale::text("状态", "Status"))
+                                        .disabled(busy || service_missing)
+                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                            panel.refresh_configuration_sync(cx);
+                                        })))
+                                    .child(
                                 Button::new("workspace-sync-run")
                                     .compact()
                                     .primary()
@@ -122,6 +175,7 @@ impl PreferencesPanel {
                                     .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
                                         panel.run_workspace_sync(cx);
                                     })),
+                                ),
                             ),
                     )
                     .child(div().flex().gap_3()
@@ -143,6 +197,7 @@ impl PreferencesPanel {
                                 root_path.unwrap_or(if service_missing { "同步服务不可用" } else { "正在读取路径…" }),
                                 theme,
                             ))))
+                    .when_some(directory_error, |card, error| card.child(sync_note(error, theme.error)))
                     .when_some(self.sync_result.as_ref().and_then(|result| result.commit_hash.clone()), |card, hash| {
                         card.child(sync_info_row(
                             IconName::GitCommitHorizontal,
@@ -152,6 +207,54 @@ impl PreferencesPanel {
                         ))
                     }),
             )
+            .when(rebase_in_progress, |page| {
+                let abort_entity = panel_entity.clone();
+                page.child(
+                    sync_card(theme)
+                        .child(div().text_size(theme.text_sm).font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child(crate::locale::text("变基需要处理", "Rebase needs attention")))
+                        .child(sync_note(crate::locale::text(
+                            "在配置目录中解决并暂存冲突，刷新状态后继续，或中止本次变基。",
+                            "Resolve and stage conflicts in the configuration folder, then refresh and continue or abort the rebase.",
+                        ), theme.muted))
+                        .children(conflicts.iter().map(|path| {
+                            div().w_full().min_w(px(0.)).text_size(theme.text_xs)
+                                .font_family("monospace").text_color(theme.foreground)
+                                .child(path.clone())
+                        }))
+                        .child(div().flex().flex_wrap().items_center().gap_2()
+                            .child(Button::new("workspace-sync-rebase-continue")
+                                .compact().outline()
+                                .label(crate::locale::text("继续变基", "Continue rebase"))
+                                .disabled(!can_rebase || !conflicts.is_empty())
+                                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                    panel.continue_workspace_rebase(cx);
+                                })))
+                            .child(Button::new("workspace-sync-rebase-abort")
+                                .compact().outline()
+                                .label(crate::locale::text("中止变基", "Abort rebase"))
+                                .disabled(!can_rebase)
+                                .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
+                                    let entity = abort_entity.clone();
+                                    window.open_alert_dialog(cx, move |alert, _, _| {
+                                        let entity = entity.clone();
+                                        alert.confirm()
+                                            .title(crate::locale::text("中止变基？", "Abort rebase?"))
+                                            .description(crate::locale::text(
+                                                "未提交的冲突处理可能丢失。",
+                                                "Uncommitted conflict resolutions may be lost.",
+                                            ))
+                                            .ok_text(crate::locale::text("中止变基", "Abort rebase"))
+                                            .ok_variant(ButtonVariant::Danger)
+                                            .cancel_text(crate::locale::text("取消", "Cancel"))
+                                            .on_ok(move |_, _, app| {
+                                                let _ = entity.update(app, |panel, cx| panel.abort_workspace_rebase(cx));
+                                                true
+                                            })
+                                    });
+                                }))))
+                )
+            })
             .child(
                 sync_card(theme)
                     .child(div().flex().flex_wrap().items_start().justify_between().gap_3()
@@ -304,10 +407,14 @@ fn key_resize_input_events(
     .inset_0()
 }
 
-/// 汇总本地 Git 状态，不暴露远端 URL 或受保护文件内容。
+/// 变基通常临时处于 detached HEAD；优先显示恢复状态，避免提示用户错误切换分支。
+///
+/// @author kongweiguang
 fn repository_label(status: &ConfigurationSyncStatus) -> gpui_kit::SharedString {
     if !status.git_available {
         crate::locale::text("Git 不可用", "Git unavailable")
+    } else if status.rebase_in_progress {
+        crate::locale::text("变基中", "Rebase in progress")
     } else {
         match status.repository {
             SyncRepositoryState::Missing => crate::locale::text("未初始化", "Not initialized"),
@@ -462,3 +569,7 @@ fn sync_note(text: impl Into<gpui_kit::SharedString>, color: gpui_kit::Hsla) -> 
         .text_color(color)
         .child(text.into())
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/preferences_sync_ui.rs"]
+mod sync_ui_tests;

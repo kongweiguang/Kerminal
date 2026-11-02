@@ -69,7 +69,7 @@ enum SidecarLocation {
 
 /// 为 schema 0..2 生成相同只读快照上的 before/stage，并在用户库仍为原值时冻结 CAS 指纹。
 ///
-/// schema 3 也走 SQLite online backup 校验，但只清理 operation 私有副本并返回无变更结果。
+/// schema 3 也走 online backup；按原始 WAL 是否存在选择读取方式，始终保留源文件前后 CAS 校验。
 ///
 /// @author kongweiguang
 pub(crate) fn prepare(root: &Path, operation_dir: &Path) -> AppResult<PreparedSqliteMigration> {
@@ -97,8 +97,11 @@ pub(crate) fn prepare(root: &Path, operation_dir: &Path) -> AppResult<PreparedSq
     ensure_absent(&pending)?;
 
     let preparation = (|| {
-        let (source_schema_version, consistent_before_sha256) =
-            create_consistent_before(&database, &before_database)?;
+        let (source_schema_version, consistent_before_sha256) = create_consistent_before(
+            &database,
+            &before_database,
+            initial_fingerprint.wal_sha256.is_some(),
+        )?;
         let migration_result = migrate_legacy_command_history(&before_database, &staged_database)
             .map_err(|error| {
             AppError::infrastructure_with_source("命令数据库迁移副本校验失败", error)
@@ -393,12 +396,35 @@ pub(crate) fn verify_committed(
     }
 }
 
-/// 用 SQLite online backup 固定源事务快照；不能用 main 文件的裸复制充当 before。
+/// 有 WAL 时用只读事务捕获完整快照；无 WAL 时用 immutable 防止 SQLite 自建空 sidecar。
+/// immutable 只适用于已确认无 WAL 的源；prepare 的前后摘要仍拒绝新增 WAL 或主库变化。
+/// 路径逐字节编码为 URI，避免空格、中文、#、% 或网络路径被当作查询参数或 authority。
 ///
 /// @author kongweiguang
-fn create_consistent_before(source_path: &Path, destination: &Path) -> AppResult<(u32, String)> {
-    let mut source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(sqlite_error("读取命令数据库快照失败"))?;
+fn create_consistent_before(
+    source_path: &Path,
+    destination: &Path,
+    source_wal_present: bool,
+) -> AppResult<(u32, String)> {
+    let mut source = if source_wal_present {
+        Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    } else {
+        let absolute =
+            std::path::absolute(source_path).map_err(io_error("解析命令数据库快照路径失败"))?;
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut uri = String::from("file:");
+        for byte in absolute.as_os_str().as_encoded_bytes() {
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        uri.push_str("?immutable=1");
+        Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+    }
+    .map_err(sqlite_error("读取命令数据库快照失败"))?;
     source
         .busy_timeout(SQLITE_BUSY_TIMEOUT)
         .map_err(sqlite_error("读取命令数据库快照失败"))?;

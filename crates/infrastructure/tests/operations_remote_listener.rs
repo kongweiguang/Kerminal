@@ -1,8 +1,11 @@
 // @author kongweiguang
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -28,15 +31,19 @@ use kerminal_domain::{
 };
 use kerminal_infrastructure::operations::SshPortForwardRuntime;
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex},
+    net::{TcpListener, TcpStream},
     sync::Notify,
     time::{Duration, Instant, timeout},
 };
+use tokio_socks::tcp::socks5::Socks5Stream;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy)]
 enum AcceptBehavior {
     CancelledEnd,
     UnexpectedEnd,
+    Injected,
 }
 
 #[derive(Default)]
@@ -45,6 +52,10 @@ struct ListenerReceipts {
     closed: AtomicUsize,
     lease_closed: AtomicUsize,
     accept_started: Notify,
+    incoming: Mutex<VecDeque<TunnelChannelHandle>>,
+    incoming_ready: Notify,
+    opened_tunnels: AtomicUsize,
+    tunnel_targets: Mutex<Vec<(String, u16)>>,
 }
 
 struct FakeRemoteConnections {
@@ -165,13 +176,26 @@ impl RemoteConnectionHandle for FakeRemoteHandle {
         Err(AppError::unsupported("测试不提供 SFTP"))
     }
 
-    /// 远端 listener 不会接受客户端，因此不需要建立 direct-tcpip channel。
+    /// 为 direct-tcpip 返回可辨认的远端响应，使方向错误不能被本机网络碰巧连通掩盖。
+    ///
+    /// @author kongweiguang
     async fn open_tunnel(
         &self,
-        _request: TunnelRequest,
+        request: TunnelRequest,
         _cancel: CancellationToken,
     ) -> AppResult<TunnelChannelHandle> {
-        Err(AppError::unsupported("测试不提供 direct-tcpip"))
+        self.receipts.opened_tunnels.fetch_add(1, Ordering::AcqRel);
+        self.receipts
+            .tunnel_targets
+            .lock()
+            .expect("target lock")
+            .push((request.destination.host, request.destination.port));
+        let (channel, mut remote) = duplex(1024);
+        tokio::spawn(async move {
+            let _ = remote.write_all(b"ssh-egress").await;
+            let _ = remote.read(&mut [0]).await;
+        });
+        Ok(TunnelChannelHandle::new(Box::new(channel)))
     }
 
     /// 创建能按用例等待取消或立即结束的 listener，覆盖 close 与 EOF 的竞态。
@@ -202,7 +226,9 @@ struct FakeRemoteForwardListener {
 
 #[async_trait]
 impl RemoteForwardListener for FakeRemoteForwardListener {
-    /// 区分 stop 触发的正常 None 与未经取消的意外 EOF。
+    /// 区分 stop 触发的正常 None、意外 EOF 与测试注入的 SSH channel。
+    ///
+    /// @author kongweiguang
     async fn accept(
         &mut self,
         cancel: CancellationToken,
@@ -215,6 +241,22 @@ impl RemoteForwardListener for FakeRemoteForwardListener {
                 Ok(None)
             }
             AcceptBehavior::UnexpectedEnd => Ok(None),
+            AcceptBehavior::Injected => loop {
+                let notified = self.receipts.incoming_ready.notified();
+                let channel = self
+                    .receipts
+                    .incoming
+                    .lock()
+                    .expect("incoming lock")
+                    .pop_front();
+                if let Some(channel) = channel {
+                    break Ok(Some(channel));
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break Ok(None),
+                    _ = notified => {},
+                }
+            },
         }
     }
 
@@ -316,6 +358,214 @@ async fn unexpected_remote_listener_end_remains_failure() {
         "closing an already-failed listener must retain its failure result"
     );
     assert_eq!(receipts.accepted.load(Ordering::Acquire), 1);
+    assert_eq!(receipts.closed.load(Ordering::Acquire), 1);
+    assert_eq!(receipts.lease_closed.load(Ordering::Acquire), 1);
+}
+
+/// 本机 SOCKS 的域名必须原样交给 SSH 出口，不能错误地在客户端本地解析。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn local_socks_uses_ssh_egress_and_releases_listener() {
+    let host_id = HostId::new();
+    let receipts = Arc::new(ListenerReceipts::default());
+    let connections: Arc<dyn RemoteConnectionService> = Arc::new(FakeRemoteConnections {
+        host_id: host_id.clone(),
+        behavior: AcceptBehavior::Injected,
+        receipts: receipts.clone(),
+    });
+    let reservation = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("reserve port");
+    let port = reservation.local_addr().expect("reserved address").port();
+    drop(reservation);
+    let mut config = remote_dynamic_config(host_id);
+    config.kind = ForwardKind::Dynamic;
+    config.bind = ForwardEndpoint::new("127.0.0.1", port).expect("local bind");
+    config.remote_access_scope = None;
+    let handle = SshPortForwardRuntime::new(connections)
+        .start(
+            "local-socks-egress".to_owned(),
+            config,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("local SOCKS starts");
+
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("local listener");
+    let mut socks = timeout(
+        Duration::from_secs(3),
+        Socks5Stream::connect_with_socket(stream, ("ssh-only.invalid", 32123)),
+    )
+    .await
+    .expect("SOCKS handshake completed")
+    .expect("SSH target accepted");
+    let mut response = [0; 10];
+    timeout(Duration::from_secs(3), socks.read_exact(&mut response))
+        .await
+        .expect("SSH response completed")
+        .expect("SSH response received");
+    assert_eq!(&response, b"ssh-egress");
+    assert_eq!(receipts.opened_tunnels.load(Ordering::Acquire), 1);
+    assert_eq!(
+        receipts
+            .tunnel_targets
+            .lock()
+            .expect("target lock")
+            .as_slice(),
+        &[("ssh-only.invalid".to_owned(), 32123)]
+    );
+
+    handle
+        .close_until(Instant::now() + Duration::from_secs(3))
+        .await
+        .expect("local SOCKS closes");
+    let mut trailing = [0];
+    assert_eq!(
+        timeout(Duration::from_secs(3), socks.read(&mut trailing))
+            .await
+            .expect("stream closed")
+            .expect("stream read"),
+        0
+    );
+    assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+    assert_eq!(receipts.lease_closed.load(Ordering::Acquire), 1);
+}
+
+/// 注入一条 forwarded-tcpip 通道，使真实接收循环按顺序处理协议和取消。
+///
+/// @author kongweiguang
+fn inject_remote_client(receipts: &ListenerReceipts) -> DuplexStream {
+    let (client, server) = duplex(4096);
+    receipts
+        .incoming
+        .lock()
+        .expect("incoming lock")
+        .push_back(TunnelChannelHandle::new(Box::new(server)));
+    receipts.incoming_ready.notify_one();
+    client
+}
+
+/// 远端 SOCKS 必须访问客户端回环地址并在客户端解析域名，不能绕回 SSH 出口。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn remote_socks_uses_client_egress_and_releases_channels() {
+    let host_id = HostId::new();
+    let receipts = Arc::new(ListenerReceipts::default());
+    let connections: Arc<dyn RemoteConnectionService> = Arc::new(FakeRemoteConnections {
+        host_id: host_id.clone(),
+        behavior: AcceptBehavior::Injected,
+        receipts: receipts.clone(),
+    });
+    let local_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("client fixture");
+    let local_port = local_listener.local_addr().expect("fixture address").port();
+    let local_server = tokio::spawn(async move {
+        let mut clients = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let (mut socket, _) = local_listener.accept().await.expect("accept client target");
+            clients.spawn(async move {
+                socket
+                    .write_all(b"local-egress")
+                    .await
+                    .expect("write client marker");
+                assert_eq!(socket.read(&mut [0]).await.expect("observe close"), 0);
+            });
+        }
+        while let Some(result) = clients.join_next().await {
+            result.expect("client target closed cleanly");
+        }
+    });
+    let handle = SshPortForwardRuntime::new(connections)
+        .start(
+            "remote-socks-egress".to_owned(),
+            remote_dynamic_config(host_id),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("remote SOCKS starts");
+
+    let closed_port = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("reserve closed target");
+    let closed_port_number = closed_port.local_addr().expect("closed target").port();
+    drop(closed_port);
+    assert!(
+        timeout(
+            Duration::from_secs(3),
+            Socks5Stream::connect_with_socket(
+                inject_remote_client(&receipts),
+                ("127.0.0.1", closed_port_number),
+            ),
+        )
+        .await
+        .expect("SOCKS failure is returned")
+        .is_err()
+    );
+
+    for command in [2_u8, 3_u8] {
+        let mut client = inject_remote_client(&receipts);
+        client.write_all(&[5, 1, 0]).await.expect("SOCKS greeting");
+        let mut greeting = [0; 2];
+        client
+            .read_exact(&mut greeting)
+            .await
+            .expect("greeting reply");
+        assert_eq!(greeting, [5, 0]);
+        client
+            .write_all(&[5, command, 0, 1, 127, 0, 0, 1, 0, 80])
+            .await
+            .expect("unsupported request");
+        let mut reply = [0; 10];
+        timeout(Duration::from_secs(3), client.read_exact(&mut reply))
+            .await
+            .expect("unsupported reply completed")
+            .expect("unsupported reply received");
+        assert_eq!(reply[1], 7, "BIND and UDP must remain unsupported");
+    }
+
+    let mut streams = Vec::new();
+    for target in ["127.0.0.1", "localhost"] {
+        let client = inject_remote_client(&receipts);
+        let mut socks = timeout(
+            Duration::from_secs(3),
+            Socks5Stream::connect_with_socket(client, (target, local_port)),
+        )
+        .await
+        .expect("SOCKS handshake completed")
+        .expect("client target accepted");
+        let mut response = [0; 12];
+        timeout(Duration::from_secs(3), socks.read_exact(&mut response))
+            .await
+            .expect("client response completed")
+            .expect("client response received");
+        assert_eq!(&response, b"local-egress");
+        streams.push(socks);
+    }
+    assert_eq!(receipts.opened_tunnels.load(Ordering::Acquire), 0);
+
+    handle
+        .close_until(Instant::now() + Duration::from_secs(3))
+        .await
+        .expect("remote SOCKS closes");
+    for mut socks in streams {
+        let mut trailing = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(3), socks.read(&mut trailing))
+                .await
+                .expect("stream closed")
+                .expect("stream read"),
+            0
+        );
+    }
+    timeout(Duration::from_secs(3), local_server)
+        .await
+        .expect("client target tasks complete")
+        .expect("client fixture task");
     assert_eq!(receipts.closed.load(Ordering::Acquire), 1);
     assert_eq!(receipts.lease_closed.load(Ordering::Acquire), 1);
 }

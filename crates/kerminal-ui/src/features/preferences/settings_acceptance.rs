@@ -19,6 +19,18 @@ pub(crate) struct ProfileAcceptanceState {
     pub(crate) shell_focus: FocusHandle,
 }
 
+/// 只保留录制会话的可观察字段，避免在根视图跨模块暴露可变控制器。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShortcutCaptureAcceptanceState {
+    pub(crate) action: String,
+    pub(crate) strokes: Vec<String>,
+    pub(crate) recording: bool,
+    pub(crate) focus: FocusHandle,
+    pub(crate) error: Option<String>,
+}
+
 impl PreferencesPanel {
     /// 原生验收读取草稿、事务和真实输入焦点，避免向仍在重载的禁用输入框发送文字。
     /// 实际保存仍由生产按钮和仓储执行。
@@ -162,10 +174,11 @@ impl PreferencesPanel {
         self.interface_language_select.read(cx).focus_handle(cx)
     }
 
-    /// Exposes only disclosure booleans so screenshot actions can verify real expansion state.
-    pub(crate) fn settings_acceptance_disclosures(&self) -> [bool; 5] {
+    /// 只投影仍存在的展开状态，验收通过真实控件操作并保持与清单顺序一致。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn settings_acceptance_disclosures(&self) -> [bool; 4] {
         [
-            self.terminal_renderer_open,
             self.sftp_advanced_open,
             self.connectivity.external_compatibility_expanded,
             self.connectivity.mcp_connection_expanded,
@@ -191,6 +204,22 @@ impl PreferencesPanel {
             pattern: session.draft.pattern.clone(),
             note: session.draft.note.clone(),
             save_pending: self.keyword_editor.save_pending.is_some(),
+        })
+    }
+
+    /// 只读投影录制焦点和预览，确保原生验收按真实事件确认而非直接改写设置。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn settings_acceptance_shortcut_capture(
+        &self,
+    ) -> Option<ShortcutCaptureAcceptanceState> {
+        let capture = self.shortcut_capture.as_ref()?;
+        Some(ShortcutCaptureAcceptanceState {
+            action: capture.action.clone(),
+            strokes: capture.strokes.clone(),
+            recording: capture.recording,
+            focus: capture.focus.clone(),
+            error: capture.error.clone(),
         })
     }
 }

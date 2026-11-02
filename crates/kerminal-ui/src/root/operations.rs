@@ -19,9 +19,9 @@ use kerminal_domain::{
 use kerminal_terminal::input::TerminalKeyEvent;
 
 use super::{
-    CenterPanel, InputModifiers, KeyPhase, RootView, SessionCommand, TerminalInputEvent,
-    TerminalKey, UiInputProjection, UiTerminalInputRequest, WorkspaceTerminalOpenKind,
-    workspace_runtime::RuntimePanePhase,
+    CenterPanel, InputModifiers, KeyPhase, RootConfirmationOwner, RootView, SessionCommand,
+    TerminalInputEvent, TerminalKey, UiInputProjection, UiTerminalInputRequest,
+    WorkspaceTerminalOpenKind, workspace_runtime::RuntimePanePhase,
 };
 use crate::features::operations::{
     ContainerPanelContext, OperationsEvent, OperationsView, TmuxAttachTarget,
@@ -48,7 +48,8 @@ struct WorkspaceTerminalIntent {
     transient: bool,
 }
 
-/// 容器请求在提交服务前重验真实活动终端；确认与回执仍归原 Entity，会话创建沿用统一 owner。
+/// 运维请求保留原视图所有权；打开草稿的隧道错误须仍属于当前模态，避免迟到反馈串入新表单。
+/// 列表失败复用工作区 toast，容器请求在提交前重验活动终端。
 /// @author kongweiguang
 pub(super) fn handle_operations_event(
     root: &mut RootView,
@@ -59,6 +60,19 @@ pub(super) fn handle_operations_event(
 ) {
     match event {
         OperationsEvent::RootConfirmationChanged => {}
+        OperationsEvent::ForwardError { message } => {
+            if operations_view.read(cx).is_forward_form_open()
+                && (root.root_confirmation_owner != Some(RootConfirmationOwner::Operations)
+                    || !root
+                        .root_confirmation_operations_view
+                        .as_ref()
+                        .is_some_and(|owner| owner.entity_id() == operations_view.entity_id()))
+            {
+                return;
+            }
+            root.status = Some(message.clone().into());
+            cx.notify();
+        }
         OperationsEvent::ContainerRefreshRequested { context, runtime } => {
             if container_context_is_current(root, operations_view, Some(context), true, cx) {
                 operations_view.update(cx, |view, cx| {
@@ -387,7 +401,7 @@ fn read_compose_yaml_preview(
 }
 
 /// Compose YAML 与 main 一样打开中央只读文件 Tab；保留冻结端点，不转向共享 SFTP 浏览器。
-/// 描述登记与工作区快照提交必须同时成功，失败时撤销本轮登记，已存在的同源标签直接激活。
+/// 已有端点先安全收紧访问策略再复用，描述登记或快照提交失败不得产生新的文件别名。
 ///
 /// @author kongweiguang
 fn open_compose_config(
@@ -406,14 +420,14 @@ fn open_compose_config(
         cx.notify();
         return;
     }
-    if root.file_editor_workspace.is_none() {
+    let Some(editor) = root.file_editor_workspace.clone() else {
         root.status = Some(crate::locale::text(
             "文件编辑服务尚未配置。",
             "The file editor service is unavailable.",
         ));
         cx.notify();
         return;
-    }
+    };
     let (target, path, machine_id, root_path) = match &endpoint {
         FileEndpoint::Remote { host_id, path } => (
             WorkspaceTargetRef::Ssh {
@@ -441,23 +455,26 @@ fn open_compose_config(
     use kerminal_application::workspace::{
         WorkspaceFileAccess, WorkspaceFileSource, WorkspaceSessionTab,
     };
-    if let Some(id) = controller
-        .snapshot()
-        .terminal_tabs
-        .iter()
-        .find_map(|tab| match tab {
-            WorkspaceSessionTab::WorkspaceFile {
-                id,
-                target: candidate,
-                path: candidate_path,
-                source: WorkspaceFileSource::ComposeYaml,
-                access: WorkspaceFileAccess::Readonly,
-                ..
-            } if candidate == &target && candidate_path == &path => Some(id.clone()),
-            _ => None,
-        })
-    {
-        // 去重后仍须先提交 controller 的活动身份；只投影编辑器会在下一帧被原 Tab 覆盖。
+    if let Some(id) = root.workspace_files.tab_for_endpoint(&endpoint) {
+        let Some(controller) = root.workspace_controller.as_mut() else {
+            return;
+        };
+        let changed = match root
+            .workspace_files
+            .restrict_file_to_readonly(controller, &editor, &id, &endpoint, cx)
+        {
+            Ok(changed) => changed,
+            Err(error) => {
+                root.status = Some(error.public_message().into());
+                cx.notify();
+                return;
+            }
+        };
+        if changed {
+            root.refresh_workspace_views(cx);
+            root.persist_workspace_snapshot(cx);
+        }
+        // 去重后仍须提交 controller 的活动身份；仅切换编辑器会被原导航覆盖。
         let event = crate::features::workspace_tabs::WorkspaceTabEvent::Activate(id.clone());
         if root.handle_workspace_tab_event(&event, window, cx) {
             root.activate_workspace_tab(&id, window, cx);
@@ -1050,6 +1067,12 @@ fn attach_tmux_in_current_terminal(
     operations_view: &Entity<crate::features::operations::OperationsView>,
     cx: &mut Context<RootView>,
 ) -> Option<UiSessionBinding> {
+    if !operations_view
+        .read(cx)
+        .tmux_session_attach_allowed(target, session_id)
+    {
+        return None;
+    }
     if target.validate().is_err() || !valid_tmux_session_id(session_id) {
         root.status = Some(crate::locale::text(
             "tmux 会话目标无效，未发送连接命令。",

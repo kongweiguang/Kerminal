@@ -49,7 +49,7 @@ pub enum AgentHistoryMode {
     Archived,
 }
 
-/// 当前候选变化只影响历史筛选和新建请求，不会修改任何既有 Agent binding。
+/// 历史按会话归属筛选；保留候选字段以兼容调用方，但筛选不依据它隐藏会话或重绑目标。
 ///
 /// @author kongweiguang
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -483,7 +483,7 @@ pub trait AgentService: Send + Sync {
     /// 列出历史会话及当前运行态关联，取消后不得返回陈旧列表。
     async fn list(&self, cancellation: CancellationToken) -> AppResult<Vec<AgentSessionView>>;
 
-    /// 按右栏归属和当前显式候选计算历史视图及数量；调用只读且不触发目标重绑。
+    /// 按右栏归属计算历史视图及数量；候选变化不隐藏同一归属的会话，也不触发目标重绑。
     async fn history(
         &self,
         request: AgentHistoryRequest,

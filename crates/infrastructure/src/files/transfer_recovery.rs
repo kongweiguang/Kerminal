@@ -55,6 +55,8 @@ struct RecoveryDocument {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredRecord {
     id: TransferId,
+    #[serde(default, skip_serializing_if = "is_false")]
+    drag_staging: bool,
     source: StoredEndpoint,
     destination: StoredEndpoint,
     kind: String,
@@ -508,14 +510,18 @@ fn decode_records(source: &str) -> AppResult<Vec<TransferRecoveryRecord>> {
         return Err(corrupt());
     }
     let document: RecoveryDocument = serde_json::from_str(source).map_err(|_| corrupt())?;
-    if document.schema_version != 1 || document.records.len() > MAX_RECORDS {
+    if !matches!(document.schema_version, 1 | 2) || document.records.len() > MAX_RECORDS {
         return Err(corrupt());
     }
+    let version = document.schema_version;
     let mut identities = HashSet::new();
     document
         .records
         .into_iter()
         .map(|stored| {
+            if version == 1 && stored.drag_staging {
+                return Err(corrupt());
+            }
             if !identities.insert(stored.id.clone()) {
                 return Err(corrupt());
             }
@@ -565,7 +571,11 @@ fn write_document(
         validate_record(record)?;
     }
     let document = RecoveryDocument {
-        schema_version: 1,
+        schema_version: if records.iter().any(|record| record.drag_staging) {
+            2
+        } else {
+            1
+        },
         records: records.iter().map(StoredRecord::from_record).collect(),
     };
     let mut bytes = serde_json::to_vec_pretty(&document)
@@ -635,6 +645,9 @@ fn write_document(
 /// 恢复事实只允许原请求范围内的实际目标；继任任务可保留旧 owner，但必须匹配原暂存命名和 token。
 /// @author kongweiguang
 fn validate_record(record: &TransferRecoveryRecord) -> AppResult<()> {
+    if record.drag_staging && !matches!(&record.request.destination, FileEndpoint::Local { .. }) {
+        return Err(corrupt());
+    }
     if record.request.source == record.request.destination
         || record
             .request
@@ -811,6 +824,7 @@ impl StoredRecord {
     fn from_record(record: &TransferRecoveryRecord) -> Self {
         Self {
             id: record.id.clone(),
+            drag_staging: record.drag_staging,
             source: StoredEndpoint::from_endpoint(&record.request.source),
             destination: StoredEndpoint::from_endpoint(&record.request.destination),
             kind: match record.request.kind {
@@ -855,6 +869,7 @@ impl StoredRecord {
     fn into_record(self) -> AppResult<TransferRecoveryRecord> {
         Ok(TransferRecoveryRecord {
             id: self.id,
+            drag_staging: self.drag_staging,
             request: TransferRequest {
                 source: self.source.into_endpoint()?,
                 destination: self.destination.into_endpoint()?,
@@ -896,6 +911,13 @@ impl StoredRecord {
             archived: self.archived,
         })
     }
+}
+
+/// 普通记录继续使用旧格式，不为非拖出传输写入新增字段。
+///
+/// @author kongweiguang
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl StoredEndpoint {

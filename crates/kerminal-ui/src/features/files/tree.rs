@@ -173,6 +173,14 @@ impl TreeRequestCancellation {
 }
 
 impl FileTreeBrowser {
+    /// 标签恢复时保留已有树缓存和选择，但旧标签的子目录请求不得写入当前代次。
+    ///
+    /// @author kongweiguang
+    pub(super) fn rebind_generation(&mut self, generation: u64) {
+        self.cancel_pending_requests();
+        self.root_generation = generation;
+    }
+
     /// 根目录请求开始时取消旧代次的子目录读取，避免迟到结果写入新路径。
     ///
     /// @author kongweiguang

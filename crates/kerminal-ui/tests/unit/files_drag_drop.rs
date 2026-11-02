@@ -10,10 +10,12 @@ use kerminal_domain::{
 };
 
 use super::{
-    DropDirectorySnapshot, DropRejection, FileTransferDrag, drop_directory_is_current,
-    external_drop_directory_ready, external_paths_drop_is_allowed, internal_drop_is_allowed,
+    DropDirectorySnapshot, DropRejection, FileTransferDrag, copy_target_rejection,
+    drop_directory_is_current, drop_targets_are_current, external_drop_directory_ready,
+    external_paths_drop_is_allowed, internal_drop_is_allowed, plan_copy_entries,
     plan_internal_drop, validate_drop_entry,
 };
+use crate::features::files::action_test_support as support;
 
 /// 构造绑定稳定主机身份的 POSIX endpoint，覆盖路径语义不依赖测试宿主系统。
 ///
@@ -128,7 +130,7 @@ fn rejects_same_side_busy_and_unloaded_internal_drop() {
         "data.bin",
         FileEntryKind::File,
     );
-    let drag = FileTransferDrag::new(0, source_root.clone(), 3, Arc::new(vec![source]), 0);
+    let drag = FileTransferDrag::new(17, 0, source_root.clone(), 3, Arc::new(vec![source]), 0);
     let target = remote(&target_host, "/target");
     let source_snapshot = DropDirectorySnapshot {
         endpoint: &source_root,
@@ -139,6 +141,7 @@ fn rejects_same_side_busy_and_unloaded_internal_drop() {
 
     assert!(!internal_drop_is_allowed(
         &drag,
+        17,
         0,
         source_snapshot,
         0,
@@ -148,6 +151,7 @@ fn rejects_same_side_busy_and_unloaded_internal_drop() {
     ));
     assert!(!internal_drop_is_allowed(
         &drag,
+        17,
         0,
         source_snapshot,
         1,
@@ -157,6 +161,7 @@ fn rejects_same_side_busy_and_unloaded_internal_drop() {
     ));
     assert!(!internal_drop_is_allowed(
         &drag,
+        17,
         0,
         source_snapshot,
         1,
@@ -166,6 +171,7 @@ fn rejects_same_side_busy_and_unloaded_internal_drop() {
     ));
     assert!(internal_drop_is_allowed(
         &drag,
+        17,
         0,
         source_snapshot,
         1,
@@ -175,6 +181,17 @@ fn rejects_same_side_busy_and_unloaded_internal_drop() {
     ));
     assert!(!internal_drop_is_allowed(
         &drag,
+        18,
+        0,
+        source_snapshot,
+        1,
+        &target,
+        true,
+        false
+    ));
+    assert!(!internal_drop_is_allowed(
+        &drag,
+        17,
         0,
         DropDirectorySnapshot {
             generation: 4,
@@ -187,6 +204,7 @@ fn rejects_same_side_busy_and_unloaded_internal_drop() {
     ));
     assert!(!internal_drop_is_allowed(
         &drag,
+        17,
         0,
         DropDirectorySnapshot {
             loading: true,
@@ -199,6 +217,7 @@ fn rejects_same_side_busy_and_unloaded_internal_drop() {
     ));
     assert!(!internal_drop_is_allowed(
         &drag,
+        17,
         0,
         DropDirectorySnapshot {
             listing_directory: None,
@@ -209,6 +228,45 @@ fn rejects_same_side_busy_and_unloaded_internal_drop() {
         true,
         false,
     ));
+}
+
+/// 释放时再次验证 FilesPane 身份，即使其他实体的路径和代次完全相同也不能接收拖动。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn release_rejects_a_different_pane_with_identical_directories(app: &mut gpui_kit::TestAppContext) {
+    let source = remote(&HostId::new(), "/source");
+    let target = remote(&HostId::new(), "/target");
+    let file = entry(
+        super::child_endpoint(&source, "file.txt").expect("valid child"),
+        "file.txt",
+        FileEntryKind::File,
+    );
+    let seeded_file = file.clone();
+    let seeded_target = target.clone();
+    let fixture = support::entity_fixture(app, source.clone(), move |pane| {
+        pane.panels[0].endpoint = seeded_target;
+        support::seed_listing(pane, 0, 4, Vec::new());
+        support::seed_listing(pane, 1, 3, vec![seeded_file]);
+    });
+    let _runtime = fixture.runtime;
+    let pane_id = fixture.pane.entity_id().as_u64();
+    let drag = FileTransferDrag::new(pane_id, 1, source, 3, Arc::new(vec![file]), 0);
+    app.update(|cx| {
+        fixture.pane.update(cx, |pane, _| {
+            assert!(drop_targets_are_current(
+                pane, pane_id, &drag, 0, &target, 4
+            ));
+            assert!(!drop_targets_are_current(
+                pane,
+                pane_id.wrapping_add(1),
+                &drag,
+                0,
+                &target,
+                4,
+            ));
+        });
+    });
 }
 
 /// 符号链接保持不可拖传，避免一次看似普通的拖动触发链接跟随。
@@ -411,6 +469,7 @@ fn keeps_selected_entries_frozen_while_panel_selection_changes() {
         FileEntryKind::File,
     );
     let drag = FileTransferDrag::new(
+        17,
         0,
         source_root,
         12,
@@ -446,7 +505,7 @@ fn mixed_selection_queues_valid_items_and_preserves_failure_feedback() {
         "shortcut",
         FileEntryKind::Symlink,
     );
-    let drag = FileTransferDrag::new(0, source_root, 1, Arc::new(vec![valid, rejected]), 0);
+    let drag = FileTransferDrag::new(17, 0, source_root, 1, Arc::new(vec![valid, rejected]), 0);
     let target = remote(&target_host, "/archive");
 
     let plan = plan_internal_drop(&drag, &target, ConflictPolicy::Rename);
@@ -457,6 +516,7 @@ fn mixed_selection_queues_valid_items_and_preserves_failure_feedback() {
     assert!(plan.issues[0].contains("shortcut"));
 
     let rejected_only = FileTransferDrag::new(
+        17,
         0,
         remote(&source_host, "/source"),
         1,
@@ -470,4 +530,76 @@ fn mixed_selection_queues_valid_items_and_preserves_failure_feedback() {
     let failed_plan = plan_internal_drop(&rejected_only, &target, ConflictPolicy::Rename);
     assert!(failed_plan.items.is_empty());
     assert_eq!(failed_plan.issues.len(), 1);
+}
+
+/// 菜单与工具栏使用同一计划：无效目标拒绝入队，混合选区保留可复制项及拒绝原因。
+///
+/// @author kongweiguang
+#[test]
+fn copy_plan_rejects_same_directory_and_keeps_safe_mixed_selection() {
+    let host = HostId::new();
+    let root = remote(&host, "/source");
+    let folder = entry(
+        remote(&host, "/source/folder"),
+        "folder",
+        FileEntryKind::Directory,
+    );
+    let file = entry(
+        remote(&host, "/source/report.txt"),
+        "report.txt",
+        FileEntryKind::File,
+    );
+    let items = vec![folder.clone(), file.clone()];
+
+    assert_eq!(
+        copy_target_rejection(items.iter(), &root, &root),
+        Some(DropRejection::SameParent)
+    );
+    let (same_items, same_issues) = plan_copy_entries(&items, &root, &root, ConflictPolicy::Rename);
+    assert!(same_items.is_empty());
+    assert_eq!(same_issues.len(), 2);
+
+    let target = remote(&host, "/source/folder/child");
+    assert_eq!(copy_target_rejection(items.iter(), &root, &target), None);
+    let (valid, issues) = plan_copy_entries(&items, &root, &target, ConflictPolicy::Rename);
+    assert_eq!(valid.len(), 1);
+    assert_eq!(valid[0].0, "report.txt");
+    assert_eq!(valid[0].1.source, file.endpoint);
+    assert_eq!(issues.len(), 1);
+    assert!(issues[0].contains("folder"));
+}
+
+/// 树选中的父目录不可复制时，内部拖放仍提交安全子项；外部拖出保留原折叠根项。
+///
+/// @author kongweiguang
+#[test]
+fn tree_drag_preserves_safe_child_when_selected_parent_is_rejected() {
+    let host = HostId::new();
+    let root = remote(&host, "/source");
+    let folder = entry(
+        remote(&host, "/source/folder"),
+        "folder",
+        FileEntryKind::Directory,
+    );
+    let file = entry(
+        remote(&host, "/source/folder/file.txt"),
+        "file.txt",
+        FileEntryKind::File,
+    );
+    let drag = FileTransferDrag::new(17, 0, root.clone(), 1, Arc::new(vec![folder.clone()]), 1)
+        .with_tree_selection(Arc::new(vec![file.clone(), folder.clone()]));
+    let nested_target = remote(&host, "/source/folder/target");
+    let plan = plan_internal_drop(&drag, &nested_target, ConflictPolicy::Rename);
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.items[0].1.source, file.endpoint);
+    assert_eq!(plan.issues.len(), 1);
+    assert_eq!(plan.included_descendants, 0);
+    assert_eq!(drag.entries(), &[folder]);
+    assert_eq!(drag.selected_count(), 2);
+
+    let other_target = remote(&HostId::new(), "/target");
+    let covered_plan = plan_internal_drop(&drag, &other_target, ConflictPolicy::Rename);
+    assert_eq!(covered_plan.items.len(), 1);
+    assert_eq!(covered_plan.included_descendants, 1);
+    assert!(covered_plan.issues.is_empty());
 }

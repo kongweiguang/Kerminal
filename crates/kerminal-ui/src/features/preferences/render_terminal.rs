@@ -3,18 +3,21 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    Animation, AnimationExt as _, ClickEvent, Context, Entity, IntoElement, SharedString, Window,
+    Animation, AnimationExt as _, AppContext as _, ClickEvent, Context, Entity, IntoElement,
+    SharedString, Subscription, Window,
     assets::IconName,
     component::{
-        Disableable as _, FocusableExt as _, Selectable as _, Sizable as _,
+        Disableable as _, FocusableExt as _, IndexPath, Selectable as _, Sizable as _,
         button::{Button, ButtonCustomVariant, ButtonVariants as _},
-        input::{InputState, NumberStep},
+        input::{InputState, NumberInput, NumberStep},
         menu::{DropdownMenu as _, PopupMenuItem},
+        searchable_list::SearchableVec,
+        select::{Select, SelectEvent, SelectState},
         switch::Switch,
     },
     div,
     prelude::*,
-    px,
+    px, rems,
 };
 use kerminal_application::preferences::{
     SettingsSnapshot, TerminalColorScheme, TerminalCursorStyle, TerminalFontWeight,
@@ -22,17 +25,21 @@ use kerminal_application::preferences::{
 };
 use std::time::Duration;
 
-use crate::{terminal_metrics::TerminalMetrics, theme::ThemeTokens};
+use crate::{
+    terminal_metrics::{TerminalMetrics, font_weight},
+    theme::ThemeTokens,
+};
 
-use super::panel::{PreferencesPanel, SettingsInputs};
+use super::{
+    DraftStatus, SettingsIssueKind,
+    panel::{PreferencesPanel, SettingsInputs, SettingsSuccessStatus},
+};
 
 #[derive(Clone, Copy)]
 struct SchemeOption {
     id: &'static str,
     value: TerminalColorScheme,
     label: &'static str,
-    description: &'static str,
-    swatches: [u32; 4],
 }
 
 /// 下拉控件的字段名、当前值和可选项成组传递，避免调用点遗漏可见标签。
@@ -53,29 +60,21 @@ const SCHEME_OPTIONS: [SchemeOption; 4] = [
         id: "kerminal",
         value: TerminalColorScheme::Kerminal,
         label: "Kerminal",
-        description: "默认终端主题。",
-        swatches: [0x1f1f21, 0x60a5fa, 0x4ade80, 0xfacc15],
     },
     SchemeOption {
         id: "tokyo-night",
         value: TerminalColorScheme::TokyoNight,
         label: "Tokyo Night",
-        description: "低亮度夜间主题。",
-        swatches: [0x1a1b26, 0x7aa2f7, 0x9ece6a, 0xbb9af7],
     },
     SchemeOption {
         id: "solarized",
         value: TerminalColorScheme::Solarized,
         label: "Solarized",
-        description: "经典低对比。",
-        swatches: [0x002b36, 0x268bd2, 0x859900, 0xb58900],
     },
     SchemeOption {
         id: "github",
         value: TerminalColorScheme::Github,
         label: "GitHub",
-        description: "高对比代码色盘。",
-        swatches: [0xffffff, 0x0969da, 0x1a7f37, 0x9a6700],
     },
 ];
 
@@ -88,59 +87,76 @@ pub(in crate::features::preferences) struct TerminalPreviewColors {
     cursor: u32,
 }
 
-const FONT_OPTIONS: [(&str, &str); 15] = [
-    (
-        "JetBrains Mono",
-        "\"JetBrains Mono\", \"JetBrains Mono NL\", \"Cascadia Mono\", Consolas, monospace",
-    ),
-    (
-        "JetBrainsMono Nerd Font",
-        "\"JetBrainsMono Nerd Font\", \"JetBrainsMonoNL Nerd Font\", \"JetBrains Mono\", \"Cascadia Mono\", Consolas, monospace",
-    ),
-    (
-        "Fira Code",
-        "\"Fira Code\", \"FiraCode Nerd Font\", \"Cascadia Code\", Consolas, monospace",
-    ),
-    (
-        "Cascadia Mono",
-        "\"Cascadia Mono\", \"Cascadia Code\", \"Cascadia Mono NF\", Consolas, monospace",
-    ),
-    (
-        "Cascadia Code",
-        "\"Cascadia Code\", \"Cascadia Code NF\", \"Cascadia Mono\", Consolas, monospace",
-    ),
-    (
-        "MesloLGS NF",
-        "\"MesloLGS NF\", \"MesloLGS Nerd Font\", \"MesloLGM Nerd Font\", \"Cascadia Mono\", Consolas, monospace",
-    ),
-    (
-        "Hack",
-        "\"Hack\", \"Hack Nerd Font\", \"Cascadia Mono\", Consolas, monospace",
-    ),
-    (
-        "Source Code Pro",
-        "\"Source Code Pro\", \"SauceCodePro Nerd Font\", \"Cascadia Mono\", Consolas, monospace",
-    ),
-    (
-        "Iosevka Term",
-        "\"Iosevka Term\", \"IosevkaTerm Nerd Font\", \"Iosevka\", \"Cascadia Mono\", Consolas, monospace",
-    ),
-    (
-        "IBM Plex Mono",
-        "\"IBM Plex Mono\", \"BlexMono Nerd Font\", \"Cascadia Mono\", Consolas, monospace",
-    ),
-    (
-        "Inconsolata",
-        "\"Inconsolata\", \"Inconsolata Nerd Font\", \"Cascadia Mono\", Consolas, monospace",
-    ),
-    (
-        "Ubuntu Mono",
-        "\"Ubuntu Mono\", \"UbuntuMono Nerd Font\", \"Cascadia Mono\", Consolas, monospace",
-    ),
-    ("Consolas", "Consolas, \"Cascadia Mono\", monospace"),
-    ("Lucida Console", "\"Lucida Console\", Consolas, monospace"),
-    ("Courier New", "\"Courier New\", Consolas, monospace"),
-];
+/// 随设置页渲染周期保留选择器与订阅；切换设置页后自然释放。
+struct SystemFontPicker {
+    installed: Vec<String>,
+    select: Entity<SelectState<SearchableVec<String>>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl SystemFontPicker {
+    /// 只在首次显示时枚举系统字体，并在配置读回变化时同步显示实际回退族。
+    ///
+    /// @author kongweiguang
+    fn new(
+        owner: Entity<PreferencesPanel>,
+        terminal: &kerminal_application::preferences::TerminalSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let installed = window.text_system().all_font_names();
+        let resolved = TerminalMetrics::from_settings(terminal, &installed)
+            .font_family
+            .to_string();
+        let mut options = installed.clone();
+        if !options.iter().any(|option| option == &resolved) {
+            options.push(resolved.clone());
+        }
+        let selected = options
+            .iter()
+            .position(|option| option == &resolved)
+            .map(IndexPath::new);
+        let select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(options), selected, window, cx).searchable(true)
+        });
+        let weak_owner = owner.downgrade();
+        let selection = cx.subscribe(
+            &select,
+            move |_, _, event: &SelectEvent<SearchableVec<String>>, cx| {
+                let SelectEvent::Confirm(Some(value)) = event else {
+                    return;
+                };
+                let value = value.clone();
+                let _ = weak_owner.update(cx, |panel, cx| {
+                    panel.edit_settings(|settings| settings.terminal.font_family = value, cx);
+                });
+            },
+        );
+        let observation = cx.observe_in(&owner, window, |picker, owner, window, cx| {
+            let Some(terminal) = owner
+                .read(cx)
+                .settings
+                .as_ref()
+                .map(|settings| settings.value().terminal.clone())
+            else {
+                return;
+            };
+            let resolved = TerminalMetrics::from_settings(&terminal, &picker.installed)
+                .font_family
+                .to_string();
+            if picker.select.read(cx).selected_value() != Some(&resolved) {
+                picker.select.update(cx, |select, cx| {
+                    select.set_selected_value(&resolved, window, cx)
+                });
+            }
+        });
+        Self {
+            installed,
+            select,
+            _subscriptions: vec![selection, observation],
+        }
+    }
+}
 
 impl PreferencesPanel {
     /// 初始化 Kit 数值输入器的边界与步进，使键盘输入、失焦修正和加减按钮共用 main 的范围。
@@ -168,20 +184,7 @@ impl PreferencesPanel {
         configure_number(&inputs.sftp_idle_timeout, 30., 3_600., 1., window, cx);
     }
 
-    /// 先展开并通知再等待搜索定位，避免直接在 render 中修改持久折叠状态。
-    ///
-    /// @author kongweiguang
-    pub(in crate::features::preferences) fn reveal_terminal_renderer(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.terminal_renderer_open {
-            self.terminal_renderer_open = true;
-            cx.notify();
-        }
-    }
-
-    /// 按 main 的断点组合终端设置，并依据明暗策略选择终端预览，避免应用色板干扰终端。
+    /// 围绕同一终端预览组织外观、光标和操作；单列分组避免无关区域互相撑高，所有控件仍写入唯一自动保存草稿。
     ///
     /// @author kongweiguang
     pub(super) fn render_terminal(
@@ -196,9 +199,15 @@ impl PreferencesPanel {
         let locked = self.settings_controls_locked();
         let terminal = settings.terminal;
         let viewport_width = window.viewport_size().width.as_f32();
-        let medium_layout = viewport_width >= 768.0;
-        let large_layout = viewport_width >= 1024.0;
-        let wide_layout = viewport_width >= 1280.0;
+        // 设置弹框有最大宽度和独立侧栏；按实际可用宽度与 rem 比例决定列数，避免大窗口或放大文字误判。
+        let measured_width = self.content_scroll.bounds().size.width.as_f32();
+        let content_width = if measured_width > 0.0 {
+            measured_width
+        } else {
+            viewport_width.min(1152.0) - 280.0
+        };
+        let medium_layout = content_width >= window.rem_size().as_f32() * 28.0;
+        let wide_layout = content_width >= window.rem_size().as_f32() * 40.0;
         let is_dark = match settings.theme_mode {
             ThemeMode::Dark => true,
             ThemeMode::Light => false,
@@ -207,43 +216,70 @@ impl PreferencesPanel {
                 gpui_kit::WindowAppearance::Dark | gpui_kit::WindowAppearance::VibrantDark
             ),
         };
+        let owner = cx.entity();
+        let initial_terminal = terminal.clone();
+        let font_picker =
+            window.use_keyed_state("preferences-terminal-font-picker", cx, move |window, cx| {
+                SystemFontPicker::new(owner, &initial_terminal, window, cx)
+            });
+        let picker = font_picker.read(cx);
         let resolved_font_family =
-            TerminalMetrics::from_settings(&terminal, &window.text_system().all_font_names())
-                .font_family;
+            TerminalMetrics::from_settings(&terminal, &picker.installed).font_family;
+        let font_select = picker.select.clone();
 
         let font_weight_options = vec![
-            (TerminalFontWeight::Normal, "常规".into()),
-            (TerminalFontWeight::Medium, "中等".into()),
-            (TerminalFontWeight::Bold, "加粗".into()),
+            (
+                TerminalFontWeight::Normal,
+                crate::locale::text("常规", "Normal"),
+            ),
+            (
+                TerminalFontWeight::Medium,
+                crate::locale::text("中等", "Medium"),
+            ),
+            (
+                TerminalFontWeight::Bold,
+                crate::locale::text("加粗", "Bold"),
+            ),
         ];
         let right_click_options = vec![
-            (TerminalRightClickBehavior::None, "不执行".into()),
-            (TerminalRightClickBehavior::Paste, "粘贴".into()),
-            (TerminalRightClickBehavior::Menu, "菜单".into()),
+            (
+                TerminalRightClickBehavior::None,
+                crate::locale::text("不执行", "None"),
+            ),
+            (
+                TerminalRightClickBehavior::Paste,
+                crate::locale::text("粘贴", "Paste"),
+            ),
+            (
+                TerminalRightClickBehavior::Menu,
+                crate::locale::text("菜单", "Menu"),
+            ),
         ];
 
+        let font_family_control = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(field_label(crate::locale::text("字体", "Font"), theme))
+            .child(
+                Select::new(&font_select)
+                    .id("terminal-font-family")
+                    .accessibility_label(crate::locale::text("终端字体", "Terminal font"))
+                    .search_placeholder(crate::locale::text("搜索字体", "Search fonts"))
+                    .disabled(locked)
+                    .bg(theme.field_surface())
+                    .border_color(theme.strong_border())
+                    .rounded(theme.control_radius)
+                    .w_full(),
+            )
+            .children(self.terminal_field_error(
+                "font_family",
+                SettingsIssueKind::InvalidFontFamily,
+                theme,
+            ));
         let font_controls = vec![
-            div()
-                .w_full()
-                .min_w(px(0.))
-                .child(settings_dropdown(
-                    SettingsDropdownSpec {
-                        id: "terminal-font-family",
-                        label: crate::locale::text("终端字体", "Terminal font"),
-                        accessibility_label: crate::locale::text("终端字体", "Terminal font"),
-                        current_label: current_font_label(&terminal.font_family),
-                        current: terminal.font_family.clone(),
-                        options: FONT_OPTIONS
-                            .iter()
-                            .map(|(label, value)| ((*value).to_owned(), (*label).into()))
-                            .collect(),
-                        update: set_font_family,
-                    },
-                    locked,
-                    theme,
-                    cx,
-                ))
-                .into_any_element(),
             number_setting_field(
                 crate::locale::text("字号", "Font size"),
                 &self.settings_inputs.font_size,
@@ -253,6 +289,12 @@ impl PreferencesPanel {
                 locked,
                 theme,
             )
+            .id("terminal-font-size")
+            .children(self.terminal_field_error(
+                "font_size",
+                SettingsIssueKind::InvalidFontSize,
+                theme,
+            ))
             .into_any_element(),
             number_setting_field(
                 crate::locale::text("行高", "Line height"),
@@ -263,315 +305,353 @@ impl PreferencesPanel {
                 locked,
                 theme,
             )
-            .into_any_element(),
-        ];
-        let font_weight_control = settings_dropdown(
-            SettingsDropdownSpec {
-                id: "terminal-font-weight",
-                label: crate::locale::text("字重", "Font weight"),
-                accessibility_label: crate::locale::text("终端字重", "Terminal weight"),
-                current_label: font_weight_label(terminal.font_weight),
-                current: terminal.font_weight,
-                options: font_weight_options,
-                update: set_font_weight,
-            },
-            locked,
-            theme,
-            cx,
-        )
-        .into_any_element();
-        let font_grid = super::render_settings::settings_grid_rows(
-            font_controls,
-            if medium_layout {
-                &[2.0, 1.0, 1.0]
-            } else {
-                &[1.0]
-            },
-            super::render_settings::SettingsGridGap::Standard,
-            false,
-        );
-
-        let interaction_controls = vec![
-            policy_switch(
-                "terminal-selection-copy",
-                IconName::MousePointerClick,
-                crate::locale::text("选中复制", "Copy selection"),
-                terminal.selection_copy,
-                locked,
+            .id("terminal-line-height")
+            .children(self.terminal_field_error(
+                "line_height",
+                SettingsIssueKind::InvalidLineHeight,
                 theme,
-                cx.listener(|panel, enabled: &bool, _, cx| {
-                    panel.edit_settings(|settings| settings.terminal.selection_copy = *enabled, cx);
-                }),
-            )
+            ))
             .into_any_element(),
-            policy_switch(
-                "terminal-show-tab-numbers",
-                IconName::Terminal,
-                crate::locale::text("显示标签序号", "Show tab numbers"),
-                terminal.show_tab_numbers,
-                locked,
-                theme,
-                cx.listener(|panel, enabled: &bool, _, cx| {
-                    panel.edit_settings(
-                        |settings| settings.terminal.show_tab_numbers = *enabled,
-                        cx,
-                    );
-                }),
-            )
-            .into_any_element(),
-            policy_switch(
-                "terminal-cursor-blink",
-                IconName::Type,
-                crate::locale::text("光标闪烁", "Cursor blink"),
-                terminal.cursor_blink,
-                locked,
-                theme,
-                cx.listener(|panel, enabled: &bool, _, cx| {
-                    panel.edit_settings(|settings| settings.terminal.cursor_blink = *enabled, cx);
-                }),
-            )
-            .into_any_element(),
-            policy_switch(
-                "terminal-command-rail",
-                IconName::Terminal,
-                crate::locale::text("显示命令色条", "Show command rail"),
-                terminal.show_command_block_rail,
-                locked,
-                theme,
-                cx.listener(|panel, enabled: &bool, _, cx| {
-                    panel.edit_settings(
-                        |settings| settings.terminal.show_command_block_rail = *enabled,
-                        cx,
-                    );
-                }),
-            )
-            .into_any_element(),
-            policy_switch(
-                "terminal-confirm-close",
-                IconName::RotateCcw,
-                crate::locale::text("关闭标签前确认", "Confirm before closing tab"),
-                terminal.confirm_close_tab,
-                locked,
-                theme,
-                cx.listener(|panel, enabled: &bool, _, cx| {
-                    panel.edit_settings(
-                        |settings| settings.terminal.confirm_close_tab = *enabled,
-                        cx,
-                    );
-                }),
-            )
-            .into_any_element(),
-            policy_switch(
-                "terminal-auto-reconnect",
-                IconName::RotateCcw,
-                crate::locale::text("自动重连", "Reconnect automatically"),
-                terminal.auto_reconnect,
-                locked,
-                theme,
-                cx.listener(|panel, enabled: &bool, _, cx| {
-                    panel.edit_settings(|settings| settings.terminal.auto_reconnect = *enabled, cx);
-                }),
-            )
-            .into_any_element(),
-        ];
-        let interaction_grid = super::render_settings::settings_grid_rows(
-            interaction_controls,
-            if wide_layout {
-                &[1.0, 1.0, 1.0]
-            } else if medium_layout {
-                &[1.0, 1.0]
-            } else {
-                &[1.0]
-            },
-            super::render_settings::SettingsGridGap::Compact,
-            false,
-        );
-
-        let behavior_controls = vec![
-            div()
-                .w_full()
-                .min_w(px(0.))
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_size(theme.text_xs)
-                        .font_weight(theme.settings_medium_font_weight())
-                        .text_color(theme.field_label)
-                        .child(crate::locale::text("键盘", "Keyboard")),
-                )
-                .child(policy_switch(
-                    "terminal-mac-option-meta",
-                    IconName::Terminal,
-                    crate::locale::text(
-                        "将 macOS Option 键作为 Meta 键",
-                        "Use macOS Option as Meta",
-                    ),
-                    terminal.mac_option_is_meta,
-                    locked,
-                    theme,
-                    cx.listener(|panel, enabled: &bool, _, cx| {
-                        panel.edit_settings(
-                            |settings| settings.terminal.mac_option_is_meta = *enabled,
-                            cx,
-                        );
-                    }),
-                ))
-                .into_any_element(),
             settings_dropdown(
                 SettingsDropdownSpec {
-                    id: "terminal-right-click",
-                    label: crate::locale::text("右键行为", "Right-click behavior"),
-                    accessibility_label: crate::locale::text(
-                        "终端右键行为",
-                        "Terminal right-click behavior",
-                    ),
-                    current_label: right_click_label(terminal.right_click_behavior),
-                    current: terminal.right_click_behavior,
-                    options: right_click_options,
-                    update: set_right_click,
+                    id: "terminal-font-weight",
+                    label: crate::locale::text("字重", "Font weight"),
+                    accessibility_label: crate::locale::text("终端字重", "Terminal weight"),
+                    current_label: font_weight_label(terminal.font_weight),
+                    current: terminal.font_weight,
+                    options: font_weight_options,
+                    update: set_font_weight,
                 },
                 locked,
                 theme,
                 cx,
             )
             .into_any_element(),
-            number_setting(
-                crate::locale::text("滚屏缓冲", "Scrollback"),
-                &self.settings_inputs.scrollback,
-                Some(crate::locale::text("行", "lines")),
-                None,
-                locked,
-                theme,
-            )
-            .into_any_element(),
         ];
-        let behavior_grid = super::render_settings::settings_grid_rows(
-            behavior_controls,
-            if wide_layout {
-                &[0.9, 1.25, 1.0]
-            } else if medium_layout {
-                &[1.0, 1.0]
+        let appearance = subpanel(
+            crate::locale::text("外观与字体", "Appearance and font"),
+            theme,
+        )
+        .child(scheme_picker(
+            "terminal-scheme",
+            terminal.color_scheme,
+            is_dark,
+            wide_layout,
+            locked,
+            theme,
+            cx,
+        ))
+        .child(section_separator(theme))
+        .child(font_family_control)
+        .child(super::render_settings::settings_grid_rows(
+            font_controls,
+            if medium_layout {
+                &[1.0, 1.0, 1.0]
             } else {
                 &[1.0]
             },
             super::render_settings::SettingsGridGap::Standard,
-            true,
+            false,
+        ))
+        .child(font_preview(
+            &terminal,
+            is_dark,
+            resolved_font_family,
+            theme,
+        ));
+
+        let interaction = subpanel(
+            crate::locale::text("操作与连接", "Interaction and connections"),
+            theme,
+        )
+        .child(policy_switch(
+            "terminal-selection-copy",
+            crate::locale::text("选中即复制", "Copy on selection"),
+            Some(crate::locale::text(
+                "选中的文本自动复制到剪贴板。",
+                "Automatically copy selected text to the clipboard.",
+            )),
+            terminal.selection_copy,
+            locked,
+            theme,
+            cx.listener(|panel, enabled: &bool, _, cx| {
+                panel.edit_settings(|settings| settings.terminal.selection_copy = *enabled, cx);
+            }),
+        ))
+        .child(section_separator(theme))
+        .child(settings_dropdown(
+            SettingsDropdownSpec {
+                id: "terminal-right-click",
+                label: crate::locale::text("右键操作", "Right-click action"),
+                accessibility_label: crate::locale::text(
+                    "终端右键行为",
+                    "Terminal right-click behavior",
+                ),
+                current_label: right_click_label(terminal.right_click_behavior),
+                current: terminal.right_click_behavior,
+                options: right_click_options,
+                update: set_right_click,
+            },
+            locked,
+            theme,
+            cx,
+        ))
+        .child(section_separator(theme))
+        .child(policy_switch(
+            "terminal-show-tab-numbers",
+            crate::locale::text("显示标签序号", "Show tab numbers"),
+            None,
+            terminal.show_tab_numbers,
+            locked,
+            theme,
+            cx.listener(|panel, enabled: &bool, _, cx| {
+                panel.edit_settings(|settings| settings.terminal.show_tab_numbers = *enabled, cx);
+            }),
+        ))
+        .child(section_separator(theme))
+        .child(policy_switch(
+            "terminal-confirm-close",
+            crate::locale::text("关闭标签前确认", "Confirm before closing tab"),
+            None,
+            terminal.confirm_close_tab,
+            locked,
+            theme,
+            cx.listener(|panel, enabled: &bool, _, cx| {
+                panel.edit_settings(
+                    |settings| settings.terminal.confirm_close_tab = *enabled,
+                    cx,
+                );
+            }),
+        ))
+        .child(section_separator(theme))
+        .child(policy_switch(
+            "terminal-auto-reconnect",
+            crate::locale::text("SSH 断线自动重连", "Reconnect SSH automatically"),
+            None,
+            terminal.auto_reconnect,
+            locked,
+            theme,
+            cx.listener(|panel, enabled: &bool, _, cx| {
+                panel.edit_settings(|settings| settings.terminal.auto_reconnect = *enabled, cx);
+            }),
+        ))
+        .when(cfg!(target_os = "macos"), |group| {
+            group.child(section_separator(theme)).child(policy_switch(
+                "terminal-mac-option-meta",
+                crate::locale::text("将 Option 键用作 Meta", "Use Option as Meta"),
+                None,
+                terminal.mac_option_is_meta,
+                locked,
+                theme,
+                cx.listener(|panel, enabled: &bool, _, cx| {
+                    panel.edit_settings(
+                        |settings| settings.terminal.mac_option_is_meta = *enabled,
+                        cx,
+                    );
+                }),
+            ))
+        });
+
+        let history = subpanel(crate::locale::text("滚屏历史", "Scrollback history"), theme).child(
+            number_setting_field(
+                crate::locale::text("保留行数", "Lines to keep"),
+                &self.settings_inputs.scrollback,
+                Some(crate::locale::text("行", "lines")),
+                Some(crate::locale::text(
+                    "保留 1,000–50,000 行；更多历史会占用更多内存。",
+                    "Keep 1,000–50,000 lines. More history uses more memory.",
+                )),
+                false,
+                locked,
+                theme,
+            )
+            .children(self.terminal_field_error(
+                "scrollback",
+                SettingsIssueKind::InvalidScrollback,
+                theme,
+            )),
         );
 
         let content = div()
             .id("preferences-terminal")
             .flex_1()
             .w_full()
-            .min_w(px(0.))
-            .min_h(px(0.))
+            .min_w_0()
+            .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.content_scroll)
-            .flex()
-            .flex_col()
-            .gap_4()
             .child(
                 div()
                     .w_full()
+                    .min_w_0()
                     .flex()
-                    .when(wide_layout, |layout| layout.flex_row().items_stretch())
-                    .when(!wide_layout, |layout| layout.flex_col())
+                    .flex_col()
                     .gap_4()
-                    .child(
-                        subpanel(
-                            crate::locale::text("终端主题", "Terminal theme"),
-                            Some(IconName::Terminal),
-                            theme,
-                        )
-                        .when(wide_layout, |panel| {
-                            panel.flex_grow(0.9).flex_basis(px(0.)).min_w(px(0.))
-                        })
-                        .child(scheme_picker(
-                            "terminal-scheme-light",
-                            crate::locale::text("浅色终端主题", "Light terminal theme"),
-                            terminal.light_color_scheme,
-                            false,
-                            locked,
-                            theme,
-                            cx,
-                        ))
-                        .child(scheme_picker(
-                            "terminal-scheme-dark",
-                            crate::locale::text("暗色终端主题", "Dark terminal theme"),
-                            terminal.dark_color_scheme,
-                            true,
-                            locked,
-                            theme,
-                            cx,
-                        )),
+                    .pr_2()
+                    .pb_2()
+                    .child(appearance)
+                    .child(cursor_section(&terminal, is_dark, locked, theme, cx))
+                    .child(interaction)
+                    .child(history)
+                    .children(
+                        self.settings_issues
+                            .iter()
+                            .filter(|issue| {
+                                !matches!(
+                                    issue.kind,
+                                    SettingsIssueKind::InvalidFontFamily
+                                        | SettingsIssueKind::InvalidFontSize
+                                        | SettingsIssueKind::InvalidLineHeight
+                                        | SettingsIssueKind::InvalidScrollback
+                                )
+                            })
+                            .map(|issue| super::render_settings::settings_issue_row(issue, theme)),
                     )
-                    .child(
-                        subpanel(
-                            crate::locale::text("字体配置", "Font settings"),
-                            Some(IconName::Type),
-                            theme,
-                        )
-                        .when(wide_layout, |panel| {
-                            panel.flex_grow(1.1).flex_basis(px(0.)).min_w(px(0.))
-                        })
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_col()
-                                .gap_3()
-                                .child(font_grid)
-                                .child(font_weight_control),
-                        )
-                        .child(font_preview(
-                            &terminal,
-                            is_dark,
-                            resolved_font_family,
-                            theme,
-                        )),
-                    ),
-            )
-            .child(renderer_disclosure(
-                self.terminal_renderer_open,
-                locked,
-                theme,
-                cx,
-            ))
-            .child(
-                subpanel(
-                    crate::locale::text("终端交互", "Terminal interaction"),
-                    Some(IconName::MousePointerClick),
-                    theme,
-                )
-                .child(interaction_grid)
-                .child(behavior_grid),
-            )
-            .child(cursor_section(
-                &terminal,
-                is_dark,
-                locked,
-                large_layout,
-                theme,
-                cx,
-            ))
-            .children(
+                    .children(
+                        self.settings_input_errors
+                            .iter()
+                            .filter(|(key, _)| {
+                                !matches!(
+                                    **key,
+                                    "font_family" | "font_size" | "line_height" | "scrollback"
+                                )
+                            })
+                            .map(|(_, message)| super::render_settings::issue_row(message, theme)),
+                    )
+                    .children(super::render::settings_error_banner(
+                        self.settings_error.as_deref(),
+                        theme,
+                    )),
+            );
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(content)
+            .child(self.render_terminal_save_status(theme, cx))
+            .into_any_element()
+    }
+
+    /// 数字格式与领域范围错误就近出现，保留输入中间态；跨页错误仍由正文和状态栏提示。
+    /// @author kongweiguang
+    fn terminal_field_error(
+        &self,
+        key: &str,
+        kind: SettingsIssueKind,
+        theme: ThemeTokens,
+    ) -> Option<impl IntoElement> {
+        let message = self
+            .settings_input_errors
+            .get(key)
+            .map(String::as_str)
+            .or_else(|| {
                 self.settings_issues
                     .iter()
-                    .map(|issue| super::render_settings::settings_issue_row(issue, theme)),
-            )
-            .children(
-                self.settings_input_errors
-                    .values()
-                    .map(|message| super::render_settings::issue_row(message, theme)),
-            )
-            .children(super::render::settings_error_banner(
-                self.settings_error.as_deref(),
-                theme,
-            ))
-            .child(self.render_save_notice(theme));
+                    .find(|issue| issue.kind == kind)
+                    .map(|issue| issue.message.as_str())
+            })?;
+        Some(
+            div()
+                .id(format!("terminal-{key}-error"))
+                .debug_selector({
+                    let selector = format!("terminal-{key}-error");
+                    move || selector.clone()
+                })
+                .text_size(theme.text_xs)
+                .text_color(theme.error)
+                .child(message.to_owned()),
+        )
+    }
 
-        content.into_any_element()
+    /// 固定状态区只投影真实草稿状态，输入错误与待保存不显示成功；确定失败才允许调用原保存用例重试。
+    /// @author kongweiguang
+    fn render_terminal_save_status(
+        &self,
+        theme: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let draft = self.settings.as_ref();
+        let state = draft.map(|draft| draft.status());
+        let dirty = draft.is_some_and(|draft| draft.is_dirty());
+        let invalid = !self.settings_input_errors.is_empty()
+            || self.settings_issues.iter().any(|issue| issue.blocks_save());
+        let failed = matches!(
+            state,
+            Some(DraftStatus::Failed | DraftStatus::ExternalConflict | DraftStatus::OutcomeUnknown)
+        );
+        let saved = state == Some(DraftStatus::Ready)
+            && !dirty
+            && !invalid
+            && self.settings_error.is_none()
+            && self.status.is_none()
+            && self.settings_success_status == Some(SettingsSuccessStatus::Saved);
+        let message = if invalid {
+            crate::locale::text(
+                "尚未保存，请修正标记的内容。",
+                "Not saved. Review the marked fields.",
+            )
+        } else if failed || self.settings_error.is_some() {
+            self.settings_error
+                .as_deref()
+                .or(self.status.as_deref())
+                .map(|message| SharedString::from(message.to_owned()))
+                .unwrap_or_else(|| {
+                    crate::locale::text(
+                        "尚未保存，更改已保留。",
+                        "Not saved. Your changes are preserved.",
+                    )
+                })
+        } else if state == Some(DraftStatus::Saving) {
+            crate::locale::text("正在保存…", "Saving…")
+        } else if dirty {
+            crate::locale::text("等待自动保存…", "Waiting to save…")
+        } else if let Some(status) = self.status.as_deref() {
+            SharedString::from(status.to_owned())
+        } else if saved {
+            crate::locale::text("设置已保存", "Settings saved")
+        } else {
+            crate::locale::text("更改将自动保存", "Changes save automatically")
+        };
+        div()
+            .id("terminal-save-status")
+            .debug_selector(|| "terminal-save-status".into())
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(theme.border)
+            .pt_2()
+            .mt_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(theme.text_xs)
+            .text_color(if invalid || failed || self.settings_error.is_some() {
+                theme.error
+            } else {
+                theme.muted
+            })
+            .when(saved, |row| {
+                row.child(gpui_kit::component::Icon::new(IconName::Check).size_3())
+            })
+            .child(div().flex_1().min_w_0().child(message))
+            .when(
+                state == Some(DraftStatus::Failed)
+                    && dirty
+                    && !invalid
+                    && !self.settings_controls_locked(),
+                |row| {
+                    row.child(
+                        Button::new("terminal-retry-save")
+                            .small()
+                            .outline()
+                            .label(crate::locale::text("重试保存", "Retry save"))
+                            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                panel.save_settings(cx);
+                            })),
+                    )
+                },
+            )
     }
 }
 
@@ -593,17 +673,13 @@ fn configure_number(
     });
 }
 
-/// 卡片沿用 main 的分组表面；无图标的光标分区使用较轻的小标题，保留原有层级。
+/// 同层级设置使用统一中性分组与标题，不再用装饰图标或等高列暗示不存在的关联。
 ///
 /// @author kongweiguang
-fn subpanel(
-    title: impl Into<SharedString>,
-    icon: Option<IconName>,
-    theme: ThemeTokens,
-) -> gpui_kit::Div {
+fn subpanel(title: SharedString, theme: ThemeTokens) -> gpui_kit::Div {
     div()
         .w_full()
-        .min_w(px(0.))
+        .min_w_0()
         .p_4()
         .flex()
         .flex_col()
@@ -614,257 +690,149 @@ fn subpanel(
         .border_color(theme.border)
         .child(
             div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .when_some(icon, |row, icon| {
-                    row.child(
-                        gpui_kit::component::Icon::new(icon)
-                            .size(px(16.))
-                            .text_color(theme.muted),
-                    )
-                })
-                .child(
-                    div()
-                        .text_size(if icon.is_some() {
-                            theme.text_sm
-                        } else {
-                            theme.text_xs
-                        })
-                        .font_weight(theme.settings_medium_font_weight())
-                        .text_color(if icon.is_some() {
-                            theme.foreground
-                        } else {
-                            theme.field_label
-                        })
-                        .child(title.into()),
-                ),
+                .text_size(theme.text_sm)
+                .font_weight(theme.settings_medium_font_weight())
+                .text_color(theme.foreground)
+                .child(title),
         )
 }
 
-/// 复刻 main 的两列配色卡；窄列中压缩色样与勾选标记，给方案标题留足宽度。
+/// 字段标题与原生控件共用一条对齐线，避免每个字段派生不同层级。
+/// @author kongweiguang
+fn field_label(label: SharedString, theme: ThemeTokens) -> gpui_kit::Div {
+    div()
+        .text_size(theme.text_xs)
+        .font_weight(theme.settings_medium_font_weight())
+        .text_color(theme.field_label)
+        .child(label)
+}
+
+/// 分隔线归分组所有，不给每一设置行再套一层卡片。
+/// @author kongweiguang
+fn section_separator(theme: ThemeTokens) -> gpui_kit::Div {
+    div().w_full().border_b_1().border_color(theme.border)
+}
+
+/// 单一主题按当前应用明暗显示实际色样，并保持键盘选择和稳定身份。
 ///
 /// @author kongweiguang
 fn scheme_picker(
     id_prefix: &'static str,
-    label: SharedString,
     current: TerminalColorScheme,
-    dark_scheme: bool,
+    is_dark: bool,
+    wide: bool,
     disabled: bool,
     theme: ThemeTokens,
     cx: &mut Context<PreferencesPanel>,
 ) -> impl IntoElement {
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(
-            div()
-                .text_size(theme.text_xs)
-                .font_weight(theme.settings_medium_font_weight())
-                .text_color(theme.field_label)
-                .child(label),
-        )
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .children(SCHEME_OPTIONS.chunks(2).map(|row_options| {
-                    div()
-                        .w_full()
-                        .min_w(px(0.))
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .children(row_options.iter().copied().map(|option| {
-                            let selected = option.value == current;
-                            let option_value = option.value;
-                            let fill = if selected {
-                                theme.surface_selected()
-                            } else {
-                                theme.secondary
-                            };
-                            let border = if selected {
-                                theme.tunnel_action.opacity(0.45)
+    div().w_full().flex().flex_col().gap_2().children(
+        SCHEME_OPTIONS
+            .chunks(if wide { 4 } else { 2 })
+            .map(|row_options| {
+                div().w_full().min_w(px(0.)).flex().gap_2().children(
+                    row_options.iter().copied().map(|option| {
+                        let selected = option.value == current;
+                        let value = option.value;
+                        let colors = terminal_preview_colors(value, is_dark);
+                        let swatches = [
+                            colors.background,
+                            colors.foreground,
+                            colors.green,
+                            colors.cyan,
+                        ];
+                        Button::new(format!("{id_prefix}-{}", option.id))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h_16()
+                            .px_3()
+                            .rounded(theme.control_radius)
+                            .border_1()
+                            .border_color(if selected {
+                                theme.accent.opacity(0.55)
                             } else {
                                 theme.border
-                            };
-                            let hover = if selected {
-                                theme.surface_selected()
-                            } else {
-                                theme.surface_hover()
-                            };
-                            Button::new(format!("{id_prefix}-{}", option.id))
-                                .flex_1()
-                                .flex_basis(px(0.))
-                                .min_w(px(0.))
-                                .min_h(px(96.))
-                                .h_auto()
-                                .p_3()
-                                .rounded(theme.control_radius)
-                                .outline()
-                                .border_1()
-                                .border_color(border)
-                                .selected(selected)
-                                .toggled(selected)
-                                .accessibility_label(crate::locale::text(
-                                    format!("{}：{}", option.label, option.description),
-                                    format!("{}: {}", option.label, option.description),
-                                ))
-                                .tab_stop(true)
-                                .tab_index(0)
-                                .focus_ring(true)
-                                .disabled(disabled)
-                                .custom(
-                                    ButtonCustomVariant::new(cx)
-                                        .color(fill)
-                                        .foreground(theme.foreground)
-                                        .hover(hover)
-                                        .active(hover),
-                                )
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .min_w(px(0.))
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .min_w(px(0.))
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .gap_2()
-                                                .child(
-                                                    div()
-                                                        .min_w(px(0.))
-                                                        .flex_1()
-                                                        .truncate()
-                                                        .text_size(theme.text_sm)
-                                                        .font_weight(
-                                                            theme.settings_medium_font_weight(),
-                                                        )
-                                                        .text_color(if selected {
-                                                            theme.selected_foreground
-                                                        } else {
-                                                            theme.muted
-                                                        })
-                                                        .child(option.label),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_shrink_0()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .overflow_hidden()
-                                                                .rounded_full()
-                                                                .border_1()
-                                                                .border_color(
-                                                                    theme.border.opacity(0.5),
-                                                                )
-                                                                .children(
-                                                                    option
-                                                                        .swatches
-                                                                        .into_iter()
-                                                                        .map(|color| {
-                                                                            div().size(px(12.)).bg(
-                                                                                gpui_kit::rgb(
-                                                                                    color,
-                                                                                ),
-                                                                            )
-                                                                        }),
-                                                                ),
-                                                        )
-                                                        .when(selected, |row| {
-                                                            row.child(
-                                                            div()
-                                                                .size(px(16.))
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .rounded_full()
-                                                                .bg(theme.tunnel_action)
-                                                                .text_color(theme.background)
-                                                                .child(
-                                                                    gpui_kit::component::Icon::new(
-                                                                        IconName::Check,
-                                                                    )
-                                                                        .size(px(10.)),
-                                                                ),
-                                                        )
-                                                        }),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .min_w(px(0.))
-                                                .text_size(theme.text_xs)
-                                                .line_height(px(20.))
-                                                .whitespace_normal()
-                                                .text_color(theme.muted.opacity(0.8))
-                                                .text_left()
-                                                .child(option.description),
-                                        ),
-                                )
-                                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                                    panel.edit_settings(
-                                        move |settings| {
-                                            set_terminal_scheme(
-                                                settings,
-                                                option_value,
-                                                dark_scheme,
-                                            );
-                                        },
-                                        cx,
-                                    );
-                                }))
-                        }))
-                })),
-        )
+                            })
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(if selected {
+                                        theme.surface_selected()
+                                    } else {
+                                        theme.secondary
+                                    })
+                                    .foreground(theme.foreground)
+                                    .hover(theme.surface_hover())
+                                    .active(theme.surface_selected()),
+                            )
+                            .selected(selected)
+                            .toggled(selected)
+                            .focus_ring(true)
+                            .disabled(disabled)
+                            .accessibility_label(crate::locale::text(
+                                format!("{} 终端主题", option.label),
+                                format!("{} terminal theme", option.label),
+                            ))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .text_size(theme.text_sm)
+                                                    .child(option.label),
+                                            )
+                                            .child(
+                                                gpui_kit::component::Icon::new(IconName::Check)
+                                                    .size_3()
+                                                    .opacity(if selected { 1.0 } else { 0.0 }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .overflow_hidden()
+                                            .rounded_full()
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .children(swatches.into_iter().map(|color| {
+                                                div().flex_1().h_2().bg(gpui_kit::rgb(color))
+                                            })),
+                                    ),
+                            )
+                            .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
+                                panel.edit_settings(
+                                    |settings| set_terminal_scheme(settings, value),
+                                    cx,
+                                );
+                            }))
+                    }),
+                )
+            }),
+    )
 }
-
-/// 终端 scheme 同步当前选择与对应的明暗字段，切换桌面主题时保留另一侧偏好。
+/// 单一主题同步旧版浅深字段，避免旧配置读取者与当前选择产生不同结果。
 ///
 /// @author kongweiguang
-fn set_terminal_scheme(
-    settings: &mut SettingsSnapshot,
-    value: TerminalColorScheme,
-    dark_scheme: bool,
-) {
+fn set_terminal_scheme(settings: &mut SettingsSnapshot, value: TerminalColorScheme) {
     settings.terminal.color_scheme = value;
-    if dark_scheme {
-        settings.terminal.dark_color_scheme = value;
-    } else {
-        settings.terminal.light_color_scheme = value;
-    }
+    settings.terminal.dark_color_scheme = value;
+    settings.terminal.light_color_scheme = value;
+    settings.terminal.legacy_color_scheme_missing = false;
 }
 
-/// 字段标题与 NumberInput 同组显示，维持其他设置数字控件原有的最小宽度。
-///
-/// @author kongweiguang
-pub(in crate::features::preferences) fn number_setting(
-    label: SharedString,
-    input: &Entity<InputState>,
-    suffix: Option<SharedString>,
-    help: Option<SharedString>,
-    disabled: bool,
-    theme: ThemeTokens,
-) -> impl IntoElement {
-    number_setting_field(label, input, suffix, help, false, disabled, theme)
-}
-
-/// 数字输入沿用 main 的普通字段而不增加步进按钮；保留原 InputState 的范围与中间态校验。
-/// 字号与行高并排时压缩最小宽度，36px 命中高度保持一致。
+/// 字号与行高复用同一 InputState 的边界、步进和中间态，其余字段沿用普通输入框。
 ///
 /// @author kongweiguang
 fn number_setting_field(
@@ -875,18 +843,32 @@ fn number_setting_field(
     compact_controls: bool,
     disabled: bool,
     theme: ThemeTokens,
-) -> impl IntoElement {
-    let field = gpui_kit::Styled::h(
-        super::render_settings::settings_input(input, theme)
-            .when(compact_controls, |field| field.small()),
-        px(36.),
-    )
-    .w_full()
-    .disabled(disabled)
-    .when_some(suffix, |field, suffix| field.suffix(suffix));
+) -> gpui_kit::Div {
+    let accessibility_label = label.clone();
+    let field = if compact_controls {
+        NumberInput::new(input)
+            .small()
+            .h(px(36.))
+            .w_full()
+            .bg(theme.field_surface())
+            .border_color(theme.strong_border())
+            .rounded(theme.control_radius)
+            .disabled(disabled)
+            .when_some(suffix, |field, suffix| field.suffix(suffix))
+            .into_any_element()
+    } else {
+        gpui_kit::Styled::h(
+            super::render_settings::settings_input(input, theme),
+            px(36.),
+        )
+        .w_full()
+        .disabled(disabled)
+        .when_some(suffix, |field, suffix| field.suffix(suffix))
+        .into_any_element()
+    };
     div()
         .flex_1()
-        .min_w(px(if compact_controls { 96. } else { 112. }))
+        .min_w(px(if compact_controls { 120. } else { 112. }))
         .flex()
         .flex_col()
         .gap_1()
@@ -897,7 +879,14 @@ fn number_setting_field(
                 .text_color(theme.field_label)
                 .child(label),
         )
-        .child(field)
+        .child(
+            div()
+                .id(("number-setting-group", input.entity_id()))
+                .w_full()
+                .role(gpui_kit::Role::Group)
+                .aria_label(accessibility_label)
+                .child(field),
+        )
         .when_some(help, |field, help| {
             field.child(
                 div()
@@ -987,39 +976,6 @@ where
         )
 }
 
-/// 将字体显示名和可跨平台回退的 CSS 栈写入终端设置快照。
-///
-/// @author kongweiguang
-fn set_font_family(settings: &mut SettingsSnapshot, value: String) {
-    settings.terminal.font_family = value;
-}
-
-/// 把主终端字体族列表映射成当前预览可见的显示名，未列出的旧值仍可读。
-///
-/// @author kongweiguang
-fn current_font_label(value: &str) -> SharedString {
-    FONT_OPTIONS
-        .iter()
-        .find(|(_, family)| *family == value)
-        .map(|(label, _)| (*label).into())
-        .unwrap_or_else(|| primary_font_family(value).into())
-}
-
-/// 从字体回退栈取首选族给预览使用，同时保留原始完整栈用于持久化。
-///
-/// @author kongweiguang
-fn primary_font_family(value: &str) -> String {
-    value
-        .split(',')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .trim()
-        .to_owned()
-}
-
 /// 将用户选择的字重写入 snapshot，字体预览和运行时终端读取同一字段。
 ///
 /// @author kongweiguang
@@ -1027,18 +983,7 @@ fn set_font_weight(settings: &mut SettingsSnapshot, value: TerminalFontWeight) {
     settings.terminal.font_weight = value;
 }
 
-/// 映射应用的字体字重枚举到预览文字的 Kit 字重。
-///
-/// @author kongweiguang
-fn font_weight(value: TerminalFontWeight) -> gpui_kit::FontWeight {
-    match value {
-        TerminalFontWeight::Normal => gpui_kit::FontWeight::NORMAL,
-        TerminalFontWeight::Medium => gpui_kit::FontWeight::MEDIUM,
-        TerminalFontWeight::Bold => gpui_kit::FontWeight::BOLD,
-    }
-}
-
-/// 预览沿用终端布局解析出的已安装字体，并保留 main 的内容表面与字段字级，避免缺失首选字体时预览和实际绘制分离。
+/// 用唯一终端样本同时反馈配色、字体和光标；字重直接复用运行时映射，避免展示比实际终端更粗的文本。
 ///
 /// @author kongweiguang
 fn font_preview(
@@ -1047,142 +992,85 @@ fn font_preview(
     resolved_font_family: SharedString,
     theme: ThemeTokens,
 ) -> impl IntoElement {
-    let scheme = if is_dark {
-        terminal.dark_color_scheme
-    } else {
-        terminal.light_color_scheme
-    };
-    let colors = terminal_preview_colors(scheme, is_dark);
+    let colors = terminal_preview_colors(terminal.color_scheme, is_dark);
+    // 预览模拟终端栅格，因此保留与运行时相同的物理字号和行高，不跟随界面 rem 二次缩放。
     let font_size = px(f32::from(terminal.font_size));
     let line_height = px(f32::from(terminal.font_size) * terminal.line_height as f32);
-    let font_weight = font_weight(terminal.font_weight);
+    let weight = font_weight(terminal.font_weight);
     div()
         .id("terminal-font-preview")
         .w_full()
+        .min_w_0()
         .flex()
         .flex_col()
-        .gap_2()
-        .child(
-            div()
-                .text_size(theme.text_xs)
-                .font_weight(theme.settings_medium_font_weight())
-                .text_color(theme.field_label)
-                .child(crate::locale::text("字体预览", "Font preview")),
-        )
+        .rounded(theme.control_radius)
+        .border_1()
+        .border_color(theme.border)
         .child(
             div()
                 .w_full()
-                .min_w(px(0.))
+                .min_w_0()
                 .flex()
                 .items_center()
                 .gap_2()
-                .rounded(theme.control_radius)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.panel)
                 .px_3()
                 .py_2()
+                .text_size(theme.text_xs)
+                .text_color(theme.muted)
+                .child(crate::locale::text("终端预览", "Terminal preview"))
                 .child(
                     div()
-                        .w(px(40.))
-                        .h(px(28.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(theme.control_radius)
-                        .border_1()
-                        .border_color(theme.border)
-                        .font_family(resolved_font_family.clone())
-                        .font_weight(font_weight)
-                        .text_size(theme.text_sm)
-                        .line_height(px(20.))
-                        .child("Aa"),
-                )
-                .child(
-                    div()
-                        .min_w(px(0.))
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .text_size(theme.text_xs)
-                                .line_height(px(16.))
-                                .text_color(theme.muted)
-                                .child(crate::locale::text("当前预览", "Current preview")),
-                        )
-                        .child(
-                            div()
-                                .text_size(theme.text_sm)
-                                .line_height(px(20.))
-                                .font_weight(theme.settings_medium_font_weight())
-                                .text_color(theme.foreground)
-                                .child(current_font_label(&terminal.font_family)),
-                        ),
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_right()
+                        .child(resolved_font_family.clone()),
                 ),
         )
         .child(
             div()
                 .w_full()
-                .min_w(px(0.))
+                .min_w_0()
                 .overflow_hidden()
-                .rounded(theme.radius_sm)
-                .border_1()
-                .border_color(theme.border)
+                .rounded_b(theme.control_radius)
                 .bg(gpui_kit::rgb(colors.background))
-                .text_color(gpui_kit::rgb(colors.foreground))
                 .px_3()
                 .py_3()
                 .children([
                     preview_line(
-                        format!("font: {}", current_font_label(&terminal.font_family)),
+                        "$ ssh user@server.example.com".to_owned(),
                         &resolved_font_family,
                         font_size,
                         line_height,
-                        font_weight,
-                        gpui_kit::rgb(colors.foreground).into(),
-                    ),
-                    preview_line(
-                        "abcdefghijklmnopqrstuvwxyz".to_owned(),
-                        &resolved_font_family,
-                        font_size,
-                        line_height,
-                        font_weight,
-                        gpui_kit::rgb(colors.foreground).into(),
-                    ),
-                    preview_line(
-                        "0123456789 !@#$%^&*()[]{}<>".to_owned(),
-                        &resolved_font_family,
-                        font_size,
-                        line_height,
-                        font_weight,
-                        gpui_kit::rgb(colors.foreground).into(),
-                    ),
-                    preview_line(
-                        "中文路径 /var/log/应用 日志输出".to_owned(),
-                        &resolved_font_family,
-                        font_size,
-                        line_height,
-                        font_weight,
-                        gpui_kit::rgb(colors.foreground).into(),
-                    ),
-                    preview_line(
-                        "$ ssh root@server.example.com".to_owned(),
-                        &resolved_font_family,
-                        font_size,
-                        line_height,
-                        font_weight,
+                        weight,
                         gpui_kit::rgb(colors.green).into(),
                     ),
                     preview_line(
-                        "$ npm run build && npm run start".to_owned(),
+                        "中文路径 /var/log/app · 0123456789".to_owned(),
                         &resolved_font_family,
                         font_size,
                         line_height,
-                        font_weight,
+                        weight,
+                        gpui_kit::rgb(colors.foreground).into(),
+                    ),
+                    preview_line(
+                        "Aa Bb Cc  Il1 O0  {} [] <>".to_owned(),
+                        &resolved_font_family,
+                        font_size,
+                        line_height,
+                        weight,
+                        gpui_kit::rgb(colors.foreground).into(),
+                    ),
+                    preview_line(
+                        "$ ".to_owned(),
+                        &resolved_font_family,
+                        font_size,
+                        line_height,
+                        weight,
                         gpui_kit::rgb(colors.cyan).into(),
                     )
                     .flex()
-                    .items_end()
+                    .items_center()
                     .child(cursor_marker(
                         terminal.cursor_style,
                         colors.cursor,
@@ -1316,46 +1204,30 @@ pub(in crate::features::preferences) fn terminal_preview_colors(
     }
 }
 
-/// 光标样式预览读取对应明暗模式的终端色盘，确保界面色板不会影响终端内容示例。
+/// 光标形态与闪烁就近组合；静态选项只表达形状，唯一终端预览展示闪烁，避免多个动画争夺注意力。
 ///
 /// @author kongweiguang
 fn cursor_section(
     terminal: &kerminal_application::preferences::TerminalSettings,
     is_dark: bool,
     locked: bool,
-    large_layout: bool,
     theme: ThemeTokens,
     cx: &mut Context<PreferencesPanel>,
 ) -> impl IntoElement {
-    let scheme = if is_dark {
-        terminal.dark_color_scheme
-    } else {
-        terminal.light_color_scheme
-    };
-    let colors = terminal_preview_colors(scheme, is_dark);
+    let colors = terminal_preview_colors(terminal.color_scheme, is_dark);
     let choices = [
-        (
-            TerminalCursorStyle::Block,
-            "cursor-block",
-            "块状",
-            "醒目，易定位。",
-        ),
-        (
-            TerminalCursorStyle::Bar,
-            "cursor-bar",
-            "竖线",
-            "轻量插入点。",
-        ),
+        (TerminalCursorStyle::Block, "cursor-block", "块状", "Block"),
+        (TerminalCursorStyle::Bar, "cursor-bar", "竖线", "Bar"),
         (
             TerminalCursorStyle::Underline,
             "cursor-underline",
             "下划线",
-            "占用最少。",
+            "Underline",
         ),
     ];
     let cards = choices
         .into_iter()
-        .map(|(style, id, label, description)| {
+        .map(|(style, id, label_zh, label_en)| {
             let animation_id = match style {
                 TerminalCursorStyle::Block => "terminal-cursor-preview-block",
                 TerminalCursorStyle::Bar => "terminal-cursor-preview-bar",
@@ -1363,10 +1235,12 @@ fn cursor_section(
             };
             let selected = terminal.cursor_style == style;
             Button::new(format!("terminal-{id}"))
-                .flex_1()
-                .min_w(px(160.))
-                .h_auto()
-                .p(px(14.))
+                .compact()
+                .w(rems(8.25))
+                .flex_shrink_0()
+                .min_w(px(0.))
+                .h_8()
+                .px_2()
                 .rounded(theme.control_radius)
                 .border_1()
                 .border_color(if selected {
@@ -1385,248 +1259,66 @@ fn cursor_section(
                         .hover(theme.surface_hover())
                         .active(theme.surface_selected()),
                 )
+                .selected(selected)
+                .toggled(selected)
                 .disabled(locked)
                 .child(
                     div()
                         .w_full()
                         .flex()
-                        .flex_col()
-                        .items_start()
+                        .items_center()
                         .gap_2()
                         .child(
                             div()
-                                .w_full()
+                                .size(px(22.))
                                 .flex()
                                 .items_center()
-                                .justify_between()
-                                .child(div().text_size(theme.text_sm).child(label))
-                                .when(selected, |row| {
-                                    row.child(gpui_kit::component::Icon::new(IconName::Check))
-                                }),
+                                .justify_center()
+                                .rounded(theme.radius_sm)
+                                .bg(gpui_kit::rgb(colors.background))
+                                .child(cursor_marker(style, colors.cursor, false, animation_id)),
                         )
                         .child(
                             div()
-                                .text_size(theme.text_xs)
-                                .min_h(px(40.))
-                                .line_height(px(20.))
-                                .text_color(theme.muted)
-                                .child(crate::locale::text(description, description)),
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_size(theme.text_sm)
+                                .child(crate::locale::text(label_zh, label_en)),
                         )
-                        .child(cursor_preview(
-                            style,
-                            terminal.cursor_blink,
-                            animation_id,
-                            colors,
-                            theme,
-                        )),
+                        .when(selected, |row| {
+                            row.child(gpui_kit::component::Icon::new(IconName::Check).size(px(14.)))
+                        }),
                 )
                 .accessibility_label(crate::locale::text(
-                    format!("{label}光标：{description}"),
-                    format!("{label} cursor: {description}"),
+                    format!("{label_zh}光标"),
+                    format!("{label_en} cursor"),
                 ))
                 .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
                     panel.edit_settings(move |settings| settings.terminal.cursor_style = style, cx);
                 }))
                 .into_any_element()
         })
-        .collect();
-    let cards = super::render_settings::settings_grid_rows(
-        cards,
-        if large_layout {
-            &[1.0, 1.0, 1.0]
-        } else {
-            &[1.0]
-        },
-        super::render_settings::SettingsGridGap::Standard,
-        false,
-    );
-    subpanel(crate::locale::text("光标形态", "Cursor style"), None, theme).child(cards)
-}
-
-/// 标题栏使用应用语义色，正文及光标从终端预览色盘读取，动画身份保持稳定。
-///
-/// @author kongweiguang
-fn cursor_preview(
-    style: TerminalCursorStyle,
-    blink: bool,
-    animation_id: &'static str,
-    colors: TerminalPreviewColors,
-    theme: ThemeTokens,
-) -> impl IntoElement {
-    div()
-        .w_full()
-        .overflow_hidden()
-        .rounded(theme.radius_sm)
-        .border_1()
-        .border_color(theme.border)
-        .bg(gpui_kit::rgb(colors.background))
-        .child(
-            div()
-                .w_full()
-                .h(px(28.))
-                .flex()
-                .items_center()
-                .gap_1()
-                .px_3()
-                .border_b_1()
-                .border_color(theme.border)
-                .bg(theme.panel)
-                .children([
-                    div()
-                        .size(px(6.))
-                        .rounded_full()
-                        .bg(theme.error.opacity(0.8)),
-                    div()
-                        .size(px(6.))
-                        .rounded_full()
-                        .bg(theme.warning.opacity(0.8)),
-                    div()
-                        .size(px(6.))
-                        .rounded_full()
-                        .bg(theme.success.opacity(0.8)),
-                ])
-                .child(
-                    div()
-                        .ml_2()
-                        .text_size(px(10.))
-                        .font_weight(theme.settings_medium_font_weight())
-                        .text_color(theme.muted)
-                        .child("PROMPT"),
-                ),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w(px(0.))
-                .px_3()
-                .py_2()
-                .font_family("monospace")
-                .text_size(px(11.))
-                .line_height(px(20.))
-                .text_color(gpui_kit::rgb(colors.foreground))
-                .child(
-                    div()
-                        .w_full()
-                        .text_color(gpui_kit::rgb(colors.green))
-                        .child("root@kerminal"),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .text_color(gpui_kit::rgb(colors.foreground).opacity(0.75))
-                        .child("~/workspace"),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_end()
-                        .child(
-                            div()
-                                .text_color(gpui_kit::rgb(colors.cyan))
-                                .child("$ edit cursor"),
-                        )
-                        .child(cursor_marker(style, colors.cursor, blink, animation_id)),
-                ),
-        )
-}
-
-/// Disclosure 保持 main 的 44px 标题命中区；禁止滚动内容挤压带裁切的容器，避免入口消失。
-///
-/// @author kongweiguang
-fn renderer_disclosure(
-    expanded: bool,
-    disabled: bool,
-    theme: ThemeTokens,
-    cx: &mut Context<PreferencesPanel>,
-) -> impl IntoElement {
-    let description = crate::locale::text(
-        "终端由当前 GPUI 窗口的原生渲染器绘制。",
-        "Terminals are drawn by the native renderer in the current GPUI window.",
-    );
-    let status = crate::locale::text("GPUI 原生渲染", "GPUI native rendering");
-    div()
-        .w_full()
-        .flex_shrink_0()
-        .min_h(px(46.))
-        .overflow_hidden()
-        .rounded(theme.radius_panel)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.panel)
+        .collect::<Vec<_>>();
+    let cards = div()
+        .id("terminal-cursor-choices")
         .flex()
-        .flex_col()
-        .child(
-            Button::new("terminal-renderer-disclosure")
-                .compact()
-                .custom(super::render_settings::settings_ghost_variant(theme, cx))
-                .w_full()
-                .h(px(44.))
-                .accessibility_label(crate::locale::text("终端渲染", "Terminal rendering"))
-                .disabled(disabled)
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(gpui_kit::component::Icon::new(if expanded {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                }))
-                                .child(
-                                    div()
-                                        .text_size(theme.text_sm)
-                                        .font_weight(theme.settings_medium_font_weight())
-                                        .text_color(theme.foreground)
-                                        .child(crate::locale::text(
-                                            "终端渲染",
-                                            "Terminal rendering",
-                                        )),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_size(theme.text_xs)
-                                .text_color(theme.muted)
-                                .child(status),
-                        ),
-                )
-                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                    panel.terminal_renderer_open = !panel.terminal_renderer_open;
-                    cx.notify();
-                })),
-        )
-        .when(expanded, |body| {
-            body.child(
-                div()
-                    .w_full()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .p_3()
-                    .child(
-                        div()
-                            .w_full()
-                            .rounded(theme.control_radius)
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.background)
-                            .px_3()
-                            .py_2()
-                            .text_size(theme.text_xs)
-                            .line_height(px(20.))
-                            .text_color(theme.muted)
-                            .child(description),
-                    ),
-            )
-        })
+        .flex_wrap()
+        .gap_2()
+        .children(cards);
+    subpanel(crate::locale::text("光标", "Cursor"), theme)
+        .child(cards)
+        .child(section_separator(theme))
+        .child(policy_switch(
+            "terminal-cursor-blink",
+            crate::locale::text("光标闪烁", "Blink cursor"),
+            None,
+            terminal.cursor_blink,
+            locked,
+            theme,
+            cx.listener(|panel, enabled: &bool, _, cx| {
+                panel.edit_settings(|settings| settings.terminal.cursor_blink = *enabled, cx);
+            }),
+        ))
 }
 
 /// 将 terminal font weight 变更提交到同一设置草稿，不派生第二份控件状态。
@@ -1658,14 +1350,13 @@ fn right_click_label(value: TerminalRightClickBehavior) -> SharedString {
     }
 }
 
-/// 行点击复刻 main 的整行开关热区，零最小宽度让 viewport 网格中的长标签换行。
-/// 子 Switch 截断冒泡，保留 Kit 的受控、键盘与禁用语义。
+/// 平整的设置行保留整行热区；子 Switch 截断冒泡并提供键盘与禁用语义。
 ///
 /// @author kongweiguang
 fn policy_switch(
     id: &'static str,
-    icon: IconName,
     label: SharedString,
+    description: Option<SharedString>,
     checked: bool,
     disabled: bool,
     theme: ThemeTokens,
@@ -1676,23 +1367,11 @@ fn policy_switch(
     let switch_listener = listener.clone();
     div()
         .id(format!("{id}-row"))
+        .debug_selector(move || format!("{id}-row"))
         .w_full()
         .min_w(px(0.))
-        .min_h(px(44.))
-        .rounded(theme.control_radius)
-        .border_1()
-        .border_color(if checked {
-            theme.tunnel_action.opacity(0.35)
-        } else {
-            theme.border
-        })
-        .bg(if checked {
-            theme.surface_selected()
-        } else {
-            theme.background
-        })
-        .px_3()
-        .py_2()
+        .min_h(rems(2.75))
+        .py_1()
         .flex()
         .items_center()
         .justify_between()
@@ -1700,30 +1379,30 @@ fn policy_switch(
         .child(
             div()
                 .flex_1()
-                .min_w(px(0.))
+                .min_w_0()
                 .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    gpui_kit::component::Icon::new(icon)
-                        .size(px(16.))
-                        .text_color(theme.muted),
-                )
+                .flex_col()
+                .gap_1()
                 .child(
                     div()
-                        .flex_1()
-                        .min_w(px(0.))
                         .text_size(theme.text_sm)
-                        .line_height(px(20.))
                         .whitespace_normal()
                         .text_left()
-                        .text_color(theme.settings_choice_foreground(checked))
+                        .text_color(theme.foreground)
                         .child(label),
-                ),
+                )
+                .when_some(description, |column, description| {
+                    column.child(
+                        div()
+                            .text_size(theme.text_xs)
+                            .text_color(theme.muted)
+                            .child(description),
+                    )
+                }),
         )
         .child(
             Switch::new(id)
-                .track_size(px(40.), px(24.))
+                .small()
                 .checked(checked)
                 .disabled(disabled)
                 .accessibility_label(switch_label)
@@ -1734,7 +1413,7 @@ fn policy_switch(
                 }),
         )
         .when(!disabled, |row| {
-            row.cursor_pointer().on_click(move |_, window, cx| {
+            row.on_click(move |_, window, cx| {
                 listener(&!checked, window, cx);
             })
         })

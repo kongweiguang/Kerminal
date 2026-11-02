@@ -56,7 +56,7 @@ async fn workspace_migration_commits_journal_and_reads_back_current_document() {
     );
     assert_eq!(
         fs::read(root.path().join(".kerminal-format.toml")).expect("迁移应提交当前格式 marker"),
-        b"data_format = 4\nmigration_contract = 2\n"
+        b"data_format = 4\nmigration_contract = 3\n"
     );
     assert_eq!(
         migration

@@ -35,6 +35,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/local_drag_out.rs"]
+mod local_drag_out;
+
 struct UnexpectedRemoteAccess {
     calls: Arc<AtomicUsize>,
 }

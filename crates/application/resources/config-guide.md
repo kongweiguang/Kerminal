@@ -9,9 +9,9 @@
 | 路径 | 用途及关联 |
 | --- | --- |
 | `settings.toml` | 界面、终端行为与工具偏好；未知字段和注释应保留。 |
-| `profiles/<id>.toml` | 本地 shell 启动参数、工作目录、环境变量和默认项；`id` 必须等于文件名 stem，`sidebar_group_id`（若有）引用主机分组。 |
-| `hosts/groups.toml` | 分组名和排序；分组 `id` 被 host 的 `group_id` 和 profile 的 `sidebar_group_id` 引用。 |
-| `hosts/<id>.toml` | SSH、SFTP、Telnet、串口或 RDP 连接资料；当前 schema 为 3，必须声明 `protocol`。 |
+| `profiles/<id>.toml` | 无分组的本地终端启动模板及默认项；`id` 必须等于文件名 stem。 |
+| `hosts/groups.toml` | 分组名和排序；分组 `id` 被本地或远程 host 的 `group_id` 引用。 |
+| `hosts/<id>.toml` | 本地主机以及 SSH、SFTP、Telnet、串口或 RDP 连接资料；当前 schema 为 3，必须声明 `protocol`。 |
 | `snippets/<id>.toml` | 可复用的单条命令、变量和使用范围。 |
 | `workflows/<id>.toml` | 有序的多步命令；步骤 ID 在文件内唯一，`sort_order` 必须严格递增。 |
 | `workspace/session.json` | 工作区 Tab、Pane 和布局恢复数据；应用管理，直接编辑前先备份。 |
@@ -27,7 +27,19 @@
 
 `themeMode` 和 `interfaceDensity` 是顶层外观选项；界面配色、语言、背景开关、背景适配方式、背景图片路径与透明度统一放在 `[appearance]` 下。`[terminal]` 保存字体、光标、色盘与滚屏缓冲。设置中暂未识别的扩展键由原文仓储保留。
 
-`[appearance].colorScheme` 是应用界面配色，可为 `kerminal`、`jetbrains`、`fleet`、`xcode`、`claude`、`vscode`，缺省为 `kerminal`；未知值属于无效配置。每套配色都提供浅色和深色，`themeMode` 为 `dark`、`light` 或 `system`，`system` 按系统明暗外观选择当前应用配色的对应版本。`[terminal].colorScheme` 和终端的浅深色盘是独立设置，修改应用配色不会修改终端颜色设置。旧文件缺少应用配色字段时直接使用默认值，读取不会改写文件。
+`[appearance].colorScheme` 是应用界面配色，可为 `kerminal`、`jetbrains`、`fleet`、`xcode`、`claude`、`vscode`，缺省为 `kerminal`；未知值属于无效配置。每套配色都提供浅色和深色，`themeMode` 为 `dark`、`light` 或 `system`，`system` 按系统明暗外观选择当前应用配色的对应版本。终端使用独立的 `[terminal].colorScheme` 主题标识，并按实际应用明暗选择该主题的浅色或深色色盘；修改应用配色不会改变终端主题。旧的 `lightColorScheme`、`darkColorScheme` 字段保留兼容，界面选择终端主题时会同步更新两个旧字段。旧终端配置缺少 `colorScheme` 而含有浅深字段时，按窗口当前实际明暗把对应旧主题归并为单一主题；读取只更新内存快照，后续修改设置时通过原 revision 保存。旧文件缺少应用配色字段时直接使用默认值，读取不会改写文件。
+
+终端 `colorScheme` 可为 `kerminal`、`tokyoNight`、`solarized` 或 `github`。`fontFamily` 可为系统字体族名，也兼容旧版逗号分隔的候选字体列表；绘制时按顺序选择已安装字体，不可用时使用应用回退规则。`fontSize` 为 10–24 的整数，`lineHeight` 为 1.0–1.8 的数值，`scrollback` 为 1000–50000 行；超出范围的配置会被 validator 拒绝。
+
+`cursorStyle` 可为 `block`、`bar` 或 `underline`，`cursorBlink` 控制默认光标闪烁。`rightClickBehavior` 可为 `none`、`paste` 或 `menu`；`selectionCopy`、`showTabNumbers`、`confirmCloseTab` 和 `autoReconnect` 分别控制选中复制、标签序号、关闭确认和自动重连。`macOptionIsMeta` 只用于 macOS。旧 `showCommandBlockRail` 字段保留兼容，设置界面不再提供该选项。
+
+`[terminal.inlineSuggestion]` 复用既有命令提示设置。`enabled` 默认 `true`；`presentation` 可为 `off`、`inline`、`inlineAndMenu`，默认 `inlineAndMenu`。关闭总开关会同步为 `off`，选择 `off` 也会关闭总开关。`acceptKey` 为 `rightArrow`（默认）或 `disabled`；`partialAccept` 默认 `true`，控制 Alt+右方向键的分段接受。`menuShortcut` 保留 `ctrlSpace`；Ctrl+Space 和 Alt+/ 均可主动打开候选菜单。`tabOpensMenu` 默认 `false`，只有显式启用时才将 Tab 用于候选菜单。菜单 Enter 和点击只补全，不执行命令。启用设置不代表当前 Shell 已提供可信编辑状态；不支持或集成失败的会话保留普通终端输入。
+
+`[terminal.inlineSuggestion.providers]` 的 `history`、`remotePath`、`remoteCommand`、`git`、`spec` 均默认 `true`。这些是来源开关，不保存候选或命令正文。`remoteRefresh` 为 `safe`（默认）或 `off`；`remoteProbeEnabled` 默认 `true`，与 `remoteRefresh` 的关闭状态保持一致。远端探测开关只控制远端来源，不能用来禁用本地命令历史。`auditRetentionDays` 默认 `30`，`feedbackRetentionDays` 默认 `365`，均限制在 1–3650 天；历史与接受反馈继续使用应用管理的数据库，不创建第二份历史文件。
+
+本地会话自动加入本地目录与 PATH 命令来源，Git 来源沿用 `git` 开关；`remotePath`、`remoteCommand` 和远端探测开关只作用于 SSH 来源。依赖目录的候选使用 Shell 回报的实时目录，未知时跳过，不使用启动目录代替。PATH 来源读取应用启动时继承的环境，不承诺反映 Shell 内后续修改的 PATH、函数或别名。本地历史可跨本地会话召回；SSH 历史仅在同一已保存 host ID 内召回。
+
+`[mcp].bindMode` 是监听范围：`loopback` 为本机，`lan` 为所有 IPv4 网卡；缺省为 `loopback`。`port` 是固定监听端口，缺省为 `37657`，有效范围 1–65535。局域网模式要求 `tokenRef = "service:kerminal:mcp-token:v1"`，对应令牌由应用保存在加密 vault；不要将令牌正文写入普通配置、日志或工作区上下文。配置校验不能创建令牌或启动服务。
 
 `[workbenchLayout]` 保存稳定的工作台用户意图：`hostSidebarCollapsed` 默认 `false`，`hostSidebarWidth` 默认 `220` 且范围为 `168`–`360`；`dockPanelWidths` 默认空表，右侧 Attached 工具共用 `360` 逻辑像素内容宽度，显式宽度范围为 `130`–`1360`；`bottomPanelHeight` 默认 `240` 且范围为 `180`–`4000`。
 
@@ -41,16 +53,16 @@
 
 `keybindings` 是快捷键行数组，每个 `action` 只能出现一次。`action` 使用应用已提供的动作标识；未知动作会保留在设置中但不会执行，不要用配置新增动作或 MCP 工具。`label` 和 `description` 是界面说明；`scope` 为 `global`、`terminal` 或 `workspace`；`editable` 控制设置页是否允许编辑该行。
 
-`binding` 是通用回退键位；Windows 的 `windowsBinding` 和 macOS 的 `macBinding` 为空时回退到 `binding`。`linuxBinding` 缺省时沿用旧 Linux 行为：先使用 `windowsBinding`，该字段为空时再回退到 `binding`；写成空字符串则显式禁用 Linux 绑定。`windowsAlternateBinding` 是 Windows 专用附加键位，缺省或空字符串表示不启用备用键位。
+`binding` 是通用回退键位；Windows 的 `windowsBinding` 和 macOS 的 `macBinding` 为空时回退到 `binding`。`linuxBinding` 缺省时沿用旧 Linux 行为：先使用 `windowsBinding`，该字段为空时再回退到 `binding`；写成空字符串则显式禁用 Linux 绑定。每个动作在每个平台只有一个有效绑定。
 
-内置 `terminal.paste` 默认只作用于终端：Windows 主键为 `Ctrl+V`、备用键为 `Ctrl+Shift+V`，Linux 为 `Ctrl+Shift+V`，macOS 为 `Cmd+V`。它的通用 `binding` 刻意留空；这样用户清空一个平台的覆盖值时，不会意外继承其他平台的键位。一次性旧格式迁移只会为已有的非空快捷键列表补入缺失的退出和粘贴动作；已有行及其空绑定保持不变，明确的 `keybindings = []` 也保持为空。补入粘贴动作时，若已有行占用了某个平台的默认粘贴键，只清空新粘贴行对应平台的冲突绑定。正常读取和保存不会恢复缺失动作。
+内置 `terminal.paste` 默认只作用于终端：Windows 为 `Ctrl+V`，Linux 为 `Ctrl+Shift+V`，macOS 为 `Cmd+V`。它的通用 `binding` 刻意留空；这样用户清空一个平台的覆盖值时，不会意外继承其他平台的键位。一次性旧格式迁移只会为已有的非空快捷键列表补入缺失的退出和粘贴动作；已有行及其空绑定保持不变，明确的 `keybindings = []` 也保持为空。补入粘贴动作时，若已有行占用了某个平台的默认粘贴键，只清空新粘贴行对应平台的冲突绑定。正常读取和保存不会恢复缺失动作。
 
 <!-- example:settings -->
 ```toml
 schema_version = 1
 themeMode = "system"
 interfaceDensity = "compact"
-keybindings = [{ action = "terminal.paste", label = "粘贴到终端", description = "", binding = "", windowsBinding = "Ctrl+V", windowsAlternateBinding = "Ctrl+Shift+V", linuxBinding = "Ctrl+Shift+V", macBinding = "Cmd+V", scope = "terminal", editable = true }]
+keybindings = [{ action = "terminal.paste", label = "粘贴到终端", description = "", binding = "", windowsBinding = "Ctrl+V", linuxBinding = "Ctrl+Shift+V", macBinding = "Cmd+V", scope = "terminal", editable = true }]
 
 [appearance]
 colorScheme = "kerminal"
@@ -70,6 +82,10 @@ cursorStyle = "block"
 cursorBlink = true
 colorScheme = "kerminal"
 selectionCopy = false
+
+[mcp]
+bindMode = "loopback"
+port = 37657
 
 [workbenchLayout]
 hostSidebarCollapsed = false
@@ -95,7 +111,11 @@ containers = "attached"
 
 ## Profile
 
-`id`、`name`、`shell` 是必需项。`shell` 是本机 shell 可执行文件，`args` 为启动参数，`cwd` 为可选工作目录，`env` 为进程环境覆盖，`is_default` 表示本地新会话的默认 profile，`sidebar_group_id` 为可选侧栏分组，`sort_order` 控制列表顺序，`created_at` / `updated_at` 是保留的时间戳字符串。
+`id`、`name`、`shell`、`is_default`、`sort_order`、`created_at` 和 `updated_at` 是必需项。`shell` 是本机 shell 可执行文件，`args` 为启动参数，`cwd` 为可选工作目录，`env` 为进程环境覆盖；省略 `args` 或 `env` 时分别为空数组或空表。`is_default` 表示本地新会话的默认 Profile，`sort_order` 控制列表顺序，`created_at` / `updated_at` 是保留的时间戳字符串。Profile 本身没有分组，不接受 `sidebar_group_id`；`env` 保存在 Profile 配置文件中，不要在其中写入凭据。
+
+全新配置根初始化时会发现当前系统可用的 Shell 并生成标准 Profile，优先把系统默认 Shell 对应项设为默认；没有可用候选时不生成。已存在或迁移的配置根即使 Profile 为空，也不会在后续启动时自动补建。
+
+设置页管理 Profile 模板；在添加主机时选择模板，会把启动设置复制成本地主机快照。本地主机保存后出现在侧栏，并可单独修改和分组；之后编辑或删除模板不会改变已有主机。
 
 <!-- example:profile -->
 ```toml
@@ -116,7 +136,24 @@ updated_at = "<preserve-existing-timestamp>"
 
 ## Host 与分组
 
-分组项包含 `id`、`name`、`sort_order` 和时间戳；host 的 `group_id` 必须指向现有分组。所有 host 必需 `id`、`name`、`protocol`、`auth_type`、`sort_order` 和时间戳。可选根字段 `note` 最多 4096 个字符，允许多行和制表符但拒绝其它控制字符；应用保存时纯空白备注会省略，有内容时保留用户输入的换行。SSH、SFTP、Telnet、RDP 还必须声明 `host`、`port`、`username`；串口主机改用唯一的 `[serial]` 表保存设备与线路参数，不重复写网络 endpoint。`tags` 只是用户标签，不决定协议，也不能保存串口参数。认证材料只能保存在加密 vault，host 文件只放 `secret_ref` / `key_passphrase_ref` 等引用。
+分组项包含 `id`、`name`、`sort_order` 和时间戳；host 的 `group_id` 必须指向现有分组。所有 host 必需 `id`、`name`、`protocol`、`sort_order` 和时间戳；远程主机还需 `auth_type`。远程主机的可选根字段 `note` 最多 4096 个字符，允许多行和制表符但拒绝其它控制字符；应用保存时纯空白备注会省略，有内容时保留用户输入的换行。SSH、SFTP、Telnet、RDP 还必须声明 `host`、`port`、`username`；串口主机改用唯一的 `[serial]` 表保存设备与线路参数，不重复写网络 endpoint。`tags` 只是用户标签，不决定协议，也不能保存串口参数。认证材料只能保存在加密 vault，host 文件只放 `secret_ref` / `key_passphrase_ref` 等引用。
+
+本地主机使用 `protocol = "local"` 和 `[local]` 表，`shell`、`args` 为启动程序及参数，`cwd` 为可选工作目录。主机环境变量快照由应用写入加密 vault，`environment_ref` 仅保存绑定该主机的引用；没有环境覆盖时可省略。不要在主机文件的根表或 `[local]` 中写入 `env`、`environment` 或远程 endpoint 字段，也不要手工伪造环境引用。`migration_origin` 是应用管理的旧数据迁移去重标识，普通编辑不需要填写。
+
+<!-- example:local-host -->
+```toml
+schema_version = 3
+id = "local-work"
+name = "Work terminal"
+protocol = "local"
+sort_order = 10
+created_at = "<preserve-existing-timestamp>"
+updated_at = "<preserve-existing-timestamp>"
+
+[local]
+shell = "<installed-shell-executable>"
+args = []
+```
 
 SSH/SFTP 高级项使用当前 snake_case 字段：`[ssh_options.terminal]` 的 `connect_timeout_seconds` 为 1–600 秒（默认 30），`keepalive_seconds` 为 0–600 秒（默认 60，0 关闭）；`term` 是无空白/控制字符、最多 128 字节的终端类型，省略时使用 `xterm-256color`；`working_directory` 为非空且不含控制字符的默认目录。显式启动和恢复目录优先，默认目录不覆盖正在浏览或恢复的位置。
 
@@ -258,7 +295,7 @@ updated_at = "<preserve-existing-timestamp>"
 
 - 只改请求涉及的文件和字段；保留现有 schema、注释、未知字段、时间戳和排序。应用写入按原始文件 revision 做并发检查。
 - 文件 ID 使用 ASCII 字母、数字、点、下划线或连字符；不能是 `.` 或 `..`。普通 host ID 不能是保留名 `groups`，路径文件名 stem 必须与文档 `id` 一致。
-- `hosts/groups.toml` 的 `groups[].id` 必须唯一。Host `group_id` 与 profile `sidebar_group_id` 若设置，必须引用现存分组；`__ungrouped__` 是运行时标识，不写入文件。
+- `hosts/groups.toml` 的 `groups[].id` 必须唯一。本地和远程 Host 的 `group_id` 若设置，必须引用现存分组；Profile 不保存分组。`__ungrouped__` 是运行时标识，不写入文件。
 - 不要手工编辑 `secrets/`。`vault-key.toml`、密钥备份、`.storage-transactions/`、vault 事务 journal、SQLite、运行日志、Agent 运行态文件和 `.storage.lock` 属于本机状态；加密 `vault.toml` 可以同步。
 - 未经请求不要直接编辑 `workspace/session.json`、`data/command.sqlite` 或 `secrets/`。`.gitignore` 必须排除本机 vault key 和备份，不能因此排除加密 vault 正文。
 

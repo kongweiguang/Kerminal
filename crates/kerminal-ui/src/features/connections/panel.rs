@@ -18,8 +18,8 @@ use kerminal_application::{
     connections::{
         HostKeyChallenge, HostKeyPeer, HostKeyRotationRequest, HostKeyStatus, HostKeyTrustRequest,
         RdpClientLifecycle, RdpLaunchId, RdpLaunchReceipt, RdpLaunchRequest, RdpLaunchService,
-        RdpLaunchStatus, RdpLaunchStatusMessage, RdpLaunchStatusService, RemoteConnectionService,
-        SerialPortDescriptor, SerialPortService,
+        RdpLaunchStatus, RdpLaunchStatusService, RemoteConnectionService, SerialPortDescriptor,
+        SerialPortService,
         management::{
             CredentialCleanupStatus, HostAuthenticationMode, HostCredentialChange,
             HostCredentialSlot, HostDeletionReceipt, HostDraft, HostGroup,
@@ -193,6 +193,19 @@ pub enum ConnectionsEvent {
         endpoint: FileEndpoint,
         initial_local_directory: Option<std::path::PathBuf>,
     },
+    /// 文件面板选择只回投明确请求，不改变共享工作台或侧栏所选主机。
+    SftpSelectionReady {
+        request_id: String,
+        endpoint: FileEndpoint,
+        initial_local_directory: Option<PathBuf>,
+    },
+    /// 请求的取消与失败都必须释放 Root 队列；空原因表示显式取消。
+    SftpSelectionFinished {
+        request_id: String,
+        message: Option<String>,
+        /// 另一个连接意图已接管预检通道，队列不能立即覆盖该意图。
+        interrupted: bool,
+    },
     CreateSftpTransferTabRequested {
         request_id: String,
         endpoint: FileEndpoint,
@@ -203,11 +216,21 @@ pub enum ConnectionsEvent {
         host_id: HostId,
         receipt: RdpLaunchReceipt,
     },
+    RdpStatusChanged {
+        message: String,
+    },
     ExternalTargetReady {
         target: ExternalRoutedTarget,
     },
+    ExternalTargetCancelled {
+        host_id: HostId,
+    },
     GroupRenameCancelled,
     GroupRenameSaved,
+    HostDeletionDismissed,
+    HostDeletionFinished {
+        message: String,
+    },
 }
 
 /// 只有确认写入或明确采用读回时才发布导航选中意图，普通列表刷新不改变用户选择。
@@ -269,6 +292,10 @@ pub(super) enum PendingAction {
         intent_id: Option<String>,
     },
     Sftp {
+        endpoint: FileEndpoint,
+        request_id: String,
+    },
+    SftpSelection {
         endpoint: FileEndpoint,
         request_id: String,
     },
@@ -802,37 +829,37 @@ pub(super) fn group_save_review_facts(
     .to_string()
 }
 
-/// 连接面板只区分主机详情与分组编辑，主机目录始终由独立左侧导航维护。
+/// 连接面板只区分普通主机选择与分组编辑，主机目录始终由独立左侧导航维护。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum ConnectionsPresentation {
     #[default]
-    HostDetails,
+    HostSelection,
     GroupRename,
 }
 
 impl ConnectionsPresentation {
-    /// 普通主机选择更新详情时不关闭分组编辑器，避免未提交名称随导航消失。
+    /// 普通主机选择恢复默认展示态，不关闭分组编辑器，避免未提交名称随导航消失。
     ///
     /// @author kongweiguang
-    fn show_host_details(&mut self) {
+    fn show_host_selection(&mut self) {
         if *self != Self::GroupRename {
-            *self = Self::HostDetails;
+            *self = Self::HostSelection;
         }
     }
 
-    /// 创建与重命名共用全宽分组编辑器；退出后回到唯一的详情展示态。
+    /// 创建与重命名共用全宽分组编辑器；退出后回到普通展示态。
     ///
     /// @author kongweiguang
     fn show_group_editor(&mut self) {
         *self = Self::GroupRename;
     }
 
-    /// 关闭分组编辑器统一恢复详情态；Root generation 决定是否返回原中心工作区。
+    /// 关闭分组编辑器统一恢复普通展示态；Root generation 决定是否返回原中心工作区。
     ///
     /// @author kongweiguang
     fn finish_group_editor(&mut self) {
         if *self == Self::GroupRename {
-            *self = Self::HostDetails;
+            *self = Self::HostSelection;
         }
     }
 
@@ -986,10 +1013,6 @@ pub struct ConnectionsPanel {
     pub(super) hosts: HostManagementService,
     pub(super) remote: Arc<dyn RemoteConnectionService>,
     pub(super) rdp: Option<Arc<RdpLaunchService>>,
-    pub(super) rdp_status_host: Option<HostId>,
-    pub(super) rdp_status_lifecycle: Option<RdpClientLifecycle>,
-    pub(super) rdp_status_message: Option<RdpLaunchStatusMessage>,
-    pub(super) rdp_status_error: Option<String>,
     pub(super) executor: ApplicationTaskExecutor,
     pub(super) recovery: ConfigurationRecoveryState,
     pub(super) serial_port_service: Option<Arc<SerialPortService>>,
@@ -1033,6 +1056,8 @@ pub struct ConnectionsPanel {
     probe_request: ConnectionRequestEpoch,
     pub(super) pending_trust: Option<PendingTrust>,
     pub(super) connection_request: ConnectionRequestEpoch,
+    /// 活动选择必须在被普通连接替换时回报，不能遗留 Root 队列中的悬挂项。
+    pub(super) sftp_selection_request_id: Option<String>,
     sidebar_container_intent: Option<String>,
     sidebar_container_failure: Option<(String, String)>,
     pub(super) external_launch: Option<ExternalLaunchService>,
@@ -1070,7 +1095,7 @@ pub struct ConnectionsPanel {
 impl EventEmitter<ConnectionsEvent> for ConnectionsPanel {}
 
 impl ConnectionsPanel {
-    /// 注入主机用例和应用 runtime；中央只承载所选详情与编辑器，不重复绘制目录。
+    /// 注入主机用例和应用 runtime；中央只承载编辑器与本地主机操作，不重复绘制目录。
     ///
     /// @author kongweiguang
     pub fn new(
@@ -1105,10 +1130,6 @@ impl ConnectionsPanel {
             hosts,
             remote,
             rdp,
-            rdp_status_host: None,
-            rdp_status_lifecycle: None,
-            rdp_status_message: None,
-            rdp_status_error: None,
             executor,
             recovery,
             serial_port_service: None,
@@ -1151,6 +1172,7 @@ impl ConnectionsPanel {
             probe_request: ConnectionRequestEpoch::new(),
             pending_trust: None,
             connection_request: ConnectionRequestEpoch::new(),
+            sftp_selection_request_id: None,
             sidebar_container_intent: None,
             sidebar_container_failure: None,
             external_launch: None,
@@ -1616,7 +1638,7 @@ impl ConnectionsPanel {
         if hosts_changed {
             self.refresh_for_external_change(cx);
         }
-        if profiles_changed {
+        if hosts_changed || profiles_changed {
             self.reload_local_hosts(cx);
         }
         if !hosts_changed && !profiles_changed {
@@ -1659,43 +1681,34 @@ impl ConnectionsPanel {
         self.selected_host.clone()
     }
 
-    /// 仅在相同 HostId 的详情中显示最近一次 RDP 结果，避免旧客户端事件覆盖其他操作状态。
-    pub(super) fn rdp_status_for_host(&self, host_id: &HostId) -> Option<(String, bool)> {
-        if self.rdp_status_host.as_ref() != Some(host_id) {
-            return None;
-        }
-        if let Some(error) = &self.rdp_status_error {
-            return Some((error.clone(), true));
-        }
-        let message = self.rdp_status_message?;
-        let lifecycle = self.rdp_status_lifecycle?;
-        Some(rdp_status_text(message.status, lifecycle))
-    }
-
-    /// 订阅当前启动身份；取消 watcher 只停止 UI 观察，不会关闭外部客户端或清理其文件。
+    /// 订阅当前启动身份；状态写入 Root 全局反馈，取消 watcher 不关闭外部客户端或清理其文件。
     fn watch_rdp_status(
         &mut self,
-        host_id: HostId,
         launch_id: RdpLaunchId,
         lifecycle: RdpClientLifecycle,
         cx: &mut Context<Self>,
     ) {
         self.rdp_status_cancellation.cancel();
         self.rdp_status_cancellation = CancellationToken::new();
-        self.rdp_status_host = Some(host_id);
         self.rdp_status_launch_id = Some(launch_id);
-        self.rdp_status_lifecycle = Some(lifecycle);
-        self.rdp_status_message = None;
-        self.rdp_status_error = None;
 
         let Some(service) = self.rdp_status_service.clone() else {
+            cx.emit(ConnectionsEvent::RdpStatusChanged {
+                message: crate::locale::text(
+                    "RDP 状态服务不可用，无法继续显示客户端运行状态。",
+                    "The RDP status service is unavailable; client progress cannot be shown.",
+                )
+                .to_string(),
+            });
             cx.notify();
             return;
         };
         let subscription = match service.subscribe(launch_id) {
             Ok(subscription) => subscription,
             Err(error) => {
-                self.rdp_status_error = Some(localized_error(&error));
+                cx.emit(ConnectionsEvent::RdpStatusChanged {
+                    message: localized_error(&error),
+                });
                 cx.notify();
                 return;
             }
@@ -1707,10 +1720,10 @@ impl ConnectionsPanel {
                 match result {
                     Ok(message) => {
                         let terminal = message.status.is_terminal();
+                        let (text, _) = rdp_status_text(message.status, lifecycle);
                         let _ = this.update(cx, |panel, cx| {
                             if panel.rdp_status_launch_id == Some(launch_id) {
-                                panel.rdp_status_message = Some(message);
-                                panel.rdp_status_error = None;
+                                cx.emit(ConnectionsEvent::RdpStatusChanged { message: text });
                                 cx.notify();
                             }
                         });
@@ -1725,7 +1738,7 @@ impl ConnectionsPanel {
                         let message = localized_error(&error);
                         let _ = this.update(cx, |panel, cx| {
                             if panel.rdp_status_launch_id == Some(launch_id) {
-                                panel.rdp_status_error = Some(message);
+                                cx.emit(ConnectionsEvent::RdpStatusChanged { message });
                                 cx.notify();
                             }
                         });
@@ -2176,9 +2189,11 @@ impl ConnectionsPanel {
         self.reload_with_group_save_review(explicitly_requested_review, cx);
     }
 
-    /// 选择主机后向 Root 发布稳定 HostId，并保留现有终端会话与分屏状态。
+    /// 普通主机选择会接管连接通道，因此先通知传输选择队列取消，避免后续请求覆盖新连接。
+    ///
+    /// @author kongweiguang
     pub(super) fn select_host(&mut self, host_id: HostId, cx: &mut Context<Self>) {
-        self.cancel_connection_request();
+        self.cancel_connection_request(cx);
         self.status = None;
         self.selected_host = Some(host_id.clone());
         cx.emit(ConnectionsEvent::HostSelected { host_id });
@@ -2191,20 +2206,118 @@ impl ConnectionsPanel {
         self.connection_request.begin()
     }
 
-    /// 选择、取消或替换目标时立刻取消 SSH 操作，并清掉属于旧请求的挑战。
-    pub(super) fn cancel_connection_request(&mut self) {
+    /// 选择、取消或替换目标时报告文件选择的取消，确保另一侧等待的意图能继续处理。
+    ///
+    /// @author kongweiguang
+    pub(super) fn cancel_connection_request(&mut self, cx: &mut Context<Self>) {
+        self.cancel_connection_request_with_reason(true, cx);
+    }
+
+    /// 区分用户取消与其他连接抢占，防止文件队列重新覆盖刚发起的终端连接。
+    ///
+    /// @author kongweiguang
+    fn cancel_connection_request_with_reason(&mut self, interrupted: bool, cx: &mut Context<Self>) {
         self.connection_request.cancel();
         self.pending_trust = None;
         self.sidebar_container_intent = None;
         self.sidebar_container_failure = None;
+        if let Some(request_id) = self.sftp_selection_request_id.take() {
+            cx.emit(ConnectionsEvent::SftpSelectionFinished {
+                request_id,
+                message: None,
+                interrupted,
+            });
+        }
     }
 
-    /// 显式查看详情时复用面板选择；普通目录单击不进入此入口，也不切换或新建会话。
+    /// 仅结束同一文件选择预检；指纹回读完成前保留原请求以免错误覆盖真实结果。
     ///
     /// @author kongweiguang
-    pub fn select_host_id(&mut self, host_id: &HostId, cx: &mut Context<Self>) {
-        self.presentation.show_host_details();
-        self.select_host(host_id.clone(), cx);
+    pub(super) fn finish_sftp_selection(
+        &mut self,
+        action: &PendingAction,
+        message: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let PendingAction::SftpSelection { request_id, .. } = action else {
+            return;
+        };
+        if self.sftp_selection_request_id.as_deref() != Some(request_id.as_str()) {
+            return;
+        }
+        self.sftp_selection_request_id = None;
+        cx.emit(ConnectionsEvent::SftpSelectionFinished {
+            request_id: request_id.clone(),
+            message,
+            interrupted: false,
+        });
+    }
+
+    /// 文件选择不改写侧栏选中主机，主机配置和信任校验仍沿用同一连接面板用例。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn request_sftp_selection(
+        &mut self,
+        host_id: &HostId,
+        request_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_connection_request(cx);
+        let host = self.rows.iter().find(|host| &host.id == host_id).cloned();
+        let endpoint = host.as_ref().and_then(|host| {
+            host_sftp_capable(host.protocol, host.sftp_options.enabled)
+                .then(|| {
+                    FileEndpoint::remote(
+                        host.id.clone(),
+                        host.sftp_options
+                            .remote_start_directory
+                            .as_deref()
+                            .unwrap_or("/"),
+                    )
+                    .ok()
+                })
+                .flatten()
+        });
+        let Some(endpoint) = endpoint else {
+            cx.emit(ConnectionsEvent::SftpSelectionFinished {
+                request_id,
+                message: Some(crate::locale::text(
+                    "主机不存在、未启用 SFTP 或起始目录无效，请刷新后重试。",
+                    "The host is unavailable, SFTP is disabled, or its start directory is invalid. Refresh and try again.",
+                ).to_string()),
+                interrupted: false,
+            });
+            self.reload(cx);
+            return;
+        };
+        self.sftp_selection_request_id = Some(request_id.clone());
+        self.preflight_host_keys(
+            host_id.clone(),
+            PendingAction::SftpSelection {
+                endpoint,
+                request_id,
+            },
+            cx,
+        );
+    }
+
+    /// 取消指定选择时遵循信任写入的回读边界，避免后续请求覆盖尚未确认的指纹变更。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn cancel_sftp_selection(&mut self, request_id: &str, cx: &mut Context<Self>) {
+        if self.sftp_selection_request_id.as_deref() != Some(request_id) {
+            return;
+        }
+        if self
+            .pending_trust
+            .as_ref()
+            .is_some_and(|pending| pending.operation_busy)
+        {
+            self.cancel_pending_trust(cx);
+        } else {
+            self.cancel_connection_request_with_reason(false, cx);
+            cx.notify();
+        }
     }
 
     /// 由独立主机导航请求连接时复用当前协议映射、host-key 预检与二次信任流程。
@@ -2287,12 +2400,12 @@ impl ConnectionsPanel {
         self.connect_selected_for_transfer_tab(cx);
     }
 
-    /// 从左栏事件切入详情，并让运维目标继续接收显式选择的 HostId。
+    /// 从左栏事件选择主机，并让运维目标继续接收显式选择的 HostId。
     /// @author kongweiguang
-    pub fn show_saved_host(&mut self, host_id: &HostId, cx: &mut Context<Self>) {
+    fn select_saved_host(&mut self, host_id: &HostId, cx: &mut Context<Self>) {
         self.pending_host_deletion = None;
         self.pending_group_deletion = None;
-        self.presentation.show_host_details();
+        self.presentation.show_host_selection();
         self.select_host(host_id.clone(), cx);
     }
 
@@ -2307,7 +2420,7 @@ impl ConnectionsPanel {
         if self.refuse_host_editor_replacement(cx) {
             return;
         }
-        self.show_saved_host(host_id, cx);
+        self.select_saved_host(host_id, cx);
         self.edit_host(host_id, window, cx);
     }
 
@@ -2381,7 +2494,7 @@ impl ConnectionsPanel {
             }
             host.protocol = protocol;
         }
-        self.show_saved_host(host_id, cx);
+        self.select_saved_host(host_id, cx);
         self.cancel_serial_port_scan();
         self.editor = Some(HostEditor::duplicate(&host, &self.groups, window, cx));
         self.pending_new_host_id = None;
@@ -2450,7 +2563,7 @@ impl ConnectionsPanel {
             self.reload(cx);
             return;
         };
-        self.show_saved_host(host_id, cx);
+        self.select_saved_host(host_id, cx);
         self.pending_host_deletion = Some(PendingHostDeletion {
             host_id: host_id.clone(),
             revision,
@@ -2459,11 +2572,35 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
+    /// 面板是否停在一个尚未提交的删除确认上。
+    /// Root 用它判断 Escape 的归属，避免按键穿透到终端或全局快捷键。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn has_pending_deletion_confirmation(&self) -> bool {
+        self.pending_host_deletion.is_some()
+            || self.pending_group_deletion.is_some()
+            || self.local_hosts.pending_delete.is_some()
+    }
+
+    /// 取消最上层的删除确认；写入门禁、未知回执和只读恢复仍由各取消入口裁决。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn cancel_pending_deletion_confirmation(&mut self, cx: &mut Context<Self>) {
+        if self.local_hosts.pending_delete.is_some() {
+            self.cancel_delete_local_host(cx);
+        } else if self.pending_host_deletion.is_some() {
+            self.cancel_host_deletion(cx);
+        } else if self.pending_group_deletion.is_some() {
+            self.cancel_group_deletion(cx);
+        }
+    }
+
     /// 撤销尚未提交的删除确认；无后台删除任务时不会触碰持久数据。
     /// @author kongweiguang
     pub fn cancel_host_deletion(&mut self, cx: &mut Context<Self>) {
         if !self.configuration_mutation_busy {
             self.pending_host_deletion = None;
+            cx.emit(ConnectionsEvent::HostDeletionDismissed);
             cx.notify();
         }
     }
@@ -2934,10 +3071,12 @@ impl ConnectionsPanel {
         self.configuration_mutation_busy = false;
         match result {
             Ok(receipt) => {
+                let message = host_deletion_notice(receipt);
                 self.pending_host_deletion = None;
-                self.status_after_reload = Some(host_deletion_notice(receipt));
+                self.status_after_reload = Some(message.clone());
                 self.external_conflict = false;
                 self.reload(cx);
+                cx.emit(ConnectionsEvent::HostDeletionFinished { message });
             }
             Err(error)
                 if matches!(
@@ -2945,16 +3084,16 @@ impl ConnectionsPanel {
                     PublicErrorCode::OutcomeUnknown | PublicErrorCode::Conflict
                 ) =>
             {
+                let message = if error.public_code() == PublicErrorCode::OutcomeUnknown {
+                    crate::locale::text("删除结果未知；已刷新列表，请核对主机是否仍存在后再手动决定，不会自动重试。", "The delete outcome is unknown. The list was refreshed; verify whether the host remains before deciding manually. No automatic retry was made.").to_string()
+                } else {
+                    crate::locale::text("主机配置已变化；列表已刷新，请重新确认删除。", "Host configuration changed. The list was refreshed; confirm deletion again if needed.").to_string()
+                };
                 self.pending_host_deletion = None;
-                self.status_after_reload = Some(
-                    if error.public_code() == PublicErrorCode::OutcomeUnknown {
-                        crate::locale::text("删除结果未知；已刷新列表，请核对主机是否仍存在后再手动决定，不会自动重试。", "The delete outcome is unknown. The list was refreshed; verify whether the host remains before deciding manually. No automatic retry was made.").to_string()
-                    } else {
-                        crate::locale::text("主机配置已变化；列表已刷新，请重新确认删除。", "Host configuration changed. The list was refreshed; confirm deletion again if needed.").to_string()
-                    },
-                );
+                self.status_after_reload = Some(message.clone());
                 self.external_conflict = false;
                 self.reload(cx);
+                cx.emit(ConnectionsEvent::HostDeletionFinished { message });
             }
             Err(error) => self.status = Some(localized_error(&error)),
         }
@@ -3049,7 +3188,7 @@ impl ConnectionsPanel {
         intent_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.cancel_connection_request();
+        self.cancel_connection_request(cx);
         let Some(host_id) = self.selected_host.clone() else {
             self.status =
                 Some(crate::locale::text("请先选择一台主机。", "Select a host first.").to_string());
@@ -3173,11 +3312,7 @@ impl ConnectionsPanel {
                 let request_generation = self.rdp_request_generation;
                 self.rdp_status_cancellation.cancel();
                 self.rdp_status_cancellation = CancellationToken::new();
-                self.rdp_status_host = None;
                 self.rdp_status_launch_id = None;
-                self.rdp_status_lifecycle = None;
-                self.rdp_status_message = None;
-                self.rdp_status_error = None;
                 let executor = self.executor.clone();
                 let host_id = host.id.clone();
                 cx.spawn(async move |this, cx| {
@@ -3214,12 +3349,7 @@ impl ConnectionsPanel {
                                             "The system was asked to open the RDP file; sign-in is handled by the external client.",
                                         ).to_string(),
                                     });
-                                    panel.watch_rdp_status(
-                                        host_id.clone(),
-                                        launch_id,
-                                        lifecycle,
-                                        cx,
-                                    );
+                                    panel.watch_rdp_status(launch_id, lifecycle, cx);
                                     cx.emit(ConnectionsEvent::RdpLaunchCompleted {
                                         host_id,
                                         receipt,
@@ -4569,7 +4699,7 @@ impl ConnectionsPanel {
         );
     }
 
-    /// 写入前可直接取消连接；写入开始后只请求取消并等回执/回读，避免误报信任记录未变。
+    /// 写入前取消同时撤销同一外部认证票据；写入开始后只请求取消并等回执/回读，避免误报信任记录未变。
     /// @author kongweiguang
     pub(super) fn cancel_pending_trust(&mut self, cx: &mut Context<Self>) {
         if let Some(pending) = self.pending_trust.as_ref()
@@ -4585,7 +4715,17 @@ impl ConnectionsPanel {
             cx.notify();
             return;
         }
-        self.cancel_connection_request();
+        let external_host = self.pending_trust.as_ref().and_then(|pending| {
+            if let PendingAction::External(target) = &pending.action {
+                Some(target.host_id().clone())
+            } else {
+                None
+            }
+        });
+        self.cancel_connection_request_with_reason(false, cx);
+        if let Some(host_id) = external_host {
+            cx.emit(ConnectionsEvent::ExternalTargetCancelled { host_id });
+        }
         self.status = Some(
             crate::locale::text(
                 "已取消连接请求，不会继续建立终端或文件连接。",
@@ -4596,7 +4736,9 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 逐个检查跳板和目标指纹；已知 peer 自动继续，未知或变化的指纹必须停在显式确认界面。
+    /// 检查固定主机的逐跳指纹；配置消失时通知文件选择的原 owner，避免另一侧一直等待。
+    ///
+    /// @author kongweiguang
     pub(super) fn preflight_host_keys(
         &mut self,
         host_id: HostId,
@@ -4611,13 +4753,16 @@ impl ConnectionsPanel {
                 )
                 .to_string(),
             );
+            self.finish_sftp_selection(&action, self.status.clone(), cx);
             self.reload(cx);
             return;
         };
         self.preflight_host_key_count(host_id, host.route.jump_hosts.len(), action, cx);
     }
 
-    /// 对保存主机或外部临时目标复用逐跳检查，跳板数量只来自各自的显式路由快照。
+    /// 保存主机与临时目标复用逐跳检查，失败按原动作回报，不能吞掉双侧选择的队列完成信号。
+    ///
+    /// @author kongweiguang
     pub(super) fn preflight_host_key_count(
         &mut self,
         host_id: HostId,
@@ -4703,7 +4848,13 @@ impl ConnectionsPanel {
                         }
                         Ok(None) => panel.emit_action(action, cx),
                         Err(error) => {
+                            if let PendingAction::External(target) = &action {
+                                cx.emit(ConnectionsEvent::ExternalTargetCancelled {
+                                    host_id: target.host_id().clone(),
+                                });
+                            }
                             let message = localized_error(&error);
+                            panel.finish_sftp_selection(&action, Some(message.clone()), cx);
                             panel.sidebar_container_failure = panel
                                 .sidebar_container_intent
                                 .take()
@@ -5221,6 +5372,24 @@ impl ConnectionsPanel {
                     endpoint,
                     initial_local_directory,
                 })
+            }
+            PendingAction::SftpSelection {
+                endpoint,
+                request_id,
+            } => {
+                if self.sftp_selection_request_id.as_deref() != Some(request_id.as_str()) {
+                    return;
+                }
+                self.sftp_selection_request_id = None;
+                let initial_local_directory = endpoint
+                    .host_id()
+                    .and_then(|host_id| self.rows.iter().find(|host| &host.id == host_id))
+                    .and_then(|host| host.sftp_options.local_start_directory.clone());
+                cx.emit(ConnectionsEvent::SftpSelectionReady {
+                    request_id,
+                    endpoint,
+                    initial_local_directory,
+                });
             }
             PendingAction::SftpTransferTab {
                 request_id,

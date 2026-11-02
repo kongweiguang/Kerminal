@@ -422,6 +422,151 @@ mod profile_watcher {
         }
     }
 
+    /// 保存中、未知结果和只读恢复丢弃的旧主题回读不能污染缓存；成功安装后才能切换来源。
+    ///
+    /// @author kongweiguang
+    #[gpui_kit::test]
+    fn discarded_legacy_settings_readbacks_do_not_change_the_theme_cache(app: &mut TestAppContext) {
+        use kerminal_application::preferences::{TerminalColorScheme, ThemeMode};
+
+        let (_runtime, _, panel, visual) = fixture(app);
+        visual.update(|window, app| {
+            panel.update(app, |panel, cx| {
+                let base_revision = ConfigRevision::from_sha256("legacy-base".into());
+                let changed_revision = ConfigRevision::from_sha256("legacy-change".into());
+                let mut original = SettingsSnapshot {
+                    theme_mode: ThemeMode::Light,
+                    ..SettingsSnapshot::default()
+                };
+                original.terminal.light_color_scheme = TerminalColorScheme::Github;
+                original.terminal.dark_color_scheme = TerminalColorScheme::TokyoNight;
+                original.terminal.legacy_color_scheme_missing = true;
+                let mut changed = original.clone();
+                changed.theme_mode = ThemeMode::Dark;
+                changed.terminal.dark_color_scheme = TerminalColorScheme::Solarized;
+
+                panel.install_settings(
+                    VersionedSettings {
+                        settings: original.clone(),
+                        revision: Some(base_revision.clone()),
+                    },
+                    window,
+                    cx,
+                );
+                let draft = panel.settings.as_mut().unwrap();
+                let mut edited = draft.value().clone();
+                edited.terminal.font_family = "In-flight edit".into();
+                draft.replace_value(edited).unwrap();
+                draft.begin_save().unwrap();
+
+                let generation = panel.begin_settings_revision_check();
+                panel.finish_settings_revision_check(
+                    Ok(VersionedSettings {
+                        settings: changed.clone(),
+                        revision: Some(changed_revision.clone()),
+                    }),
+                    generation,
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    panel.settings.as_ref().unwrap().status(),
+                    DraftStatus::Saving
+                );
+                let mut original_in_dark = original.clone();
+                original_in_dark.theme_mode = ThemeMode::Dark;
+                PreferencesPanel::resolve_legacy_terminal_theme(&mut original_in_dark, window, cx);
+                assert_eq!(
+                    original_in_dark.terminal.color_scheme,
+                    TerminalColorScheme::Github
+                );
+
+                panel
+                    .settings
+                    .as_mut()
+                    .unwrap()
+                    .save_outcome_unknown()
+                    .unwrap();
+                let generation = panel.begin_settings_revision_check();
+                panel.finish_settings_revision_check(
+                    Ok(VersionedSettings {
+                        settings: changed.clone(),
+                        revision: Some(changed_revision.clone()),
+                    }),
+                    generation,
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    panel.settings.as_ref().unwrap().status(),
+                    DraftStatus::OutcomeUnknown
+                );
+                let mut original_in_dark = original.clone();
+                original_in_dark.theme_mode = ThemeMode::Dark;
+                PreferencesPanel::resolve_legacy_terminal_theme(&mut original_in_dark, window, cx);
+                assert_eq!(
+                    original_in_dark.terminal.color_scheme,
+                    TerminalColorScheme::Github
+                );
+
+                panel.install_settings(
+                    VersionedSettings {
+                        settings: original.clone(),
+                        revision: Some(base_revision),
+                    },
+                    window,
+                    cx,
+                );
+                panel.recovery.mode = ConfigurationMode::ReadOnlyRecovery;
+                let generation = panel.begin_settings_revision_check();
+                panel.finish_settings_revision_check(
+                    Ok(VersionedSettings {
+                        settings: changed.clone(),
+                        revision: Some(changed_revision.clone()),
+                    }),
+                    generation,
+                    window,
+                    cx,
+                );
+                let mut original_in_dark = original;
+                original_in_dark.theme_mode = ThemeMode::Dark;
+                PreferencesPanel::resolve_legacy_terminal_theme(&mut original_in_dark, window, cx);
+                assert_eq!(
+                    original_in_dark.terminal.color_scheme,
+                    TerminalColorScheme::Github
+                );
+
+                panel.recovery.mode = ConfigurationMode::ReadWrite;
+                let generation = panel.begin_settings_revision_check();
+                panel.finish_settings_revision_check(
+                    Ok(VersionedSettings {
+                        settings: changed.clone(),
+                        revision: Some(changed_revision),
+                    }),
+                    generation,
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    panel
+                        .settings
+                        .as_ref()
+                        .unwrap()
+                        .value()
+                        .terminal
+                        .color_scheme,
+                    TerminalColorScheme::Solarized
+                );
+                changed.theme_mode = ThemeMode::Light;
+                PreferencesPanel::resolve_legacy_terminal_theme(&mut changed, window, cx);
+                assert_eq!(
+                    changed.terminal.color_scheme,
+                    TerminalColorScheme::Solarized
+                );
+            });
+        });
+    }
+
     /// watcher 回执期间允许继续输入；相同 revision 和其他 Profile 变更不得覆盖输入或丢失焦点。
     /// 同一 Profile 确有不同 revision 时才保留草稿并进入外部冲突。
     ///
@@ -499,7 +644,7 @@ mod profile_watcher {
         let (runtime, _, panel, visual) = fixture(app);
         let (id, generation) = visual.update(|window, app| {
             panel.update(app, |panel, cx| {
-                panel.create_profile_in_group(None, window, cx);
+                panel.create_profile_in_group(window, cx);
                 panel
                     .profile_inputs
                     .name

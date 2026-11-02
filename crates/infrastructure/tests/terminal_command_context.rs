@@ -1032,6 +1032,7 @@ async fn agent_view_input_requires_exact_owner_and_generation() {
 }
 
 /// 受管 UI 命令必须在写入前原子复验 generation，防止检查后重连把旧脚本送入新 transport。
+/// 注入已使 prompt_ready 变为 false；迟到的 Readline 重绘 B 也不能重新开放该提示符。
 ///
 /// @author kongweiguang
 #[tokio::test]
@@ -1095,6 +1096,7 @@ async fn managed_command_rejects_stale_ui_binding_before_injection() {
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let service = Arc::clone(&manager);
+    let active_session_id = session_id.clone();
     let command = tokio::spawn(async move {
         service
             .execute_shell_command(
@@ -1115,6 +1117,19 @@ async fn managed_command_rejects_stale_ui_binding_before_injection() {
         .expect("matching UI binding reaches the shared writer")
         .expect("read accepted command bytes");
     assert!(injected_bytes > 0);
+    output
+        .write_all(b"\x1b]133;B\x07managed-repaint")
+        .await
+        .expect("late prompt-end repaint");
+    wait_for_render_marker(manager.as_ref(), &active_session_id, "managed-repaint").await;
+    let during_command = manager
+        .terminal_command_context(active_session_id)
+        .await
+        .expect("managed command remains active");
+    assert!(
+        !during_command.prompt_ready,
+        "a duplicate B cannot reopen an injected command's prompt"
+    );
     cancellation.cancel();
     let outcome = tokio::time::timeout(Duration::from_secs(2), command)
         .await
@@ -1289,6 +1304,69 @@ async fn prompt_change_cancels_pending_ui_write_without_blocking_reader() {
         .close_all()
         .await
         .expect("close test session resources");
+}
+
+/// Readline 重绘重复输出 B 不代表新提示符，不能取消同一行仍在背压中的追加写入。
+/// 使用实际 reader/writer 门禁，确保忽略重绘不会放宽另一个用例覆盖的 A/B 跨 prompt 取消。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn repeated_prompt_end_preserves_pending_ui_write_and_context() {
+    let (manager, factory, session_id) = create_ui_session(RemoteShellDialect::Posix).await;
+    let mut endpoint = factory.output.lock().await.take().expect("test stream");
+    endpoint
+        .write_all(b"\x1b]133;A\x07\x1b]133;B\x07")
+        .await
+        .expect("initial prompt");
+    let initial = wait_for_prompt(manager.as_ref(), &session_id).await;
+    let buffered = vec![b'x'; 4096];
+    manager
+        .write(session_id.clone(), buffered.clone())
+        .await
+        .expect("fill writer buffer");
+    endpoint
+        .write_all(b"\x1b]133;A\x07\x1b]133;B\x07")
+        .await
+        .expect("new prompt");
+    let prompt = wait_for_prompt_after(manager.as_ref(), &session_id, initial.prompt_epoch).await;
+    let binding = UiSessionBinding {
+        session_id: session_id.clone(),
+        owner: prompt.owner.clone(),
+        session_generation: prompt.session_generation,
+    };
+    let service = Arc::clone(&manager);
+    let version = prompt.version();
+    let pending = tokio::spawn(async move {
+        service
+            .write_ui_input(UiTerminalInputRequest {
+                binding,
+                expected_context: Some(version),
+                projection: UiInputProjection::Tracked,
+                event: TerminalInputEvent::Text("suffix".to_owned()),
+            })
+            .await
+    });
+    wait_for_input_generation(manager.as_ref(), &session_id, prompt.input_generation + 1).await;
+    endpoint
+        .write_all(b"\x1b]133;B\x07redraw-settled")
+        .await
+        .expect("readline prompt-end repaint");
+    wait_for_render_marker(manager.as_ref(), &session_id, "redraw-settled").await;
+    assert!(
+        !pending.is_finished(),
+        "repaint must not cancel pending input"
+    );
+    let mut received = vec![0; buffered.len() + 6];
+    tokio::time::timeout(Duration::from_secs(2), endpoint.read_exact(&mut received))
+        .await
+        .expect("writer remains live")
+        .expect("drain writer");
+    assert_eq!(&received[..buffered.len()], buffered.as_slice());
+    assert_eq!(&received[buffered.len()..], b"suffix");
+    let after = pending.await.expect("join").expect("same-prompt write");
+    assert_eq!(after.prompt_epoch, prompt.prompt_epoch);
+    assert_eq!(after.availability, TerminalCommandAvailability::Available);
+    manager.close_all().await.expect("close test session");
 }
 
 /// raw write receipt 保留准入前的真实空 prompt，而不读取或重建终端屏幕文本。

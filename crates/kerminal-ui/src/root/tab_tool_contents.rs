@@ -24,6 +24,7 @@ pub(super) struct RetainedTabToolContents {
     snippet_fill_subscription: Option<Subscription>,
     snippet_current_command_subscription: Option<Subscription>,
     logs_view: Option<Entity<LogsView>>,
+    logs_fill_subscription: Option<Subscription>,
     sftp_panel: Option<Entity<FilesPane>>,
     sftp_panel_subscription: Option<workspace_files::FilesPaneSubscriptions>,
     operations_views: BTreeMap<ToolRailToolId, Entity<OperationsView>>,
@@ -78,6 +79,7 @@ impl RetainedTabToolContents {
             snippet_fill_subscription: root._snippet_terminal_fill_subscription.take(),
             snippet_current_command_subscription: root._snippet_current_command_subscription.take(),
             logs_view: root.logs_view.take(),
+            logs_fill_subscription: root._logs_fill_subscription.take(),
             sftp_panel: root.sftp_panel.take(),
             sftp_panel_subscription: root._sftp_panel_subscriptions.take(),
             operations_views,
@@ -101,6 +103,7 @@ impl RetainedTabToolContents {
         root._snippet_terminal_fill_subscription = self.snippet_fill_subscription;
         root._snippet_current_command_subscription = self.snippet_current_command_subscription;
         root.logs_view = self.logs_view;
+        root._logs_fill_subscription = self.logs_fill_subscription;
         if root.commands_view.is_none() {
             root.commands_view = RootView::create_commands_view(&root.services, window, cx);
             (
@@ -110,10 +113,9 @@ impl RetainedTabToolContents {
             ) = RootView::subscribe_commands_view(root.commands_view.as_ref(), window, cx);
         }
         if root.logs_view.is_none() {
-            root.logs_view = root.services.commands.clone().map(|commands| {
-                let executor = root.services.executor.clone();
-                cx.new(|cx| LogsView::new(commands, executor, window, cx))
-            });
+            root.logs_view = RootView::create_logs_view(&root.services, window, cx);
+            root._logs_fill_subscription =
+                RootView::subscribe_logs_view(root.logs_view.as_ref(), window, cx);
         }
         root.sftp_panel = self.sftp_panel;
         root._sftp_panel_subscriptions = self.sftp_panel_subscription;

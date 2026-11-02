@@ -13,9 +13,9 @@ fn find_shortcut_keeps_replace_collapsed() {
     assert!(!SearchPanelMode::Find.shows_replace());
 }
 
-/// Ctrl/Cmd+H 从任意面板状态进入替换模式，并由工具栏反向折叠。
+/// Ctrl/Cmd+H 从任意面板状态进入替换模式，不依赖已移除的工具栏入口。
 #[test]
-fn replace_shortcut_and_toolbar_toggle_share_modes() {
+fn replace_shortcut_opens_replace_from_any_search_mode() {
     assert_eq!(
         SearchPanelMode::Closed.show_replace(),
         SearchPanelMode::Replace
@@ -25,14 +25,6 @@ fn replace_shortcut_and_toolbar_toggle_share_modes() {
         SearchPanelMode::Replace
     );
     assert!(SearchPanelMode::Replace.shows_replace());
-    assert_eq!(
-        SearchPanelMode::Find.toggle_replace(),
-        SearchPanelMode::Replace
-    );
-    assert_eq!(
-        SearchPanelMode::Replace.toggle_replace(),
-        SearchPanelMode::Find
-    );
 }
 
 /// 关闭状态没有可见输入行，供 Escape 和显式关闭按钮共用同一业务状态。

@@ -2,9 +2,9 @@
 //!
 //! @author kongweiguang
 
-use chrono::{DateTime, Datelike, SecondsFormat, Utc};
 use gpui_kit::{
-    ClickEvent, Context, Focusable, IntoElement, Render, Window,
+    AnyElement, ClickEvent, Context, Focusable, InteractiveElement as _, IntoElement, Render,
+    StatefulInteractiveElement as _, Window,
     component::{
         Disableable, FocusTrapElement as _, Sizable as _,
         button::{Button, ButtonVariants},
@@ -16,10 +16,7 @@ use gpui_kit::{
 };
 use kerminal_application::connections::management::ManagedHost;
 use kerminal_application::preferences::VersionedProfile;
-use kerminal_domain::{
-    connections::{ConnectionCapabilities, RemoteProtocol, SshAuthentication},
-    preferences::{ConfigurationMode, TerminalProfile},
-};
+use kerminal_domain::preferences::{ConfigurationMode, TerminalProfile};
 
 use crate::theme::ThemeTokens;
 use crate::ui_button::icon_button;
@@ -32,10 +29,11 @@ use super::{
 };
 
 impl Render for ConnectionsPanel {
-    /// 编辑时表单占用独立工作区；普通模式只绘制左栏选中主机详情，避免重复中央目录。
+    /// 编辑时表单占用独立工作区；普通模式不绘制远端主机详情页，目录选择留在左侧。
     /// 无编辑器时的未知本地主机写入提示挂在面板层，避免切换选择后丢失唯一核对入口。
     /// 从 Kit 全局主题取色，确保编辑页与左侧导航保持相同的浅深主题语义。
     /// 编辑器内分组作为最上层小弹层呈现，原表单实体和草稿持续保留，Tab 不越过当前弹层。
+    /// 主机与分组的删除确认同样挂在面板最上层，以居中弹层出现，不参与内容流排版。
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.start_configuration_watch(cx);
@@ -44,12 +42,11 @@ impl Render for ConnectionsPanel {
         let readonly = self.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
         let editing = self.editor_open();
         let editing_group = self.presentation.shows_group_editor();
+        let selected_host = self.selected_host_snapshot();
         let content = if editing {
             render_editor(self, theme, window, cx).into_any_element()
         } else if editing_group {
             render_group_rename_editor(self, readonly, theme, cx).into_any_element()
-        } else if let Some(host) = self.selected_host_snapshot() {
-            render_host_details(self, &host, theme, cx).into_any_element()
         } else if let Some(profile) = self
             .local_hosts
             .selected
@@ -72,9 +69,11 @@ impl Render for ConnectionsPanel {
         let mut panel = div()
             .id("connections-panel")
             .capture_key_down(cx.listener(|panel, event, window, cx| {
+                panel.handle_confirmation_escape(event, window, cx);
                 panel.handle_editor_save_key(event, window, cx);
             }))
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -83,7 +82,7 @@ impl Render for ConnectionsPanel {
         panel = panel.child(body);
         if editing && editing_group {
             let focus_handle = self.group_name_input.read(cx).focus_handle(cx);
-            panel = panel.relative().child(
+            panel = panel.child(
                 div()
                     .id("connections-inline-group-overlay")
                     .absolute()
@@ -119,21 +118,10 @@ impl Render for ConnectionsPanel {
         }
         if !editing
             && !editing_group
-            && self.local_hosts.save_outcome_unknown
+            && (self.local_hosts.save_outcome_unknown || self.local_hosts.cleanup_pending)
             && self.local_hosts.pending_delete.is_none()
         {
             panel = panel.child(render_local_host_unknown_banner(self, theme, cx));
-        }
-        if self.pending_group_deletion.is_some() {
-            panel = panel.child(render_group_deletion_confirmation(self, theme, cx));
-        }
-        if let Some(pending_delete) = self.local_hosts.pending_delete.clone() {
-            panel = panel.child(render_local_host_deletion_confirmation(
-                self,
-                &pending_delete,
-                theme,
-                cx,
-            ));
         }
         if !editing {
             let status = if self.local_hosts.selected.is_some() {
@@ -145,6 +133,27 @@ impl Render for ConnectionsPanel {
                 self.status.clone()
             };
             panel = panel.child(render_status(status, theme));
+        }
+
+        // 删除确认统一挂在面板最上层的居中弹层里，确认卡不再参与内容流排版，
+        // 避免在主机空状态下把整块工作区拉成横跨窗口的大弹框。
+        if let Some(pending_deletion) = self.pending_host_deletion.clone()
+            && let Some(host) = selected_host
+                .as_ref()
+                .filter(|host| host.id == pending_deletion.host_id)
+        {
+            panel = panel.child(render_host_deletion_confirmation(self, host, theme, cx));
+        }
+        if self.pending_group_deletion.is_some() {
+            panel = panel.child(render_group_deletion_confirmation(self, theme, cx));
+        }
+        if let Some(pending_delete) = self.local_hosts.pending_delete.clone() {
+            panel = panel.child(render_local_host_deletion_confirmation(
+                self,
+                &pending_delete,
+                theme,
+                cx,
+            ));
         }
 
         panel
@@ -159,7 +168,7 @@ impl Render for ConnectionsPanel {
     }
 }
 
-/// 将本地主机作为普通连接详情呈现；紧凑编辑图标节省操作栏宽度，连接、默认项和配置复制仍保留明确文字与原目标绑定。
+/// 本地主机详情只提供与主机有关的操作；默认启动模板由 Profile 设置页管理。
 /// 环境变量只展示名称以免把令牌值暴露在连接目录中；写入仍受共享配置门禁保护。
 ///
 /// @author kongweiguang
@@ -173,7 +182,8 @@ fn render_local_host_details(
     let can_write = panel.recovery.mode != ConfigurationMode::ReadOnlyRecovery
         && !panel.local_hosts.loading
         && !panel.local_hosts.saving
-        && !panel.local_hosts.save_outcome_unknown;
+        && !panel.local_hosts.save_outcome_unknown
+        && !panel.local_hosts.cleanup_pending;
     let can_connect = !panel.local_hosts.loading && !panel.local_hosts.save_outcome_unknown;
     let mut detail = div()
         .id("connections-local-host-details")
@@ -224,11 +234,9 @@ fn render_local_host_details(
     detail = detail.child(local_host_configuration_card(profile, theme));
 
     let connect_profile_id = profile_id.clone();
-    let default_profile_id = profile_id.clone();
     let edit_profile_id = profile_id.clone();
     let duplicate_profile_id = profile_id.clone();
     let delete_profile_id = profile_id;
-    let is_default = profile.is_default;
     let actions = div()
         .w_full()
         .flex()
@@ -258,19 +266,6 @@ fn render_local_host_details(
                 panel.begin_edit_local_host(edit_profile_id.clone(), window, cx)
             }))
         });
-    let actions = actions.child(
-        Button::new("connections-local-host-set-default")
-            .compact()
-            .label(if is_default {
-                crate::locale::text("已默认", "Default")
-            } else {
-                crate::locale::text("设为默认", "Set as default")
-            })
-            .disabled(!can_write || is_default)
-            .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                panel.request_set_default_local_host(default_profile_id.clone(), cx)
-            })),
-    );
     let actions = if can_write {
         actions
             .child(
@@ -322,10 +317,17 @@ fn render_local_host_unknown_banner(
                 .min_w(px(0.))
                 .text_size(theme.text_xs)
                 .text_color(theme.muted)
-                .child(crate::locale::text(
-                    "本地主机更改结果未知；不会自动重放，请先刷新并核对实际配置。",
-                    "A local host change has an unknown result. It will not be replayed; read back and review the stored configuration first.",
-                )),
+                .child(if panel.local_hosts.cleanup_pending {
+                    crate::locale::text(
+                        "本地主机更改已完成；部分旧凭据尚待清理，请重试清理。",
+                        "The local host change is complete; some old credentials still need cleanup. Retry cleanup.",
+                    )
+                } else {
+                    crate::locale::text(
+                        "本地主机更改结果未知；不会自动重放，请先刷新并核对实际配置。",
+                        "A local host change has an unknown result. It will not be replayed; read back and review the stored configuration first.",
+                    )
+                }),
         )
         .child(
             Button::new("connections-review-local-host-unknown-banner")
@@ -656,175 +658,49 @@ fn render_group_rename_editor(
         )
 }
 
-/// 选中主机展示协议能力与显式连接按钮；编辑图标只打开当前主机草稿，连接操作仍由用户明确选择。
-fn render_host_details(
-    panel: &mut ConnectionsPanel,
-    host: &ManagedHost,
+/// 删除确认的共用弹层外壳：居中、限定宽度、超出可滚动。
+/// 确认卡脱离面板内容流，避免空状态工作区被整块撑成横跨窗口的弹框。
+/// 两个 id 均为静态字符串，绘制路径不再为每帧拼装 ElementId。
+/// 卡片提供稳定身份后才能持有滚动状态，避免无状态 Div 无法调用滚动 API。
+/// 点击遮罩等同取消；卡片内部吞掉点击，避免操作正文时误触关闭。
+///
+/// @author kongweiguang
+fn deletion_confirmation_overlay(
+    id: &'static str,
+    card_debug_id: &'static str,
     theme: ThemeTokens,
-    cx: &mut Context<ConnectionsPanel>,
-) -> impl IntoElement {
-    let capabilities = ConnectionCapabilities::for_protocol(host.protocol);
-    let host_id = host.id.clone();
-    let can_write = panel.recovery.mode != ConfigurationMode::ReadOnlyRecovery;
-    let mut detail = div()
-        .id("connections-host-details")
-        .size_full()
+    card: AnyElement,
+    dismiss: Option<impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .debug_selector(move || format!("{id}-bounds"))
+        .absolute()
+        .inset_0()
+        .occlude()
+        .p_4()
         .flex()
-        .flex_col()
-        .gap_4()
-        .overflow_y_scroll()
-        .p_6()
-        .bg(theme.background)
+        .items_center()
+        .justify_center()
+        .bg(theme.background.opacity(0.8))
+        .when_some(dismiss, |overlay, dismiss| overlay.on_click(dismiss))
         .child(
             div()
-                .w_full()
-                .flex()
-                .items_start()
-                .gap_3()
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(23.))
-                                .font_weight(gpui_kit::FontWeight::BOLD)
-                                .child(host.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .text_color(theme.muted)
-                                .child(endpoint_label(host)),
-                        ),
-                )
-                .child({
-                    let label = crate::locale::text("编辑连接", "Edit connection");
-                    icon_button(
-                        "connections-edit-host",
-                        gpui_kit::assets::IconName::Pencil,
-                        label.clone(),
-                    )
-                    .with_size(gpui_kit::component::Size::Medium)
-                    .tooltip(label)
-                    .disabled(!can_write)
-                    .on_click(cx.listener(
-                        move |panel, _: &ClickEvent, window, cx| {
-                            panel.edit_host(&host_id, window, cx)
-                        },
-                    ))
-                }),
-        )
-        .child(render_capability_card(host, capabilities, theme));
-
-    let mut actions = div().w_full().flex().gap_2();
-    if capabilities.terminal {
-        actions = actions.child(
-            Button::new("connections-connect")
-                .compact()
-                .label(if host.protocol == RemoteProtocol::Serial {
-                    crate::locale::text("打开串口终端", "Open serial terminal")
-                } else if host.protocol == RemoteProtocol::Telnet {
-                    crate::locale::text("打开 Telnet", "Open Telnet")
-                } else {
-                    crate::locale::text("连接终端", "Connect terminal")
-                })
-                .when(true, Button::primary)
-                .on_click(
-                    cx.listener(|panel, _: &ClickEvent, _, cx| panel.connect_selected(false, cx)),
-                ),
-        );
-    } else if host.protocol == RemoteProtocol::Sftp {
-        actions = actions.child(
-            Button::new("connections-connect-sftp-only")
-                .compact()
-                .label(crate::locale::text("打开 SFTP", "Open SFTP"))
-                .when(true, Button::primary)
-                .on_click(
-                    cx.listener(|panel, _: &ClickEvent, _, cx| panel.connect_selected(false, cx)),
-                ),
-        );
-    }
-    if capabilities.sftp && host.protocol != RemoteProtocol::Sftp {
-        actions = actions.child(
-            Button::new("connections-open-files")
-                .compact()
-                .label(crate::locale::text("浏览文件", "Browse files"))
-                .on_click(
-                    cx.listener(|panel, _: &ClickEvent, _, cx| panel.connect_selected(true, cx)),
-                ),
-        );
-    }
-    if capabilities.launch_rdp {
-        actions = actions.child(
-            Button::new("connections-launch-rdp")
-                .compact()
-                .label(crate::locale::text("启动远程桌面", "Launch remote desktop"))
-                .when(true, Button::primary)
-                .on_click(
-                    cx.listener(|panel, _: &ClickEvent, _, cx| panel.connect_selected(false, cx)),
-                ),
-        );
-    }
-    if can_write {
-        let duplicate_host_id = host.id.clone();
-        let delete_host_id = host.id.clone();
-        actions = actions
-            .child(
-                Button::new("connections-duplicate-host")
-                    .compact()
-                    .label(crate::locale::text("复制配置…", "Duplicate config…"))
-                    .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-                        panel.duplicate_saved_host(&duplicate_host_id, window, cx)
-                    })),
-            )
-            .child(
-                Button::new("connections-delete-host")
-                    .compact()
-                    .danger()
-                    .label(crate::locale::text("删除…", "Delete…"))
-                    .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                        panel.request_delete_host(&delete_host_id, cx)
-                    })),
-            );
-    }
-    detail = detail.child(actions).child(render_auth_card(host, theme));
-    if panel
-        .pending_host_deletion
-        .as_ref()
-        .is_some_and(|pending| pending.host_id == host.id)
-    {
-        detail = detail.child(render_host_deletion_confirmation(panel, host, theme, cx));
-    }
-    if let Some((status, is_error)) = panel.rdp_status_for_host(&host.id) {
-        detail = detail.child(
-            div()
-                .id("connections-rdp-status")
-                .w_full()
-                .p_3()
-                .rounded_md()
+                .id(card_debug_id)
+                .debug_selector(move || card_debug_id.to_owned())
+                .w(px(480.))
+                .max_w_full()
+                .max_h_full()
+                .overflow_y_scroll()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
                 .bg(theme.panel)
-                .text_size(theme.text_xs)
-                .text_color(if is_error { theme.error } else { theme.muted })
-                .child(status),
-        );
-    }
-    if !host.tags.is_empty() {
-        detail = detail.child(div().w_full().flex().flex_wrap().gap_2().children(
-            host.tags.iter().map(|tag| {
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(theme.sidebar)
-                    .text_size(theme.text_xs)
-                    .child(tag.clone())
-            }),
-        ));
-    }
-    detail
+                .text_color(theme.foreground)
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(card),
+        )
+        .into_any_element()
 }
 
 /// 删除分组前显示受影响主机数，并要求用户明确选择目标分组或未分组。
@@ -832,7 +708,7 @@ fn render_group_deletion_confirmation(
     panel: &mut ConnectionsPanel,
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
-) -> impl IntoElement {
+) -> AnyElement {
     let Some(pending) = panel.pending_group_deletion.clone() else {
         return div().into_any_element();
     };
@@ -852,13 +728,10 @@ fn render_group_deletion_confirmation(
     let mut card = div()
         .id("connections-delete-group-confirmation")
         .w_full()
-        .p_4()
+        .p_5()
         .flex()
         .flex_col()
-        .gap_2()
-        .bg(theme.panel)
-        .border_1()
-        .border_color(theme.warning)
+        .gap_3()
         .child(
             div()
                 .text_size(theme.text_body)
@@ -877,6 +750,7 @@ fn render_group_deletion_confirmation(
                     "Host reassignment and group deletion are committed in one configuration transaction.",
                 )),
         );
+    let mut destinations = div().flex().flex_col().gap_2();
     for destination in panel
         .groups
         .iter()
@@ -885,9 +759,10 @@ fn render_group_deletion_confirmation(
         .collect::<Vec<_>>()
     {
         let id = destination.id.clone();
-        card = card.child(
+        destinations = destinations.child(
             Button::new(format!("connections-delete-group-move-{}", id))
                 .compact()
+                .w_full()
                 .label(crate::locale::text(
                     format!("迁移到 {} 并删除", destination.name),
                     format!("Move to {} and delete", destination.name),
@@ -898,28 +773,43 @@ fn render_group_deletion_confirmation(
                 })),
         );
     }
-    card = card.child(
-        Button::new("connections-delete-group-ungroup")
-            .compact()
-            .danger()
-            .label(crate::locale::text(
-                "迁移到未分组并删除",
-                "Move to ungrouped and delete",
-            ))
-            .disabled(panel.configuration_mutation_busy)
-            .on_click(
-                cx.listener(|panel, _: &ClickEvent, _, cx| panel.confirm_group_deletion(None, cx)),
+    card = card.child(destinations).child(
+        div()
+            .w_full()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("connections-delete-group-cancel")
+                    .compact()
+                    .ghost()
+                    .label(crate::locale::text("取消", "Cancel"))
+                    .disabled(panel.configuration_mutation_busy)
+                    .on_click(
+                        cx.listener(|panel, _: &ClickEvent, _, cx| panel.cancel_group_deletion(cx)),
+                    ),
+            )
+            .child(
+                Button::new("connections-delete-group-ungroup")
+                    .compact()
+                    .danger()
+                    .label(crate::locale::text(
+                        "迁移到未分组并删除",
+                        "Move to ungrouped and delete",
+                    ))
+                    .disabled(panel.configuration_mutation_busy)
+                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                        panel.confirm_group_deletion(None, cx)
+                    })),
             ),
     );
-    card.child(
-        Button::new("connections-delete-group-cancel")
-            .compact()
-            .ghost()
-            .label(crate::locale::text("取消", "Cancel"))
-            .disabled(panel.configuration_mutation_busy)
-            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| panel.cancel_group_deletion(cx))),
+    deletion_confirmation_overlay(
+        "connections-delete-group-overlay",
+        "rr-connections-delete-group-card",
+        theme,
+        card.into_any_element(),
+        Some(cx.listener(|panel, _: &ClickEvent, _, cx| panel.cancel_group_deletion(cx))),
     )
-    .into_any_element()
 }
 
 /// 删除主机前确认精确名称和配置后果；凭据是否可清理由回执单独说明。
@@ -928,17 +818,14 @@ fn render_host_deletion_confirmation(
     host: &ManagedHost,
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
-) -> impl IntoElement {
-    div()
+) -> AnyElement {
+    let card = div()
         .id("connections-delete-host-confirmation")
         .w_full()
-        .p_4()
+        .p_5()
         .flex()
         .flex_col()
-        .gap_2()
-        .bg(theme.panel)
-        .border_1()
-        .border_color(theme.error)
+        .gap_3()
         .child(
             div()
                 .text_size(theme.text_body)
@@ -959,8 +846,20 @@ fn render_host_deletion_confirmation(
         )
         .child(
             div()
+                .w_full()
                 .flex()
+                .justify_end()
                 .gap_2()
+                .child(
+                    Button::new("connections-delete-host-cancel")
+                        .compact()
+                        .ghost()
+                        .label(crate::locale::text("取消", "Cancel"))
+                        .disabled(panel.configuration_mutation_busy)
+                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                            panel.cancel_host_deletion(cx)
+                        })),
+                )
                 .child(
                     Button::new("connections-delete-host-confirm")
                         .compact()
@@ -974,28 +873,25 @@ fn render_host_deletion_confirmation(
                         .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
                             panel.confirm_host_deletion(cx)
                         })),
-                )
-                .child(
-                    Button::new("connections-delete-host-cancel")
-                        .compact()
-                        .ghost()
-                        .label(crate::locale::text("取消", "Cancel"))
-                        .disabled(panel.configuration_mutation_busy)
-                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.cancel_host_deletion(cx)
-                        })),
                 ),
-        )
+        );
+    deletion_confirmation_overlay(
+        "connections-delete-host-overlay",
+        "rr-connections-delete-host-card",
+        theme,
+        card.into_any_element(),
+        Some(cx.listener(|panel, _: &ClickEvent, _, cx| panel.cancel_host_deletion(cx))),
+    )
 }
 
-/// 删除确认始终绑定同一 versioned 快照，展示稳定 ID，并在未知回执时只允许显式读回。
+/// 删除确认绑定同一 versioned 快照，按钮门禁跟随真实写入状态，未知回执只允许读回。
 /// @author kongweiguang
 fn render_local_host_deletion_confirmation(
     panel: &mut ConnectionsPanel,
     pending: &VersionedProfile,
     theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
-) -> impl IntoElement {
+) -> AnyElement {
     let profile_id = &pending.profile.id;
     let readonly = panel.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
     let saving = panel.local_hosts.saving;
@@ -1022,16 +918,13 @@ fn render_local_host_deletion_confirmation(
             "Only the local host configuration is deleted; already-open terminals are not closed.",
         )
     };
-    let mut card = div()
+    let card = div()
         .id("connections-delete-local-host-confirmation")
         .w_full()
-        .p_4()
+        .p_5()
         .flex()
         .flex_col()
-        .gap_2()
-        .bg(theme.panel)
-        .border_1()
-        .border_color(theme.error)
+        .gap_3()
         .child(
             div()
                 .text_size(theme.text_body)
@@ -1060,8 +953,18 @@ fn render_local_host_deletion_confirmation(
                 .child(detail),
         );
 
+    let mut actions = div().w_full().flex().justify_end().gap_2().child(
+        Button::new("connections-delete-local-host-cancel")
+            .compact()
+            .ghost()
+            .label(crate::locale::text("取消", "Cancel"))
+            .disabled(saving || outcome_unknown)
+            .on_click(
+                cx.listener(|panel, _: &ClickEvent, _, cx| panel.cancel_delete_local_host(cx)),
+            ),
+    );
     if outcome_unknown {
-        card = card.child(
+        actions = actions.child(
             Button::new("connections-review-local-host-delete")
                 .compact()
                 .label(if reading {
@@ -1076,7 +979,7 @@ fn render_local_host_deletion_confirmation(
                 ),
         );
     } else {
-        card = card.child(
+        actions = actions.child(
             Button::new("connections-delete-local-host-confirm")
                 .compact()
                 .danger()
@@ -1085,236 +988,22 @@ fn render_local_host_deletion_confirmation(
                 } else {
                     crate::locale::text("确认删除配置", "Delete configuration")
                 })
-                .disabled(readonly || saving || panel.local_hosts.loading)
+                .disabled(
+                    readonly || panel.local_hosts.loading || panel.local_hosts.mutation_blocked(),
+                )
                 .on_click(
                     cx.listener(|panel, _: &ClickEvent, _, cx| panel.confirm_delete_local_host(cx)),
                 ),
         );
     }
 
-    card.child(
-        Button::new("connections-delete-local-host-cancel")
-            .compact()
-            .ghost()
-            .label(crate::locale::text("取消", "Cancel"))
-            .disabled(saving || outcome_unknown)
-            .on_click(
-                cx.listener(|panel, _: &ClickEvent, _, cx| panel.cancel_delete_local_host(cx)),
-            ),
+    deletion_confirmation_overlay(
+        "connections-delete-local-host-overlay",
+        "rr-connections-delete-local-host-card",
+        theme,
+        card.child(actions).into_any_element(),
+        Some(cx.listener(|panel, _: &ClickEvent, _, cx| panel.cancel_delete_local_host(cx))),
     )
-}
-
-/// 显示协议 capabilities 的真实边界，避免按钮对不支持的连接误导用户。
-/// 能力卡同时展示配置时间；时间统一为项目使用的 UTC ISO 格式，坏值明确显示缺失。
-///
-/// @author kongweiguang
-fn render_capability_card(
-    host: &ManagedHost,
-    capabilities: ConnectionCapabilities,
-    theme: ThemeTokens,
-) -> impl IntoElement {
-    let created_at = display_host_timestamp(&host.created_at);
-    let updated_at = display_host_timestamp(&host.updated_at);
-    let mut names = vec![protocol_label(host.protocol).to_owned()];
-    if capabilities.terminal {
-        names.push(crate::locale::text("终端", "Terminal").to_string());
-    }
-    if capabilities.exec {
-        names.push(crate::locale::text("远程命令", "Remote commands").to_string());
-    }
-    if capabilities.sftp {
-        names.push(crate::locale::text("SFTP 文件", "SFTP files").to_string());
-    }
-    if capabilities.tunnel {
-        names.push(crate::locale::text("端口转发", "Port forwarding").to_string());
-    }
-    if capabilities.launch_rdp {
-        names.push(crate::locale::text("系统 RDP 客户端", "System RDP client").to_string());
-    }
-    div()
-        .w_full()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .rounded_md()
-        .bg(theme.panel)
-        .child(
-            div()
-                .text_size(px(14.))
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .child(crate::locale::text("能力", "Capabilities")),
-        )
-        .child(
-            div()
-                .text_size(px(12.))
-                .text_color(theme.muted)
-                .child(names.join(" · ")),
-        )
-        .child(
-            div()
-                .text_size(px(12.))
-                .text_color(theme.muted)
-                .child(crate::locale::text(
-                    format!("创建于 {} · 更新于 {}", created_at, updated_at),
-                    format!("Created {} · updated {}", created_at, updated_at),
-                )),
-        )
-}
-
-/// 将保存的 Unix 毫秒或 RFC3339 时间规范化为 UTC；无效和超出四位年份的值统一显示为未知。
-/// 使用 Chrono 处理日历边界，避免手写日期算法并保持与工作区元数据相同的 UTC 展示。
-/// @author kongweiguang
-fn display_host_timestamp(value: &str) -> String {
-    let value = value.trim();
-    let parsed = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        value
-            .parse::<i64>()
-            .ok()
-            .and_then(DateTime::<Utc>::from_timestamp_millis)
-    } else {
-        DateTime::parse_from_rfc3339(value)
-            .ok()
-            .map(|timestamp| timestamp.with_timezone(&Utc))
-    };
-
-    parsed
-        .filter(|timestamp| (1..=9999).contains(&timestamp.year()))
-        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true))
-        .unwrap_or_else(|| crate::locale::text("未知", "Unknown").to_string())
-}
-
-/// 认证详情只展示模式与 opaque ref 状态；非 Windows RDP 明示外部客户端不会自动收到保存密码。
-fn render_auth_card(host: &ManagedHost, theme: ThemeTokens) -> impl IntoElement {
-    let authentication = match host.protocol {
-        RemoteProtocol::Ssh | RemoteProtocol::Sftp => match host.authentication.as_ref() {
-            Some(SshAuthentication::Agent) => "SSH Agent".to_owned(),
-            Some(SshAuthentication::Password { .. }) => crate::locale::text(
-                "密码认证（vault 引用）",
-                "Password authentication (vault reference)",
-            )
-            .to_string(),
-            Some(SshAuthentication::PrivateKey {
-                path,
-                secret,
-                passphrase,
-            }) => {
-                let path_state = if path.is_some() {
-                    ("已设置", "set")
-                } else {
-                    ("未设置", "not set")
-                };
-                let secret_state = if secret.is_some() {
-                    ("已设置", "set")
-                } else {
-                    ("未设置", "not set")
-                };
-                let passphrase_state = if passphrase.is_some() {
-                    ("已设置", "set")
-                } else {
-                    ("未设置", "not set")
-                };
-                crate::locale::text(
-                    format!(
-                        "私钥文件{} · 私钥密文{} · 私钥口令{}",
-                        path_state.0, secret_state.0, passphrase_state.0
-                    ),
-                    format!(
-                        "Private key file {} · private key secret {} · key passphrase {}",
-                        path_state.1, secret_state.1, passphrase_state.1
-                    ),
-                )
-                .to_string()
-            }
-            None => crate::locale::text(
-                "认证引用缺失，请编辑主机补齐",
-                "Authentication reference is missing; edit the host to add it",
-            )
-            .to_string(),
-        },
-        RemoteProtocol::Rdp => if host.rdp_password.is_some() {
-            crate::locale::text("RDP 密码（vault 引用）", "RDP password (vault reference)")
-        } else {
-            crate::locale::text(
-                "由 RDP 客户端提示凭据",
-                "Credentials prompted by RDP client",
-            )
-        }
-        .to_string(),
-        RemoteProtocol::Telnet => {
-            crate::locale::text("终端内交互式认证", "Interactive terminal authentication")
-                .to_string()
-        }
-        RemoteProtocol::Serial => {
-            crate::locale::text("本地设备连接", "Local device connection").to_string()
-        }
-    };
-    let mut card = div()
-        .w_full()
-        .p_4()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .rounded_md()
-        .bg(theme.panel)
-        .child(
-            div()
-                .text_size(px(14.))
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .child(crate::locale::text("认证", "Authentication")),
-        )
-        .child(
-            div()
-                .text_size(px(12.))
-                .text_color(theme.muted)
-                .child(authentication),
-        )
-        .child(if host.route.jump_hosts.is_empty() {
-            crate::locale::text("路由：直连", "Route: direct").to_string()
-        } else {
-            crate::locale::text(
-                format!("路由：{} 个 SSH 跳板", host.route.jump_hosts.len()),
-                format!("Route: {} SSH jump hosts", host.route.jump_hosts.len()),
-            )
-            .to_string()
-        });
-    if host.protocol == RemoteProtocol::Rdp && !cfg!(target_os = "windows") {
-        card = card.child(
-            div()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(crate::locale::text(
-                    "此平台由外部 RDP 客户端处理认证；保存的密码不会自动填入客户端。",
-                    "The external RDP client handles authentication on this platform; saved passwords are not entered automatically.",
-                )),
-        );
-    }
-    card
-}
-
-/// 对应协议使用稳定中文名，列表和详情保持一致的识别文案。
-fn protocol_label(protocol: RemoteProtocol) -> &'static str {
-    match protocol {
-        RemoteProtocol::Ssh => "SSH",
-        RemoteProtocol::Sftp => "SFTP-only",
-        RemoteProtocol::Telnet => "Telnet",
-        RemoteProtocol::Serial => "Serial",
-        RemoteProtocol::Rdp => "RDP",
-    }
-}
-
-/// 把保存端点映射为只读展示字符串，串口详情使用 typed device path。
-fn endpoint_label(host: &ManagedHost) -> String {
-    match host.protocol {
-        RemoteProtocol::Serial => host.serial.as_ref().map_or_else(
-            || host.endpoint.host.clone(),
-            |serial| serial.device.to_string_lossy().into_owned(),
-        ),
-        _ => format!(
-            "{}@{}:{}",
-            host.endpoint.username, host.endpoint.host, host.endpoint.port
-        ),
-    }
 }
 
 /// 无主机选中时提供明确信息，而不是隐藏或显示未接线的占位按钮。

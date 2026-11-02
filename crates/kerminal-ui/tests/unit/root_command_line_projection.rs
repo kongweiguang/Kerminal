@@ -3,6 +3,7 @@
 //! @author kongweiguang
 
 use super::*;
+use kerminal_application::sessions::ShellEditingShell;
 use kerminal_domain::{
     connections::RemoteShellDialect,
     identity::{PaneId, SessionId, TabId},
@@ -86,6 +87,55 @@ fn acknowledge_edit(
     projection.apply_ack(ticket, request, &context);
     projection.observe_context(binding, &context);
     context
+}
+
+/// Shell 读回不能覆盖尚未回执的 FIFO 输入，否则历史捕获会与实际编辑顺序分叉。
+#[test]
+fn shell_snapshot_does_not_overwrite_pending_input() {
+    let binding = ui_binding("session-snapshot-pending", 4);
+    let context = available_context(&binding, 2, 5);
+    let mut projection = CommandLineProjection::default();
+    let mut snapshot = ShellEditingSnapshot {
+        binding: binding.clone(),
+        context: context.version(),
+        revision: 1,
+        input: "git che".to_owned(),
+        cursor: 7,
+        cwd: None,
+        shell: ShellEditingShell::Bash,
+        shell_version: None,
+        shell_prediction_visible: Some(false),
+    };
+    assert!(projection.seed_shell_snapshot(&snapshot, &context));
+    let request = input_request(
+        &binding,
+        TerminalInputEvent::Text("c".to_owned()),
+        UiInputProjection::Tracked,
+    );
+    let ticket = projection
+        .register_input(&request)
+        .expect("input has a FIFO ticket");
+    snapshot.revision += 1;
+    snapshot.input = "git checkout".to_owned();
+    snapshot.cursor = snapshot.input.chars().count();
+    assert!(!projection.seed_shell_snapshot(&snapshot, &context));
+    let state = projection
+        .sessions
+        .get(&binding.session_id)
+        .expect("session exists");
+    assert_eq!(
+        state.known_line.as_ref().map(|line| line.text.as_str()),
+        Some("git che")
+    );
+    acknowledge_edit(&mut projection, &binding, &request, &ticket, context);
+    let state = projection
+        .sessions
+        .get(&binding.session_id)
+        .expect("session remains");
+    assert_eq!(
+        state.known_line.as_ref().map(|line| line.text.as_str()),
+        Some("git chec")
+    );
 }
 
 /// 字符与 Backspace 的精确投影只在同一 writer ACK context 上成立，拒绝旧版本和错光标。

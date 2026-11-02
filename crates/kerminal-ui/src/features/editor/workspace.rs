@@ -56,14 +56,6 @@ impl SearchPanelMode {
         Self::Closed
     }
 
-    /// 工具栏只在打开时进入替换模式，再次点击仅折叠替换行而保留查询。
-    pub(super) fn toggle_replace(self) -> Self {
-        match self {
-            Self::Closed | Self::Find => Self::Replace,
-            Self::Replace => Self::Find,
-        }
-    }
-
     /// 搜索请求回执在面板任一可见模式下仍有效，只有关闭才使代次失效。
     pub(super) fn is_visible(self) -> bool {
         self != Self::Closed
@@ -463,14 +455,28 @@ impl FileEditorWorkspace {
     ///
     /// @author kongweiguang
     pub fn open_file(&mut self, endpoint: FileEndpoint, cx: &mut Context<Self>) {
+        self.open_file_with_activation(endpoint, true, cx);
+    }
+
+    /// 后台恢复只装配缓冲，不能发布短暂的活动文件变化，否则 Root 会误当成用户切换导航。
+    ///
+    /// @author kongweiguang
+    fn open_file_with_activation(
+        &mut self,
+        endpoint: FileEndpoint,
+        activate: bool,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.endpoint == endpoint) {
-            self.active_endpoint = Some(endpoint.clone());
+            if activate {
+                self.active_endpoint = Some(endpoint.clone());
+            }
             self.publish_workspace_projection_if_changed(cx);
             self.sync_target_name_requests(cx);
             let should_retry = self.tabs[index].session.is_none() && !self.tabs[index].loading;
             if should_retry {
                 self.start_load(endpoint, false, cx);
-            } else {
+            } else if activate {
                 let query = self.current_search_query(cx);
                 self.sync_search_query(query, cx);
                 cx.notify();
@@ -478,7 +484,9 @@ impl FileEditorWorkspace {
             return;
         }
 
-        self.clear_search_projection(cx);
+        if activate {
+            self.clear_search_projection(cx);
+        }
         let generation = self.reserve_load_generation();
         let title = endpoint_title(&endpoint);
         self.tabs.push(EditorTab {
@@ -498,14 +506,16 @@ impl FileEditorWorkspace {
             search_decorations: None,
             save_operation: None,
         });
-        self.active_endpoint = Some(endpoint.clone());
+        if activate {
+            self.active_endpoint = Some(endpoint.clone());
+        }
         self.sync_target_name_requests(cx);
         self.spawn_load(endpoint, generation, cx);
         self.publish_workspace_projection_if_changed(cx);
         cx.notify();
     }
 
-    /// Workspace v3 文件按持久标题和权限打开；只读别名不能解锁共享缓冲，且标题/权限变化需同步 Files 快照。
+    /// Workspace 文件按持久标题和汇总权限装配；后台恢复不改变活动缓冲，只读别名不能解锁共享文档。
     ///
     /// @author kongweiguang
     pub fn open_workspace_file(
@@ -513,10 +523,11 @@ impl FileEditorWorkspace {
         endpoint: FileEndpoint,
         title: String,
         readonly: bool,
+        activate: bool,
         cx: &mut Context<Self>,
     ) -> AppResult<()> {
         if !self.tabs.iter().any(|tab| tab.endpoint == endpoint) {
-            self.open_file(endpoint.clone(), cx);
+            self.open_file_with_activation(endpoint.clone(), activate, cx);
         }
 
         let Some(index) = self.tabs.iter().position(|tab| tab.endpoint == endpoint) else {
@@ -533,7 +544,9 @@ impl FileEditorWorkspace {
         if !title.trim().is_empty() {
             tab.title = title;
         }
-        self.active_endpoint = Some(endpoint);
+        if activate {
+            self.active_endpoint = Some(endpoint);
+        }
         if let (Some(editor), Some(session)) = (&tab.editor, &tab.session) {
             let readonly = effective_readonly(session.is_readonly(), tab.workspace_readonly);
             editor.update(cx, |state, cx| state.set_readonly(readonly, cx));
@@ -541,6 +554,37 @@ impl FileEditorWorkspace {
         self.publish_workspace_projection_if_changed(cx);
         cx.notify();
         Ok(())
+    }
+
+    /// 只读收紧前读取原工作区策略，文件系统只读不能代替该值；在途保存与实际脏稿必须先处理。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn workspace_file_readonly_before_restriction(
+        &self,
+        endpoint: &FileEndpoint,
+        cx: &gpui_kit::App,
+    ) -> AppResult<Option<bool>> {
+        let Some(tab) = self.tabs.iter().find(|tab| &tab.endpoint == endpoint) else {
+            return Ok(None);
+        };
+        if tab.save_operation.is_some()
+            || tab
+                .session
+                .as_ref()
+                .is_some_and(|session| session.phase() == EditorPhase::Saving)
+        {
+            return Err(AppError::conflict("文件正在保存，完成后才能切换为只读"));
+        }
+        let buffer_dirty = match (&tab.session, &tab.editor) {
+            (Some(session), Some(editor)) => session.is_dirty(&editor.read(cx).text().to_string()),
+            _ => false,
+        };
+        if tab.dirty || buffer_dirty {
+            return Err(AppError::conflict(
+                "文件已有未保存修改，请先保存或放弃修改再以只读方式打开",
+            ));
+        }
+        Ok(Some(tab.workspace_readonly))
     }
 
     /// 多个 Workspace Tab 可映射同一文档；只在汇总权限实际变化后同步只读投影。
@@ -991,6 +1035,137 @@ impl FileEditorWorkspace {
         }
     }
 
+    /// 验收只读真实缓冲和领域阶段，避免将可见标签误当成文件已读取成功。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub(crate) fn right_rail_acceptance_file_ready(
+        &self,
+        endpoint: &FileEndpoint,
+        expected_content: &str,
+        cx: &gpui_kit::App,
+    ) -> bool {
+        self.active_endpoint.as_ref() == Some(endpoint)
+            && self
+                .tabs
+                .iter()
+                .find(|tab| &tab.endpoint == endpoint)
+                .is_some_and(|tab| {
+                    !tab.loading
+                        && !tab.is_readonly()
+                        && tab.error.is_none()
+                        && tab
+                            .session
+                            .as_ref()
+                            .is_some_and(|session| session.phase() == EditorPhase::Ready)
+                        && tab
+                            .editor
+                            .as_ref()
+                            .is_some_and(|editor| editor.read(cx).text() == expected_content)
+                })
+    }
+
+    /// 确认编辑器采用远端读回的精确 revision，避免只凭 Ready 和文本推断保存成功。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub(crate) fn right_rail_acceptance_file_revision_matches(
+        &self,
+        endpoint: &FileEndpoint,
+        revision: &kerminal_domain::files::FileRevision,
+    ) -> bool {
+        self.active_endpoint.as_ref() == Some(endpoint)
+            && self
+                .tabs
+                .iter()
+                .find(|tab| &tab.endpoint == endpoint)
+                .is_some_and(|tab| {
+                    !tab.loading
+                        && !tab.dirty
+                        && tab.session.as_ref().is_some_and(|session| {
+                            session.phase() == EditorPhase::Ready && session.revision() == revision
+                        })
+                })
+    }
+
+    /// 同时观察冲突正文与指定文件的重载确认，避免其他弹层或未完成状态误报验收通过。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub(crate) fn right_rail_acceptance_file_conflict(
+        &self,
+        endpoint: &FileEndpoint,
+        expected_content: &str,
+        reload_confirmation: bool,
+        cx: &gpui_kit::App,
+    ) -> bool {
+        let confirmation_matches = if reload_confirmation {
+            matches!(
+                self.confirmation.as_ref(),
+                Some(EditorConfirmation::Reload {
+                    endpoint: actual,
+                    continue_quit: false,
+                    close_after_readback: false,
+                }) if actual == endpoint
+            )
+        } else {
+            self.confirmation.is_none()
+        };
+        self.active_endpoint.as_ref() == Some(endpoint)
+            && confirmation_matches
+            && self
+                .tabs
+                .iter()
+                .find(|tab| &tab.endpoint == endpoint)
+                .is_some_and(|tab| {
+                    !tab.loading
+                        && tab.dirty
+                        && tab
+                            .session
+                            .as_ref()
+                            .is_some_and(|session| session.phase() == EditorPhase::Conflict)
+                        && tab
+                            .editor
+                            .as_ref()
+                            .is_some_and(|editor| editor.read(cx).text() == expected_content)
+                })
+    }
+
+    /// 仅在隔离 fixture 的活动可写文档准备好后使用编辑器正规修改链，脏状态仍由生产订阅计算。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub(crate) fn right_rail_acceptance_replace_file(
+        &mut self,
+        endpoint: &FileEndpoint,
+        content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.active_endpoint.as_ref() != Some(endpoint) || self.confirmation.is_some() {
+            return false;
+        }
+        let Some(tab) = self.tabs.iter().find(|tab| &tab.endpoint == endpoint) else {
+            return false;
+        };
+        if tab.loading
+            || tab.is_readonly()
+            || tab.save_operation.is_some()
+            || tab.error.is_some()
+            || tab
+                .session
+                .as_ref()
+                .is_none_or(|session| session.phase() != EditorPhase::Ready)
+        {
+            return false;
+        }
+        let Some(editor) = tab.editor.clone() else {
+            return false;
+        };
+        editor.update(cx, |state, cx| state.replace_all(content, window, cx));
+        true
+    }
+
     /// Reads the loaded document without a typed mutation context so Root can verify the same readonly editor entity.
     ///
     /// @author kongweiguang
@@ -1092,24 +1267,6 @@ impl FileEditorWorkspace {
         }
         self.activate(endpoint, cx);
         true
-    }
-
-    /// 工具栏切换替换区后明确聚焦查找框；无已加载编辑器时不创建无目标搜索状态。
-    ///
-    /// @author kongweiguang
-    pub(super) fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.active_tab().is_some_and(|tab| tab.editor.is_some()) {
-            return;
-        }
-        let opening = !self.search_panel_mode.is_visible();
-        self.search_panel_mode = self.search_panel_mode.toggle_replace();
-        if opening {
-            let query = self.current_search_query(cx);
-            self.sync_search_query(query, cx);
-        }
-        self.find_input
-            .update(cx, |state, cx| state.focus(window, cx));
-        cx.notify();
     }
 
     /// Ctrl/Cmd+F 只对已加载编辑器打开查找行；没有目标时保留查询且不改变焦点。
@@ -1775,3 +1932,7 @@ fn take_workspace_close_resolution(
     *pending_close = None;
     Some(event)
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/editor_workspace_navigation.rs"]
+mod workspace_navigation_tests;

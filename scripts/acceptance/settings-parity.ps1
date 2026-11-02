@@ -4,6 +4,12 @@ param(
 
     [switch]$SkipBuild,
 
+    [switch]$McpOnly,
+
+    [switch]$SuggestionsOnly,
+
+    [switch]$SshSuggestions,
+
     [ValidateRange(800, 3840)]
     [int]$Width = 1440,
 
@@ -16,6 +22,13 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ($McpOnly -and $SuggestionsOnly) {
+    throw '-McpOnly and -SuggestionsOnly are mutually exclusive.'
+}
+if ($SshSuggestions -and -not $SuggestionsOnly) {
+    throw '-SshSuggestions requires -SuggestionsOnly and an isolated fixture.'
+}
 
 $script:RepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $script:DiagnosticsRoot = [IO.Path]::GetFullPath((Join-Path $script:RepositoryRoot 'target\diagnostics\settings-parity'))
@@ -35,7 +48,6 @@ $script:ExpectedPages = @(
 )
 $script:ExpectedThemes = @('light', 'dark', 'system')
 $script:ExpectedDisclosures = @(
-    'terminal-renderer',
     'sftp-advanced',
     'external-launch-compatibility',
     'mcp-connection-info',
@@ -48,6 +60,23 @@ $script:ExpectedKeywordLifecycleActions = @(
     'delete-keyword-rule-readback',
     'undo-keyword-deletion-within-15-seconds'
 )
+$script:ExpectedKeywordAdjustmentChecks = @(
+    [pscustomobject]@{ Action = 'keyword-scroll-and-preserve-drafts'; File = 'settings-functional-keyword-list-scroll.png' },
+    [pscustomobject]@{ Action = 'keyword-search-filter'; File = 'settings-functional-keyword-filter.png' },
+    [pscustomobject]@{ Action = 'keyword-limit-and-footer'; File = 'settings-functional-keyword-limit-footer.png' }
+)
+$script:ExpectedTerminalChecks = @(
+    [pscustomobject]@{ Action = 'terminal-theme-and-live-palette'; File = 'settings-functional-terminal-theme.png' },
+    [pscustomobject]@{ Action = 'terminal-system-font-search'; File = 'settings-functional-terminal-font.png' },
+    [pscustomobject]@{ Action = 'terminal-font-size-step-and-bounds'; File = 'settings-functional-terminal-font-size.png' },
+    [pscustomobject]@{ Action = 'terminal-line-height-step-and-bounds'; File = 'settings-functional-terminal-line-height.png' }
+)
+$script:ExpectedShortcutChecks = @(
+    [pscustomobject]@{ Action = 'shortcut-capture-and-cancel'; File = 'settings-functional-shortcut-capture.png' },
+    [pscustomobject]@{ Action = 'shortcut-custom-binding-live'; File = 'settings-functional-shortcut-live.png' },
+    [pscustomobject]@{ Action = 'shortcut-platform-linux-recorder'; File = 'settings-functional-shortcut-linux.png' },
+    [pscustomobject]@{ Action = 'shortcut-platform-macos-recorder'; File = 'settings-functional-shortcut-macos.png' }
+)
 $script:ExpectedSyncActions = @(
     'sync-local-remote-roundtrip',
     'sync-failure-preserves-local',
@@ -57,12 +86,19 @@ $script:ExpectedMcpActions = @(
     'mcp-timeout-retry-stops-original-owner',
     'mcp-start-stop-light',
     'mcp-start-stop-dark',
-    'mcp-start-stop-system'
+    'mcp-start-stop-system',
+    'mcp-lan-binds-all-interfaces'
 )
 $script:ExpectedProfileActions = @(
     'create-profile-readback',
     'edit-profile-readback',
     'set-default-profile-readback'
+)
+$script:ExpectedProfileHostChecks = @(
+    [pscustomobject]@{ Action = 'profile-template-not-a-host'; File = $null },
+    [pscustomobject]@{ Action = 'profile-create-local-host'; File = 'settings-functional-local-host-created.png' },
+    [pscustomobject]@{ Action = 'profile-edit-keeps-host-snapshot'; File = $null },
+    [pscustomobject]@{ Action = 'profile-delete-local-host'; File = 'settings-functional-local-host-deleted.png' }
 )
 $script:NativeDesktopLauncherSource = @'
 using System;
@@ -366,7 +402,7 @@ namespace Kerminal.SettingsParity
             }
         }
 
-        // Isolates production Git's inherited configuration in the child only, preventing user rewrites, hooks, or network transports from affecting local fixtures.
+        // Isolates Git and suggestion-test Shell history in the child only; normal user profiles and history must never receive fixture commands.
         private static IntPtr CreateIsolatedGitEnvironment(string outputDirectory)
         {
             var variables = new System.Collections.Generic.SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -381,6 +417,13 @@ namespace Kerminal.SettingsParity
             variables["GIT_CONFIG_SYSTEM"] = "NUL";
             variables["GIT_ALLOW_PROTOCOL"] = "file";
             variables["GIT_TERMINAL_PROMPT"] = "0";
+            if (variables.TryGetValue("KERMINAL_SETTINGS_ACCEPTANCE_SCOPE", out var scope) && scope == "suggestions")
+            {
+                var profileRoot = System.IO.Path.Combine(outputDirectory, "config");
+                variables["USERPROFILE"] = profileRoot;
+                variables["APPDATA"] = System.IO.Path.Combine(profileRoot, "AppData", "Roaming");
+                variables["LOCALAPPDATA"] = System.IO.Path.Combine(profileRoot, "AppData", "Local");
+            }
             var block = new StringBuilder();
             foreach (var entry in variables)
                 block.Append(entry.Key).Append('=').Append(entry.Value).Append('\0');
@@ -503,18 +546,24 @@ function Assert-CaptureRecord {
 }
 
 function Assert-SettingsParityReport {
+    # 命令提示专项同时核对交互、原生截图和真实采样延迟，避免功能通过掩盖性能目标未达成。
     # 同步验收必须有本地 bare 仓库的成功、失败保留和恢复回读，页面截图不替代写入证据。
     # 核对页面、操作回读、截图清单及请求视口，避免默认尺寸掩盖窄窗验收未生效。
+    # 密集规则的确认框截图属于焦点流程的固定证据，必须登记并保留严格的完整清单校验。
+    # @author kongweiguang
     param(
         [Parameter(Mandatory = $true)]$Report,
         [Parameter(Mandatory = $true)][string]$RunRoot,
         [Parameter(Mandatory = $true)][int]$ProcessId,
         [Parameter(Mandatory = $true)][string]$DesktopName,
         [Parameter(Mandatory = $true)][int]$ExpectedWidth,
-        [Parameter(Mandatory = $true)][int]$ExpectedHeight
+        [Parameter(Mandatory = $true)][int]$ExpectedHeight,
+        [switch]$McpOnly,
+        [switch]$SuggestionsOnly,
+        [switch]$SshSuggestions
     )
 
-    if ($Report.schemaVersion -ne 4 -or $Report.captureMode -cne 'hidden_native_window') {
+    if ($Report.schemaVersion -ne 6 -or $Report.captureMode -cne 'hidden_native_window') {
         throw 'Settings parity report schema or capture mode is unsupported.'
     }
     if ($Report.captureBackend -cne 'gpui_window_render_to_image') {
@@ -533,10 +582,98 @@ function Assert-SettingsParityReport {
         [uint64]$nativeIsolation.processId -ne [uint64]$ProcessId) {
         throw 'The acceptance window was not proven hidden on its owned private desktop.'
     }
-    if ($Report.settingsModalGeneration -lt 1 -or
-        [double]$Report.windowWidth -ne $ExpectedWidth -or
+    if ([double]$Report.windowWidth -ne $ExpectedWidth -or
         [double]$Report.windowHeight -ne $ExpectedHeight) {
-        throw "The settings modal lifecycle or native viewport dimensions are invalid; expected ${ExpectedWidth}x${ExpectedHeight}."
+        throw "The native viewport dimensions are invalid; expected ${ExpectedWidth}x${ExpectedHeight}."
+    }
+    if ($SuggestionsOnly) {
+        # 终端专项没有打开设置弹窗；仍严格检查所有操作、主题和本轮截图。
+        $expectedChecks = @('history-recorded', 'ghost-at-cursor', 'native-tab-recovers', 'cursor-move-recovers', 'right-append-same-prompt',
+            'menu-inside-pane', 'enter-append-same-prompt', 'escape-suppresses',
+            'mouse-dismiss-keeps-input', 'mouse-append-same-prompt', 'mouse-accept-keeps-input')
+        $expectedSuggestionCaptures = 6
+        if ($SshSuggestions) {
+            $expectedSuggestionCaptures = 8
+            $expectedChecks += 'ssh-docker-prefix-suggestions'
+            $expectedChecks += 'ssh-next-prompt-recovers'
+            if ($Report.target -cne 'isolated-ssh' -or $Report.shell -cne 'Bash') {
+                throw 'The suggestion report did not use the isolated SSH Bash fixture.'
+            }
+        } elseif ($Report.target -cne 'local') {
+            throw 'The local suggestion report used an unexpected target.'
+        }
+        if ($Report.scope -cne 'suggestions' -or
+            ($Report.themes -join ',') -cne 'light,dark,system' -or
+            ($Report.checks -join ',') -cne ($expectedChecks -join ',') -or
+            @($Report.screenshots).Count -ne $expectedSuggestionCaptures) {
+            throw 'The suggestion-only report is incomplete.'
+        }
+        if (@($Report.warmCandidateLatency.samplesMs).Count -ne 20 -or
+            [double]$Report.warmCandidateLatency.p95Ms -le 0) {
+            throw 'The suggestion latency samples are incomplete.'
+        }
+        if (-not $SshSuggestions -and (
+            [double]$Report.warmCandidateLatency.targetMs -ne 200 -or
+            -not $Report.warmCandidateLatency.meetsTarget -or
+            [double]$Report.warmCandidateLatency.p95Ms -gt 200)) {
+            throw 'The suggestion warm candidate latency did not meet the 200 ms P95 target.'
+        }
+        $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($capture in $Report.screenshots) {
+            if (-not $names.Add([string]$capture.file)) {
+                throw "Duplicate suggestion capture: $($capture.file)"
+            }
+            Assert-CaptureRecord -Capture $capture -RunRoot $RunRoot
+        }
+        foreach ($theme in $script:ExpectedThemes) {
+            foreach ($kind in @('ghost', 'menu')) {
+                if (-not $names.Contains("suggestions-$kind-$theme.png")) {
+                    throw "The suggestion report is missing $kind for theme $theme."
+                }
+            }
+        }
+        if ($SshSuggestions) {
+            foreach ($file in @('suggestions-docker-ghost.png', 'suggestions-docker-menu.png')) {
+                if (-not $names.Contains($file)) {
+                    throw "The SSH suggestion report is missing the actual Docker prefix capture: $file."
+                }
+            }
+        }
+        return
+    }
+    if ($Report.settingsModalGeneration -lt 1) {
+        throw 'The settings modal lifecycle is invalid.'
+    }
+    if ($McpOnly) {
+        # 专项仍核对相同的隐藏桌面与尺寸证据，不能用局部截图冒充完整设置验收。
+        if ($Report.scope -cne 'mcp' -or $Report.themes.Count -ne 3 -or
+            ($Report.themes -join ',') -cne 'light,dark,system' -or
+            $Report.mcpChecks.Count -ne $script:ExpectedMcpActions.Count -or
+            $Report.draftChecks.Count -ne 5) {
+            throw 'The MCP-only report is incomplete.'
+        }
+        $expectedActions = @($script:ExpectedMcpActions) + @(
+            'mcp-occupied-port-keeps-retry',
+            'mcp-retry-reads-latest-and-copies-live-json',
+            'mcp-invalid-draft-allows-stop',
+            'mcp-invalid-port-prevents-start',
+            'mcp-corrected-draft-starts'
+        )
+        $checks = @($Report.mcpChecks) + @($Report.draftChecks)
+        for ($index = 0; $index -lt $expectedActions.Count; $index++) {
+            if (-not $checks[$index].passed -or $checks[$index].action -cne $expectedActions[$index]) {
+                throw "MCP native check failed or is missing: $($expectedActions[$index])"
+            }
+        }
+        foreach ($capture in $Report.screenshots) {
+            Assert-CaptureRecord -Capture $capture -RunRoot $RunRoot
+        }
+        foreach ($theme in $script:ExpectedThemes) {
+            if (@($Report.screenshots.file) -cnotcontains "settings-mcp-compact-$theme.png") {
+                throw "The MCP report is missing theme $theme."
+            }
+        }
+        return
     }
     if ($Report.themes.Count -ne $script:ExpectedThemes.Count) {
         throw 'The report does not contain all three theme captures.'
@@ -670,6 +807,60 @@ function Assert-SettingsParityReport {
         }
     }
 
+    # 真实终端配置、PTy 色盘和输入控件均需有本次运行的截图与持久化回读。
+    $terminalChecks = $Report.PSObject.Properties['terminalChecks']
+    if ($null -eq $terminalChecks -or @($terminalChecks.Value).Count -ne $script:ExpectedTerminalChecks.Count) {
+        throw 'The report does not contain the complete terminal settings checks.'
+    }
+    for ($index = 0; $index -lt $script:ExpectedTerminalChecks.Count; $index++) {
+        $check = $terminalChecks.Value[$index]
+        $expected = $script:ExpectedTerminalChecks[$index]
+        if (-not $check.passed -or $check.action -cne $expected.Action -or
+            [string]::IsNullOrWhiteSpace([string]$check.expected) -or
+            $check.expected -cne $check.observed -or $null -eq $check.capture -or
+            [string]$check.capture.file -cne $expected.File) {
+            throw "Terminal settings check failed: $($expected.Action)"
+        }
+        $null = $expectedCaptureNames.Add([string]$check.capture.file)
+        Assert-CaptureRecord -Capture $check.capture -RunRoot $RunRoot
+    }
+
+    # 快捷键回执同时验证录制取消和应用后新旧键的不同结果。
+    $shortcutChecks = $Report.PSObject.Properties['shortcutChecks']
+    if ($null -eq $shortcutChecks -or @($shortcutChecks.Value).Count -ne $script:ExpectedShortcutChecks.Count) {
+        throw 'The report does not contain the complete shortcut capture checks.'
+    }
+    for ($index = 0; $index -lt $script:ExpectedShortcutChecks.Count; $index++) {
+        $check = $shortcutChecks.Value[$index]
+        $expected = $script:ExpectedShortcutChecks[$index]
+        if (-not $check.passed -or $check.action -cne $expected.Action -or
+            [string]::IsNullOrWhiteSpace([string]$check.expected) -or
+            $check.expected -cne $check.observed -or $null -eq $check.capture -or
+            [string]$check.capture.file -cne $expected.File) {
+            throw "Shortcut capture check failed: $($expected.Action)"
+        }
+        $null = $expectedCaptureNames.Add([string]$check.capture.file)
+        Assert-CaptureRecord -Capture $check.capture -RunRoot $RunRoot
+    }
+
+    # 每项都必须同时有操作结果和属于当前运行的原生截图，缺任何一项都不能计为通过。
+    $keywordAdjustments = $Report.PSObject.Properties['keywordAdjustmentChecks']
+    if ($null -eq $keywordAdjustments -or @($keywordAdjustments.Value).Count -ne $script:ExpectedKeywordAdjustmentChecks.Count) {
+        throw 'The report does not contain the complete keyword layout and draft checks.'
+    }
+    for ($index = 0; $index -lt $script:ExpectedKeywordAdjustmentChecks.Count; $index++) {
+        $check = $keywordAdjustments.Value[$index]
+        $expected = $script:ExpectedKeywordAdjustmentChecks[$index]
+        if (-not $check.passed -or $check.action -cne $expected.Action -or
+            [string]::IsNullOrWhiteSpace([string]$check.expected) -or
+            $check.expected -cne $check.observed -or $null -eq $check.capture -or
+            [string]$check.capture.file -cne $expected.File) {
+            throw "Keyword layout or draft check failed: $($expected.Action)"
+        }
+        $null = $expectedCaptureNames.Add([string]$check.capture.file)
+        Assert-CaptureRecord -Capture $check.capture -RunRoot $RunRoot
+    }
+
     $syncChecks = $Report.PSObject.Properties['syncChecks']
     if ($null -eq $syncChecks -or @($syncChecks.Value).Count -ne $script:ExpectedSyncActions.Count) {
         throw 'The report does not contain the complete local Git sync lifecycle.'
@@ -716,10 +907,37 @@ function Assert-SettingsParityReport {
         }
     }
 
+    # 模板和本地主机的独立身份、快照与删除都必须有本轮回执，关键界面另保留截图。
+    $profileHostChecks = $Report.PSObject.Properties['profileHostChecks']
+    if ($null -eq $profileHostChecks -or @($profileHostChecks.Value).Count -ne $script:ExpectedProfileHostChecks.Count) {
+        throw 'The report does not contain the complete Profile-to-local-host lifecycle.'
+    }
+    for ($index = 0; $index -lt $script:ExpectedProfileHostChecks.Count; $index++) {
+        $check = $profileHostChecks.Value[$index]
+        $expected = $script:ExpectedProfileHostChecks[$index]
+        if (-not $check.passed -or $check.action -cne $expected.Action -or
+            [string]::IsNullOrWhiteSpace([string]$check.expected) -or $check.expected -cne $check.observed) {
+            throw "Profile-to-local-host lifecycle failed: $($expected.Action)"
+        }
+        if ($null -ne $expected.File) {
+            if ($null -eq $check.capture -or [string]$check.capture.file -cne $expected.File) {
+                throw "Profile-to-local-host capture missing: $($expected.Action)"
+            }
+            $null = $expectedCaptureNames.Add([string]$check.capture.file)
+            Assert-CaptureRecord -Capture $check.capture -RunRoot $RunRoot
+        } elseif ($null -ne $check.capture) {
+            throw "Unexpected Profile-to-local-host capture: $($expected.Action)"
+        }
+    }
+
     foreach ($fileName in @(
         'settings-opened.png',
+        'settings-functional-keyword-close-confirmation.png',
         'settings-functional-keyword-colors.png',
         'settings-functional-keyword-color-picker.png',
+        'settings-functional-keyword-summary-light.png',
+        'settings-functional-keyword-summary-dark.png',
+        'settings-functional-keyword-summary-system.png',
         'settings-functional-profile.png'
     )) {
         $null = $expectedCaptureNames.Add($fileName)
@@ -953,7 +1171,11 @@ $cleanupFailure = $null
 $evidenceFailure = $null
 $logMoveFailure = $null
 $configDirectoryRemoved = $false
+$previousAcceptanceScope = [Environment]::GetEnvironmentVariable('KERMINAL_SETTINGS_ACCEPTANCE_SCOPE', 'Process')
+$previousSshSuggestions = [Environment]::GetEnvironmentVariable('KERMINAL_SUGGESTIONS_ACCEPTANCE_SSH', 'Process')
 try {
+    [Environment]::SetEnvironmentVariable('KERMINAL_SETTINGS_ACCEPTANCE_SCOPE', $(if ($McpOnly) { 'mcp' } elseif ($SuggestionsOnly) { 'suggestions' } else { $null }), 'Process')
+    [Environment]::SetEnvironmentVariable('KERMINAL_SUGGESTIONS_ACCEPTANCE_SSH', $(if ($SshSuggestions) { '1' } else { $null }), 'Process')
     [void][IO.Directory]::CreateDirectory($runnerLogDirectory)
     $result = Invoke-HiddenAcceptanceProcess `
         -Executable $ExecutablePath `
@@ -1010,11 +1232,16 @@ try {
         -ProcessId $result.ProcessId `
         -DesktopName $result.DesktopName `
         -ExpectedWidth $Width `
-        -ExpectedHeight $Height
+        -ExpectedHeight $Height `
+        -McpOnly:$McpOnly `
+        -SuggestionsOnly:$SuggestionsOnly `
+        -SshSuggestions:$SshSuggestions
     $acceptancePassed = $true
 } catch {
     $acceptanceFailure = $_
 } finally {
+    [Environment]::SetEnvironmentVariable('KERMINAL_SETTINGS_ACCEPTANCE_SCOPE', $previousAcceptanceScope, 'Process')
+    [Environment]::SetEnvironmentVariable('KERMINAL_SUGGESTIONS_ACCEPTANCE_SSH', $previousSshSuggestions, 'Process')
     try {
         if (Test-Path -LiteralPath $runRoot) {
             Remove-IsolatedConfigDirectory -RunRoot $runRoot -ConfigDirectory $configDirectory

@@ -15,10 +15,11 @@ use kerminal_domain::{
         BroadcastAnalysis, BroadcastTarget, CommandHistoryEntry, CommandHistoryListRequest,
         CommandHistoryRecordRequest, CommandHistoryRecordResult, CommandHistorySource,
         CommandHistoryTarget, CommandSuggestionCandidate, CommandSuggestionFeedbackRequest,
-        CommandSuggestionRequest, CommandWorkflow, NormalizedCommandHistory, SnippetCatalogItem,
-        SnippetCatalogListRequest, SnippetCatalogOrigin, SnippetDefinition, SuggestionProviderKind,
-        WorkflowListRequest, WorkflowStepInput, WorkflowUpdateRequest, validate_history_context,
-        validate_workflow,
+        CommandSuggestionRequest, CommandSuggestionResult, CommandWorkflow,
+        NormalizedCommandHistory, SnippetCatalogItem, SnippetCatalogListRequest,
+        SnippetCatalogOrigin, SnippetDefinition, SuggestionProviderKind, SuggestionSourceState,
+        SuggestionSourceStatus, WorkflowListRequest, WorkflowStepInput, WorkflowUpdateRequest,
+        validate_history_context, validate_workflow,
     },
     identity::{HostId, PaneId, SessionId},
     preferences::ConfigRevision,
@@ -89,7 +90,10 @@ pub use submission::{
 };
 pub use suggestions::CompositeCommandSuggestionProvider;
 pub use suggestions::HistoryCommandSuggestionProvider;
-pub use terminal_suggestions::{TerminalSuggestionBatch, TerminalSuggestionQuery};
+pub use terminal_suggestions::{
+    TerminalSuggestionBatch, TerminalSuggestionProgress, TerminalSuggestionProgressPublisher,
+    TerminalSuggestionProgressSubscription, TerminalSuggestionQuery,
+};
 pub use versioned::VersionedCommandDefinition;
 pub use workflow_execution::{
     WorkflowExecution, WorkflowExecutionControl, WorkflowExecutionRequest, WorkflowProgressEvent,
@@ -165,6 +169,15 @@ pub trait CommandHistoryRepository: Send + Sync + 'static {
     /// 按已经约束过的过滤条件查询，结果按时间倒序并受 limit 限制。
     async fn list(&self, request: CommandHistoryListRequest)
     -> AppResult<Vec<CommandHistoryEntry>>;
+
+    /// 建议必须先按精确前缀过滤再截断；未实现的仓储显式降级，不能伪装为完整结果。
+    async fn list_prefix(
+        &self,
+        _request: CommandHistoryListRequest,
+        _prefix: String,
+    ) -> AppResult<Vec<CommandHistoryEntry>> {
+        Err(AppError::unsupported("命令历史前缀查询不可用"))
+    }
 
     /// 持久化安全 draft 并由存储层分配稳定 ID 与创建时间。
     async fn append(&self, draft: CommandHistoryDraft) -> AppResult<CommandHistoryEntry>;
@@ -299,12 +312,53 @@ pub trait CommandSuggestionProvider: Send + Sync + 'static {
     /// 声明此 provider 的限界范围，让应用组合器只调用配置选中的来源。
     fn supported_providers(&self) -> Vec<SuggestionProviderKind>;
 
+    /// 来源可按目标排除不适用的 adapter，避免将未执行的远端查询误报为成功。
+    fn supports_provider_target(
+        &self,
+        _provider: SuggestionProviderKind,
+        _target: CommandHistoryTarget,
+    ) -> bool {
+        true
+    }
+
     /// 根据明确 session 与输入前缀产生候选；token 让远端探测在取消时结束内部 I/O。
     async fn suggest(
         &self,
         request: CommandSuggestionRequest,
         cancellation: CancellationToken,
     ) -> AppResult<Vec<CommandSuggestionCandidate>>;
+
+    /// 可选进度接口保留旧 provider 的单批实现；聚合器可覆盖为按来源增量返回。
+    async fn suggest_with_progress(
+        &self,
+        request: CommandSuggestionRequest,
+        cancellation: CancellationToken,
+        updates: Option<tokio::sync::mpsc::Sender<CommandSuggestionResult>>,
+    ) -> AppResult<CommandSuggestionResult> {
+        let sources = self
+            .supported_providers()
+            .into_iter()
+            .filter(|provider| {
+                request
+                    .providers
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(provider))
+                    && self.supports_provider_target(*provider, request.target)
+            })
+            .map(|provider| SuggestionSourceStatus {
+                provider,
+                state: SuggestionSourceState::Ready,
+            })
+            .collect();
+        let result = CommandSuggestionResult {
+            candidates: self.suggest(request, cancellation).await?,
+            sources,
+        };
+        if let Some(updates) = updates {
+            let _ = updates.try_send(result.clone());
+        }
+        Ok(result)
+    }
 }
 
 /// 广播绑定显式指定 pane/session，切 Tab 不会把一条命令重定向到另一个终端。
@@ -410,13 +464,14 @@ fn request_has_remote_provider(
     request: &CommandSuggestionRequest,
     supported: &[SuggestionProviderKind],
 ) -> bool {
-    request
-        .providers
-        .as_deref()
-        .unwrap_or(supported)
-        .iter()
-        .copied()
-        .any(is_remote_suggestion_provider)
+    request.target == CommandHistoryTarget::Ssh
+        && request
+            .providers
+            .as_deref()
+            .unwrap_or(supported)
+            .iter()
+            .copied()
+            .any(is_remote_suggestion_provider)
 }
 
 /// 只将三类需要 SSH/SFTP 的来源纳入远端配置门禁，本地历史、片段和 spec 仍由请求方选择。
@@ -457,7 +512,9 @@ fn restrict_remote_providers_to_persisted_settings(
                         && settings.is_some_and(|settings| settings.providers.remote_command)
                 }
                 SuggestionProviderKind::Git => {
-                    remote_enabled && settings.is_some_and(|settings| settings.providers.git)
+                    request.target == CommandHistoryTarget::Local
+                        || (remote_enabled
+                            && settings.is_some_and(|settings| settings.providers.git))
                 }
                 _ => true,
             })

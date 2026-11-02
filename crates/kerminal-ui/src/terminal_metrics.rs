@@ -4,11 +4,11 @@
 
 use std::sync::{Arc, OnceLock};
 
-use gpui_kit::{FontWeight, Pixels, Point, SharedString, Window, point, px};
+use gpui_kit::{FontWeight, Pixels, Point, SharedString, TextStyle, Window, point, px};
 use kerminal_application::preferences::{
     TerminalCursorStyle, TerminalFontWeight, TerminalSettings,
 };
-use kerminal_terminal::snapshot::TerminalCursorShape;
+use kerminal_terminal::snapshot::{TerminalCursor, TerminalCursorShape};
 
 use crate::features::terminal_tools::selection::ViewportCell;
 
@@ -55,16 +55,22 @@ impl TerminalMetrics {
         }
     }
 
-    /// 用窗口文本系统测量固定宽度字形一次，后续渲染、resize、IME 与鼠标共享结果。
+    /// 正文、行内提示和网格测量必须共用字体与字重，并保留小数行高，不能继承 UI 文本的取整布局。
+    pub(crate) fn text_style(&self, window: &Window) -> TextStyle {
+        let mut style = window.text_style();
+        style.font_family = self.font_family.clone();
+        style.font_size = px(self.font_size).into();
+        style.line_height = px(self.line_height).into();
+        style.font_weight = font_weight(self.font_weight);
+        style
+    }
+
+    /// 用绘制同源的字体样式测量固定宽度字形一次，后续渲染、resize、IME 与鼠标共享结果。
     ///
     /// @author kongweiguang
     pub fn cell_width(&self, window: &mut Window) -> Pixels {
         let width = self.cell_width_cache.get_or_init(|| {
-            let mut style = window.text_style();
-            style.font_family = self.font_family.clone();
-            style.font_size = px(self.font_size).into();
-            style.line_height = px(self.line_height).into();
-            style.font_weight = font_weight(self.font_weight);
+            let style = self.text_style(window);
             window
                 .text_system()
                 .shape_line("M".into(), px(self.font_size), &[style.to_run(1)], None)
@@ -158,6 +164,17 @@ pub(crate) fn effective_cursor_shape(
     }
 }
 
+/// 默认闪烁由用户设置控制，终端明确要求常亮时保留协议意图；关闭设置总是常亮。
+///
+/// @author kongweiguang
+pub(crate) fn cursor_visible_in_phase(
+    cursor: &TerminalCursor,
+    blink_enabled: bool,
+    phase_visible: bool,
+) -> bool {
+    !blink_enabled || (cursor.blink_from_terminal && !cursor.blinking) || phase_visible
+}
+
 /// 先用 GPUI 返回的实际字体族解析配置；系统没有已知等宽字体时才退回通用族并记录限制。
 ///
 /// @author kongweiguang
@@ -168,6 +185,11 @@ fn resolve_font_family(configured: &str, installed_font_families: &[String]) -> 
             .find(|family| family.eq_ignore_ascii_case(candidate))
             .cloned()
     };
+
+    // 系统选择器保存的是完整族名；先精确匹配，避免族名中的逗号被当作旧 CSS 回退分隔符。
+    if let Some(family) = find_installed(configured.trim()) {
+        return family;
+    }
 
     for candidate in configured.split(',') {
         let candidate = candidate

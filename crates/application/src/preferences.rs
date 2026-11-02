@@ -41,7 +41,7 @@ pub use settings::{
 pub const CONFIG_GUIDE: &str = include_str!("../resources/config-guide.md");
 
 /// 配置指南的内容修订号；生成文件用它和正文摘要区分受管旧版与用户自定义文档。
-pub const CONFIG_GUIDE_REVISION: u32 = 13;
+pub const CONFIG_GUIDE_REVISION: u32 = 15;
 
 /// 启动时的指南状态，供 UI 明确告知应用已更新或保留了用户编辑内容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,8 +537,13 @@ fn profile_target(profile: TerminalProfile) -> LocalSessionTarget {
     }
 }
 
-/// 拒绝空白或过长 profile 字段，防止无意义配置和超大环境表进入文件。
+/// 模板不持有侧栏分组，并拒绝无意义命令与超大环境表进入文件。
+///
+/// @author kongweiguang
 fn validate_profile_draft(draft: &ProfileDraft) -> AppResult<()> {
+    if draft.sidebar_group_id.is_some() {
+        return Err(AppError::invalid("Profile 模板不支持主机分组"));
+    }
     if draft.name.trim().is_empty() || draft.name.len() > 256 || draft.name.contains('\0') {
         return Err(AppError::invalid("profile 名称不能为空或过长"));
     }

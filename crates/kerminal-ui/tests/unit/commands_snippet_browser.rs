@@ -2,23 +2,26 @@
 //!
 //! @author kongweiguang
 
+use std::collections::HashSet;
+
+use kerminal_application::AppError;
 use kerminal_application::commands::{
     SnippetCatalogCursor, SnippetCatalogRevision, SnippetCatalogSection,
     SnippetExecutionCatalogSnapshot,
 };
 use kerminal_domain::commands::{
-    SnippetCatalogOrigin, SnippetContextBinding, SnippetContextBindingKind, SnippetDefaultAction,
-    SnippetDefinition, SnippetPreferenceKey, SnippetRisk, SnippetScope, SnippetVariable,
-    SnippetVariableKind, SnippetVariableRenderStrategy,
+    SnippetCatalogItem, SnippetCatalogOrigin, SnippetContextBinding, SnippetContextBindingKind,
+    SnippetDefaultAction, SnippetDefinition, SnippetPreference, SnippetPreferenceKey, SnippetRisk,
+    SnippetScope, SnippetVariable, SnippetVariableKind, SnippetVariableRenderStrategy,
 };
 use kerminal_domain::preferences::ConfigRevision;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     PendingBuiltinSnippetCopy, SnippetInlinePreview, SnippetPreviewToggleAction,
-    copy_builtin_definition_to_user, is_exact_user_snippet_copy, is_snippet_search_shortcut,
-    pending_builtin_copy_matches_source, snippet_copy_snapshot_matches,
-    snippet_preview_copy_is_allowed,
+    clear_snippet_favorite_error, copy_builtin_definition_to_user, finish_snippet_favorite_request,
+    is_exact_user_snippet_copy, is_snippet_search_shortcut, pending_builtin_copy_matches_source,
+    record_snippet_favorite_error, snippet_copy_snapshot_matches, snippet_preview_copy_is_allowed,
 };
 use crate::features::commands::SnippetDraftValues;
 use crate::features::commands::snippet_browser::{
@@ -28,6 +31,201 @@ use crate::features::commands::snippet_browser::{
     snippet_page_matches_filter,
 };
 use kerminal_application::commands::VersionedCommandDefinition;
+
+/// 使用真实目录投影覆盖同名不同来源的收藏回执，避免测试依赖展示排序。
+///
+/// @author kongweiguang
+fn favorite_test_item(key: &SnippetPreferenceKey) -> SnippetCatalogItem {
+    SnippetCatalogItem {
+        id: key.snippet_id.clone(),
+        origin: key.origin,
+        title: key.snippet_id.clone(),
+        description: String::new(),
+        template: "echo ready".to_owned(),
+        category: "test".to_owned(),
+        pack: "test".to_owned(),
+        tags: Vec::new(),
+        scope: SnippetScope::Any,
+        platforms: Vec::new(),
+        shells: Vec::new(),
+        capabilities: Vec::new(),
+        risk: SnippetRisk::Inspect,
+        sensitive: false,
+        duration: String::new(),
+        default_action: SnippetDefaultAction::Insert,
+        variables: Vec::new(),
+        context_bindings: Vec::new(),
+        derived_from: None,
+        catalog_version: None,
+        command_spec: None,
+        owner: None,
+        tested_version: None,
+        source_name: None,
+        source_url: None,
+        deprecated: false,
+        favorite: false,
+        use_count: 0,
+        last_used_at_unix_ms: None,
+        sort_order: 0,
+        updated_at: String::new(),
+    }
+}
+
+/// 回执使用真实偏好类型，以检查来源和目标收藏值都与写入请求一致。
+///
+/// @author kongweiguang
+fn favorite_test_receipt(key: &SnippetPreferenceKey, favorite: bool) -> SnippetPreference {
+    SnippetPreference {
+        key: key.clone(),
+        favorite,
+        use_count: 0,
+        last_action: None,
+        last_used_at_unix_ms: None,
+    }
+}
+
+/// 并发收藏的结果不属于目录查询代次；筛选更换后仍必须接收两个精确回执。
+///
+/// @author kongweiguang
+#[test]
+fn favorite_receipts_survive_filter_replacement_and_parallel_completion() {
+    let builtin = SnippetPreferenceKey {
+        origin: SnippetCatalogOrigin::Builtin,
+        snippet_id: "same-id".to_owned(),
+    };
+    let user = SnippetPreferenceKey {
+        origin: SnippetCatalogOrigin::User,
+        snippet_id: "same-id".to_owned(),
+    };
+    let mut pending = HashSet::new();
+    assert!(pending.insert(builtin.clone()));
+    assert!(!pending.insert(builtin.clone()));
+    assert!(pending.insert(user.clone()));
+    let mut items = vec![favorite_test_item(&builtin), favorite_test_item(&user)];
+
+    let mut page_generation = 0;
+    let mut loading = false;
+    let mut cancellation = None;
+    let first = begin_snippet_page_request(
+        &mut page_generation,
+        1,
+        &mut loading,
+        &mut cancellation,
+        false,
+    )
+    .expect("first page request");
+    begin_snippet_page_request(
+        &mut page_generation,
+        2,
+        &mut loading,
+        &mut cancellation,
+        false,
+    )
+    .expect("replacement page request");
+    assert!(first.cancellation.is_cancelled());
+
+    assert!(
+        finish_snippet_favorite_request(
+            &mut pending,
+            &mut items,
+            &builtin,
+            true,
+            Ok(favorite_test_receipt(&builtin, true)),
+        )
+        .expect("builtin write is still pending")
+        .is_ok()
+    );
+    assert!(items[0].favorite);
+    assert!(!items[1].favorite);
+    assert!(pending.contains(&user));
+    let error = finish_snippet_favorite_request(
+        &mut pending,
+        &mut items,
+        &user,
+        true,
+        Err(AppError::infrastructure("preference store unavailable")),
+    )
+    .expect("user write is still pending")
+    .expect_err("the failed write must be surfaced");
+    assert_eq!(error.public_message(), "preference store unavailable");
+    assert!(!items[1].favorite);
+    assert!(pending.is_empty());
+    assert!(
+        finish_snippet_favorite_request(
+            &mut pending,
+            &mut items,
+            &builtin,
+            true,
+            Ok(favorite_test_receipt(&builtin, true)),
+        )
+        .is_none()
+    );
+}
+
+/// 错误来源或错误目标值的回执不能改变任何行，也不能留下永久忙碌状态。
+///
+/// @author kongweiguang
+#[test]
+fn favorite_receipt_requires_exact_identity_and_target_value() {
+    let builtin = SnippetPreferenceKey {
+        origin: SnippetCatalogOrigin::Builtin,
+        snippet_id: "same-id".to_owned(),
+    };
+    let user = SnippetPreferenceKey {
+        origin: SnippetCatalogOrigin::User,
+        snippet_id: "same-id".to_owned(),
+    };
+    for receipt in [
+        favorite_test_receipt(&user, true),
+        favorite_test_receipt(&builtin, false),
+    ] {
+        let mut pending = HashSet::from([builtin.clone()]);
+        let mut items = vec![favorite_test_item(&builtin), favorite_test_item(&user)];
+        assert!(
+            finish_snippet_favorite_request(&mut pending, &mut items, &builtin, true, Ok(receipt))
+                .expect("write is still pending")
+                .is_err()
+        );
+        assert!(pending.is_empty());
+        assert!(items.iter().all(|item| !item.favorite));
+    }
+}
+
+/// 多个片段的失败要同时保留；重试一项或其他功能更新状态时不能吞掉其余反馈。
+///
+/// @author kongweiguang
+#[test]
+fn favorite_errors_are_independent_and_preserve_unrelated_status() {
+    let first = SnippetPreferenceKey {
+        origin: SnippetCatalogOrigin::Builtin,
+        snippet_id: "first".to_owned(),
+    };
+    let second = SnippetPreferenceKey {
+        origin: SnippetCatalogOrigin::User,
+        snippet_id: "second".to_owned(),
+    };
+    let mut errors = Vec::new();
+    let mut status = None;
+    record_snippet_favorite_error(
+        &mut errors,
+        &mut status,
+        first.clone(),
+        "first failed".into(),
+    );
+    record_snippet_favorite_error(
+        &mut errors,
+        &mut status,
+        second.clone(),
+        "second failed".into(),
+    );
+    assert_eq!(status.as_deref(), Some("first failed；second failed"));
+    clear_snippet_favorite_error(&mut errors, &mut status, &first);
+    assert_eq!(status.as_deref(), Some("second failed"));
+    status = Some("another operation needs attention".to_owned());
+    clear_snippet_favorite_error(&mut errors, &mut status, &second);
+    assert_eq!(status.as_deref(), Some("another operation needs attention"));
+    assert!(errors.is_empty());
+}
 
 /// 同一已选片段只切换原位投影，运行变量草稿不触发跨片段保存门禁。
 ///

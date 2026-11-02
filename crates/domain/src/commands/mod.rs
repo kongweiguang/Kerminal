@@ -25,8 +25,8 @@ pub use snippet::{
 pub use suggestion::{
     CommandSuggestionActivation, CommandSuggestionCandidate, CommandSuggestionFeedbackAction,
     CommandSuggestionFeedbackRequest, CommandSuggestionReplacementRange, CommandSuggestionRequest,
-    CommandSuggestionSensitivity, SuggestionPresentation, SuggestionProviderKind,
-    SuggestionQueryMode,
+    CommandSuggestionResult, CommandSuggestionSensitivity, SuggestionPresentation,
+    SuggestionProviderKind, SuggestionQueryMode, SuggestionSourceState, SuggestionSourceStatus,
 };
 pub use workflow::{
     CommandWorkflow, CommandWorkflowStep, WorkflowListRequest, WorkflowRun, WorkflowRunState,

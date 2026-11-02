@@ -125,15 +125,20 @@ pub(super) fn refresh_profile_directory(root: &mut RootView, cx: &mut Context<Ro
     }
 }
 
-/// 同一快照统一驱动主题和运行态；应用配色独立于终端设置，保存回声也不重复提交终端操作。
+/// 同一快照统一驱动主题和运行态；旧浅深配置按实际外观只归并一次，保存回声不重复提交终端操作。
 ///
 /// @author kongweiguang
 pub(super) fn apply_snapshot(
     root: &mut RootView,
-    snapshot: SettingsSnapshot,
+    mut snapshot: SettingsSnapshot,
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) {
+    crate::features::preferences::legacy_terminal_theme::resolve_legacy_terminal_theme(
+        &mut snapshot,
+        window.appearance(),
+        cx,
+    );
     let palette_only = app_palette_only_update(root.settings_snapshot.as_ref(), &snapshot);
     let runtime = if palette_only {
         None
@@ -301,25 +306,13 @@ pub(super) fn interaction_policy(root: &RootView) -> Option<TerminalInteractionP
     interaction_policy_from_snapshot(root.settings_snapshot.as_ref())
 }
 
-/// 浅深配色分别保存；运行态按实际主题选择，避免设置按钮改变但终端仍读取旧通用色盘。
+/// 主题身份只有一份，浅深 palette 由实际应用外观选择，避免切换外观时换成另一主题。
 /// @author kongweiguang
 pub(super) fn terminal_scheme_for_snapshot(
     snapshot: &SettingsSnapshot,
-    appearance: gpui_kit::WindowAppearance,
+    _appearance: gpui_kit::WindowAppearance,
 ) -> kerminal_application::preferences::TerminalColorScheme {
-    let dark = match snapshot.theme_mode {
-        ThemeMode::Dark => true,
-        ThemeMode::Light => false,
-        ThemeMode::System => matches!(
-            appearance,
-            gpui_kit::WindowAppearance::Dark | gpui_kit::WindowAppearance::VibrantDark
-        ),
-    };
-    if dark {
-        snapshot.terminal.dark_color_scheme
-    } else {
-        snapshot.terminal.light_color_scheme
-    }
+    snapshot.terminal.color_scheme
 }
 
 /// 关键词只从已加载快照刷新各 pane；失败提示和旧规则保留由工具叶子统一负责。

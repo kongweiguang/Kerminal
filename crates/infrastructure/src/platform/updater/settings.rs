@@ -4,10 +4,16 @@
 
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cargo_packager_updater::{Config, WindowsConfig, WindowsUpdateInstallMode, url::Url};
+use minisign_verify::PublicKey;
 use semver::Version;
 
 use kerminal_application::{AppError, AppResult};
+
+#[cfg(windows)]
+#[path = "windows_install.rs"]
+mod windows_install;
 
 /// 统一限制请求时长和下载包上限，避免远端 metadata 导致无界运行或缓存。
 pub(super) const MAX_UPDATE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -22,6 +28,31 @@ pub struct UpdaterSettings {
 }
 
 impl UpdaterSettings {
+    /// 正式构建在装配时验证嵌入公钥，避免无效信任根让更新入口看似可用却永远验签失败。
+    ///
+    /// @author kongweiguang
+    pub fn from_release_config(
+        current_version: &str,
+        endpoint: &str,
+        public_key: &str,
+    ) -> AppResult<Self> {
+        let endpoint = Url::parse(endpoint).map_err(|_| AppError::invalid("更新地址格式无效"))?;
+        let decoded_key = STANDARD
+            .decode(public_key)
+            .map_err(|_| AppError::invalid("更新签名公钥格式无效"))?;
+        let key_text = std::str::from_utf8(&decoded_key)
+            .map_err(|_| AppError::invalid("更新签名公钥格式无效"))?;
+        PublicKey::decode(key_text).map_err(|_| AppError::invalid("更新签名公钥格式无效"))?;
+
+        Self::new(
+            current_version,
+            vec![endpoint],
+            public_key.to_owned(),
+            Duration::from_secs(120),
+            MAX_UPDATE_BYTES,
+        )
+    }
+
     /// 固定 HTTPS、SemVer、passive NSIS 与资源上限，使正式和测试端点走同一验证路径。
     pub fn new(
         current_version: &str,
@@ -80,15 +111,19 @@ impl UpdaterSettings {
         })
     }
 
-    /// 仅在 Linux AppImage 运行态启用原位替换，DEB 安装交由系统包管理器更新。
+    /// 只在可确认的正式安装形态启用更新，避免开发可执行文件触发用户安装器。
     pub fn supports_current_runtime() -> bool {
         #[cfg(target_os = "linux")]
         {
             std::env::var_os("APPIMAGE").is_some()
         }
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        #[cfg(target_os = "windows")]
         {
-            true
+            windows_install::is_current_install()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            is_current_macos_bundle()
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         {
@@ -120,6 +155,29 @@ impl UpdaterSettings {
     pub(super) const fn max_update_bytes(&self) -> u64 {
         self.max_update_bytes
     }
+}
+
+/// macOS 原位更新只接受应用包内的主程序，不把裸开发二进制解释为可替换的 bundle。
+#[cfg(target_os = "macos")]
+fn is_current_macos_bundle() -> bool {
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(macos) = executable.parent() else {
+        return false;
+    };
+    let Some(contents) = macos.parent() else {
+        return false;
+    };
+    executable
+        .file_name()
+        .is_some_and(|name| name == "kerminal")
+        && macos.file_name().is_some_and(|name| name == "MacOS")
+        && contents.file_name().is_some_and(|name| name == "Contents")
+        && contents
+            .parent()
+            .and_then(|bundle| bundle.extension())
+            .is_some_and(|extension| extension == "app")
 }
 
 /// 更新源在所有构建配置下都必须是无凭据 HTTPS。

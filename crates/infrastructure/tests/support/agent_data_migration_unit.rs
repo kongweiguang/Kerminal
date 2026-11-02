@@ -14,8 +14,14 @@ use kerminal_domain::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::plan_agent_migration;
 use crate::agents::FileAgentWorkspaceRepository;
+
+/// 旧 Agent 样本不含 Profile 映射；测试便捷入口留在 tests，生产规划只保留实际调用路径。
+///
+/// @author kongweiguang
+fn plan_agent_migration(root: &Path) -> kerminal_application::AppResult<Vec<super::FileEdit>> {
+    super::plan_agent_migration_with_profiles(root, &std::collections::BTreeMap::new())
+}
 
 /// 在临时根下写入当前 Store 可读取的 session.toml，并返回固定会话目录。
 ///
@@ -1385,4 +1391,112 @@ fn canonical_target_session_bytes_are_unchanged() {
         fs::read(path).expect("canonical bytes remain stable"),
         original
     );
+}
+
+/// 新版写入的权限字段必须能经过契约升级，且不能在清理旧运行态时丢失策略或注释。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn stored_permission_modes_migrate_without_changing_launch_policy() {
+    use kerminal_domain::agents::AgentLaunchPermissionMode;
+
+    for (mode, arguments, expected) in [
+        ("default", "--fixture", AgentLaunchPermissionMode::Default),
+        (
+            "skipPermissions",
+            "--dangerously-bypass-approvals-and-sandbox",
+            AgentLaunchPermissionMode::SkipPermissions,
+        ),
+    ] {
+        for status in ["active", "archived"] {
+            let temporary = tempfile::tempdir().expect("isolated permission migration root");
+            let root = temporary.path();
+            let id = "agent-migration-permission-fixture";
+            let session_root = write_session(root, id, status, "ready");
+            write_provider(&session_root, AgentProvider::Codex);
+            let path = session_root.join("session.toml");
+            let original = fs::read_to_string(&path)
+                .expect("synthetic session text")
+                .replace(
+                    "title = \"Migration fixture\"",
+                    &format!(
+                        "permission_mode = \"{mode}\" # retain permission choice\ntitle = \"Migration fixture\""
+                    ),
+                )
+                .replace("args = [\"--fixture\"]", &format!("args = [\"{arguments}\"]"));
+            fs::write(&path, &original).expect("session with explicit permission policy");
+
+            let edits = plan_agent_migration(root).expect("known permission field is migratable");
+            assert_eq!(edits.len(), usize::from(status == "active"));
+            assert_eq!(
+                fs::read(&path).expect("planner remains read-only"),
+                original.as_bytes()
+            );
+            for edit in &edits {
+                fs::write(root.join(&edit.relative_path), &edit.after)
+                    .expect("apply only to isolated fixture");
+            }
+            let after = fs::read_to_string(&path).expect("migrated session text");
+            assert!(after.contains(&format!(
+                "permission_mode = \"{mode}\" # retain permission choice"
+            )));
+            if status == "archived" {
+                assert_eq!(after, original);
+            }
+            let repository = FileAgentWorkspaceRepository::new(root.to_path_buf());
+            let snapshot = repository
+                .read_session(
+                    AgentSessionId::parse(id).expect("valid fixture identity"),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("ordinary reader accepts migrated permission metadata");
+            assert_eq!(snapshot.session.permission_mode, expected);
+            assert!(
+                plan_agent_migration(root)
+                    .expect("repeat migration is valid")
+                    .is_empty()
+            );
+        }
+    }
+}
+
+/// 接受新字段不能放宽权限校验；未知枚举和与真实 argv 冲突的声明均保留原件并拒绝迁移。
+///
+/// @author kongweiguang
+#[test]
+fn invalid_or_conflicting_permission_modes_block_migration_without_writes() {
+    for (mode, arguments) in [
+        ("futurePolicy", "--fixture"),
+        ("skipPermissions", "--fixture"),
+        ("default", "--dangerously-bypass-approvals-and-sandbox"),
+    ] {
+        let temporary = tempfile::tempdir().expect("isolated invalid permission root");
+        let root = temporary.path();
+        let id = "agent-migration-invalid-permission-fixture";
+        let session_root = write_session(root, id, "active", "ready");
+        let provider = write_provider(&session_root, AgentProvider::Codex);
+        let path = session_root.join("session.toml");
+        let original = fs::read_to_string(&path)
+            .expect("synthetic session text")
+            .replace(
+                "title = \"Migration fixture\"",
+                &format!("permission_mode = \"{mode}\"\ntitle = \"Migration fixture\""),
+            )
+            .replace(
+                "args = [\"--fixture\"]",
+                &format!("args = [\"{arguments}\"]"),
+            );
+        fs::write(&path, &original).expect("invalid permission fixture");
+
+        assert!(plan_agent_migration(root).is_err());
+        assert_eq!(
+            fs::read(&path).expect("source evidence remains"),
+            original.as_bytes()
+        );
+        assert_eq!(
+            fs::read(session_root.join("provider.toml")).expect("provider remains"),
+            provider
+        );
+    }
 }

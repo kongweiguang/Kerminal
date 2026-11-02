@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use gpui_kit::{AppContext as _, Context, PathPromptOptions, Window};
+use gpui_kit::{AppContext as _, Context, Entity, PathPromptOptions, Window};
 use kerminal_application::{
     AppError, AppResult,
     connections::RdpClientLifecycle,
@@ -22,11 +22,12 @@ use kerminal_domain::{
     },
 };
 
-use super::workspace_files::sftp_transfer_tab_for_host;
+use super::workspace_files::{FilesWorkspaceSelection, sftp_transfer_tab_for_host};
 use crate::features::connections::{
     ConnectionsEvent, HostFilePickerTarget, HostNavigationEvent, HostSessionProjection,
     HostSessionStatus,
 };
+use crate::features::files::{FilePaneSide, FilesPane};
 use crate::features::operations::ContainerPanelContext;
 use crate::features::workspace_controller::{WorkspaceControllerEffect, WorkspacePersistenceState};
 
@@ -57,13 +58,32 @@ pub(super) enum SftpNavigationReceiptDisposition {
     Missing,
 }
 
-/// 单一连接面板的 SFTP picker 保存回执只可回投到发起时的共享工作台实例。
+/// 单一连接面板的新建主机回执只可回投发起时的文件面板和侧别。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PendingSftpHostCreation {
     pub(super) request_id: String,
     pub(super) workbench_tab_id: TabId,
     pub(super) navigation_generation: u64,
     pub(super) saved_host: Option<(HostId, bool)>,
+    pub(super) origin: Option<FileSftpOrigin>,
+}
+
+/// 仅保存面板稳定身份和选择代次，不用全局活动主机代替实际发起者。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FileSftpOrigin {
+    pub(super) source: FilesWorkspaceSelection,
+    pub(super) pane_id: u64,
+    pub(super) side: FilePaneSide,
+    pub(super) generation: u64,
+    pub(super) navigation_generation: u64,
+}
+
+/// 主机密钥提示同一时间只有一个 owner，但左右各自的请求可以独立排队。
+#[derive(Clone, Debug)]
+pub(super) struct FileSftpSelectionRequest {
+    pub(super) request_id: String,
+    pub(super) host_id: HostId,
+    pub(super) origin: FileSftpOrigin,
 }
 
 /// 请求身份优先于导航校验；先到的旧回执不能消费新预检或覆盖其可见状态。
@@ -106,7 +126,7 @@ pub(super) fn sftp_transfer_tab_activation(
     }
 }
 
-/// 只有请求、共享工作台身份和中央导航代次都仍匹配时，保存完成才可启动自动预检。
+/// 新建主机只在原标签身份和导航代次均有效时启动自动预检。
 ///
 /// @author kongweiguang
 fn sftp_host_creation_source_is_current(
@@ -123,38 +143,378 @@ fn sftp_host_creation_source_is_current(
 }
 
 impl RootView {
-    /// 只允许共享文件工作台发起 SFTP 默认的新主机表单，并撤销表单背后的旧共享预检。
+    /// 按原工作区身份找回面板，不能让已关闭标签或新建面板继承旧选择请求。
+    ///
+    /// @author kongweiguang
+    fn file_sftp_origin_pane(&self, origin: &FileSftpOrigin) -> Option<Entity<FilesPane>> {
+        let pane = match &origin.source {
+            FilesWorkspaceSelection::Workbench => self.files_pane.clone(),
+            FilesWorkspaceSelection::TransferTab(tab_id) => self.workspace_files.files_pane(tab_id),
+        }?;
+        (pane.entity_id().as_u64() == origin.pane_id).then_some(pane)
+    }
+
+    /// 回执必须同时属于当前可见工作区、原侧和原选择代次，单独打开的标签也不能互相回投。
+    ///
+    /// @author kongweiguang
+    fn file_sftp_origin_is_current(&self, origin: &FileSftpOrigin, cx: &mut Context<Self>) -> bool {
+        self.center_panel == CenterPanel::Files
+            && self.surface_navigation_generation == origin.navigation_generation
+            && self.files_workspace_selection == origin.source
+            && match &origin.source {
+                FilesWorkspaceSelection::Workbench => self.shared_sftp_workbench_is_selected(),
+                FilesWorkspaceSelection::TransferTab(tab_id) => {
+                    self.nonterminal_workspace_tab_is_visible(tab_id)
+                }
+            }
+            && self.file_sftp_origin_pane(origin).is_some_and(|pane| {
+                pane.read(cx)
+                    .host_selection_is_current(origin.side, origin.generation)
+            })
+    }
+
+    /// 只接受当前中央视图发起的选择，不从活动终端或左栏所选主机推断来源。
+    ///
+    /// @author kongweiguang
+    fn capture_file_sftp_origin(
+        &self,
+        pane: &Entity<FilesPane>,
+        side: FilePaneSide,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) -> Option<FileSftpOrigin> {
+        let origin = FileSftpOrigin {
+            source: self.files_workspace_selection.clone(),
+            pane_id: pane.entity_id().as_u64(),
+            side,
+            generation,
+            navigation_generation: self.surface_navigation_generation,
+        };
+        self.file_sftp_origin_is_current(&origin, cx)
+            .then_some(origin)
+    }
+
+    /// 保留两侧独立意图；同侧新代次只替换对应排队或正在预检的旧目标。
+    ///
+    /// @author kongweiguang
+    pub(super) fn request_file_sftp_host(
+        &mut self,
+        pane: &Entity<FilesPane>,
+        side: FilePaneSide,
+        generation: u64,
+        host_id: HostId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(origin) = self.capture_file_sftp_origin(pane, side, generation, cx) else {
+            return;
+        };
+        self.enqueue_file_sftp_host(origin, host_id, cx);
+    }
+
+    /// 连接面板目前拥有一个指纹确认层；顺序执行预检而不取消另一侧的待处理请求。
+    ///
+    /// @author kongweiguang
+    fn enqueue_file_sftp_host(
+        &mut self,
+        origin: FileSftpOrigin,
+        host_id: HostId,
+        cx: &mut Context<Self>,
+    ) {
+        let same_side = |request: &FileSftpSelectionRequest| {
+            request.origin.pane_id == origin.pane_id && request.origin.side == origin.side
+        };
+        if self
+            .active_file_sftp_selection
+            .as_ref()
+            .is_some_and(|request| {
+                same_side(request)
+                    && request.origin.generation == origin.generation
+                    && request.host_id == host_id
+            })
+            || self.pending_file_sftp_selections.iter().any(|request| {
+                same_side(request)
+                    && request.origin.generation == origin.generation
+                    && request.host_id == host_id
+            })
+        {
+            return;
+        }
+        self.pending_file_sftp_selections
+            .retain(|request| !same_side(request));
+        let active_to_cancel = self
+            .active_file_sftp_selection
+            .as_ref()
+            .filter(|request| same_side(request))
+            .map(|request| request.request_id.clone());
+        self.pending_file_sftp_selections
+            .push_back(FileSftpSelectionRequest {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                host_id,
+                origin,
+            });
+        if let Some(request_id) = active_to_cancel
+            && let Some(panel) = self.connections_panel.clone()
+        {
+            panel.update(cx, |panel, cx| panel.cancel_sftp_selection(&request_id, cx));
+        }
+        self.advance_file_sftp_selections(cx);
+    }
+
+    /// 已消失的面板和过期代次在出队时跳过，避免把信任对话框投到后来打开的页面。
+    ///
+    /// @author kongweiguang
+    pub(super) fn advance_file_sftp_selections(&mut self, cx: &mut Context<Self>) {
+        if self.active_file_sftp_selection.is_some()
+            || self.connections_modal_open
+            || self.connection_prompt_modal_open
+        {
+            return;
+        }
+        while let Some(request) = self.pending_file_sftp_selections.pop_front() {
+            if !self.file_sftp_origin_is_current(&request.origin, cx) {
+                if let Some(pane) = self.file_sftp_origin_pane(&request.origin) {
+                    pane.update(cx, |pane, cx| {
+                        pane.cancel_host_selection(
+                            request.origin.side,
+                            request.origin.generation,
+                            cx,
+                        )
+                    });
+                }
+                continue;
+            }
+            let Some(panel) = self.connections_panel.clone() else {
+                if let Some(pane) = self.file_sftp_origin_pane(&request.origin) {
+                    pane.update(cx, |pane, cx| {
+                        pane.fail_host_selection(
+                            request.origin.side,
+                            request.origin.generation,
+                            crate::locale::text(
+                                "主机连接服务不可用。",
+                                "The host connection service is unavailable.",
+                            )
+                            .to_string(),
+                            cx,
+                        )
+                    });
+                }
+                continue;
+            };
+            self.active_file_sftp_selection = Some(request.clone());
+            panel.update(cx, |panel, cx| {
+                panel.request_sftp_selection(&request.host_id, request.request_id.clone(), cx);
+            });
+            return;
+        }
+    }
+
+    /// 页面离开时立即解除每侧等待；信任写入若已开始仍由连接面板等待回读后释放队列。
+    ///
+    /// @author kongweiguang
+    pub(super) fn cancel_file_sftp_selections(&mut self, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.pending_file_sftp_selections);
+        for request in pending {
+            if let Some(pane) = self.file_sftp_origin_pane(&request.origin) {
+                pane.update(cx, |pane, cx| {
+                    pane.cancel_host_selection(request.origin.side, request.origin.generation, cx)
+                });
+            }
+        }
+        if let Some(request) = self.active_file_sftp_selection.clone() {
+            if let Some(pane) = self.file_sftp_origin_pane(&request.origin) {
+                pane.update(cx, |pane, cx| {
+                    pane.cancel_host_selection(request.origin.side, request.origin.generation, cx)
+                });
+            }
+            if let Some(panel) = self.connections_panel.clone() {
+                panel.update(cx, |panel, cx| {
+                    panel.cancel_sftp_selection(&request.request_id, cx)
+                });
+            } else {
+                self.active_file_sftp_selection = None;
+            }
+        }
+    }
+
+    /// 切换或关闭一个主机标签只撤销该侧原代次，不打断另一侧排队的连接意图。
+    ///
+    /// @author kongweiguang
+    pub(super) fn cancel_file_sftp_selection(
+        &mut self,
+        pane: &Entity<FilesPane>,
+        side: FilePaneSide,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let matches = |request: &FileSftpSelectionRequest| {
+            request.origin.pane_id == pane.entity_id().as_u64()
+                && request.origin.side == side
+                && request.origin.generation == generation
+        };
+        self.pending_file_sftp_selections
+            .retain(|request| !matches(request));
+        if let Some(request_id) = self
+            .active_file_sftp_selection
+            .as_ref()
+            .filter(|request| matches(request))
+            .map(|request| request.request_id.clone())
+            && let Some(panel) = self.connections_panel.clone()
+        {
+            panel.update(cx, |panel, cx| panel.cancel_sftp_selection(&request_id, cx));
+        }
+    }
+
+    /// 只清理已确认关闭的传输标签所属请求，后台标签关闭不打断其他面板与侧别。
+    ///
+    /// @author kongweiguang
+    pub(super) fn cancel_file_sftp_selections_for_tab(
+        &mut self,
+        tab_id: &TabId,
+        cx: &mut Context<Self>,
+    ) {
+        let belongs_to_tab = |request: &FileSftpSelectionRequest| matches!(&request.origin.source, FilesWorkspaceSelection::TransferTab(id) if id == tab_id);
+        let mut cancelled = Vec::new();
+        self.pending_file_sftp_selections.retain(|request| {
+            if belongs_to_tab(request) {
+                cancelled.push(request.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(request) = self
+            .active_file_sftp_selection
+            .as_ref()
+            .filter(|request| belongs_to_tab(request))
+            .cloned()
+        {
+            cancelled.push(request.clone());
+            if let Some(panel) = self.connections_panel.clone() {
+                panel.update(cx, |panel, cx| {
+                    panel.cancel_sftp_selection(&request.request_id, cx)
+                });
+            } else {
+                self.active_file_sftp_selection = None;
+            }
+        }
+        for request in cancelled {
+            if let Some(pane) = self.file_sftp_origin_pane(&request.origin) {
+                pane.update(cx, |pane, cx| {
+                    pane.cancel_host_selection(request.origin.side, request.origin.generation, cx)
+                });
+            }
+        }
+    }
+
+    /// 快速打开与上下文主机链接只更新左栏选择和运维目标，保留当前中央工作区。
+    /// 目标失效时不打开空连接页；展开侧栏让真实选择或错误反馈可见。
+    ///
+    /// @author kongweiguang
+    pub(super) fn reveal_host_in_navigation(
+        &mut self,
+        host_id: &HostId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(navigation) = self.host_navigation.clone() else {
+            self.status = Some(crate::locale::text(
+                "主机导航尚未就绪，未能选择该主机。",
+                "Host navigation is unavailable, so the host was not selected.",
+            ));
+            cx.notify();
+            return false;
+        };
+        if self.host_sidebar_collapsed {
+            self.set_host_sidebar_collapsed(false, cx);
+        }
+        let selected = navigation.update(cx, |navigation, cx| {
+            navigation.select_host_from_external(host_id, cx)
+        });
+        if !selected {
+            self.status = Some(crate::locale::text(
+                "主机已不存在，请刷新列表后重试。",
+                "This host no longer exists. Refresh the list and try again.",
+            ));
+            cx.notify();
+        }
+        selected
+    }
+
+    /// 新建表单冻结当前文件面板与侧别；保存和模态关闭后仍需校验原工作区身份。
     ///
     /// @author kongweiguang
     pub(super) fn begin_create_sftp_host_from_workbench(
         &mut self,
+        pane: &Entity<FilesPane>,
+        side: FilePaneSide,
+        generation: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.shared_sftp_workbench_is_selected() {
+        let Some(origin) = self.capture_file_sftp_origin(pane, side, generation, cx) else {
             return false;
-        }
+        };
         let Some(panel) = self.connections_panel.clone() else {
             self.status = Some(crate::locale::text(
                 "主机连接服务尚未配置。",
                 "Host connection services are unavailable.",
             ));
+            pane.update(cx, |pane, cx| {
+                pane.fail_host_selection(
+                    side,
+                    generation,
+                    crate::locale::text(
+                        "主机连接服务不可用。",
+                        "The host connection service is unavailable.",
+                    )
+                    .to_string(),
+                    cx,
+                )
+            });
             cx.notify();
             return false;
         };
         if !self.prepare_connection_editor_modal(window, cx) {
+            pane.update(cx, |pane, cx| {
+                pane.fail_host_selection(
+                    side,
+                    generation,
+                    crate::locale::text(
+                        "连接编辑器暂不可用。",
+                        "The connection editor is unavailable.",
+                    )
+                    .to_string(),
+                    cx,
+                )
+            });
             return false;
         }
 
-        // 打开新建表单代表用户离开当前 endpoint 操作；旧共享预检不得在表单背后改绑。
-        self.surface_navigation_generation = self.surface_navigation_generation.wrapping_add(1);
+        // 表单只替代该侧未提交的选择；另侧请求可保留，待模态关闭后继续。
+        self.pending_file_sftp_selections.retain(|request| {
+            request.origin.pane_id != origin.pane_id || request.origin.side != origin.side
+        });
+        if let Some(request_id) = self
+            .active_file_sftp_selection
+            .as_ref()
+            .filter(|request| {
+                request.origin.pane_id == origin.pane_id && request.origin.side == origin.side
+            })
+            .map(|request| request.request_id.clone())
+        {
+            panel.update(cx, |panel, cx| panel.cancel_sftp_selection(&request_id, cx));
+        }
         self.pending_sftp_navigation = None;
         let request_id = uuid::Uuid::new_v4().to_string();
+        let source_tab_id = match &origin.source {
+            FilesWorkspaceSelection::Workbench => self.sftp_workbench_tab_id.clone(),
+            FilesWorkspaceSelection::TransferTab(tab_id) => tab_id.clone(),
+        };
         self.pending_sftp_host_creation = Some(PendingSftpHostCreation {
             request_id: request_id.clone(),
-            workbench_tab_id: self.sftp_workbench_tab_id.clone(),
+            workbench_tab_id: source_tab_id,
             navigation_generation: self.surface_navigation_generation,
             saved_host: None,
+            origin: Some(origin),
         });
         let started = panel.update(cx, |panel, cx| {
             panel.begin_create_sftp_host(request_id, window, cx)
@@ -166,6 +526,18 @@ impl RootView {
                 "连接编辑器正在处理其他草稿，暂时无法新建 SFTP 主机。",
                 "The connection editor is handling another draft and cannot start an SFTP host yet.",
             ));
+            pane.update(cx, |pane, cx| {
+                pane.fail_host_selection(
+                    side,
+                    generation,
+                    crate::locale::text(
+                        "连接编辑器正忙，请稍后重试。",
+                        "The connection editor is busy. Try again shortly.",
+                    )
+                    .to_string(),
+                    cx,
+                )
+            });
             cx.notify();
         }
         started
@@ -186,13 +558,27 @@ impl RootView {
             return;
         };
         let request_id = pending.request_id.clone();
+        let origin = pending.origin.clone();
+        let source_current = origin
+            .as_ref()
+            .is_some_and(|origin| self.file_sftp_origin_is_current(origin, cx));
+        let current_tab_id = self
+            .visible_workspace_tab_id()
+            .unwrap_or_else(|| self.sftp_workbench_tab_id.clone());
         if !sftp_host_creation_source_is_current(
             pending,
             &request_id,
-            &self.sftp_workbench_tab_id,
+            &current_tab_id,
             self.surface_navigation_generation,
-            self.shared_sftp_workbench_is_selected(),
+            source_current,
         ) {
+            if let Some(origin) = origin.as_ref()
+                && let Some(pane) = self.file_sftp_origin_pane(origin)
+            {
+                pane.update(cx, |pane, cx| {
+                    pane.cancel_host_selection(origin.side, origin.generation, cx)
+                });
+            }
             self.pending_sftp_host_creation = None;
             return;
         }
@@ -206,11 +592,27 @@ impl RootView {
                 "主机已保存，但未启用 SFTP；可稍后从主机选择器中打开其他主机。",
                 "The host was saved without SFTP enabled. You can choose another host from the picker.",
             ));
+            if let Some(origin) = origin.as_ref()
+                && let Some(pane) = self.file_sftp_origin_pane(origin)
+            {
+                pane.update(cx, |pane, cx| {
+                    pane.fail_host_selection(
+                        origin.side,
+                        origin.generation,
+                        crate::locale::text(
+                            "主机已保存，但未启用 SFTP。",
+                            "The host was saved without SFTP enabled.",
+                        )
+                        .to_string(),
+                        cx,
+                    )
+                });
+            }
             cx.notify();
             return;
         }
-        if let Some(panel) = self.connections_panel.clone() {
-            panel.update(cx, |panel, cx| panel.request_open_sftp_host(&host_id, cx));
+        if let Some(origin) = origin {
+            self.enqueue_file_sftp_host(origin, host_id, cx);
         } else {
             self.status = Some(crate::locale::text(
                 "主机已保存，但连接服务已关闭；请从选择器重新打开 SFTP。",
@@ -334,7 +736,7 @@ pub(super) fn handle_connections_event(
             true
         }
         ConnectionsEvent::ConnectLocalProfileRequested { profile_id } => {
-            // 本地主机仍由 ProfileService 按稳定 ProfileId 解析；不能把它伪装成远端 HostId。
+            // 历史字段名继续携带本地主机 ID；模板只供无显式 ID 的默认终端使用。
             root.selected_host_id = None;
             root.refresh_operations_panel_targets(cx);
             root.create_terminal_for_target(local_profile_target_request(profile_id), window, cx);
@@ -374,6 +776,15 @@ pub(super) fn handle_connections_event(
         }
         ConnectionsEvent::GroupRenameCancelled | ConnectionsEvent::GroupRenameSaved => {
             finish_group_rename_return(root, window, cx);
+            true
+        }
+        ConnectionsEvent::HostDeletionDismissed => {
+            finish_host_deletion_return(root, window, cx);
+            true
+        }
+        ConnectionsEvent::HostDeletionFinished { message } => {
+            root.status = Some(message.clone().into());
+            finish_host_deletion_return(root, window, cx);
             true
         }
         ConnectionsEvent::SftpOpenStarted { request_id } => {
@@ -419,8 +830,92 @@ pub(super) fn handle_connections_event(
                 .pending_sftp_host_creation
                 .as_ref()
                 .is_some_and(|pending| pending.request_id == *request_id)
+                && let Some(pending) = root.pending_sftp_host_creation.take()
+                && let Some(origin) = pending.origin
+                && let Some(pane) = root.file_sftp_origin_pane(&origin)
             {
-                root.pending_sftp_host_creation = None;
+                pane.update(cx, |pane, cx| {
+                    pane.cancel_host_selection(origin.side, origin.generation, cx)
+                });
+            }
+            true
+        }
+        ConnectionsEvent::SftpSelectionReady {
+            request_id,
+            endpoint,
+            initial_local_directory,
+        } => {
+            if !root
+                .active_file_sftp_selection
+                .as_ref()
+                .is_some_and(|request| &request.request_id == request_id)
+            {
+                return true;
+            }
+            let Some(request) = root.active_file_sftp_selection.take() else {
+                return true;
+            };
+            let current = root.file_sftp_origin_is_current(&request.origin, cx);
+            if let Some(pane) = root.file_sftp_origin_pane(&request.origin) {
+                pane.update(cx, |pane, cx| {
+                    if current {
+                        pane.complete_host_selection(
+                            request.origin.side,
+                            request.origin.generation,
+                            endpoint.clone(),
+                            initial_local_directory.clone(),
+                            cx,
+                        );
+                    } else {
+                        pane.cancel_host_selection(
+                            request.origin.side,
+                            request.origin.generation,
+                            cx,
+                        );
+                    }
+                });
+            }
+            root.advance_file_sftp_selections(cx);
+            true
+        }
+        ConnectionsEvent::SftpSelectionFinished {
+            request_id,
+            message,
+            interrupted,
+        } => {
+            if !root
+                .active_file_sftp_selection
+                .as_ref()
+                .is_some_and(|request| &request.request_id == request_id)
+            {
+                return true;
+            }
+            let Some(request) = root.active_file_sftp_selection.take() else {
+                return true;
+            };
+            let current = root.file_sftp_origin_is_current(&request.origin, cx);
+            if let Some(pane) = root.file_sftp_origin_pane(&request.origin) {
+                pane.update(cx, |pane, cx| {
+                    if current && let Some(message) = message {
+                        pane.fail_host_selection(
+                            request.origin.side,
+                            request.origin.generation,
+                            message.clone(),
+                            cx,
+                        );
+                    } else {
+                        pane.cancel_host_selection(
+                            request.origin.side,
+                            request.origin.generation,
+                            cx,
+                        );
+                    }
+                });
+            }
+            if *interrupted {
+                root.cancel_file_sftp_selections(cx);
+            } else {
+                root.advance_file_sftp_selections(cx);
             }
             true
         }
@@ -481,8 +976,17 @@ pub(super) fn handle_connections_event(
             cx.notify();
             true
         }
+        ConnectionsEvent::RdpStatusChanged { message } => {
+            root.status = Some(message.clone().into());
+            cx.notify();
+            true
+        }
         ConnectionsEvent::ExternalTargetReady { target } => {
             handle_external_target(root, target, window, cx)
+        }
+        ConnectionsEvent::ExternalTargetCancelled { host_id } => {
+            root.cancel_external_password_retry(host_id);
+            true
         }
     }
 }
@@ -528,6 +1032,9 @@ fn handle_external_target(
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) -> bool {
+    if let Some(handled) = root.resume_external_password_retry(target, window, cx) {
+        return handled;
+    }
     match &target.intent {
         ExternalLaunchIntent::SftpTransfer { .. } => handle_external_sftp(root, target, window, cx),
         ExternalLaunchIntent::SshTerminal { remote_command } => {
@@ -719,6 +1226,13 @@ fn handle_external_ssh_terminal(
 
     root.set_center_panel(CenterPanel::Terminal, window, cx);
     root.refresh_workspace_views(cx);
+    root.external_ssh_attempts.insert(
+        reservation.pane_id.clone(),
+        super::external_auth::ExternalSshAttempt {
+            target: target.clone(),
+            generation: reservation.generation,
+        },
+    );
     let opened = root.open_workspace_terminal_pane(
         super::terminal_open::WorkspaceTerminalOpenRequest {
             tab_id: reservation.tab_id,
@@ -740,6 +1254,7 @@ fn handle_external_ssh_terminal(
             ));
         }
         Err(error) => {
+            root.external_ssh_attempts.remove(&reservation.pane_id);
             let _ = root
                 .workspace_runtime
                 .mark_restore_failed(&reservation.pane_id);
@@ -1048,6 +1563,27 @@ fn finish_group_rename_return(
     cx: &mut Context<RootView>,
 ) {
     let return_panel = root.group_rename_return_surface.take();
+    let Some(return_panel) = group_rename_return_target(root.center_panel, return_panel) else {
+        return;
+    };
+    if root.center_panel != return_panel {
+        let files_selection = root.files_workspace_selection.clone();
+        root.set_center_panel(return_panel, window, cx);
+        if return_panel == CenterPanel::Files {
+            root.files_workspace_selection = files_selection;
+        }
+    }
+}
+
+/// 删除主机确认结束或取消后仅恢复原临时导航；用户已显式离开连接页时不抢回。
+///
+/// @author kongweiguang
+fn finish_host_deletion_return(
+    root: &mut RootView,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+) {
+    let return_panel = root.host_deletion_return_surface.take();
     let Some(return_panel) = group_rename_return_target(root.center_panel, return_panel) else {
         return;
     };
@@ -1463,7 +1999,7 @@ fn open_pinned_container(
 
 /// 路由主机与本地 Profile 意图；容器目标由活动终端绑定，不从左栏选择或覆盖。
 ///
-/// 主机单击只更新导航选择，不加载详情或替换中央工作区；详情由明确的查看或编辑动作打开。
+/// 主机单击只更新导航选择，不打开中央详情；配置操作由明确的编辑、复制或删除动作进入。
 /// 创建/重命名共享原工作区返回点，中心不再打开重复连接目录。
 /// 本地主机表单复用 ConnectionsPanel 的编辑器模态；连接与传输继续使用原有会话路径。
 /// 每次显式终端连接意图都会交给连接面板预检并创建独立会话，不因同主机已有 pane 而改为激活旧标签。
@@ -1479,10 +2015,6 @@ pub(super) fn handle_host_navigation_event(
     // 后来的侧栏操作优先；信任预检或终端就绪的迟到结果不能重开容器工具。
     root.pending_sidebar_container = None;
     match event {
-        HostNavigationEvent::OpenHostContainersRequested { host_id } => {
-            super::sidebar_containers::open_host(root, host_id.clone(), None, window, cx);
-            return;
-        }
         HostNavigationEvent::PinnedContainerDetailsRequested { stable_id } => {
             super::sidebar_containers::open_pinned_details(root, stable_id, window, cx);
             return;
@@ -1522,19 +2054,12 @@ pub(super) fn handle_host_navigation_event(
         // 忽略编辑中重复触发，避免重置分组草稿或覆盖原工作区返回点。
         return;
     }
+    let host_deletion_return_panel =
+        (matches!(event, HostNavigationEvent::DeleteHostRequested { .. })
+            && root.center_panel != CenterPanel::Connections)
+            .then_some(root.center_panel);
     match event {
         HostNavigationEvent::OpenSftpWorkbenchRequested => {
-            if root.files_pane.is_none() {
-                root.status = Some(crate::locale::text(
-                    "文件服务尚未配置，无法打开 SFTP 工作台。",
-                    "File services are unavailable, so the SFTP workbench cannot be opened.",
-                ));
-                cx.notify();
-                return;
-            }
-            if root.compact_host_drawer_open {
-                root.close_compact_drawer(window, cx);
-            }
             root.open_shared_sftp_workbench(window, cx);
             return;
         }
@@ -1571,8 +2096,7 @@ pub(super) fn handle_host_navigation_event(
                 return;
             }
         }
-        HostNavigationEvent::ShowHostDetailsRequested { .. }
-        | HostNavigationEvent::DeleteHostRequested { .. }
+        HostNavigationEvent::DeleteHostRequested { .. }
         | HostNavigationEvent::DeleteLocalProfileRequested { .. }
         | HostNavigationEvent::CreateGroupRequested
         | HostNavigationEvent::RenameGroupRequested { .. }
@@ -1583,8 +2107,13 @@ pub(super) fn handle_host_navigation_event(
         | HostNavigationEvent::PinnedContainerOpenRequested { .. }
         | HostNavigationEvent::PinnedContainerRemoveRequested { .. }
         | HostNavigationEvent::PinnedContainerDetailsRequested { .. }
-        | HostNavigationEvent::PinnedContainerFilesRequested { .. }
-        | HostNavigationEvent::OpenHostContainersRequested { .. } => {}
+        | HostNavigationEvent::PinnedContainerFilesRequested { .. } => {}
+    }
+
+    if let Some(return_panel) = host_deletion_return_panel
+        && root.center_panel == CenterPanel::Connections
+    {
+        root.host_deletion_return_surface = Some(return_panel);
     }
 
     let Some(panel) = root.connections_panel.clone() else {
@@ -1612,8 +2141,7 @@ pub(super) fn handle_host_navigation_event(
         | HostNavigationEvent::PinnedContainerOpenRequested { .. }
         | HostNavigationEvent::PinnedContainerRemoveRequested { .. }
         | HostNavigationEvent::PinnedContainerDetailsRequested { .. }
-        | HostNavigationEvent::PinnedContainerFilesRequested { .. }
-        | HostNavigationEvent::OpenHostContainersRequested { .. } => {}
+        | HostNavigationEvent::PinnedContainerFilesRequested { .. } => {}
         HostNavigationEvent::ConnectRequested { host_id } => {
             panel.request_connect_host(host_id, cx)
         }
@@ -1622,9 +2150,6 @@ pub(super) fn handle_host_navigation_event(
         }
         HostNavigationEvent::CreateSftpTransferTabRequested { host_id } => {
             panel.request_create_sftp_transfer_tab_host(host_id, cx)
-        }
-        HostNavigationEvent::ShowHostDetailsRequested { host_id } => {
-            panel.show_saved_host(host_id, cx)
         }
         HostNavigationEvent::EditHostRequested { host_id } => {
             panel.edit_saved_host(host_id, window, cx)

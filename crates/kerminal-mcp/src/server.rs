@@ -3,7 +3,6 @@
 //! @author kongweiguang
 
 use std::{
-    io::ErrorKind,
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -12,19 +11,25 @@ use std::{
 use axum::{
     Router,
     body::Body,
-    extract::{Request, State},
-    http::{HeaderMap, StatusCode, header::ORIGIN},
+    extract::{ConnectInfo, Request, State},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, ORIGIN},
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     serve,
 };
-use kerminal_application::{AppError, AppResult, PublicErrorCode, agents::AgentService};
+use kerminal_application::{
+    AppError, AppResult, PublicErrorCode, agents::AgentService, mcp_runtime::McpAccessToken,
+};
 use kerminal_domain::identity::AgentSessionId;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig,
     session::{SessionManager, local::LocalSessionManager},
     tower::StreamableHttpService,
 };
+use subtle::ConstantTimeEq;
 use tokio::{
     net::TcpListener,
     runtime::Handle,
@@ -36,7 +41,6 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{McpServices, protocol::KerminalMcpHandler};
 
 const DEFAULT_MCP_PORT: u16 = 37657;
-const MCP_PORT_SCAN_LIMIT: u16 = 64;
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// MCP 监听配置。端口 0 表示调用方显式请求系统分配可用端口。
@@ -46,10 +50,12 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
-    /// 仅接受旧版规范化后的 IPv4 loopback 地址，保持本地 MCP 的 Host 边界。
+    /// 只接受本机回环或显式局域网监听，不把任意公网地址当作可配置目标。
     pub fn new(bind_address: SocketAddr) -> AppResult<Self> {
-        if bind_address.ip() != Ipv4Addr::LOCALHOST {
-            return Err(AppError::invalid("MCP bind address must be loopback"));
+        if bind_address.ip() != Ipv4Addr::LOCALHOST && bind_address.ip() != Ipv4Addr::UNSPECIFIED {
+            return Err(AppError::invalid(
+                "MCP bind address must be loopback or all IPv4 interfaces",
+            ));
         }
         Ok(Self { bind_address })
     }
@@ -61,7 +67,7 @@ impl McpServerConfig {
 }
 
 impl Default for McpServerConfig {
-    /// 默认复用旧版 127.0.0.1:37657 入口，端口冲突时沿用向后扫描策略。
+    /// 缺省保持本机入口；用户明确选择的端口发生冲突时不静默改变端口。
     fn default() -> Self {
         Self {
             bind_address: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), DEFAULT_MCP_PORT),
@@ -79,12 +85,53 @@ impl McpServer {
         services: McpServices,
         config: McpServerConfig,
     ) -> AppResult<McpServerHandle> {
-        let listener = bind_listener(config.bind_address).await?;
+        Self::start_authorized(runtime, services, config, None, None).await
+    }
+
+    /// 局域网 listener 必须携带经过 Vault 读取的令牌；本机入口继续允许无令牌启动。
+    pub async fn start_with_token(
+        runtime: &Handle,
+        services: McpServices,
+        config: McpServerConfig,
+        token: McpAccessToken,
+    ) -> AppResult<McpServerHandle> {
+        Self::start_authorized(runtime, services, config, Some(token), None).await
+    }
+
+    /// 可注入预绑定 socket 与令牌，支持配置替换时先检查新端口而不释放旧 listener。
+    pub(crate) async fn start_authorized(
+        runtime: &Handle,
+        services: McpServices,
+        config: McpServerConfig,
+        token: Option<McpAccessToken>,
+        listener: Option<TcpListener>,
+    ) -> AppResult<McpServerHandle> {
+        let lan = config.bind_address.ip() == Ipv4Addr::UNSPECIFIED;
+        if lan && token.is_none() {
+            return Err(AppError::invalid("局域网 MCP 缺少访问令牌"));
+        }
+        let listener = match listener {
+            Some(listener) => listener,
+            None => bind_listener(config.bind_address).await?,
+        };
         let local_address = listener.local_addr().map_err(|error| {
             tracing::error!(%error, "failed to read MCP listener address");
             AppError::infrastructure("MCP listener address unavailable")
         })?;
-        let allowed_origin = format!("http://{local_address}");
+        let port = local_address.port();
+        let lan_addresses = if lan {
+            local_ipv4_addresses().await?
+        } else {
+            Vec::new()
+        };
+        let mut allowed_hosts = vec![
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+            "::1".to_owned(),
+        ];
+        allowed_hosts.extend(lan_addresses.iter().map(ToString::to_string));
+        let mut allowed_origins = vec![format!("http://127.0.0.1:{port}")];
+        allowed_origins.extend(lan_addresses.iter().map(|ip| format!("http://{ip}:{port}")));
 
         let cancellation = CancellationToken::new();
         let service_lifetimes = TaskTracker::new();
@@ -102,8 +149,8 @@ impl McpServer {
             sessions.clone(),
             StreamableHttpServerConfig::default()
                 .with_stateful_mode(true)
-                .with_allowed_hosts(["localhost", "127.0.0.1", "::1"])
-                .with_allowed_origins([allowed_origin.as_str()])
+                .with_allowed_hosts(allowed_hosts)
+                .with_allowed_origins(allowed_origins.clone())
                 .with_cancellation_token(cancellation.child_token()),
         );
         let router = Router::new()
@@ -113,22 +160,30 @@ impl McpServer {
                 inject_agent_session_scope,
             ))
             .layer(middleware::from_fn_with_state(
-                allowed_origin,
+                allowed_origins,
                 validate_mcp_origin,
+            ))
+            .layer(middleware::from_fn_with_state(
+                token.map(Arc::new),
+                authorize_remote_peer,
             ));
         let shutdown = cancellation.clone();
         let task = runtime.spawn(async move {
-            serve(listener, router)
-                .with_graceful_shutdown(shutdown.cancelled_owned())
-                .await
-                .map_err(|error| {
-                    tracing::error!(%error, "MCP HTTP server stopped with an error");
-                    AppError::infrastructure("MCP HTTP server failed")
-                })
+            serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "MCP HTTP server stopped with an error");
+                AppError::infrastructure("MCP HTTP server failed")
+            })
         });
 
         Ok(McpServerHandle {
-            endpoint: format!("http://{local_address}/mcp"),
+            endpoint: format!("http://127.0.0.1:{port}/mcp"),
+            lan_addresses,
             cancellation,
             task: Some(task),
             sessions,
@@ -140,29 +195,93 @@ impl McpServer {
 
 /// 先用唯一 listener origin 拦截不规范头，补齐 RMCP 对 malformed Origin 返回 400 的状态码差异。
 async fn validate_mcp_origin(
-    State(allowed_origin): State<String>,
+    State(allowed_origins): State<Vec<String>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if is_allowed_origin_header(request.headers(), &allowed_origin) {
+    if is_allowed_origin_header(request.headers(), &allowed_origins) {
         return next.run(request).await;
     }
     StatusCode::FORBIDDEN.into_response()
 }
 
 /// 接受无 Origin 的原生客户端，只允许单个精确匹配的浏览器 Origin，拒绝重复和逗号合并值。
-fn is_allowed_origin_header(headers: &HeaderMap, allowed_origin: &str) -> bool {
+fn is_allowed_origin_header(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
     let mut values = headers.get_all(ORIGIN).iter();
     match (values.next(), values.next()) {
         (None, None) => true,
-        (Some(value), None) => value.as_bytes() == allowed_origin.as_bytes(),
+        (Some(value), None) => allowed_origins
+            .iter()
+            .any(|allowed| value.as_bytes() == allowed.as_bytes()),
         _ => false,
     }
+}
+
+/// 只相信传输层记录的 TCP 对端；转发头不能把远端请求伪装为本机。
+async fn authorize_remote_peer(
+    State(token): State<Option<Arc<McpAccessToken>>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(ConnectInfo(peer)) = request.extensions().get::<ConnectInfo<SocketAddr>>() else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if is_authorized_peer(peer.ip(), request.headers(), token.as_deref()) {
+        next.run(request).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+/// 只有真实回环连接沿用原有免认证契约，远端必须提交唯一且匹配的 Bearer。
+fn is_authorized_peer(
+    peer: std::net::IpAddr,
+    headers: &HeaderMap,
+    token: Option<&McpAccessToken>,
+) -> bool {
+    if peer.is_loopback() {
+        return true;
+    }
+    token.is_some_and(|token| {
+        let mut headers = headers.get_all(AUTHORIZATION).iter();
+        match (headers.next(), headers.next()) {
+            (Some(value), None) => value
+                .to_str()
+                .ok()
+                .and_then(|value| value.split_once(' '))
+                .is_some_and(|(scheme, candidate)| {
+                    scheme.eq_ignore_ascii_case("Bearer")
+                        && bool::from(candidate.as_bytes().ct_eq(token.secret().as_bytes()))
+                }),
+            _ => false,
+        }
+    })
+}
+
+/// 仅发布本机网卡实际 IPv4 地址，去重后按稳定顺序供 Host 校验与复制使用。
+pub(crate) async fn local_ipv4_addresses() -> AppResult<Vec<Ipv4Addr>> {
+    tokio::task::spawn_blocking(|| {
+        let networks = sysinfo::Networks::new_with_refreshed_list();
+        let mut addresses = networks
+            .values()
+            .flat_map(|network| network.ip_networks())
+            .filter_map(|network| match network.addr {
+                std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses
+    })
+    .await
+    .map_err(|error| AppError::infrastructure_with_source("MCP 网卡地址读取失败", error))
 }
 
 /// 运行中的 MCP server 句柄；显式 shutdown 等待连接与 listener 有序停止。
 pub struct McpServerHandle {
     endpoint: String,
+    lan_addresses: Vec<Ipv4Addr>,
     cancellation: CancellationToken,
     task: Option<JoinHandle<AppResult<()>>>,
     sessions: Arc<LocalSessionManager>,
@@ -174,6 +293,11 @@ impl McpServerHandle {
     /// 返回本次实际绑定的全局 MCP endpoint，包含系统分配的真实端口。
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// 只暴露本次 listener 已加入 Host 白名单的实际网卡地址。
+    pub fn lan_addresses(&self) -> &[Ipv4Addr] {
+        &self.lan_addresses
     }
 
     /// 返回该 listener 的取消信号副本，使外部资源 owner 可同步停止接入且仍保留本句柄等待 join。
@@ -378,34 +502,15 @@ impl Drop for McpServerHandle {
     }
 }
 
-/// 保持旧版默认端口和有限冲突扫描，同时让显式端口 0 直接由系统分配。
-async fn bind_listener(bind_address: SocketAddr) -> AppResult<TcpListener> {
-    let requested_port = bind_address.port();
-    let attempts = if requested_port == 0 {
-        1
-    } else {
-        MCP_PORT_SCAN_LIMIT
-    };
-    for attempt in 0..attempts {
-        let port = requested_port
-            .checked_add(attempt)
-            .ok_or_else(|| AppError::invalid("MCP port range exhausted"))?;
-        let address = SocketAddr::new(bind_address.ip(), port);
-        match TcpListener::bind(address).await {
-            Ok(listener) => return Ok(listener),
-            Err(error) if error.kind() == ErrorKind::AddrInUse && attempt + 1 < attempts => {}
-            Err(error) => {
-                tracing::error!(%error, %address, "failed to bind MCP loopback listener");
-                return Err(AppError::infrastructure_with_source(
-                    "MCP listener bind failed",
-                    error,
-                ));
-            }
+/// 精确绑定用户选定端口；零只供隔离测试请求系统分配。
+pub(crate) async fn bind_listener(bind_address: SocketAddr) -> AppResult<TcpListener> {
+    TcpListener::bind(bind_address).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AddrInUse {
+            AppError::conflict("MCP 端口已被占用")
+        } else {
+            AppError::infrastructure_with_source("MCP listener bind failed", error)
         }
-    }
-    Err(AppError::conflict(
-        "MCP has no available loopback port in the configured range",
-    ))
+    })
 }
 
 #[cfg(test)]

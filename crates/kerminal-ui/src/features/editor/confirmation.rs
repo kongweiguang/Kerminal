@@ -262,6 +262,7 @@ impl FileEditorWorkspace {
                             .gap_2()
                             .child(
                                 Button::new("file-editor-reload-confirm")
+                                    .debug_selector(|| "rr-file-editor-reload-confirm".to_owned())
                                     .compact()
                                     .flex_shrink_0()
                                     .primary()

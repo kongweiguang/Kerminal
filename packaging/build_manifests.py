@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -208,8 +210,26 @@ def fingerprint(root: Path, relative: str, candidate: Path) -> tuple[int, str, s
     return size_bytes, digest.hexdigest(), included_paths
 
 
+def _signature_payload(contents: bytes) -> bytes:
+    """统一原始 minisign 与 cargo-packager 的 Base64 sidecar，保留被签名文本的原始字节。"""
+    if contents.startswith(b"untrusted comment:"):
+        payload = contents
+    else:
+        try:
+            payload = base64.b64decode(contents.strip(), validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ManifestError("签名 sidecar 不是有效的 minisign 或 Base64 文本") from error
+    if not payload.startswith(b"untrusted comment:") or b"\x00" in payload:
+        raise ManifestError("签名 sidecar 不是有效的 minisign 文本")
+    try:
+        payload.decode("ascii")
+    except UnicodeError as error:
+        raise ManifestError("签名 sidecar 不是 ASCII 文本") from error
+    return payload
+
+
 def read_signature(root: Path, relative: str | None) -> tuple[str | None, str | None, set[str]]:
-    """读取非空 ASCII minisign sidecar；密钥验证由单独的 verifier 完成。"""
+    """输出 SDK 所需的 Base64 签名，同时对原 sidecar 保留可复核的文件摘要。"""
     if relative is None:
         return None, None, set()
     normalized, path = safe_path(root, relative)
@@ -217,23 +237,35 @@ def read_signature(root: Path, relative: str | None) -> tuple[str | None, str | 
         raise ManifestError("签名 sidecar 必须是普通文件")
     try:
         signature_bytes = path.read_bytes()
-        content = signature_bytes.decode("ascii").strip()
-    except (OSError, UnicodeError) as error:
-        raise ManifestError("签名 sidecar 不存在或不是 ASCII 文本") from error
-    if not content or "\x00" in content:
-        raise ManifestError("签名 sidecar 为空或格式损坏")
+    except OSError as error:
+        raise ManifestError("签名 sidecar 不存在或无法读取") from error
+    if not signature_bytes or len(signature_bytes) > 16 * 1024:
+        raise ManifestError("签名 sidecar 为空或超过大小限制")
+    content = base64.b64encode(_signature_payload(signature_bytes)).decode("ascii")
     return content, hashlib.sha256(signature_bytes).hexdigest(), {normalized}
 
 
 def verify_signature(
     root: Path, artifact_path: Path, signature_path: Path, public_key: str, verifier: str
 ) -> None:
-    """使用 minisign 对 staging 中的原始产物做验签，失败时不泄漏签名正文。"""
-    command = [verifier, "-Vm", str(artifact_path), "-P", public_key, "-x", str(signature_path)]
+    """对原始产物验签；官方 CLI 接受原始文本而 updater 接受其 Base64 包装。"""
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        payload = _signature_payload(signature_path.read_bytes())
+        with tempfile.TemporaryDirectory(prefix="kerminal-signature-") as directory:
+            decoded_signature = Path(directory) / "signature.minisig"
+            decoded_signature.write_bytes(payload)
+            command = [
+                verifier,
+                "-Vm",
+                str(artifact_path),
+                "-P",
+                public_key,
+                "-x",
+                str(decoded_signature),
+            ]
+            result = subprocess.run(command, check=False, capture_output=True, text=True)
     except OSError as error:
-        raise ManifestError("找不到 minisign 验签程序") from error
+        raise ManifestError("无法读取签名或启动 minisign 验签程序") from error
     if result.returncode != 0:
         raise ManifestError("minisign 验签失败；已拒绝生成可安装更新元数据")
 
@@ -253,6 +285,18 @@ def _check_artifact_kind(kind: Any, platform: Any, arch: Any, path: str, candida
     return platform, arch, kind
 
 
+def github_asset_name(platform: str, arch: str, path: str, purpose: str | None = None) -> str:
+    """GitHub 资源是平铺文件；平台与架构前缀避免两个 macOS 归档互相覆盖。"""
+    name = f"{platform}-{arch}-{PurePosixPath(path).name}"
+    if purpose is not None:
+        if purpose not in {"new-updater", "legacy-tauri"}:
+            raise ManifestError("未知 updater 签名用途")
+        name += f".{purpose}.sig"
+    if len(name.encode("utf-8")) > 255 or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise ManifestError("GitHub Release 资源名包含不支持的字符或过长")
+    return name
+
+
 def validate_inventory(
     root: Path,
     inventory: Any,
@@ -262,8 +306,9 @@ def validate_inventory(
     legacy_public_key: str | None = None,
     verifier: str = "minisign",
     verify_crypto: bool = True,
+    github_release_assets: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """分别验证新旧 updater 信任根，再构造两个互不混用的 JSON 契约。"""
+    """分别验证两套信任根，并按目标分发布局生成互不混用的更新契约。"""
     if not isinstance(inventory, dict) or inventory.get("schemaVersion") != 1:
         raise ManifestError("artifact inventory schemaVersion 必须为 1")
     version = validate_version(inventory.get("version"))
@@ -449,7 +494,11 @@ def validate_inventory(
     tauri_platforms: dict[str, Any] = {}
     for key, artifact in sorted(new_updates.items()):
         platform_key = key
-        url = f"{base_url}/{quote(artifact.path, safe='/-._~')}"
+        publish_path = (
+            github_asset_name(artifact.platform, artifact.arch, artifact.path)
+            if github_release_assets else artifact.path
+        )
+        url = f"{base_url}/{quote(publish_path, safe='/-._~')}"
         cargo_platforms[platform_key] = {
             "url": url,
             "signature": artifact.signature,
@@ -459,7 +508,11 @@ def validate_inventory(
     for key, artifact in sorted(legacy_updates.items()):
         old_platform = "darwin" if artifact.platform == "macos" else artifact.platform
         old_key = f"{old_platform}-{artifact.arch}"
-        url = f"{base_url}/{quote(artifact.path, safe='/-._~')}"
+        publish_path = (
+            github_asset_name(artifact.platform, artifact.arch, artifact.path)
+            if github_release_assets else artifact.path
+        )
+        url = f"{base_url}/{quote(publish_path, safe='/-._~')}"
         tauri_platforms[old_key] = {"url": url, "signature": artifact.legacy_signature}
 
     expected_platforms = {
@@ -486,6 +539,7 @@ def validate_inventory(
 
     artifact_rows: list[dict[str, Any]] = []
     checksum_rows: list[dict[str, Any]] = []
+    github_names: set[str] = set()
     for artifact in sorted(artifacts, key=lambda item: (item.platform, item.arch, item.kind)):
         artifact_rows.append(
             {
@@ -505,6 +559,13 @@ def validate_inventory(
             }
         )
         checksum_rows.append({"fileName": artifact.path, "sha256": artifact.sha256})
+        if github_release_assets and artifact.kind != "app-bundle":
+            asset_name = github_asset_name(artifact.platform, artifact.arch, artifact.path)
+            if asset_name.casefold() in github_names:
+                raise ManifestError("GitHub Release 资源名发生冲突")
+            github_names.add(asset_name.casefold())
+            artifact_rows[-1]["githubAssetName"] = asset_name
+            checksum_rows[-1]["githubAssetName"] = asset_name
         for purpose, sidecar_path, sidecar_hash, sidecar_status in (
             (
                 "new-updater",
@@ -546,6 +607,15 @@ def validate_inventory(
                     }
                 )
                 checksum_rows.append({"fileName": sidecar_path, "sha256": sidecar_hash})
+                if github_release_assets:
+                    signature_name = github_asset_name(
+                        artifact.platform, artifact.arch, artifact.path, purpose
+                    )
+                    if signature_name.casefold() in github_names:
+                        raise ManifestError("GitHub Release 签名资源名发生冲突")
+                    github_names.add(signature_name.casefold())
+                    artifact_rows[-1]["githubAssetName"] = signature_name
+                    checksum_rows[-1]["githubAssetName"] = signature_name
             else:
                 existing_signature["signingPurpose"].append(purpose)
 
@@ -556,6 +626,8 @@ def validate_inventory(
         "signingClass": signing_class,
         "artifacts": artifact_rows,
     }
+    if github_release_assets:
+        artifact_manifest["distributionLayout"] = "github-release"
     checksums = {"schemaVersion": 1, "version": version, "artifacts": checksum_rows}
     return cargo_metadata, legacy_metadata, {"artifactManifest": artifact_manifest, "checksums": checksums}
 
@@ -641,6 +713,11 @@ def parse_arguments(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--legacy-public-key", help="旧 Tauri updater 的 minisign 公钥正文；不接受私钥")
     parser.add_argument("--minisign", default="minisign", help="minisign 可执行文件路径")
     parser.add_argument(
+        "--github-release-assets",
+        action="store_true",
+        help="为 GitHub Release 平铺资源生成带平台和架构的唯一文件名",
+    )
+    parser.add_argument(
         "--skip-signature-verification",
         action="store_true",
         help="仅用于产生带 .test 后缀的结构测试文件，不验证密码学签名",
@@ -676,6 +753,7 @@ def main(arguments: list[str] | None = None) -> int:
         legacy_public_key=options.legacy_public_key,
         verifier=options.minisign,
         verify_crypto=not options.skip_signature_verification,
+        github_release_assets=options.github_release_assets,
     )
     names = build_output_names(options.signing_class)
     output_values = {

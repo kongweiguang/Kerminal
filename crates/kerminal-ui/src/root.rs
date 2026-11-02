@@ -11,7 +11,9 @@ mod command_suggestions;
 mod connections;
 mod container_panel;
 mod context_projection;
+mod cursor_blink;
 mod custom_agent_manager;
+mod external_auth;
 mod keybinding_actions;
 mod keybinding_focus;
 mod keybindings;
@@ -27,11 +29,16 @@ mod right_rail_acceptance;
 #[cfg(feature = "right-rail-acceptance")]
 mod settings_acceptance;
 #[cfg(feature = "right-rail-acceptance")]
+mod suggestions_acceptance;
+#[cfg(feature = "right-rail-acceptance")]
 mod workbench_acceptance;
 #[cfg(feature = "right-rail-acceptance")]
 pub use self::right_rail_acceptance::RightRailAcceptanceShellSnapshot;
 #[cfg(feature = "right-rail-acceptance")]
 pub use self::settings_acceptance::SettingsAcceptanceState;
+#[cfg(feature = "right-rail-acceptance")]
+pub use self::suggestions_acceptance::SuggestionsAcceptanceState;
+mod history;
 #[cfg(feature = "right-rail-acceptance")]
 mod right_rail_acceptance_agent;
 #[cfg(feature = "right-rail-acceptance")]
@@ -53,6 +60,7 @@ mod session_reconnect;
 mod sidebar_containers;
 mod snippet_editor;
 mod split_target_picker;
+mod suggestion_overlay;
 mod tab_agent_panels;
 mod tab_tool_contents;
 #[cfg(feature = "acceptance-metrics")]
@@ -68,6 +76,8 @@ mod terminal_viewport;
 pub(crate) mod terminal_wheel;
 mod tool_panels;
 mod tool_rail_customizer;
+#[cfg(feature = "right-rail-acceptance")]
+pub(crate) mod transfer_workspace_acceptance;
 mod update_host_recovery;
 mod updates;
 #[cfg(target_os = "windows")]
@@ -78,6 +88,7 @@ mod workbench_layout;
 mod workbench_resize;
 mod workspace_broadcast;
 mod workspace_close;
+mod workspace_file_navigation;
 mod workspace_files;
 mod workspace_orphan_cleanup;
 mod workspace_render;
@@ -119,8 +130,8 @@ use kerminal_application::{
         ToolRailToolId,
     },
     sessions::{
-        SessionFilter, TerminalCommandAvailability, TerminalCommandContext, UiInputProjection,
-        UiSessionBinding, UiTerminalInputRequest,
+        SessionFilter, TerminalCommandContext, UiInputProjection, UiSessionBinding,
+        UiTerminalInputRequest,
     },
     workspace::{
         WorkspaceContainerRuntime, WorkspaceLocalMachineScope, WorkspaceMachineStatus,
@@ -559,7 +570,7 @@ enum TerminalTargetRequest {
     },
 }
 
-/// 初始标签只投影已加载的 Profile 名称；持久化目标仍保留稳定 ID，不从终端内容推断。
+/// 初始标签只投影已加载的本地主机或默认模板名称；持久化目标保留稳定 ID，不从终端内容推断。
 ///
 /// @author kongweiguang
 fn terminal_tab_title(
@@ -676,6 +687,8 @@ pub struct RootView {
     keybinding_focus: keybinding_focus::KeybindingFocusTracker<FocusHandle>,
     /// 输入建议候选只由桥接 controller 持有；缓存 context 仅用于绑定和 CAS 版本校验。
     terminal_command_suggestions: command_suggestions::TerminalCommandSuggestionBridge,
+    /// 等待会话 FIFO 空闲再发起只读 Shell 探测，避免探测按键插入尚未完成的用户输入。
+    pending_suggestion_snapshot: Option<(command_suggestions::TerminalSuggestionSnapshotJob, bool)>,
     terminal_command_contexts: HashMap<SessionId, CachedTerminalCommandContext>,
     /// 命令正文仅由同 binding 的 FIFO 输入 ACK 推进，不从终端渲染内容反推。
     command_line_projection: command_line_projection::CommandLineProjection,
@@ -703,6 +716,8 @@ pub struct RootView {
     connections_modal_generation: u64,
     /// 分组重命名开始时的中心工作区；离开连接页或显式导航后立即作废，防止迟到保存回执劫持导航。
     group_rename_return_surface: Option<CenterPanel>,
+    /// 主机删除确认临时占用的中心工作区；取消或结算后仅当连接页仍活动时恢复。
+    host_deletion_return_surface: Option<CenterPanel>,
     /// 操作/文件危险确认只保存当前 feature owner；表单基线与提交仍由该 Entity 持有。
     root_confirmation_owner: Option<RootConfirmationOwner>,
     tool_rail_customizer: Option<Entity<tool_rail_customizer::ToolRailCustomizer>>,
@@ -812,6 +827,8 @@ pub struct RootView {
     workspace_runtime: WorkspaceRuntime,
     /// 非终端 workspace tab 按稳定 TabId 持有文件面板和恢复状态。
     workspace_files: workspace_files::WorkspaceFileRuntime,
+    /// 资源或退出确认占用期间合并编辑器投影，解除门禁后再协调主导航。
+    editor_navigation_sync_pending: bool,
     /// 文件入口保存明确的展示来源，活动传输标签不会抢占共享 SFTP 工作台。
     files_workspace_selection: workspace_files::FilesWorkspaceSelection,
     /// 共享 SFTP 工作台使用窗口内固定身份，不进入工作区文档或独立传输资源生命周期。
@@ -829,6 +846,9 @@ pub struct RootView {
     pending_sftp_transfer_navigation: Option<connections::SftpNavigationRequest>,
     /// 仅工作台选择器的专用创建流程可在保存后回投；窗口重建不恢复此一次性意图。
     pending_sftp_host_creation: Option<connections::PendingSftpHostCreation>,
+    /// 双侧选择各自冻结来源；复用连接面板的单个信任通道依次处理。
+    pending_file_sftp_selections: VecDeque<connections::FileSftpSelectionRequest>,
+    active_file_sftp_selection: Option<connections::FileSftpSelectionRequest>,
     /// orphan session 的可见重试入口只投影 WorkspaceRuntime 中保留的实际资源 owner。
     workspace_orphan_cleanup_panel:
         Option<Entity<workspace_orphan_cleanup::WorkspaceOrphanCleanupPanel>>,
@@ -870,6 +890,7 @@ pub struct RootView {
     context_panel: Option<Entity<crate::features::context::ContextPanel>>,
     _context_panel_event_subscription: Option<gpui_kit::Subscription>,
     logs_view: Option<Entity<crate::features::commands::LogsView>>,
+    _logs_fill_subscription: Option<gpui_kit::Subscription>,
     tool_rail_operations_views:
         BTreeMap<ToolRailToolId, Entity<crate::features::operations::OperationsView>>,
     _tool_rail_operations_subscriptions: BTreeMap<ToolRailToolId, gpui_kit::Subscription>,
@@ -909,6 +930,9 @@ pub struct RootView {
     workspace_load_pending: bool,
     /// 一个外部 activation 同一时刻只跑一次，避免 IPC 重投并发创建重复临时连接。
     pending_external_activations: Vec<ExternalActivation>,
+    external_ssh_attempts: HashMap<PaneId, external_auth::ExternalSshAttempt>,
+    pending_external_password_offers: VecDeque<(PaneId, u64)>,
+    pending_external_password_retry: Option<external_auth::ExternalPasswordRetryTicket>,
     pending_quit_intent: Option<QuitIntent>,
     /// 准备失败仍属可用工作台；独立保存原错，直到用户取消或真正派发收尾。
     quit_preparation_failure: Option<SharedString>,
@@ -929,6 +953,8 @@ pub struct RootView {
     terminal_color_scheme: TerminalColorScheme,
     cursor_blink_enabled: bool,
     cursor_blink_phase_visible: bool,
+    /// 唯一窗口级时钟随 Root 释放，失焦时保持可见且不触发无效重绘。
+    cursor_blink_task: Option<gpui_kit::Task<()>>,
     pending_palette_update: Option<(TerminalPalette, usize, u64)>,
     palette_update_running: bool,
     /// 只让最新设置请求发布错误状态，旧重配失败不能覆盖后来成功的用户操作。
@@ -983,6 +1009,9 @@ impl RootView {
     ///
     /// @author kongweiguang
     pub(super) fn cancel_workspace_restore(&mut self, pane_id: &PaneId) {
+        self.external_ssh_attempts.remove(pane_id);
+        self.pending_external_password_offers
+            .retain(|(queued, _)| queued != pane_id);
         let generation = self.workspace_restore_generations.get(pane_id).copied();
         let owner_tab_id = self
             .pending_terminal_creation_owner
@@ -1825,7 +1854,6 @@ impl RootView {
             && cached.context.session_id == binding.session_id
             && cached.context.owner == binding.owner
             && cached.context.session_generation == binding.session_generation
-            && cached.context.availability == TerminalCommandAvailability::Available
             && cached.context.prompt_ready
             && !cached.context.alternate_screen)
             .then(|| cached.context.clone())
@@ -1891,7 +1919,149 @@ impl RootView {
         self._suggestion_menu_subscription = Some(subscription);
     }
 
-    /// 在 application executor 中运行可取消查询，主线程只接受仍为当前 generation 的结果。
+    /// 手动请求立即探测，自动请求在 FIFO 空闲后合并短时间输入；探测不复用旧命令行投影。
+    fn request_suggestion_snapshot(
+        &mut self,
+        binding: UiSessionBinding,
+        mode: SuggestionQueryMode,
+        immediate: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.is_active_suggestion_binding(&binding) {
+            return false;
+        }
+        let Some(job) = self
+            .terminal_command_suggestions
+            .begin_snapshot(binding.clone(), mode)
+        else {
+            return false;
+        };
+        self.suggestion_menu_binding = (mode == SuggestionQueryMode::Menu).then_some(binding);
+        self.pending_suggestion_snapshot = Some((job, immediate));
+        self.sync_suggestion_menu(cx);
+        self.start_pending_suggestion_snapshot(cx);
+        cx.notify();
+        true
+    }
+
+    /// 空闲 lane 合并 50ms 连续输入，为 Shell 读回和首帧留出响应预算；失败按同一绑定能力提示恢复。
+    fn start_pending_suggestion_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some((job, _)) = self.pending_suggestion_snapshot.as_ref() else {
+            return;
+        };
+        if !self
+            .terminal_command_suggestions
+            .snapshot_is_current(job.request_generation, &job.binding)
+            || !self.is_active_suggestion_binding(&job.binding)
+        {
+            self.pending_suggestion_snapshot = None;
+            return;
+        }
+        if !self.session_commands.is_idle(&job.binding.session_id) {
+            return;
+        }
+        let Some((job, immediate)) = self.pending_suggestion_snapshot.take() else {
+            return;
+        };
+        let binding = job.binding.clone();
+        let io_binding = binding.clone();
+        let generation = job.request_generation;
+        let executor = self.services.executor.clone();
+        let sessions = self.services.sessions.clone();
+        cx.spawn(async move |this, cx| {
+            if !immediate {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+            }
+            if job.cancellation.is_cancelled() {
+                return;
+            }
+            let result = executor
+                .run_cancellable(job.cancellation, move |cancellation| async move {
+                    let snapshot_result: kerminal_application::AppResult<_> = async {
+                        let snapshot = sessions
+                            .request_shell_editing_snapshot(io_binding.clone(), cancellation)
+                            .await?;
+                        let context = sessions
+                            .terminal_command_context(io_binding.session_id.clone())
+                            .await?;
+                        Ok((snapshot, context))
+                    }
+                    .await;
+                    let availability = if snapshot_result.is_err() {
+                        sessions.shell_editing_availability(io_binding).await.ok()
+                    } else {
+                        None
+                    };
+                    Ok((snapshot_result, availability))
+                })
+                .await;
+            let _ = this.update(cx, |root, cx| {
+                if !root
+                    .terminal_command_suggestions
+                    .snapshot_is_current(generation, &binding)
+                    || !root.is_active_suggestion_binding(&binding)
+                {
+                    return;
+                }
+                if !root.session_commands.is_idle(&binding.session_id) {
+                    let mode = root.terminal_command_suggestions.active_mode();
+                    root.request_suggestion_snapshot(binding.clone(), mode, immediate, cx);
+                    return;
+                }
+                match result {
+                    Ok((Ok((snapshot, context)), _))
+                        if snapshot.binding == binding
+                            && snapshot.context == context.version()
+                            && root
+                                .command_line_projection
+                                .seed_shell_snapshot(&snapshot, &context) =>
+                    {
+                        root.terminal_command_contexts.insert(
+                            binding.session_id.clone(),
+                            CachedTerminalCommandContext {
+                                binding: binding.clone(),
+                                context: context.clone(),
+                            },
+                        );
+                        if let Some(job) = root
+                            .terminal_command_suggestions
+                            .snapshot_received(generation, &context, snapshot)
+                        {
+                            root.sync_suggestion_menu(cx);
+                            root.run_terminal_suggestion_job(job, cx);
+                        } else {
+                            root.terminal_command_suggestions
+                                .snapshot_failed(generation, &binding, None);
+                        }
+                    }
+                    Ok((Err(kerminal_application::AppError::Invalid { context }), _))
+                        if context == kerminal_application::sessions::SHELL_EDITING_INPUT_TOO_LONG_CONTEXT =>
+                    {
+                        root.terminal_command_suggestions
+                            .snapshot_input_too_long(generation, &binding);
+                    }
+                    Ok((_, availability)) => {
+                        root.terminal_command_suggestions.snapshot_failed(
+                            generation,
+                            &binding,
+                            availability,
+                        );
+                    }
+                    Err(_) => {
+                        root.terminal_command_suggestions
+                            .snapshot_failed(generation, &binding, None);
+                    }
+                }
+                root.sync_suggestion_menu(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 在 application executor 中运行可取消查询，主线程仅应用当前快照的增量及最终结果。
     fn run_terminal_suggestion_job(
         &mut self,
         job: command_suggestions::TerminalSuggestionJob,
@@ -1904,10 +2074,38 @@ impl RootView {
             return;
         };
         let executor = self.services.executor.clone();
+        let (updates, mut receiver) =
+            kerminal_application::commands::TerminalSuggestionProgressPublisher::channel();
         cx.spawn(async move |this, cx| {
-            let result =
-                command_suggestions::TerminalCommandSuggestionBridge::run(job, executor, commands)
-                    .await;
+            while let Some(progress) = receiver.recv().await {
+                if this
+                    .update(cx, |root, cx| {
+                        if root
+                            .terminal_command_suggestions
+                            .is_request_current(generation)
+                            && root
+                                .terminal_command_suggestions
+                                .apply_progress(progress, false)
+                        {
+                            root.sync_suggestion_menu(cx);
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let result = command_suggestions::TerminalCommandSuggestionBridge::run(
+                job,
+                executor,
+                commands,
+                Some(updates),
+            )
+            .await;
             let _ = this.update(cx, |root, cx| {
                 if !root
                     .terminal_command_suggestions
@@ -1916,8 +2114,9 @@ impl RootView {
                     return;
                 }
                 match result {
-                    Ok(batch) => {
-                        root.terminal_command_suggestions.apply_batch(batch);
+                    Ok(progress) => {
+                        root.terminal_command_suggestions
+                            .apply_progress(progress, true);
                     }
                     Err(_) => {
                         root.terminal_command_suggestions.fail_request(generation);
@@ -1950,22 +2149,23 @@ impl RootView {
         let Some(binding) = self.suggestion_menu_binding.clone() else {
             return;
         };
-        let Some(context) = self.suggestion_context_for_binding(&binding) else {
+        if !self.is_active_suggestion_binding(&binding) {
             self.terminal_command_suggestions.clear();
             self.suggestion_menu_binding = None;
             self.sync_suggestion_menu(cx);
             return;
-        };
+        }
         match event {
             command_suggestions::TerminalCommandSuggestionMenuEvent::Dismiss {
                 request_generation,
             } if self
                 .terminal_command_suggestions
-                .is_request_current(*request_generation) =>
+                .is_menu_projection_current(*request_generation) =>
             {
                 self.terminal_command_suggestions.dismiss_menu();
                 self.suggestion_menu_binding = None;
                 self.sync_suggestion_menu(cx);
+                cx.notify();
             }
             command_suggestions::TerminalCommandSuggestionMenuEvent::Retry {
                 request_generation,
@@ -1973,11 +2173,7 @@ impl RootView {
                 .terminal_command_suggestions
                 .is_request_current(*request_generation) =>
             {
-                if let Some(job) = self.terminal_command_suggestions.request_menu(&context) {
-                    self.suggestion_menu_binding = Some(binding);
-                    self.sync_suggestion_menu(cx);
-                    self.run_terminal_suggestion_job(job, cx);
-                }
+                self.request_suggestion_snapshot(binding, SuggestionQueryMode::Menu, true, cx);
             }
             command_suggestions::TerminalCommandSuggestionMenuEvent::Accept {
                 request_generation,
@@ -1987,6 +2183,9 @@ impl RootView {
                 .terminal_command_suggestions
                 .is_request_current(*request_generation) =>
             {
+                let Some(context) = self.suggestion_context_for_binding(&binding) else {
+                    return;
+                };
                 if !self.session_commands.is_idle(&binding.session_id) {
                     self.status = Some("终端仍有输入等待写入，请稍后接受建议。".into());
                     cx.notify();
@@ -2008,6 +2207,8 @@ impl RootView {
                 {
                     if let Some(commands) = self.commands_view.as_ref() {
                         commands.update(cx, |view, cx| view.select_snippets(cx));
+                        self.cancel_visible_transfer_preparation(cx);
+                        self.cancel_file_sftp_selections(cx);
                         self.surface_navigation_generation =
                             self.surface_navigation_generation.wrapping_add(1);
                         self.center_panel = CenterPanel::Commands;
@@ -2017,6 +2218,12 @@ impl RootView {
                         self.refresh_active_suggestion_context(cx);
                         cx.notify();
                     }
+                    return;
+                }
+                if acceptance.shell_snapshot.is_none() {
+                    self.terminal_command_suggestions.clear();
+                    self.suggestion_menu_binding = None;
+                    self.sync_suggestion_menu(cx);
                     return;
                 }
                 let Some(request) = self.terminal_command_suggestions.acceptance_input_request(
@@ -2062,7 +2269,9 @@ impl RootView {
         mode: SuggestionQueryMode,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.session_commands.is_idle(&binding.session_id) {
+        if acceptance.shell_snapshot.is_none()
+            || !self.session_commands.is_idle(&binding.session_id)
+        {
             self.terminal_command_suggestions.clear();
             self.suggestion_menu_binding = None;
             self.sync_suggestion_menu(cx);
@@ -2098,6 +2307,7 @@ impl RootView {
     /// 搜索控件作为 Canvas 的绝对定位子层挂载，避免显隐或错误反馈改动 PTY 行列测量。
     /// 原位重启期间保留画面但不重新安装旧代次输入，直到新连接完成身份核对。
     /// Tab 覆盖仅在画布真实聚焦时启用，使终端补全与搜索框的焦点导航各归其主。
+    /// 行内后缀只占光标到 pane 右缘的剩余宽度，窄分屏时裁切而不覆盖相邻工具。
     ///
     /// @author kongweiguang
     fn render_workspace_pane(
@@ -2192,9 +2402,19 @@ impl RootView {
         let ime_composing = input_handler
             .as_ref()
             .is_some_and(|input| input.read(cx).is_composing());
-        let blink_visible = !self.cursor_blink_enabled
-            || !snapshot.cursor.blinking
-            || self.cursor_blink_phase_visible;
+        let selection_gesture_active = input_handler.as_ref().is_some_and(|input| {
+            tools
+                .read(cx)
+                .has_active_selection_gesture(input.read(cx).binding())
+        });
+        let selection_update_pending =
+            terminal_tools_runtime::resolve_owner(self, &tools, &session_id, cx)
+                .is_some_and(|owner| self.terminal_tools_runtime.selection_may_be_present(&owner));
+        let suggestion_anchor_available = suggestion_overlay::anchor_available(
+            &snapshot,
+            selection_gesture_active || selection_update_pending,
+        );
+        let blink_visible = !self.cursor_blink_enabled || self.cursor_blink_phase_visible;
         let right_click_behavior = self
             .settings_snapshot
             .as_ref()
@@ -2228,11 +2448,14 @@ impl RootView {
         );
         let mut canvas_region = div()
             .id(format!("workspace-terminal-canvas-{}", pane_id.as_str()))
+            // 普通 Div 的 ElementId 不进入 Kit 观察树；验收从实际布局定位输入区域。
+            .debug_selector(|| format!("workspace-terminal-canvas-{}", pane_id.as_str()))
             .size_full()
             .flex_1()
             .relative()
             .min_w(px(0.))
             .min_h(px(0.))
+            .overflow_hidden()
             .bg(terminal_background_color(snapshot.palette).opacity(terminal_body_opacity));
         if input_handler.is_none() {
             let click_tab_id = tab_id.clone();
@@ -2298,33 +2521,38 @@ impl RootView {
                 .inline_ghost()
                 .filter(|ghost| &ghost.binding == binding)
         });
-        let show_suggestion_overlays = keybinding_focus::suggestion_overlays_visible(
-            ime_composing,
-            menu_matches_binding,
-            inline_ghost.is_some(),
-        );
+        let show_suggestion_overlays = suggestion_anchor_available
+            && keybinding_focus::suggestion_overlays_visible(
+                ime_composing,
+                menu_matches_binding,
+                inline_ghost.is_some(),
+            );
         if show_suggestion_overlays
             && menu_matches_binding
             && let Some(menu) = self.suggestion_menu.as_ref()
         {
-            canvas_region = canvas_region.child(
-                div()
-                    .id(format!("suggestion-menu-{}", pane_id.as_str()))
-                    .absolute()
-                    .top(px(12.))
-                    .right(px(12.))
-                    .child(menu.clone()),
+            canvas_region = canvas_region.child(suggestion_overlay::anchored_menu(
+                menu.clone(),
+                snapshot.cursor,
+                self.terminal_metrics.clone(),
+            ));
+        } else if show_suggestion_overlays
+            && !suggestion_overlay::has_native_prediction(&snapshot)
+            && let Some(ghost) = inline_ghost
+        {
+            let foreground = snapshot.palette.dim_foreground;
+            let color = gpui_kit::rgb(
+                u32::from(foreground.red) << 16
+                    | u32::from(foreground.green) << 8
+                    | u32::from(foreground.blue),
             );
-        } else if show_suggestion_overlays && let Some(ghost) = inline_ghost {
-            canvas_region = canvas_region.child(
-                div()
-                    .id(format!("suggestion-ghost-{}", pane_id.as_str()))
-                    .absolute()
-                    .bottom(px(30.))
-                    .left(px(12.))
-                    .text_color(ThemeTokens::current(window, cx).muted)
-                    .child(ghost.text),
-            );
+            canvas_region = canvas_region.child(suggestion_overlay::inline_ghost(
+                format!("suggestion-ghost-{}", pane_id.as_str()).into(),
+                ghost.text.into(),
+                snapshot.cursor,
+                self.terminal_metrics.clone(),
+                color.into(),
+            ));
         }
         container = container.child(canvas_region);
         container.into_any_element()
@@ -2347,12 +2575,14 @@ impl RootView {
         match result {
             Some(Ok(WorkspaceControllerEffect::Changed { .. })) => {
                 self.focused_agent_terminal = false;
+                self.cancel_visible_transfer_preparation(cx);
                 self.center_panel = CenterPanel::Terminal;
                 self.refresh_workspace_views(cx);
                 self.persist_workspace_snapshot(cx);
             }
             Some(Ok(WorkspaceControllerEffect::Unchanged)) => {
                 self.focused_agent_terminal = false;
+                self.cancel_visible_transfer_preparation(cx);
                 self.center_panel = CenterPanel::Terminal;
             }
             Some(Ok(WorkspaceControllerEffect::ResourceOperation(operation))) => {
@@ -2386,6 +2616,20 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_workspace_tab_surface(tab_id, true, window, cx);
+    }
+
+    /// 资源回执可同步已删除页面的后继，但焦点仍由用户或模态持有；显式点击才立即聚焦。
+    /// 独立传输面板已受理后按目标 Tab 抑制窄窗工具遮罩，目录读取失败仍留在面板内重试。
+    ///
+    /// @author kongweiguang
+    fn activate_workspace_tab_surface(
+        &mut self,
+        tab_id: &TabId,
+        request_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let tab = self.workspace_controller.as_ref().and_then(|controller| {
             controller
                 .snapshot()
@@ -2397,6 +2641,14 @@ impl RootView {
         let Some(tab) = tab else {
             return;
         };
+        let retains_visible_files = matches!(
+            (&tab, &self.files_workspace_selection),
+            (WorkspaceSessionTab::SftpTransfer { id, .. }, workspace_files::FilesWorkspaceSelection::TransferTab(current)) if id == current
+        );
+        if !retains_visible_files {
+            self.cancel_visible_transfer_preparation(cx);
+        }
+        self.cancel_file_sftp_selections(cx);
         self.surface_navigation_generation = self.surface_navigation_generation.wrapping_add(1);
         self.clear_pending_pane_focus();
         self.clear_keybinding_chord();
@@ -2404,10 +2656,19 @@ impl RootView {
         match tab {
             WorkspaceSessionTab::Terminal { layout, .. } => {
                 self.center_panel = CenterPanel::Terminal;
-                if let Some(pane_id) = layout.pane_ids().into_iter().next() {
+                if request_focus && let Some(pane_id) = layout.pane_ids().into_iter().next() {
                     self.focus_workspace_pane(tab_id.clone(), pane_id, window, cx);
                 } else {
-                    self.set_reported_focus_session(None, cx);
+                    let session_id = self.workspace_controller.as_ref().and_then(|controller| {
+                        controller
+                            .snapshot()
+                            .focused_pane_id
+                            .as_ref()
+                            .filter(|id| layout.contains_pane(id))
+                            .and_then(|id| self.workspace_runtime.session_for_pane(id))
+                            .cloned()
+                    });
+                    self.set_reported_focus_session(session_id, cx);
                 }
             }
             WorkspaceSessionTab::SftpTransfer { .. } => {
@@ -2416,6 +2677,31 @@ impl RootView {
                     workspace_files::FilesWorkspaceSelection::TransferTab(tab_id.clone());
                 self.ensure_workspace_file_tab(tab_id, window, cx);
                 self.set_reported_focus_session(None, cx);
+                let transfer_is_current =
+                    self.workspace_controller
+                        .as_ref()
+                        .is_some_and(|controller| {
+                            controller.snapshot().active_tab_id.as_ref() == Some(tab_id)
+                        })
+                        && self.workspace_files.files_pane(tab_id).is_some()
+                        && matches!(
+                            self.workspace_files.restore_state(tab_id),
+                            Some(workspace_files::WorkspaceFileRestoreState::Ready)
+                        );
+                if transfer_is_current && self.tool_rail_rendered_compact.0 {
+                    if request_focus && !self.tool_panel_overlay_focus_is_blocked(window, cx) {
+                        self.tool_rail_state
+                            .hide_compact_drawer_for_tab(Some(tab_id));
+                        self.close_compact_drawer_for_center_navigation(window, cx);
+                    } else if !request_focus
+                        && !self.compact_host_drawer_open
+                        && !self.compact_tool_drawer_open
+                    {
+                        // 后台回执不恢复旧抽屉焦点，也不能在下一帧自动抢走当前焦点。
+                        self.tool_rail_state
+                            .hide_compact_drawer_for_tab(Some(tab_id));
+                    }
+                }
             }
             WorkspaceSessionTab::WorkspaceFile { .. } => {
                 self.center_panel = CenterPanel::Editor;
@@ -2764,6 +3050,8 @@ impl RootView {
     /// 字体使用 GPUI 已安装清单，临时抽屉和分隔尺寸随 Root 生命周期保存。
     /// 宿主收尾事实初始为空，避免把可取消准备阶段误当成服务已停止。
     /// SFTP 导航与创建回投从空身份开始，持久工作区不能恢复已经失效的异步用户意图。
+    /// 隐藏设置中的退出确认须重新打开其模态入口，不能只保留不可见的脏稿门禁。
+    /// 确认显隐事件使父容器同步切换焦点陷阱，不能只重绘面板子树。
     ///
     /// @author kongweiguang
     pub fn new(services: AppServices, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -2868,6 +3156,10 @@ impl RootView {
                 PreferencesEvent::CloseRequested => {
                     root.close_preferences_modal(window, cx);
                 }
+                PreferencesEvent::QuitConfirmationRequested => {
+                    root.show_preferences_quit_confirmation(window, cx);
+                }
+                PreferencesEvent::LeaveConfirmationChanged => cx.notify(),
                 PreferencesEvent::QuitConfirmed => {
                     root.handle_preferences_quit_result(true, cx);
                 }
@@ -3135,10 +3427,8 @@ impl RootView {
                 root.handle_context_panel_event(event.clone(), window, cx);
             })
         });
-        let logs_view = services.commands.clone().map(|commands| {
-            let executor = services.executor.clone();
-            cx.new(|cx| crate::features::commands::LogsView::new(commands, executor, window, cx))
-        });
+        let logs_view = Self::create_logs_view(&services, window, cx);
+        let logs_fill_subscription = Self::subscribe_logs_view(logs_view.as_ref(), window, cx);
         let mcp_runtime_panel = services.mcp_runtime.clone().map(|runtime| {
             let executor = services.executor.clone();
             cx.new(|_| crate::features::mcp_runtime::McpRuntimePanel::new(runtime, executor))
@@ -3294,6 +3584,8 @@ impl RootView {
                         root.cancel_pending_update_install(cx);
                         root.pending_quit_intent = None;
                         root.quit_preparation_failure = None;
+                        let projection = editor.read(cx).workspace_projection();
+                        root.push_editor_workspace_projection(projection, window, cx);
                     }
                     FileEditorWorkspaceEvent::WorkspaceProjectionChanged => {
                         let projection = editor.read(cx).workspace_projection();
@@ -3307,6 +3599,7 @@ impl RootView {
                         operation_id.clone(),
                         endpoint.clone(),
                         *closed,
+                        window,
                         cx,
                     ),
                 },
@@ -3402,6 +3695,7 @@ impl RootView {
             keybinding_focus: keybinding_focus::KeybindingFocusTracker::default(),
             terminal_command_suggestions: command_suggestions::TerminalCommandSuggestionBridge::new(
             ),
+            pending_suggestion_snapshot: None,
             terminal_command_contexts: HashMap::new(),
             command_line_projection: command_line_projection::CommandLineProjection::default(),
             suggestion_menu: None,
@@ -3422,6 +3716,7 @@ impl RootView {
             connections_modal_return_focus: None,
             connections_modal_generation: 0,
             group_rename_return_surface: None,
+            host_deletion_return_surface: None,
             root_confirmation_owner: None,
             tool_rail_customizer: None,
             root_confirmation_operations_view: None,
@@ -3511,6 +3806,7 @@ impl RootView {
             workspace_controller: None,
             workspace_runtime: WorkspaceRuntime::default(),
             workspace_files: workspace_files::WorkspaceFileRuntime::default(),
+            editor_navigation_sync_pending: false,
             files_workspace_selection: workspace_files::FilesWorkspaceSelection::default(),
             sftp_workbench_tab_id: TabId::new(),
             sftp_workbench_tab_open: false,
@@ -3521,6 +3817,8 @@ impl RootView {
             latest_sftp_request_id: None,
             pending_sftp_transfer_navigation: None,
             pending_sftp_host_creation: None,
+            pending_file_sftp_selections: VecDeque::new(),
+            active_file_sftp_selection: None,
             workspace_orphan_cleanup_panel,
             _workspace_orphan_cleanup_subscription: workspace_orphan_cleanup_subscription,
             workspace_tabs_view,
@@ -3546,6 +3844,7 @@ impl RootView {
             context_panel,
             _context_panel_event_subscription: context_panel_event_subscription,
             logs_view,
+            _logs_fill_subscription: logs_fill_subscription,
             tool_rail_operations_views: BTreeMap::new(),
             _tool_rail_operations_subscriptions: BTreeMap::new(),
             tool_rail_proxy_panels: BTreeMap::new(),
@@ -3568,6 +3867,9 @@ impl RootView {
             pending_close_batch_focus: None,
             workspace_load_pending,
             pending_external_activations: Vec::new(),
+            external_ssh_attempts: HashMap::new(),
+            pending_external_password_offers: VecDeque::new(),
+            pending_external_password_retry: None,
             pending_quit_intent: None,
             quit_preparation_failure: None,
             quit_ready_emitted: false,
@@ -3586,6 +3888,7 @@ impl RootView {
             terminal_color_scheme: initial_color_scheme,
             cursor_blink_enabled: TerminalSettings::default().cursor_blink,
             cursor_blink_phase_visible: true,
+            cursor_blink_task: None,
             pending_palette_update: None,
             palette_update_running: false,
             palette_update_generation: 0,
@@ -3597,6 +3900,7 @@ impl RootView {
         root.refresh_proxy_panel(cx);
         root.refresh_workspace_orphan_cleanup(cx);
         root.observe_application_executor(cx);
+        root.start_cursor_blink_clock(window, cx);
         root
     }
 
@@ -4117,20 +4421,16 @@ impl RootView {
             })
     }
 
-    /// 接收文件浏览器的显式 endpoint 并打开统一编辑器，不从当前终端或选中主机猜目标。
+    /// 显式端点由统一导航登记，已有文件复用顶栏和编辑缓冲；临时连接必须走携带 lease 的入口。
+    ///
+    /// @author kongweiguang
     pub fn open_file_endpoint(
         &mut self,
         endpoint: FileEndpoint,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(editor) = self.file_editor_workspace.as_ref() else {
-            self.status = Some("文件编辑服务尚未配置".into());
-            cx.notify();
-            return;
-        };
-        editor.update(cx, |workspace, cx| workspace.open_file(endpoint, cx));
-        self.set_center_panel(CenterPanel::Editor, window, cx);
+        self.open_file_endpoint_with_lease(endpoint, None, window, cx);
     }
 
     /// 显式折叠只持久化折叠意图；临时抽屉不走此入口，尺寸仍来自先前用户拖动而非窄窗测量。
@@ -4184,6 +4484,24 @@ impl RootView {
         cx.notify();
     }
 
+    /// 离开当前文件视图时只撤销其未提交批次，后台已受理传输与其他标签互不影响。
+    ///
+    /// @author kongweiguang
+    pub(super) fn cancel_visible_transfer_preparation(&mut self, cx: &mut Context<Self>) {
+        if self.center_panel != CenterPanel::Files {
+            return;
+        }
+        let pane = match &self.files_workspace_selection {
+            workspace_files::FilesWorkspaceSelection::Workbench => self.files_pane.clone(),
+            workspace_files::FilesWorkspaceSelection::TransferTab(tab_id) => {
+                self.workspace_files.files_pane(tab_id)
+            }
+        };
+        if let Some(pane) = pane {
+            pane.update(cx, |pane, cx| pane.cancel_transfer_preparation(cx));
+        }
+    }
+
     /// 切换正文只清理旧焦点；Files 仅在共享来源已选中时投影临时工作台，独立传输保留自己的 TabId。
     /// 模态草稿打开时保留底层页面，不重定向左栏主机或终端工具目标。
     ///
@@ -4195,6 +4513,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         self.group_rename_return_surface = None;
+        self.host_deletion_return_surface = None;
         // Preferences is a modal surface: preserving center_panel keeps its Entity mounted and
         // prevents settings navigation from resetting terminal focus, tabs, or running sessions.
         if panel == CenterPanel::Preferences {
@@ -4204,6 +4523,10 @@ impl RootView {
         if self.preferences_modal_open || self.connections_modal_open {
             return;
         }
+        if panel != CenterPanel::Files {
+            self.cancel_visible_transfer_preparation(cx);
+        }
+        self.cancel_file_sftp_selections(cx);
         self.surface_navigation_generation = self.surface_navigation_generation.wrapping_add(1);
         if panel == CenterPanel::Files
             && self.files_workspace_selection == workspace_files::FilesWorkspaceSelection::Workbench
@@ -4293,7 +4616,38 @@ impl RootView {
             && self.files_workspace_selection == workspace_files::FilesWorkspaceSelection::Workbench
     }
 
-    /// 共享文件工作台入口显式切换展示来源；独立 SFTP 传输标签仍由其持久 TabId 单独激活。
+    /// 成功导航后的抽屉卸载共用焦点交接；上层模态或已移动的焦点不受影响。
+    /// Agent 抽屉同步撤销搜索定位，但各工具的打开顺序和宽窗停靠继续保留。
+    ///
+    /// @author kongweiguang
+    fn close_compact_drawer_for_center_navigation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.compact_host_drawer_open && !self.compact_tool_drawer_open {
+            return;
+        }
+        if self.compact_tool_drawer_open
+            && self.tool_rail_rendered_compact.1 == Some(ToolRailToolId::AgentLauncher)
+        {
+            self.reconcile_agent_search_visibility(false, cx);
+        }
+        let focus_workspace = self
+            .compact_drawer_focus_handle
+            .contains_focused(window, cx)
+            && !self.tool_panel_overlay_focus_is_blocked(window, cx);
+        self.compact_host_drawer_open = false;
+        self.compact_tool_drawer_open = false;
+        self.compact_drawer_return_focus = None;
+        if focus_workspace {
+            window.focus(&self.focus_handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// 共享文件工作台的所有入口共用展示与窄窗抽屉交接；失败或宽窗布局保留原状态。
+    /// 独立 SFTP 传输标签仍由其持久 TabId 单独激活，已移动的焦点和上层模态不被抢占。
     ///
     /// @author kongweiguang
     pub(super) fn open_shared_sftp_workbench(
@@ -4314,11 +4668,25 @@ impl RootView {
         }
         // 显式重新进入工作台会撤销旧批次的延迟关闭，避免后续无关 ACK 收起刚打开的视图。
         self.sftp_workbench_close_after_batch = None;
+        if self.files_workspace_selection != workspace_files::FilesWorkspaceSelection::Workbench {
+            self.cancel_visible_transfer_preparation(cx);
+        }
         self.files_workspace_selection = workspace_files::FilesWorkspaceSelection::Workbench;
         self.sftp_workbench_tab_open = true;
         self.clear_pending_pane_focus();
         self.set_reported_focus_session(None, cx);
         self.set_center_panel(CenterPanel::Files, window, cx);
+        if self.compact_host_drawer_open || self.compact_tool_drawer_open {
+            if self.tool_rail_rendered_compact.0 && self.tool_rail_rendered_compact.1.is_some() {
+                let active_tab_id = self
+                    .workspace_controller
+                    .as_ref()
+                    .and_then(|controller| controller.snapshot().active_tab_id.clone());
+                self.tool_rail_state
+                    .hide_compact_drawer_for_tab(active_tab_id.as_ref());
+            }
+            self.close_compact_drawer_for_center_navigation(window, cx);
+        }
         true
     }
 
@@ -4495,7 +4863,7 @@ impl RootView {
     }
 
     /// 跟随 ConnectionsPanel 的草稿状态开关遮罩，直接由实体观察器调用而不轮询。
-    /// 保存后的 SFTP 回投等真实模态关闭再继续，不以若干渲染帧猜测表单何时收起。
+    /// 保存后的 SFTP 回投与外部认证排队等真实模态关闭再继续，不以渲染帧猜测表单何时收起。
     ///
     /// @author kongweiguang
     fn sync_connection_editor_modal(
@@ -4523,6 +4891,10 @@ impl RootView {
         } else {
             self.close_connection_editor_modal(window, cx);
             self.resume_sftp_host_creation(window, cx);
+            self.advance_file_sftp_selections(cx);
+        }
+        if !prompt_open {
+            self.resume_queued_external_password_offer(cx);
         }
     }
 
@@ -5018,7 +5390,7 @@ impl RootView {
         self.status = Some(
             match &target_request {
                 TerminalTargetRequest::ProfileDefaultLocal => "正在启动本地终端…",
-                TerminalTargetRequest::ProfileLocal { .. } => "正在启动本地 Profile…",
+                TerminalTargetRequest::ProfileLocal { .. } => "正在启动本地主机…",
                 TerminalTargetRequest::ExplicitHost { .. } => "正在连接终端…",
             }
             .into(),
@@ -5363,6 +5735,17 @@ impl RootView {
             cx.stop_propagation();
             return;
         }
+        // 删除确认不是模态弹层，焦点可能仍在侧栏；Escape 必须先归还给最上层确认，再交给下层。
+        if event.keystroke.key.eq_ignore_ascii_case("escape")
+            && let Some(panel) = self.connections_panel.clone()
+            && panel.read(cx).has_pending_deletion_confirmation()
+        {
+            panel.update(cx, |panel, cx| {
+                panel.cancel_pending_deletion_confirmation(cx)
+            });
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key.eq_ignore_ascii_case("escape")
             && let Some((preview, _, _)) = self.pending_workspace_split_preview(cx)
             && self
@@ -5433,6 +5816,7 @@ impl RootView {
         let focused = window.focused(cx);
         if self.keybinding_focus.observe(focused.clone()) {
             self.keybinding_runtime.clear_pending();
+            self.keybinding_runtime.clear_terminal_shortcut_keys();
         }
         if self
             .pending_pane_focus_intent
@@ -5448,11 +5832,13 @@ impl RootView {
     fn clear_keybinding_chord(&mut self) {
         self.keybinding_focus.reset();
         self.keybinding_runtime.clear_pending();
+        self.keybinding_runtime.clear_terminal_shortcut_keys();
     }
 
-    /// Composition invalidates command-line guesses and lets the platform route physical keys.
+    /// 输入法接管时撤销组合前缀和旧快捷键按住态，避免提交后误吞普通终端按键。
     fn suspend_suggestions_for_ime(&mut self, binding: &UiSessionBinding, cx: &mut Context<Self>) {
         self.keybinding_runtime.clear_pending();
+        self.keybinding_runtime.clear_terminal_shortcut_keys();
         if self.suggestion_menu_binding.as_ref() == Some(binding)
             || self.is_active_suggestion_binding(binding)
         {
@@ -5479,6 +5865,14 @@ impl RootView {
             .get(&binding.session_id)
             .is_some_and(|registered| registered.binding == binding)
         {
+            return;
+        }
+        // 已被快捷键消费的 keydown 没有进入终端，Kitty 也不应收到孤立的 keyup。
+        if self
+            .keybinding_runtime
+            .release_terminal_shortcut_key(&event.keystroke)
+        {
+            cx.stop_propagation();
             return;
         }
         if input_handler.read(cx).is_composing() {
@@ -5977,11 +6371,7 @@ impl RootView {
             } => self.open_context_terminal_link(&identity, candidate_id, cx),
             ContextPanelEvent::Navigate(target) => match target {
                 ContextNavigationTarget::Host(host_id) => {
-                    self.selected_host_id = Some(host_id.clone());
-                    if let Some(panel) = self.connections_panel.clone() {
-                        panel.update(cx, |panel, cx| panel.select_host_id(&host_id, cx));
-                        self.set_center_panel(CenterPanel::Connections, window, cx);
-                    }
+                    self.reveal_host_in_navigation(&host_id, cx);
                     self.refresh_context_panel_projection(cx);
                 }
                 ContextNavigationTarget::Tab(tab_id) => {
@@ -6391,9 +6781,7 @@ impl Render for RootView {
                 } else {
                     (self.focus_handle.clone(), None)
                 };
-                let blink_visible = !self.cursor_blink_enabled
-                    || !snapshot.cursor.blinking
-                    || self.cursor_blink_phase_visible;
+                let blink_visible = !self.cursor_blink_enabled || self.cursor_blink_phase_visible;
                 let right_click_behavior = self
                     .settings_snapshot
                     .as_ref()

@@ -250,7 +250,8 @@ impl CommandsView {
         panel
     }
 
-    /// 应用候选的 Unicode 字符范围，危险候选只插入草稿且绝不代替用户提交。
+    /// 草稿使用完整替换文本；suffix 仅供终端行尾追加，二者叠加会重复历史命令尾部。
+    /// 危险候选也只填入草稿，必须由用户另行提交。
     pub(super) fn accept_suggestion(
         &mut self,
         id: String,
@@ -293,8 +294,7 @@ impl CommandsView {
             return;
         }
         characters.splice(start..end, candidate.replacement_text.chars());
-        let mut value = characters.into_iter().collect::<String>();
-        value.push_str(&candidate.suffix);
+        let value = characters.into_iter().collect::<String>();
         self.command_input
             .update(cx, |input, cx| input.set_value(value, window, cx));
         self.suggestions.clear();

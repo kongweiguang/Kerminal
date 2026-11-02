@@ -2,9 +2,41 @@
 //!
 //! @author kongweiguang
 
-#[cfg(target_os = "linux")]
-use super::gpu::parse_nvidia_smi_gpus;
 use super::gpu::parse_windows_gpu_json;
+#[cfg(target_os = "linux")]
+use super::gpu::{parse_nvidia_smi_gpus, unavailable_for_io};
+
+/// GPU sysfs 的错误分类延续原有诊断契约，不能将权限或无效数据折叠成普通采集失败。
+///
+/// @author kongweiguang
+#[cfg(target_os = "linux")]
+#[test]
+fn sysfs_io_error_classification_preserves_diagnostic_reason() {
+    use kerminal_application::diagnostics::DiagnosticUnavailableReason;
+    use std::io::{Error, ErrorKind};
+
+    for (kind, expected) in [
+        (ErrorKind::NotFound, DiagnosticUnavailableReason::NotFound),
+        (
+            ErrorKind::PermissionDenied,
+            DiagnosticUnavailableReason::PermissionDenied,
+        ),
+        (
+            ErrorKind::InvalidData,
+            DiagnosticUnavailableReason::InvalidData,
+        ),
+        (
+            ErrorKind::InvalidInput,
+            DiagnosticUnavailableReason::InvalidData,
+        ),
+        (
+            ErrorKind::Other,
+            DiagnosticUnavailableReason::CollectionFailed,
+        ),
+    ] {
+        assert_eq!(unavailable_for_io(Error::from(kind)), expected);
+    }
+}
 
 /// 验证 NVIDIA CLI 的 MiB、百分比和温度字段按实际单位映射。
 #[cfg(target_os = "linux")]

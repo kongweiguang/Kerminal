@@ -7,16 +7,21 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+mod configuration;
 mod lifecycle;
 mod synchronization;
 
 use kerminal_application::{
     AppError, AppResult,
     agents::AgentService,
-    mcp_runtime::{McpRuntimeControl, McpRuntimeSnapshot, McpRuntimeState},
+    mcp_runtime::{McpRuntimeControl, McpRuntimeSnapshot, McpRuntimeState, McpTokenStore},
     platform::{
         DesktopNotificationEvent, DesktopNotificationService, NotificationImportance,
         WindowVisibility,
+    },
+    preferences::{
+        PreferencesService,
+        settings::{McpBindMode, McpSettings},
     },
 };
 use tokio::{
@@ -48,12 +53,16 @@ pub(super) struct ActiveShutdown {
 pub struct McpRuntimeController {
     runtime: Handle,
     services: McpServices,
-    config: McpServerConfig,
+    config: StdRwLock<McpServerConfig>,
+    settings: StdRwLock<McpSettings>,
+    preferences: Option<PreferencesService>,
+    token_store: Option<Arc<dyn McpTokenStore>>,
     agent_service: Option<Arc<dyn AgentService>>,
     notifications: DesktopNotificationService,
     unavailable_reason: Option<String>,
     owner: Mutex<RuntimeOwner>,
     operation_gate: Mutex<()>,
+    configuration_gate: Mutex<()>,
     snapshot: StdRwLock<McpRuntimeSnapshot>,
     active_shutdown: StdMutex<Option<ActiveShutdown>>,
     shutting_down: AtomicBool,
@@ -79,15 +88,72 @@ impl McpRuntimeController {
             runtime,
             agent_service: services.agents.clone(),
             services,
-            config,
+            settings: StdRwLock::new(McpSettings {
+                port: config.bind_address().port(),
+                bind_mode: if config.bind_address().ip() == std::net::Ipv4Addr::UNSPECIFIED {
+                    kerminal_application::preferences::settings::McpBindMode::Lan
+                } else {
+                    kerminal_application::preferences::settings::McpBindMode::Loopback
+                },
+                token_ref: None,
+            }),
+            config: StdRwLock::new(config),
+            preferences: None,
+            token_store: None,
             notifications,
             unavailable_reason,
             owner: Mutex::new(RuntimeOwner::default()),
             operation_gate: Mutex::new(()),
+            configuration_gate: Mutex::new(()),
             snapshot: StdRwLock::new(initial),
             active_shutdown: StdMutex::new(None),
             shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// 桌面注入同一设置仓储与 Vault；本机构造不读取或创建令牌。
+    pub fn with_preferences(
+        runtime: Handle,
+        services: McpServices,
+        preferences: PreferencesService,
+        token_store: Arc<dyn McpTokenStore>,
+        notifications: DesktopNotificationService,
+    ) -> Self {
+        let mut controller =
+            Self::new(runtime, services, McpServerConfig::default(), notifications);
+        controller.preferences = Some(preferences);
+        controller.token_store = Some(token_store);
+        controller
+    }
+
+    /// 配置读取不持锁跨越异步操作，避免通知和退出阻塞在网络或磁盘 I/O 上。
+    fn current_config(&self) -> McpServerConfig {
+        *self
+            .config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 替换运行配置只在串行门内调用，已保存设置和 listener 的真实状态分别显示。
+    fn set_config(&self, settings: McpSettings) -> AppResult<()> {
+        let ip = match settings.bind_mode {
+            kerminal_application::preferences::settings::McpBindMode::Loopback => {
+                std::net::Ipv4Addr::LOCALHOST
+            }
+            kerminal_application::preferences::settings::McpBindMode::Lan => {
+                std::net::Ipv4Addr::UNSPECIFIED
+            }
+        };
+        let config = McpServerConfig::new(std::net::SocketAddr::new(ip.into(), settings.port))?;
+        *self
+            .config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+        *self
+            .settings
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = settings;
+        Ok(())
     }
 
     /// 以非阻塞锁发布状态快照，UI 可在 listener join 或 workspace 写入期间持续刷新。
@@ -98,8 +164,18 @@ impl McpRuntimeController {
         }
     }
 
+    /// 监听范围来自实际 listener 配置，外部改写的设置草稿不能冒充运行态。
+    fn current_bind_mode(&self) -> McpBindMode {
+        if self.current_config().bind_address().ip() == std::net::Ipv4Addr::UNSPECIFIED {
+            McpBindMode::Lan
+        } else {
+            McpBindMode::Loopback
+        }
+    }
+
     /// 只把 application 的稳定公开错误文案放进状态，不泄露 source 或路径。
     fn snapshot_with_failure(
+        &self,
         state: McpRuntimeState,
         endpoint: Option<String>,
         pending: bool,
@@ -107,6 +183,7 @@ impl McpRuntimeController {
     ) -> McpRuntimeSnapshot {
         McpRuntimeSnapshot {
             state,
+            bind_mode: self.current_bind_mode(),
             endpoint,
             client_json: None,
             endpoint_sync_pending: pending,
@@ -138,7 +215,7 @@ impl McpRuntimeController {
             .notifications
             .notify(
                 DesktopNotificationEvent::McpServerFailed {
-                    port: Some(self.config.bind_address().port()),
+                    port: Some(self.current_config().bind_address().port()),
                     reason: Some(error.public_message().to_owned()),
                     importance: Some(NotificationImportance::High),
                 },
@@ -195,6 +272,7 @@ impl McpRuntimeController {
         McpRuntimeSnapshot {
             client_json: Some(Self::client_json(&endpoint)),
             state: McpRuntimeState::Running,
+            bind_mode: self.current_bind_mode(),
             endpoint: Some(endpoint),
             endpoint_sync_pending: false,
             unavailable_reason: None,
@@ -234,6 +312,7 @@ impl McpRuntimeController {
             let endpoint = server.endpoint().to_owned();
             self.publish(McpRuntimeSnapshot {
                 state: McpRuntimeState::Stopping,
+                bind_mode: self.current_bind_mode(),
                 endpoint: Some(endpoint.clone()),
                 client_json: None,
                 endpoint_sync_pending,
@@ -242,7 +321,7 @@ impl McpRuntimeController {
             });
             server.begin_shutdown();
             if let Err(error) = server.shutdown_until(deadline).await {
-                let snapshot = Self::snapshot_with_failure(
+                let snapshot = self.snapshot_with_failure(
                     McpRuntimeState::Stopping,
                     Some(endpoint),
                     endpoint_sync_pending,
@@ -263,6 +342,7 @@ impl McpRuntimeController {
         let should_sync_clear = owner.pending_sync.is_some() || had_server;
         self.publish(McpRuntimeSnapshot {
             state: McpRuntimeState::Stopped,
+            bind_mode: self.current_bind_mode(),
             endpoint: None,
             client_json: None,
             endpoint_sync_pending: should_sync_clear,
@@ -285,7 +365,7 @@ impl McpRuntimeController {
             }
             Err(error) => {
                 let snapshot =
-                    Self::snapshot_with_failure(McpRuntimeState::Stopped, None, true, &error);
+                    self.snapshot_with_failure(McpRuntimeState::Stopped, None, true, &error);
                 self.publish(snapshot);
                 Err(error)
             }

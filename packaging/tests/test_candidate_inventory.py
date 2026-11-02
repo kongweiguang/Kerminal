@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import io
 import shutil
@@ -19,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import build_candidate_inventory
 import build_manifests
 import collect_candidates
+import stage_release_assets
 
 
 class CandidateInventoryTests(unittest.TestCase):
@@ -223,11 +225,67 @@ class CandidateInventoryTests(unittest.TestCase):
             / self.legacy_signatures
             / "aarch64-apple-darwin"
             / "update-bundle.app.tar.gz.sig"
-        ).read_bytes().decode("ascii").strip()
+        ).read_bytes()
         self.assertEqual(
-            legacy["platforms"]["darwin-aarch64"]["signature"],
+            base64.b64decode(legacy["platforms"]["darwin-aarch64"]["signature"]),
             expected_legacy_signature,
         )
+
+    def test_github_feed_and_staged_assets_share_unique_platform_names(self) -> None:
+        """相同 macOS 包名必须变成不同 GitHub 资源，feed 和暂存文件严格对应。"""
+        arguments = self._arguments("production")
+        arguments.github_release_assets = True
+        arguments.base_url = "https://github.com/example/project/releases/download/v0.4.0-dev.2"
+        with patch.object(build_manifests, "verify_signature"):
+            build_candidate_inventory.build_and_validate(arguments)
+
+        metadata = json.loads((self.metadata_output / "kerminal-updater.json").read_text(encoding="utf-8"))
+        arm = metadata["platforms"]["macos-aarch64"]["url"]
+        x64 = metadata["platforms"]["macos-x86_64"]["url"]
+        self.assertTrue(arm.endswith("macos-aarch64-update-bundle.app.tar.gz"))
+        self.assertTrue(x64.endswith("macos-x86_64-update-bundle.app.tar.gz"))
+        self.assertNotEqual(arm, x64)
+
+        release_assets = self.base / "release-assets"
+        stage_release_assets.stage_release_assets(
+            self.candidate, self.metadata_output, release_assets, arguments.base_url
+        )
+        for entry in metadata["platforms"].values():
+            self.assertTrue((release_assets / entry["url"].rsplit("/", 1)[-1]).is_file())
+        self.assertTrue((release_assets / "latest.json").is_file())
+
+    def test_release_staging_rejects_changed_payload_and_cleans_partial_output(self) -> None:
+        """验签后若候选字节变化，不得留下看似完整的发布文件集。"""
+        arguments = self._arguments("production")
+        arguments.github_release_assets = True
+        arguments.base_url = "https://github.com/example/project/releases/download/v0.4.0-dev.2"
+        with patch.object(build_manifests, "verify_signature"):
+            build_candidate_inventory.build_and_validate(arguments)
+        package = self.candidate / "x86_64-pc-windows-msvc" / "installer-from-run-42-setup.exe"
+        package.write_bytes(b"changed after verification")
+
+        release_assets = self.base / "release-assets"
+        with self.assertRaises(build_manifests.ManifestError):
+            stage_release_assets.stage_release_assets(
+                self.candidate, self.metadata_output, release_assets, arguments.base_url
+            )
+        self.assertFalse(release_assets.exists())
+
+    def test_release_staging_rejects_cross_architecture_feed(self) -> None:
+        """即便两个架构都已验签，也不能让 arm64 更新项指向 x64 包。"""
+        arguments = self._arguments("production")
+        arguments.github_release_assets = True
+        arguments.base_url = "https://github.com/example/project/releases/download/v0.4.0-dev.2"
+        with patch.object(build_manifests, "verify_signature"):
+            build_candidate_inventory.build_and_validate(arguments)
+        feed_path = self.metadata_output / "kerminal-updater.json"
+        feed = json.loads(feed_path.read_text(encoding="utf-8"))
+        feed["platforms"]["macos-aarch64"] = feed["platforms"]["macos-x86_64"]
+        feed_path.write_text(json.dumps(feed), encoding="utf-8")
+        with self.assertRaises(build_manifests.ManifestError):
+            stage_release_assets.stage_release_assets(
+                self.candidate, self.metadata_output, self.base / "release-assets", arguments.base_url
+            )
 
     def test_missing_required_signature_fails_before_writing_outputs(self) -> None:
         """不能用新旧信任根互相兜底；缺任一所需 sidecar 时不写清单。"""

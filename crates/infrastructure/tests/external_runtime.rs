@@ -129,6 +129,83 @@ async fn temporary_password_exists_until_last_consumer_releases_lease() {
     );
 }
 
+/// 用户明确重试时，同一 agent 目标才改用零化密码；不触及保存主机或其它租约。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn explicit_password_retry_updates_only_the_same_agent_target() {
+    let registry = isolated_registry();
+    let mut agent_target = password_target();
+    agent_target.authentication = ExternalAuthenticationHint::Agent;
+    let lease = registry
+        .register(agent_target)
+        .await
+        .expect("register agent target");
+    let host_id = lease.host_id().clone();
+    let original = HostConnectionRepository::load(&registry, &host_id)
+        .await
+        .expect("load agent target");
+    assert!(matches!(
+        original.authentication,
+        Some(kerminal_domain::connections::SshAuthentication::Agent)
+    ));
+
+    registry
+        .set_password(&host_id, Zeroizing::new("retry-secret".to_owned()))
+        .await
+        .expect("explicit retry accepts a temporary password");
+    let profile = HostConnectionRepository::load(&registry, &host_id)
+        .await
+        .expect("load password retry target");
+    let reference = match profile.authentication {
+        Some(kerminal_domain::connections::SshAuthentication::Password { secret }) => secret,
+        _ => panic!("explicit retry should select password authentication"),
+    };
+    match CredentialResolver::resolve(&registry, &reference, &CancellationToken::new())
+        .await
+        .expect("temporary password is available to the same target")
+    {
+        ResolvedCredential::Password(secret) => assert_eq!(secret.as_str(), "retry-secret"),
+        _ => panic!("retry secret must remain a password"),
+    }
+    drop(lease);
+    assert!(
+        CredentialResolver::resolve(&registry, &reference, &CancellationToken::new())
+            .await
+            .is_err()
+    );
+}
+
+/// 显式选择的私钥身份不能因密码输入而被静默覆盖。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn password_retry_cannot_replace_an_explicit_private_key() {
+    let registry = isolated_registry();
+    let mut key_target = password_target();
+    key_target.authentication = ExternalAuthenticationHint::PrivateKey {
+        path: "C:/test/id_ed25519".into(),
+    };
+    let lease = registry
+        .register(key_target)
+        .await
+        .expect("register key target");
+    let host_id = lease.host_id().clone();
+    assert!(
+        registry
+            .set_password(&host_id, Zeroizing::new("retry-secret".to_owned()))
+            .await
+            .is_err()
+    );
+    let profile = HostConnectionRepository::load(&registry, &host_id)
+        .await
+        .expect("original key target remains available");
+    assert!(matches!(
+        profile.authentication,
+        Some(kerminal_domain::connections::SshAuthentication::PrivateKey { .. })
+    ));
+}
+
 /// 目标数达到固定上限时拒绝新注册，不自动淘汰会影响用户重连的临时身份。
 #[tokio::test]
 async fn registry_rejects_capacity_overflow_without_eviction() {

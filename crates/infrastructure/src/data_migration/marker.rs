@@ -9,16 +9,17 @@ use serde::{Deserialize, Serialize};
 
 pub(super) const MARKER_FILE_NAME: &str = ".kerminal-format.toml";
 pub(super) const CURRENT_DATA_FORMAT: u32 = 4;
-pub(super) const CURRENT_MIGRATION_CONTRACT: u32 = 2;
-pub(super) const PREVIOUS_MIGRATION_CONTRACT: u32 = 1;
+pub(super) const CURRENT_MIGRATION_CONTRACT: u32 = 3;
+pub(super) const PREVIOUS_MIGRATION_CONTRACT: u32 = 2;
+pub(super) const EARLIEST_MIGRATION_CONTRACT: u32 = 1;
 const MAX_MARKER_BYTES: u64 = 4 * 1024;
 
-/// 只为已知的同代上一契约开放显式升级，其他旧代和未来标记仍不能被猜测解释。
+/// 只为明确已发布的同代契约开放显式升级，保留版本以核对原 journal 的恢复目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MarkerRead {
     Missing,
     Current,
-    PreviousSupported,
+    PreviousSupported(u32),
     Blocked(DataMigrationBlocker),
 }
 
@@ -52,7 +53,7 @@ pub(super) fn read_marker(root: &Path) -> AppResult<MarkerRead> {
     classify_marker_bytes(&bytes)
 }
 
-/// 只接受完整的两个字段；精确的 (4, 1) 只进入迁移，不成为业务 reader 的兼容分支。
+/// 只接受完整的两个字段；已知契约 1、2 只进入迁移，不成为业务 reader 的兼容分支。
 pub(super) fn classify_marker_bytes(bytes: &[u8]) -> AppResult<MarkerRead> {
     let marker = match toml::from_str::<FormatMarker>(std::str::from_utf8(bytes).unwrap_or("")) {
         Ok(marker) => marker,
@@ -79,8 +80,11 @@ pub(super) fn classify_marker_bytes(bytes: &[u8]) -> AppResult<MarkerRead> {
             },
         ));
     }
-    if marker.migration_contract == PREVIOUS_MIGRATION_CONTRACT {
-        return Ok(MarkerRead::PreviousSupported);
+    if matches!(
+        marker.migration_contract,
+        EARLIEST_MIGRATION_CONTRACT | PREVIOUS_MIGRATION_CONTRACT
+    ) {
+        return Ok(MarkerRead::PreviousSupported(marker.migration_contract));
     }
     if marker.migration_contract != CURRENT_MIGRATION_CONTRACT {
         return Ok(MarkerRead::Blocked(
@@ -104,6 +108,14 @@ pub(super) fn current_marker_bytes() -> Vec<u8> {
 pub(super) fn previous_marker_bytes() -> Vec<u8> {
     format!(
         "data_format = {CURRENT_DATA_FORMAT}\nmigration_contract = {PREVIOUS_MIGRATION_CONTRACT}\n"
+    )
+    .into_bytes()
+}
+
+/// 已发布契约 1 的 journal 必须继续验证原始目标摘要，不能根据当前版本重算。
+pub(super) fn earliest_marker_bytes() -> Vec<u8> {
+    format!(
+        "data_format = {CURRENT_DATA_FORMAT}\nmigration_contract = {EARLIEST_MIGRATION_CONTRACT}\n"
     )
     .into_bytes()
 }

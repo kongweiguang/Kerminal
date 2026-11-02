@@ -11,6 +11,7 @@ use gpui_kit::{
         button::{Button, ButtonCustomVariant, ButtonVariants},
         checkbox::Checkbox,
         input::Input,
+        spinner::Spinner,
         tab::{Tab, TabBar},
         tooltip::Tooltip,
     },
@@ -47,15 +48,14 @@ mod preview;
 struct SnippetCatalogNotice {
     id: &'static str,
     message: gpui_kit::SharedString,
-    retryable: bool,
     is_error: bool,
-    loading: bool,
 }
 
 impl CommandsView {
     /// 紧凑目录沿用 main 右栏的 12px 内边距和分组间距；宽工作区保持原排版。
     /// 搜索快捷键仅在片段子树内接管且不覆盖输入控件焦点；紧凑目录延续宿主表面，避免暗色下叠深第二层面板。
     /// 单行搜索尺寸通过 Styled 指定，避免 Input 的多行专用 h 忽略右栏规格。
+    /// 查询中的旧行继续禁用，但不插入加载横幅；进度统一由标题栏图标表达，避免列表上下跳动。
     ///
     /// @author kongweiguang
     pub(super) fn render_snippets(
@@ -153,7 +153,7 @@ impl CommandsView {
                 crate::locale::text(format!("共 {total} 个片段"), format!("{total} snippets"))
             }
         });
-        let notice = if let Some(error) = self.snippet_page_error.clone() {
+        let notice = if let Some(error) = self.snippet_page_error.clone().filter(|_| !loading) {
             let detail = if !has_loaded_page {
                 error
             } else if rows_stale {
@@ -169,28 +169,7 @@ impl CommandsView {
                 SnippetCatalogNotice {
                     id: "snippet-catalog-error",
                     message: detail.into(),
-                    retryable: true,
                     is_error: true,
-                    loading,
-                },
-                theme,
-                cx,
-            ))
-        } else if rows_stale && has_loaded_page {
-            let filter = snippet_filter_description(
-                loaded_section.unwrap_or(self.snippet_catalog_section),
-                loaded_query.as_deref().unwrap_or_default(),
-            );
-            Some(self.render_snippet_catalog_notice(
-                SnippetCatalogNotice {
-                    id: "snippet-catalog-stale",
-                    message: crate::locale::text(
-                        format!("正在读取新筛选；当前仍显示上次成功的“{filter}”，旧条目暂不可操作。"),
-                        format!("Loading the new filter; showing the last successful “{filter}” results. Actions are paused."),
-                    ),
-                    retryable: false,
-                    is_error: false,
-                    loading,
                 },
                 theme,
                 cx,
@@ -203,9 +182,7 @@ impl CommandsView {
                         "片段目录尚未读取。",
                         "The snippet catalog has not loaded yet.",
                     ),
-                    retryable: true,
                     is_error: false,
-                    loading,
                 },
                 theme,
                 cx,
@@ -286,22 +263,12 @@ impl CommandsView {
                         list.border_y_1().border_color(theme.border)
                     })
                     .children(rows)
-                    .when_some(empty_state, |list, empty_state| list.child(empty_state))
-                    .when(loading, |list| {
-                        list.child(
-                            div()
-                                .id("snippet-catalog-loading")
-                                .w_full()
-                                .p_3()
-                                .text_color(theme.muted)
-                                .child(crate::locale::text("正在加载片段…", "Loading snippets…")),
-                        )
-                    }),
+                    .when_some(empty_state, |list, empty_state| list.child(empty_state)),
             )
             .into_any_element()
     }
 
-    /// 错误与旧筛选提示固定在列表前；重试重新走原查询用例，不复用过期行的动作。
+    /// 仅需用户处理的读取故障占用提示区域；重试重新走原查询用例，不复用过期行的动作。
     ///
     /// @author kongweiguang
     fn render_snippet_catalog_notice(
@@ -313,9 +280,7 @@ impl CommandsView {
         let SnippetCatalogNotice {
             id,
             message,
-            retryable,
             is_error,
-            loading,
         } = notice;
         div()
             .id(id)
@@ -336,18 +301,15 @@ impl CommandsView {
                     .text_color(if is_error { theme.warning } else { theme.muted })
                     .child(message),
             )
-            .when(retryable, |view| {
-                view.child(
-                    Button::new("snippet-catalog-retry")
-                        .compact()
-                        .secondary()
-                        .label(crate::locale::text("重试", "Retry"))
-                        .disabled(loading)
-                        .on_click(cx.listener(|view, _: &ClickEvent, window, cx| {
-                            view.retry_snippet_page(window, cx);
-                        })),
-                )
-            })
+            .child(
+                Button::new("snippet-catalog-retry")
+                    .compact()
+                    .secondary()
+                    .label(crate::locale::text("重试", "Retry"))
+                    .on_click(cx.listener(|view, _: &ClickEvent, window, cx| {
+                        view.retry_snippet_page(window, cx);
+                    })),
+            )
             .into_any_element()
     }
 
@@ -953,6 +915,8 @@ impl CommandsView {
     /// 紧凑行复用 main 的双行摘要与整行切换命中区，宽目录保留较舒展的原布局。
     /// 预览仍单独滚动，避免窄栏内的长正文挤压行控件。
     /// 按钮悬停色通过 Kit variant 注入，避免重复注册组件内部的 hover refinement。
+    /// 详情读取只替换原行尾图标，保持行高与后续条目位置，仍允许点击标题取消展开。
+    /// 收藏写入仅禁用对应的星标并原位显示进度，其他片段仍可操作。
     ///
     /// @author kongweiguang
     fn render_snippet_row(
@@ -969,8 +933,26 @@ impl CommandsView {
         let title = item.title.clone();
         let description = item.description.clone();
         let favorite = item.favorite;
+        let favorite_pending = self.snippet_favorite_pending.contains(&key);
+        let favorite_label = crate::locale::text(
+            if favorite_pending {
+                format!("正在更新收藏 {title}")
+            } else if favorite {
+                format!("取消收藏 {title}")
+            } else {
+                format!("收藏 {title}")
+            },
+            if favorite_pending {
+                format!("Updating favorite {title}")
+            } else if favorite {
+                format!("Remove favorite {title}")
+            } else {
+                format!("Favorite {title}")
+            },
+        );
         let selected = self.selected_snippet_matches_key(&key);
         let preview_open = self.snippet_inline_preview.matches_key(&key);
+        let preview_loading = self.snippet_inline_preview.is_loading_key(&key);
         let (metadata, metadata_details) = row_metadata(
             item.origin,
             &item.category,
@@ -1042,26 +1024,24 @@ impl CommandsView {
                             .ml_1()
                             .w(px(32.))
                             .h(px(32.))
-                            .child(Icon::new(IconName::Star).size(px(14.)).text_color(
-                                if favorite {
-                                    theme.warning
-                                } else {
-                                    theme.subtle
-                                },
-                            ))
-                            .accessibility_label(crate::locale::text(
-                                if favorite {
-                                    format!("取消收藏 {title}")
-                                } else {
-                                    format!("收藏 {title}")
-                                },
-                                if favorite {
-                                    format!("Remove favorite {title}")
-                                } else {
-                                    format!("Favorite {title}")
-                                },
-                            ))
-                            .disabled(stale)
+                            .child(if favorite_pending {
+                                Spinner::new()
+                                    .with_size(px(14.))
+                                    .color(theme.subtle)
+                                    .into_any_element()
+                            } else {
+                                Icon::new(IconName::Star)
+                                    .size(px(14.))
+                                    .text_color(if favorite {
+                                        theme.warning
+                                    } else {
+                                        theme.subtle
+                                    })
+                                    .into_any_element()
+                            })
+                            .accessibility_label(favorite_label.clone())
+                            .tooltip(favorite_label.clone())
+                            .disabled(stale || favorite_pending)
                             .on_click(cx.listener(
                                 move |view, _: &ClickEvent, _, cx| {
                                     view.set_snippet_favorite(favorite_key.clone(), !favorite, cx);
@@ -1148,11 +1128,17 @@ impl CommandsView {
                                     })
                                     .child(metadata),
                             )
-                            .child(
+                            .child(if preview_loading {
+                                Spinner::new()
+                                    .with_size(px(14.))
+                                    .color(theme.subtle)
+                                    .into_any_element()
+                            } else {
                                 Icon::new(preview_icon)
                                     .size(px(14.))
-                                    .text_color(theme.subtle),
-                            )
+                                    .text_color(theme.subtle)
+                                    .into_any_element()
+                            })
                             .on_click(cx.listener(
                                 move |view, _: &ClickEvent, window, cx| {
                                     view.toggle_snippet_preview(open_key.clone(), window, cx);
@@ -1199,24 +1185,15 @@ impl CommandsView {
                         .w(px(32.))
                         .h(px(32.))
                         .icon(IconName::Star)
+                        .loading(favorite_pending)
                         .text_color(if favorite {
                             theme.warning
                         } else {
                             theme.subtle
                         })
-                        .accessibility_label(crate::locale::text(
-                            if favorite {
-                                "取消收藏"
-                            } else {
-                                "收藏片段"
-                            },
-                            if favorite {
-                                "Remove favorite"
-                            } else {
-                                "Favorite snippet"
-                            },
-                        ))
-                        .disabled(stale)
+                        .accessibility_label(favorite_label.clone())
+                        .tooltip(favorite_label)
+                        .disabled(stale || favorite_pending)
                         .on_click(cx.listener(
                             move |view, _: &ClickEvent, _, cx| {
                                 view.set_snippet_favorite(favorite_key.clone(), !favorite, cx);
@@ -1325,6 +1302,7 @@ impl CommandsView {
                         .w(px(32.))
                         .h(px(32.))
                         .icon(preview_icon)
+                        .loading(preview_loading)
                         .accessibility_label(title_action.clone())
                         .tooltip(title_action)
                         .disabled(stale)

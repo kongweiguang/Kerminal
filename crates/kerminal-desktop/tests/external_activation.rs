@@ -27,6 +27,34 @@ fn versioned_external_payload_round_trips_without_debugging_arguments() {
     assert!(!format!("{request:?}").contains("用户@example.com"));
 }
 
+/// 首次启动和单实例转发使用同一 argv 契约，JSON 与第三方参数不能在传输中改写。
+///
+/// @author kongweiguang
+#[test]
+fn real_executable_external_arguments_survive_cold_and_forwarded_activation() {
+    for arguments in [
+        vec!["kerminal.exe", "-ssh", "alice@host.example", "-P", "2222"],
+        vec![
+            "kerminal.exe",
+            "--external-ssh-json",
+            r#"{"host":"host.example","port":2222,"user":"alice"}"#,
+        ],
+        vec![
+            "kerminal.exe",
+            "kerminal://ssh?host=host.example&user=alice&openSftp=true",
+        ],
+    ] {
+        let cold = activation_from_os(arguments.iter().map(|value| OsString::from(*value)), None)
+            .expect("valid platform argv")
+            .expect("external request");
+        let forwarded = decode_message(
+            &encode_message(&ActivationRequest::External(cold.clone())).expect("encode request"),
+        )
+        .expect("decode request");
+        assert_eq!(forwarded, ActivationRequest::External(cold));
+    }
+}
+
 /// 保留现有简单二次启动消息，同时拒绝未知版本、未知字段和不完整外部请求。
 #[test]
 fn decoder_accepts_legacy_focus_but_fails_closed_on_unknown_contracts() {

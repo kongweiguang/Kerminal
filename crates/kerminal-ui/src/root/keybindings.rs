@@ -2,7 +2,10 @@
 //!
 //! @author kongweiguang
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::{KeyContext, Keystroke};
 use kerminal_application::preferences::KeybindingPreference;
@@ -35,7 +38,7 @@ pub(super) enum KeybindingFocusScope {
 pub(super) enum KeybindingDispatch {
     /// 当前按键不属于快捷键，必须继续交给终端或焦点控件。
     Unhandled,
-    /// 当前按键是有效 chord 前缀，暂时等待后续 stroke。
+    /// 当前按键是有效 chord 前缀，或已消费按键的重复事件。
     Pending,
     /// 找到已知的业务动作，由 Root 调用对应的原生用例入口。
     Action(KeybindingAction),
@@ -48,6 +51,7 @@ pub(super) struct RootKeybindingRuntime {
     pending_strokes: Vec<Keystroke>,
     pending_scope: Option<KeybindingFocusScope>,
     pending_since: Option<Instant>,
+    terminal_shortcut_keys: HashSet<String>,
 }
 
 impl Default for RootKeybindingRuntime {
@@ -61,6 +65,7 @@ impl Default for RootKeybindingRuntime {
             pending_strokes: Vec::new(),
             pending_scope: None,
             pending_since: None,
+            terminal_shortcut_keys: HashSet::new(),
         }
     }
 }
@@ -70,6 +75,7 @@ impl RootKeybindingRuntime {
     ///
     /// @author kongweiguang
     pub(super) fn update(&mut self, preferences: &[KeybindingPreference]) {
+        self.clear_terminal_shortcut_keys();
         self.compiled = CompiledKeybindings::compile(preferences, KeybindingPlatform::current());
         let editor_preferences = preferences
             .iter()
@@ -208,6 +214,39 @@ impl RootKeybindingRuntime {
         if let Some(editor_global_runtime) = self.editor_global_runtime.as_mut() {
             editor_global_runtime.clear_pending();
         }
+    }
+
+    /// 仅记录已经被终端快捷键真正消费的物理主键，重复事件不能再次执行动作或泄漏到 PTY。
+    ///
+    /// @author kongweiguang
+    pub(super) fn remember_terminal_shortcut_key(&mut self, keystroke: &Keystroke) {
+        if !keystroke.key.is_empty() {
+            self.terminal_shortcut_keys
+                .insert(keystroke.key.to_ascii_lowercase());
+        }
+    }
+
+    /// 比较物理主键而非修饰键快照，处理用户先松开 Ctrl/Shift 后主键仍在重复的情况。
+    ///
+    /// @author kongweiguang
+    pub(super) fn is_terminal_shortcut_repeat(&self, keystroke: &Keystroke) -> bool {
+        self.terminal_shortcut_keys
+            .contains(&keystroke.key.to_ascii_lowercase())
+    }
+
+    /// keyup 清除对应身份并告诉调用方吞掉该释放事件，避免 Kitty 接收没有 press 的 release。
+    ///
+    /// @author kongweiguang
+    pub(super) fn release_terminal_shortcut_key(&mut self, keystroke: &Keystroke) -> bool {
+        self.terminal_shortcut_keys
+            .remove(&keystroke.key.to_ascii_lowercase())
+    }
+
+    /// 焦点、输入法与配置变化后不能把旧 pane 的按键身份用于新目标。
+    ///
+    /// @author kongweiguang
+    pub(super) fn clear_terminal_shortcut_keys(&mut self) {
+        self.terminal_shortcut_keys.clear();
     }
 }
 

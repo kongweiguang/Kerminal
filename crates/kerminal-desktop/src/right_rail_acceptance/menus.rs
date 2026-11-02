@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::{error::Error, io, path::Path, time::Instant};
+use std::{error::Error, fs, io, path::Path, time::Instant};
 
 use gpui_pre::{
     AnyWindowHandle, AsyncApp, Bounds, InputEvent, KeyDownEvent, KeyUpEvent, Keystroke,
@@ -89,7 +89,7 @@ pub(super) async fn capture_menu(
     .await;
     let open_state_after_capture = read_menu_frame_state(cx, window)?;
     let _closed_state = if open_state_after_capture.popup_bounds.is_some() {
-        dismiss_and_wait_for_popup_absent(cx, window, surface).await?
+        dismiss_and_wait_for_popup_absent(cx, window, surface, None).await?
     } else {
         return Err(io::Error::other(format!(
             "{surface} popup disappeared before the acceptance driver could dismiss it"
@@ -136,7 +136,7 @@ pub(super) async fn capture_menu(
 /// 只对当前帧中存在且位于可视视口内的真实触发器发送窗口输入，避免硬编码坐标误点。
 ///
 /// @author kongweiguang
-fn click_selector(
+pub(super) fn click_selector(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
     selector: &str,
@@ -178,6 +178,86 @@ fn click_selector(
         }
         Ok::<_, io::Error>(())
     })??;
+    Ok(())
+}
+
+/// 在已绘制的 fixture 行触发右键并读取原生菜单标签，确保精简命令未仅仅被视觉遮挡。
+///
+/// @author kongweiguang
+pub(super) async fn assert_file_context_menu(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    selector: &str,
+    diagnostic: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let _ = frame_signature(cx, window)?;
+    window.update(cx, |_, window, app| {
+        let bounds = window
+            .debug_selector_bounds(selector)
+            .ok_or_else(|| io::Error::other(format!("missing fixture file row {selector:?}")))?;
+        if !bounds_inside_viewport(bounds, window.visual_viewport_bounds()) {
+            return Err(io::Error::other("fixture file row is outside the viewport"));
+        }
+        let position = bounds.center();
+        for event in [
+            MouseMoveEvent {
+                position,
+                ..MouseMoveEvent::default()
+            }
+            .to_platform_input(),
+            MouseDownEvent {
+                button: MouseButton::Right,
+                position,
+                click_count: 1,
+                ..MouseDownEvent::default()
+            }
+            .to_platform_input(),
+            MouseUpEvent {
+                button: MouseButton::Right,
+                position,
+                click_count: 1,
+                ..MouseUpEvent::default()
+            }
+            .to_platform_input(),
+        ] {
+            let _ = window.dispatch_event(event, app);
+        }
+        Ok::<_, io::Error>(())
+    })??;
+    wait_for_popup_presence(cx, window, true, "fixture file context menu").await?;
+    let labels = window.update(cx, |_, window, _| {
+        gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .filter(|node| node.role() == Some(gpui_pre::Role::MenuItem))
+            .filter_map(|node| node.label().map(str::to_owned))
+            .collect::<Vec<_>>()
+    })?;
+    let menu_result = if !labels
+        .iter()
+        .any(|label| label == "复制路径" || label == "Copy path")
+    {
+        Err(io::Error::other(format!(
+            "file menu is missing Copy path: {labels:?}"
+        )))
+    } else if labels.iter().any(|label| {
+        matches!(
+            label.as_str(),
+            "下载到剪贴板"
+                | "Download to clipboard"
+                | "复制项目"
+                | "Copy item"
+                | "工作区打开"
+                | "Open in workspace"
+        )
+    }) {
+        Err(io::Error::other(format!(
+            "file menu contains a removed command: {labels:?}"
+        )))
+    } else {
+        Ok(())
+    };
+    dismiss_and_wait_for_popup_absent(cx, window, "fixture file context menu", diagnostic).await?;
+    menu_result?;
     Ok(())
 }
 
@@ -252,6 +332,7 @@ async fn dismiss_and_wait_for_popup_absent(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
     surface: &str,
+    diagnostic: Option<&Path>,
 ) -> Result<MenuFrameState, Box<dyn Error>> {
     let escape = Keystroke::parse("escape").map_err(|error| {
         io::Error::new(
@@ -259,7 +340,8 @@ async fn dismiss_and_wait_for_popup_absent(
             format!("could not construct Escape input: {error}"),
         )
     })?;
-    window.update(cx, |_, window, app| {
+    let (before, after_down, after_up) = window.update(cx, |_, window, app| {
+        let before = diagnostic.map(|_| menu_focus_diagnostic(window, app));
         let _ = window.dispatch_event(
             KeyDownEvent {
                 keystroke: escape.clone(),
@@ -269,9 +351,53 @@ async fn dismiss_and_wait_for_popup_absent(
             .to_platform_input(),
             app,
         );
+        let after_down = diagnostic.map(|_| menu_focus_diagnostic(window, app));
         let _ = window.dispatch_event(KeyUpEvent { keystroke: escape }.to_platform_input(), app);
+        let after_up = diagnostic.map(|_| menu_focus_diagnostic(window, app));
+        (before, after_down, after_up)
     })?;
-    wait_for_popup_presence(cx, window, false, surface).await
+    let result = wait_for_popup_presence(cx, window, false, surface).await;
+    if let Some(path) = diagnostic {
+        let after_frame = window.update(cx, |_, window, app| menu_focus_diagnostic(window, app))?;
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "beforeEscape": &before, "afterKeyDown": &after_down,
+                "afterKeyUp": &after_up, "afterFrame": &after_frame,
+            }))?,
+        )?;
+        if before
+            .as_ref()
+            .is_some_and(|state| state["drawerPresent"] == true)
+            && (!before
+                .as_ref()
+                .is_some_and(|state| state["popupContextActive"] == true)
+                || after_frame["popupPresent"] != false
+                || after_frame["drawerPresent"] != true)
+        {
+            return Err(io::Error::other(
+                "窄窗文件菜单未获得键盘上下文，或一次 Escape 同时关闭了抽屉",
+            )
+            .into());
+        }
+    }
+    result
+}
+
+/// 只读当前焦点、键盘上下文及菜单和抽屉边界，不改变 Escape 的分发路径或焦点。
+///
+/// @author kongweiguang
+fn menu_focus_diagnostic(window: &gpui_pre::Window, app: &gpui_pre::App) -> serde_json::Value {
+    let contexts = window.context_stack();
+    let popup = window.debug_selector_bounds(POPUP_MENU_SELECTOR);
+    let drawer = window.debug_selector_bounds("workbench-compact-tool-drawer-surface");
+    serde_json::json!({
+        "focus": window.focused(app).map(|focus| format!("{focus:?}")),
+        "contextStack": format!("{contexts:?}"),
+        "popupContextActive": contexts.iter().any(|context| context.contains("PopupMenu")),
+        "popupBounds": format!("{popup:?}"), "popupPresent": popup.is_some(),
+        "drawerBounds": format!("{drawer:?}"), "drawerPresent": drawer.is_some(),
+    })
 }
 
 #[cfg(test)]

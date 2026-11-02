@@ -8,10 +8,10 @@ use gpui_kit::{Context, Entity, EntityId};
 use kerminal_application::{
     AppError,
     operations::{
-        CurrentTerminalProxyRequest, FutureProxyApplyRequest, FutureProxyAttemptResult,
-        FutureProxyRetryIntent, TerminalProxyApplication, TerminalProxyApplyOutcome,
-        TerminalProxyApplyResult, TerminalProxyReconcileOutcome, TerminalProxyReconcileResult,
-        TerminalProxyUnavailableReason,
+        CurrentTerminalProxyRequest, FutureProxyApplyRequest, FutureProxyApplyState,
+        FutureProxyAttemptResult, FutureProxyRetryIntent, TerminalProxyApplication,
+        TerminalProxyApplyOutcome, TerminalProxyApplyResult, TerminalProxyReconcileOutcome,
+        TerminalProxyReconcileResult, TerminalProxyUnavailableReason,
     },
     sessions::{
         TerminalCommandAvailability, TerminalCommandContext, TerminalCommandUnavailableReason,
@@ -21,14 +21,14 @@ use kerminal_application::{
 use kerminal_domain::{
     connections::RemoteShellDialect,
     identity::{HostId, SessionId},
-    sessions::{SessionOwner, SessionTarget},
+    sessions::{SessionLifecycle, SessionOwner, SessionTarget},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::features::operations::proxy_panel::{
     ProxyApplicationPanel, ProxyCurrentApplication, ProxyCurrentAvailability, ProxyCurrentSession,
     ProxyFutureProjection, ProxyHistoryResult, ProxyOperationStatus, ProxyPanelEvent,
-    ProxyReviewScript, ProxyUnavailableReason,
+    ProxyReviewScript, ProxyUnavailableReason, proxy_status_error,
 };
 
 use super::{RootView, workspace_runtime::RuntimePanePhase};
@@ -84,6 +84,14 @@ struct ActiveProxyTask {
     cancellation: Option<CancellationSlot>,
 }
 
+/// 同一终端的 shell 回读由一个任务持有，面板仅登记各自的目标快照。
+struct SharedCurrentRead {
+    ticket: ProxyTaskTicket,
+    scope: ProxyCurrentScope,
+    cancellation: CancellationSlot,
+    waiters: std::collections::HashMap<EntityId, ProxyCurrentScope>,
+}
+
 /// Root 持有异步回执 generation 和协作取消，不创建第二个代理或终端服务。
 /// 保留首次 SSH 策略的安全结果和不透明一次性重试授权。
 pub(super) struct InitialProxyNotice {
@@ -97,6 +105,7 @@ pub(super) struct InitialProxyNotice {
 pub(super) struct ProxyRuntime {
     next_generation: u64,
     active: std::collections::HashMap<ProxyTaskKey, ActiveProxyTask>,
+    current_read: Option<SharedCurrentRead>,
 }
 
 impl CancellationSlot {
@@ -190,27 +199,25 @@ impl ProxyRuntime {
         }
     }
 
-    /// pane、主机或所选转发变化时取消旧 current 读取和有绑定的用户操作。
+    /// 移除面板的旧读取观察者；已提交操作仍保留 ticket 等待真实回执。
+    ///
+    /// @author kongweiguang
     fn cancel_stale_current(&mut self, panel_id: EntityId, scope: Option<&ProxyCurrentScope>) {
+        if let Some(read) = self.current_read.as_mut() {
+            read.waiters.remove(&panel_id);
+        }
         let stale_keys = self
             .active
             .iter()
             .filter(|(key, active)| {
-                matches!(key, ProxyTaskKey::CurrentRead(id) if *id == panel_id)
-                    || (matches!(key, ProxyTaskKey::PanelRequest(id, _) if *id == panel_id)
-                        && active.scope.is_some()
-                        && active.scope.as_ref() != scope)
+                matches!(key, ProxyTaskKey::PanelRequest(id, _) if *id == panel_id)
+                    && active.scope.is_some()
+                    && active.scope.as_ref() != scope
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in stale_keys {
-            if matches!(key, ProxyTaskKey::CurrentRead(_)) {
-                if let Some(active) = self.active.remove(&key)
-                    && let Some(cancellation) = active.cancellation
-                {
-                    cancellation.cancel();
-                }
-            } else if let Some(cancellation) = self
+            if let Some(cancellation) = self
                 .active
                 .get(&key)
                 .and_then(|active| active.cancellation.as_ref())
@@ -221,13 +228,88 @@ impl ProxyRuntime {
         }
     }
 
-    /// 同一绑定仍在执行用户操作时，不并发启动新的 shell 探针打断命令提示符。
+    /// 同一终端只允许一个代理操作，面板的主机或转发选择不能改变 shell 互斥边界。
+    ///
+    /// @author kongweiguang
     fn has_current_operation(&self, scope: &ProxyCurrentScope) -> bool {
         self.active.iter().any(|(key, active)| {
-            matches!(key, ProxyTaskKey::PanelRequest(_, _))
-                && active.scope.as_ref() == Some(scope)
-                && active.cancellation.is_some()
+            (matches!(key, ProxyTaskKey::PanelRequest(_, _))
+                && active
+                    .scope
+                    .as_ref()
+                    .is_some_and(|other| same_proxy_terminal(other, scope))
+                && active.cancellation.is_some())
+                || matches!(key, ProxyTaskKey::InitialReady(id) if id == &scope.session_id)
         })
+    }
+
+    /// 读取期间拒绝过期的菜单事件，避免用户操作抢占正在核对的原终端。
+    ///
+    /// @author kongweiguang
+    fn has_current_read(&self, scope: &ProxyCurrentScope) -> bool {
+        self.current_read
+            .as_ref()
+            .is_some_and(|read| same_proxy_terminal(&read.scope, scope))
+    }
+
+    /// 复用同一终端的在途回读；不同面板选择不会触发互相争抢的 shell 探针。
+    ///
+    /// @author kongweiguang
+    fn begin_or_join_current_read(
+        &mut self,
+        panel_id: EntityId,
+        scope: ProxyCurrentScope,
+    ) -> Option<(ProxyTaskTicket, CancellationSlot)> {
+        if let Some(read) = self.current_read.as_mut()
+            && same_proxy_terminal(&read.scope, &scope)
+        {
+            read.waiters.insert(panel_id, scope);
+            return None;
+        }
+        if let Some(read) = self.current_read.take() {
+            read.cancellation.cancel();
+            self.finish(&read.ticket);
+        }
+        let cancellation = CancellationSlot::default();
+        let ticket = self.begin(
+            ProxyTaskKey::CurrentRead(panel_id),
+            Some(scope.clone()),
+            Some(cancellation.clone()),
+        );
+        self.current_read = Some(SharedCurrentRead {
+            ticket: ticket.clone(),
+            scope: scope.clone(),
+            cancellation: cancellation.clone(),
+            waiters: [(panel_id, scope)].into_iter().collect(),
+        });
+        Some((ticket, cancellation))
+    }
+
+    /// 无面板需要原目标时取消探针；保留批次直到收尾，重入不会与旧租约并发。
+    ///
+    /// @author kongweiguang
+    fn cancel_unobserved_current_read(&self) {
+        if let Some(read) = self.current_read.as_ref()
+            && read.waiters.is_empty()
+        {
+            read.cancellation.cancel();
+        }
+    }
+
+    /// 只有当前批次可以分发结果，过期任务不能清除新目标的观察者。
+    ///
+    /// @author kongweiguang
+    fn finish_current_read(&mut self, ticket: &ProxyTaskTicket) -> Option<SharedCurrentRead> {
+        if !self
+            .current_read
+            .as_ref()
+            .is_some_and(|read| read.ticket == *ticket)
+        {
+            return None;
+        }
+        let read = self.current_read.take();
+        self.finish(ticket);
+        read
     }
 
     /// 没有可读主机时停止未来策略读取，已有非取消型 CAS 操作仍等待明确结果。
@@ -238,6 +320,41 @@ impl ProxyRuntime {
             cancellation.cancel();
         }
     }
+}
+
+/// 读取和操作互斥由真实 session owner 决定，不受每个面板的选择影响。
+///
+/// @author kongweiguang
+fn same_proxy_terminal(left: &ProxyCurrentScope, right: &ProxyCurrentScope) -> bool {
+    left.session_id == right.session_id && left.owner == right.owner
+}
+
+/// 只有运行中的同一 UI owner 的服务观察可用于保留刷新前投影；未知或退出立即失效。
+///
+/// @author kongweiguang
+fn trusted_proxy_refresh_binding(
+    scope: &ProxyCurrentScope,
+    observation: Option<(UiSessionBinding, SessionLifecycle)>,
+) -> Option<UiSessionBinding> {
+    let (binding, lifecycle) = observation?;
+    (lifecycle == SessionLifecycle::Running
+        && binding.session_id == scope.session_id
+        && binding.owner == scope.owner)
+        .then_some(binding)
+}
+
+/// 首次尚无服务观察时允许已由用例核实的回执；重连中或观察已换代时禁止回投旧结果。
+///
+/// @author kongweiguang
+fn proxy_readback_matches_observation(
+    binding: &UiSessionBinding,
+    observation: Option<(UiSessionBinding, SessionLifecycle)>,
+    reconnecting: bool,
+) -> bool {
+    !reconnecting
+        && observation.is_none_or(|(observed, lifecycle)| {
+            lifecycle == SessionLifecycle::Running && observed == *binding
+        })
 }
 
 impl Drop for ProxyRuntime {
@@ -390,7 +507,7 @@ fn recovery_forward_id_from_readback(
     }
 }
 
-/// 从 session service 取 generation、回读 shell marker，再确认读取期间 session 未重连；无原记录时保持空态。
+/// 按 session generation 回读唯一代理事务；无跟踪记录时不依赖各面板选择的转发。
 ///
 /// @author kongweiguang
 async fn read_current_proxy_session(
@@ -421,15 +538,6 @@ async fn read_current_proxy_session(
             },
             result,
         ))
-    } else if let Some(forward_id) = scope.forward_id.clone() {
-        let request = CurrentTerminalProxyRequest {
-            forward_id,
-            binding: binding.clone(),
-        };
-        let result = proxy
-            .reconcile_current(request.clone(), cancellation.clone())
-            .await?;
-        Some((request, result))
     } else {
         None
     };
@@ -466,6 +574,8 @@ async fn read_current_proxy_session(
 
 /// 将 use case 未应用原因映射到 UI 稳定分类，不向界面泄露低层命令或 transport 文本。
 /// 自动应用/重试只展示结构化安全原因，不把 shell 命令或执行输出放入工作区提示。
+///
+/// @author kongweiguang
 fn initial_proxy_outcome_message(
     outcome: &TerminalProxyApplyOutcome,
 ) -> Option<gpui_kit::SharedString> {
@@ -532,8 +642,8 @@ fn initial_proxy_outcome_message(
                 "The current shell dialect does not support the proxy script.",
             ),
             TerminalProxyUnavailableReason::PolicyChanged => crate::locale::text(
-                "代理策略已变化；请在面板读取最新状态。",
-                "The proxy policy changed. Read its latest state in the panel.",
+                "代理策略已变化，请刷新后重试。",
+                "The proxy policy changed. Refresh and try again.",
             ),
             TerminalProxyUnavailableReason::AttemptAlreadyProcessed => crate::locale::text(
                 "该代理尝试已处理，不能重复应用。",
@@ -553,8 +663,8 @@ fn initial_proxy_outcome_message(
             ),
         },
         TerminalProxyApplyOutcome::Failed { .. } => crate::locale::text(
-            "代理脚本执行失败；请在代理面板核对终端状态。",
-            "The proxy script failed. Check the terminal state in the proxy panel.",
+            "代理脚本执行失败，请核对当前终端。",
+            "The proxy script failed. Check the current terminal.",
         ),
         TerminalProxyApplyOutcome::Unknown { .. } => crate::locale::text(
             "代理执行结果未知；先核对终端状态，不要再次发送脚本。",
@@ -622,13 +732,24 @@ fn history_result(result: &TerminalProxyApplyResult) -> Option<ProxyHistoryResul
     }
 }
 
-/// 将应用动作和独立 readback 合并为用户可理解的最终回执，未知状态保持锁定。
+/// 将应用动作和独立 readback 合并为最终回执；部分恢复始终保留用户手动修改的警示。
+///
+/// @author kongweiguang
 fn current_operation_status(
     restoring: bool,
     operation: &kerminal_application::AppResult<TerminalProxyApplyResult>,
     application: ProxyCurrentApplication,
     cancelled: bool,
 ) -> ProxyOperationStatus {
+    if operation
+        .as_ref()
+        .is_ok_and(|result| matches!(result.outcome, TerminalProxyApplyOutcome::PartiallyRestored))
+    {
+        return ProxyOperationStatus::Failed(crate::locale::text(
+            "代理只恢复了部分变量；手动修改的值已保留。",
+            "The proxy was only partially restored; manually changed values were kept.",
+        ));
+    }
     match application {
         ProxyCurrentApplication::OutcomeUnknown => ProxyOperationStatus::OutcomeUnknown,
         ProxyCurrentApplication::Applied if !restoring => ProxyOperationStatus::Applied,
@@ -678,6 +799,38 @@ fn current_operation_status(
                 }
             }
         }
+    }
+}
+
+/// 写回与读取分别核对；读取失败不能伪装为关闭，CAS 失败也不能因同值回读而消失。
+///
+/// @author kongweiguang
+fn future_operation_error(
+    result: &kerminal_application::AppResult<(
+        kerminal_application::AppResult<FutureProxyApplyState>,
+        kerminal_application::AppResult<FutureProxyApplyState>,
+    )>,
+    request: &FutureProxyApplyRequest,
+) -> Option<gpui_kit::SharedString> {
+    match result {
+        Ok((write, Ok(state))) if state.host_id == request.host_id => {
+            if let Err(error) = write {
+                Some(error.public_message().to_owned().into())
+            } else if state.forward_id != request.forward_id
+                || request.expected_revision.checked_add(1) != Some(state.revision)
+            {
+                Some(crate::locale::text(
+                    "代理设置已变化，请刷新后重试。",
+                    "The proxy setting changed. Refresh and try again.",
+                ))
+            } else {
+                None
+            }
+        }
+        _ => Some(crate::locale::text(
+            "代理设置结果未知，请刷新后核对。",
+            "The proxy setting result is unknown. Refresh to verify it.",
+        )),
     }
 }
 
@@ -981,7 +1134,9 @@ impl RootView {
         }
     }
 
-    /// 逐个刷新主运维页和固定 Ports 面板；每个实体保留独立选择与迟到回执门禁。
+    /// 面板保留独立选择，指向同一终端时共享一次权威回读。
+    ///
+    /// @author kongweiguang
     pub(super) fn refresh_proxy_panel(&mut self, cx: &mut Context<Self>) {
         let panels = self.proxy_panels();
         if panels.is_empty() {
@@ -995,6 +1150,7 @@ impl RootView {
         for panel in panels {
             self.refresh_proxy_panel_entity(panel, proxy.clone(), cx);
         }
+        self.proxy_runtime.cancel_unobserved_current_read();
     }
 
     /// 主运维页持续可用；标签换挂前跳过旧 Ports 实体，避免新 pane 投影清除其原选择。
@@ -1014,7 +1170,22 @@ impl RootView {
             .collect()
     }
 
-    /// 对单个代理面板同步 session 与 host policy 状态，任务键始终绑定该 panel Entity。
+    /// 脚本审阅结束后仅补做被互斥门禁延后的刷新，普通审阅不额外注入探针。
+    ///
+    /// @author kongweiguang
+    fn resume_deferred_proxy_refresh(&mut self, cx: &mut Context<Self>) {
+        if self
+            .proxy_panels()
+            .iter()
+            .any(|panel| panel.read(cx).is_current_refreshing())
+        {
+            self.refresh_proxy_panel(cx);
+        }
+    }
+
+    /// 面板各自核对选择与未来策略，终端回读加入同 session 的共享批次。
+    ///
+    /// @author kongweiguang
     fn refresh_proxy_panel_entity(
         &mut self,
         panel: Entity<ProxyApplicationPanel>,
@@ -1041,13 +1212,17 @@ impl RootView {
             selected_host_id.clone(),
             selected_forward_id,
             active_ui_ssh_target(self),
-        );
+        )
+        .filter(|scope| self.proxy_scope_is_readable(scope));
         self.proxy_runtime
             .cancel_stale_current(panel_id, scope.as_ref());
         match scope {
             Some(scope) => {
+                let binding = self.proxy_refresh_binding(&scope);
+                panel.update(cx, |panel, cx| {
+                    panel.begin_current_refresh(&scope.host_id, binding.as_ref(), cx)
+                });
                 if !self.proxy_runtime.has_current_operation(&scope) {
-                    panel.update(cx, |panel, cx| panel.set_current_session(None, None, cx));
                     self.refresh_current_proxy_state(panel.clone(), proxy.clone(), scope, cx);
                 }
             }
@@ -1058,14 +1233,7 @@ impl RootView {
 
         match selected_host_id {
             Some(host_id) => {
-                panel.update(cx, |panel, cx| {
-                    panel.set_future_projection(
-                        ProxyFutureProjection::Loading {
-                            host_id: host_id.clone(),
-                        },
-                        cx,
-                    );
-                });
+                panel.update(cx, |panel, cx| panel.begin_future_refresh(&host_id, cx));
                 self.refresh_future_proxy_state(panel, proxy, host_id, cx);
             }
             None => {
@@ -1080,7 +1248,90 @@ impl RootView {
         }
     }
 
-    /// 按明确 panel source 分发意图；任何 session 操作都再次校验焦点 owner 与选择快照。
+    /// 已确认断开或正在重连时撤销旧投影并暂停探针；首次尚无服务观察仍可读取。
+    ///
+    /// @author kongweiguang
+    fn proxy_scope_is_readable(&self, scope: &ProxyCurrentScope) -> bool {
+        let SessionOwner::Ui { tab_id, pane_id } = &scope.owner else {
+            return false;
+        };
+        if self
+            .session_restart_projection(pane_id)
+            .is_some_and(|state| state.busy)
+        {
+            return false;
+        }
+        let Some(pane) = self.workspace_runtime.pane(pane_id) else {
+            return false;
+        };
+        let Some(target) = pane.target.as_ref() else {
+            return false;
+        };
+        self.session_reconnect
+            .panel_observation(pane_id, tab_id, &scope.session_id, target)
+            .is_none_or(|observation| observation.lifecycle == SessionLifecycle::Running)
+    }
+
+    /// 复用重连协调器对生命周期和 generation 的服务观察，禁止重连期间保留旧代理事务。
+    ///
+    /// @author kongweiguang
+    fn proxy_refresh_binding(&self, scope: &ProxyCurrentScope) -> Option<UiSessionBinding> {
+        let SessionOwner::Ui { tab_id, pane_id } = &scope.owner else {
+            return None;
+        };
+        let pane = self.workspace_runtime.pane(pane_id)?;
+        let target = pane.target.as_ref()?;
+        let observation =
+            self.session_reconnect
+                .panel_observation(pane_id, tab_id, &scope.session_id, target);
+        trusted_proxy_refresh_binding(
+            scope,
+            observation.map(|observation| (observation.binding, observation.lifecycle)),
+        )
+    }
+
+    /// 回执投影前再次核对重连状态与已观察代次，避免旧读回填入同 ID 的新会话。
+    ///
+    /// @author kongweiguang
+    fn proxy_readback_binding_is_current(
+        &self,
+        scope: &ProxyCurrentScope,
+        binding: &UiSessionBinding,
+    ) -> bool {
+        let SessionOwner::Ui { tab_id, pane_id } = &scope.owner else {
+            return false;
+        };
+        let Some(pane) = self.workspace_runtime.pane(pane_id) else {
+            return false;
+        };
+        let Some(target) = pane.target.as_ref() else {
+            return false;
+        };
+        let observation =
+            self.session_reconnect
+                .panel_observation(pane_id, tab_id, &scope.session_id, target);
+        let reconnecting = self
+            .session_restart_projection(pane_id)
+            .is_some_and(|state| state.busy);
+        if !proxy_readback_matches_observation(
+            binding,
+            observation.map(|value| (value.binding, value.lifecycle)),
+            reconnecting,
+        ) {
+            return false;
+        }
+        self.pane_input_handlers
+            .get(&binding.session_id)
+            .is_none_or(|entry| entry.binding == *binding)
+            && self
+                .terminal_command_contexts
+                .get(&binding.session_id)
+                .is_none_or(|entry| entry.binding == *binding)
+    }
+
+    /// 按明确 panel source 分发意图；本地失败提示也核对主机和会话，避免切换后串到新目标。
+    ///
+    /// @author kongweiguang
     pub(super) fn handle_proxy_panel_event(
         &mut self,
         source: Entity<ProxyApplicationPanel>,
@@ -1091,6 +1342,25 @@ impl RootView {
             return;
         }
         match event {
+            ProxyPanelEvent::OperationError {
+                host_id,
+                binding,
+                message,
+            } => {
+                let panel = source.read(cx);
+                let binding_matches = binding.as_ref().is_none_or(|binding| {
+                    panel
+                        .current_session()
+                        .is_some_and(|session| &session.binding == binding)
+                        && active_ui_ssh_target(self).is_some_and(|(_, session_id, owner)| {
+                            session_id == binding.session_id && owner == binding.owner
+                        })
+                });
+                if panel.host_id() == host_id.as_ref() && binding_matches {
+                    self.status = Some(message.clone());
+                    cx.notify();
+                }
+            }
             ProxyPanelEvent::SelectionChanged {
                 host_id,
                 forward_id,
@@ -1200,7 +1470,9 @@ impl RootView {
                 .any(|panel| panel.entity_id() == source.entity_id())
     }
 
-    /// 读取 selected host 的未来策略；切换主机只取消读取，不会取消已进入 CAS 的写操作。
+    /// 读取 selected host 的未来策略；只报告当前主机的真实失败，不改写已提交的 CAS。
+    ///
+    /// @author kongweiguang
     fn refresh_future_proxy_state(
         &mut self,
         panel: Entity<ProxyApplicationPanel>,
@@ -1244,6 +1516,18 @@ impl RootView {
                 {
                     return;
                 }
+                if let Err(error) = &result
+                    && !cancellation.is_cancelled()
+                {
+                    root.status = Some(error.public_message().to_owned().into());
+                    cx.notify();
+                } else if result.as_ref().is_ok_and(|state| state.host_id != host_id) {
+                    root.status = Some(crate::locale::text(
+                        "代理设置读取与当前主机不匹配，请刷新后重试。",
+                        "The proxy settings belong to a different host. Refresh and try again.",
+                    ));
+                    cx.notify();
+                }
                 panel.update(cx, |panel, cx| match result {
                     Ok(state) if state.host_id == host_id => panel.set_future_projection(
                         ProxyFutureProjection::Ready {
@@ -1253,19 +1537,16 @@ impl RootView {
                         },
                         cx,
                     ),
-                    Ok(_) | Err(_) => panel.set_future_projection(
-                        ProxyFutureProjection::Unavailable {
-                            host_id: Some(host_id.clone()),
-                        },
-                        cx,
-                    ),
+                    Ok(_) | Err(_) => panel.finish_failed_future_refresh(&host_id, cx),
                 });
             });
         });
         task.detach();
     }
 
-    /// 首次/焦点/转发变化时重新读回 shell 状态；初始值未知，禁止按隧道元数据伪造 NotApplied。
+    /// 一个终端仅运行一次权威 shell 回读；完成后逐个复核面板快照再共享结果。
+    ///
+    /// @author kongweiguang
     fn refresh_current_proxy_state(
         &mut self,
         panel: Entity<ProxyApplicationPanel>,
@@ -1273,13 +1554,12 @@ impl RootView {
         scope: ProxyCurrentScope,
         cx: &mut Context<Self>,
     ) {
-        let panel_id = panel.entity_id();
-        let cancellation = CancellationSlot::default();
-        let ticket = self.proxy_runtime.begin(
-            ProxyTaskKey::CurrentRead(panel_id),
-            Some(scope.clone()),
-            Some(cancellation.clone()),
-        );
+        let Some((ticket, cancellation)) = self
+            .proxy_runtime
+            .begin_or_join_current_read(panel.entity_id(), scope.clone())
+        else {
+            return;
+        };
         let executor = self.services.executor.clone();
         let sessions = self.services.sessions.clone();
         let cancellation_for_task = cancellation.clone();
@@ -1300,27 +1580,48 @@ impl RootView {
                 })
                 .await;
             let _ = this.update(cx, |root, cx| {
-                if !root.proxy_runtime.is_current(&ticket) {
+                let Some(read) = root.proxy_runtime.finish_current_read(&ticket) else {
                     return;
-                }
-                root.proxy_runtime.finish(&ticket);
-                if !root.proxy_current_scope_matches(&panel, &scope, cx) {
-                    return;
-                }
-                match result {
-                    Ok(readback) => {
-                        panel.update(cx, |panel, cx| {
-                            panel.set_current_session(
-                                Some(readback.session),
-                                readback.recovery_forward_id,
-                                cx,
-                            );
-                        });
+                };
+                if read.cancellation.is_cancelled() {
+                    if !read.waiters.is_empty() {
+                        root.refresh_proxy_panel(cx);
                     }
-                    Err(error) => {
-                        panel.update(cx, |panel, cx| {
-                            panel.set_current_session(None, None, cx);
-                        });
+                    return;
+                }
+                for panel in root.proxy_panels() {
+                    let Some(scope) = read.waiters.get(&panel.entity_id()) else {
+                        continue;
+                    };
+                    if !root.proxy_current_scope_matches(&panel, scope, cx) {
+                        continue;
+                    }
+                    if let Ok(readback) = &result
+                        && !root.proxy_readback_binding_is_current(scope, &readback.session.binding)
+                    {
+                        panel.update(cx, |panel, cx| panel.set_current_session(None, None, cx));
+                        continue;
+                    }
+                    let binding = if result.is_err() {
+                        root.proxy_refresh_binding(scope).filter(|binding| {
+                            root.proxy_readback_binding_is_current(scope, binding)
+                        })
+                    } else {
+                        None
+                    };
+                    panel.update(cx, |panel, cx| match &result {
+                        Ok(readback) => panel.set_current_session(
+                            Some(readback.session.clone()),
+                            readback.recovery_forward_id.clone(),
+                            cx,
+                        ),
+                        Err(_) => panel.finish_failed_current_refresh(
+                            &scope.host_id,
+                            binding.as_ref(),
+                            cx,
+                        ),
+                    });
+                    if let Err(error) = &result {
                         root.status = Some(error.public_message().to_owned().into());
                     }
                 }
@@ -1346,6 +1647,11 @@ impl RootView {
             .as_ref()
             .and_then(|operations| operations.terminal_proxy())
         else {
+            self.status = Some(crate::locale::text(
+                "代理服务不可用。",
+                "Proxy service is unavailable.",
+            ));
+            cx.notify();
             source.update(cx, |panel, cx| {
                 panel.finish_current_operation(
                     request_id,
@@ -1361,6 +1667,11 @@ impl RootView {
         };
         let selected = source.read(cx);
         let Some(current) = selected.current_session().cloned() else {
+            self.status = Some(crate::locale::text(
+                "当前 SSH 会话已失效，请刷新后重试。",
+                "The current SSH session is no longer available. Refresh and retry.",
+            ));
+            cx.notify();
             source.update(cx, |panel, cx| {
                 panel.finish_current_operation(
                     request_id,
@@ -1399,6 +1710,26 @@ impl RootView {
                     cx,
                 );
             });
+            return;
+        }
+
+        if self.proxy_runtime.has_current_operation(&scope)
+            || self.proxy_runtime.has_current_read(&scope)
+        {
+            let message = crate::locale::text(
+                "当前终端正在处理代理，请稍后重试。",
+                "The terminal is processing a proxy operation. Try again shortly.",
+            );
+            self.status = Some(message.clone());
+            source.update(cx, |panel, cx| {
+                panel.finish_current_operation(
+                    request_id,
+                    ProxyOperationStatus::Failed(message),
+                    None,
+                    cx,
+                )
+            });
+            cx.notify();
             return;
         }
 
@@ -1467,6 +1798,7 @@ impl RootView {
                 }
                 root.proxy_runtime.finish(&ticket);
                 if !root.proxy_panel_is_current(&source) {
+                    root.resume_deferred_proxy_refresh(cx);
                     return;
                 }
                 if !root.proxy_current_scope_matches(&source, &scope, cx) {
@@ -1482,6 +1814,7 @@ impl RootView {
                             cx,
                         );
                     });
+                    root.resume_deferred_proxy_refresh(cx);
                     return;
                 }
                 source.update(cx, |panel, cx| {
@@ -1499,10 +1832,13 @@ impl RootView {
                         },
                         Err(_) if cancellation.is_cancelled() => ProxyOperationStatus::Cancelled,
                         Err(error) => {
-                            root.status = Some(error.public_message().to_owned().into());
                             ProxyOperationStatus::Failed(error.public_message().to_owned().into())
                         }
                     };
+                    if let Some(message) = proxy_status_error(&status) {
+                        root.status = Some(message);
+                        cx.notify();
+                    }
                     if let Ok(readback) = &reconciliation {
                         panel.set_current_session(
                             Some(readback.session.clone()),
@@ -1512,6 +1848,7 @@ impl RootView {
                     }
                     panel.finish_current_operation(request_id, status, None, cx);
                 });
+                root.refresh_proxy_panel(cx);
             });
         });
         task.detach();
@@ -1535,6 +1872,11 @@ impl RootView {
             .as_ref()
             .and_then(|operations| operations.terminal_proxy())
         else {
+            self.status = Some(crate::locale::text(
+                "代理服务不可用。",
+                "Proxy service is unavailable.",
+            ));
+            cx.notify();
             source.update(cx, |panel, cx| {
                 panel.finish_current_operation(
                     request_id,
@@ -1550,6 +1892,11 @@ impl RootView {
         };
         let selected = source.read(cx);
         let Some(current) = selected.current_session().cloned() else {
+            self.status = Some(crate::locale::text(
+                "当前 SSH 会话已失效，请刷新后重试。",
+                "The current SSH session is no longer available. Refresh and retry.",
+            ));
+            cx.notify();
             source.update(cx, |panel, cx| {
                 panel.finish_current_operation(
                     request_id,
@@ -1609,6 +1956,25 @@ impl RootView {
             session_id: binding.session_id.clone(),
             owner: binding.owner.clone(),
         };
+        if self.proxy_runtime.has_current_operation(&scope)
+            || self.proxy_runtime.has_current_read(&scope)
+        {
+            let message = crate::locale::text(
+                "当前终端正在处理代理，请稍后重试。",
+                "The terminal is processing a proxy operation. Try again shortly.",
+            );
+            self.status = Some(message.clone());
+            source.update(cx, |panel, cx| {
+                panel.finish_current_operation(
+                    request_id,
+                    ProxyOperationStatus::Failed(message),
+                    None,
+                    cx,
+                )
+            });
+            cx.notify();
+            return;
+        }
         let panel_id = source.entity_id();
         self.proxy_runtime
             .cancel_stale_current(panel_id, Some(&scope));
@@ -1708,6 +2074,10 @@ impl RootView {
                                 application,
                                 cancelled,
                             );
+                            if let Some(message) = proxy_status_error(&status) {
+                                root.status = Some(message);
+                                cx.notify();
+                            }
                             panel.finish_current_operation(request_id, status, history, cx);
                         });
                     } else {
@@ -1720,18 +2090,17 @@ impl RootView {
                             panel.finish_current_operation(request_id, status, None, cx);
                         });
                     }
-                    if let Err(error) = readback {
-                        root.status = Some(error.public_message().to_owned().into());
-                    }
                 }
-                // 多个代理面板可能指向同一 shell；动作完成后让所有实体各自回读权威状态。
+                // 多个面板共享同一次后续回读，避免再次争抢同一事务。
                 root.refresh_proxy_panel(cx);
             });
         });
         task.detach();
     }
 
-    /// Future policy 是 CAS 写入且不可取消；无论写入回执如何都立即读取权威状态，未知时不重放。
+    /// Future policy 的写入与权威回读分别判断；错误只投递给仍处于原主机的面板。
+    ///
+    /// @author kongweiguang
     fn start_future_proxy_operation(
         &mut self,
         source: Entity<ProxyApplicationPanel>,
@@ -1753,6 +2122,11 @@ impl RootView {
             .as_ref()
             .and_then(|operations| operations.terminal_proxy())
         else {
+            self.status = Some(crate::locale::text(
+                "代理服务不可用。",
+                "Proxy service is unavailable.",
+            ));
+            cx.notify();
             source.update(cx, |panel, cx| {
                 panel.set_future_projection(
                     ProxyFutureProjection::OutcomeUnknown {
@@ -1797,14 +2171,27 @@ impl RootView {
                     return;
                 }
                 root.proxy_runtime.cancel_future_read(source.entity_id());
+                if let Some(message) = future_operation_error(&result, &request) {
+                    root.status = Some(message);
+                    cx.notify();
+                }
                 source.update(cx, |panel, cx| match result {
-                    Ok((_, Ok(state))) if state.host_id == host_id => {
+                    Ok((write, Ok(state))) if state.host_id == host_id => {
                         let projection = ProxyFutureProjection::Ready {
                             host_id: state.host_id,
                             forward_id: state.forward_id,
                             revision: state.revision,
                         };
-                        if !panel.set_future_result(request_id, projection.clone(), cx) {
+                        if let Err(error) = write {
+                            panel.set_future_projection(projection, cx);
+                            panel.set_operation_status(
+                                request_id,
+                                ProxyOperationStatus::Failed(
+                                    error.public_message().to_owned().into(),
+                                ),
+                                cx,
+                            );
+                        } else if !panel.set_future_result(request_id, projection.clone(), cx) {
                             panel.set_future_projection(projection, cx);
                         }
                     }
@@ -1829,7 +2216,9 @@ impl RootView {
         task.detach();
     }
 
-    /// 只生成可审阅脚本；事件必须仍绑定当前 SSH pane、所选 SOCKS 转发和可信 shell 方言。
+    /// 只生成可审阅脚本；失败提示也限制在原 pane、转发和 shell 方言。
+    ///
+    /// @author kongweiguang
     fn start_proxy_script_review(
         &mut self,
         source: Entity<ProxyApplicationPanel>,
@@ -1867,6 +2256,11 @@ impl RootView {
             .as_ref()
             .and_then(|operations| operations.terminal_proxy())
         else {
+            self.status = Some(crate::locale::text(
+                "代理服务不可用。",
+                "Proxy service is unavailable.",
+            ));
+            cx.notify();
             source.update(cx, |panel, cx| {
                 panel.set_operation_status(
                     request_id,
@@ -1909,9 +2303,17 @@ impl RootView {
                 }
                 root.proxy_runtime.finish(&ticket);
                 if !root.proxy_panel_is_current(&source) {
+                    root.resume_deferred_proxy_refresh(cx);
                     return;
                 }
                 let still_current = root.proxy_current_scope_matches(&source, &scope, cx);
+                if still_current
+                    && !cancellation.is_cancelled()
+                    && let Err(error) = &result
+                {
+                    root.status = Some(error.public_message().to_owned().into());
+                    cx.notify();
+                }
                 source.update(cx, |panel, cx| {
                     if !still_current {
                         panel.set_operation_status(request_id, ProxyOperationStatus::Cancelled, cx);
@@ -1946,6 +2348,7 @@ impl RootView {
                         }
                     }
                 });
+                root.resume_deferred_proxy_refresh(cx);
             });
         });
         task.detach();

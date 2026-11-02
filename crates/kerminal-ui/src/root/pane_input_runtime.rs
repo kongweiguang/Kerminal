@@ -908,14 +908,15 @@ impl RootView {
         } else {
             tracked_projection_for_input(&event.binding.owner, event)
         };
-        if projection == UiInputProjection::Invalidates
-            && self.is_active_suggestion_binding(&event.binding)
-        {
-            self.terminal_command_suggestions.clear();
-            self.suggestion_menu_binding = None;
+        let suspended_suggestions = self.is_active_suggestion_binding(&event.binding)
+            && !matches!(&event.event, TerminalInputEvent::Focus(_))
+            && !is_key_release;
+        if suspended_suggestions {
+            self.terminal_command_suggestions
+                .suspend_for_pending_input();
             self.sync_suggestion_menu(cx);
         }
-        self.enqueue_session_command(
+        let accepted = self.enqueue_session_command(
             SessionCommand::UiInput(Box::new(super::session_queue::UiInputWork::new(
                 UiTerminalInputRequest {
                     binding: event.binding.clone(),
@@ -927,6 +928,10 @@ impl RootView {
             ))),
             cx,
         );
+        if !accepted && suspended_suggestions {
+            let mode = self.terminal_command_suggestions.active_mode();
+            self.request_suggestion_snapshot(event.binding.clone(), mode, false, cx);
+        }
     }
 }
 

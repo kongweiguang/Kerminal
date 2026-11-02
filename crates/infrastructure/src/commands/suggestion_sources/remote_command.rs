@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 use super::{
     CandidateContext, MAX_COMMAND_ENTRIES, MAX_PATH_DIRECTORIES, RemoteCommandSuggestionProvider,
-    RemoteSuggestionQuery, candidate, prefix_score, quote,
+    RemoteSuggestionQuery, candidate, prefix_score,
     syntax::{ParsedPrefix, ShellFamily, is_command_position},
 };
 
@@ -69,7 +69,8 @@ pub(super) async fn suggestions(
         .iter()
         .filter(|name| name.starts_with(typed))
         .filter_map(|name| {
-            let replacement = quote(name, prefix.shell)?;
+            let replacement =
+                super::syntax::append_literal(&request.input, request.cursor, prefix, name)?;
             let score = prefix_score(typed, name, false) - 0.1;
             Some(candidate(
                 CandidateContext {
@@ -113,13 +114,15 @@ async fn executable_names(
         return Ok(Some(names));
     }
     if provider.executables.is_backing_off(&key).await {
-        return Ok(None);
+        return Err(kerminal_application::AppError::infrastructure(
+            "远端命令建议暂不可用",
+        ));
     }
     let gate = provider.executables.gate(&key);
     let guard = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(kerminal_application::AppError::cancelled("远端命令建议已取消")),
-            _ = tokio::time::sleep_until(operation_deadline) => return Ok(None),
+        _ = tokio::time::sleep_until(operation_deadline) => return Err(kerminal_application::AppError::timeout("远端命令建议查询超时")),
         guard = super::cache::lock_gate(gate, cancellation) => guard,
     };
     let Some(_guard) = guard else {
@@ -131,11 +134,13 @@ async fn executable_names(
         return Ok(Some(names));
     }
     if provider.executables.is_backing_off(&key).await {
-        return Ok(None);
+        return Err(kerminal_application::AppError::infrastructure(
+            "远端命令建议暂不可用",
+        ));
     }
 
     let (program, arguments) = match shell {
-        ShellFamily::Posix => (POSIX_PATH_PROBE, vec!["PATH".to_owned()]),
+        ShellFamily::Posix | ShellFamily::Fish => (POSIX_PATH_PROBE, vec!["PATH".to_owned()]),
         ShellFamily::PowerShell => (
             POWERSHELL_PATH_PROBE,
             vec![POWERSHELL_PATH_ARGUMENT.to_owned()],
@@ -152,27 +157,45 @@ async fn executable_names(
                 working_directory: request.cwd.clone(),
             },
         )
-        .await?;
+        .await;
+    let path_output = match path_output {
+        Ok(output) => output,
+        Err(error) => {
+            if !cancellation.is_cancelled() {
+                provider
+                    .executables
+                    .mark_failure(key, super::REMOTE_FAILURE_BACKOFF)
+                    .await;
+            }
+            return Err(error);
+        }
+    };
     let Some(path_output) = path_output else {
         provider
             .executables
             .mark_failure(key, super::REMOTE_FAILURE_BACKOFF)
             .await;
-        return Ok(None);
+        return Err(kerminal_application::AppError::infrastructure(
+            "远端 PATH 查询失败",
+        ));
     };
     let Some(path_line) = path_value(&path_output, shell) else {
         provider
             .executables
             .mark_failure(key, super::REMOTE_FAILURE_BACKOFF)
             .await;
-        return Ok(None);
+        return Err(kerminal_application::AppError::infrastructure(
+            "远端 PATH 输出无效",
+        ));
     };
     if path_line.len() > 8 * 1024 || path_line.chars().any(char::is_control) {
         provider
             .executables
             .mark_failure(key, super::REMOTE_FAILURE_BACKOFF)
             .await;
-        return Ok(None);
+        return Err(kerminal_application::AppError::infrastructure(
+            "远端 PATH 输出超过限制",
+        ));
     }
 
     let mut directories = Vec::new();
@@ -252,7 +275,9 @@ async fn executable_names(
 fn path_value(output: &[u8], shell: ShellFamily) -> Option<String> {
     let text = std::str::from_utf8(output).ok()?;
     let value = match shell {
-        ShellFamily::Posix => text.lines().next()?.trim_end_matches('\r').to_owned(),
+        ShellFamily::Posix | ShellFamily::Fish => {
+            text.lines().next()?.trim_end_matches('\r').to_owned()
+        }
         ShellFamily::PowerShell => text.lines().find_map(|line| {
             let line = line.trim_start();
             let (name, value) = line.split_once(char::is_whitespace)?;
@@ -270,7 +295,7 @@ fn path_value(output: &[u8], shell: ShellFamily) -> Option<String> {
 /// 将 PATH 项限制为可由 POSIX SFTP RemotePath 表示的绝对路径，并跳过相对或未展开变量。
 fn path_directories(value: &str, shell: ShellFamily) -> Vec<kerminal_domain::files::RemotePath> {
     let delimiter = match shell {
-        ShellFamily::Posix => ':',
+        ShellFamily::Posix | ShellFamily::Fish => ':',
         ShellFamily::PowerShell if value.contains(';') || looks_like_windows_path(value) => ';',
         ShellFamily::PowerShell => ':',
         ShellFamily::Unknown => return Vec::new(),

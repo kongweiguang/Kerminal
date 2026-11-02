@@ -41,6 +41,7 @@ fn record(root: &std::path::Path) -> TransferRecoveryRecord {
     };
     TransferRecoveryRecord {
         id: TransferId::new(),
+        drag_staging: false,
         request: TransferRequest {
             source: FileEndpoint::Local {
                 path: root.join("source.txt"),
@@ -121,6 +122,48 @@ async fn recovery_round_trip_preserves_exact_target_and_ownership() {
             "no runtime or credential field {excluded}"
         );
     }
+}
+
+/// 拖出暂存的恢复用途必须跨重启保留，普通记录仍写旧版本供旧版本读取。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn drag_staging_purpose_is_durable_and_uses_versioned_format() {
+    let temporary = tempfile::tempdir().expect("isolated fixture");
+    let repository = JsonTransferRecoveryRepository::new(temporary.path());
+    let mut expected = record(temporary.path());
+    expected.drag_staging = true;
+    let id = expected.id.clone();
+    repository
+        .upsert(expected.clone(), CancellationToken::new())
+        .await
+        .expect("save drag preparation evidence");
+    let path = temporary.path().join("data/transfer-recovery.json");
+    let source = tokio::fs::read_to_string(&path)
+        .await
+        .expect("read persisted evidence");
+    let document: serde_json::Value = serde_json::from_str(&source).expect("JSON document");
+    assert_eq!(document["schemaVersion"], 2);
+    assert_eq!(document["records"][0]["dragStaging"], true);
+    validate_transfer_recovery_document(&source).expect("version 2 is accepted");
+    assert_eq!(
+        JsonTransferRecoveryRepository::new(temporary.path())
+            .list(CancellationToken::new())
+            .await
+            .expect("reopen evidence"),
+        vec![expected]
+    );
+    let downgraded = source.replace("\"schemaVersion\": 2", "\"schemaVersion\": 1");
+    assert!(validate_transfer_recovery_document(&downgraded).is_err());
+    repository
+        .remove(&id, CancellationToken::new())
+        .await
+        .expect("clear finished evidence");
+    let after = tokio::fs::read_to_string(&path)
+        .await
+        .expect("remaining document");
+    let after: serde_json::Value = serde_json::from_str(&after).expect("remaining JSON");
+    assert_eq!(after["schemaVersion"], 1);
 }
 
 /// 损坏或未来文档不能用空默认值覆盖，保存失败后逐字保留旧材料。

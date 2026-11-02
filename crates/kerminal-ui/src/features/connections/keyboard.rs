@@ -10,6 +10,30 @@ use gpui_kit::{
 use super::panel::{ConnectionsEditorKind, ConnectionsPanel};
 
 impl ConnectionsPanel {
+    /// Escape 先关闭最上层删除确认，且只调用既有取消入口，写入门禁和未知回执仍由原逻辑裁决。
+    /// 面板内按钮持有焦点时也必须在这一层截断按键，否则会穿透到终端或全局快捷键。
+    ///
+    /// @author kongweiguang
+    pub(super) fn handle_confirmation_escape(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.keystroke.key.eq_ignore_ascii_case("escape")
+            || event.keystroke.modifiers.modified()
+            || event.is_held
+        {
+            return;
+        }
+        if !self.has_pending_deletion_confirmation() {
+            return;
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        self.cancel_pending_deletion_confirmation(cx);
+    }
+
     /// Ctrl/Cmd+S 只提交当前单行编辑任务；多行、IME 和顶层分组弹层拥有自己的输入语义。
     /// 捕获阶段读取组合态，避免输入组件先提交候选词后把同一按键误判为保存。
     /// @author kongweiguang

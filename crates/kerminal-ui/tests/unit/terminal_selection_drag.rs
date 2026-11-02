@@ -91,6 +91,7 @@ fn terminal_point_projection_keeps_its_viewport_metadata() {
             column: 0,
             shape: TerminalCursorShape::Block,
             style_from_terminal: false,
+            blink_from_terminal: false,
             blinking: false,
             visible: false,
         },

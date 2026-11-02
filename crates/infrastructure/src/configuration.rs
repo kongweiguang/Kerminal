@@ -33,6 +33,7 @@ use tokio::task;
 use crate::storage::{AtomicCommitError, CommitMode, StorageCoordinator, commit_staged_file};
 
 mod host_group_transaction;
+mod local_host_recovery;
 mod profile_default_transaction;
 mod settings;
 mod validation;
@@ -61,6 +62,14 @@ pub struct ConfigurationStoreInitError {
 }
 
 impl ConfigurationStore {
+    /// 本地主机直接读回也经过同一 schema 和密文引用校验，避免绕开启动扫描。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn validate_host_source(id: &str, source: &str) -> AppResult<()> {
+        validation::validate_document(&ConfigDocumentPath::Host(id.to_owned()), source)
+            .map_err(|source| AppError::configuration_corrupt("本地主机配置").with_source(source))
+    }
+
     /// 创建用户数据根并恢复 profile、host/group journal；损坏文件保留原文并阻断写入。
     pub fn initialize(root: impl AsRef<Path>) -> Result<Self, ConfigurationStoreInitError> {
         let root = root.as_ref().to_path_buf();
@@ -410,7 +419,9 @@ impl ConfigurationStore {
         }))
     }
 
-    /// 在原 TOML 上仅替换 schema 1 已知字段，未知键和注释由 toml_edit 留在原文中。
+    /// 模板不再携带侧栏分组；其余未知键和注释继续由 toml_edit 留在原文中。
+    ///
+    /// @author kongweiguang
     fn save_profile_document(
         &self,
         draft: ProfileDraft,
@@ -451,7 +462,7 @@ impl ConfigurationStore {
             cwd: draft.cwd,
             env: draft.env,
             is_default: existing.as_ref().is_some_and(|profile| profile.is_default),
-            sidebar_group_id: draft.sidebar_group_id,
+            sidebar_group_id: None,
             sort_order: draft.sort_order,
             created_at: existing
                 .as_ref()
@@ -555,7 +566,9 @@ impl ConfigurationStore {
         })
     }
 
-    /// 在唯一存储锁和 compare-and-swap revision 保护下原子替换一份配置。
+    /// 主机分组归属与 CAS 在同一存储锁内复核，避免并发删除分组后写出悬空引用。
+    ///
+    /// @author kongweiguang
     fn write_document(
         &self,
         path: ConfigDocumentPath,
@@ -572,6 +585,32 @@ impl ConfigurationStore {
             })?;
         self.ensure_writable()?;
         self.ensure_configuration_transactions_absent()?;
+        if matches!(&path, ConfigDocumentPath::Host(_)) {
+            let host = toml::from_str::<toml::Value>(&source)
+                .map_err(|error| AppError::configuration_corrupt("主机配置").with_source(error))?;
+            if let Some(group_id) = host.get("group_id").and_then(toml::Value::as_str) {
+                let groups = self
+                    .read_document_unlocked(ConfigDocumentPath::HostGroups)?
+                    .ok_or_else(|| AppError::conflict("主机分组已变化，请刷新后再保存"))?;
+                validation::validate_document(&groups.path, &groups.source).map_err(|error| {
+                    AppError::configuration_corrupt("主机分组").with_source(error)
+                })?;
+                let groups = toml::from_str::<toml::Value>(&groups.source).map_err(|error| {
+                    AppError::configuration_corrupt("主机分组").with_source(error)
+                })?;
+                if !groups
+                    .get("groups")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|groups| {
+                        groups.iter().any(|group| {
+                            group.get("id").and_then(toml::Value::as_str) == Some(group_id)
+                        })
+                    })
+                {
+                    return Err(AppError::conflict("主机分组已变化，请刷新后再保存"));
+                }
+            }
+        }
         let absolute_path = safe_join(&self.inner.root, &relative_path)?;
 
         if final_path_is_symlink(&absolute_path)

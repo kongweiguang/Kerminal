@@ -2,10 +2,12 @@
 //!
 //! @author kongweiguang
 
+mod context_menu;
 mod dialog;
 mod directory_follow;
 mod drag_drop;
 mod host_picker;
+mod host_tabs;
 mod permissions;
 mod remote_clipboard;
 mod render;
@@ -14,10 +16,15 @@ mod right_rail_acceptance;
 mod selection;
 mod target_names;
 mod transfer_queue;
+mod transfer_refresh;
+#[cfg(feature = "right-rail-acceptance")]
+mod transfer_workspace_acceptance;
 mod tree;
 mod view_mode;
 
-pub use host_picker::{CreateSftpHostRequested, SftpHostKeyTrustRequested, SftpHostRequested};
+pub use host_picker::{
+    CreateSftpHostRequested, FilePaneSide, SftpHostKeyTrustRequested, SftpHostRequested,
+};
 #[cfg(feature = "right-rail-acceptance")]
 pub use right_rail_acceptance::transfers::{
     RightRailSftpTransferItem, RightRailSftpTransferTarget,
@@ -25,11 +32,8 @@ pub use right_rail_acceptance::transfers::{
 pub(crate) use target_names::{FileTargetNameLookup, FileTargetNameState, SftpHostChoice};
 
 use std::{
-    cell::Cell,
     collections::HashSet,
     path::PathBuf,
-    rc::Rc,
-    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -42,32 +46,29 @@ use gpui_kit::{
 };
 use kerminal_application::{
     AppError, AppResult, ApplicationTaskExecutor, PublicErrorCode,
-    files::{FileService, MAX_FILE_PREVIEW_BYTES, clipboard_download::RemoteClipboardSource},
+    files::FileService,
     platform::external_launch::ExternalTargetLease,
     preferences::{InterfaceDensity, ThemeMode},
     sessions::UiSessionBinding,
-    transfers::{TransferRecoveryRecord, TransferService},
+    transfers::{TransferQueueEvent, TransferRecoveryRecord, TransferService},
 };
 use kerminal_domain::files::{
     BookmarkTarget, ConflictPolicy, DeleteTargetKind, DirectoryListing, FileBookmark, FileEndpoint,
-    FileEntry, FileEntryKind, FilePreview, RemotePath, TransferKind, TransferRequest,
-    TransferStatus, TransferSummary,
+    FileEntry, FileEntryKind, RemotePath, TransferKind, TransferRequest, TransferSummary,
 };
 use kerminal_domain::identity::HostId;
 use tokio_util::sync::CancellationToken;
 
-use crate::{features::editor::EditorWorkspaceProjection, locale};
+use crate::locale;
+#[cfg(test)]
+use transfer_refresh::TransferRefreshScope;
+use transfer_refresh::{completed_transfer_refresh_directories, panel_needs_transfer_refresh};
 
-/// 文件面板请求根视图打开独立编辑器 tab，编辑器脏状态由根窗口统一管理。
+/// 文件面板冻结编辑目标及其独立临时连接 owner，避免切换终端后文档失去原目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenFileRequested {
     pub endpoint: FileEndpoint,
-}
-
-/// 文件工作区请求 Root 提供当前编辑器 tab 的只读快照，不共享编辑器实体。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WorkspaceOverviewRequested {
-    pub(crate) generation: u64,
+    pub external_target_lease: Option<ExternalTargetLease>,
 }
 
 /// 工作区中的文件行请求 Root 激活仍然存在的 editor endpoint。
@@ -79,15 +80,16 @@ pub(crate) struct ActivateEditorFileRequested {
 /// 紧凑 SFTP 栏请求 Root 对冻结的终端会话执行 shell 目录跟随配置。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FilesPaneEvent {
+    TransferEndpointsChanged {
+        left: FileEndpoint,
+        right: Option<FileEndpoint>,
+    },
+    CancelHostSelection {
+        side: FilePaneSide,
+        generation: u64,
+    },
     SetupTerminalDirectoryFollow {
         binding: UiSessionBinding,
-    },
-    CopyRemoteFilesToClipboard {
-        request_id: u64,
-        sources: Vec<RemoteClipboardSource>,
-    },
-    CancelClipboardDownload {
-        request_id: u64,
     },
 }
 
@@ -110,19 +112,15 @@ struct BrowserPanel {
     list_focus_handle: Option<gpui_kit::FocusHandle>,
     keyboard_focus: FileListKeyboardFocus,
     pending_selection: Option<String>,
-    pending_file_preview: bool,
     path_input: Option<Entity<InputState>>,
     path_input_endpoint: Option<String>,
     _path_subscription: Option<Subscription>,
     loading: bool,
     directory_error: Option<String>,
     generation: u64,
-    preview_generation: u64,
-    preview_cancellation: Option<Arc<PreviewTaskCancellation>>,
     tree: tree::FileTreeBrowser,
     tree_widget: Option<tree::TreeWidget>,
     list_scroll: VirtualListScrollHandle,
-    keyboard_scroll_intent: KeyboardScrollIntent,
     sort: FileSort,
     entry_filter: view_mode::FileEntryFilter,
     navigation_history: NavigationHistory,
@@ -159,168 +157,6 @@ pub(super) enum FileListMovement {
     PageNext { visible_rows: usize },
     First,
     Last,
-}
-
-/// 键盘移动后的补滚动只在目标、目录与预览代次仍匹配时生效。
-///
-/// @author kongweiguang
-#[derive(Clone)]
-struct PendingKeyboardScroll {
-    revision: u64,
-    panel_generation: u64,
-    directory: FileEndpoint,
-    target_name: String,
-    target_endpoint: FileEndpoint,
-    preview_generation: u64,
-    wait_for_preview: bool,
-    consumed: Rc<Cell<bool>>,
-}
-
-/// 保存单个尚未消费的键盘可见性请求，鼠标滚动或新输入会使旧 revision 失效。
-///
-/// @author kongweiguang
-#[derive(Clone, Default)]
-struct KeyboardScrollIntent {
-    revision: u64,
-    pending: Option<PendingKeyboardScroll>,
-}
-
-/// 当前预览/列表快照是否仍允许消费一次延迟键盘滚动。
-///
-/// @author kongweiguang
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KeyboardScrollReadiness {
-    Stale,
-    WaitingForPreview,
-    Ready,
-}
-
-/// 一次 prepaint 用的只读状态快照，避免重复读取并保证评估与消费使用相同上下文。
-///
-/// @author kongweiguang
-#[derive(Clone)]
-struct KeyboardScrollSnapshot {
-    panel_generation: u64,
-    directory: FileEndpoint,
-    listing_is_current: bool,
-    active_name: Option<String>,
-    selected_endpoint: Option<FileEndpoint>,
-    preview_generation: u64,
-    preview_pending: bool,
-}
-
-impl KeyboardScrollIntent {
-    /// 用新键盘目标替换旧意图，预览文件仅等待本次请求结束后再校正 viewport。
-    ///
-    /// @author kongweiguang
-    fn arm(
-        &mut self,
-        panel_generation: u64,
-        directory: &FileEndpoint,
-        target_name: &str,
-        target_endpoint: &FileEndpoint,
-        preview_generation: u64,
-        wait_for_preview: bool,
-    ) -> u64 {
-        if let Some(previous) = self.pending.take() {
-            previous.consumed.set(true);
-        }
-        self.revision = self.revision.wrapping_add(1);
-        self.pending = Some(PendingKeyboardScroll {
-            revision: self.revision,
-            panel_generation,
-            directory: directory.clone(),
-            target_name: target_name.to_owned(),
-            target_endpoint: target_endpoint.clone(),
-            preview_generation,
-            wait_for_preview,
-            consumed: Rc::new(Cell::new(false)),
-        });
-        self.revision
-    }
-
-    /// 取消等待中的补滚动并标记共享令牌，让已捕获的 Canvas 闭包也看见失效。
-    ///
-    /// @author kongweiguang
-    fn cancel(&mut self) {
-        if let Some(pending) = self.pending.take() {
-            pending.consumed.set(true);
-        }
-        self.revision = self.revision.wrapping_add(1);
-    }
-
-    /// 只撤销创建该 Canvas 时仍然存活的意图，不误伤更新后的键盘目标。
-    ///
-    /// @author kongweiguang
-    fn cancel_if_revision(&mut self, revision: u64) {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.revision == revision)
-        {
-            self.cancel();
-        }
-    }
-
-    /// 对照活动文件与已提交清单，预览仍在读取时等待；其它代次或目标变化视为过期。
-    ///
-    /// @author kongweiguang
-    fn readiness_for(
-        &self,
-        revision: u64,
-        snapshot: &KeyboardScrollSnapshot,
-    ) -> KeyboardScrollReadiness {
-        let Some(pending) = self
-            .pending
-            .as_ref()
-            .filter(|pending| pending.revision == revision)
-        else {
-            return KeyboardScrollReadiness::Stale;
-        };
-        if !snapshot.listing_is_current
-            || pending.panel_generation != snapshot.panel_generation
-            || pending.directory != snapshot.directory
-            || snapshot.active_name.as_deref() != Some(pending.target_name.as_str())
-            || snapshot.selected_endpoint.as_ref() != Some(&pending.target_endpoint)
-            || pending.preview_generation != snapshot.preview_generation
-            || pending.consumed.get()
-        {
-            return KeyboardScrollReadiness::Stale;
-        }
-        if pending.wait_for_preview && snapshot.preview_pending {
-            KeyboardScrollReadiness::WaitingForPreview
-        } else {
-            KeyboardScrollReadiness::Ready
-        }
-    }
-
-    /// 单次消费 ready 意图；失效快照清掉旧项，仍在读取的预览保留到下一次布局。
-    ///
-    /// @author kongweiguang
-    fn consume_if_ready(&mut self, revision: u64, snapshot: &KeyboardScrollSnapshot) -> bool {
-        match self.readiness_for(revision, snapshot) {
-            KeyboardScrollReadiness::Ready => {
-                let Some(consumed) = self
-                    .pending
-                    .as_ref()
-                    .filter(|pending| pending.revision == revision)
-                    .map(|pending| Rc::clone(&pending.consumed))
-                else {
-                    return false;
-                };
-                if consumed.replace(true) {
-                    return false;
-                }
-                self.cancel();
-                true
-            }
-            KeyboardScrollReadiness::WaitingForPreview => false,
-            KeyboardScrollReadiness::Stale => {
-                self.cancel_if_revision(revision);
-                false
-            }
-        }
-    }
 }
 
 impl FileListKeyboardFocus {
@@ -416,89 +252,52 @@ impl FileListKeyboardFocus {
     }
 }
 
-/// 每个浏览侧独立保留有界路径历史；回退/前进是视图导航，不创建或重绑会话。
+/// 每个浏览侧只记录当前路径是否离开过初始目录；共享工作台据此决定是否应用主机本地起始目录。
 ///
 /// @author kongweiguang
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct NavigationHistory {
-    entries: Vec<FileEndpoint>,
-    cursor: usize,
+    current: FileEndpoint,
+    moved: bool,
 }
 
 impl NavigationHistory {
-    /// 初始化历史时将构造端点作为唯一当前项，避免首次后退跳到空目标。
+    /// 初始化时当前目录就是初始目录。
     ///
     /// @author kongweiguang
     fn new(endpoint: FileEndpoint) -> Self {
         Self {
-            entries: vec![endpoint],
-            cursor: 0,
+            current: endpoint,
+            moved: false,
         }
     }
 
-    /// 切换连接身份时丢弃旧主机路径，避免回退重新暴露已失效的 SFTP 目标。
+    /// 切换连接身份时重置为新的初始目录，避免旧目标影响共享工作台判断。
     ///
     /// @author kongweiguang
     fn reset(&mut self, endpoint: FileEndpoint) {
-        self.entries.clear();
-        self.entries.push(endpoint);
-        self.cursor = 0;
+        self.current = endpoint;
+        self.moved = false;
     }
 
-    /// 用户主动改变目录后截断前进分支，并限制历史长度以免长期浏览累积无界路径。
+    /// 只有真正切换目录才标记离开初始路径；重复打开当前目录不改变判断。
     ///
     /// @author kongweiguang
     fn push(&mut self, endpoint: FileEndpoint) {
-        if self.entries.get(self.cursor) == Some(&endpoint) {
+        if self.current == endpoint {
             return;
         }
-        self.entries.truncate(self.cursor.saturating_add(1));
-        self.entries.push(endpoint);
-        if self.entries.len() > MAX_NAVIGATION_HISTORY {
-            let overflow = self.entries.len() - MAX_NAVIGATION_HISTORY;
-            self.entries.drain(..overflow);
-        }
-        self.cursor = self.entries.len().saturating_sub(1);
+        self.current = endpoint;
+        self.moved = true;
     }
 
-    /// 回退只移动视图历史游标，调用方随后按原 endpoint 重读目录。
+    /// 非初始目录只用于首次绑定主机时的默认目录决策。
     ///
     /// @author kongweiguang
-    fn back(&mut self) -> Option<FileEndpoint> {
-        if self.cursor == 0 || self.entries.is_empty() {
-            return None;
-        }
-        self.cursor -= 1;
-        self.entries.get(self.cursor).cloned()
-    }
-
-    /// 前进只移动视图历史游标，调用方随后按原 endpoint 重读目录。
-    ///
-    /// @author kongweiguang
-    fn forward(&mut self) -> Option<FileEndpoint> {
-        if self.cursor.saturating_add(1) >= self.entries.len() {
-            return None;
-        }
-        self.cursor += 1;
-        self.entries.get(self.cursor).cloned()
-    }
-
-    /// 工具栏只在存在前一项时启用回退操作。
-    ///
-    /// @author kongweiguang
-    fn can_go_back(&self) -> bool {
-        self.cursor > 0
-    }
-
-    /// 工具栏只在存在后一项时启用前进操作。
-    ///
-    /// @author kongweiguang
-    fn can_go_forward(&self) -> bool {
-        self.cursor.saturating_add(1) < self.entries.len()
+    fn is_initial(&self) -> bool {
+        !self.moved
     }
 }
-
-const MAX_NAVIGATION_HISTORY: usize = 64;
 
 /// 紧凑文件栏区分失效、切换文件系统、保留本机浏览位置和显式 SSH 目录跟随。
 ///
@@ -550,26 +349,25 @@ fn should_apply_shared_host_local_start(
     host_picker_enabled: bool,
     right_target_unselected: bool,
     left_endpoint: &FileEndpoint,
-    left_navigation_count: usize,
+    left_path_is_initial: bool,
     left_host_locked: bool,
 ) -> bool {
     host_picker_enabled
         && right_target_unselected
         && matches!(left_endpoint, FileEndpoint::Local { .. })
-        && left_navigation_count == 1
+        && left_path_is_initial
         && !left_host_locked
 }
 
-/// 共享工作台右侧尚未显式绑定主机时，拒绝左侧向隐藏本机占位目标发起复制。
-/// 独立文件面板和远端复制回本机不受此选择器状态限制。
+/// 中央工作台两端都必须明确选择，避免内部本机占位被当作传输来源或目标。
 ///
 /// @author kongweiguang
 fn can_transfer_to_other_side(
     host_picker_enabled: bool,
-    right_target_unselected: bool,
+    target_unselected: [bool; 2],
     source_side: usize,
 ) -> bool {
-    !(host_picker_enabled && right_target_unselected && source_side == 0)
+    source_side < 2 && (!host_picker_enabled || !target_unselected.into_iter().any(|value| value))
 }
 
 /// 文件列表排序仅属于各自浏览面板，避免视图排序影响冻结的传输目标。
@@ -606,70 +404,7 @@ impl FileSort {
     }
 }
 
-/// 绑定受监督任务 token，使切换选择或关闭 pane 能协作取消当前预览 IO。
-#[derive(Default)]
-struct PreviewTaskCancellation {
-    state: Mutex<PreviewTaskCancellationState>,
-}
-
-#[derive(Default)]
-struct PreviewTaskCancellationState {
-    cancelled: bool,
-    task_token: Option<CancellationToken>,
-}
-
-impl PreviewTaskCancellation {
-    /// 将 executor 的任务 token 交给 pane 侧取消句柄；绑定前已失效的请求会立即取消。
-    ///
-    /// @author kongweiguang
-    fn bind_task_token(&self, token: CancellationToken) {
-        let cancel_now = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.cancelled {
-                true
-            } else {
-                state.task_token = Some(token.clone());
-                false
-            }
-        };
-        if cancel_now {
-            token.cancel();
-        }
-    }
-
-    /// 清除已经完成的任务 token，避免后续 pane 状态继续持有已结束的取消句柄。
-    ///
-    /// @author kongweiguang
-    fn clear_task_token(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.task_token = None;
-    }
-
-    /// 先记录请求失效再取消任务，覆盖取消早于 executor 启动的竞态。
-    ///
-    /// @author kongweiguang
-    fn cancel(&self) {
-        let task_token = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.cancelled = true;
-            state.task_token.take()
-        };
-        if let Some(token) = task_token {
-            token.cancel();
-        }
-    }
-}
-
-/// GPUI 文件工作区维持左右浏览、预览、书签与统一传输队列的轻量视图状态。
+/// GPUI 文件工作区维持左右浏览、书签与统一传输队列的轻量视图状态。
 pub struct FilesPane {
     files: FileService,
     transfers: TransferService,
@@ -677,6 +412,7 @@ pub struct FilesPane {
     target_name_lookup: FileTargetNameLookup,
     target_names: FileTargetNameState,
     panels: [BrowserPanel; 2],
+    local_directories: [PathBuf; 2],
     locked_left_host_id: Option<HostId>,
     external_target_lease: Option<ExternalTargetLease>,
     active_side: usize,
@@ -684,7 +420,6 @@ pub struct FilesPane {
     current_terminal_endpoint: Option<FileEndpoint>,
     current_terminal_binding: Option<UiSessionBinding>,
     directory_follow_setup_bindings: Vec<UiSessionBinding>,
-    preview: Option<FilePreview>,
     bookmarks: Vec<FileBookmark>,
     bookmarks_target: Option<BookmarkTarget>,
     bookmark_request_target: Option<BookmarkTarget>,
@@ -696,15 +431,14 @@ pub struct FilesPane {
     queue: transfer_queue::TransferQueueUi,
     host_picker: host_picker::HostPickerState,
     transfer_submission_busy: bool,
+    transfer_submission_generation: u64,
+    transfer_submission: Option<TransferSubmission>,
+    #[cfg(target_os = "windows")]
+    drag_out_generation: u64,
     pending_transfer_conflict: Option<PendingTransferConflict>,
     permissions: permissions::PermissionEditor,
     compact_layout: bool,
     view_mode: view_mode::FilesViewMode,
-    browser_mode: view_mode::FilesViewMode,
-    workspace_projection: Option<EditorWorkspaceProjection>,
-    workspace_generation: u64,
-    /// 已应用的编辑器快照版本跨视图保留，拒绝隐藏期间迟到的旧推送。
-    workspace_projection_revision: Option<u64>,
     show_hidden_files: bool,
     status: Option<String>,
     status_details_expanded: bool,
@@ -712,9 +446,6 @@ pub struct FilesPane {
     initialized: bool,
     queue_watch_started: bool,
     delete_confirmation: Option<Vec<FileEntry>>,
-    remote_clipboard: Option<remote_clipboard::RemoteFileClipboard>,
-    next_clipboard_download_request_id: u64,
-    active_clipboard_download_request_id: Option<u64>,
     next_host_key_trust_request_id: u64,
     pending_host_key_trust: Option<PendingHostKeyTrust>,
     name_input: Option<Entity<InputState>>,
@@ -742,10 +473,9 @@ struct PendingHostKeyTrust {
     panel_generation: u64,
 }
 
-/// 上传选择器按用户从紧凑栏菜单选择的类型限制系统选择范围。
+/// 上传选择器按菜单命令限制系统选择范围。
 #[derive(Clone, Copy)]
 enum UploadSelectionKind {
-    Any,
     Files,
     Directories,
 }
@@ -773,6 +503,21 @@ struct TransferBatchPlan {
     issues: Vec<String>,
     labels: BatchEnqueueLabels,
     target: TransferTargetSnapshot,
+}
+
+/// 提交前可撤销，入队后必须等待逐项回执，避免视图生命周期丢失真实结果。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferSubmissionPhase {
+    Preparing,
+    Enqueuing,
+}
+
+/// 同一面板至多一个提交，代次隔离迟到回执，侧别限定目录变化的取消范围。
+struct TransferSubmission {
+    generation: u64,
+    cancellation: CancellationToken,
+    related_sides: [bool; 2],
+    phase: TransferSubmissionPhase,
 }
 
 /// 只有已确认存在冲突的批次才跨帧保留，用于主窗口级决策弹框。
@@ -954,10 +699,20 @@ fn count_existing_transfer_conflicts(
         .count()
 }
 
-/// 把逐项反馈压缩为工具栏状态；文本只表示“已入队”，不冒充实际传输完成。
+/// 全部受理的结果已在传输列表可见，只对未受理、部分失败或取消保留反馈，避免成功底栏挤动列表。
 ///
 /// @author kongweiguang
-fn batch_enqueue_message(action_zh: &str, action_en: &str, outcome: BatchEnqueueOutcome) -> String {
+fn batch_enqueue_message(
+    action_zh: &str,
+    action_en: &str,
+    outcome: BatchEnqueueOutcome,
+) -> Option<String> {
+    if outcome.issues.is_empty()
+        && outcome.cancelled_remaining == 0
+        && outcome.queued == outcome.planned_tasks
+    {
+        return None;
+    }
     let mut message = if outcome.included_by_selected_directories == 0 {
         format!(
             "{} {}/{}.",
@@ -1004,7 +759,7 @@ fn batch_enqueue_message(action_zh: &str, action_en: &str, outcome: BatchEnqueue
             outcome.issues.join(&locale::text("；", "; "))
         ));
     }
-    message
+    Some(message)
 }
 
 impl FilesPane {
@@ -1018,11 +773,12 @@ impl FilesPane {
         target_name_lookup: FileTargetNameLookup,
         endpoint: FileEndpoint,
     ) -> Self {
-        let local = match &endpoint {
-            FileEndpoint::Local { path } => FileEndpoint::Local { path: path.clone() },
-            _ => FileEndpoint::Local {
-                path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            },
+        let local_directory = match &endpoint {
+            FileEndpoint::Local { path } => path.clone(),
+            _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        let local = FileEndpoint::Local {
+            path: local_directory.clone(),
         };
         let target = endpoint;
         Self {
@@ -1032,6 +788,7 @@ impl FilesPane {
             target_name_lookup,
             target_names: FileTargetNameState::default(),
             panels: [BrowserPanel::new(local), BrowserPanel::new(target)],
+            local_directories: [local_directory.clone(), local_directory],
             locked_left_host_id: None,
             external_target_lease: None,
             active_side: 1,
@@ -1039,7 +796,6 @@ impl FilesPane {
             current_terminal_endpoint: None,
             current_terminal_binding: None,
             directory_follow_setup_bindings: Vec::new(),
-            preview: None,
             bookmarks: Vec::new(),
             bookmarks_target: None,
             bookmark_request_target: None,
@@ -1051,14 +807,14 @@ impl FilesPane {
             queue: transfer_queue::TransferQueueUi::default(),
             host_picker: host_picker::HostPickerState::default(),
             transfer_submission_busy: false,
+            transfer_submission_generation: 0,
+            transfer_submission: None,
+            #[cfg(target_os = "windows")]
+            drag_out_generation: 0,
             pending_transfer_conflict: None,
             permissions: permissions::PermissionEditor::default(),
             compact_layout: false,
             view_mode: view_mode::FilesViewMode::List,
-            browser_mode: view_mode::FilesViewMode::List,
-            workspace_projection: None,
-            workspace_generation: 0,
-            workspace_projection_revision: None,
             show_hidden_files: true,
             status: None,
             status_details_expanded: false,
@@ -1066,9 +822,6 @@ impl FilesPane {
             initialized: false,
             queue_watch_started: false,
             delete_confirmation: None,
-            remote_clipboard: None,
-            next_clipboard_download_request_id: 0,
-            active_clipboard_download_request_id: None,
             next_host_key_trust_request_id: 0,
             pending_host_key_trust: None,
             name_input: None,
@@ -1147,7 +900,8 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// Root 为独立文件 rail 提供当前终端的可信本机或 SSH 目标；目标失效会撤销旧数据以阻断跨目标操作。
+    /// Root 为独立文件 rail 提供终端或活动文件的可信本机/SSH 目标；终端身份另行绑定，不能由目录推断。
+    /// 目标失效会撤销旧数据以阻断跨目标操作，文件 Tab 因此可保留浏览能力而不获得发送终端的权限。
     ///
     /// @author kongweiguang
     ///
@@ -1170,7 +924,7 @@ impl FilesPane {
             self.current_terminal_endpoint = None;
             self.current_terminal_binding = None;
             self.external_target_lease = None;
-            self.invalidate_compact_target();
+            self.invalidate_compact_target(cx);
             cx.notify();
             return;
         }
@@ -1193,7 +947,7 @@ impl FilesPane {
                                 if !self.compact_target_error_is_current(&message) {
                                     self.current_terminal_endpoint = None;
                                     self.external_target_lease = None;
-                                    self.invalidate_compact_target();
+                                    self.invalidate_compact_target(cx);
                                     self.status = Some(message);
                                     cx.notify();
                                 }
@@ -1228,7 +982,7 @@ impl FilesPane {
         // user's browser; only a same-host SSH target may follow its directory when opted in.
         let should_notify = match action {
             CompactTargetUpdateAction::BindTarget => {
-                self.invalidate_compact_target();
+                self.invalidate_compact_target(cx);
                 self.panels[1].endpoint = endpoint.clone();
                 self.panels[1].navigation_history.reset(endpoint.clone());
                 self.open_endpoint_on_side(1, endpoint, cx);
@@ -1498,8 +1252,7 @@ impl FilesPane {
         }
         match result {
             Ok(()) => {
-                self.status =
-                    Some(locale::text("主机密钥已信任。", "The host key was trusted.").to_string());
+                self.status = None;
                 self.load_panel_at(1, pending.endpoint, cx);
             }
             Err(error) => self.status = Some(error),
@@ -1543,49 +1296,10 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 按浏览历史回退当前侧目录；不创建新会话，也不改变目标绑定。
+    /// 清除旧文件系统的可见清单、选择及待加载 endpoint，并推进代次拒收迟到回执。
     ///
     /// @author kongweiguang
-    pub(crate) fn navigate_back(&mut self, side: usize, cx: &mut Context<Self>) {
-        let Some(endpoint) = self.panels[side].navigation_history.back() else {
-            return;
-        };
-        self.navigate_to_history_endpoint(side, endpoint, cx);
-    }
-
-    /// 按浏览历史前进当前侧目录；不创建新会话，也不改变目标绑定。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn navigate_forward(&mut self, side: usize, cx: &mut Context<Self>) {
-        let Some(endpoint) = self.panels[side].navigation_history.forward() else {
-            return;
-        };
-        self.navigate_to_history_endpoint(side, endpoint, cx);
-    }
-
-    /// 清除旧目录选择并按历史保存的完整 endpoint 重新读取。
-    ///
-    /// @author kongweiguang
-    fn navigate_to_history_endpoint(
-        &mut self,
-        side: usize,
-        endpoint: FileEndpoint,
-        cx: &mut Context<Self>,
-    ) {
-        self.panels[side].endpoint = endpoint.clone();
-        self.panels[side].pending_selection = None;
-        self.panels[side].pending_file_preview = false;
-        self.panels[side].selected = None;
-        self.panels[side].selection.clear();
-        self.preview = None;
-        self.delete_confirmation = None;
-        self.load_panel_at(side, endpoint, cx);
-    }
-
-    /// 清除旧文件系统的可见清单、选择、预览及待加载 endpoint，并推进代次拒收迟到回执。
-    ///
-    /// @author kongweiguang
-    fn invalidate_compact_target(&mut self) {
+    fn invalidate_compact_target(&mut self, cx: &mut Context<Self>) {
         let panel = &mut self.panels[1];
         panel.generation = panel.generation.wrapping_add(1);
         panel.loading = false;
@@ -1596,10 +1310,7 @@ impl FilesPane {
         panel.selection.clear();
         panel.keyboard_focus.clear();
         panel.pending_selection = None;
-        panel.pending_file_preview = false;
-        panel.invalidate_preview_request();
         panel.tree.cancel_pending_requests();
-        self.preview = None;
         self.bookmark_generation = self.bookmark_generation.wrapping_add(1);
         self.bookmarks.clear();
         self.bookmarks_target = None;
@@ -1610,21 +1321,7 @@ impl FilesPane {
         self.delete_confirmation = None;
         self.name_action = None;
         self.status = None;
-        if self
-            .pending_transfer_conflict
-            .as_ref()
-            .is_some_and(|pending| pending.plan.target.side == 1)
-        {
-            self.pending_transfer_conflict = None;
-            self.transfer_submission_busy = false;
-            self.status = Some(
-                locale::text(
-                    "目标目录已变化，未提交的传输已取消。",
-                    "The destination changed. The unsubmitted transfer was canceled.",
-                )
-                .to_string(),
-            );
-        }
+        self.cancel_transfer_preparation_for_side(1, cx);
     }
 
     /// 避免 Root 每次 render 都重复清理已失效的文件目标和推进请求代次。
@@ -1640,8 +1337,6 @@ impl FilesPane {
             && panel.selected.is_none()
             && panel.selection == selection::FileSelection::default()
             && panel.pending_selection.is_none()
-            && !panel.pending_file_preview
-            && self.preview.is_none()
             && self.bookmarks.is_empty()
             && self.bookmarks_target.is_none()
             && self.bookmark_request_target.is_none()
@@ -1678,7 +1373,7 @@ impl FilesPane {
         }
         self.current_terminal_endpoint = None;
         self.external_target_lease = None;
-        self.invalidate_compact_target();
+        self.invalidate_compact_target(cx);
         self.status = Some(message);
         cx.notify();
     }
@@ -1746,92 +1441,10 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 将最新 editor 快照按请求代次写入当前工作区视图，拒绝切页后的迟到回包。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn set_workspace_projection(
-        &mut self,
-        projection: EditorWorkspaceProjection,
-        generation: u64,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !workspace_projection_request_is_current(
-            self.view_mode == view_mode::FilesViewMode::Workspace,
-            generation,
-            self.workspace_generation,
-        ) || !workspace_projection_response_is_fresh(
-            self.workspace_projection_revision,
-            projection.revision,
-        ) {
-            return false;
-        }
-        if self.workspace_projection_revision == Some(projection.revision)
-            && self.workspace_projection.as_ref() == Some(&projection)
-        {
-            return true;
-        }
-        if self.workspace_projection_revision == Some(projection.revision)
-            && self.workspace_projection.is_some()
-        {
-            return false;
-        }
-        self.workspace_projection_revision = Some(projection.revision);
-        self.workspace_projection = Some(projection);
-        self.sync_target_name_requests(cx);
-        cx.notify();
-        true
-    }
-
-    /// Root 将编辑器实际状态推送到可见 Files 工作区，并按版本挡住迟到事件。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn set_live_workspace_projection(
-        &mut self,
-        projection: EditorWorkspaceProjection,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.view_mode != view_mode::FilesViewMode::Workspace
-            || !workspace_projection_push_is_newer(
-                self.workspace_projection_revision,
-                projection.revision,
-            )
-        {
-            return false;
-        }
-        self.workspace_projection_revision = Some(projection.revision);
-        self.workspace_projection = Some(projection);
-        self.sync_target_name_requests(cx);
-        cx.notify();
-        true
-    }
-
-    /// 切换编辑器工作区概览；每次打开都发新代次请求，避免复用过期 tab 快照。
-    ///
-    /// @author kongweiguang
-    pub(super) fn toggle_workspace_overview(&mut self, cx: &mut Context<Self>) {
-        if self.view_mode == view_mode::FilesViewMode::Workspace {
-            self.view_mode = self.browser_mode;
-            self.workspace_projection = None;
-        } else {
-            self.browser_mode = self.view_mode;
-            self.view_mode = view_mode::FilesViewMode::Workspace;
-            self.workspace_generation = self.workspace_generation.wrapping_add(1);
-            self.workspace_projection = None;
-            cx.emit(WorkspaceOverviewRequested {
-                generation: self.workspace_generation,
-            });
-        }
-        self.sync_target_name_requests(cx);
-        cx.notify();
-    }
-
-    /// 切换列表与惰性树时只同步可见 endpoint 选择，不触发额外文件 IO。
+    /// 切换列表与惰性树只同步可见选择，不触发额外 IO 或选择裁剪提示；计数直接反映结果。
     ///
     /// @author kongweiguang
     pub(super) fn toggle_tree_view(&mut self, cx: &mut Context<Self>) {
-        if self.view_mode == view_mode::FilesViewMode::Workspace {
-            return;
-        }
         let side = self.active_side;
         if self.view_mode == view_mode::FilesViewMode::List {
             let endpoints = self.panels[side]
@@ -1862,7 +1475,6 @@ impl FilesPane {
                 .filter(|entry| parent_endpoint(&entry.endpoint).as_ref() == Some(&root))
                 .cloned()
                 .collect::<Vec<_>>();
-            let hidden_count = selected.len().saturating_sub(root_selected.len());
             let selected_names = root_selected
                 .iter()
                 .map(|entry| entry.name.clone())
@@ -1870,44 +1482,16 @@ impl FilesPane {
             self.panels[side].selection.clear();
             self.panels[side].selection.select_all(&selected_names);
             self.panels[side].selected = root_selected.first().cloned();
-            self.panels[side].invalidate_preview_request();
-            self.preview = None;
             self.view_mode = view_mode::FilesViewMode::List;
-            if let Some(entry) = self.panels[side]
-                .selected
-                .as_ref()
-                .filter(|entry| entry.kind == FileEntryKind::File)
-                .cloned()
-            {
-                self.load_preview(side, entry.endpoint, cx);
-            }
-            self.status = (hidden_count > 0).then(|| {
-                locale::text(
-                    format!("切回列表后移除了 {hidden_count} 个子目录选择。"),
-                    format!("Cleared {hidden_count} nested selections when returning to the list."),
-                )
-                .to_string()
-            });
         }
-        self.browser_mode = self.view_mode;
         self.delete_confirmation = None;
         cx.notify();
     }
 
-    /// 将图标视图按钮映射到既有切换用例，确保离开工作区时恢复用户上次的浏览模式。
+    /// 将视图菜单项映射到列表与惰性树切换。
     ///
     /// @author kongweiguang
     fn set_file_view_mode(&mut self, target: view_mode::FilesViewMode, cx: &mut Context<Self>) {
-        if target == view_mode::FilesViewMode::Workspace {
-            if self.view_mode != target {
-                self.toggle_workspace_overview(cx);
-            }
-            return;
-        }
-
-        if self.view_mode == view_mode::FilesViewMode::Workspace {
-            self.toggle_workspace_overview(cx);
-        }
         if self.view_mode != target {
             self.toggle_tree_view(cx);
         }
@@ -1975,18 +1559,7 @@ impl FilesPane {
                 self.load_tree_directory(side, endpoint, cx);
             }
             TreeEvent::Collapsed(_) => {
-                let removed = self.panels[side].tree.collapse(&endpoint);
-                if removed > 0 {
-                    self.status = Some(
-                        locale::text(
-                            format!("折叠目录后清除了 {removed} 个不可见选择。"),
-                            format!(
-                                "Cleared {removed} hidden selections from the collapsed folder."
-                            ),
-                        )
-                        .to_string(),
-                    );
-                }
+                self.panels[side].tree.collapse(&endpoint);
                 if let Some(entry) = self.panels[side].tree.entry(&endpoint)
                     && self.panels[side].selected.as_ref().is_some_and(|selected| {
                         parent_endpoint(&selected.endpoint).as_ref() == Some(&endpoint)
@@ -1994,17 +1567,13 @@ impl FilesPane {
                     })
                 {
                     self.panels[side].selected = Some(entry);
-                    self.panels[side].invalidate_preview_request();
-                    if side == self.active_side {
-                        self.preview = None;
-                    }
                 }
             }
         }
         cx.notify();
     }
 
-    /// GPUI 的焦点行只驱动单项预览；批量选择仍由完整 endpoint 集合单独维护。
+    /// GPUI 的焦点行只同步单项选择；批量选择仍由完整 endpoint 集合单独维护。
     ///
     /// @author kongweiguang
     fn handle_tree_focus_changed(
@@ -2055,14 +1624,6 @@ impl FilesPane {
             return;
         }
         self.panels[side].selected = Some(entry.clone());
-        if entry.kind == FileEntryKind::File {
-            self.load_preview(side, endpoint, cx);
-        } else {
-            self.panels[side].invalidate_preview_request();
-            if side == self.active_side {
-                self.preview = None;
-            }
-        }
         cx.notify();
     }
 
@@ -2181,13 +1742,7 @@ impl FilesPane {
             .entry(&endpoint)
             .filter(|_| self.panels[side].tree.is_selected(&endpoint))
             .or_else(|| selected.first().cloned());
-        self.panels[side].selected = focused.clone();
-        self.preview = None;
-        if let Some(entry) = focused.filter(|entry| entry.kind == FileEntryKind::File) {
-            self.load_preview(side, entry.endpoint, cx);
-        } else {
-            self.panels[side].invalidate_preview_request();
-        }
+        self.panels[side].selected = focused;
         cx.notify();
     }
 
@@ -2237,13 +1792,14 @@ impl FilesPane {
         let apply_shared_local_start = self.initialized
             && should_apply_shared_host_local_start(
                 self.host_picker.enabled,
-                self.host_picker.right_target_unselected,
+                self.host_picker.target_unselected[1],
                 &self.panels[0].endpoint,
-                self.panels[0].navigation_history.entries.len(),
+                self.panels[0].navigation_history.is_initial(),
                 self.locked_left_host_id.is_some(),
             );
-        self.host_picker.right_target_unselected = false;
-        self.host_picker.expanded = false;
+        self.cancel_pending_host_selection(FilePaneSide::Right, cx);
+        self.host_picker.target_unselected[1] = false;
+        self.host_picker.expanded_side = None;
         if (self.initialized || self.panels[1].generation > 0)
             && endpoint_same_filesystem(&self.panels[1].endpoint, &endpoint)
         {
@@ -2280,19 +1836,21 @@ impl FilesPane {
                 self.load_panel_at(0, local_endpoint, cx);
             }
         }
-        self.open_endpoint(endpoint, cx);
+        if self.host_picker.enabled {
+            self.bind_selected_endpoint(FilePaneSide::Right, endpoint, cx);
+        } else {
+            self.open_endpoint(endpoint, cx);
+        }
     }
 
-    /// 切换活动面板时复用目标级书签缓存，并取消上一侧尚未完成的预览。
+    /// 切换活动面板时复用目标级书签缓存。
     ///
     /// @author kongweiguang
     fn activate_side(&mut self, side: usize, cx: &mut Context<Self>) {
         if self.active_side == side {
             return;
         }
-        self.panels[self.active_side].invalidate_preview_request();
         self.active_side = side;
-        self.preview = None;
         self.load_bookmarks(side, cx);
         cx.notify();
     }
@@ -2306,7 +1864,7 @@ impl FilesPane {
         endpoint: FileEndpoint,
         cx: &mut Context<Self>,
     ) {
-        self.open_endpoint_on_side_with_selection(side, endpoint, None, false, cx);
+        self.open_endpoint_on_side_with_selection(side, endpoint, None, cx);
     }
 
     /// 将 endpoint 与可选恢复项一次写入面板，再发起目录读取，避免响应快于选择设置。
@@ -2317,12 +1875,17 @@ impl FilesPane {
         side: usize,
         endpoint: FileEndpoint,
         pending_selection: Option<String>,
-        pending_file_preview: bool,
         cx: &mut Context<Self>,
     ) {
-        if side == 1 && self.host_picker.enabled {
-            self.host_picker.right_target_unselected = false;
-            self.host_picker.expanded = false;
+        if self.host_picker.enabled && side < self.panels.len() {
+            if self.host_picker.target_pending[side]
+                && self.panels[side].endpoint != endpoint
+                && let Some(side) = FilePaneSide::from_index(side)
+            {
+                self.cancel_pending_host_selection(side, cx);
+            }
+            self.host_picker.target_unselected[side] = false;
+            self.host_picker.expanded_side = None;
         }
         if side == 0 && !endpoint_matches_locked_host(&endpoint, self.locked_left_host_id.as_ref())
         {
@@ -2336,65 +1899,12 @@ impl FilesPane {
             cx.notify();
             return;
         }
-        if self.active_side != side {
-            self.panels[self.active_side].invalidate_preview_request();
-            self.preview = None;
-        }
         self.active_side = side;
         self.panels[side].pending_selection = pending_selection;
-        self.panels[side].pending_file_preview = pending_file_preview;
-        self.panels[side].invalidate_preview_request();
         self.panels[side].navigation_history.push(endpoint.clone());
         self.delete_confirmation = None;
         self.load_panel_at(side, endpoint, cx);
         cx.notify();
-    }
-
-    /// 打开主机本地或 SSH 配置文件时先读取父目录并验证真实文件项，再复用普通预览路径。
-    ///
-    /// @author kongweiguang
-    pub fn open_endpoint_with_selection(
-        &mut self,
-        endpoint: FileEndpoint,
-        selection_name: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> AppResult<()> {
-        if matches!(&endpoint, FileEndpoint::Container { .. }) {
-            let error = AppError::unsupported("Compose 配置预览只支持主机本机或 SSH 文件 endpoint");
-            self.status = Some(localized_error(&error));
-            cx.notify();
-            return Err(error);
-        }
-        let expected_name = endpoint_name(&endpoint)
-            .ok_or_else(|| AppError::invalid("文件 endpoint 缺少可显示的文件名"))?;
-        if selection_name
-            .as_deref()
-            .is_some_and(|name| name != expected_name)
-        {
-            return Err(AppError::invalid("选择名称与文件 endpoint 不匹配"));
-        }
-        let parent = parent_endpoint(&endpoint)
-            .ok_or_else(|| AppError::invalid("文件 endpoint 没有可读取的父目录"))?;
-        let side = if endpoint_same_filesystem(&self.panels[0].endpoint, &endpoint) {
-            0
-        } else if endpoint_same_filesystem(&self.panels[1].endpoint, &endpoint) {
-            1
-        } else if matches!(endpoint, FileEndpoint::Local { .. }) {
-            0
-        } else {
-            1
-        };
-        if side == 0 && !endpoint_matches_locked_host(&parent, self.locked_left_host_id.as_ref()) {
-            let error = AppError::invalid("Compose 文件不属于左侧锁定的主机");
-            self.status = Some(localized_error(&error));
-            cx.notify();
-            return Err(error);
-        }
-        if expected_name.starts_with('.') {
-            self.show_hidden_files = true;
-        }
-        self.open_endpoint_on_side_with_selection(side, parent, Some(expected_name), true, cx);
-        Ok(())
     }
 
     /// 首次绘制时创建路径输入，并只在 endpoint 真正变化后同步其值，保留未提交草稿。
@@ -2477,16 +1987,10 @@ impl FilesPane {
             return;
         }
 
-        if self.active_side != side {
-            self.panels[self.active_side].invalidate_preview_request();
-            self.preview = None;
-        }
         self.active_side = side;
         self.panels[side].pending_selection = None;
         self.panels[side].selected = None;
         self.panels[side].selection.clear();
-        self.panels[side].invalidate_preview_request();
-        self.preview = None;
         self.delete_confirmation = None;
         self.status = None;
         self.panels[side].navigation_history.push(endpoint.clone());
@@ -2494,14 +1998,13 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 在当前 endpoint 上切换点文件显示，并清除因此变为不可见的选择和预览任务。
+    /// 隐藏文件同时裁剪不可见选择，结果由行和计数表达，不额外插入选择裁剪提示。
     ///
     /// @author kongweiguang
     fn toggle_hidden_files(&mut self, cx: &mut Context<Self>) {
         self.show_hidden_files = !self.show_hidden_files;
-        let mut removed_tree_selections = 0usize;
         for panel in &mut self.panels {
-            removed_tree_selections += panel.tree.retain_visible_selection(self.show_hidden_files);
+            panel.tree.retain_visible_selection(self.show_hidden_files);
         }
         if !self.show_hidden_files {
             for side in 0..self.panels.len() {
@@ -2513,23 +2016,8 @@ impl FilesPane {
                     .is_some_and(render::browser::is_hidden_entry);
                 if hidden_selection {
                     self.panels[side].selected = None;
-                    self.panels[side].invalidate_preview_request();
-                    if side == self.active_side {
-                        self.preview = None;
-                    }
                 }
             }
-        }
-        if removed_tree_selections > 0 {
-            self.status = Some(
-                locale::text(
-                    format!("隐藏文件后清除了 {removed_tree_selections} 个树选择。"),
-                    format!(
-                        "Cleared {removed_tree_selections} tree selections hidden by the filter."
-                    ),
-                )
-                .to_string(),
-            );
         }
         cx.notify();
     }
@@ -2579,7 +2067,7 @@ impl FilesPane {
         entries
     }
 
-    /// 更新选择并让预览跟随稳定身份；新选择先撤销旧补滚动，键盘移动可随后重建受代次保护的意图。
+    /// 更新选择并绑定稳定身份；切换侧别时同时加载该侧书签。
     ///
     /// @author kongweiguang
     fn select_entry(
@@ -2604,15 +2092,9 @@ impl FilesPane {
             return;
         }
         if self.active_side != side {
-            self.panels[self.active_side]
-                .keyboard_scroll_intent
-                .cancel();
-            self.panels[self.active_side].invalidate_preview_request();
-            self.preview = None;
             self.active_side = side;
             self.load_bookmarks(side, cx);
         }
-        self.panels[side].keyboard_scroll_intent.cancel();
         self.delete_confirmation = None;
         let directory = self.panels[side].endpoint.clone();
         self.panels[side]
@@ -2636,13 +2118,7 @@ impl FilesPane {
                 })
                 .cloned()
         };
-        self.panels[side].selected = focused_entry.clone();
-        self.preview = None;
-        if let Some(entry) = focused_entry.filter(|entry| entry.kind == FileEntryKind::File) {
-            self.load_preview(side, entry.endpoint, cx);
-        } else {
-            self.panels[side].invalidate_preview_request();
-        }
+        self.panels[side].selected = focused_entry;
         cx.notify();
     }
 
@@ -2659,7 +2135,7 @@ impl FilesPane {
         }
     }
 
-    /// 校验目标后按当前 viewport 移动；文件预览回流后只补滚一次，且鼠标浏览可撤销该意图。
+    /// 校验目标后按当前 viewport 移动，并直接滚动到活动行。
     ///
     /// @author kongweiguang
     fn move_list_keyboard_focus(
@@ -2725,9 +2201,6 @@ impl FilesPane {
             return;
         };
         let scroll = panel.list_scroll.clone();
-        let target_name = entry.name.clone();
-        let target_endpoint = entry.endpoint.clone();
-        let wait_for_preview = entry.kind == FileEntryKind::File;
 
         self.select_entry(
             side,
@@ -2740,25 +2213,6 @@ impl FilesPane {
             ordered_names,
             cx,
         );
-        let panel = &mut self.panels[side];
-        let selected_is_keyboard_target = panel
-            .selected
-            .as_ref()
-            .is_some_and(|selected| selected.endpoint == target_endpoint);
-        if wait_for_preview && selected_is_keyboard_target {
-            let panel_generation = panel.generation;
-            let preview_generation = panel.preview_generation;
-            panel.keyboard_scroll_intent.arm(
-                panel_generation,
-                directory,
-                &target_name,
-                &target_endpoint,
-                preview_generation,
-                true,
-            );
-        } else {
-            panel.keyboard_scroll_intent.cancel();
-        }
         scroll.scroll_to_item(index, gpui_kit::ScrollStrategy::Nearest);
     }
 
@@ -2816,16 +2270,6 @@ impl FilesPane {
                 .tree
                 .selected_entries(self.show_hidden_files);
             self.panels[side].selected = selected.first().cloned();
-            self.panels[side].invalidate_preview_request();
-            self.preview = None;
-            if let Some(entry) = self.panels[side]
-                .selected
-                .as_ref()
-                .filter(|entry| entry.kind == FileEntryKind::File)
-                .cloned()
-            {
-                self.load_preview(side, entry.endpoint, cx);
-            }
             self.delete_confirmation = None;
             cx.notify();
             return;
@@ -2848,8 +2292,6 @@ impl FilesPane {
         if all_selected {
             self.panels[side].selection.clear();
             self.panels[side].selected = None;
-            self.panels[side].invalidate_preview_request();
-            self.preview = None;
         } else {
             self.panels[side].selection.select_all(&visible_names);
             if let Some(entry) = self.panels[side]
@@ -2863,16 +2305,13 @@ impl FilesPane {
                 })
                 .cloned()
             {
-                self.panels[side].selected = Some(entry.clone());
-                if entry.kind == FileEntryKind::File {
-                    self.load_preview(side, entry.endpoint, cx);
-                }
+                self.panels[side].selected = Some(entry);
             }
         }
         cx.notify();
     }
 
-    /// Enter 与双击打开目录或请求 Root 在编辑器中打开文件，单击只改变选择和预览。
+    /// Enter 与双击共用文件打开门禁，临时目标必须在离开源面板前取得独立租约。
     ///
     /// @author kongweiguang
     fn open_entry(&mut self, side: usize, entry: FileEntry, cx: &mut Context<Self>) {
@@ -2901,12 +2340,33 @@ impl FilesPane {
             self.panels[side].tree.select_only(&entry.endpoint);
         }
         self.panels[side].selected = Some(entry.clone());
-        self.panels[side].invalidate_preview_request();
-        self.preview = None;
-        cx.emit(OpenFileRequested {
-            endpoint: entry.endpoint,
-        });
+        self.request_open_file(entry.endpoint, cx);
         cx.notify();
+    }
+
+    /// 所有文件入口共用租约检查；目标已失效时保留原面板并显示错误，不改投当前主机。
+    ///
+    /// @author kongweiguang
+    fn request_open_file(&mut self, endpoint: FileEndpoint, cx: &mut Context<Self>) {
+        let external_target_lease =
+            match retain_file_target_lease(&endpoint, self.external_target_lease.as_ref()) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.status = Some(
+                        locale::text(
+                            error.public_message(),
+                            "The temporary connection is unavailable; the file cannot be opened.",
+                        )
+                        .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+            };
+        cx.emit(OpenFileRequested {
+            endpoint,
+            external_target_lease,
+        });
     }
 
     /// 打开传输目标所在目录并选中目标项，确保队列中的完整 endpoint 可被定位。
@@ -2938,7 +2398,7 @@ impl FilesPane {
             1
         };
         let selection = endpoint_name(&destination);
-        self.open_endpoint_on_side_with_selection(side, parent, selection, false, cx);
+        self.open_endpoint_on_side_with_selection(side, parent, selection, cx);
     }
 
     /// 恢复一个独立的双面板传输工作区，并校验左侧锁定主机与初始选择。
@@ -2947,7 +2407,7 @@ impl FilesPane {
     pub fn open_workspace_transfer(
         &mut self,
         left: FileEndpoint,
-        right: FileEndpoint,
+        right: Option<FileEndpoint>,
         locked_left_host_id: Option<HostId>,
         initial_right_selection: Option<String>,
         cx: &mut Context<Self>,
@@ -2957,25 +2417,34 @@ impl FilesPane {
         }
 
         self.initialized = true;
-        self.host_picker.right_target_unselected = false;
-        self.host_picker.expanded = false;
-        self.locked_left_host_id = locked_left_host_id;
+        self.host_picker.target_unselected = [false, right.is_none()];
+        self.host_picker.targets_initialized = true;
+        self.host_picker.restored_targets = true;
+        self.host_picker.expanded_side = None;
+        self.locked_left_host_id = None;
+        if let FileEndpoint::Local { path } = &left {
+            self.local_directories[0] = path.clone();
+        }
+        if let Some(FileEndpoint::Local { path }) = &right {
+            self.local_directories[1] = path.clone();
+        }
+        self.host_picker.last_emitted_endpoints = Some((left.clone(), right.clone()));
+        let right_endpoint = right.unwrap_or_else(|| FileEndpoint::Local {
+            path: self.local_directories[1].clone(),
+        });
         self.panels[0].endpoint = left;
         let left_endpoint = self.panels[0].endpoint.clone();
         self.panels[0].navigation_history.reset(left_endpoint);
         self.panels[0].pending_selection = None;
-        self.panels[0].pending_file_preview = false;
         self.panels[0].selected = None;
         self.panels[0].selection.clear();
-        self.panels[1].endpoint = right;
+        self.panels[1].endpoint = right_endpoint;
         let right_endpoint = self.panels[1].endpoint.clone();
         self.panels[1].navigation_history.reset(right_endpoint);
         self.panels[1].pending_selection = initial_right_selection;
-        self.panels[1].pending_file_preview = false;
         self.panels[1].selected = None;
         self.panels[1].selection.clear();
         self.sync_target_name_requests(cx);
-        self.preview = None;
         self.bookmarks.clear();
         self.bookmarks_target = None;
         self.bookmark_request_target = None;
@@ -2989,7 +2458,9 @@ impl FilesPane {
         self.active_side = 1;
         self.external_target_lease = None;
         self.load_panel(0, cx);
-        self.load_panel(1, cx);
+        if !self.host_picker.target_unselected[1] {
+            self.load_panel(1, cx);
+        }
         self.reload_transfers(cx);
         cx.notify();
         Ok(())
@@ -3060,7 +2531,7 @@ impl FilesPane {
         if !self.compact_layout {
             self.load_panel(0, cx);
         }
-        if !self.host_picker.right_target_unselected
+        if (!self.host_picker.enabled || !self.host_picker.target_unselected[1])
             && (!self.compact_layout
                 || !matches!(&self.panels[1].endpoint, FileEndpoint::Local { .. }))
         {
@@ -3073,9 +2544,10 @@ impl FilesPane {
     ///
     /// @author kongweiguang
     pub(super) fn refresh_workbench(&mut self, cx: &mut Context<Self>) {
-        self.refresh_panel(0, cx);
-        if !self.host_picker.right_target_unselected {
-            self.refresh_panel(1, cx);
+        for side in 0..2 {
+            if !self.host_picker.enabled || !self.host_picker.target_unselected[side] {
+                self.refresh_panel(side, cx);
+            }
         }
         self.reload_transfers(cx);
     }
@@ -3214,7 +2686,7 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 验证名称为单一目录项后调用 FileService，避免 UI 输入成为父路径或绝对路径。
+    /// 验证名称为单一目录项后调用 FileService；成功由目录回读呈现，仅失败保留反馈，避免额外状态条。
     ///
     /// @author kongweiguang
     fn commit_name_action(&mut self, cx: &mut Context<Self>) {
@@ -3295,9 +2767,7 @@ impl FilesPane {
                                     pane.name_action = None;
                                     pane.name_action_side = None;
                                     pane.name_action_target = None;
-                                    pane.status = Some(
-                                        locale::text("目录已创建。", "Folder created.").to_string(),
-                                    )
+                                    pane.status = None;
                                 }
                                 Err(error) => pane.status = Some(localized_error(&error)),
                             }
@@ -3357,9 +2827,7 @@ impl FilesPane {
                                     pane.name_action = None;
                                     pane.name_action_side = None;
                                     pane.name_action_target = None;
-                                    pane.status = Some(
-                                        locale::text("项目已重命名。", "Item renamed.").to_string(),
-                                    )
+                                    pane.status = None;
                                 }
                                 Err(error) => pane.status = Some(localized_error(&error)),
                             }
@@ -3476,7 +2944,6 @@ impl FilesPane {
                         Err(error) => localized_error(&error),
                     });
                     pane.load_panel(side, cx);
-                    pane.preview = None;
                     cx.notify();
                 });
             });
@@ -3503,21 +2970,14 @@ impl FilesPane {
         }
     }
 
-    /// 使用 GPUI 原生选择器并逐项交给应用层检查；部分失败和取消均返回准确计数。
-    ///
-    /// @author kongweiguang
-    fn prompt_upload(&mut self, cx: &mut Context<Self>) {
-        self.prompt_upload_kind(UploadSelectionKind::Any, cx);
-    }
-
-    /// 紧凑栏文件上传只打开文件选择器，业务仍由共用队列受理与去重。
+    /// 工具栏文件上传只打开文件选择器，业务仍由共用队列受理与去重。
     ///
     /// @author kongweiguang
     pub(super) fn prompt_upload_files(&mut self, cx: &mut Context<Self>) {
         self.prompt_upload_kind(UploadSelectionKind::Files, cx);
     }
 
-    /// 紧凑栏目录上传只允许选择目录，避免系统对话框中误选文件。
+    /// 工具栏目录上传只允许选择目录，避免系统对话框中误选文件。
     ///
     /// @author kongweiguang
     pub(super) fn prompt_upload_directories(&mut self, cx: &mut Context<Self>) {
@@ -3533,6 +2993,7 @@ impl FilesPane {
     }
 
     /// 右键上传固定菜单捕获目录，并把选择器期间的来源检查与目标快照串成一个未提交计划。
+    /// 选择器等待复用现有取消令牌，UI 不为竞速等待额外依赖运行时实现。
     ///
     /// @author kongweiguang
     fn prompt_upload_kind_to(
@@ -3553,9 +3014,12 @@ impl FilesPane {
             cx.notify();
             return;
         };
-        if !self.begin_transfer_submission(cx) {
+        let mut related_sides = [false; 2];
+        related_sides[target.side] = true;
+        let Some((generation, cancellation)) = self.begin_transfer_preparation(related_sides, cx)
+        else {
             return;
-        }
+        };
         let conflict_policy = self.queue.conflict_policy;
         let external_target_lease = self.external_target_lease_for_endpoint(&destination_directory);
         let selected = cx.prompt_for_paths(PathPromptOptions {
@@ -3564,12 +3028,10 @@ impl FilesPane {
             multiple: true,
             prompt: Some(locale::text(
                 match selection_kind {
-                    UploadSelectionKind::Any => "选择要传入当前目录的文件或目录",
                     UploadSelectionKind::Files => "选择要传入当前目录的文件",
                     UploadSelectionKind::Directories => "选择要传入当前目录的文件夹",
                 },
                 match selection_kind {
-                    UploadSelectionKind::Any => "Choose files or folders to upload here",
                     UploadSelectionKind::Files => "Choose files to upload here",
                     UploadSelectionKind::Directories => "Choose folders to upload here",
                 },
@@ -3579,9 +3041,11 @@ impl FilesPane {
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |cancel| async move {
-                    let selected = selected
+                .run_cancellable(cancellation, move |cancel| async move {
+                    let selected = cancel
+                        .run_until_cancelled(selected)
                         .await
+                        .ok_or_else(|| AppError::cancelled("上传计划已取消"))?
                         .map_err(|_| AppError::cancelled("文件选择已取消"))?
                         .map_err(|_| AppError::infrastructure("系统文件选择器无法打开"))?;
                     let Some(paths) = selected else {
@@ -3679,6 +3143,9 @@ impl FilesPane {
                 .await;
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
+                    if !pane.transfer_preparation_is_current(generation) {
+                        return;
+                    }
                     match result {
                         Ok(Some((items, total, issues))) => pane.enqueue_transfer_batch_started(
                             TransferBatchPlan {
@@ -3694,11 +3161,7 @@ impl FilesPane {
                             },
                             cx,
                         ),
-                        Ok(None) => pane.finish_unsubmitted_transfer(
-                            locale::text("已取消文件选择。", "File selection canceled.")
-                                .to_string(),
-                            cx,
-                        ),
+                        Ok(None) => pane.finish_cancelled_transfer(cx),
                         Err(error) => {
                             pane.finish_unsubmitted_transfer(localized_error(&error), cx);
                         }
@@ -3819,7 +3282,7 @@ impl FilesPane {
             });
         }
         if sources.is_empty() {
-            self.status = Some(batch_enqueue_message(
+            self.status = batch_enqueue_message(
                 "下载任务已入队",
                 "Download tasks queued",
                 BatchEnqueueOutcome {
@@ -3830,14 +3293,17 @@ impl FilesPane {
                     issues,
                     cancelled_remaining: 0,
                 },
-            ));
+            );
             cx.notify();
             return;
         }
 
-        if !self.begin_transfer_submission(cx) {
+        let mut related_sides = [false; 2];
+        related_sides[side] = true;
+        let Some((generation, cancellation)) = self.begin_transfer_preparation(related_sides, cx)
+        else {
             return;
-        }
+        };
         let target_directory = match &self.panels[0].endpoint {
             FileEndpoint::Local { path } => path.clone(),
             _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -3858,9 +3324,11 @@ impl FilesPane {
             let selected_path = cx.prompt_for_new_path(&target_directory, Some(&source.name));
             cx.spawn(async move |this, cx| {
                 let result = executor
-                    .run(move |cancel| async move {
-                        let path = selected_path
+                    .run_cancellable(cancellation, move |cancel| async move {
+                        let path = cancel
+                            .run_until_cancelled(selected_path)
                             .await
+                            .ok_or_else(|| AppError::cancelled("下载计划已取消"))?
                             .map_err(|_| AppError::cancelled("保存位置选择已取消"))?
                             .map_err(|_| AppError::infrastructure("系统保存对话框无法打开"))?;
                         if cancel.is_cancelled() {
@@ -3882,30 +3350,30 @@ impl FilesPane {
                     })
                     .await;
                 cx.update(|app| {
-                    let _ = this.update(app, |pane, cx| match result {
-                        Ok(Some(items)) => pane.enqueue_transfer_batch_started(
-                            TransferBatchPlan {
-                                items,
-                                total: 1,
-                                included_by_selected_directories: 0,
-                                issues,
-                                labels: BatchEnqueueLabels {
-                                    action_zh: "下载任务已入队",
-                                    action_en: "Download tasks queued",
+                    let _ = this.update(app, |pane, cx| {
+                        if !pane.transfer_preparation_is_current(generation) {
+                            return;
+                        }
+                        match result {
+                            Ok(Some(items)) => pane.enqueue_transfer_batch_started(
+                                TransferBatchPlan {
+                                    items,
+                                    total: 1,
+                                    included_by_selected_directories: 0,
+                                    issues,
+                                    labels: BatchEnqueueLabels {
+                                        action_zh: "下载任务已入队",
+                                        action_en: "Download tasks queued",
+                                    },
+                                    target,
                                 },
-                                target,
-                            },
-                            cx,
-                        ),
-                        Ok(None) => pane.finish_unsubmitted_transfer(
-                            locale::text(
-                                "已取消下载位置选择。",
-                                "Download location selection canceled.",
-                            )
-                            .to_string(),
-                            cx,
-                        ),
-                        Err(error) => pane.finish_unsubmitted_transfer(localized_error(&error), cx),
+                                cx,
+                            ),
+                            Ok(None) => pane.finish_cancelled_transfer(cx),
+                            Err(error) => {
+                                pane.finish_unsubmitted_transfer(localized_error(&error), cx)
+                            }
+                        }
                     });
                 });
             })
@@ -3924,9 +3392,11 @@ impl FilesPane {
         });
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |cancel| async move {
-                    let paths = selected_path
+                .run_cancellable(cancellation, move |cancel| async move {
+                    let paths = cancel
+                        .run_until_cancelled(selected_path)
                         .await
+                        .ok_or_else(|| AppError::cancelled("下载计划已取消"))?
                         .map_err(|_| AppError::cancelled("下载目录选择已取消"))?
                         .map_err(|_| AppError::infrastructure("系统目录选择器无法打开"))?;
                     let Some(mut paths) = paths else {
@@ -3971,30 +3441,28 @@ impl FilesPane {
                 })
                 .await;
             cx.update(|app| {
-                let _ = this.update(app, |pane, cx| match result {
-                    Ok(Some((items, issues))) => pane.enqueue_transfer_batch_started(
-                        TransferBatchPlan {
-                            items,
-                            total,
-                            included_by_selected_directories,
-                            issues,
-                            labels: BatchEnqueueLabels {
-                                action_zh: "下载任务已入队",
-                                action_en: "Download tasks queued",
+                let _ = this.update(app, |pane, cx| {
+                    if !pane.transfer_preparation_is_current(generation) {
+                        return;
+                    }
+                    match result {
+                        Ok(Some((items, issues))) => pane.enqueue_transfer_batch_started(
+                            TransferBatchPlan {
+                                items,
+                                total,
+                                included_by_selected_directories,
+                                issues,
+                                labels: BatchEnqueueLabels {
+                                    action_zh: "下载任务已入队",
+                                    action_en: "Download tasks queued",
+                                },
+                                target,
                             },
-                            target,
-                        },
-                        cx,
-                    ),
-                    Ok(None) => pane.finish_unsubmitted_transfer(
-                        locale::text(
-                            "已取消下载位置选择。",
-                            "Download location selection canceled.",
-                        )
-                        .to_string(),
-                        cx,
-                    ),
-                    Err(error) => pane.finish_unsubmitted_transfer(localized_error(&error), cx),
+                            cx,
+                        ),
+                        Ok(None) => pane.finish_cancelled_transfer(cx),
+                        Err(error) => pane.finish_unsubmitted_transfer(localized_error(&error), cx),
+                    }
                 });
             });
         })
@@ -4009,22 +3477,16 @@ impl FilesPane {
         self.load_panel_at(side, endpoint, cx);
     }
 
-    /// 新目录请求先撤销键盘可见性补偿，再重置滚动；仅匹配 generation 的回执能提交新清单。
+    /// 新目录请求切换到目标视图；同目录刷新保留滚动与选择，回执仍绑定 generation。
     ///
     /// @author kongweiguang
     fn load_panel_at(&mut self, side: usize, endpoint: FileEndpoint, cx: &mut Context<Self>) {
-        self.cancel_transfer_conflict_for_panel_change(side, cx);
-        self.panels[side].keyboard_scroll_intent.cancel();
+        self.cancel_transfer_preparation_for_side(side, cx);
         self.panels[side]
             .keyboard_focus
             .reset_for_directory(&endpoint);
-        self.panels[side].list_scroll = VirtualListScrollHandle::new();
-        let previous_preview = (self.active_side == side)
-            .then(|| self.preview.clone())
-            .flatten();
-        self.panels[side].invalidate_preview_request();
-        if self.active_side == side {
-            self.preview = None;
+        if self.panels[side].endpoint != endpoint {
+            self.panels[side].list_scroll = VirtualListScrollHandle::new();
         }
         let generation = {
             let panel = &mut self.panels[side];
@@ -4084,7 +3546,7 @@ impl FilesPane {
                                 return;
                             }
                             let show_hidden_files = pane.show_hidden_files;
-                            let tree_selection_dropped = pane.panels[side].tree.set_root_listing(
+                            pane.panels[side].tree.set_root_listing(
                                 listing.directory.clone(),
                                 generation,
                                 listing.entries.clone(),
@@ -4110,9 +3572,7 @@ impl FilesPane {
                                 .collect::<Vec<_>>();
                             let keyboard_visible_names = visible_entries
                                 .iter()
-                                .filter(|entry| {
-                                    pane.panels[side].entry_filter.matches(entry.kind)
-                                })
+                                .filter(|entry| pane.panels[side].entry_filter.matches(entry.kind))
                                 .map(|entry| entry.name.clone())
                                 .collect::<Vec<_>>();
                             let panel = &mut pane.panels[side];
@@ -4122,43 +3582,31 @@ impl FilesPane {
                             }
                             panel.endpoint = listing.directory.clone();
                             let requested_selection = panel.pending_selection.take();
-                            let selected = requested_selection.as_ref().and_then(|name| {
+                            let selected = if let Some(name) = requested_selection.as_ref() {
                                 listing
                                     .entries
                                     .iter()
                                     .find(|entry| &entry.name == name)
                                     .cloned()
-                            });
-                            let file_preview_requested = panel.pending_file_preview;
-                            panel.pending_file_preview = false;
-                            if let Some(entry) = selected.as_ref() {
+                            } else {
+                                panel.selected.as_ref().and_then(|previous| {
+                                    listing
+                                        .entries
+                                        .iter()
+                                        .find(|entry| entry.endpoint == previous.endpoint)
+                                        .cloned()
+                                })
+                            };
+                            if requested_selection.is_some()
+                                && let Some(entry) = selected.as_ref()
+                            {
                                 panel.selection.select_only(&entry.name);
                             }
                             panel.selection.retain_visible(&visible_names);
                             panel
                                 .keyboard_focus
                                 .retain_visible(&listing.directory, &keyboard_visible_names);
-                            if file_preview_requested
-                                && selected
-                                    .as_ref()
-                                    .is_some_and(render::browser::is_hidden_entry)
-                            {
-                                pane.show_hidden_files = true;
-                                if let Some(entry) = selected.as_ref() {
-                                    panel.selection.select_only(&entry.name);
-                                }
-                            }
-                            if file_preview_requested
-                                && !selected
-                                    .as_ref()
-                                    .is_some_and(|entry| entry.kind == FileEntryKind::File)
-                            {
-                                panel.selected = None;
-                                pane.status = Some(locale::text(
-                                    "指定的配置文件不存在或不是普通文件。",
-                                    "The requested configuration file is missing or not a regular file.",
-                                ).to_string());
-                            } else if requested_selection.is_some() && selected.is_none() {
+                            if requested_selection.is_some() && selected.is_none() {
                                 panel.selected = None;
                                 pane.status = Some(
                                     locale::text(
@@ -4171,41 +3619,24 @@ impl FilesPane {
                                 panel.selected = selected;
                                 pane.status = None;
                             }
-                            let preview_endpoint = panel
-                                .selected
-                                .as_ref()
-                                .filter(|entry| entry.kind == FileEntryKind::File)
-                                .map(|entry| entry.endpoint.clone());
                             panel.listing = Some(listing);
-                            if tree_selection_dropped > 0 && pane.status.is_none() {
-                                pane.status = Some(locale::text(
-                                    format!(
-                                        "目录刷新后清除了 {tree_selection_dropped} 个已失效树选择。"
-                                    ),
-                                    format!(
-                                        "Cleared {tree_selection_dropped} stale tree selections after refresh."
-                                    ),
-                                ).to_string());
+                            if let FileEndpoint::Local { path } = &panel.endpoint {
+                                pane.local_directories[side] = path.clone();
                             }
+                            pane.complete_active_host_tab_refresh(side);
                             if side == pane.active_side {
                                 pane.load_bookmarks(side, cx);
-                                if let Some(endpoint) = preview_endpoint {
-                                    pane.load_preview(side, endpoint, cx);
-                                }
                             }
                         }
                         Err(error) => {
                             let error_message = localized_error(&error);
                             panel.directory_error = Some(error_message.clone());
                             pane.panels[side].pending_selection = None;
-                            pane.panels[side].pending_file_preview = false;
                             pane.status = Some(error_message);
-                            if side == pane.active_side {
-                                pane.preview = previous_preview;
-                            }
                         }
                     }
                     pane.sync_target_name_requests(cx);
+                    pane.emit_transfer_endpoints_changed(cx);
                     cx.notify();
                 });
             });
@@ -4214,18 +3645,15 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 同步双面板和当前 editor 投影目标集合；同一 HostId 或容器身份只查询一次。
+    /// 同步双面板目标集合；同一 HostId 或容器身份只查询一次。
     ///
     /// @author kongweiguang
     fn sync_target_name_requests(&mut self, cx: &mut Context<Self>) {
-        let mut endpoints = self
+        let endpoints = self
             .panels
             .iter()
             .map(|panel| panel.endpoint.clone())
             .collect::<Vec<_>>();
-        if let Some(projection) = &self.workspace_projection {
-            endpoints.extend(projection.tabs.iter().map(|tab| tab.endpoint.clone()));
-        }
         let requests = self
             .target_names
             .synchronize(endpoints, &self.target_name_lookup);
@@ -4337,7 +3765,7 @@ impl FilesPane {
         .detach();
     }
 
-    /// 目录项进入目录，普通文件只加载有界预览并保留显式编辑入口。
+    /// 目录项进入目录，普通文件保留显式编辑入口。
     ///
     /// @author kongweiguang
     fn activate_entry(&mut self, side: usize, entry: FileEntry, cx: &mut Context<Self>) {
@@ -4356,10 +3784,6 @@ impl FilesPane {
             return;
         }
         let switched_side = self.active_side != side;
-        if switched_side {
-            self.panels[self.active_side].invalidate_preview_request();
-            self.preview = None;
-        }
         self.active_side = side;
         if entry.kind == FileEntryKind::Directory {
             self.panels[side]
@@ -4369,7 +3793,6 @@ impl FilesPane {
             self.panels[side].pending_selection = None;
             self.panels[side].selected = None;
             self.panels[side].selection.clear();
-            self.preview = None;
             self.load_panel(side, cx);
             return;
         }
@@ -4379,62 +3802,8 @@ impl FilesPane {
         if let Some(name) = endpoint_name(&entry.endpoint) {
             self.panels[side].selection.select_only(&name);
         }
-        self.panels[side].selected = Some(entry.clone());
-        self.preview = None;
-        if entry.kind == FileEntryKind::File {
-            self.load_preview(side, entry.endpoint, cx);
-        } else {
-            self.panels[side].invalidate_preview_request();
-        }
+        self.panels[side].selected = Some(entry);
         cx.notify();
-    }
-
-    /// 预览按面板、选择与请求代次提交结果；旧读取在选项或 pane 失效时会被取消。
-    ///
-    /// @author kongweiguang
-    fn load_preview(&mut self, side: usize, endpoint: FileEndpoint, cx: &mut Context<Self>) {
-        self.panels[side].invalidate_preview_request();
-        let generation = self.panels[side].preview_generation;
-        let request_cancellation = Arc::new(PreviewTaskCancellation::default());
-        self.panels[side].preview_cancellation = Some(Arc::clone(&request_cancellation));
-        let external_target_lease = self.external_target_lease_for_endpoint(&endpoint);
-        let files = self.files.clone();
-        let executor = self.executor.clone();
-        let expected_endpoint = endpoint.clone();
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(move |cancel| async move {
-                    request_cancellation.bind_task_token(cancel.clone());
-                    let _external_target_scope = external_target_lease;
-                    let result = files
-                        .preview_file(cancel, endpoint, MAX_FILE_PREVIEW_BYTES)
-                        .await;
-                    request_cancellation.clear_task_token();
-                    result
-                })
-                .await;
-            cx.update(|app| {
-                let _ = this.update(app, |pane, cx| {
-                    let active_side = pane.active_side;
-                    let panel = &mut pane.panels[side];
-                    let request_is_current = panel.preview_generation == generation
-                        && panel.selected.as_ref().is_some_and(|selected| {
-                            selected.kind == FileEntryKind::File
-                                && selected.endpoint == expected_endpoint
-                        });
-                    if !request_is_current || active_side != side {
-                        return;
-                    }
-                    panel.preview_cancellation = None;
-                    match result {
-                        Ok(preview) => pane.preview = Some(preview),
-                        Err(error) => pane.status = Some(error.public_message().to_owned()),
-                    }
-                    cx.notify();
-                });
-            });
-        })
-        .detach();
     }
 
     /// 返回一层目录的父路径；POSIX 远端路径不经过 Windows Path 规则解释。
@@ -4464,6 +3833,11 @@ impl FilesPane {
             }),
         };
         let Some(endpoint) = endpoint else { return };
+        if self.host_picker.target_pending[side]
+            && let Some(side) = FilePaneSide::from_index(side)
+        {
+            self.cancel_pending_host_selection(side, cx);
+        }
         if side == 0 && !endpoint_matches_locked_host(&endpoint, self.locked_left_host_id.as_ref())
         {
             self.status = Some(
@@ -4479,11 +3853,10 @@ impl FilesPane {
         self.panels[side].navigation_history.push(endpoint.clone());
         self.panels[side].endpoint = endpoint;
         self.panels[side].pending_selection = None;
-        self.panels[side].pending_file_preview = false;
         self.panels[side].selected = None;
         self.panels[side].selection.clear();
-        self.preview = None;
         self.load_panel(side, cx);
+        self.emit_transfer_endpoints_changed(cx);
     }
 
     /// 将指定面板的当前路径加入或移除目标级书签；回执按面板端点校验，切换活动侧不丢结果。
@@ -4614,15 +3987,18 @@ impl FilesPane {
     ///
     /// @author kongweiguang
     fn transfer_selected(&mut self, cx: &mut Context<Self>) {
+        if self.transfer_submission_busy {
+            return;
+        }
         let source_side = self.active_side;
         let destination_side = 1 - source_side;
-        if !can_transfer_to_other_side(
-            self.host_picker.enabled,
-            self.host_picker.right_target_unselected,
-            source_side,
-        ) {
+        if !self.can_transfer_selected_to_other_side(source_side) {
             self.status = Some(
-                locale::text("请先选择右侧主机", "Select a host on the right first").to_string(),
+                locale::text(
+                    "请选择两侧主机并等待目录加载完成。",
+                    "Choose both hosts and wait for their directories to load.",
+                )
+                .to_string(),
             );
             cx.notify();
             return;
@@ -4638,14 +4014,14 @@ impl FilesPane {
             cx.notify();
             return;
         };
+        let source_directory = self.panels[source_side].endpoint.clone();
+        let destination_directory = self.panels[destination_side].endpoint.clone();
+        let selected = self.selected_entries(source_side);
         let (selected, included_by_selected_directories) =
             if self.view_mode == view_mode::FilesViewMode::Tree {
-                let plan = self.panels[source_side]
-                    .tree
-                    .transfer_selection_plan(self.show_hidden_files);
-                (plan.roots, plan.included_descendants)
+                drag_drop::copy_selection_roots(selected, &source_directory, &destination_directory)
             } else {
-                (self.selected_entries(source_side), 0)
+                (selected, 0)
             };
         if selected.is_empty() {
             self.status = Some(
@@ -4656,61 +4032,33 @@ impl FilesPane {
         }
 
         let total = selected.len() + included_by_selected_directories;
-        let destination_directory = self.panels[destination_side].endpoint.clone();
-        let conflict_policy = self.queue.conflict_policy;
-        let mut items = Vec::new();
-        let mut issues = Vec::new();
-        for entry in selected {
-            let Some(name) = endpoint_name(&entry.endpoint).filter(|name| valid_item_name(name))
-            else {
-                issues.push(
-                    locale::text(
-                        format!("{}: 无法安全读取文件名。", entry.name),
-                        format!("{}: the name cannot be represented safely.", entry.name),
-                    )
-                    .to_string(),
-                );
-                continue;
-            };
-            let kind = match entry.kind {
-                FileEntryKind::File => TransferKind::File,
-                FileEntryKind::Directory => TransferKind::Directory,
-                FileEntryKind::Symlink | FileEntryKind::Other => {
-                    issues.push(
-                        locale::text(
-                            format!("{}: 当前传输不跟随符号链接或特殊文件。", entry.name),
-                            format!(
-                                "{}: symbolic links and special files are not transferred.",
-                                entry.name
-                            ),
-                        )
-                        .to_string(),
-                    );
-                    continue;
-                }
-            };
-            let Some(destination) = child_endpoint(&destination_directory, &name) else {
-                issues.push(
-                    locale::text(
-                        format!("{}: 目标文件系统不支持该名称。", name),
-                        format!("{}: the destination does not support this name.", name),
-                    )
-                    .to_string(),
-                );
-                continue;
-            };
-            let request = TransferRequest {
-                source: entry.endpoint,
-                destination,
-                kind,
-                conflict_policy,
-                idle_timeout_seconds: None,
-            };
-            items.push(TransferEnqueueItem {
+        let (items, issues) = drag_drop::plan_copy_entries(
+            &selected,
+            &source_directory,
+            &destination_directory,
+            self.queue.conflict_policy,
+        );
+        let items = items
+            .into_iter()
+            .map(|(name, request)| TransferEnqueueItem {
                 name,
                 external_target_lease: self.external_target_lease_for_request(&request),
                 request,
-            });
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            self.status = batch_enqueue_message(
+                "复制任务已入队",
+                "Copy tasks queued",
+                BatchEnqueueOutcome {
+                    total,
+                    included_by_selected_directories,
+                    issues,
+                    ..BatchEnqueueOutcome::default()
+                },
+            );
+            cx.notify();
+            return;
         }
         self.enqueue_transfer_batch(
             TransferBatchPlan {
@@ -4742,9 +4090,14 @@ impl FilesPane {
     ///
     /// @author kongweiguang
     fn enqueue_transfer_batch_started(&mut self, plan: TransferBatchPlan, cx: &mut Context<Self>) {
-        if !self.transfer_submission_busy {
+        let Some((generation, cancellation)) =
+            self.transfer_submission.as_ref().and_then(|submission| {
+                (submission.phase == TransferSubmissionPhase::Preparing)
+                    .then(|| (submission.generation, submission.cancellation.clone()))
+            })
+        else {
             return;
-        }
+        };
         if !self.transfer_target_is_current(&plan.target) {
             self.finish_unsubmitted_transfer(
                 locale::text(
@@ -4761,35 +4114,42 @@ impl FilesPane {
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |cancellation| async move {
+                .run_cancellable(cancellation, move |cancellation| async move {
                     let conflicts =
                         count_transfer_conflicts(&files, &cancellation, &plan.items).await?;
                     Ok((plan, conflicts))
                 })
                 .await;
             cx.update(|app| {
-                let _ = this.update(app, |pane, cx| match result {
-                    Ok((plan, conflict_count)) if pane.transfer_target_is_current(&plan.target) => {
-                        if conflict_count == 0 {
-                            pane.submit_transfer_batch(plan, cx);
-                        } else {
-                            pane.status = None;
-                            pane.pending_transfer_conflict = Some(PendingTransferConflict {
-                                plan,
-                                conflict_count,
-                            });
-                            cx.notify();
-                        }
+                let _ = this.update(app, |pane, cx| {
+                    if !pane.transfer_preparation_is_current(generation) {
+                        return;
                     }
-                    Ok(_) => pane.finish_unsubmitted_transfer(
-                        locale::text(
-                            "目标目录已变化，传输任务未提交。",
-                            "The destination changed. No transfer tasks were submitted.",
-                        )
-                        .to_string(),
-                        cx,
-                    ),
-                    Err(error) => pane.finish_unsubmitted_transfer(localized_error(&error), cx),
+                    match result {
+                        Ok((plan, conflict_count))
+                            if pane.transfer_target_is_current(&plan.target) =>
+                        {
+                            if conflict_count == 0 {
+                                pane.submit_transfer_batch(plan, cx);
+                            } else {
+                                pane.status = None;
+                                pane.pending_transfer_conflict = Some(PendingTransferConflict {
+                                    plan,
+                                    conflict_count,
+                                });
+                                cx.notify();
+                            }
+                        }
+                        Ok(_) => pane.finish_unsubmitted_transfer(
+                            locale::text(
+                                "目标目录已变化，传输任务未提交。",
+                                "The destination changed. No transfer tasks were submitted.",
+                            )
+                            .to_string(),
+                            cx,
+                        ),
+                        Err(error) => pane.finish_unsubmitted_transfer(localized_error(&error), cx),
+                    }
                 });
             });
         })
@@ -4811,6 +4171,14 @@ impl FilesPane {
             );
             return;
         }
+        let Some(submission) = self.transfer_submission.as_mut() else {
+            return;
+        };
+        if submission.phase != TransferSubmissionPhase::Preparing {
+            return;
+        }
+        submission.phase = TransferSubmissionPhase::Enqueuing;
+        let generation = submission.generation;
         let transfers = self.transfers.clone();
         let executor = self.executor.clone();
         let labels = plan.labels;
@@ -4830,15 +4198,18 @@ impl FilesPane {
                 .await;
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
+                    if !pane.transfer_submission.as_ref().is_some_and(|submission| {
+                        submission.generation == generation
+                            && submission.phase == TransferSubmissionPhase::Enqueuing
+                    }) {
+                        return;
+                    }
                     pane.end_transfer_submission();
                     pane.pending_transfer_conflict = None;
                     match result {
                         Ok(outcome) => {
-                            pane.status = Some(batch_enqueue_message(
-                                labels.action_zh,
-                                labels.action_en,
-                                outcome,
-                            ));
+                            pane.status =
+                                batch_enqueue_message(labels.action_zh, labels.action_en, outcome);
                             pane.reload_transfers(cx);
                         }
                         Err(error) => pane.status = Some(localized_error(&error)),
@@ -4879,6 +4250,11 @@ impl FilesPane {
     /// @author kongweiguang
     fn capture_transfer_target_snapshot(&self, side: usize) -> Option<TransferTargetSnapshot> {
         let panel = self.panels.get(side)?;
+        if self.host_picker.enabled
+            && (self.host_picker.target_unselected[side] || self.host_picker.target_pending[side])
+        {
+            return None;
+        }
         (!panel.loading
             && panel.requested_endpoint.is_none()
             && panel
@@ -4892,31 +4268,48 @@ impl FilesPane {
         })
     }
 
-    /// 显式目录通常是当前浏览目录，树行目标则回退到已激活的当前面板快照。
+    /// 菜单捕获行前只检查两侧目录可用性；实际选择在动作提交时另行校验。
+    ///
+    /// @author kongweiguang
+    pub(super) fn can_transfer_selected_to_other_side(&self, side: usize) -> bool {
+        can_transfer_to_other_side(
+            self.host_picker.enabled,
+            self.host_picker.target_unselected,
+            side,
+        ) && !self.transfer_submission_busy
+            && self.capture_transfer_target_snapshot(side).is_some()
+            && self.capture_transfer_target_snapshot(1 - side).is_some()
+    }
+
+    /// 相同目录同时出现在两侧时优先原活动侧；只接受当前目录或仍可见的真实目录行。
     ///
     /// @author kongweiguang
     fn capture_transfer_target_for_directory(
         &self,
         directory: &FileEndpoint,
     ) -> Option<TransferTargetSnapshot> {
-        if let Some((side, _)) = self
-            .panels
-            .iter()
-            .enumerate()
-            .find(|(_, panel)| panel.endpoint == *directory)
-        {
-            return self.capture_transfer_target_snapshot(side);
+        for side in [self.active_side, 1 - self.active_side] {
+            let panel = &self.panels[side];
+            let is_directory_row = panel.listing.as_ref().is_some_and(|listing| {
+                listing.entries.iter().any(|entry| {
+                    entry.endpoint == *directory
+                        && entry.kind == FileEntryKind::Directory
+                        && (self.show_hidden_files || !render::browser::is_hidden_entry(entry))
+                })
+            }) || (self.view_mode == view_mode::FilesViewMode::Tree
+                && panel
+                    .tree
+                    .visible_endpoints(self.show_hidden_files)
+                    .contains(directory)
+                && panel
+                    .tree
+                    .entry(directory)
+                    .is_some_and(|entry| entry.kind == FileEntryKind::Directory));
+            if panel.endpoint == *directory || is_directory_row {
+                return self.capture_transfer_target_snapshot(side);
+            }
         }
-        if let Some(parent) = parent_endpoint(directory)
-            && let Some((side, _)) = self
-                .panels
-                .iter()
-                .enumerate()
-                .find(|(_, panel)| panel.endpoint == parent)
-        {
-            return self.capture_transfer_target_snapshot(side);
-        }
-        self.capture_transfer_target_snapshot(self.active_side)
+        None
     }
 
     /// 只用浏览目标快照判断是否仍可提交，不把原请求改投到当前活动面板。
@@ -4939,19 +4332,32 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 目标面板开始新一代读取時立即丢弃仍未提交的冲突草稿。
+    /// 用户主动取消选择器只释放批次，不插入提示条；已有独立错误仍可查看或关闭。
     ///
     /// @author kongweiguang
-    fn cancel_transfer_conflict_for_panel_change(&mut self, side: usize, cx: &mut Context<Self>) {
-        if self
-            .pending_transfer_conflict
-            .as_ref()
-            .is_some_and(|pending| pending.plan.target.side == side)
-        {
+    fn finish_cancelled_transfer(&mut self, cx: &mut Context<Self>) {
+        self.pending_transfer_conflict = None;
+        self.end_transfer_submission();
+        cx.notify();
+    }
+
+    /// 只有相关侧的未提交准备会随目录或主机变化取消；已开始受理的批次必须等回执。
+    ///
+    /// @author kongweiguang
+    pub(super) fn cancel_transfer_preparation_for_side(
+        &mut self,
+        side: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let affected = self.transfer_submission.as_ref().is_some_and(|submission| {
+            submission.phase == TransferSubmissionPhase::Preparing
+                && submission.related_sides.get(side).copied().unwrap_or(false)
+        });
+        if affected {
             self.finish_unsubmitted_transfer(
                 locale::text(
-                    "目标目录已变化，未提交的传输已取消。",
-                    "The destination changed. The unsubmitted transfer was canceled.",
+                    "文件目标或选择已变化，未提交的传输已取消。",
+                    "A file target or selection changed. The unsubmitted transfer was canceled.",
                 )
                 .to_string(),
                 cx,
@@ -4959,19 +4365,34 @@ impl FilesPane {
         }
     }
 
+    /// 离开视图只撤销尚未受理的意图，已经入队的项目与其真实回执继续保留。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn cancel_transfer_preparation(&mut self, cx: &mut Context<Self>) {
+        if self
+            .transfer_submission
+            .as_ref()
+            .is_some_and(|submission| submission.phase == TransferSubmissionPhase::Preparing)
+        {
+            self.finish_cancelled_transfer(cx);
+        }
+    }
+
+    /// 关闭面板前必须等待正在逐项受理的结果，避免已受理与未受理项目混淆。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn transfer_enqueue_in_progress(&self) -> bool {
+        self.transfer_submission
+            .as_ref()
+            .is_some_and(|submission| submission.phase == TransferSubmissionPhase::Enqueuing)
+    }
+
     /// 关闭冲突弹框只丢弃未提交计划；已排队的任务不受关闭动作影响。
     ///
     /// @author kongweiguang
     fn cancel_transfer_conflict(&mut self, cx: &mut Context<Self>) {
         if self.pending_transfer_conflict.take().is_some() {
-            self.finish_unsubmitted_transfer(
-                locale::text(
-                    "已取消冲突处理，传输任务未提交。",
-                    "Conflict handling was canceled. No transfer tasks were submitted.",
-                )
-                .to_string(),
-                cx,
-            );
+            self.finish_cancelled_transfer(cx);
         }
     }
 
@@ -4984,32 +4405,56 @@ impl FilesPane {
             .map(|pending| pending.conflict_count)
     }
 
-    /// 同一文件面板一次只允许一个传输批次进入系统选择器或队列，防止连点生成重复任务。
+    /// 同一文件面板只允许一个传输批次；原操作按钮表达忙态，重复提交不再插入状态条或覆盖已有错误。
     ///
     /// @author kongweiguang
     fn begin_transfer_submission(&mut self, cx: &mut Context<Self>) -> bool {
+        self.begin_transfer_preparation([true, true], cx).is_some()
+    }
+
+    /// 保存实际关联侧并分配单调代次；旧选择器或预检回执不能释放后续提交。
+    ///
+    /// @author kongweiguang
+    fn begin_transfer_preparation(
+        &mut self,
+        related_sides: [bool; 2],
+        cx: &mut Context<Self>,
+    ) -> Option<(u64, CancellationToken)> {
         if self.transfer_submission_busy {
-            self.status = Some(
-                locale::text(
-                    "传输任务正在提交，请稍候。",
-                    "A transfer batch is being submitted. Please wait.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return false;
+            return None;
         }
+        self.transfer_submission_generation = self.transfer_submission_generation.wrapping_add(1);
+        let generation = self.transfer_submission_generation;
+        let cancellation = CancellationToken::new();
+        self.transfer_submission = Some(TransferSubmission {
+            generation,
+            cancellation: cancellation.clone(),
+            related_sides,
+            phase: TransferSubmissionPhase::Preparing,
+        });
         self.transfer_submission_busy = true;
-        self.status =
-            Some(locale::text("正在准备传输任务…", "Preparing transfer tasks…").to_string());
         cx.notify();
-        true
+        Some((generation, cancellation))
+    }
+
+    /// 只接受仍由同一未提交批次持有的回执，不让迟到错误覆盖当前状态。
+    ///
+    /// @author kongweiguang
+    fn transfer_preparation_is_current(&self, generation: u64) -> bool {
+        self.transfer_submission.as_ref().is_some_and(|submission| {
+            submission.generation == generation
+                && submission.phase == TransferSubmissionPhase::Preparing
+                && !submission.cancellation.is_cancelled()
+        })
     }
 
     /// 对话框取消、队列受理或执行失败都要释放面板闩锁，允许用户明确重试。
     ///
     /// @author kongweiguang
     fn end_transfer_submission(&mut self) {
+        if let Some(submission) = self.transfer_submission.take() {
+            submission.cancellation.cancel();
+        }
         self.transfer_submission_busy = false;
     }
 
@@ -5021,6 +4466,7 @@ impl FilesPane {
         let refresh_directories =
             completed_transfer_refresh_directories(&self.transfer_rows, &rows);
         self.transfer_rows = rows;
+        self.invalidate_inactive_transfer_directories(&refresh_directories);
         for side in 0..self.panels.len() {
             let should_refresh = {
                 let panel = &self.panels[side];
@@ -5105,7 +4551,7 @@ impl FilesPane {
                 let mut waiting_events = events;
                 let wake = executor
                     .run(move |cancel| async move {
-                        let wake = waiting_events.recv(cancel).await;
+                        let wake = waiting_events.recv_event(cancel).await;
                         Ok((wake, waiting_events))
                     })
                     .await;
@@ -5114,11 +4560,15 @@ impl FilesPane {
                     Err(_) => break,
                 };
                 events = next_events;
-                if wake.is_none() {
-                    break;
-                }
+                let Some(wake) = wake else { break };
                 let generation = cx.update(|app| {
                     this.update(app, |pane, cx| {
+                        if matches!(
+                            wake,
+                            TransferQueueEvent::Cleared | TransferQueueEvent::Resync
+                        ) {
+                            pane.refresh_after_uncertain_transfer_change(cx);
+                        }
                         let generation = pane.queue.begin_transfer_refresh();
                         cx.notify();
                         generation
@@ -5226,13 +4676,7 @@ impl FilesPane {
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
                     match result {
-                        Ok(Some(summary)) => {
-                            pane.status = Some(format!(
-                                "{} {}",
-                                locale::text("后继任务已建立：", "Retry queued:"),
-                                summary.id
-                            ))
-                        }
+                        Ok(Some(_)) => pane.status = None,
                         Ok(None) => {
                             pane.status = Some(locale::text(
                                 "原临时目标连接已失效；请重新连接同一目标并重新创建传输任务。旧任务不会切换到新目标。",
@@ -5247,31 +4691,6 @@ impl FilesPane {
         })
         .detach();
     }
-}
-
-/// 请求回包允许当前版本首次填充，但不能覆盖已经推送过的新版本。
-///
-/// @author kongweiguang
-fn workspace_projection_response_is_fresh(current: Option<u64>, incoming: u64) -> bool {
-    current.is_none_or(|revision| incoming >= revision)
-}
-
-/// 请求回执只能填充仍处于发起视图与代次的面板，切页后重开的同一 Entity 也必须拒收旧回执。
-///
-/// @author kongweiguang
-fn workspace_projection_request_is_current(
-    workspace_view_active: bool,
-    request_generation: u64,
-    current_generation: u64,
-) -> bool {
-    workspace_view_active && request_generation == current_generation
-}
-
-/// Root 推送只接受严格更新的版本，重复事件和迟到事件都不触发新一帧。
-///
-/// @author kongweiguang
-fn workspace_projection_push_is_newer(current: Option<u64>, incoming: u64) -> bool {
-    current.is_none_or(|revision| incoming > revision)
 }
 
 impl BrowserPanel {
@@ -5289,49 +4708,33 @@ impl BrowserPanel {
             list_focus_handle: None,
             keyboard_focus: FileListKeyboardFocus::default(),
             pending_selection: None,
-            pending_file_preview: false,
             path_input: None,
             path_input_endpoint: None,
             _path_subscription: None,
             loading: false,
             directory_error: None,
             generation: 0,
-            preview_generation: 0,
-            preview_cancellation: None,
             tree: tree::FileTreeBrowser::default(),
             tree_widget: None,
             list_scroll: VirtualListScrollHandle::new(),
-            keyboard_scroll_intent: KeyboardScrollIntent::default(),
             sort: FileSort::default(),
             entry_filter: view_mode::FileEntryFilter::default(),
             navigation_history,
         }
     }
-
-    /// 使旧预览响应失效并发出协作取消，导航和选择变化都使用同一代次边界。
-    ///
-    /// @author kongweiguang
-    fn invalidate_preview_request(&mut self) {
-        self.preview_generation = self.preview_generation.wrapping_add(1);
-        if let Some(cancellation) = self.preview_cancellation.take() {
-            cancellation.cancel();
-        }
-    }
 }
 
 impl Drop for BrowserPanel {
-    /// pane 被关闭时通知仍在读取的预览协作退出，避免把已关闭视图当作资源 owner。
+    /// pane 被关闭时取消仍在读取的子树请求，避免把已关闭视图当作资源 owner。
     ///
     /// @author kongweiguang
     fn drop(&mut self) {
-        self.invalidate_preview_request();
         self.tree.cancel_pending_requests();
     }
 }
 
 impl EventEmitter<OpenFileRequested> for FilesPane {}
 impl EventEmitter<FilesPaneEvent> for FilesPane {}
-impl EventEmitter<WorkspaceOverviewRequested> for FilesPane {}
 impl EventEmitter<ActivateEditorFileRequested> for FilesPane {}
 impl EventEmitter<SftpHostRequested> for FilesPane {}
 impl EventEmitter<SftpHostKeyTrustRequested> for FilesPane {}
@@ -5367,6 +4770,25 @@ fn localized_error(error: &AppError) -> String {
         }
     };
     locale::text(error.public_message(), english).to_string()
+}
+
+/// 临时文件标签取得独立 owner；没有匹配来源时拒绝打开，普通目标不需要租约。
+///
+/// @author kongweiguang
+fn retain_file_target_lease(
+    endpoint: &FileEndpoint,
+    lease: Option<&ExternalTargetLease>,
+) -> AppResult<Option<ExternalTargetLease>> {
+    let Some(host_id) = endpoint
+        .host_id()
+        .filter(|host_id| host_id.as_str().starts_with("external:"))
+    else {
+        return Ok(None);
+    };
+    let lease = lease
+        .filter(|lease| lease.host_id() == host_id)
+        .ok_or_else(|| AppError::conflict("临时连接已失效，无法打开文件。"))?;
+    lease.retain().map(Some)
 }
 
 /// 从 endpoint 形成同一文件系统的子项，远端路径仅经领域 join_name 校验。
@@ -5514,8 +4936,10 @@ fn endpoint_name(endpoint: &FileEndpoint) -> Option<String> {
     }
 }
 
-/// 获取当前 endpoint 的父目录，同时保留主机、运行时和容器身份。
-fn parent_endpoint(endpoint: &FileEndpoint) -> Option<FileEndpoint> {
+/// 浏览与文件导航共用父目录推导，完整保留主机、运行时和容器身份，避免跨文件系统降级。
+///
+/// @author kongweiguang
+pub(crate) fn parent_endpoint(endpoint: &FileEndpoint) -> Option<FileEndpoint> {
     match endpoint {
         FileEndpoint::Local { path } => Some(FileEndpoint::Local {
             path: path.parent()?.to_path_buf(),
@@ -5568,21 +4992,6 @@ fn begin_panel_load_request(
     *generation
 }
 
-/// 传输完成只刷新当前实际展示或正在请求的精确 endpoint，不打断尚未提交的用户导航。
-///
-/// @author kongweiguang
-fn panel_needs_transfer_refresh(
-    committed_endpoint: &FileEndpoint,
-    requested_endpoint: Option<&FileEndpoint>,
-    loading: bool,
-    has_listing: bool,
-    refresh_directories: &[FileEndpoint],
-) -> bool {
-    (has_listing || loading)
-        && panel_refresh_target(committed_endpoint, requested_endpoint, loading)
-            .is_some_and(|target| refresh_directories.contains(target))
-}
-
 /// 只有当前代次与其请求 endpoint 同时吻合时才允许回执结束 pending，迟到失败/取消不清新请求。
 ///
 /// @author kongweiguang
@@ -5599,39 +5008,6 @@ fn finish_panel_load_request(
     }
     *pending_endpoint = None;
     true
-}
-
-/// 仅消费新出现或刚转为 Succeeded 且具有显式目标提交回执的任务；不从请求路径猜测 Rename 结果。
-/// 目录任务还可能改变已打开目标目录的内容，所以只在完整 endpoint 精确相等时附加自身目录。
-///
-/// @author kongweiguang
-fn completed_transfer_refresh_directories(
-    previous: &[TransferSummary],
-    current: &[TransferSummary],
-) -> Vec<FileEndpoint> {
-    let mut directories = Vec::new();
-    for summary in current {
-        if summary.status != TransferStatus::Succeeded
-            || summary.commit_summary.committed_entries() == 0
-            || previous
-                .iter()
-                .any(|old| old.id == summary.id && old.status == TransferStatus::Succeeded)
-        {
-            continue;
-        }
-        let Some(destination) = summary.actual_destination.as_ref() else {
-            continue;
-        };
-        if let Some(parent) = parent_endpoint(destination)
-            && !directories.contains(&parent)
-        {
-            directories.push(parent);
-        }
-        if summary.request.kind == TransferKind::Directory && !directories.contains(destination) {
-            directories.push(destination.clone());
-        }
-    }
-    directories
 }
 
 #[cfg(test)]
@@ -5788,7 +5164,7 @@ mod transfer_conflict_tests;
 
 #[cfg(test)]
 #[path = "../../../tests/unit/files_action_support.rs"]
-mod action_test_support;
+pub(crate) mod action_test_support;
 
 #[cfg(test)]
 #[path = "../../../tests/unit/files_action_regressions.rs"]

@@ -323,6 +323,9 @@ pub struct TerminalSettings {
     pub color_scheme: TerminalColorScheme,
     pub light_color_scheme: TerminalColorScheme,
     pub dark_color_scheme: TerminalColorScheme,
+    /// 旧文件缺少单一主题字段时保留来源事实；此状态只存在于读取结果，不写入 TOML。
+    #[serde(skip)]
+    pub legacy_color_scheme_missing: bool,
     pub font_family: String,
     pub font_size: u16,
     pub font_weight: TerminalFontWeight,
@@ -348,6 +351,7 @@ impl Default for TerminalSettings {
             color_scheme: TerminalColorScheme::Kerminal,
             light_color_scheme: TerminalColorScheme::Kerminal,
             dark_color_scheme: TerminalColorScheme::Kerminal,
+            legacy_color_scheme_missing: false,
             font_family: r#""JetBrains Mono", "SF Mono", "Cascadia Code", Consolas, monospace"#
                 .to_owned(),
             font_size: 15,
@@ -369,6 +373,24 @@ impl Default for TerminalSettings {
 }
 
 impl TerminalSettings {
+    /// 在窗口外观已知后一次性归并旧浅深选择；只改变快照，磁盘更新仍走原有 CAS 保存。
+    ///
+    /// @author kongweiguang
+    pub fn resolve_legacy_terminal_scheme(&mut self, effective_dark: bool) {
+        if !self.legacy_color_scheme_missing {
+            return;
+        }
+        let selected = if effective_dark {
+            self.dark_color_scheme
+        } else {
+            self.light_color_scheme
+        };
+        self.color_scheme = selected;
+        self.light_color_scheme = selected;
+        self.dark_color_scheme = selected;
+        self.legacy_color_scheme_missing = false;
+    }
+
     /// 校验高亮规则并收敛建议数据保留期，避免 UI 与运行态读到不同范围。
     pub(super) fn validated(mut self) -> AppResult<Self> {
         self.inline_suggestion = self.inline_suggestion.normalized();

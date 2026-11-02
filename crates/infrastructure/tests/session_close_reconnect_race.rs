@@ -89,6 +89,7 @@ impl SessionTransportFactory for RaceFactory {
             shell_dialect: kerminal_domain::connections::RemoteShellDialect::Unknown,
             process_id: None,
             shell_integration_enabled: false,
+            shell_editing_nonce: None,
         })
     }
 }

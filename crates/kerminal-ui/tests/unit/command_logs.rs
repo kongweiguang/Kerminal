@@ -20,7 +20,11 @@ use kerminal_domain::{
 };
 
 use super::super::history_query::{HistoryScope, PAGE_SIZE, page_window};
-use super::{HistoryReadKey, LogsTarget, operation_matches_target, response_matches_request};
+use super::{
+    HistoryFillFeedback, HistoryFillStatus, HistoryReadKey, LogsTarget, LogsTerminalFillCompleted,
+    history_fill_command_is_valid, history_fill_completion_matches, operation_matches_target,
+    response_matches_request,
+};
 
 /// 构造绑定一致的 UI 会话样本，确保测试使用与 Root 相同的稳定身份字段。
 ///
@@ -325,14 +329,14 @@ fn history_scopes_preserve_distinct_workspace_and_logs_contracts() {
     assert_eq!(logs.clear_request().session_id, None);
 }
 
-/// 八条一页且总查询最多一百条，页码输入在空列表和边界外均确定性夹紧。
+/// 初始八条容量在第一次布局前仍可分页；空列表及超界页码始终确定性夹紧。
 ///
 /// @author kongweiguang
 #[test]
 fn page_window_clamps_empty_partial_and_out_of_range_pages() {
-    assert_eq!(page_window(0, 0), (1, 0, 0));
-    assert_eq!(page_window(9, 9), (2, 8, 9));
-    assert_eq!(page_window(usize::MAX, 100), (13, 96, 100));
+    assert_eq!(page_window(0, 0, PAGE_SIZE), (1, 0, 0));
+    assert_eq!(page_window(9, 9, PAGE_SIZE), (2, 8, 9));
+    assert_eq!(page_window(usize::MAX, 100, PAGE_SIZE), (13, 96, 100));
 }
 
 /// 空列表或只有一页时不展示无法使用的分页按钮；超过页容量后才需要分页交互。
@@ -340,9 +344,47 @@ fn page_window_clamps_empty_partial_and_out_of_range_pages() {
 /// @author kongweiguang
 #[test]
 fn pagination_is_hidden_until_more_than_one_page_exists() {
-    assert!(!super::pagination_visible(0));
-    assert!(!super::pagination_visible(PAGE_SIZE));
-    assert!(super::pagination_visible(PAGE_SIZE + 1));
+    assert!(!super::pagination_visible(0, PAGE_SIZE));
+    assert!(!super::pagination_visible(PAGE_SIZE, PAGE_SIZE));
+    assert!(super::pagination_visible(PAGE_SIZE + 1, PAGE_SIZE));
+}
+
+/// 高度增长必须增加可见命令；临界高度需包含边框、标题和分页栏，避免末行裁切。
+///
+/// @author kongweiguang
+#[test]
+fn logs_capacity_uses_card_height_and_reserves_pagination_only_when_needed() {
+    use super::{HISTORY_HEADER_HEIGHT, HISTORY_PAGINATION_HEIGHT, HISTORY_ROW_HEIGHT};
+    let eight_rows = 2. + HISTORY_HEADER_HEIGHT + HISTORY_ROW_HEIGHT * 8.;
+    assert_eq!(super::history_page_size(eight_rows, 8), 8);
+    assert_eq!(super::history_page_size(eight_rows, 24), 7);
+    let paged_eight_rows = eight_rows + HISTORY_PAGINATION_HEIGHT;
+    assert_eq!(super::history_page_size(paged_eight_rows, 24), 8);
+    assert_eq!(super::history_page_size(paged_eight_rows - 0.5, 24), 7);
+    assert_eq!(
+        super::history_page_size(paged_eight_rows + HISTORY_ROW_HEIGHT * 8., 24),
+        16
+    );
+    assert_eq!(super::history_page_size(0., 24), 1);
+    assert_eq!(super::history_page_size(100_000., 100), 100);
+}
+
+/// 动态分页在窗口缩放、删除和空结果时仍覆盖真实末页，不遗失或重复划分记录。
+///
+/// @author kongweiguang
+#[test]
+fn logs_dynamic_pages_clamp_and_partition_all_entries() {
+    for size in [1, 7, 8, 16, 24, 100] {
+        let mut covered = Vec::new();
+        for page in 1..=24_usize.div_ceil(size) {
+            let (_, start, end) = super::logs_page_window(page, 24, size);
+            covered.extend(start..end);
+        }
+        assert_eq!(covered, (0..24).collect::<Vec<_>>());
+    }
+    assert_eq!(super::logs_page_window(3, 24, 16), (2, 16, 24));
+    assert_eq!(super::logs_page_window(2, 16, 16), (1, 0, 16));
+    assert_eq!(super::logs_page_window(0, 0, 16), (1, 0, 0));
 }
 
 /// 页内范围按 UI 的一基起始位置显示，空列表和越界范围都保持可读的零计数。
@@ -516,4 +558,167 @@ fn late_responses_follow_request_identity_after_deactivation() {
     assert!(operation_matches_target(true, Some(&target), &target));
     assert!(!operation_matches_target(false, Some(&target), &target));
     assert!(!operation_matches_target(true, Some(&new_target), &target));
+}
+
+/// 行内发送必须与应用层单行 Paste 约束一致，不能让历史换行隐式执行终端命令。
+///
+/// @author kongweiguang
+#[test]
+fn history_fill_allows_single_line_and_rejects_internal_newlines() {
+    assert!(history_fill_command_is_valid(" git status "));
+    assert!(history_fill_command_is_valid("\n\tgit\tstatus\r\n"));
+    assert!(!history_fill_command_is_valid(" \r\n\t "));
+    assert!(!history_fill_command_is_valid("echo first\necho second"));
+    assert!(!history_fill_command_is_valid("echo first\recho second"));
+}
+
+/// 历史填入完成后只有原 pane、原代次及已确认回执能触发焦点返回。
+///
+/// @author kongweiguang
+#[test]
+fn history_fill_focus_ticket_rejects_stale_or_unconfirmed_target() {
+    let (binding, info, _) = ui_session(SessionTarget::Local(LocalSessionTarget {
+        program: OsString::from("sh"),
+        args: Vec::new(),
+        working_directory: None,
+        environment: BTreeMap::new(),
+    }));
+    let target = LogsTarget::from_ui_session(binding.clone(), &info, None)
+        .expect("matching UI binding creates a Logs target");
+    let event = LogsTerminalFillCompleted {
+        binding: binding.clone(),
+        expected_focus: None,
+        generation: 11,
+    };
+
+    assert!(history_fill_completion_matches(
+        true,
+        11,
+        Some(&target),
+        false,
+        false,
+        &event
+    ));
+    assert!(!history_fill_completion_matches(
+        false,
+        11,
+        Some(&target),
+        false,
+        false,
+        &event
+    ));
+    assert!(!history_fill_completion_matches(
+        true,
+        12,
+        Some(&target),
+        false,
+        false,
+        &event
+    ));
+    assert!(!history_fill_completion_matches(
+        true,
+        11,
+        Some(&target),
+        true,
+        false,
+        &event
+    ));
+    assert!(!history_fill_completion_matches(
+        true,
+        11,
+        Some(&target),
+        false,
+        true,
+        &event
+    ));
+    assert!(!history_fill_completion_matches(
+        true, 11, None, false, false, &event
+    ));
+
+    let mut replacement_binding = binding;
+    replacement_binding.session_generation += 1;
+    let replacement_target = LogsTarget::from_ui_session(replacement_binding, &info, None)
+        .expect("changed generation remains a valid new target");
+    assert!(!history_fill_completion_matches(
+        true,
+        11,
+        Some(&replacement_target),
+        false,
+        false,
+        &event
+    ));
+}
+
+/// 新列表交互只移除已确认反馈；错误和需要用户核对的未知结果不能被刷新或筛选吞掉。
+///
+/// @author kongweiguang
+#[test]
+fn history_list_interaction_keeps_unresolved_fill_feedback() {
+    let (binding, info, _) = ui_session(SessionTarget::Local(LocalSessionTarget {
+        program: OsString::from("sh"),
+        args: Vec::new(),
+        working_directory: None,
+        environment: BTreeMap::new(),
+    }));
+    let target = LogsTarget::from_ui_session(binding, &info, None)
+        .expect("matching UI binding creates a Logs target");
+    let mut feedback = HistoryFillFeedback::default();
+    let generation = feedback.begin_interaction();
+    assert!(feedback.confirm(generation, "filled".to_owned()));
+
+    feedback.begin_interaction();
+    assert_eq!(feedback.status, None);
+
+    feedback.fail("write failed".to_owned());
+    feedback.begin_interaction();
+    assert_eq!(
+        feedback.status,
+        Some(HistoryFillStatus::Problem("write failed".to_owned()))
+    );
+
+    feedback.outcome_unknown(target.clone());
+    feedback.begin_interaction();
+    assert_eq!(feedback.unknown_target, Some(target));
+    assert_eq!(feedback.status, None);
+}
+
+/// 用户在回执到达前操作列表时，旧成功不得复现或抢焦点，但迟到的失败和未知仍须可见。
+///
+/// @author kongweiguang
+#[test]
+fn history_list_interaction_rejects_stale_success_and_keeps_late_failures() {
+    let (binding, info, _) = ui_session(SessionTarget::Local(LocalSessionTarget {
+        program: OsString::from("sh"),
+        args: Vec::new(),
+        working_directory: None,
+        environment: BTreeMap::new(),
+    }));
+    let target = LogsTarget::from_ui_session(binding.clone(), &info, None)
+        .expect("matching UI binding creates a Logs target");
+    let mut feedback = HistoryFillFeedback::default();
+    let pending = feedback.begin_interaction();
+    let event = LogsTerminalFillCompleted {
+        binding,
+        expected_focus: None,
+        generation: pending,
+    };
+    feedback.begin_interaction();
+
+    assert!(!feedback.confirm(pending, "filled".to_owned()));
+    assert_eq!(feedback.status, None);
+    assert!(!history_fill_completion_matches(
+        true,
+        feedback.generation,
+        Some(&target),
+        false,
+        false,
+        &event
+    ));
+    feedback.fail("late failure".to_owned());
+    assert_eq!(
+        feedback.status,
+        Some(HistoryFillStatus::Problem("late failure".to_owned()))
+    );
+    feedback.outcome_unknown(target.clone());
+    assert_eq!(feedback.unknown_target, Some(target));
 }

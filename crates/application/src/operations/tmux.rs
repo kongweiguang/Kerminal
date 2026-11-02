@@ -23,9 +23,9 @@ use crate::{
     AppError, AppResult,
     connections::{
         ConnectionIntent, LeasedSessionTransportControl, RemoteConnectionLease,
-        RemoteConnectionService, TerminalOpenRequest,
+        RemoteConnectionService, TerminalOpenRequest, management::HostManagementService,
     },
-    preferences::{ProfileRepository, VersionedProfile},
+    preferences::ProfileRepository,
     sessions::{
         CreateSessionRequest, SessionOpenCleanupOwner, SessionService, SessionTransport,
         SessionTransportFactory, SessionTransportOpenError,
@@ -66,6 +66,7 @@ pub struct TmuxService {
     sessions: Arc<dyn SessionService>,
     connections: Arc<dyn RemoteConnectionService>,
     profiles: Arc<dyn ProfileRepository>,
+    local_hosts: Option<HostManagementService>,
 }
 
 /// 单次 SSH attach 的 transport factory；SessionService 先持有容量和清理所有权再调用它。
@@ -177,7 +178,9 @@ async fn close_failed_tmux_lease(
 }
 
 impl TmuxService {
-    /// 注入命令、连接、profile 与 session ports，禁止此模块另建配置或终端 registry。
+    /// 注入共用用例端口，测试环境可独立装配本地主机服务。
+    ///
+    /// @author kongweiguang
     pub fn new(
         commands: Arc<dyn OperationsCommandExecutor>,
         sessions: Arc<dyn SessionService>,
@@ -189,7 +192,16 @@ impl TmuxService {
             sessions,
             connections,
             profiles,
+            local_hosts: None,
         }
+    }
+
+    /// 显式本地主机必须经同一 host 目录与 vault 解析，不能回退到同名模板。
+    ///
+    /// @author kongweiguang
+    pub fn with_local_host_service(mut self, local_hosts: HostManagementService) -> Self {
+        self.local_hosts = Some(local_hosts);
+        self
     }
 
     /// 以固定 C locale 探测版本；命令不存在作为不可用能力返回，其它连接错误仍传播。
@@ -501,7 +513,9 @@ impl TmuxService {
         })
     }
 
-    /// 生成 attach 执行规格；profile 只解析本地启动上下文，不创建 UI pane 或 session。
+    /// 生成 attach 规格时沿用目标本地主机的目录，不创建 UI pane 或 session。
+    ///
+    /// @author kongweiguang
     pub async fn attach_plan(
         &self,
         target: TmuxTarget,
@@ -524,9 +538,16 @@ impl TmuxService {
         {
             return Err(AppError::invalid("tmux 工作目录无效"));
         }
-        let profile = self.resolve_local_profile(&target, &cancel).await?;
-        let working_directory =
-            working_directory.or_else(|| profile.and_then(|profile| profile.profile.cwd));
+        let context = self.resolve_local_context(&target, &cancel).await?;
+        let resolved_directory = context
+            .and_then(|context| context.working_directory)
+            .map(|path| {
+                path.into_os_string()
+                    .into_string()
+                    .map_err(|_| AppError::invalid("tmux 工作目录无法转换为文本"))
+            })
+            .transpose()?;
+        let working_directory = working_directory.or(resolved_directory);
         let (program, mut arguments) = target_program_and_scope(&target);
         arguments.extend([
             "attach-session".to_owned(),
@@ -543,7 +564,9 @@ impl TmuxService {
         })
     }
 
-    /// 建立 tmux attach 终端；本地 profile 仅提供 cwd/env，SSH 目标始终使用远端自身配置。
+    /// 本地 attach 使用明确主机的目录和环境，SSH 目标不借用本地配置。
+    ///
+    /// @author kongweiguang
     pub async fn attach_session(
         &self,
         target: TmuxTarget,
@@ -556,7 +579,7 @@ impl TmuxService {
             .validate()
             .map_err(|_| AppError::invalid("tmux 目标无效"))?;
         validate_session_reference(&session_id)?;
-        let profile = self.resolve_local_profile(&target, &cancel).await?;
+        let context = self.resolve_local_context(&target, &cancel).await?;
         let (program, mut arguments) = target_program_and_scope(&target);
         arguments.extend(["attach-session".to_owned(), "-t".to_owned(), session_id]);
         if let Some(host_id) = target.host_id.as_ref() {
@@ -589,19 +612,11 @@ impl TmuxService {
                         target: SessionTarget::Local(LocalSessionTarget {
                             program: program.into(),
                             args: arguments.into_iter().map(Into::into).collect(),
-                            working_directory: profile
+                            working_directory: context
                                 .as_ref()
-                                .and_then(|profile| profile.profile.cwd.as_deref())
-                                .map(PathBuf::from),
-                            environment: profile
-                                .map(|profile| {
-                                    profile
-                                        .profile
-                                        .env
-                                        .into_iter()
-                                        .map(|(key, value)| (key.into(), value.into()))
-                                        .collect()
-                                })
+                                .and_then(|context| context.working_directory.clone()),
+                            environment: context
+                                .map(|context| context.environment)
                                 .unwrap_or_default(),
                         }),
                         owner,
@@ -614,31 +629,52 @@ impl TmuxService {
         }
     }
 
-    /// 按显式 profile ID 读取本地启动上下文；取消和缺失配置都必须硬失败，不猜默认项。
-    async fn resolve_local_profile(
+    /// 显式本地主机按 host ID 解析，未指定时只使用唯一默认模板；取消和缺失均保留错误。
+    ///
+    /// @author kongweiguang
+    async fn resolve_local_context(
         &self,
         target: &TmuxTarget,
         cancel: &CancellationToken,
-    ) -> AppResult<Option<VersionedProfile>> {
-        let Some(profile_id) = target.profile_id.as_deref() else {
-            return Ok(None);
-        };
+    ) -> AppResult<Option<LocalSessionTarget>> {
         if target.host_id.is_some() {
-            return Err(AppError::invalid("SSH tmux 目标不能引用本地 profile"));
+            return Ok(None);
         }
         if cancel.is_cancelled() {
-            return Err(AppError::cancelled("tmux profile 读取已取消"));
+            return Err(AppError::cancelled("tmux 本地目标读取已取消"));
         }
-        let profile = tokio::select! {
-            _ = cancel.cancelled() => return Err(AppError::cancelled("tmux profile 读取已取消")),
-            result = self.profiles.get_profile(profile_id) => result?,
+        if let Some(local_host_id) = target.profile_id.as_deref() {
+            let host_id = kerminal_domain::identity::HostId::parse(local_host_id)
+                .map_err(|_| AppError::invalid("tmux 本地主机标识无效"))?;
+            let hosts = self
+                .local_hosts
+                .as_ref()
+                .ok_or_else(|| AppError::unsupported("tmux 本地主机服务不可用"))?;
+            return hosts
+                .local_session_target(&host_id, cancel)
+                .await?
+                .map(Some)
+                .ok_or_else(|| AppError::not_found("tmux 指定的本地主机不存在"));
+        }
+        let profiles = tokio::select! {
+            _ = cancel.cancelled() => return Err(AppError::cancelled("tmux 本地目标读取已取消")),
+            result = self.profiles.list_profiles() => result?,
         };
-        if cancel.is_cancelled() {
-            return Err(AppError::cancelled("tmux profile 读取已取消"));
+        let mut defaults = profiles.into_iter().filter(|profile| profile.is_default);
+        match (defaults.next(), defaults.next()) {
+            (Some(_), Some(_)) => Err(AppError::conflict("多个本地 Profile 被标记为默认")),
+            (Some(profile), None) => Ok(Some(LocalSessionTarget {
+                program: profile.shell.into(),
+                args: profile.args.into_iter().map(Into::into).collect(),
+                working_directory: profile.cwd.map(PathBuf::from),
+                environment: profile
+                    .env
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+            })),
+            (None, _) => Ok(None),
         }
-        profile
-            .map(Some)
-            .ok_or_else(|| AppError::not_found("tmux 指定的本地 profile 不存在"))
     }
 
     /// 为查询执行程序并注入固定 locale，避免输出解析受用户系统语言影响。
@@ -652,7 +688,9 @@ impl TmuxService {
             .await
     }
 
-    /// 为普通命令与 pane 捕获复用相同 target/locale/timeout，仅允许调用方降低/放大有界输出。
+    /// 本地查询和 attach 共享目标环境，SSH 查询保持远程身份并使用固定输出语言。
+    ///
+    /// @author kongweiguang
     async fn execute_with_limit(
         &self,
         target: &TmuxTarget,
@@ -663,6 +701,25 @@ impl TmuxService {
         let (program, mut scoped) = target_program_and_scope(target);
         scoped.extend(arguments);
         let mut invocation = CommandInvocation::new(program, scoped);
+        if let Some(context) = self.resolve_local_context(target, &cancel).await? {
+            invocation.working_directory = context
+                .working_directory
+                .map(|path| {
+                    path.into_os_string()
+                        .into_string()
+                        .map_err(|_| AppError::invalid("tmux 工作目录无法转换为文本"))
+                })
+                .transpose()?;
+            for (key, value) in context.environment {
+                let key = key
+                    .into_string()
+                    .map_err(|_| AppError::invalid("tmux 环境变量名无法转换为文本"))?;
+                let value = value
+                    .into_string()
+                    .map_err(|_| AppError::invalid("tmux 环境变量值无法转换为文本"))?;
+                invocation.environment.insert(key, value);
+            }
+        }
         invocation
             .environment
             .insert("LC_ALL".to_owned(), "C".to_owned());

@@ -94,3 +94,48 @@ fn cursor_style_source_ignores_osc_payload_and_invalid_parameters() {
             .style_from_terminal
     );
 }
+
+/// 分块的 DEC 模式 12 与 DECSCUSR 均应更新闪烁来源，复位后回到用户默认行为。
+///
+/// @author kongweiguang
+#[test]
+fn cursor_blink_source_tracks_protocol_overrides_and_reset() {
+    let mut engine = engine();
+    let snapshot = |engine: &mut TerminalEngine| {
+        engine
+            .render_snapshot(RenderSnapshotRequest::default())
+            .cursor
+    };
+    assert!(!snapshot(&mut engine).blink_from_terminal);
+
+    engine.process_output(b"\x1b[?1;1");
+    assert!(!snapshot(&mut engine).blink_from_terminal);
+    engine.process_output(b"2h");
+    let cursor = snapshot(&mut engine);
+    assert!(cursor.blink_from_terminal);
+    assert!(cursor.blinking);
+    assert!(!cursor.style_from_terminal);
+
+    engine.process_output(b"\x1b[?12l");
+    let cursor = snapshot(&mut engine);
+    assert!(cursor.blink_from_terminal);
+    assert!(!cursor.blinking);
+
+    engine.process_output(b"\x1b[5 q");
+    let cursor = snapshot(&mut engine);
+    assert!(cursor.style_from_terminal);
+    assert!(cursor.blink_from_terminal);
+    assert!(cursor.blinking);
+
+    engine.process_output(b"\x1b[0 q");
+    let cursor = snapshot(&mut engine);
+    assert!(!cursor.style_from_terminal);
+    assert!(!cursor.blink_from_terminal);
+
+    engine.process_output(b"\x1b]0;\x1b[?12h\x07");
+    assert!(!snapshot(&mut engine).blink_from_terminal);
+    engine.process_output(b"\x1b[?12h\x1b[!p");
+    assert!(!snapshot(&mut engine).blink_from_terminal);
+    engine.process_output(b"\x1b[?12h\x1bc");
+    assert!(!snapshot(&mut engine).blink_from_terminal);
+}

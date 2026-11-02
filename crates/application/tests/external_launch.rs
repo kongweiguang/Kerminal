@@ -153,7 +153,9 @@ fn activation(arguments: &[&str]) -> ExternalActivation {
     }
 }
 
-/// Kerminal SSH URL 应生成临时目标，并仅将保存匹配用于 Known 展示分类。
+/// Kerminal SSH URL 保持临时目标隔离；默认 agent 目标可由用户选择密码重试。
+///
+/// @author kongweiguang
 #[tokio::test]
 async fn kerminal_ssh_url_routes_as_typed_known_target() {
     let saved_host = HostId::parse("saved:one").expect("valid host id");
@@ -173,6 +175,7 @@ async fn kerminal_ssh_url_routes_as_typed_known_target() {
     assert_eq!(target.identity.protocol, RemoteProtocol::Ssh);
     assert_eq!(target.identity.endpoint.host, "example.com");
     assert_eq!(target.identity.endpoint.username, "alice");
+    assert!(target.password_retry_available);
     assert_eq!(
         target.classification,
         ExternalTargetClassification::Known {
@@ -185,6 +188,282 @@ async fn kerminal_ssh_url_routes_as_typed_known_target() {
         state.registered[0].authentication,
         ExternalAuthenticationHint::Agent
     );
+}
+
+/// 真实入口始终以 Kerminal 为 argv0；参数签名仍须经过各客户端来源开关。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn actual_kerminal_executable_routes_vendor_examples_and_enforces_each_source() {
+    let cases: &[(ExternalLaunchToolSetting, &[&str])] = &[
+        (
+            ExternalLaunchToolSetting::Putty,
+            &["kerminal.exe", "-ssh", "alice@host.example", "-P", "2222"],
+        ),
+        (
+            ExternalLaunchToolSetting::Mobaxterm,
+            &["kerminal.exe", "-newtab", "ssh -p 2222 alice@host.example"],
+        ),
+        (
+            ExternalLaunchToolSetting::Xshell,
+            &["kerminal.exe", "-url", "ssh://alice@host.example:2222"],
+        ),
+        (
+            ExternalLaunchToolSetting::Securecrt,
+            &[
+                "kerminal.exe",
+                "/SSH2",
+                "/L",
+                "alice",
+                "/P",
+                "2222",
+                "host.example",
+            ],
+        ),
+        (
+            ExternalLaunchToolSetting::Openssh,
+            &["kerminal.exe", "-p", "2222", "-l", "alice", "host.example"],
+        ),
+        (
+            ExternalLaunchToolSetting::SftpClient,
+            &["kerminal.exe", "sftp://alice@host.example:2222/path/"],
+        ),
+        (
+            ExternalLaunchToolSetting::KerminalNative,
+            &[
+                "kerminal.exe",
+                "--external-ssh",
+                "--host",
+                "host.example",
+                "--port",
+                "2222",
+                "--user",
+                "alice",
+            ],
+        ),
+        (
+            ExternalLaunchToolSetting::KerminalNative,
+            &[
+                "kerminal.exe",
+                "--host",
+                "host.example",
+                "--port",
+                "2222",
+                "--user",
+                "alice",
+            ],
+        ),
+    ];
+
+    for (tool, arguments) in cases {
+        let (service, _) = service(None);
+        let outcome = service
+            .handle_activation(activation(arguments))
+            .await
+            .expect("documented external arguments should route");
+        let target = match outcome {
+            ExternalLaunchOutcome::Ready { target }
+            | ExternalLaunchOutcome::PasswordRequired { target } => target,
+            other => panic!("explicit username must route: {other:?}"),
+        };
+        assert_eq!(target.identity.endpoint.host, "host.example");
+        assert_eq!(target.identity.endpoint.port, 2222);
+        assert_eq!(target.identity.endpoint.username, "alice");
+
+        let (disabled, registry) = service_with_settings(
+            None,
+            ExternalLaunchSettings {
+                disabled_tools: vec![*tool],
+                ..ExternalLaunchSettings::default()
+            },
+        );
+        let error = disabled
+            .handle_activation(activation(arguments))
+            .await
+            .expect_err("disabled source must reject the corresponding signature");
+        assert_eq!(error.public_message(), "此外部客户端已在设置中禁用");
+        assert!(
+            registry
+                .state
+                .lock()
+                .expect("test mutex poisoned")
+                .registered
+                .is_empty()
+        );
+    }
+}
+
+/// OpenSSH 的无选项目标仍需要来源策略保护，不能被当作普通应用启动忽略。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn bare_openssh_destination_uses_the_openssh_source_policy() {
+    let (launch, _) = service(None);
+    let outcome = launch
+        .handle_activation(activation(&["kerminal.exe", "alice@host.example"]))
+        .await
+        .expect("bare OpenSSH destination routes");
+    assert!(matches!(outcome, ExternalLaunchOutcome::Ready { .. }));
+    let (disabled, registry) = service_with_settings(
+        None,
+        ExternalLaunchSettings {
+            disabled_tools: vec![ExternalLaunchToolSetting::Openssh],
+            ..ExternalLaunchSettings::default()
+        },
+    );
+    assert!(
+        disabled
+            .handle_activation(activation(&["kerminal.exe", "alice@host.example"]))
+            .await
+            .is_err()
+    );
+    assert!(
+        registry
+            .state
+            .lock()
+            .expect("test mutex poisoned")
+            .registered
+            .is_empty()
+    );
+}
+
+/// 原生 flags 和 JSON 必须消费完整参数，且 JSON 不得携带未声明的敏感字段。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn native_flags_and_restricted_json_preserve_validated_identity() {
+    for arguments in [
+        vec![
+            "kerminal.exe",
+            "--external-ssh",
+            "--host",
+            "host.example",
+            "--port",
+            "2222",
+            "--user",
+            "alice",
+        ],
+        vec![
+            "kerminal.exe",
+            "--external-ssh-json",
+            r#"{"host":"host.example","port":2222,"username":"alice"}"#,
+        ],
+        vec![
+            "kerminal.exe",
+            r#"--external-ssh-json={"host":"host.example","port":2222,"user":"alice"}"#,
+        ],
+    ] {
+        let (service, _) = service(None);
+        let outcome = service
+            .handle_activation(activation(&arguments))
+            .await
+            .expect("safe native arguments route");
+        let ExternalLaunchOutcome::Ready { target } = outcome else {
+            panic!("explicit native username should route");
+        };
+        assert_eq!(target.identity.endpoint.host, "host.example");
+        assert_eq!(target.identity.endpoint.port, 2222);
+        assert_eq!(target.identity.endpoint.username, "alice");
+        assert!(matches!(
+            target.intent,
+            ExternalLaunchIntent::SshTerminal { .. }
+        ));
+    }
+
+    for json in [
+        r#"{"host":"host.example","username":"alice","password":"secret-value"}"#,
+        r#"{"host":"host.example","username":"alice","passphrase":"secret-value"}"#,
+        r#"{"host":"host.example","username":"alice","privateKey":"secret-value"}"#,
+        r#"{"host":"host.example","username":"alice","future":true}"#,
+        r#"{"host":"host.example","user":"alice","username":"bob"}"#,
+        r#"{"host":"host.example","port":0,"user":"alice"}"#,
+    ] {
+        let (service, registry) = service(None);
+        let error = service
+            .handle_activation(activation(&["kerminal.exe", "--external-ssh-json", json]))
+            .await
+            .expect_err("invalid or secret-bearing JSON must fail closed");
+        assert!(!format!("{error:?}").contains("secret-value"));
+        assert!(
+            registry
+                .state
+                .lock()
+                .expect("test mutex poisoned")
+                .registered
+                .is_empty()
+        );
+    }
+}
+
+/// URL 的附加 SFTP 意图跨用户名补齐保留，SSH 仍为主连接动作。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn explicit_open_sftp_preserves_ssh_intent_after_username_prompt() {
+    let (service, _) = service(None);
+    let outcome = service
+        .handle_activation(activation(&[
+            "kerminal.exe",
+            "kerminal://ssh?host=host.example&openSftp=true",
+        ]))
+        .await
+        .expect("missing username is handled interactively");
+    let ExternalLaunchOutcome::UsernameRequired { request } = outcome else {
+        panic!("username must be requested before creating a target");
+    };
+    let outcome = service
+        .supply_username(request, "alice".to_owned())
+        .await
+        .expect("username resumes the original request");
+    let ExternalLaunchOutcome::Ready { target } = outcome else {
+        panic!("explicit username should route");
+    };
+    assert_eq!(target.identity.protocol, RemoteProtocol::Ssh);
+    assert!(matches!(
+        target.intent,
+        ExternalLaunchIntent::SshTerminal { .. }
+    ));
+    assert!(target.open_sftp_after_connect);
+}
+
+/// 不允许把 SSH 地址和 SFTP 主意图混用，避免创建必然无法路由的目标。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn native_ssh_rejects_sftp_path_and_mixed_url_arguments() {
+    for arguments in [
+        vec![
+            "kerminal.exe",
+            "--external-ssh",
+            "--host",
+            "host.example",
+            "--user",
+            "alice",
+            "--remote-path",
+            "/home",
+        ],
+        vec![
+            "kerminal.exe",
+            "kerminal://ssh?host=host.example&user=alice",
+            "--other",
+        ],
+    ] {
+        let (service, registry) = service(None);
+        assert!(
+            service
+                .handle_activation(activation(&arguments))
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .state
+                .lock()
+                .expect("test mutex poisoned")
+                .registered
+                .is_empty()
+        );
+    }
 }
 
 /// URI query allowlist拒绝密码或未知字段，且拒绝结果之前不会注册连接目标。
@@ -212,7 +491,9 @@ async fn kerminal_url_rejects_credentials_and_unknown_parameters() {
     }
 }
 
-/// OpenSSH 连接参数保留远程命令 argv 和有序跳板，不把命令拼接成 shell 字符串。
+/// OpenSSH 保留命令和跳板边界；多跳认证失败不能误导为最终目标可密码重试。
+///
+/// @author kongweiguang
 #[tokio::test]
 async fn openssh_preserves_remote_command_arguments_and_jump_chain() {
     let (service, _) = service(None);
@@ -236,6 +517,7 @@ async fn openssh_preserves_remote_command_arguments_and_jump_chain() {
     };
     assert_eq!(target.identity.endpoint.port, 2200);
     assert_eq!(target.identity.jump_hosts.len(), 1);
+    assert!(!target.password_retry_available);
     assert_eq!(target.identity.jump_hosts[0].host, "relay.example");
     assert_eq!(target.identity.jump_hosts[0].port, 2222);
     assert_eq!(target.identity.jump_hosts[0].username, "gate");
@@ -336,7 +618,9 @@ async fn sftp_url_rejects_password_userinfo() {
     );
 }
 
-/// PuTTY 安全直连字段保留 Windows 私钥路径，但口令开关不能跨进程边界传入。
+/// PuTTY 的显式私钥目标不允许被密码重试替换；秘密参数不能跨进程边界传入。
+///
+/// @author kongweiguang
 #[tokio::test]
 async fn putty_accepts_key_path_and_rejects_inline_password() {
     let (launch_service, registry) = service(None);
@@ -358,6 +642,7 @@ async fn putty_accepts_key_path_and_rejects_inline_password() {
         panic!("explicit username should avoid prompt");
     };
     assert_eq!(target.identity.endpoint.port, 2222);
+    assert!(!target.password_retry_available);
     assert_eq!(
         registry
             .state
@@ -474,6 +759,54 @@ async fn vendor_argument_and_per_tool_policies_are_applied() {
             .registered
             .is_empty()
     );
+}
+
+/// PuTTY 密码参数在拒绝秘密前先命中来源策略，不能因小写前缀被当成 OpenSSH。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn putty_secret_arguments_still_use_putty_source_policy() {
+    for arguments in [
+        vec!["kerminal.exe", "-pw", "secret-value", "host.example"],
+        vec!["kerminal.exe", "-pwfile", "secret-path", "host.example"],
+        vec!["kerminal.exe", "-pwsecret-value", "host.example"],
+    ] {
+        let (disabled, registry) = service_with_settings(
+            None,
+            ExternalLaunchSettings {
+                disabled_tools: vec![ExternalLaunchToolSetting::Putty],
+                ..ExternalLaunchSettings::default()
+            },
+        );
+        let error = disabled
+            .handle_activation(activation(&arguments))
+            .await
+            .expect_err("disabled PuTTY source must be checked first");
+        assert_eq!(error.public_message(), "此外部客户端已在设置中禁用");
+        assert!(
+            registry
+                .state
+                .lock()
+                .expect("test mutex poisoned")
+                .registered
+                .is_empty()
+        );
+
+        let (enabled, registry) = service(None);
+        let error = enabled
+            .handle_activation(activation(&arguments))
+            .await
+            .expect_err("password arguments must be rejected");
+        assert!(!format!("{error:?}").contains("secret-value"));
+        assert!(
+            registry
+                .state
+                .lock()
+                .expect("test mutex poisoned")
+                .registered
+                .is_empty()
+        );
+    }
 }
 
 /// 在精确保存目标查询期间收到禁用偏好时，恢复后仍须重新检查并阻止临时目标创建。

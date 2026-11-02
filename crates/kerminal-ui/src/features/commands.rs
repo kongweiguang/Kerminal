@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, FocusHandle, SharedString, Subscription,
@@ -68,6 +68,7 @@ mod workflow_editor;
 
 use send_state::{SendOperationKind, SendOperationState, SendOperationToken};
 
+pub(crate) use logs::LogsTerminalFillCompleted;
 #[cfg(feature = "right-rail-acceptance")]
 pub use logs::right_rail_acceptance::{
     RightRailAcceptanceLogsEntry, RightRailAcceptanceLogsSnapshot,
@@ -510,6 +511,10 @@ pub struct CommandsView {
     pub(super) snippet_page_generation: u64,
     pub(super) snippet_query_generation: u64,
     pub(super) snippet_page_cancellation: Option<CancellationToken>,
+    /// 收藏写入独立于目录查询的代次；同一来源和 ID 同时只允许一次写入。
+    pub(super) snippet_favorite_pending: HashSet<SnippetPreferenceKey>,
+    /// 多条收藏可并发失败；保留各自反馈，重试一条时不抹掉其他条目的错误。
+    snippet_favorite_errors: Vec<(SnippetPreferenceKey, String)>,
     /// 列表原位预览只保存精确目录键和加载反馈，片段定义仍由 selected_snippet 唯一持有。
     snippet_inline_preview: snippet_browser::SnippetInlinePreview,
     /// 只保留最近一次显式复制请求，避免较慢的旧结果覆盖用户后续剪贴板选择。
@@ -763,6 +768,8 @@ impl CommandsView {
             snippet_page_generation: 0,
             snippet_query_generation: 0,
             snippet_page_cancellation: None,
+            snippet_favorite_pending: HashSet::new(),
+            snippet_favorite_errors: Vec::new(),
             snippet_inline_preview: snippet_browser::SnippetInlinePreview::Collapsed,
             snippet_copy_generation: 0,
             snippet_copy_cancellation: None,

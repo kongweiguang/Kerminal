@@ -24,6 +24,10 @@ pub struct SettingsAcceptanceState {
     terminal_palette_update_generation: u64,
     terminal_palette: kerminal_terminal::snapshot::TerminalPalette,
     rendered_terminal_palette: Option<kerminal_terminal::snapshot::TerminalPalette>,
+    terminal_color_scheme: kerminal_application::preferences::TerminalColorScheme,
+    terminal_font_family: String,
+    terminal_font_size: u16,
+    terminal_line_height_milli: u16,
     ready_local_session_ids: Vec<String>,
     workspace_ready: bool,
     snippets_tool_open: bool,
@@ -32,7 +36,7 @@ pub struct SettingsAcceptanceState {
     selected_interface_language: Option<&'static str>,
     language_select_focus: FocusHandle,
     draft_keyword_rule_count: Option<usize>,
-    expanded_disclosures: [bool; 5],
+    expanded_disclosures: [bool; 4],
     modal_return_focus: Option<FocusHandle>,
     keyword_editor_open: bool,
     keyword_editor_is_new: bool,
@@ -40,6 +44,8 @@ pub struct SettingsAcceptanceState {
     keyword_editor_pattern: Option<String>,
     keyword_editor_note: Option<String>,
     keyword_save_pending: bool,
+    shortcut_capture:
+        Option<crate::features::preferences::settings_acceptance::ShortcutCaptureAcceptanceState>,
     protocol_settled: bool,
     sync_ready: bool,
     sync_busy: bool,
@@ -216,6 +222,34 @@ impl SettingsAcceptanceState {
         self.rendered_terminal_palette.as_ref()
     }
 
+    /// 暴露 Root 已应用的主题身份，持久化及终端快照仍须分别核对。
+    ///
+    /// @author kongweiguang
+    pub fn terminal_color_scheme(&self) -> kerminal_application::preferences::TerminalColorScheme {
+        self.terminal_color_scheme
+    }
+
+    /// 读取真实终端字体族，而非设置页下拉框的显示标签。
+    ///
+    /// @author kongweiguang
+    pub fn terminal_font_family(&self) -> &str {
+        &self.terminal_font_family
+    }
+
+    /// 返回实际终端字号，供数值控件与渲染投影交叉验收。
+    ///
+    /// @author kongweiguang
+    pub fn terminal_font_size(&self) -> u16 {
+        self.terminal_font_size
+    }
+
+    /// 比例以千分数表达，使原生验收比较行高时不依赖浮点的精确相等。
+    ///
+    /// @author kongweiguang
+    pub fn terminal_line_height_milli(&self) -> u16 {
+        self.terminal_line_height_milli
+    }
+
     /// 用现有 Ready 本地会话身份验证主题切换没有重建或替换终端。
     ///
     /// @author kongweiguang
@@ -257,8 +291,10 @@ impl SettingsAcceptanceState {
         &self.language_select_focus
     }
 
-    /// Returns expanded-state projections in terminal, SFTP, external, MCP, desktop order.
-    pub fn expanded_disclosures(&self) -> [bool; 5] {
+    /// 按 SFTP、外部启动、MCP、通知的固定顺序返回真实展开状态。
+    ///
+    /// @author kongweiguang
+    pub fn expanded_disclosures(&self) -> [bool; 4] {
         self.expanded_disclosures
     }
 
@@ -301,9 +337,99 @@ impl SettingsAcceptanceState {
     pub fn keyword_save_pending(&self) -> bool {
         self.keyword_save_pending
     }
+
+    /// 验收按动作身份区分当前录制会话，不将界面字符串当成绑定状态。
+    ///
+    /// @author kongweiguang
+    pub fn shortcut_capture_action(&self) -> Option<&str> {
+        self.shortcut_capture
+            .as_ref()
+            .map(|capture| capture.action.as_str())
+    }
+
+    /// 返回录制器捕获的真实组合键，以验证按键没有落入底层终端或窗口动作。
+    ///
+    /// @author kongweiguang
+    pub fn shortcut_capture_strokes(&self) -> Option<&[String]> {
+        self.shortcut_capture
+            .as_ref()
+            .map(|capture| capture.strokes.as_slice())
+    }
+
+    /// 区分等待按键与等待确认，避免向尚未完成焦点交接的控件发送输入。
+    ///
+    /// @author kongweiguang
+    pub fn shortcut_capture_recording(&self) -> bool {
+        self.shortcut_capture
+            .as_ref()
+            .is_some_and(|capture| capture.recording)
+    }
+
+    /// 按真实焦点身份等待拦截器可用，截图可见不等于键盘输入目标已切换。
+    ///
+    /// @author kongweiguang
+    pub fn shortcut_capture_focus(&self) -> Option<&FocusHandle> {
+        self.shortcut_capture.as_ref().map(|capture| &capture.focus)
+    }
+
+    /// 提供录制校验的可见错误，避免等待超时掩盖冲突或保留键原因。
+    ///
+    /// @author kongweiguang
+    pub fn shortcut_capture_error(&self) -> Option<&str> {
+        self.shortcut_capture
+            .as_ref()
+            .and_then(|capture| capture.error.as_deref())
+    }
 }
 
 impl RootView {
+    /// 只导出焦点身份用于比较窗口焦点，不改变 Root 的模态与焦点生命周期。
+    ///
+    /// @author kongweiguang
+    pub fn settings_acceptance_focus_identities(&self) -> [gpui_kit::ElementId; 3] {
+        [
+            gpui_kit::ElementId::from(&self.focus_handle),
+            gpui_kit::ElementId::from(&self.compact_drawer_focus_handle),
+            gpui_kit::ElementId::from(&self.preferences_modal_focus_handle),
+        ]
+    }
+
+    /// 使用实际主机表单的裁切区安排原生滚轮，避免将屏外控件误当作可点击。
+    ///
+    /// @author kongweiguang
+    pub fn settings_acceptance_local_editor_bounds(
+        &self,
+        cx: &Context<Self>,
+    ) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+        self.connections_panel
+            .as_ref()
+            .and_then(|panel| panel.read(cx).settings_acceptance_local_editor_bounds())
+    }
+
+    /// 默认模板名称仅用于确认侧栏目录已经处理了最新配置事件。
+    ///
+    /// @author kongweiguang
+    pub fn settings_acceptance_default_profile_name(&self, cx: &Context<Self>) -> Option<String> {
+        self.host_navigation
+            .as_ref()
+            .and_then(|navigation| navigation.read(cx).display_default_profile_name())
+            .map(|name| name.to_string())
+    }
+
+    /// 侧栏名称来自已加载的主机目录；模板本身不应因同名而被误判为主机。
+    ///
+    /// @author kongweiguang
+    pub fn settings_acceptance_local_host_name(
+        &self,
+        id: &str,
+        cx: &Context<Self>,
+    ) -> Option<String> {
+        self.host_navigation
+            .as_ref()
+            .and_then(|navigation| navigation.read(cx).display_profile_name_for(id))
+            .map(|name| name.to_string())
+    }
+
     /// 只读投影当前正文的实际裁切区域，验收仍使用真实滚轮而不写入滚动位置。
     pub fn settings_acceptance_content_bounds(
         &self,
@@ -365,6 +491,13 @@ impl RootView {
             terminal_palette_update_generation: self.palette_update_generation,
             terminal_palette: self.current_terminal_palette(),
             rendered_terminal_palette,
+            terminal_color_scheme: self.terminal_color_scheme,
+            terminal_font_family: self.terminal_metrics.font_family.to_string(),
+            terminal_font_size: self.terminal_metrics.font_size.round() as u16,
+            terminal_line_height_milli: ((self.terminal_metrics.line_height
+                / self.terminal_metrics.font_size)
+                * 1_000.)
+                .round() as u16,
             ready_local_session_ids: self.workbench_acceptance_local_state().2,
             workspace_ready: !self.workspace_load_pending && self.workspace_controller.is_some(),
             snippets_tool_open: self.right_rail_acceptance_active_tool()
@@ -384,6 +517,7 @@ impl RootView {
             keyword_save_pending: keyword_editor
                 .as_ref()
                 .is_some_and(|editor| editor.save_pending),
+            shortcut_capture: panel.settings_acceptance_shortcut_capture(),
         }
     }
 }

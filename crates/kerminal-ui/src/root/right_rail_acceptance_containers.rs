@@ -2,19 +2,375 @@
 //!
 //! @author kongweiguang
 
-use gpui_kit::{Context, Entity, Window};
-use kerminal_application::preferences::ToolRailToolId;
+use std::future::Future;
+
+use gpui_kit::{Bounds, Context, Entity, Pixels, Window};
+use kerminal_application::{
+    AppError,
+    preferences::ToolRailToolId,
+    workspace::{WorkspaceFileAccess, WorkspaceSessionTab, WorkspaceTargetRef},
+};
 use kerminal_domain::{
-    identity::HostId,
-    operations::{ContainerAction, ContainerStatus},
+    files::{FileEndpoint, RemotePath},
+    identity::{HostId, TabId},
+    operations::{ComposeProjectTarget, ContainerAction, ContainerStatus},
     sessions::{SessionTarget, SshInitialCommand},
 };
 
-use crate::features::operations::OperationsView;
+use crate::features::{operations::OperationsView, workspace_tabs::WorkspaceTabEvent};
 
 use crate::root::{RootView, RuntimePanePhase};
 
 impl RootView {
+    /// 向后台验收暴露目标绑定编辑器的真实绘制边界，既不改变内容也不发出额外文件请求。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_compose_editor_bounds(
+        &self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &Context<Self>,
+    ) -> Result<Option<(Bounds<Pixels>, Option<Bounds<Pixels>>)>, String> {
+        self.right_rail_acceptance_container_view(host)?
+            .read(cx)
+            .right_rail_acceptance_compose_editor_bounds(host, target, cx)
+    }
+
+    /// 将夹具项目的展示状态限定在当前容器视图，只提供读回，不代替生产点击触发导航。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_compose_presentation(
+        &self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &Context<Self>,
+    ) -> Result<Option<(bool, bool, bool, bool, bool)>, String> {
+        self.right_rail_acceptance_container_view(host)?
+            .read(cx)
+            .right_rail_acceptance_compose_presentation(host, target)
+    }
+
+    /// 读取前先核对真实列表中的唯一所有权标签，future 只捕获本轮固定端点而不暴露文件服务。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_read_compose_fixture(
+        &self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &Context<Self>,
+    ) -> Result<impl Future<Output = Result<String, String>> + Send + 'static + use<>, String> {
+        let endpoint = compose_fixture_endpoint(host, target)?;
+        let owned = self
+            .right_rail_acceptance_compose_owned_state(host, target, cx)?
+            .ok_or_else(|| "Compose fixture 列表尚未就绪".to_owned())?;
+        if !matches!(owned.as_slice(), [(_, ContainerStatus::Running)]) {
+            return Err("Compose fixture 缺少唯一运行中的归属容器".to_owned());
+        }
+        let files = self
+            .services
+            .files
+            .clone()
+            .ok_or_else(|| "文件服务不可用".to_owned())?;
+        let executor = self.services.executor.clone();
+        Ok(async move {
+            executor
+                .run(move |cancellation| async move {
+                    let document = files
+                        .read_text_file(cancellation, endpoint.clone(), 1024 * 1024)
+                        .await?;
+                    if document.endpoint != endpoint
+                        || document.truncated
+                        || document.content.trim().is_empty()
+                    {
+                        return Err(AppError::conflict(
+                            "Compose fixture 文件读取不完整或目标不一致",
+                        ));
+                    }
+                    Ok(document.content)
+                })
+                .await
+                .map_err(|error| error.public_message().to_owned())
+        })
+    }
+
+    /// 普通文件打开复用 Root 的生产订阅入口，并要求当前终端或文件上下文仍属于原项目。
+    ///
+    /// @author kongweiguang
+    pub fn open_right_rail_acceptance_compose_fixture_as_file(
+        &mut self,
+        host: &HostId,
+        terminal_tab_id: &TabId,
+        target: &ComposeProjectTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        let endpoint = compose_fixture_endpoint(host, target)?;
+        if !self.right_rail_acceptance_compose_fixture_context(host, terminal_tab_id, target, cx)?
+            || self.root_confirmation_owner.is_some()
+        {
+            return Ok(false);
+        }
+        self.open_file_endpoint_with_lease(endpoint, None, window, cx);
+        Ok(true)
+    }
+
+    /// Compose 入口保持 Operations 事件与 Root live gate，文件 Tab 活动时也核对其宿主和身份。
+    ///
+    /// @author kongweiguang
+    pub fn request_right_rail_acceptance_compose_fixture_config(
+        &mut self,
+        host: &HostId,
+        terminal_tab_id: &TabId,
+        target: &ComposeProjectTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        let endpoint = compose_fixture_endpoint(host, target)?;
+        if !self.right_rail_acceptance_compose_fixture_context(host, terminal_tab_id, target, cx)?
+            || self.root_confirmation_owner.is_some()
+        {
+            return Ok(false);
+        }
+        let operations = self
+            .right_rail_acceptance_operations_view(ToolRailToolId::Containers)
+            .ok_or_else(|| "容器 Operations 视图不可用".to_owned())?;
+        let Some(owned) = operations
+            .read(cx)
+            .right_rail_acceptance_compose_owned_state(host, target)?
+        else {
+            return Ok(false);
+        };
+        if !matches!(owned.as_slice(), [(_, ContainerStatus::Running)]) {
+            return Err("Compose fixture 缺少唯一运行中的归属容器".to_owned());
+        }
+        let FileEndpoint::Remote { path, .. } = endpoint else {
+            return Err("Compose fixture 端点不是 SSH 文件".to_owned());
+        };
+        operations.update(cx, |view, cx| {
+            view.right_rail_acceptance_request_compose_config(host, target, path.as_str(), cx)
+        })
+    }
+
+    /// 同时核对导航、运行态和编辑器的唯一身份、权限与真实正文，加载或脏稿不能冒充就绪。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_compose_fixture_file_ready(
+        &self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        expected: &str,
+        readonly: bool,
+        cx: &Context<Self>,
+    ) -> Result<Option<TabId>, String> {
+        let endpoint = compose_fixture_endpoint(host, target)?;
+        let Some(controller) = self.workspace_controller.as_ref() else {
+            return Ok(None);
+        };
+        let snapshot = controller.snapshot();
+        let matching = compose_fixture_tabs(snapshot.terminal_tabs.as_slice(), host, &endpoint);
+        if matching.len() > 1 {
+            return Err("同一 Compose 文件出现多个导航标签".to_owned());
+        }
+        let Some((tab_id, access)) = matching.first().copied() else {
+            return Ok(None);
+        };
+        let expected_access = if readonly {
+            WorkspaceFileAccess::Readonly
+        } else {
+            WorkspaceFileAccess::Editable
+        };
+        if *access != expected_access
+            || snapshot.active_tab_id.as_ref() != Some(tab_id)
+            || !matches!(self.center_panel, crate::root::CenterPanel::Editor)
+            || self.workspace_files.file_endpoint(tab_id).as_ref() != Some(&endpoint)
+            || !matches!(
+                self.workspace_files.restore_state(tab_id),
+                Some(crate::root::workspace_files::WorkspaceFileRestoreState::Ready)
+            )
+            || self.root_confirmation_owner.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(editor) = self.file_editor_workspace.as_ref() else {
+            return Err("文件编辑工作区不可用".to_owned());
+        };
+        let editor = editor.read(cx);
+        let projection = editor.workspace_projection();
+        let matches = projection
+            .tabs
+            .iter()
+            .filter(|tab| tab.endpoint == endpoint)
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            return Err("同一 Compose 文件出现多个编辑器缓冲".to_owned());
+        }
+        let Some(tab) = matches.first() else {
+            return Ok(None);
+        };
+        let ready = tab.active
+            && !tab.loading
+            && !tab.dirty
+            && tab.readonly == readonly
+            && if readonly {
+                editor.right_rail_acceptance_readonly_file_ready(&endpoint, expected, cx)
+            } else {
+                editor.right_rail_acceptance_file_ready(&endpoint, expected, cx)
+            };
+        Ok(ready.then(|| tab_id.clone()))
+    }
+
+    /// 就绪后仅派发一次生产关闭；处理器的 bool 只用于激活，完成必须另由双投影消失证明。
+    ///
+    /// @author kongweiguang
+    pub fn close_right_rail_acceptance_compose_fixture_file(
+        &mut self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        expected: &str,
+        readonly: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        let Some(tab_id) = self.right_rail_acceptance_compose_fixture_file_ready(
+            host, target, expected, readonly, cx,
+        )?
+        else {
+            return Ok(false);
+        };
+        self.handle_workspace_tab_event(&WorkspaceTabEvent::Close(tab_id), window, cx);
+        Ok(true)
+    }
+
+    /// 两个投影都移除精确端点才认定关闭完成，避免异步关闭留下重复导航或缓冲。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_compose_fixture_file_closed(
+        &self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &Context<Self>,
+    ) -> Result<bool, String> {
+        let endpoint = compose_fixture_endpoint(host, target)?;
+        let Some(controller) = self.workspace_controller.as_ref() else {
+            return Ok(false);
+        };
+        let nav_empty =
+            compose_fixture_tabs(&controller.snapshot().terminal_tabs, host, &endpoint).is_empty();
+        let editor_empty = self.file_editor_workspace.as_ref().is_some_and(|editor| {
+            !editor
+                .read(cx)
+                .workspace_projection()
+                .tabs
+                .iter()
+                .any(|tab| tab.endpoint == endpoint)
+        });
+        Ok(nav_empty && editor_empty)
+    }
+
+    /// 活动终端与文件投影分别验证真实上下文，避免借后台终端向其他主机发送项目请求。
+    ///
+    /// @author kongweiguang
+    fn right_rail_acceptance_compose_fixture_context(
+        &self,
+        host: &HostId,
+        terminal_tab_id: &TabId,
+        target: &ComposeProjectTarget,
+        cx: &Context<Self>,
+    ) -> Result<bool, String> {
+        let endpoint = compose_fixture_endpoint(host, target)?;
+        let Some(active) = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.snapshot().active_tab_id.as_ref())
+        else {
+            return Ok(false);
+        };
+        if active == terminal_tab_id {
+            return self.right_rail_acceptance_compose_terminal_context_ready(
+                host,
+                terminal_tab_id,
+                target,
+                cx,
+            );
+        }
+        if self.workspace_files.file_endpoint(active).as_ref() != Some(&endpoint) {
+            return Err("活动标签不是本轮 Compose fixture 文件或终端".to_owned());
+        }
+        self.right_rail_acceptance_compose_context_ready(host, active, target, cx)
+    }
+
+    /// Compose 验收只读取当前 fixture 宿主中的完整项目快照，不跨宿主寻找同名容器。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_compose_owned_state(
+        &self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &Context<Self>,
+    ) -> Result<Option<Vec<(String, ContainerStatus)>>, String> {
+        self.right_rail_acceptance_container_view(host)?
+            .read(cx)
+            .right_rail_acceptance_compose_owned_state(host, target)
+    }
+
+    /// 拆除后的项目仍通过原宿主视图选择已知目标，禁止切换到其他同名项目。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_select_owned_compose(
+        &mut self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        self.right_rail_acceptance_container_view(host)?
+            .update(cx, |view, cx| {
+                view.right_rail_acceptance_select_owned_compose(host, target, cx)
+            })
+    }
+
+    /// 实际根确认必须仍对应原宿主和完整项目，不能把其他模态当成拆除确认。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_compose_down_confirmation_ready(
+        &self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &Context<Self>,
+    ) -> Result<bool, String> {
+        self.right_rail_acceptance_container_view(host)?
+            .read(cx)
+            .right_rail_acceptance_compose_down_confirmation_ready(host, target)
+    }
+
+    /// 取消仅调用生产模态的关闭路径，后续状态必须由原宿主列表回读证明。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_cancel_compose_down(
+        &mut self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.right_rail_acceptance_container_view(host)?
+            .update(cx, |view, cx| {
+                view.right_rail_acceptance_cancel_compose_down(host, target, cx)
+            })
+    }
+
+    /// 提交通过 Operations 生产事件和 Root live gate，不直接调用 Compose 服务。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_confirm_compose_down(
+        &mut self,
+        host: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.right_rail_acceptance_container_view(host)?
+            .update(cx, |view, cx| {
+                view.right_rail_acceptance_confirm_compose_down(host, target, cx)
+            })
+    }
+
     /// 日志必须来自当前可写日志 PTY 的实际网格；同宿主普通 shell 和旧快照都不能满足回读。
     pub fn right_rail_acceptance_container_logs_text(
         &self,
@@ -185,4 +541,61 @@ impl RootView {
             .read(cx)
             .right_rail_acceptance_container_started_at(host, id)
     }
+}
+
+/// 只构造当前命名空间下的唯一 Compose 文件，所有参数必须指向同一宿主和运行 ID。
+///
+/// @author kongweiguang
+fn compose_fixture_endpoint(
+    host: &HostId,
+    target: &ComposeProjectTarget,
+) -> Result<FileEndpoint, String> {
+    let run_id = target
+        .project
+        .strip_prefix("kerminal-rr-compose-")
+        .filter(|id| {
+            id.len() == 12
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| "Compose fixture 项目缺少有效运行 ID".to_owned())?;
+    let root = format!("/run/kerminal-right-rail-{run_id}");
+    let file = format!("{root}/compose.yml");
+    if target.host_id.as_ref() != Some(host)
+        || target.working_dir != root
+        || target.config_files.len() != 1
+        || target.config_files.first().map(String::as_str) != Some(file.as_str())
+    {
+        return Err("Compose fixture 宿主、目录或唯一配置路径不匹配".to_owned());
+    }
+    Ok(FileEndpoint::Remote {
+        host_id: host.clone(),
+        path: RemotePath::parse(&file).map_err(|_| "Compose fixture 文件路径无效".to_owned())?,
+    })
+}
+
+/// 描述符按宿主和完整路径计数，避免只依赖运行态索引而漏掉重复或未恢复的标签。
+///
+/// @author kongweiguang
+fn compose_fixture_tabs<'a>(
+    tabs: &'a [WorkspaceSessionTab],
+    host: &HostId,
+    endpoint: &FileEndpoint,
+) -> Vec<(&'a TabId, &'a WorkspaceFileAccess)> {
+    let FileEndpoint::Remote { path, .. } = endpoint else {
+        return Vec::new();
+    };
+    tabs.iter()
+        .filter_map(|tab| match tab {
+            WorkspaceSessionTab::WorkspaceFile {
+                id,
+                target: WorkspaceTargetRef::Ssh { host_id },
+                path: tab_path,
+                access,
+                ..
+            } if host_id == host && tab_path == path.as_str() => Some((id, access)),
+            _ => None,
+        })
+        .collect()
 }

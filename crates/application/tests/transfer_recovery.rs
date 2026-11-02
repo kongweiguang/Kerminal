@@ -178,6 +178,7 @@ impl TransferRecoveryRepository for FailingRepository {
 fn recovery_record() -> TransferRecoveryRecord {
     TransferRecoveryRecord {
         id: TransferId::new(),
+        drag_staging: false,
         request: TransferRequest {
             source: FileEndpoint::Local {
                 path: "fixture-source".into(),

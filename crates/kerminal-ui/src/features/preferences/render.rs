@@ -3,9 +3,9 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    ClickEvent, Context, Focusable as _, IntoElement, Render, Window,
+    ClickEvent, Context, Focusable as _, IntoElement, KeyDownEvent, Render, Window,
     assets::IconName,
-    base::Selectable,
+    base::{FocusTrapElement as _, Selectable},
     component::{
         Disableable, Icon,
         button::{Button, ButtonVariants},
@@ -164,7 +164,7 @@ fn navigation_targets(
             PreferencesSection::Terminal,
             "终端",
             "Terminal",
-            "配色 color 字体 font 字号 行高 字重 渲染 renderer 光标 cursor 右键 滚屏 scrollback",
+            "配色 color 字体 font 字号 行高 字重 光标 cursor 右键 滚屏 scrollback",
             IconName::Terminal,
         ),
         (
@@ -212,7 +212,7 @@ fn navigation_targets(
             PreferencesSection::Mcp,
             "MCP",
             "MCP",
-            "MCP 服务 启动 停止 endpoint JSON 连接信息 复制",
+            "MCP 服务 启动 停止 endpoint JSON 连接信息 复制 端口 监听 本机 局域网 LAN port bind",
             IconName::Puzzle,
         ),
         (
@@ -226,9 +226,9 @@ fn navigation_targets(
         (
             "desktop",
             PreferencesSection::Desktop,
-            "桌面",
-            "Desktop",
-            "桌面 通知 notification 耗时 阈值 节流 高级",
+            "通知",
+            "Notifications",
+            "通知 notification 耗时 阈值 节流 高级",
             IconName::Bell,
         ),
         (
@@ -290,7 +290,7 @@ fn navigation_targets(
             "settings-terminal-theme-panel",
             PreferencesSection::Terminal,
             "终端主题",
-            "分别设置浅色和深色终端配色。 terminal color scheme 终端 主题 配色",
+            "选择终端主题，配色跟随应用明暗。 terminal color scheme 终端 主题 配色",
             0,
         ),
         (
@@ -298,28 +298,21 @@ fn navigation_targets(
             PreferencesSection::Terminal,
             "字体配置",
             "终端字体、字号、行高和字重。 font size line height 字体 字号 行高 字重",
-            1,
-        ),
-        (
-            "settings-terminal-renderer-panel",
-            PreferencesSection::Terminal,
-            "终端渲染",
-            "GPUI 原生终端渲染与真实诊断状态。 renderer webgl gpu cpu 渲染 显卡 加速",
-            2,
+            0,
         ),
         (
             "settings-terminal-interaction-panel",
             PreferencesSection::Terminal,
             "终端交互",
             "选中复制、右键行为、自动重连和滚屏缓冲。 copy right click reconnect scrollback 右键 复制 重连 缓冲",
-            3,
+            1,
         ),
         (
             "settings-terminal-cursor-panel",
             PreferencesSection::Terminal,
             "光标形态",
             "光标样式和闪烁行为。 cursor blink 光标 闪烁",
-            4,
+            2,
         ),
         (
             "settings-profiles-panel",
@@ -380,7 +373,7 @@ fn navigation_targets(
         (
             "settings-desktop-panel",
             PreferencesSection::Desktop,
-            "桌面通知",
+            "通知",
             "系统通知、后台事件和节流。 notification desktop background 通知 后台 节流",
             0,
         ),
@@ -443,7 +436,7 @@ fn navigation_target(spec: NavigationTargetSpec<'_>) -> NavigationTarget {
 }
 
 impl Render for PreferencesPanel {
-    /// 设置页与本地主机共用 Profile，输入搜索时正文保留当前页，避免滚动与焦点跳动。
+    /// 设置页跟踪独立焦点边界供确认层恢复，搜索仍保留当前正文页。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -493,6 +486,7 @@ impl Render for PreferencesPanel {
         settings_text_font(
             div()
                 .id("preferences-panel")
+                .track_focus(&self.settings_panel_focus)
                 .size_full()
                 .flex()
                 .flex_col()
@@ -842,7 +836,7 @@ impl PreferencesPanel {
             .into_any_element()
     }
 
-    /// 切换页面后等新滚动内容完成布局再定位，避免搜索结果指向上一页的组件索引。
+    /// 切页保留关键词草稿；延迟聚焦前重新检查确认状态，避免键盘穿透遮罩。
     ///
     /// @author kongweiguang
     fn navigate_to_target(
@@ -856,10 +850,8 @@ impl PreferencesPanel {
         let changed = self.section != section
             || self.selected_navigation_target.as_deref() != Some(id.as_str());
         if self.section != section {
+            self.cancel_shortcut_capture(cx);
             self.reset_page_disclosures();
-            if self.section == PreferencesSection::KeywordHighlights {
-                self.discard_pending_keyword_rule();
-            }
         }
         self.section = section;
         match id.as_str() {
@@ -870,9 +862,6 @@ impl PreferencesPanel {
             _ => {}
         }
         match section {
-            PreferencesSection::Terminal if id == "settings-terminal-renderer-panel" => {
-                self.reveal_terminal_renderer(cx)
-            }
             PreferencesSection::Sftp if id == "settings-sftp-panel" => {
                 self.reveal_sftp_advanced(cx)
             }
@@ -882,9 +871,6 @@ impl PreferencesPanel {
             _ => {}
         }
         let focus = match id.as_str() {
-            "settings-terminal-font-panel" => {
-                self.settings_inputs.font_family.read(cx).focus_handle(cx)
-            }
             "settings-background-panel" => self
                 .settings_inputs
                 .background_path
@@ -905,7 +891,15 @@ impl PreferencesPanel {
             let scroll = self.content_scroll.clone();
             window.on_next_frame(move |_, _| scroll.scroll_to_top_of_item(index));
         }
-        window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+        let panel = cx.weak_entity();
+        window.on_next_frame(move |window, cx| {
+            if panel
+                .upgrade()
+                .is_some_and(|panel| !panel.read(cx).has_leave_confirmation())
+            {
+                window.focus(&focus, cx);
+            }
+        });
     }
 
     /// 只读恢复条目提供固定配置目录入口，状态只反映系统请求回执，不承诺窗口已显示。
@@ -1022,7 +1016,9 @@ impl PreferencesPanel {
         })
     }
 
-    /// Dirty-close 提示覆盖两个草稿上下文，遮罩沿用主题以保持浅深色层级一致。
+    /// 关闭确认独占内部焦点范围，Escape 保留当前草稿并回到原面板控件。
+    ///
+    /// @author kongweiguang
     fn render_close_confirmation(
         &mut self,
         theme: ThemeTokens,
@@ -1030,12 +1026,23 @@ impl PreferencesPanel {
     ) -> Option<impl IntoElement> {
         self.close_confirmation.then(|| {
             div()
+                .id("preferences-close-confirmation-overlay")
                 .absolute()
                 .inset_0()
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
                 .bg(theme.dialog_scrim)
+                .on_key_down(cx.listener(|panel, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key.eq_ignore_ascii_case("escape")
+                        && !event.keystroke.modifiers.modified()
+                        && !event.is_held
+                    {
+                        panel.cancel_close(cx);
+                        cx.stop_propagation();
+                    }
+                }))
                 .child(
                     div()
                         .w(px(420.))
@@ -1061,6 +1068,7 @@ impl PreferencesPanel {
                                 .gap_2()
                                 .child(
                                     Button::new("preferences-close-cancel")
+                                        .focus_handle(&self.close_confirmation_focus.keep_editing)
                                         .compact()
                                         .label(crate::locale::text("继续编辑", "Keep editing"))
                                         .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
@@ -1069,6 +1077,7 @@ impl PreferencesPanel {
                                 )
                                 .child(
                                     Button::new("preferences-close-discard")
+                                        .focus_handle(&self.close_confirmation_focus.discard)
                                         .compact()
                                         .primary()
                                         .label(crate::locale::text(
@@ -1081,6 +1090,10 @@ impl PreferencesPanel {
                                             },
                                         )),
                                 ),
+                        )
+                        .focus_trap(
+                            "preferences-close-confirmation-focus",
+                            &self.close_confirmation_focus.container,
                         ),
                 )
         })
@@ -1280,7 +1293,9 @@ impl PreferencesPanel {
         })
     }
 
-    /// 草稿退出确认先于根窗口检查，遮罩由主题提供以避免不同配色下层级漂移。
+    /// 退出确认独占焦点范围并保留取消语义，避免键盘落到遮罩后的设置页。
+    ///
+    /// @author kongweiguang
     fn render_quit_confirmation(
         &mut self,
         theme: ThemeTokens,
@@ -1288,12 +1303,23 @@ impl PreferencesPanel {
     ) -> Option<impl IntoElement> {
         self.quit_confirmation.then(|| {
             div()
+                .id("preferences-quit-confirmation-overlay")
                 .absolute()
                 .inset_0()
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
                 .bg(theme.dialog_scrim)
+                .on_key_down(cx.listener(|panel, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key.eq_ignore_ascii_case("escape")
+                        && !event.keystroke.modifiers.modified()
+                        && !event.is_held
+                    {
+                        panel.cancel_quit(cx);
+                        cx.stop_propagation();
+                    }
+                }))
                 .child(
                     div()
                         .w(px(440.))
@@ -1310,8 +1336,8 @@ impl PreferencesPanel {
                             "Preferences contain unsaved changes",
                         ))
                         .child(crate::locale::text(
-                            crate::locale::text("退出将丢弃设置、Profile 或尚未添加的临时输入。", "Quitting will discard settings, profile edits, and unsubmitted inputs."),
-                            "Quitting will discard settings, profile edits, and pending inputs.",
+                            crate::locale::text("退出将丢弃未保存的设置、Profile、关键词规则和临时输入。", "Quitting will discard unsaved settings, profiles, keyword rules, and pending inputs."),
+                            "Quitting will discard unsaved settings, profiles, keyword rules, and pending inputs.",
                         ))
                         .child(
                             div()
@@ -1320,6 +1346,7 @@ impl PreferencesPanel {
                                 .gap_2()
                                 .child(
                                     Button::new("preferences-quit-cancel")
+                                        .focus_handle(&self.quit_confirmation_focus.keep_editing)
                                         .compact()
                                         .label(crate::locale::text("继续编辑", "Keep editing"))
                                         .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
@@ -1328,6 +1355,7 @@ impl PreferencesPanel {
                                 )
                                 .child(
                                     Button::new("preferences-quit-confirm")
+                                        .focus_handle(&self.quit_confirmation_focus.discard)
                                         .compact()
                                         .primary()
                                         .label(crate::locale::text(
@@ -1340,7 +1368,8 @@ impl PreferencesPanel {
                                             },
                                         )),
                                 ),
-                        ),
+                        )
+                        .focus_trap("preferences-quit-confirmation-focus", &self.quit_confirmation_focus.container),
                 )
         })
     }

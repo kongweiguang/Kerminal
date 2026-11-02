@@ -173,7 +173,7 @@ async fn verify_flow(
 /// 不向禁用控件盲发按键，也不重放任何保存或默认切换请求。
 ///
 /// @author kongweiguang
-async fn fill_profile_field(
+pub(super) async fn fill_profile_field(
     cx: &mut AsyncApp,
     root: &Entity<RootView>,
     window: AnyWindowHandle,
@@ -215,7 +215,7 @@ async fn fill_profile_field(
 /// 读回使用应用执行器和同一配置根；不从 UI 草稿推断磁盘状态。
 ///
 /// @author kongweiguang
-async fn read_profile(
+pub(super) async fn read_profile(
     services: &kerminal_ui::AppServices,
     id: &str,
 ) -> Result<kerminal_application::preferences::VersionedProfile, Box<dyn Error>> {

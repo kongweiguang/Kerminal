@@ -144,6 +144,7 @@ pub(super) fn group_action_menu(
             let close_entity = entity.clone();
             menu = menu.item(
                 PopupMenuItem::new(crate::locale::text("关闭分组标签", "Close group tabs"))
+                    .danger()
                     .on_click(move |_, window, app| {
                         let intent = close_intent.clone();
                         let close_entity = close_entity.clone();
@@ -162,6 +163,7 @@ pub(super) fn group_action_menu(
                     "关闭组外其它标签",
                     "Close tabs outside group",
                 ))
+                .danger()
                 .on_click(move |_, window, app| {
                     let intent = close_outside_intent.clone();
                     let close_entity = close_entity.clone();
@@ -173,7 +175,8 @@ pub(super) fn group_action_menu(
                 }),
             );
         }
-        menu.item(event_item(
+        // 解散分组保留标签，属于可逆整理；删除空分组才真正移除对象，按危险命令着色。
+        let ungroup = event_item(
             entity.clone(),
             if has_members {
                 crate::locale::text("解散分组", "Ungroup tabs")
@@ -181,7 +184,12 @@ pub(super) fn group_action_menu(
                 crate::locale::text("删除空分组", "Delete empty group")
             },
             WorkspaceTabEvent::Ungroup(group.id.clone()),
-        ))
+        );
+        menu.item(if has_members {
+            ungroup
+        } else {
+            ungroup.danger()
+        })
     }
 }
 
@@ -246,8 +254,9 @@ pub(super) fn tab_action_menu(
             let close_entity = view.clone();
             let close_id = tab_for_rename.clone();
             return menu.item(
-                PopupMenuItem::new(crate::locale::text("关闭工作台", "Close workbench")).on_click(
-                    move |_, window, app| {
+                PopupMenuItem::new(crate::locale::text("关闭工作台", "Close workbench"))
+                    .danger()
+                    .on_click(move |_, window, app| {
                         let tab_id = close_id.clone();
                         let close_entity = close_entity.clone();
                         window.defer(app, move |window, app| {
@@ -255,8 +264,7 @@ pub(super) fn tab_action_menu(
                                 tabs.request_close_tab(tab_id, window, cx);
                             });
                         });
-                    },
-                ),
+                    }),
             );
         }
         if let Some(tab_kind) = tab_kind {
@@ -366,8 +374,9 @@ pub(super) fn tab_action_menu(
         let close_entity = view.clone();
         let close_id = tab_for_rename.clone();
         menu = menu.item(
-            PopupMenuItem::new(crate::locale::text("关闭", "Close")).on_click(
-                move |_, window, app| {
+            PopupMenuItem::new(crate::locale::text("关闭", "Close"))
+                .danger()
+                .on_click(move |_, window, app| {
                     let tab_id = close_id.clone();
                     let close_entity = close_entity.clone();
                     window.defer(app, move |window, app| {
@@ -375,8 +384,7 @@ pub(super) fn tab_action_menu(
                             tabs.request_close_tab(tab_id, window, cx);
                         });
                     });
-                },
-            ),
+                }),
         );
 
         if let Some(intent) = group_others_intent {
@@ -386,6 +394,7 @@ pub(super) fn tab_action_menu(
                     "关闭同组其他标签",
                     "Close other tabs in group",
                 ))
+                .danger()
                 .on_click(move |_, window, app| {
                     let intent = intent.clone();
                     let group_others_entity = group_others_entity.clone();
@@ -405,6 +414,7 @@ pub(super) fn tab_action_menu(
                     "关闭右侧标签",
                     "Close tabs to the right",
                 ))
+                .danger()
                 .on_click(move |_, window, app| {
                     let intent = intent.clone();
                     let right_entity = right_entity.clone();
@@ -420,6 +430,7 @@ pub(super) fn tab_action_menu(
             let others_entity = view.clone();
             menu = menu.item(
                 PopupMenuItem::new(crate::locale::text("关闭其他标签", "Close other tabs"))
+                    .danger()
                     .on_click(move |_, window, app| {
                         let intent = intent.clone();
                         let others_entity = others_entity.clone();

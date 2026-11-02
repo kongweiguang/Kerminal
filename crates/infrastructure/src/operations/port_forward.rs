@@ -296,7 +296,9 @@ fn spawn_remote_forward(
     (task, failure_rx)
 }
 
-/// 运行本机接入循环，单个目标连接失败只影响当次客户端不终止其它转发。
+/// 本机 SOCKS 将目标原样交给 SSH 出口，单个目标连接失败不终止其它转发。
+///
+/// @author kongweiguang
 async fn run_local_listener(
     listener: TcpListener,
     lease: RemoteConnectionLease,
@@ -318,7 +320,11 @@ async fn run_local_listener(
                 let client_cancel = clients_cancel.child_token();
                 clients.spawn(async move {
                     let result = match (dynamic, destination) {
-                        (true, _) => proxy_socks(socket, lease, client_cancel).await,
+                        (true, _) => {
+                            proxy_socks(socket, client_cancel, move |destination, cancel| async move {
+                                open_tunnel(&lease, &destination, &cancel).await
+                            }).await
+                        },
                         (false, Some(destination)) => {
                             proxy_fixed_tcp(socket, lease, destination, client_cancel).await
                         }
@@ -344,8 +350,10 @@ async fn run_local_listener(
 
 /// 接收 SSH server 转发连接并将其桥接到固定本机目标或 SOCKS5 动态目标。
 ///
-/// listener 的 `None` 同时表示父取消 token 结束 accept，或 SSH server 意外关闭 listener；
-/// 两者必须根据父 token 分流，否则正常 stop 会被异步故障监控误标为 Failed。
+/// SOCKS 的目的连接和域名解析必须留在本机；listener 的 `None` 同时可能是取消或意外关闭，
+/// 需要根据父 token 分流，避免正常 stop 被误标为 Failed。
+///
+/// @author kongweiguang
 async fn run_remote_listener(
     mut listener: RemoteForwardHandle,
     lease: RemoteConnectionLease,
@@ -362,12 +370,17 @@ async fn run_remote_listener(
             Some(_) = clients.join_next(), if !clients.is_empty() => {},
             accepted = listener.accept(cancel.child_token()) => match accepted {
                 Ok(Some(channel)) => {
-                    let lease = lease.clone();
                     let destination = destination.clone();
                     let client_cancel = clients_cancel.child_token();
                     clients.spawn(async move {
                         let result = match (dynamic, destination) {
-                            (true, _) => proxy_socks(channel, lease, client_cancel).await,
+                            (true, _) => {
+                                proxy_socks(channel, client_cancel, move |destination, _| async move {
+                                    TcpStream::connect((destination.host.as_str(), destination.port.get()))
+                                        .await
+                                        .map_err(|error| AppError::infrastructure_with_source("本机 SOCKS5 目标连接失败", error))
+                                }).await
+                            },
                             (false, Some(destination)) => {
                                 proxy_fixed_channel(channel, destination, client_cancel).await
                             }
@@ -472,28 +485,40 @@ async fn proxy_fixed_tcp(
     bridge(&mut socket, &mut tunnel, cancel).await
 }
 
-/// SSH forwarded-tcpip channel 连接固定本机目标，退出只释放当前两个流。
+/// SSH forwarded-tcpip channel 连接固定本机目标；连接阶段也受取消和时限约束，避免关闭时遗留连接任务。
+///
+/// @author kongweiguang
 async fn proxy_fixed_channel(
     mut channel: TunnelChannelHandle,
     destination: ForwardEndpoint,
     cancel: CancellationToken,
 ) -> AppResult<()> {
-    let mut socket = TcpStream::connect((destination.host.as_str(), destination.port.get()))
-        .await
-        .map_err(|error| AppError::infrastructure_with_source("转发目标连接失败", error))?;
+    let connection = TcpStream::connect((destination.host.as_str(), destination.port.get()));
+    let mut socket = tokio::select! {
+        _ = cancel.cancelled() => return Err(AppError::cancelled("转发目标连接已取消")),
+        result = tokio::time::timeout(SOCKS5_CONNECT_TIMEOUT, connection) => match result {
+            Ok(Ok(socket)) => socket,
+            Ok(Err(error)) => return Err(AppError::infrastructure_with_source("转发目标连接失败", error)),
+            Err(_) => return Err(AppError::timeout("转发目标连接")),
+        },
+    };
     bridge(&mut channel, &mut socket, cancel).await
 }
 
-/// 用成熟协议实现完成无认证 CONNECT 协商；域名留给 SSH 远端解析以匹配动态转发语义。
+/// 共用无认证 CONNECT 协商，但由调用方选择连接出口，确保域名在对应出口一侧解析。
+/// 连接与握手均受同一转发取消令牌和独立时限约束，失败时向 SOCKS 客户端返回真实结果。
 ///
 /// @author kongweiguang
-async fn proxy_socks<S>(
+async fn proxy_socks<S, F, Fut, T>(
     incoming: S,
-    lease: RemoteConnectionLease,
     cancel: CancellationToken,
+    connect: F,
 ) -> AppResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(ForwardEndpoint, CancellationToken) -> Fut,
+    Fut: std::future::Future<Output = AppResult<T>>,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
     let negotiation = tokio::time::timeout(SOCKS5_HANDSHAKE_TIMEOUT, async {
         let protocol = Socks5ServerProtocol::accept_no_auth(incoming)
@@ -543,7 +568,7 @@ where
             })?;
             return Err(AppError::cancelled("SOCKS5 目标连接已取消"));
         },
-        result = tokio::time::timeout(SOCKS5_CONNECT_TIMEOUT, open_tunnel(&lease, &destination, &cancel)) => {
+        result = tokio::time::timeout(SOCKS5_CONNECT_TIMEOUT, connect(destination, cancel.clone())) => {
             match result {
                 Ok(Ok(tunnel)) => tunnel,
                 Ok(Err(error)) => {
@@ -568,7 +593,7 @@ where
     bridge(&mut incoming, &mut tunnel, cancel).await
 }
 
-/// 将协议库的目标类型映射为应用端点，并保留域名让远端 SSH 服务负责解析。
+/// 保留 SOCKS 域名直到选定连接出口，使本机和 SSH 两侧各自完成域名解析。
 ///
 /// @author kongweiguang
 fn socks_target_endpoint(target: TargetAddr) -> AppResult<ForwardEndpoint> {

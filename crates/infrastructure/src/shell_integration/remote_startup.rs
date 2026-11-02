@@ -32,6 +32,8 @@ pub(crate) struct RemoteInteractiveStartup {
     pub(crate) exec_command: String,
     /// 该位只表示 hook 随已确认 exec 请求启动，不代表 OSC 133 已经到达。
     pub(crate) shell_integration_enabled: bool,
+    /// 随 exec bootstrap 生成，不接受远端输出自行认领其他会话的 nonce。
+    pub(crate) editing_nonce: Option<String>,
 }
 
 /// 按精确 shell kind 构造 exec 启动命令；未知 shell 保留原 request_shell 路径。
@@ -66,13 +68,15 @@ pub(crate) fn remote_interactive_startup(
         ));
     }
 
+    let editing_nonce = uuid::Uuid::new_v4().simple().to_string();
     let exec_command = match kind {
         RemoteShellKind::Bash => bash_startup_command(working_directory),
         RemoteShellKind::Zsh => zsh_startup_command(working_directory),
         RemoteShellKind::Fish => fish_startup_command(working_directory),
         RemoteShellKind::PowerShell => powershell_startup_command(working_directory),
         RemoteShellKind::Other | RemoteShellKind::Unknown => unreachable!("unknown handled above"),
-    };
+    }
+    .replace("__KERMINAL_EDIT_NONCE__", &editing_nonce);
     if exec_command.len() > MAX_REMOTE_STARTUP_COMMAND_BYTES {
         return Err(AppError::invalid(
             "SSH shell startup command exceeds the supported size",
@@ -82,6 +86,7 @@ pub(crate) fn remote_interactive_startup(
     Ok(Some(RemoteInteractiveStartup {
         exec_command,
         shell_integration_enabled: true,
+        editing_nonce: Some(editing_nonce),
     }))
 }
 

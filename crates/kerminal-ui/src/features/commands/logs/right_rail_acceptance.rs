@@ -11,10 +11,9 @@ use kerminal_domain::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{LogsTarget, LogsView};
-use crate::features::commands::history_query::{PAGE_SIZE, page_window};
+use super::{HistoryFillStatus, LogsTarget, LogsView, logs_page_window};
 
-const USER_SEED_COUNT: usize = 9;
+const USER_SEED_COUNT: usize = 23;
 const TOOL_SEED_COUNT: usize = 1;
 
 #[derive(Default)]
@@ -50,8 +49,10 @@ pub struct RightRailAcceptanceLogsSnapshot {
     source: Option<CommandHistorySource>,
     page: usize,
     page_count: usize,
+    page_size: usize,
     total_entries: usize,
     seeded_entries: usize,
+    fill_confirmed: bool,
     entries: Vec<RightRailAcceptanceLogsEntry>,
 }
 
@@ -104,6 +105,13 @@ impl RightRailAcceptanceLogsSnapshot {
         self.page_count
     }
 
+    /// 回读实际布局容量，验收不能继续把八条硬编码为所有窗口的分页契约。
+    ///
+    /// @author kongweiguang
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
     /// 统计所有分页中的筛选结果，不把当前页行数误当成总量。
     ///
     /// @author kongweiguang
@@ -116,6 +124,13 @@ impl RightRailAcceptanceLogsSnapshot {
     /// @author kongweiguang
     pub fn seeded_entries(&self) -> usize {
         self.seeded_entries
+    }
+
+    /// 回读生产反馈，确认被动容量重排不会吞掉填入成功提示。
+    ///
+    /// @author kongweiguang
+    pub fn fill_confirmed(&self) -> bool {
+        self.fill_confirmed
     }
 
     /// 只暴露当前页的验收字段，使驱动器能检查实际列表并将删除限制到可见记录。
@@ -326,7 +341,7 @@ impl LogsView {
             return Err("日志结果包含本次验收前缀之外的历史记录".to_owned());
         }
 
-        let (page, start, end) = page_window(self.page, self.entries.len());
+        let (page, start, end) = logs_page_window(self.page, self.entries.len(), self.page_size);
         let entries = self.entries[start..end]
             .iter()
             .map(|entry| RightRailAcceptanceLogsEntry {
@@ -341,14 +356,19 @@ impl LogsView {
             query: self.query_value.clone(),
             source: self.source,
             page,
-            page_count: self.entries.len().div_ceil(PAGE_SIZE).max(1),
+            page_count: self.entries.len().div_ceil(self.page_size).max(1),
+            page_size: self.page_size,
             total_entries: self.entries.len(),
             seeded_entries: seed.recorded_count,
+            fill_confirmed: matches!(
+                self.fill_feedback.status,
+                Some(HistoryFillStatus::Confirmed(_))
+            ),
             entries,
         })
     }
 
-    /// 通过保留的 Input 状态和生产历史重载路径修改搜索条件。
+    /// 同步保留的 Input 后走生产搜索变更入口，不能绕过成功反馈与焦点票据的失效规则。
     ///
     /// @author kongweiguang
     pub(crate) fn right_rail_acceptance_set_query(
@@ -367,11 +387,9 @@ impl LogsView {
         if self.query_value == query {
             return Ok(());
         }
-        self.query_value = query.clone();
         self.query
-            .update(cx, |input, cx| input.set_value(query, window, cx));
-        self.page = 1;
-        self.reload_history(cx);
+            .update(cx, |input, cx| input.set_value(query.clone(), window, cx));
+        self.set_query(query, cx);
         cx.notify();
         Ok(())
     }
@@ -392,7 +410,7 @@ impl LogsView {
         Ok(())
     }
 
-    /// 先验证目标页存在，再通过生产分页边界逻辑切换页面。
+    /// 先按实际布局容量验证目标页存在，再通过生产分页边界逻辑切换页面。
     ///
     /// @author kongweiguang
     pub(crate) fn right_rail_acceptance_set_page(
@@ -404,7 +422,7 @@ impl LogsView {
     ) -> Result<(), String> {
         self.acceptance_mutation_prefix(run_id, binding)?;
         self.ensure_acceptance_idle()?;
-        let page_count = self.entries.len().div_ceil(PAGE_SIZE).max(1);
+        let page_count = self.entries.len().div_ceil(self.page_size).max(1);
         if !(1..=page_count).contains(&page) {
             return Err("右栏日志验收请求的页码超出当前结果范围".to_owned());
         }

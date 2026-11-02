@@ -8,6 +8,7 @@ pub mod agent_input;
 pub mod broadcast;
 pub mod command_blocks;
 pub mod logging;
+pub mod shell_editing;
 mod transport;
 
 pub use agent_input::{AgentTerminalSubmissionRequest, MAX_AGENT_TERMINAL_SUBMISSION_BYTES};
@@ -18,6 +19,11 @@ pub use command_blocks::{
     CommandBlockTextUnknownReason, CommandBlockUnknownReason, MAX_COMMAND_BLOCK_OUTPUT_BYTES,
     MAX_COMMAND_BLOCK_TEXT_BYTES, UiTerminalCommandSubmissionRequest, classify_command_block_text,
     is_plain_command_enter,
+};
+pub use shell_editing::{
+    SHELL_EDITING_INPUT_TOO_LONG_CONTEXT, SHELL_EDITING_MAX_INPUT_CHARACTERS,
+    SHELL_EDITING_MAX_SUFFIX_BYTES, ShellEditingAvailability, ShellEditingShell,
+    ShellEditingSnapshot, ShellEditingUnavailableReason,
 };
 
 pub use kerminal_terminal::input::TerminalInputEvent;
@@ -545,6 +551,45 @@ pub trait SessionService: Send + Sync {
     ) -> AppResult<TerminalCommandContext> {
         Err(AppError::unsupported(
             "当前会话服务不提供可信终端输入上下文",
+        ))
+    }
+
+    /// 查询独立的 Shell 编辑快照能力；旧 adapter 默认明确降级，不改变普通终端输入。
+    ///
+    /// @author kongweiguang
+    async fn shell_editing_availability(
+        &self,
+        _binding: UiSessionBinding,
+    ) -> AppResult<ShellEditingAvailability> {
+        Ok(ShellEditingAvailability::Unavailable(
+            ShellEditingUnavailableReason::Unsupported,
+        ))
+    }
+
+    /// 请求 Shell 实际编辑缓冲；取消或会话版本变化后不得返回旧快照。
+    ///
+    /// @author kongweiguang
+    async fn request_shell_editing_snapshot(
+        &self,
+        _binding: UiSessionBinding,
+        _cancellation: CancellationToken,
+    ) -> AppResult<ShellEditingSnapshot> {
+        Err(AppError::unsupported("当前会话不支持 Shell 编辑快照"))
+    }
+
+    /// 在原 binding 和输入版本上仅追加后缀，并以 Shell 的实际回读确认结果。
+    ///
+    /// 部分写入、取消或回读不明确时不得自动重放；成功也不表示命令已执行。
+    ///
+    /// @author kongweiguang
+    async fn append_shell_editing_suffix(
+        &self,
+        _snapshot: ShellEditingSnapshot,
+        _suffix: String,
+        _cancellation: CancellationToken,
+    ) -> AppResult<ShellEditingSnapshot> {
+        Err(AppError::unsupported(
+            "当前会话不支持安全追加 Shell 编辑缓冲",
         ))
     }
 

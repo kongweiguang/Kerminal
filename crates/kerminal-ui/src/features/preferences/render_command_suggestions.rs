@@ -366,67 +366,6 @@ impl PreferencesPanel {
                     ),
             );
 
-        let status_top = div()
-            .w_full()
-            .flex()
-            .gap_2()
-            .child(suggestion_status_tile(
-                IconName::ShieldCheck,
-                crate::locale::text("主机安装", "Host installation"),
-                crate::locale::text("不需要插件", "No plugin required"),
-                theme.success,
-                theme,
-            ))
-            .child(suggestion_status_tile(
-                IconName::Network,
-                crate::locale::text("远端探测", "Remote probes"),
-                crate::locale::text(
-                    if suggestion.remote_probe_enabled {
-                        "后台只读"
-                    } else {
-                        "已关闭"
-                    },
-                    if suggestion.remote_probe_enabled {
-                        "Read-only in background"
-                    } else {
-                        "Off"
-                    },
-                ),
-                if suggestion.remote_probe_enabled {
-                    theme.accent
-                } else {
-                    theme.muted
-                },
-                theme,
-            ));
-        let status_bottom = div()
-            .w_full()
-            .flex()
-            .gap_2()
-            .child(suggestion_status_tile(
-                IconName::Activity,
-                crate::locale::text("反馈调权", "Feedback weighting"),
-                crate::locale::text(
-                    if suggestion.enabled {
-                        "接受/忽略"
-                    } else {
-                        "暂停"
-                    },
-                    if suggestion.enabled {
-                        "Accepted / ignored"
-                    } else {
-                        "Paused"
-                    },
-                ),
-                if suggestion.enabled {
-                    theme.accent
-                } else {
-                    theme.muted
-                },
-                theme,
-            ))
-            .child(div().flex_1());
-
         let policy = div()
             .when(wide, |policy| {
                 policy.flex_basis(px(0.)).flex_grow(1.).min_w(px(340.))
@@ -445,16 +384,6 @@ impl PreferencesPanel {
                     .gap_2()
                     .mt_3()
                     .child(policy_controls),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .mt_3()
-                    .child(status_top)
-                    .child(status_bottom),
             );
 
         let provider_specs = [
@@ -610,56 +539,6 @@ fn section_heading(
         .text_color(theme.field_label)
         .child(Icon::new(icon).size(px(14.)).text_color(theme.muted))
         .child(label)
-}
-
-/// 状态摘要同时展示状态来源和当前值，并用语义色区别活跃、暂停与无需配置。
-///
-/// @author kongweiguang
-fn suggestion_status_tile(
-    icon: IconName,
-    label: gpui_kit::SharedString,
-    value: gpui_kit::SharedString,
-    tone: gpui_kit::Hsla,
-    theme: ThemeTokens,
-) -> impl IntoElement {
-    div()
-        .flex_1()
-        .min_w(px(150.))
-        .min_h(px(36.))
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.strong_border())
-        .bg(theme.field_surface())
-        .px_2()
-        .py_2()
-        .child(
-            div()
-                .min_w(px(0.))
-                .flex_1()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(Icon::new(icon).size(px(14.)).text_color(tone))
-                .child(label),
-        )
-        .child(
-            div()
-                .flex_none()
-                .rounded_full()
-                .bg(tone.opacity(0.12))
-                .px_2()
-                .py_1()
-                .text_size(theme.text_xs)
-                .font_weight(theme.settings_medium_font_weight())
-                .text_color(tone)
-                .child(value),
-        )
 }
 
 /// Provider 开关按 main 的图标、来源名和受控 Switch 行呈现。

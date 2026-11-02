@@ -58,6 +58,17 @@ pub struct WindowsWindowState {
     pub frame_signal: Arc<PlatformFrameSignal>,
     /// Prevent delayed platform callbacks from targeting an HWND after close begins.
     pub(crate) closing: Cell<bool>,
+    /// 迟到的拖放结束消息不能撤销新手势。
+    pub(crate) external_drag_generation: Cell<u64>,
+    /// 窗口关闭时取消仍在准备的来源，不等待网络任务自然超时。
+    pub(crate) external_drag_provider: RefCell<Option<Arc<dyn DeferredFileDragProvider>>>,
+    /// 单次 OLE 拖动的 Escape 消费状态由窗口和拖动线程共同持有。
+    pub(crate) external_drag_keyboard:
+        RefCell<Option<Arc<crate::external_drag::DragKeyboardState>>>,
+    /// 源窗口捕获期间的原始手势；交给 OLE 前必须始终有效。
+    pub(crate) external_drag_preparing: Cell<bool>,
+    /// 移交前返回窗口时保留原内部载荷，直到原鼠标释放后结束平台会话。
+    pub(crate) external_drag_restored: Cell<bool>,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
     pub ime_composition_handler: ImeCompositionHandler<PlatformInputHandler>,
     pub ime_composition_focus_id: Cell<Option<FocusId>>,
@@ -312,6 +323,11 @@ impl WindowsWindowState {
             callbacks,
             frame_signal: Arc::new(PlatformFrameSignal::new()),
             closing: Cell::new(false),
+            external_drag_generation: Cell::new(0),
+            external_drag_provider: RefCell::new(None),
+            external_drag_keyboard: RefCell::new(None),
+            external_drag_preparing: Cell::new(false),
+            external_drag_restored: Cell::new(false),
             input_handler: Cell::new(input_handler),
             ime_composition_handler: ImeCompositionHandler::default(),
             ime_composition_focus_id: Cell::new(None),
@@ -776,6 +792,15 @@ impl Drop for WindowsWindow {
     /// @author kongweiguang
     fn drop(&mut self) {
         self.0.state.closing.set(true);
+        self.0.state.external_drag_preparing.set(false);
+        self.0.state.external_drag_restored.set(false);
+        if let Some(provider) = self.0.state.external_drag_provider.borrow_mut().take() {
+            provider.cancel();
+        }
+        self.0
+            .state
+            .external_drag_generation
+            .set(self.0.state.external_drag_generation.get().wrapping_add(1));
         self.0.dialog_owner.close();
         unsafe { ShowWindowAsync(self.0.hwnd, SW_HIDE).ok().log_err() };
         // `DestroyWindow` below sends `WM_SHOWWINDOW`; without a callback the
@@ -798,6 +823,109 @@ impl Drop for WindowsWindow {
 }
 
 impl PlatformWindow for WindowsWindow {
+    /// 外部拖放使用独立 OLE 单元，准备和目标复制不会阻塞 GPUI。
+    ///
+    /// @author kongweiguang
+    fn can_start_external_drag(&self) -> bool {
+        true
+    }
+
+    /// 准备完成并再次确认鼠标仍按住后才释放原窗口捕获，按键过滤与该次手势共同持有。
+    ///
+    /// @author kongweiguang
+    fn start_external_drag(&self, payload: &ExternalDragPayload) -> bool {
+        crate::external_drag::drag_diagnostic("platform_start");
+        let payload = payload.clone();
+        let failed_provider = match &payload {
+            ExternalDragPayload::DeferredFiles(value) => Some(value.0.clone()),
+            _ => None,
+        };
+        let failed_paths = match &payload {
+            ExternalDragPayload::Files(paths) => Some(paths.clone()),
+            _ => None,
+        };
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (ended_tx, ended_rx) = oneshot::channel::<()>();
+        let source_window = self.0.hwnd.0 as isize;
+        let keyboard = Arc::new(crate::external_drag::DragKeyboardState::default());
+        keyboard.begin();
+        let worker_keyboard = keyboard.clone();
+        let worker = std::thread::Builder::new()
+            .name("kerminal-windows-drag".into())
+            .spawn(move || {
+                let _ = crate::external_drag::run_drag(
+                    payload,
+                    source_window,
+                    worker_keyboard,
+                    || {
+                        let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+                        if ready_tx.send(proceed_tx).is_err() {
+                            return false;
+                        }
+                        proceed_rx.recv().unwrap_or(false)
+                    },
+                    || {
+                        let _ = ended_tx.send(());
+                    },
+                );
+            });
+        if worker.is_err() {
+            crate::external_drag::drag_diagnostic("worker_spawn_failed");
+            if let Some(provider) = failed_provider {
+                provider.finish(ExternalFileDragOutcome::Failed(
+                    "无法启动系统拖放线程".into(),
+                ));
+            }
+            if let Some(paths) = failed_paths {
+                paths.finish(ExternalFileDragOutcome::Failed(
+                    "无法启动系统拖放线程".into(),
+                ));
+            }
+            return false;
+        }
+        let generation = self.0.state.external_drag_generation.get().wrapping_add(1);
+        self.0.state.external_drag_keyboard.replace(Some(keyboard));
+        self.0.state.external_drag_generation.set(generation);
+        self.0.state.external_drag_preparing.set(true);
+        self.0.state.external_drag_restored.set(false);
+        let old_provider = self.0.state.external_drag_provider.replace(failed_provider);
+        if let Some(provider) = old_provider {
+            provider.cancel();
+        }
+        let this = self.0.clone();
+        self.0
+            .executor
+            .spawn(async move {
+                if let Ok(proceed) = ready_rx.await {
+                    let held = !this.state.closing.get()
+                        && this.state.external_drag_generation.get() == generation
+                        && this.state.external_drag_preparing.replace(false)
+                        && unsafe {
+                            GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0
+                                && GetAsyncKeyState(VK_ESCAPE.0 as i32) >= 0
+                        };
+                    crate::external_drag::drag_diagnostic(format_args!("handoff held={held}"));
+                    if held {
+                        let _ = unsafe { ReleaseCapture() };
+                    }
+                    let _ = proceed.send(held);
+                }
+                let _ = ended_rx.await;
+                crate::external_drag::drag_diagnostic("platform_drag_ended");
+                if !this.state.closing.get()
+                    && this.state.external_drag_generation.get() == generation
+                {
+                    this.state.external_drag_provider.borrow_mut().take();
+                    if let Some(mut input) = this.state.callbacks.input.take() {
+                        input(PlatformInput::FileDrop(FileDropEvent::Ended));
+                        this.state.callbacks.input.set(Some(input));
+                    }
+                }
+            })
+            .detach();
+        true
+    }
+
     /// Dirty transitions request an asynchronous WM_PAINT; native VSync remains the animation clock.
     ///
     /// @author kongweiguang
@@ -1425,10 +1553,16 @@ impl accesskit::ActionHandler for A11yActionHandler {
 struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
 
 impl WindowsDragDropHandler {
-    fn handle_drag_drop(&self, input: PlatformInput) {
+    /// GPUI 明确消费有效放置事件时才向 OLE 返回接受，不能仅凭鼠标释放报成功。
+    ///
+    /// @author kongweiguang
+    fn handle_drag_drop(&self, input: PlatformInput) -> bool {
         if let Some(mut func) = self.0.state.callbacks.input.take() {
-            func(input);
+            let accepted = func(input).file_drop_accepted;
             self.0.state.callbacks.input.set(Some(func));
+            accepted
+        } else {
+            false
         }
     }
 }
@@ -1444,6 +1578,23 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     ) -> windows::core::Result<()> {
         unsafe {
             let idata_obj = pdataobj.ok()?;
+            if crate::external_drag::is_source_window(idata_obj, self.0.hwnd) {
+                *pdweffect = DROPEFFECT_COPY;
+                let mut cursor_position = POINT { x: pt.x, y: pt.y };
+                ScreenToClient(self.0.hwnd, &mut cursor_position)
+                    .ok()
+                    .log_err();
+                let scale_factor = self.0.state.scale_factor.get();
+                self.handle_drag_drop(PlatformInput::FileDrop(FileDropEvent::Entered {
+                    position: logical_point(
+                        cursor_position.x as f32,
+                        cursor_position.y as f32,
+                        scale_factor,
+                    ),
+                    paths: ExternalPaths(Default::default()),
+                }));
+                return Ok(());
+            }
             let config = FORMATETC {
                 cfFormat: CF_HDROP.0,
                 ptd: std::ptr::null_mut() as _,
@@ -1533,6 +1684,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         Ok(())
     }
 
+    /// 以实际 drop listener 的受理回执决定系统效果，本机和虚拟来源都不能把拒绝放置报为复制成功。
     fn Drop(
         &self,
         pdataobj: windows::core::Ref<IDataObject>,
@@ -1560,7 +1712,14 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 scale_factor,
             ),
         });
-        self.handle_drag_drop(input);
+        let accepted = self.handle_drag_drop(input);
+        if !accepted {
+            unsafe {
+                *pdweffect = DROPEFFECT_NONE;
+            }
+        } else if crate::external_drag::is_source_window(idata_obj, self.0.hwnd) {
+            crate::external_drag::report_internal_drop(idata_obj);
+        }
 
         Ok(())
     }

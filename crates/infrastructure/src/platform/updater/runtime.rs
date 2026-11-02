@@ -123,7 +123,7 @@ impl CargoPackagerUpdater {
             .unwrap_or(super::settings::MAX_UPDATE_BYTES);
         let availability = match (&settings, runtime_supported, current_target.is_some()) {
             (None, _, _) => UpdateAvailability::Unavailable {
-                reason: "此构建尚未配置更新源和签名公钥",
+                reason: "此构建没有有效的更新源或签名公钥",
             },
             (Some(_), false, _) => UpdateAvailability::Unavailable {
                 reason: "当前安装形态不支持应用内自动更新",

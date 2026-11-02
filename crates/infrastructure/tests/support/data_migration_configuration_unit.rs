@@ -31,6 +31,10 @@ const REVISION_11_GUIDE: &str =
     include_str!("../../../../tests/fixtures/configuration/config-guide-v11.md");
 const REVISION_12_GUIDE: &str =
     include_str!("../../../../tests/fixtures/configuration/config-guide-v12.md");
+const REVISION_13_GUIDE: &str =
+    include_str!("../../../../tests/fixtures/configuration/config-guide-v13.md");
+const REVISION_14_GUIDE: &str =
+    include_str!("../../../../tests/fixtures/configuration/config-guide-v14.md");
 const HOST_V2_SERIAL: &str =
     include_str!("../../../../tests/fixtures/configuration/host-schema-v2-serial-migration.toml");
 const HOST_V3_SERIAL: &str =
@@ -210,12 +214,6 @@ fn settings_migration_adds_missing_actions_without_rewriting_existing_rows() {
         Some("")
     );
     assert_eq!(
-        paste
-            .get("windowsAlternateBinding")
-            .and_then(toml::Value::as_str),
-        Some("")
-    );
-    assert_eq!(
         paste.get("linuxBinding").and_then(toml::Value::as_str),
         Some("")
     );
@@ -267,12 +265,7 @@ fn settings_migration_preserves_existing_chord_prefixes() {
         .find(|row| row.get("action").and_then(toml::Value::as_str) == Some("settings.open"))
         .expect("原有设置快捷键保留");
 
-    for field in [
-        "windowsBinding",
-        "windowsAlternateBinding",
-        "linuxBinding",
-        "macBinding",
-    ] {
+    for field in ["windowsBinding", "linuxBinding", "macBinding"] {
         assert_eq!(paste.get(field).and_then(toml::Value::as_str), Some(""));
     }
     assert_eq!(
@@ -1537,4 +1530,68 @@ fn frozen_revision_twelve_guide_upgrades_without_overwriting_user_edits() {
             original.as_bytes()
         );
     }
+}
+
+/// 新指南只替换精确的 revision 13，保留用户编辑的原始正文及标记。
+#[test]
+fn frozen_revision_thirteen_guide_upgrades_without_overwriting_user_edits() {
+    const { assert!(CONFIG_GUIDE_REVISION > 13) };
+    let digest = configuration::config_guide_digest(REVISION_13_GUIDE);
+    assert_eq!(digest, super::CONFIG_GUIDE_REVISION_13_SHA256);
+    let normalized = REVISION_13_GUIDE.replace("\r\n", "\n").replace('\r', "\n");
+    for body in [normalized.clone(), normalized.replace('\n', "\r\n")] {
+        for marked in [false, true] {
+            let original = if marked {
+                format!(
+                    "{}13 sha256={digest} -->\n{body}",
+                    configuration::CONFIG_GUIDE_MARKER_PREFIX
+                )
+            } else {
+                body.clone()
+            };
+            let root = tempdir().expect("创建隔离 revision 13 根");
+            write_fixture(root.path(), "kerminal-config.md", &original);
+            let edits = plan_configuration_migration(root.path()).expect("规划旧指南升级");
+            let planned = edit(&edits, "kerminal-config.md").expect("冻结指南产生计划");
+            assert_eq!(planned.before.as_deref(), Some(original.as_bytes()));
+            assert_eq!(planned.after, configuration::managed_config_guide());
+        }
+    }
+    let custom = format!("{normalized}\n## User notes\nPreserve these notes.\n");
+    let root = tempdir().expect("创建隔离自定义指南根");
+    write_fixture(root.path(), "kerminal-config.md", &custom);
+    let edits = plan_configuration_migration(root.path()).expect("检查自定义指南");
+    assert!(edit(&edits, "kerminal-config.md").is_none());
+}
+
+/// 新指南只替换精确的 revision 14，保留用户编辑的原始正文及标记。
+#[test]
+fn frozen_revision_fourteen_guide_upgrades_without_overwriting_user_edits() {
+    const { assert!(CONFIG_GUIDE_REVISION > 14) };
+    let digest = configuration::config_guide_digest(REVISION_14_GUIDE);
+    assert_eq!(digest, super::CONFIG_GUIDE_REVISION_14_SHA256);
+    let normalized = REVISION_14_GUIDE.replace("\r\n", "\n").replace('\r', "\n");
+    for body in [normalized.clone(), normalized.replace('\n', "\r\n")] {
+        for marked in [false, true] {
+            let original = if marked {
+                format!(
+                    "{}14 sha256={digest} -->\n{body}",
+                    configuration::CONFIG_GUIDE_MARKER_PREFIX
+                )
+            } else {
+                body.clone()
+            };
+            let root = tempdir().expect("创建隔离 revision 14 根");
+            write_fixture(root.path(), "kerminal-config.md", &original);
+            let edits = plan_configuration_migration(root.path()).expect("规划旧指南升级");
+            let planned = edit(&edits, "kerminal-config.md").expect("冻结指南产生计划");
+            assert_eq!(planned.before.as_deref(), Some(original.as_bytes()));
+            assert_eq!(planned.after, configuration::managed_config_guide());
+        }
+    }
+    let custom = format!("{normalized}\n## User notes\nPreserve these notes.\n");
+    let root = tempdir().expect("创建隔离自定义指南根");
+    write_fixture(root.path(), "kerminal-config.md", &custom);
+    let edits = plan_configuration_migration(root.path()).expect("检查自定义指南");
+    assert!(edit(&edits, "kerminal-config.md").is_none());
 }

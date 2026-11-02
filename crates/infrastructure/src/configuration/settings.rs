@@ -26,6 +26,7 @@ struct SettingsDocument {
     keybindings: Vec<KeybindingPreference>,
     desktop_notifications: DesktopNotificationSettings,
     external_launch: ExternalLaunchSettings,
+    mcp: kerminal_application::preferences::settings::McpSettings,
     agent_launcher: AgentLauncherSettings,
     sftp: SftpPerformanceSettings,
     tool_rail: ToolRailSettings,
@@ -73,6 +74,7 @@ impl SettingsDocument {
             keybindings: settings.keybindings,
             desktop_notifications: settings.desktop_notifications,
             external_launch: settings.external_launch,
+            mcp: settings.mcp,
             agent_launcher: settings.agent_launcher,
             sftp: settings.sftp,
             tool_rail: settings.tool_rail,
@@ -98,6 +100,7 @@ impl SettingsDocument {
             keybindings: self.keybindings,
             desktop_notifications: self.desktop_notifications,
             external_launch: self.external_launch,
+            mcp: self.mcp,
             agent_launcher: self.agent_launcher,
             sftp: self.sftp,
             tool_rail: self.tool_rail,
@@ -108,7 +111,18 @@ impl SettingsDocument {
 
 /// 在基础设施边界读取旧文件结构；未知键由 TOML 解析器忽略并由原文仓储保留。
 pub(super) fn decode_settings(source: &str) -> Result<SettingsSnapshot, toml::de::Error> {
-    toml::from_str::<SettingsDocument>(source).map(SettingsDocument::into_snapshot)
+    let document = toml::from_str::<toml::Value>(source)?;
+    let legacy_color_scheme_missing = document
+        .get("terminal")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|terminal| {
+            !terminal.contains_key("colorScheme")
+                && (terminal.contains_key("lightColorScheme")
+                    || terminal.contains_key("darkColorScheme"))
+        });
+    let mut settings = document.try_into::<SettingsDocument>()?.into_snapshot();
+    settings.terminal.legacy_color_scheme_missing = legacy_color_scheme_missing;
+    Ok(settings)
 }
 
 /// 对原始 TOML 做注释和扩展字段保留式更新，仅在创建文件时初始化 schema 版本。

@@ -123,7 +123,9 @@ pub(super) fn inspect_journals(root: &Path) -> AppResult<JournalScan> {
                 recovery_pending: journal.state != JournalState::Committed,
                 committed: journal.state == JournalState::Committed,
                 target_migration_contract: journal.files.last().map(|entry| {
-                    if entry.after_sha256 == sha256(&marker::previous_marker_bytes()) {
+                    if entry.after_sha256 == sha256(&marker::earliest_marker_bytes()) {
+                        marker::EARLIEST_MIGRATION_CONTRACT
+                    } else if entry.after_sha256 == sha256(&marker::previous_marker_bytes()) {
                         marker::PREVIOUS_MIGRATION_CONTRACT
                     } else {
                         marker::CURRENT_MIGRATION_CONTRACT
@@ -347,7 +349,7 @@ pub(super) fn require_operation_directory(root: &Path, operation_id: &str) -> Ap
     Ok(path)
 }
 
-/// 保留已发布 contract 1 的精确摘要以便原计划前滚，contract 2 才允许有旧 marker before。
+/// 保留已发布 contract 1、2 的精确摘要，以便旧计划前滚后再进入当前契约。
 pub(super) fn validate_journal(journal: &MigrationJournal) -> bool {
     let operation_id = Uuid::parse_str(&journal.operation_id);
     if journal.schema_version != JOURNAL_SCHEMA
@@ -373,14 +375,26 @@ pub(super) fn validate_journal(journal: &MigrationJournal) -> bool {
             return false;
         }
     }
+    if let Some(key) = journal
+        .files
+        .iter()
+        .find(|entry| entry.relative_path == "secrets/vault-key.toml")
+        && (key.before_sha256.is_some()
+            || !journal.files.iter().any(|entry| {
+                entry.relative_path == "secrets/vault.toml" && entry.before_sha256.is_none()
+            }))
+    {
+        return false;
+    }
     let Some(marker_entry) = journal.files.last() else {
         return false;
     };
     let current_after = marker_entry.after_sha256 == sha256(&marker::current_marker_bytes());
     let previous_after = marker_entry.after_sha256 == sha256(&marker::previous_marker_bytes());
+    let earliest_after = marker_entry.after_sha256 == sha256(&marker::earliest_marker_bytes());
     if marker_entry.relative_path != marker::MARKER_FILE_NAME
-        || !current_after && !previous_after
-        || previous_after && marker_entry.before_sha256.is_some()
+        || !current_after && !previous_after && !earliest_after
+        || earliest_after && marker_entry.before_sha256.is_some()
     {
         return false;
     }
@@ -409,6 +423,7 @@ pub(super) fn is_managed_path(path: &str) -> bool {
     if path == "settings.toml"
         || path == "hosts/groups.toml"
         || path == "secrets/vault.toml"
+        || path == "secrets/vault-key.toml"
         || path == "kerminal-config.md"
         || path == "window-state.json"
         || path == "workspace/session.json"
@@ -454,11 +469,14 @@ pub(super) fn sha256(bytes: &[u8]) -> String {
 /// 以独占方式创建 journal、staging 或备份文件，并同步其内容后才返回。
 pub(super) fn write_new_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
     ensure_parent_directories(path)?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    crate::vault::profile_migration::private_creation_mode(&mut options);
+    let mut file = options
         .open(path)
         .map_err(|source| io_error("创建迁移文件失败", source))?;
+    crate::vault::profile_migration::secure_new_file(path)
+        .map_err(|source| AppError::infrastructure_with_source("保护迁移文件失败", source))?;
     file.write_all(bytes)
         .map_err(|source| io_error("写入迁移文件失败", source))?;
     file.sync_all()

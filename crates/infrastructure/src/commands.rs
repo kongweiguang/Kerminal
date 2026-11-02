@@ -14,4 +14,6 @@ pub use catalog::FileCommandCatalogRepository;
 pub use snippet_transfer_file::SystemSnippetTransferFileAdapter;
 pub use specs::StaticSpecSuggestionProvider;
 pub mod suggestion_sources;
-pub use suggestion_sources::{RemoteCommandSuggestionProvider, RemoteSuggestionPolicy};
+pub use suggestion_sources::{
+    LocalCommandSuggestionProvider, RemoteCommandSuggestionProvider, RemoteSuggestionPolicy,
+};

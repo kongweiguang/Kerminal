@@ -172,6 +172,25 @@ impl RootView {
         files.read(cx).right_rail_acceptance_transfer_rows(target)
     }
 
+    /// 展开状态只从当前 fixture 面板读取，供真实按钮点击后的窗口验收使用。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_sftp_transfer_history_expanded(
+        &self,
+        target: &RightRailSftpTransferTarget<'_>,
+        cx: &Context<Self>,
+    ) -> Result<Option<bool>, String> {
+        let Some(files) = self.right_rail_acceptance_sftp_transfer_panel(target)? else {
+            return Ok(None);
+        };
+        if self.root_confirmation_owner.is_some() {
+            return Ok(None);
+        }
+        files
+            .read(cx)
+            .right_rail_acceptance_transfer_history_expanded(target)
+    }
+
     /// Expose the application file port for bounded SHA readback only after both fixture listings are committed.
     ///
     /// @author kongweiguang

@@ -29,7 +29,6 @@ fn keybinding(action: &str, scope: KeybindingScope, windows: &str, mac: &str) ->
         description: String::new(),
         binding: windows.to_string(),
         windows_binding: windows.to_string(),
-        windows_alternate_binding: None,
         linux_binding: None,
         mac_binding: mac.to_string(),
         scope,
@@ -394,11 +393,11 @@ fn platform_shortcut_fields_keep_legacy_fallback_and_explicit_disable() {
     let mut paste = keybinding(
         "terminal.paste",
         KeybindingScope::Terminal,
-        "Ctrl+V",
+        "Ctrl+Shift+V",
         "Cmd+V",
     );
-    paste.binding = "Ctrl+Shift+V".to_owned();
-    paste.windows_alternate_binding = Some("Ctrl+Shift+V".to_owned());
+    paste.binding = "Ctrl+V".to_owned();
+    paste.linux_binding = Some("Ctrl+V".to_owned());
     let mut close_tab = keybinding(
         "terminal.closeTab",
         KeybindingScope::Workspace,
@@ -424,15 +423,15 @@ fn platform_shortcut_fields_keep_legacy_fallback_and_explicit_disable() {
             .any(|issue| issue.kind == SettingsIssueKind::KeybindingCollision)
     );
 
-    settings.keybindings[0].windows_alternate_binding = Some(String::new());
+    // Linux 显式空值关闭该平台绑定，Windows 主键冲突保持不变。
     settings.keybindings[0].linux_binding = Some(String::new());
     assert!(
-        !validate_settings(&settings, KeyboardPlatform::Windows)
+        !validate_settings(&settings, KeyboardPlatform::Linux)
             .iter()
             .any(|issue| issue.kind == SettingsIssueKind::KeybindingCollision)
     );
     assert!(
-        !validate_settings(&settings, KeyboardPlatform::Linux)
+        validate_settings(&settings, KeyboardPlatform::Windows)
             .iter()
             .any(|issue| issue.kind == SettingsIssueKind::KeybindingCollision)
     );
@@ -440,7 +439,7 @@ fn platform_shortcut_fields_keep_legacy_fallback_and_explicit_disable() {
     // windowsBinding 为空时，旧 Linux 仍回退到通用 binding，而不是被视为无绑定。
     settings.keybindings[0].linux_binding = None;
     settings.keybindings[0].windows_binding.clear();
-    settings.keybindings[1].linux_binding = Some("Ctrl+Shift+V".to_owned());
+    settings.keybindings[1].linux_binding = Some("Ctrl+V".to_owned());
     assert!(
         validate_settings(&settings, KeyboardPlatform::Linux)
             .iter()
@@ -448,7 +447,7 @@ fn platform_shortcut_fields_keep_legacy_fallback_and_explicit_disable() {
     );
 }
 
-/// Linux 与 Windows 备用键选项仍遵守已有 128 字节上限，避免绕过平台键位校验。
+/// Linux 平台绑定仍遵守已有 128 字节上限，避免绕过平台键位校验。
 ///
 /// @author kongweiguang
 #[test]
@@ -460,17 +459,9 @@ fn optional_platform_shortcut_bindings_obey_length_limit() {
         "Ctrl+V",
         "Cmd+V",
     );
-    paste.windows_alternate_binding = Some("x".repeat(129));
+    paste.linux_binding = Some("x".repeat(129));
     settings.keybindings = vec![paste];
 
-    assert!(
-        validate_settings(&settings, KeyboardPlatform::Windows)
-            .iter()
-            .any(|issue| issue.kind == SettingsIssueKind::InvalidKeybinding)
-    );
-
-    settings.keybindings[0].windows_alternate_binding = None;
-    settings.keybindings[0].linux_binding = Some("x".repeat(129));
     assert!(
         validate_settings(&settings, KeyboardPlatform::Linux)
             .iter()
@@ -490,7 +481,6 @@ fn shortcut_option_states_survive_unrelated_settings_draft_edit() {
         "Ctrl+V",
         "Cmd+V",
     );
-    paste.windows_alternate_binding = Some(String::new());
     paste.linux_binding = Some(String::new());
     let legacy = keybinding(
         "terminal.closeTab",
@@ -509,10 +499,8 @@ fn shortcut_option_states_survive_unrelated_settings_draft_edit() {
     draft.replace_value(updated).unwrap();
 
     let paste = &draft.value().keybindings[0];
-    assert_eq!(paste.windows_alternate_binding.as_deref(), Some(""));
     assert_eq!(paste.linux_binding.as_deref(), Some(""));
     let legacy = &draft.value().keybindings[1];
-    assert_eq!(legacy.windows_alternate_binding, None);
     assert_eq!(legacy.linux_binding, None);
 }
 

@@ -171,13 +171,22 @@ fn conflicting_or_future_forward_documents_remain_untouched() {
     );
 }
 
-/// 缺少恢复文件是首次使用，未来或损坏的当前恢复文件则精确指向固定路径并保留内容。
+/// 预检兼容普通恢复与拖出准备两种当前格式；未来版本仍须阻断且保留原文件，不能当作空记录迁移。
 #[test]
 fn recovery_preflight_validates_current_format_without_inventing_old_tasks() {
     let root = tempfile::tempdir().expect("创建隔离根");
     validate_current_operational_state(root.path()).expect("缺失当前文件视为空");
     fs::create_dir(root.path().join("data")).expect("创建恢复目录");
-    let original = b"{\"schemaVersion\":2,\"records\":[]}";
+    for schema_version in [1, 2] {
+        fs::write(
+            root.path().join(TRANSFER_RECOVERY),
+            serde_json::to_vec(&json!({ "schemaVersion": schema_version, "records": [] }))
+                .expect("当前恢复格式可编码"),
+        )
+        .expect("写入当前恢复文件");
+        validate_current_operational_state(root.path()).expect("支持的恢复格式应通过预检");
+    }
+    let original = b"{\"schemaVersion\":3,\"records\":[]}";
     fs::write(root.path().join(TRANSFER_RECOVERY), original).expect("写入未来恢复文件");
     assert_eq!(
         validate_current_operational_state(root.path()).expect_err("未来记录必须阻断"),

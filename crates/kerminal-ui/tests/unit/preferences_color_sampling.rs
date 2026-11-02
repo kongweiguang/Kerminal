@@ -260,12 +260,24 @@ fn late_sample_after_rule_cancel_does_not_restore_or_change_draft(
     assert_eq!(displayed_color(&picker, visual), color_after_cancel);
 }
 
-/// 切出关键词页面会取消采样并丢弃临时编辑会话；旧回执不能修改仍被其他页面持有的 picker。
+/// 切页取消采样但保留规则草稿；同时检查身份与颜色，避免空草稿比较掩盖迟到回执覆盖。
+///
+/// @author kongweiguang
 #[gpui_kit::test]
 fn late_sample_after_page_switch_does_not_change_picker(app: &mut gpui_kit::TestAppContext) {
     let (runtime, panel, _, visual) = fixture(app);
     let sampler = DeferredSampler::new();
     let picker = prepare_sample(&panel, visual, sampler.clone());
+    let original_rule_id = visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let session = panel
+            .keyword_editor
+            .session
+            .as_ref()
+            .expect("new draft exists before sampling");
+        assert!(session.is_new);
+        session.draft.id.clone()
+    });
     start_sample(&panel, &picker, visual);
     let request = wait_for_request(&runtime, visual, &sampler);
 
@@ -274,6 +286,7 @@ fn late_sample_after_page_switch_does_not_change_picker(app: &mut gpui_kit::Test
     draw(visual);
     let color_after_page_switch = displayed_color(&picker, visual);
     let draft_after_page_switch = draft_light_foreground(&panel, visual);
+    assert_eq!(draft_after_page_switch.as_deref(), Some("#112233"));
     request.resolve(Ok(ColorSampleOutcome::Selected(SampledColor::new(
         0x44, 0x55, 0x66,
     ))));
@@ -284,10 +297,42 @@ fn late_sample_after_page_switch_does_not_change_picker(app: &mut gpui_kit::Test
         draft_light_foreground(&panel, visual),
         draft_after_page_switch
     );
-    assert!(visual.update(|_, cx| panel.read(cx).keyword_editor.session.is_none()));
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let session = panel
+            .keyword_editor
+            .session
+            .as_ref()
+            .expect("page navigation retains the rule draft");
+        assert!(session.is_new);
+        assert_eq!(session.draft.id, original_rule_id);
+    });
+    assert_eq!(
+        draft_light_foreground(&panel, visual).as_deref(),
+        Some("#112233")
+    );
+
+    click(visual, "preferences-nav-keywords");
+    draw(visual);
+    visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let session = panel
+            .keyword_editor
+            .session
+            .as_ref()
+            .expect("returning to keywords resumes the same draft");
+        assert!(session.is_new);
+        assert_eq!(session.draft.id, original_rule_id);
+    });
+    assert_eq!(
+        draft_light_foreground(&panel, visual).as_deref(),
+        Some("#112233")
+    );
 }
 
-/// 替换为另一条新规则会推进采样代际，旧颜色不能落到新的编辑身份上。
+/// 显式取消并新建会推进采样代次，旧颜色不能落到新的编辑身份上。
+///
+/// @author kongweiguang
 #[gpui_kit::test]
 fn late_sample_after_rule_replacement_does_not_change_new_draft(
     app: &mut gpui_kit::TestAppContext,
@@ -309,6 +354,7 @@ fn late_sample_after_rule_replacement_does_not_change_new_draft(
     start_sample(&panel, &picker, visual);
     let request = wait_for_request(&runtime, visual, &sampler);
 
+    click(visual, "keyword-cancel");
     click(visual, "keyword-new");
     assert!(request.cancellation.is_cancelled());
     let new_rule_id = visual.update(|_, cx| {

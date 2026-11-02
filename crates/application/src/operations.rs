@@ -735,6 +735,17 @@ impl OperationsService {
         self
     }
 
+    /// 本地 tmux 共享主机目录与 vault 解析，避免 profile 模板意外成为持久主机。
+    ///
+    /// @author kongweiguang
+    pub fn with_local_host_service(
+        mut self,
+        hosts: crate::connections::management::HostManagementService,
+    ) -> Self {
+        self.tmux = self.tmux.with_local_host_service(hosts);
+        self
+    }
+
     /// 用既有 commands 与 session service 装配代理用例，确保转发关闭会取消同一策略状态。
     pub fn with_terminal_proxy(mut self, commands: Arc<CommandsService>) -> Self {
         self.terminal_proxy = Some(TerminalProxyApplication::new(

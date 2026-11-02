@@ -196,6 +196,49 @@ async fn accepted_and_dismissed_feedback_write_minimal_audit_pairs() {
     assert!(!audit_json.contains("/srv/app"));
 }
 
+/// 新本地来源复用 schema 3 的来源族与 local target，既可记录反馈又不改变已有库结构。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn local_sources_keep_schema_three_feedback_compatible() {
+    let root = TestRoot::new();
+    let repository =
+        SqliteCommandHistoryRepository::open(StorageCoordinator::new(root.path().to_path_buf()))
+            .expect("open database");
+    for provider in [
+        SuggestionProviderKind::LocalPath,
+        SuggestionProviderKind::LocalCommand,
+    ] {
+        let mut feedback = request(
+            CommandSuggestionFeedbackAction::Accepted,
+            provider,
+            "git",
+            "git.exe",
+        );
+        feedback.target = CommandHistoryTarget::Local;
+        feedback.remote_host_id = None;
+        repository
+            .record_feedback(feedback)
+            .await
+            .expect("record local feedback");
+    }
+    let connection = Connection::open(root.database_file()).unwrap();
+    let schema: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(schema, 3);
+    for provider in ["remotePath", "remoteCommand"] {
+        let count: i64 = connection.query_row(
+            "SELECT count(*) FROM command_suggestion_feedback WHERE provider = ?1 AND target = 'local' AND remote_host_id IS NULL",
+            [provider], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
+        let audit: i64 = connection.query_row(
+            "SELECT count(*) FROM command_suggestion_audit_events WHERE provider = ?1 AND target = 'local' AND event_kind = 'feedback'",
+            [provider], |row| row.get(0)).unwrap();
+        assert_eq!(audit, 1);
+    }
+}
+
 /// 验证片段反馈只保存 `@snippet` 标记和安全 ID，不保留变量展开或输入正文。
 #[tokio::test]
 async fn snippet_feedback_discards_expanded_command_text() {

@@ -64,7 +64,7 @@ use crate::root::{
 };
 use crate::terminal_input_handler::TerminalImePreferenceHandler;
 use crate::terminal_interaction::TerminalRightClickAction;
-use crate::terminal_metrics::{TerminalMetrics, effective_cursor_shape, font_weight};
+use crate::terminal_metrics::{TerminalMetrics, cursor_visible_in_phase, effective_cursor_shape};
 use crate::theme::ThemeTokens;
 #[cfg(feature = "acceptance-metrics")]
 use kerminal_terminal::snapshot::TerminalRow;
@@ -908,11 +908,8 @@ pub(crate) fn terminal_canvas(
                     });
                 }
             }
-            let mut text_style = window.text_style();
-            text_style.font_family = metrics.font_family.clone();
-            text_style.font_size = font_size.into();
-            text_style.line_height = line_height.into();
-            text_style.font_weight = font_weight(metrics.font_weight);
+            // 正文与行内提示共享度量，避免 UI 字重继承或行高取整造成相邻字形基线错位。
+            let text_style = metrics.text_style(window);
 
             let content_width = (bounds.size.width - inset * 2.0).max(px(0.0));
             let content_height = (bounds.size.height - inset * 2.0).max(px(0.0));
@@ -1154,9 +1151,11 @@ pub(crate) fn terminal_canvas(
                     .as_ref()
                     .is_some_and(|(text, _)| !text.is_empty());
                 if snapshot.cursor.visible
-                    && (!snapshot.cursor.blinking
-                        || !metrics.cursor_blink
-                        || cursor_blink_phase_visible)
+                    && cursor_visible_in_phase(
+                        &snapshot.cursor,
+                        metrics.cursor_blink,
+                        cursor_blink_phase_visible,
+                    )
                     && snapshot.scrollback_offset == 0
                     && !ime_is_active
                     && snapshot.cursor.row < row_limit

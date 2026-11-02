@@ -2,9 +2,9 @@
 //!
 //! @author kongweiguang
 
-use super::super::OperationsView;
 use super::super::forms::{ForwardBindScope, ForwardBindScopeOption};
-use super::{localized_text, section_feedback, section_page};
+use super::super::{OperationsEvent, OperationsView, proxy_panel::ProxyForwardActionState};
+use super::{localized_text, section_page};
 use crate::theme::ThemeTokens;
 use crate::ui_button::icon_button;
 use gpui_kit::{
@@ -12,9 +12,10 @@ use gpui_kit::{
     assets::IconName,
     base::Button as BaseButton,
     component::{
-        ActiveTheme as _, Disableable, Icon, Sizable as _,
+        Disableable, Icon, Sizable as _,
         button::{Button, ButtonCustomVariant, ButtonVariants},
         input::Input,
+        menu::{DropdownMenu as _, PopupMenuItem},
         select::Select,
         tooltip::Tooltip,
     },
@@ -23,7 +24,7 @@ use gpui_kit::{
     px,
 };
 use kerminal_application::operations::ManagedPortForwardSnapshot;
-use kerminal_application::operations::PortForwardDefinition;
+use kerminal_application::sessions::UiSessionBinding;
 use kerminal_domain::identity::HostId;
 use kerminal_domain::operations::{ForwardKind, ForwardState};
 use std::net::IpAddr;
@@ -46,6 +47,156 @@ fn forward_action_button(
         .h(px(36.))
         .rounded(theme.control_radius)
         .tooltip(label)
+}
+
+/// 剪贴板结果由回读确认；成功不打断操作，失败统一交给工作区短暂提示。
+///
+/// @author kongweiguang
+fn copy_forward_text(value: &str, cx: &mut Context<OperationsView>) {
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(value.to_owned()));
+    let verified = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .is_some_and(|text| text == value);
+    if !verified {
+        cx.emit(OperationsEvent::ForwardError {
+            message: crate::locale::text(
+                "无法核对剪贴板结果，请重试。",
+                "Clipboard could not be verified; retry.",
+            )
+            .to_string(),
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForwardProxyAction {
+    Apply,
+    Restore,
+    Reconcile,
+}
+
+/// 使用同一动作词汇投影行菜单与独立恢复入口，避免当前状态对应不同操作文案。
+///
+/// @author kongweiguang
+fn forward_proxy_action_label(action: ForwardProxyAction) -> SharedString {
+    match action {
+        ForwardProxyAction::Apply => {
+            crate::locale::text("应用到当前终端", "Apply to current terminal")
+        }
+        ForwardProxyAction::Restore => {
+            crate::locale::text("恢复当前终端代理", "Restore current terminal proxy")
+        }
+        ForwardProxyAction::Reconcile => {
+            crate::locale::text("核对当前终端代理", "Check current terminal proxy")
+        }
+    }
+}
+
+/// 菜单可在终端或代理状态变化期间保持打开，点击时重核原绑定与动作资格，避免改投其它事务。
+///
+/// @author kongweiguang
+fn execute_forward_proxy_action(
+    view: &mut OperationsView,
+    forward_id: &str,
+    binding: Option<&UiSessionBinding>,
+    action: ForwardProxyAction,
+    cx: &mut Context<OperationsView>,
+) {
+    let Some(panel) = view.proxy_panel.clone() else {
+        cx.emit(OperationsEvent::ForwardError {
+            message: crate::locale::text(
+                "当前终端代理暂不可用。",
+                "Current terminal proxy is unavailable.",
+            )
+            .to_string(),
+        });
+        return;
+    };
+    let current = panel.read(cx);
+    if current.current_session().map(|session| &session.binding) != binding
+        || (action != ForwardProxyAction::Apply
+            && current.current_recovery_forward_id() != Some(forward_id))
+    {
+        cx.emit(OperationsEvent::ForwardError {
+            message: crate::locale::text(
+                "当前终端已变化，请重新操作。",
+                "The current terminal changed. Try again.",
+            )
+            .to_string(),
+        });
+        return;
+    }
+    let state = current.action_state_for_forward(forward_id);
+    let eligible = match action {
+        ForwardProxyAction::Apply => state.current_enabled,
+        ForwardProxyAction::Restore => state.restore_current && !state.busy,
+        ForwardProxyAction::Reconcile => state.reconcile_current && !state.busy,
+    };
+    if !eligible {
+        let message = if action == ForwardProxyAction::Apply {
+            state.current_reason
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            crate::locale::text(
+                "当前终端代理状态已变化，请重新操作。",
+                "The current terminal proxy state changed. Try again.",
+            )
+        });
+        cx.emit(OperationsEvent::ForwardError {
+            message: message.to_string(),
+        });
+        return;
+    }
+    panel.update(cx, |panel, cx| match action {
+        ForwardProxyAction::Apply => {
+            panel.apply_to_current_forward(forward_id.to_owned(), cx);
+        }
+        ForwardProxyAction::Restore => panel.restore_current(cx),
+        ForwardProxyAction::Reconcile => panel.reconcile_current(cx),
+    });
+}
+
+/// 原转发行消失时仍提供唯一已核实事务的操作；已有行时只保留该行菜单入口。
+///
+/// @author kongweiguang
+fn missing_forward_recovery_action(
+    rows: &[ManagedPortForwardSnapshot],
+    forward_id: &str,
+    state: &ProxyForwardActionState,
+) -> Option<ForwardProxyAction> {
+    if rows.iter().any(|row| row.forward.id == forward_id) {
+        return None;
+    }
+    if state.restore_current {
+        Some(ForwardProxyAction::Restore)
+    } else if state.reconcile_current {
+        Some(ForwardProxyAction::Reconcile)
+    } else {
+        None
+    }
+}
+
+/// 菜单可能跨异步刷新存活；只允许原目标代次中仍存在的同一转发执行写操作。
+///
+/// @author kongweiguang
+fn forward_menu_target_is_current(
+    view: &OperationsView,
+    expected: &ManagedPortForwardSnapshot,
+    generation: u64,
+) -> bool {
+    view.active
+        && view.target_generation == generation
+        && view.forwards.data().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.forward.id == expected.forward.id
+                    && row.forward.config == expected.forward.config
+                    && row.forward.state == expected.forward.state
+                    && row.persistent == expected.persistent
+            })
+        })
 }
 
 /// 运行时清单供全局代理使用；右栏必须单独按固定 SSH 主机过滤，不能显示其它主机的会话。
@@ -118,7 +269,10 @@ fn forward_direction_labels(kind: ForwardKind) -> (SharedString, SharedString) {
 }
 
 impl OperationsView {
-    /// main 的标题卡与会话容器分别成组；成功和错误在标题内反馈，不增设全局结果卡。
+    /// 列表只展示隧道状态和动作；刷新保留最近成功布局，只旋转原按钮内的刷新图标。
+    /// 失败由工作区提示，恢复入口始终绑定原事务，已确认的空态不因一次读取失败而闪退。
+    /// 菜单点击时复核原复选状态，避免打开期间的策略变化把用户意图反向执行。
+    /// 添加按钮与刷新使用统一的次级样式，减少不同主题下的颜色分支。
     /// 容器目标显示专用提示且不改变 HostId 写入门禁。
     ///
     /// @author kongweiguang
@@ -172,6 +326,15 @@ impl OperationsView {
             })
             .collect::<Vec<_>>();
         let empty = rows.is_empty();
+        let orphan_recovery = (|| {
+            let panel = self.proxy_panel.as_ref()?.read(cx);
+            let forward_id = panel.current_recovery_forward_id()?;
+            let state = panel.action_state_for_forward(forward_id);
+            let action = missing_forward_recovery_action(&rows, forward_id, &state)?;
+            let binding = panel.current_session()?.binding.clone();
+            Some((forward_id.to_owned(), binding, action, state.busy))
+        })();
+        let target_generation = self.target_generation;
         let target_label = self.tool_rail_target_label();
         let endpoint_label = self
             .host_target
@@ -179,10 +342,15 @@ impl OperationsView {
             .and_then(|host_id| self.host_subtitles.get(host_id))
             .map(|subtitle| forward_host_endpoint_label(subtitle.as_ref()).to_owned())
             .unwrap_or(target_label);
-        let count_label = crate::locale::text(
-            format!("{} 个会话", rows.len()),
-            format!("{} sessions", rows.len()),
-        );
+        let count_label = self
+            .forwards
+            .data()
+            .map_or_else(SharedString::default, |_| {
+                crate::locale::text(
+                    format!("{} 个会话", rows.len()),
+                    format!("{} sessions", rows.len()),
+                )
+            });
         let mut body = div().w_full().flex().flex_col().gap_3();
         body = body.child(
             div()
@@ -235,52 +403,20 @@ impl OperationsView {
                                 .child(count_label),
                         ),
                 )
-                .children(self.compact_operation_feedback(theme))
-                .when_some(
-                    self.forward_success_notice
-                        .as_ref()
-                        .filter(|_| self.compact_layout && self.status.is_none()),
-                    |header, message| {
-                        header.child(
-                            div()
-                                .text_size(theme.text_sm)
-                                .text_color(theme.success)
-                                .child(message.clone()),
-                        )
-                    },
-                )
-                .when(
-                    self.forwards.error().is_some()
-                        || self.forwards.phase() == super::super::state::SectionPhase::Cancelled,
-                    |header| {
-                        header.child(section_feedback(
-                            &self.forwards,
-                            false,
-                            SharedString::default(),
-                            theme,
-                        ))
-                    },
-                )
                 .child(
                     div()
                         .w_full()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap_2()
                         .child(
                             Button::new("operations-forward-add")
                                 .compact()
+                                .secondary()
                                 .w(px(36.))
                                 .h(px(36.))
                                 .rounded(theme.control_radius)
-                                .custom(
-                                    ButtonCustomVariant::new(cx)
-                                        .color(theme.tunnel_action)
-                                        .foreground(cx.theme().primary_foreground)
-                                        .hover(theme.tunnel_action_hover)
-                                        .active(theme.tunnel_action)
-                                        .shadow(true),
-                                )
                                 .icon(IconName::Plus)
                                 .accessibility_label(crate::locale::text("添加隧道", "Add tunnel"))
                                 .tooltip(crate::locale::text("添加隧道", "Add tunnel"))
@@ -302,41 +438,67 @@ impl OperationsView {
                             )
                             .with_size(gpui_kit::component::Size::Medium)
                             .h(px(36.))
-                            .disabled(
+                            .debug_selector(|| "rr-forwards-refresh".to_owned())
+                            .loading_icon(IconName::RefreshCw)
+                            .loading(
                                 self.forwards.phase() == super::super::state::SectionPhase::Loading,
                             )
                             .on_click(
                                 cx.listener(|view, _: &ClickEvent, _, cx| view.load_forwards(cx)),
                             ),
+                        )
+                        .when_some(
+                            orphan_recovery,
+                            |toolbar, (forward_id, binding, action, busy)| {
+                                let label = forward_proxy_action_label(action);
+                                toolbar.child(
+                                    Button::new("operations-forward-orphan-recovery")
+                                        .compact()
+                                        .secondary()
+                                        .label(label)
+                                        .debug_selector(|| "rr-forward-orphan-recovery".to_owned())
+                                        .disabled(self.busy || busy)
+                                        .on_click(cx.listener(
+                                            move |view, _: &ClickEvent, _, cx| {
+                                                if view.busy {
+                                                    return;
+                                                }
+                                                if !view.active
+                                                    || view.target_generation != target_generation
+                                                {
+                                                    cx.emit(OperationsEvent::ForwardError {
+                                                        message: crate::locale::text(
+                                                            "当前终端已变化，请重新操作。",
+                                                            "The current terminal changed. Try again.",
+                                                        ).to_string(),
+                                                    });
+                                                    return;
+                                                }
+                                                execute_forward_proxy_action(
+                                                    view,
+                                                    &forward_id,
+                                                    Some(&binding),
+                                                    action,
+                                                    cx,
+                                                );
+                                            },
+                                        )),
+                                )
+                            },
                         ),
                 ),
         );
 
-        let mut sessions = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_2()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.panel)
-            .when(
-                self.forwards.phase() == super::super::state::SectionPhase::Loading,
-                |sessions| {
-                    sessions.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_right()
-                            .text_size(theme.text_xs)
-                            .text_color(theme.muted)
-                            .child(crate::locale::text("正在同步", "Synchronizing")),
-                    )
-                },
-            );
-        if empty {
+        let mut sessions = div().w_full().flex().flex_col().gap_2().when(
+            self.forwards.data().is_none()
+                && matches!(
+                    self.forwards.phase(),
+                    super::super::state::SectionPhase::NotLoaded
+                        | super::super::state::SectionPhase::Loading
+                ),
+            |sessions| sessions.min_h(px(96.)),
+        );
+        if empty && self.forwards.data().is_some() {
             sessions = sessions.child(
                 div()
                     .w_full()
@@ -366,21 +528,9 @@ impl OperationsView {
             let details_open = *detail_state.read(cx);
             let toggle_detail_state = detail_state.clone();
             let copy_address = forward_copy_address(&forward);
-            let copy_feedback_state = window.use_keyed_state(
-                format!("operations-forward-copy-feedback-{id}"),
-                cx,
-                |_, _| None::<String>,
-            );
-            let copy_feedback = copy_feedback_state.read(cx).clone();
             let stopped = forward.forward.state == ForwardState::Stopped;
             let start_id = id.clone();
             let stop_id = id.clone();
-            let edit_snapshot = forward.clone();
-            let definition = PortForwardDefinition {
-                id: id.clone(),
-                config: forward.forward.config.clone(),
-            };
-            let delete_definition = definition.clone();
             let kind = forward.forward.config.kind;
             let is_remote = matches!(kind, ForwardKind::Remote | ForwardKind::RemoteDynamic);
             let is_remote_socks = kind == ForwardKind::RemoteDynamic;
@@ -401,10 +551,12 @@ impl OperationsView {
                 .proxy_panel
                 .as_ref()
                 .map(|panel| panel.read(cx).action_state_for_forward(&id));
-            let proxy_feedback = self
-                .proxy_panel
-                .as_ref()
-                .and_then(|panel| panel.read(cx).feedback_for_forward(&id));
+            let menu_binding = self.proxy_panel.as_ref().and_then(|panel| {
+                panel
+                    .read(cx)
+                    .current_session()
+                    .map(|session| session.binding.clone())
+            });
             let proxy_url = forward_proxy_url(&forward);
             let user_setup_script = (is_remote_socks
                 && forward.forward.state == ForwardState::Active)
@@ -416,7 +568,6 @@ impl OperationsView {
                 .flatten();
             let user_undo_script =
                 is_remote_socks.then(|| proxy_scripts::user_proxy_undo_script(&id));
-            let has_user_proxy_scripts = user_setup_script.is_some() && user_undo_script.is_some();
             let (state_color, state_description) = match forward.forward.state {
                 ForwardState::Active => (theme.success, crate::locale::text("运行中", "Running")),
                 ForwardState::Starting => {
@@ -428,10 +579,6 @@ impl OperationsView {
                 ForwardState::Stopped => (theme.muted, crate::locale::text("已退出", "Exited")),
                 ForwardState::Failed => (theme.error, crate::locale::text("异常", "Failed")),
             };
-            let failure = forward.failure_code.map_or_else(String::new, |code| {
-                format!(" · {} {code:?}", localized_text("错误", "error"))
-            });
-
             let mut row = div()
                 .w_full()
                 .flex()
@@ -440,7 +587,7 @@ impl OperationsView {
                 .gap_3()
                 .when(self.compact_layout, |row| row.gap_0())
                 .p_3()
-                .rounded_xl()
+                .rounded(theme.radius)
                 .border_1()
                 .border_color(theme.border)
                 .bg(theme.muted_surface())
@@ -500,15 +647,7 @@ impl OperationsView {
                                     Tooltip::new(route_tooltip.clone()).build(window, cx)
                                 })
                                 .aria_label(route_accessible),
-                        )
-                        .when(!failure.is_empty(), |content| {
-                            content.child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(theme.subtle)
-                                    .child(failure.clone()),
-                            )
-                        }),
+                        ),
                 );
             let mut actions = div().mt_3().flex().flex_wrap().gap_2().child(
                 Button::new(format!("forward-details-{id}"))
@@ -540,7 +679,6 @@ impl OperationsView {
                     })),
             );
 
-            let copy_state = copy_feedback_state.clone();
             let copied_address = copy_address.clone();
             actions = actions.child(
                 forward_action_button(
@@ -551,198 +689,9 @@ impl OperationsView {
                 )
                 .with_size(gpui_kit::component::Size::Medium)
                 .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
-                        copied_address.clone(),
-                    ));
-                    let verified = cx
-                        .read_from_clipboard()
-                        .and_then(|item| item.text())
-                        .is_some_and(|text| text == copied_address);
-                    let message = if verified {
-                        crate::locale::text("地址已复制。", "Address copied.")
-                    } else {
-                        crate::locale::text(
-                            "无法核对剪贴板结果；请重试或手动复制地址。",
-                            "Clipboard could not be verified; retry or copy the address manually.",
-                        )
-                    }
-                    .to_string();
-                    copy_state.update(cx, |feedback, cx| {
-                        *feedback = Some(message);
-                        cx.notify();
-                    });
+                    copy_forward_text(&copied_address, cx);
                 })),
             );
-
-            let edit_button = forward_action_button(
-                theme,
-                format!("forward-edit-{id}"),
-                IconName::Pencil,
-                crate::locale::text("编辑隧道", "Edit tunnel"),
-            )
-            .with_size(gpui_kit::component::Size::Medium)
-            .disabled(self.busy)
-            .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
-                view.prepare_forward_edit(edit_snapshot.clone(), window, cx)
-            }));
-            actions = actions.child(edit_button);
-
-            if is_remote_socks {
-                let apply_id = id.clone();
-                let reconcile_current = proxy_action_state
-                    .as_ref()
-                    .is_some_and(|state| state.reconcile_current);
-                let apply_enabled = proxy_action_state
-                    .as_ref()
-                    .is_some_and(|state| state.current_enabled)
-                    || reconcile_current;
-                let apply_tooltip = proxy_action_state
-                    .as_ref()
-                    .filter(|_| !reconcile_current)
-                    .and_then(|state| state.current_reason.clone())
-                    .unwrap_or_else(|| {
-                        if reconcile_current {
-                            crate::locale::text(
-                                "核对当前终端代理状态",
-                                "Check current terminal proxy state",
-                            )
-                        } else {
-                            crate::locale::text("注入当前终端", "Inject into current terminal")
-                        }
-                    });
-                let current_button = forward_action_button(
-                    theme,
-                    format!("forward-proxy-current-{id}"),
-                    IconName::Terminal,
-                    apply_tooltip,
-                )
-                .with_size(gpui_kit::component::Size::Medium)
-                .disabled(!apply_enabled || self.busy)
-                .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                    if let Some(panel) = view.proxy_panel.clone() {
-                        panel.update(cx, |panel, cx| {
-                            if reconcile_current {
-                                panel.select_forward(apply_id.clone(), cx);
-                                panel.reconcile_current(cx);
-                            } else {
-                                panel.apply_to_current_forward(apply_id.clone(), cx);
-                            }
-                        });
-                    }
-                }));
-                actions = actions.child(current_button);
-
-                let future_id = id.clone();
-                let future_active = proxy_action_state
-                    .as_ref()
-                    .is_some_and(|state| state.future_active);
-                let future_enabled = proxy_action_state
-                    .as_ref()
-                    .is_some_and(|state| state.future_enabled);
-                let future_tooltip = if future_active {
-                    crate::locale::text("关闭新终端自动使用", "Disable proxy for new terminals")
-                } else {
-                    proxy_action_state
-                        .as_ref()
-                        .and_then(|state| state.future_reason.clone())
-                        .unwrap_or_else(|| {
-                            crate::locale::text("新终端自动使用", "Use for new terminals")
-                        })
-                };
-                let mut future_button = forward_action_button(
-                    theme,
-                    format!("forward-proxy-future-{id}"),
-                    IconName::Terminal,
-                    future_tooltip,
-                )
-                .with_size(gpui_kit::component::Size::Medium)
-                .disabled(!future_enabled || self.busy)
-                .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                    if let Some(panel) = view.proxy_panel.clone() {
-                        panel.update(cx, |panel, cx| {
-                            panel.toggle_future_for_forward(future_id.clone(), cx)
-                        });
-                    }
-                }));
-                if future_active {
-                    future_button = future_button.primary();
-                }
-                actions = actions.child(future_button);
-
-                if let Some(script) = user_setup_script {
-                    let script_state = copy_feedback_state.clone();
-                    actions = actions.child(
-                        forward_action_button(theme,
-                            format!("forward-copy-user-setup-{id}"),
-                            IconName::Copy,
-                            crate::locale::text(
-                                "复制用户级配置脚本，需在远端终端手动执行",
-                                "Copy user-level setup script; run it manually in the remote terminal",
-                            ),
-                        )
-                        .with_size(gpui_kit::component::Size::Medium)
-                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
-                                script.clone(),
-                            ));
-                            let verified = cx
-                                .read_from_clipboard()
-                                .and_then(|item| item.text())
-                                .is_some_and(|text| text == script);
-                            let message = if verified {
-                                crate::locale::text("地址已复制。", "Address copied.")
-                            } else {
-                                crate::locale::text(
-                                    "无法核对剪贴板结果；请重试或手动复制地址。",
-                                    "Clipboard could not be verified; retry or copy the address manually.",
-                                )
-                            }
-                            .to_string();
-                            script_state.update(cx, |feedback, cx| {
-                                *feedback = Some(message);
-                                cx.notify();
-                            });
-                        })),
-                    );
-                }
-
-                if let Some(script) = user_undo_script {
-                    let script_state = copy_feedback_state.clone();
-                    actions = actions.child(
-                        forward_action_button(theme,
-                            format!("forward-copy-user-undo-{id}"),
-                            IconName::Copy,
-                            crate::locale::text(
-                                "复制撤销脚本，需在远端终端手动执行",
-                                "Copy undo script; run it manually in the remote terminal",
-                            ),
-                        )
-                        .with_size(gpui_kit::component::Size::Medium)
-                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
-                                script.clone(),
-                            ));
-                            let verified = cx
-                                .read_from_clipboard()
-                                .and_then(|item| item.text())
-                                .is_some_and(|text| text == script);
-                            let message = if verified {
-                                crate::locale::text("地址已复制。", "Address copied.")
-                            } else {
-                                crate::locale::text(
-                                    "无法核对剪贴板结果；请重试或手动复制地址。",
-                                    "Clipboard could not be verified; retry or copy the address manually.",
-                                )
-                            }
-                            .to_string();
-                            script_state.update(cx, |feedback, cx| {
-                                *feedback = Some(message);
-                                cx.notify();
-                            });
-                        })),
-                    );
-                }
-            }
 
             if stopped && forward.persistent {
                 actions = actions.child(
@@ -776,65 +725,229 @@ impl OperationsView {
                 );
             }
 
-            if forward.persistent {
-                actions = actions.child(
-                    forward_action_button(
-                        theme,
-                        format!("forward-delete-{id}"),
-                        IconName::Trash,
-                        crate::locale::text("删除隧道", "Delete tunnel"),
-                    )
-                    .text_color(theme.error)
-                    .with_size(gpui_kit::component::Size::Medium)
-                    .disabled(self.busy)
-                    .on_click(cx.listener(
-                        move |view, _: &ClickEvent, _, cx| {
-                            view.delete_forward_definition(delete_definition.clone(), cx)
-                        },
-                    )),
-                );
+            let entity = cx.entity().clone();
+            let menu_forward = forward.clone();
+            let menu_generation = self.target_generation;
+            let menu_busy = self.busy;
+            let menu_selector = format!("rr-forward-more-{id}");
+            let reconcile_current = proxy_action_state
+                .as_ref()
+                .is_some_and(|state| state.reconcile_current);
+            let restore_current = proxy_action_state
+                .as_ref()
+                .is_some_and(|state| state.restore_current);
+            let current_action = if reconcile_current {
+                ForwardProxyAction::Reconcile
+            } else if restore_current {
+                ForwardProxyAction::Restore
             } else {
-                let delete_runtime_id = id.clone();
-                actions = actions.child(
-                    forward_action_button(
-                        theme,
-                        format!("forward-delete-{id}"),
-                        IconName::Trash,
-                        crate::locale::text("删除隧道", "Delete tunnel"),
+                ForwardProxyAction::Apply
+            };
+            let proxy_busy = proxy_action_state.as_ref().is_some_and(|state| state.busy);
+            let future_active = proxy_action_state
+                .as_ref()
+                .is_some_and(|state| state.future_active);
+            actions = actions.child(
+                forward_action_button(
+                    theme,
+                    format!("forward-more-{id}"),
+                    IconName::Ellipsis,
+                    crate::locale::text(
+                        format!("更多隧道操作 {}", forward.forward.config.name),
+                        format!("More tunnel actions for {}", forward.forward.config.name),
+                    ),
+                )
+                .with_size(gpui_kit::component::Size::Medium)
+                .debug_selector(move || menu_selector.clone())
+                .dropdown_menu(move |menu, _, _| {
+                    let mut menu = crate::ui_popup::context_menu(menu, theme, Some(px(280.)))
+                        .max_h(px(400.))
+                        .scrollable(true);
+                    menu = menu.item(
+                        PopupMenuItem::new(crate::locale::text("编辑隧道", "Edit tunnel"))
+                            .icon(IconName::Pencil)
+                            .disabled(menu_busy)
+                            .on_click({
+                                let entity = entity.clone();
+                                let expected = menu_forward.clone();
+                                move |_, window, app| {
+                                    entity.update(app, |view, cx| {
+                                        if forward_menu_target_is_current(
+                                            view,
+                                            &expected,
+                                            menu_generation,
+                                        ) {
+                                            view.prepare_forward_edit(expected.clone(), window, cx);
+                                        }
+                                    });
+                                }
+                            }),
+                    );
+                    if is_remote_socks {
+                        menu = menu.item(PopupMenuItem::separator());
+                        let current_label = forward_proxy_action_label(current_action);
+                        menu = menu.item(
+                            PopupMenuItem::new(current_label)
+                                .disabled(proxy_busy || menu_busy)
+                                .on_click({
+                                    let entity = entity.clone();
+                                    let expected = menu_forward.clone();
+                                    let binding = menu_binding.clone();
+                                    move |_, _, app| {
+                                        entity.update(app, |view, cx| {
+                                            if view.busy {
+                                                return;
+                                            }
+                                            if !forward_menu_target_is_current(
+                                                view,
+                                                &expected,
+                                                menu_generation,
+                                            ) {
+                                                cx.emit(OperationsEvent::ForwardError {
+                                                    message: crate::locale::text(
+                                                        "隧道或当前主机已变化，请重新操作。",
+                                                        "The tunnel or current host changed. Try again.",
+                                                    ).to_string(),
+                                                });
+                                                return;
+                                            }
+                                            execute_forward_proxy_action(
+                                                view,
+                                                &expected.forward.id,
+                                                binding.as_ref(),
+                                                current_action,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                        );
+                        menu = menu.item(
+                            PopupMenuItem::new(crate::locale::text(
+                                "新终端自动使用",
+                                "Use for new terminals",
+                            ))
+                            .checked(future_active)
+                            .disabled(proxy_busy || menu_busy)
+                            .on_click({
+                                let entity = entity.clone();
+                                let expected = menu_forward.clone();
+                                move |_, _, app| {
+                                    entity.update(app, |view, cx| {
+                                        if !forward_menu_target_is_current(
+                                            view,
+                                            &expected,
+                                            menu_generation,
+                                        ) || view.busy
+                                        {
+                                            return;
+                                        }
+                                        if let Some(panel) = view.proxy_panel.clone() {
+                                            let state = panel
+                                                .read(cx)
+                                                .action_state_for_forward(&expected.forward.id);
+                                            if state.future_active != future_active {
+                                                cx.emit(OperationsEvent::ForwardError {
+                                                    message: crate::locale::text(
+                                                        "代理设置已变化，请重新打开菜单。",
+                                                        "Proxy settings changed. Reopen the menu.",
+                                                    ).to_string(),
+                                                });
+                                                return;
+                                            }
+                                            if !state.future_enabled {
+                                                cx.emit(OperationsEvent::ForwardError {
+                                                    message: state.future_reason.unwrap_or_else(|| {
+                                                        crate::locale::text(
+                                                            "后续终端代理暂不可用。",
+                                                            "Future terminal proxy is unavailable.",
+                                                        )
+                                                    }).to_string(),
+                                                });
+                                                return;
+                                            }
+                                            panel.update(cx, |panel, cx| {
+                                                panel.toggle_future_for_forward(
+                                                    expected.forward.id.clone(),
+                                                    cx,
+                                                );
+                                            });
+                                        } else {
+                                            cx.emit(OperationsEvent::ForwardError {
+                                                message: crate::locale::text(
+                                                    "后续终端代理暂不可用。",
+                                                    "Future terminal proxy is unavailable.",
+                                                )
+                                                .to_string(),
+                                            });
+                                        }
+                                    });
+                                }
+                            }),
+                        );
+                        for (script, label) in [
+                            (
+                                user_setup_script.clone(),
+                                crate::locale::text("复制配置脚本", "Copy setup script"),
+                            ),
+                            (
+                                user_undo_script.clone(),
+                                crate::locale::text("复制撤销脚本", "Copy undo script"),
+                            ),
+                        ] {
+                            if let Some(script) = script {
+                                menu = menu.item(PopupMenuItem::new(label).on_click({
+                                    let entity = entity.clone();
+                                    let expected = menu_forward.clone();
+                                    move |_, _, app| {
+                                        entity.update(app, |view, cx| {
+                                            if forward_menu_target_is_current(
+                                                view,
+                                                &expected,
+                                                menu_generation,
+                                            ) {
+                                                copy_forward_text(&script, cx);
+                                            }
+                                        });
+                                    }
+                                }));
+                            }
+                        }
+                    }
+                    menu = menu.item(PopupMenuItem::separator());
+                    menu.item(
+                        PopupMenuItem::new(crate::locale::text("删除隧道", "Delete tunnel"))
+                            .danger()
+                            .icon(IconName::Trash)
+                            .disabled(menu_busy)
+                            .on_click({
+                                let entity = entity.clone();
+                                let expected = menu_forward.clone();
+                                move |_, _, app| {
+                                    entity.update(app, |view, cx| {
+                                        if !forward_menu_target_is_current(
+                                            view,
+                                            &expected,
+                                            menu_generation,
+                                        ) || view.busy
+                                        {
+                                            return;
+                                        }
+                                        if expected.persistent {
+                                            view.request_delete_forward_definition(
+                                                expected.forward.id.clone(),
+                                                cx,
+                                            );
+                                        } else {
+                                            view.stop_forward(expected.forward.id.clone(), cx);
+                                        }
+                                    });
+                                }
+                            }),
                     )
-                    .text_color(theme.error)
-                    .with_size(gpui_kit::component::Size::Medium)
-                    .disabled(self.busy)
-                    .on_click(cx.listener(
-                        move |view, _: &ClickEvent, _, cx| {
-                            view.stop_forward(delete_runtime_id.clone(), cx)
-                        },
-                    )),
-                );
-            }
+                }),
+            );
 
-            if let Some(feedback) = proxy_feedback {
-                actions = actions.child(
-                    div()
-                        .w_full()
-                        .text_size(theme.text_xs)
-                        .text_color(if feedback.is_error {
-                            theme.error
-                        } else {
-                            theme.muted
-                        })
-                        .child(feedback.message),
-                );
-            }
-            if let Some(feedback) = copy_feedback {
-                actions = actions.child(
-                    div()
-                        .w_full()
-                        .text_size(theme.text_xs)
-                        .text_color(theme.muted)
-                        .child(feedback),
-                );
-            }
             if details_open {
                 let direction = match kind {
                     ForwardKind::Local => crate::locale::text("本机 → 主机", "Local → host"),
@@ -902,23 +1015,6 @@ impl OperationsView {
                             .child(proxy_url.clone()),
                     );
                 }
-                if is_remote_socks && has_user_proxy_scripts {
-                    details = details.child(
-                        div()
-                            .w_full()
-                            .p_2()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(theme.accent.opacity(0.2))
-                            .bg(theme.accent.opacity(0.1))
-                            .text_size(theme.text_xs)
-                            .text_color(theme.accent)
-                            .child(crate::locale::text(
-                                "脚本只写当前用户 home，不需要 root；提供备份和撤销脚本。",
-                                "Scripts write only under the current user's home, need no root, and provide backup and undo steps.",
-                            )),
-                    );
-                }
                 row = row.child(details);
             }
             row = row.child(actions);
@@ -938,7 +1034,9 @@ impl OperationsView {
     /// Root 提供单一玻璃表面、遮罩与焦点；正文保持透明，避免遮住背景采样并在圆角外漏出矩形底色。
     /// 表单只对齐 ModalShell 内容间距并独立于右栏布局。
     /// 宽度封顶 1024px，低于 720px 时纵向排列端点，避免窄窗口压缩输入控件；忙碌时继续等待真实用例回执。
-    /// 标题、校验反馈与操作栏固定，只有字段正文滚动；高度使用 Root 扣除边框后的预算。
+    /// 标题与操作栏固定，错误由根层右下角通知承载，不在正文插入反馈挤动输入框。
+    /// 主动作保持稳定文案与尺寸；保存结果未知时只核对原请求，不把核对伪装成启动。
+    /// 只有字段正文滚动；高度使用 Root 扣除边框后的预算。
     ///
     /// @author kongweiguang
     pub(in crate::features::operations) fn render_forward_form_modal(
@@ -1506,20 +1604,6 @@ impl OperationsView {
             );
         }
 
-        if let Some(status) = self.status.as_ref() {
-            content = content.child(
-                div()
-                    .id("forward-form-feedback")
-                    .w_full()
-                    .p_3()
-                    .rounded_md()
-                    .bg(theme.error.opacity(0.1))
-                    .text_size(theme.text_xs)
-                    .text_color(theme.error)
-                    .child(status.clone()),
-            );
-        }
-
         let mut footer = div()
             .w_full()
             .flex_shrink_0()
@@ -1555,7 +1639,11 @@ impl OperationsView {
                         .border_1()
                         .border_color(theme.tool_panel_border)
                         .custom(footer_action_style)
-                        .label(crate::locale::text("取消", "Cancel"))
+                        .label(if self.forward_save_pending.is_some() {
+                            crate::locale::text("关闭", "Close")
+                        } else {
+                            crate::locale::text("取消", "Cancel")
+                        })
                         .disabled(cancel_disabled)
                         .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
                             view.cancel_forward_form(cx);
@@ -1571,12 +1659,19 @@ impl OperationsView {
                         .border_1()
                         .border_color(theme.tool_panel_border)
                         .custom(footer_action_style)
-                        .when(
-                            self.forward_edit_expected.is_none() && !self.busy,
-                            |button| button.icon(IconName::Plus),
-                        )
-                        .label(if self.busy {
-                            crate::locale::text("正在处理…", "Working…")
+                        .icon(if self.forward_save_pending.is_some() {
+                            IconName::RefreshCw
+                        } else if self.forward_edit_expected.is_some() {
+                            IconName::Check
+                        } else {
+                            IconName::Plus
+                        })
+                        .loading(self.busy)
+                        .when(self.forward_save_pending.is_some(), |button| {
+                            button.loading_icon(IconName::RefreshCw)
+                        })
+                        .label(if self.forward_save_pending.is_some() {
+                            crate::locale::text("核对保存状态", "Check save status")
                         } else if self.forward_edit_expected.is_some() {
                             crate::locale::text("保存修改", "Save changes")
                         } else {

@@ -58,12 +58,20 @@ impl Render for OperationsView {
             theme
         };
         let dedicated_header = self.section_selection.is_fixed();
+        let fill_compose_yaml = self.compact_layout
+            && self.section_selection.active() == OperationsSection::Containers
+            && matches!(
+                self.container_host.page(),
+                container_panel::ContainerHostPage::ComposeProject { .. }
+            )
+            && self.container_host.project_tab() == container_panel::ComposeProjectTab::Yaml;
         let mut section_content = div()
             .w_full()
             .flex()
             .flex_col()
             .gap_3()
-            .when(self.compact_layout, |body| body.gap_2());
+            .when(self.compact_layout, |body| body.gap_2())
+            .when(fill_compose_yaml, |body| body.h_full().min_h_0());
         match self.section_selection.active() {
             OperationsSection::ServerInfo => {
                 section_content = section_content.child(self.render_server(theme, cx));
@@ -85,7 +93,11 @@ impl Render for OperationsView {
             .flex_col()
             .gap_3()
             .when(self.compact_layout, |body| {
-                body.flex_1().overflow_y_scroll().gap_2()
+                body.flex_1()
+                    .min_h_0()
+                    .gap_2()
+                    .when(fill_compose_yaml, |body| body.overflow_hidden())
+                    .when(!fill_compose_yaml, |body| body.overflow_y_scroll())
             })
             .child(section_content)
             .when_some(
@@ -772,9 +784,28 @@ fn section_page(
     compact: bool,
     fixed: bool,
 ) -> impl IntoElement {
+    section_page_with_fill(title, content, theme, compact, fixed, false)
+}
+
+/// YAML 预览需要明确的高度链；其它运维列表继续按内容高度滚动。
+///
+/// @author kongweiguang
+fn section_page_with_fill(
+    title: impl Into<SharedString>,
+    content: impl IntoElement,
+    theme: ThemeTokens,
+    compact: bool,
+    fixed: bool,
+    fill_height: bool,
+) -> impl IntoElement {
     let title = title.into();
     let flattened = is_fixed_compact_operations_panel(compact, fixed);
-    let mut page = div().w_full().flex().flex_col().gap_2();
+    let mut page = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .when(fill_height, |page| page.h_full().min_h_0());
     if !flattened {
         page = page
             .when(compact, |page| page.gap_1().p_2())

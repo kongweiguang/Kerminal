@@ -32,7 +32,7 @@ fn expected_local_modified(timestamp: DateTime<Utc>) -> String {
     }
 }
 
-/// main 默认时间列常驻，400px 起增加大小列，540px 前不显示权限列。
+/// 常规宽度沿用 main 的时间与大小列，540px 前不显示权限列。
 ///
 /// @author kongweiguang
 #[test]
@@ -45,12 +45,18 @@ fn dock_width_keeps_size_and_modified_columns() {
     }
 }
 
-/// 400px 以下只保留名称与时间列，防止大小和权限挤占可读名称空间。
+/// 极窄时仅保留名称；320px 起恢复时间，400px 起恢复大小列。
 ///
 /// @author kongweiguang
 #[test]
 fn narrow_width_reduces_metadata_before_name_space() {
-    for width in [0., 240., 319., 399.] {
+    for width in [0., 220., 240., 319.] {
+        let columns = FileTableColumns::for_width(px(width));
+        assert!(!columns.size);
+        assert!(!columns.modified);
+        assert!(!columns.permissions);
+    }
+    for width in [320., 399.] {
         let columns = FileTableColumns::for_width(px(width));
         assert!(!columns.size);
         assert!(columns.modified);

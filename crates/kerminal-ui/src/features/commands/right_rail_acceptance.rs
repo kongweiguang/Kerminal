@@ -15,6 +15,50 @@ const CANCELLED_RUN_SNIPPET_ID: &str = "snippet.builtin.core.find_large_files";
 const PING_SNIPPET_ID: &str = "snippet.builtin.core.ping_host";
 
 impl CommandsView {
+    /// 原生验收只读取精确来源的预览阶段，不以选中项存在冒充加载完成或取消成功。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_snippet_preview_phase(
+        &self,
+        binding: &UiSessionBinding,
+        snippet_id: &str,
+    ) -> Result<&'static str, String> {
+        if self.ui_session_binding.as_ref() != Some(binding) {
+            return Err("片段预览的 fixture 绑定已变化".to_owned());
+        }
+        let key = SnippetPreferenceKey {
+            origin: SnippetCatalogOrigin::Builtin,
+            snippet_id: snippet_id.to_owned(),
+        };
+        use super::snippet_browser::SnippetInlinePreview;
+        match &self.snippet_inline_preview {
+            SnippetInlinePreview::Loading(current) if current == &key => {
+                if self.status.is_some() {
+                    return Err("详情加载不应插入全局状态提示".to_owned());
+                }
+                Ok("loading")
+            }
+            SnippetInlinePreview::Ready(current) if current == &key => Ok("ready"),
+            SnippetInlinePreview::Failed {
+                key: current,
+                message,
+            } if current == &key => Err(message.clone()),
+            _ => Ok("collapsed"),
+        }
+    }
+
+    /// 验收结束沿生产查询和分类入口恢复目录，不把测试筛选残留到下一主题的截图。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_restore_snippet_catalog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_snippet_query(String::new(), window, cx);
+        self.select_snippet_catalog_section(SnippetCatalogSection::Common, window, cx);
+    }
+
     /// 校验导入预览与隔离样本完全一致后，只触发一次现有生产确认和批次提交流程。
     ///
     /// @author kongweiguang

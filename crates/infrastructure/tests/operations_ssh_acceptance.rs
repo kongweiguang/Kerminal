@@ -58,7 +58,7 @@ use kerminal_infrastructure::{
     storage::StorageCoordinator,
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     runtime::Handle,
     time::{Instant, sleep},
@@ -678,7 +678,7 @@ async fn exercise_operations(
     .await?;
     run_acceptance_stage(
         "forward_remote_dynamic",
-        verify_remote_dynamic_forward(fixture, &config.target),
+        verify_remote_dynamic_forward(fixture),
     )
     .await?;
     run_acceptance_stage(
@@ -970,11 +970,24 @@ async fn verify_remote_forward(
     Ok(())
 }
 
-/// 从远端 SOCKS5 客户端访问任务 sshd，覆盖 remote dynamic 的 accept 与双向数据泵。
-async fn verify_remote_dynamic_forward(
-    fixture: &OperationsFixture,
-    target: &SocketAddr,
-) -> Result<(), Box<dyn Error>> {
+/// 远端 SOCKS 必须到达 SSH 侧不能直接访问的客户端 fixture，证明出口方向及真实数据泵。
+///
+/// @author kongweiguang
+async fn verify_remote_dynamic_forward(fixture: &OperationsFixture) -> Result<(), Box<dyn Error>> {
+    let local_listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let local_port = local_listener.local_addr()?.port();
+    let isolation = run_remote(
+        &fixture.commands,
+        &fixture.host_id,
+        "python3",
+        vec![
+            "-c".to_owned(),
+            REMOTE_ASSERT_CLIENT_FIXTURE_UNREACHABLE.to_owned(),
+            local_port.to_string(),
+        ],
+    )
+    .await?;
+    ensure_remote_success(&isolation, "client fixture isolation")?;
     let snapshot = run_acceptance_stage("forward_remote_dynamic_start", async {
         let remote_port = remote_ephemeral_port(&fixture.commands, &fixture.host_id).await?;
         let bind = ForwardEndpoint::new("127.0.0.1", remote_port)
@@ -998,29 +1011,48 @@ async fn verify_remote_dynamic_forward(
     })
     .await?;
     let actual = snapshot.actual_bind.clone();
-    let result = run_acceptance_stage("forward_remote_dynamic_data", async {
-        let result = run_remote(
-            &fixture.commands,
-            &fixture.host_id,
-            "python3",
-            vec![
-                "-c".to_owned(),
-                REMOTE_SOCKS_READ_BANNER.to_owned(),
-                actual.host.clone(),
-                actual.port.get().to_string(),
-                target.port().to_string(),
-            ],
-        )
+    let probe_result: Result<(), Box<dyn Error>> = async {
+        let result = run_acceptance_stage("forward_remote_dynamic_data", async {
+            let (result, served) = tokio::join!(
+                run_remote(
+                    &fixture.commands,
+                    &fixture.host_id,
+                    "python3",
+                    vec![
+                        "-c".to_owned(),
+                        REMOTE_SOCKS_READ_LINE.to_owned(),
+                        actual.host.clone(),
+                        actual.port.get().to_string(),
+                        local_port.to_string(),
+                    ],
+                ),
+                async {
+                    let (mut stream, _) =
+                        tokio::time::timeout(Duration::from_secs(6), local_listener.accept())
+                            .await
+                            .map_err(|_| io_error("client SOCKS fixture was not reached"))??;
+                    stream.write_all(b"KERM_CLIENT_SOCKS_EGRESS\n").await?;
+                    Ok::<(), std::io::Error>(())
+                },
+            );
+            served?;
+            let result = result?;
+            ensure_remote_success(&result, "remote dynamic SOCKS data")?;
+            Ok(result)
+        })
         .await?;
-        ensure_remote_success(&result, "remote dynamic SOCKS data")?;
-        Ok(result)
-    })
-    .await?;
-    run_acceptance_stage("forward_remote_dynamic_banner", async {
-        ensure_ssh_banner(&result.stdout)
-    })
-    .await?;
-    run_acceptance_stage("forward_remote_dynamic_stop", async {
+        run_acceptance_stage("forward_remote_dynamic_client_egress", async {
+            if result.stdout != b"KERM_CLIENT_SOCKS_EGRESS\n" {
+                return Err(
+                    io_error("remote SOCKS did not return the client fixture response").into(),
+                );
+            }
+            Ok(())
+        })
+        .await
+    }
+    .await;
+    let stopped = run_acceptance_stage("forward_remote_dynamic_stop", async {
         fixture
             .operations
             .port_forwards
@@ -1028,12 +1060,27 @@ async fn verify_remote_dynamic_forward(
             .await
             .map_err(box_error)
     })
-    .await?;
-    run_acceptance_stage("forward_remote_dynamic_release", async {
+    .await;
+    let released = run_acceptance_stage("forward_remote_dynamic_release", async {
         verify_remote_port_released(&fixture.commands, &fixture.host_id, &actual).await
     })
-    .await?;
-    Ok(())
+    .await;
+    let primary = probe_result.err();
+    let mut cleanup_errors = Vec::new();
+    if let Err(error) = stopped {
+        cleanup_errors.push(("remote_dynamic_stop", error.to_string()));
+    }
+    if let Err(error) = released {
+        cleanup_errors.push(("remote_dynamic_release", error.to_string()));
+    }
+    if primary.is_none() && cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Box::new(AcceptanceFailure {
+            primary,
+            cleanup_errors,
+        }))
+    }
 }
 
 /// 为每个实际 tmux 用例调用记录静态子阶段，并保留创建回执供解析失败后的精确清理。
@@ -1881,7 +1928,20 @@ sys.stdout.buffer.write(data)
 s.close()
 "#;
 
-const REMOTE_SOCKS_READ_BANNER: &str = r#"import socket,struct,sys
+const REMOTE_ASSERT_CLIENT_FIXTURE_UNREACHABLE: &str = r#"import socket,sys
+s=socket.socket()
+s.settimeout(3)
+try:
+ s.connect(('127.0.0.1',int(sys.argv[1])))
+except ConnectionRefusedError:
+ pass
+else:
+ raise RuntimeError('client fixture is directly reachable from SSH host')
+finally:
+ s.close()
+"#;
+
+const REMOTE_SOCKS_READ_LINE: &str = r#"import socket,struct,sys
 def exact(s,n):
  data=b''
  while len(data)<n:
@@ -1903,7 +1963,7 @@ else: raise RuntimeError('SOCKS5 address type invalid')
 data=b''
 while b'\n' not in data and len(data)<1024:
  part=s.recv(1)
- if not part: raise RuntimeError('SSH banner stream closed')
+  if not part: raise RuntimeError('fixture stream closed')
  data+=part
 sys.stdout.buffer.write(data)
 s.close()

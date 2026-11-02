@@ -2955,6 +2955,9 @@ impl App {
         true
     }
 
+    /// 旧平台拖动结束时只移除其已恢复的载荷，不清掉期间新开始的内部拖动。
+    ///
+    /// @author kongweiguang
     pub(crate) fn end_platform_drag(&mut self, source_window: WindowId) -> bool {
         if !self
             .platform_owned_drag
@@ -2963,8 +2966,13 @@ impl App {
         {
             return false;
         }
+        let restored = self.platform_owned_drag.as_ref().is_some_and(|drag| {
+            matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
+        });
         self.platform_owned_drag = None;
-        self.active_drag = None;
+        if restored {
+            self.active_drag = None;
+        }
         true
     }
 

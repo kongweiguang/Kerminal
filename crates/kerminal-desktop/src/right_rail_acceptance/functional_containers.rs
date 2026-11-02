@@ -5,11 +5,13 @@
 use std::{error::Error, io};
 
 use gpui_kit::{AnyWindowHandle, AsyncApp, Entity};
+use gpui_pre::{InputEvent, KeyDownEvent, KeyUpEvent, Keystroke};
 use kerminal_domain::{
+    files::RemotePath,
     identity::{HostId, TabId},
-    operations::{ContainerAction, ContainerStatus},
+    operations::{ComposeProjectTarget, ContainerAction, ContainerStatus},
 };
-use kerminal_ui::RootView;
+use kerminal_ui::{ComposeAcceptanceOpenRequest, RootView};
 
 use super::{
     RightRailCaptureContext, ToolRailToolId, activate_dialog_tool,
@@ -71,7 +73,7 @@ pub(super) async fn run(
     let cleanup_result =
         restore_fixture_running(cx, root, window, host_id, name, &container_id).await;
 
-    match (flow_result, cleanup_result) {
+    let container_result: Result<(), Box<dyn Error>> = match (flow_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(flow), Ok(())) => Err(flow),
         (Ok(()), Err(cleanup)) => Err(cleanup),
@@ -79,6 +81,877 @@ pub(super) async fn run(
             "容器功能验收失败：{flow}；fixture 运行态恢复失败：{cleanup}"
         ))
         .into()),
+    };
+    container_result?;
+
+    run_compose_fixture(cx, root, window, capture, records, &fixture_terminal_tab_id).await
+}
+
+/// 只对本轮标签、路径和主机均匹配的 Compose fixture 执行菜单验收，并在失败后尝试恢复。
+///
+/// @author kongweiguang
+async fn run_compose_fixture(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+    terminal_tab_id: &TabId,
+) -> Result<(), Box<dyn Error>> {
+    let host = &capture.fixture_host_id;
+    let run_id = capture
+        .fixture_container_name
+        .strip_prefix("kerminal-rr-")
+        .ok_or_else(|| io::Error::other("容器 fixture 名称缺少运行 ID"))?;
+    let project_name = format!("kerminal-rr-compose-{run_id}");
+    let target = poll_root(cx, root, window, "Compose fixture 目标", |root, _, cx| {
+        root.right_rail_acceptance_compose_target(host, &project_name, cx)
+    })
+    .await?;
+    let fixture_root = format!("/run/kerminal-right-rail-{run_id}");
+    if capture.remote_sftp_directory != format!("{fixture_root}/home/sftp")
+        || target.host_id.as_ref() != Some(host)
+        || target.project != project_name
+        || target.working_dir != fixture_root
+        || target.config_files.len() != 1
+        || target.config_files[0] != format!("{fixture_root}/compose.yml")
+    {
+        return Err(io::Error::other("Compose fixture 的宿主、运行 ID 或配置路径不匹配").into());
+    }
+    let flow_result =
+        run_compose_flow(cx, root, window, capture, records, terminal_tab_id, &target).await;
+    let restore_result =
+        match activate_compose_terminal(cx, root, window, host, terminal_tab_id).await {
+            Ok(()) => restore_compose_fixture(cx, root, window, host, &target).await,
+            Err(error) => Err(error),
+        };
+    match (flow_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(flow), Ok(())) => Err(flow),
+        (Ok(()), Err(restore)) => Err(restore),
+        (Err(flow), Err(restore)) => Err(io::Error::other(format!(
+            "Compose 验收失败：{flow}；fixture 恢复失败：{restore}"
+        ))
+        .into()),
+    }
+}
+
+/// 每个动作都从真实更多菜单触发，再读取同一项目的生产列表与 inspect 回执。
+///
+/// @author kongweiguang
+async fn run_compose_flow(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+    terminal_tab_id: &TabId,
+    target: &ComposeProjectTarget,
+) -> Result<(), Box<dyn Error>> {
+    let host = &capture.fixture_host_id;
+    select_compose_fixture(cx, root, window, host, target).await?;
+    let original_id = wait_compose_container(
+        cx,
+        root,
+        window,
+        (host, target),
+        None,
+        Some(ContainerStatus::Running),
+        "Compose 初始状态",
+    )
+    .await?
+    .ok_or_else(|| io::Error::other("Compose 初始容器缺失"))?;
+    verify_compose_file_identity(cx, root, window, capture, records, terminal_tab_id, target)
+        .await?;
+    verify_compose_yaml_rejections(cx, root, window, host, terminal_tab_id, target).await?;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-yaml-target-rejected",
+        "wrong_host_and_unowned_yaml_path_rejected_without_opening_a_tab",
+    )
+    .await?;
+
+    open_compose_menu(cx, root, window, host, target).await?;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-menu-open",
+        "production_compose_more_menu_visible_in_the_native_window",
+    )
+    .await?;
+    send_compose_menu_key(cx, window, "escape")?;
+    wait_compose_popup(cx, root, window, false).await?;
+
+    choose_compose_menu_action(cx, root, window, host, target, 1).await?;
+    wait_compose_container(
+        cx,
+        root,
+        window,
+        (host, target),
+        Some(&original_id),
+        Some(ContainerStatus::Exited),
+        "Compose stop 回读",
+    )
+    .await?;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-stopped",
+        "same_owned_compose_container_exited_after_stop",
+    )
+    .await?;
+
+    choose_compose_menu_action(cx, root, window, host, target, 0).await?;
+    wait_compose_container(
+        cx,
+        root,
+        window,
+        (host, target),
+        Some(&original_id),
+        Some(ContainerStatus::Running),
+        "Compose up 回读",
+    )
+    .await?;
+    let started_at = read_started_at(cx, root, window, host, &original_id).await?;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-up",
+        "same_owned_compose_container_running_after_up",
+    )
+    .await?;
+
+    choose_compose_menu_action(cx, root, window, host, target, 2).await?;
+    wait_compose_container(
+        cx,
+        root,
+        window,
+        (host, target),
+        Some(&original_id),
+        Some(ContainerStatus::Running),
+        "Compose restart 回读",
+    )
+    .await?;
+    let deadline = std::time::Instant::now() + super::PANEL_FRAME_TIMEOUT;
+    let restarted_at = loop {
+        let restarted_at = read_started_at(cx, root, window, host, &original_id).await?;
+        if restarted_at != started_at {
+            break restarted_at;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::other("Compose restart 未改变真实 StartedAt").into());
+        }
+        cx.background_executor()
+            .timer(super::PANEL_FRAME_POLL)
+            .await;
+    };
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-restarted",
+        "same_owned_compose_container_has_new_started_at",
+    )
+    .await?;
+
+    choose_compose_menu_action(cx, root, window, host, target, 3).await?;
+    wait_compose_confirmation(cx, root, window, host, target).await?;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-down-confirmation",
+        "production_down_confirmation_shows_exact_fixture_target",
+    )
+    .await?;
+    poll_root(cx, root, window, "取消 Compose down", |root, _, cx| {
+        root.right_rail_acceptance_cancel_compose_down(host, target, cx)
+            .map(|()| Some(()))
+    })
+    .await?;
+    wait_compose_container(
+        cx,
+        root,
+        window,
+        (host, target),
+        Some(&original_id),
+        Some(ContainerStatus::Running),
+        "取消 Compose down 回读",
+    )
+    .await?;
+    let after_cancel_started_at = read_started_at(cx, root, window, host, &original_id).await?;
+    if after_cancel_started_at != restarted_at {
+        return Err(io::Error::other("取消 Compose down 后容器启动时间发生变化").into());
+    }
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-down-cancelled",
+        "owned_compose_container_remains_running_after_cancel",
+    )
+    .await?;
+
+    choose_compose_menu_action(cx, root, window, host, target, 3).await?;
+    wait_compose_confirmation(cx, root, window, host, target).await?;
+    poll_root(cx, root, window, "确认 Compose down", |root, _, cx| {
+        root.right_rail_acceptance_confirm_compose_down(host, target, cx)
+            .map(|()| Some(()))
+    })
+    .await?;
+    wait_compose_container(
+        cx,
+        root,
+        window,
+        (host, target),
+        None,
+        None,
+        "Compose down 回读",
+    )
+    .await?;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-down",
+        "owned_compose_container_absent_after_confirmed_down",
+    )
+    .await?;
+
+    choose_compose_menu_action(cx, root, window, host, target, 0).await?;
+    let recreated_id = wait_compose_container(
+        cx,
+        root,
+        window,
+        (host, target),
+        None,
+        Some(ContainerStatus::Running),
+        "Compose down 后再次 up",
+    )
+    .await?
+    .ok_or_else(|| io::Error::other("Compose 再次启动未发现容器"))?;
+    if recreated_id == original_id {
+        return Err(
+            io::Error::other("Compose down 后容器 ID 未变化，无法证明容器被拆除并重建").into(),
+        );
+    }
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-up-after-down",
+        "retained_exact_project_recreated_owned_running_container",
+    )
+    .await?;
+    Ok(())
+}
+
+/// 两种入口依次打开同一远端文件，回读真实内容、唯一标签和只读收紧，避免仅验证事件受理。
+///
+/// @author kongweiguang
+async fn verify_compose_file_identity(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+    terminal_tab_id: &TabId,
+    target: &ComposeProjectTarget,
+) -> Result<(), Box<dyn Error>> {
+    let host = &capture.fixture_host_id;
+    let content_future = window
+        .update(cx, |_, _, app| {
+            root.update(app, |root, cx| {
+                root.right_rail_acceptance_read_compose_fixture(host, target, cx)
+            })
+        })?
+        .map_err(io::Error::other)?;
+    let expected = content_future.await.map_err(io::Error::other)?;
+
+    // 前一轮 Compose 验收可能保留标签；先通过生产入口激活并关闭，保证两个顺序从空状态开始。
+    open_fixture_as_file(cx, root, window, host, terminal_tab_id, target).await?;
+    let (_, initial_readonly) = poll_root(
+        cx,
+        root,
+        window,
+        "现有 Compose 文件就绪",
+        |root, _, cx| {
+            if let Some(id) = root.right_rail_acceptance_compose_fixture_file_ready(
+                host, target, &expected, true, cx,
+            )? {
+                return Ok(Some((id, true)));
+            }
+            Ok(root
+                .right_rail_acceptance_compose_fixture_file_ready(
+                    host, target, &expected, false, cx,
+                )?
+                .map(|id| (id, false)))
+        },
+    )
+    .await?;
+    close_fixture_file(cx, root, window, host, target, &expected, initial_readonly).await?;
+    return_to_compose_terminal(cx, root, window, host, terminal_tab_id, target).await?;
+
+    open_fixture_as_file(cx, root, window, host, terminal_tab_id, target).await?;
+    let file_first = wait_fixture_file(cx, root, window, host, target, &expected, false).await?;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-yaml-file-first",
+        "ordinary_file_opened_one_editable_tab_with_exact_fixture_content",
+    )
+    .await?;
+    request_fixture_compose_config(cx, root, window, host, terminal_tab_id, target).await?;
+    let restricted = wait_fixture_file(cx, root, window, host, target, &expected, true).await?;
+    if restricted != file_first {
+        return Err(io::Error::other("Compose 入口未复用普通文件标签").into());
+    }
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-yaml-file-first-reused",
+        "compose_reused_the_same_tab_and_restricted_it_to_readonly",
+    )
+    .await?;
+    close_fixture_file(cx, root, window, host, target, &expected, true).await?;
+    return_to_compose_terminal(cx, root, window, host, terminal_tab_id, target).await?;
+
+    request_fixture_compose_config(cx, root, window, host, terminal_tab_id, target).await?;
+    let compose_first = wait_fixture_file(cx, root, window, host, target, &expected, true).await?;
+    open_fixture_as_file(cx, root, window, host, terminal_tab_id, target).await?;
+    let reopened = wait_fixture_file(cx, root, window, host, target, &expected, true).await?;
+    if reopened != compose_first {
+        return Err(io::Error::other("普通文件入口未复用 Compose 只读标签").into());
+    }
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "compose-yaml-compose-first-reused",
+        "ordinary_file_reused_the_same_compose_tab_without_relaxing_readonly",
+    )
+    .await?;
+    close_fixture_file(cx, root, window, host, target, &expected, true).await?;
+    return_to_compose_terminal(cx, root, window, host, terminal_tab_id, target).await
+}
+
+/// 只发起一次经过上下文核对的普通文件打开，完成状态由独立回读判断。
+///
+/// @author kongweiguang
+async fn open_fixture_as_file(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    terminal_tab_id: &TabId,
+    target: &ComposeProjectTarget,
+) -> Result<(), Box<dyn Error>> {
+    poll_root(
+        cx,
+        root,
+        window,
+        "普通入口打开 Compose fixture",
+        |root, window, cx| {
+            root.open_right_rail_acceptance_compose_fixture_as_file(
+                host,
+                terminal_tab_id,
+                target,
+                window,
+                cx,
+            )
+            .map(|requested| requested.then_some(()))
+        },
+    )
+    .await
+}
+
+/// Compose 请求仍经当前生产 Operations 视图和 Root 目标门禁，不直接创建标签。
+///
+/// @author kongweiguang
+async fn request_fixture_compose_config(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    terminal_tab_id: &TabId,
+    target: &ComposeProjectTarget,
+) -> Result<(), Box<dyn Error>> {
+    poll_root(
+        cx,
+        root,
+        window,
+        "Compose 入口打开 fixture",
+        |root, _, cx| {
+            root.request_right_rail_acceptance_compose_fixture_config(
+                host,
+                terminal_tab_id,
+                target,
+                cx,
+            )
+            .map(|requested| requested.then_some(()))
+        },
+    )
+    .await
+}
+
+/// 等待导航和编辑器同时回读唯一身份与正文，权限不符时不能提前通过。
+///
+/// @author kongweiguang
+async fn wait_fixture_file(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    target: &ComposeProjectTarget,
+    expected: &str,
+    readonly: bool,
+) -> Result<TabId, Box<dyn Error>> {
+    poll_root(
+        cx,
+        root,
+        window,
+        "Compose fixture 文件正文和权限",
+        |root, _, cx| {
+            root.right_rail_acceptance_compose_fixture_file_ready(
+                host, target, expected, readonly, cx,
+            )
+        },
+    )
+    .await
+}
+
+/// 先确认目标无脏稿，再执行生产关闭并等待导航和编辑缓冲都消失。
+///
+/// @author kongweiguang
+async fn close_fixture_file(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    target: &ComposeProjectTarget,
+    expected: &str,
+    readonly: bool,
+) -> Result<(), Box<dyn Error>> {
+    poll_root(
+        cx,
+        root,
+        window,
+        "派发 Compose fixture 文件关闭",
+        |root, window, cx| {
+            root.close_right_rail_acceptance_compose_fixture_file(
+                host, target, expected, readonly, window, cx,
+            )
+            .map(|closed| closed.then_some(()))
+        },
+    )
+    .await?;
+    poll_root(
+        cx,
+        root,
+        window,
+        "Compose fixture 文件关闭回读",
+        |root, _, cx| {
+            root.right_rail_acceptance_compose_fixture_file_closed(host, target, cx)
+                .map(|closed| closed.then_some(()))
+        },
+    )
+    .await
+}
+
+/// 验收流程切回原 fixture 终端后重新选择项目，确保后续请求使用当前上下文。
+///
+/// @author kongweiguang
+async fn return_to_compose_terminal(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    terminal_tab_id: &TabId,
+    target: &ComposeProjectTarget,
+) -> Result<(), Box<dyn Error>> {
+    activate_compose_terminal(cx, root, window, host, terminal_tab_id).await?;
+    select_compose_fixture(cx, root, window, host, target).await?;
+    poll_root(
+        cx,
+        root,
+        window,
+        "恢复 Compose fixture 上下文",
+        |root, _, cx| {
+            root.right_rail_acceptance_compose_terminal_context_ready(
+                host,
+                terminal_tab_id,
+                target,
+                cx,
+            )
+            .map(|ready| ready.then_some(()))
+        },
+    )
+    .await
+}
+
+/// 失败恢复先回到原终端，保留待处理确认供原清理流程取消，避免选择项目时绕过确认。
+///
+/// @author kongweiguang
+async fn activate_compose_terminal(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    terminal_tab_id: &TabId,
+) -> Result<(), Box<dyn Error>> {
+    poll_root(
+        cx,
+        root,
+        window,
+        "恢复 Compose fixture 终端",
+        |root, window, cx| {
+            root.activate_right_rail_acceptance_compose_terminal_tab(
+                host,
+                terminal_tab_id,
+                window,
+                cx,
+            )
+            .map(|active| active.then_some(()))
+        },
+    )
+    .await
+}
+
+/// 错误主机和错误配置路径都走既有 Root 校验，拒绝请求且不得创建任何文件标签。
+///
+/// @author kongweiguang
+async fn verify_compose_yaml_rejections(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    terminal_tab_id: &TabId,
+    target: &ComposeProjectTarget,
+) -> Result<(), Box<dyn Error>> {
+    let fixture_root = RemotePath::parse(&target.working_dir)
+        .map_err(|_| io::Error::other("Compose fixture 根目录无效"))?;
+    let path = RemotePath::parse(&target.config_files[0])
+        .map_err(|_| io::Error::other("Compose fixture 文件路径无效"))?;
+    let wrong_path = fixture_root
+        .join_name("missing-compose.yml")
+        .map_err(|_| io::Error::other("Compose 拒绝路径无效"))?;
+    let tabs_before = poll_root(
+        cx,
+        root,
+        window,
+        "Compose 拒绝前标签数",
+        |root, _, _| Ok(root.right_rail_acceptance_workspace_tab_count()),
+    )
+    .await?;
+    for request in [
+        ComposeAcceptanceOpenRequest::new(
+            HostId::new(),
+            terminal_tab_id.clone(),
+            target.clone(),
+            path,
+            "compose.yml".to_owned(),
+            fixture_root.clone(),
+        ),
+        ComposeAcceptanceOpenRequest::new(
+            host.clone(),
+            terminal_tab_id.clone(),
+            target.clone(),
+            wrong_path,
+            "compose.yml".to_owned(),
+            fixture_root,
+        ),
+    ] {
+        let rejected = window.update(cx, |_, _, app| {
+            root.update(app, |root, cx| {
+                root.open_right_rail_acceptance_compose_config(&request, cx)
+            })
+        })?;
+        if rejected.is_ok() {
+            return Err(io::Error::other("错误 Compose 宿主或配置路径未被拒绝").into());
+        }
+        let tabs_after = poll_root(
+            cx,
+            root,
+            window,
+            "Compose 拒绝后标签数",
+            |root, _, _| Ok(root.right_rail_acceptance_workspace_tab_count()),
+        )
+        .await?;
+        if tabs_after != tabs_before {
+            return Err(io::Error::other("错误 Compose 请求意外创建了文件标签").into());
+        }
+    }
+    Ok(())
+}
+
+/// 页面选择始终基于已验证的完整 fixture 目标，拆除后允许选择保留的项目。
+///
+/// @author kongweiguang
+async fn select_compose_fixture(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    target: &ComposeProjectTarget,
+) -> Result<(), Box<dyn Error>> {
+    poll_root(cx, root, window, "选择 Compose fixture", |root, _, cx| {
+        root.right_rail_acceptance_select_owned_compose(host, target, cx)
+            .map(|ready| ready.then_some(()))
+    })
+    .await
+}
+
+/// 点击真实项目详情菜单并等待 Kit 弹层出现在当前帧。
+///
+/// @author kongweiguang
+async fn open_compose_menu(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    target: &ComposeProjectTarget,
+) -> Result<(), Box<dyn Error>> {
+    select_compose_fixture(cx, root, window, host, target).await?;
+    poll_root(cx, root, window, "Compose 更多按钮", |_, window, _| {
+        Ok(window
+            .debug_selector_bounds("rr-compose-project-more")
+            .filter(|bounds| !bounds.is_empty())
+            .map(|_| ()))
+    })
+    .await?;
+    if window.update(cx, |_, window, _| {
+        window.debug_selector_bounds("rr-popup-menu").is_some()
+    })? {
+        return Err(io::Error::other("打开 Compose 菜单前已有其他弹层").into());
+    }
+    super::menus::click_selector(cx, window, "rr-compose-project-more")?;
+    wait_compose_popup(cx, root, window, true).await
+}
+
+/// 菜单必须在当前真实窗口内出现或关闭，不以请求成功代替呈现状态。
+///
+/// @author kongweiguang
+async fn wait_compose_popup(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    expected_open: bool,
+) -> Result<(), Box<dyn Error>> {
+    poll_root(cx, root, window, "Compose 菜单状态", |_, window, _| {
+        let popup = window.debug_selector_bounds("rr-popup-menu");
+        if expected_open {
+            let Some(bounds) = popup else {
+                return Ok(None);
+            };
+            let viewport = window.visual_viewport_bounds();
+            let rounding = gpui_pre::px(0.01);
+            if bounds.is_empty()
+                || bounds.origin.x < viewport.origin.x - rounding
+                || bounds.origin.y < viewport.origin.y - rounding
+                || bounds.origin.x + bounds.size.width
+                    > viewport.origin.x + viewport.size.width + rounding
+                || bounds.origin.y + bounds.size.height
+                    > viewport.origin.y + viewport.size.height + rounding
+            {
+                return Err("Compose 菜单超出当前窗口可视范围".to_owned());
+            }
+            Ok(Some(()))
+        } else {
+            Ok(popup.is_none().then_some(()))
+        }
+    })
+    .await
+}
+
+/// 向隔离 GPUI 窗口发送键盘事件，不注入系统级输入或触碰用户正在使用的应用。
+///
+/// @author kongweiguang
+fn send_compose_menu_key(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    key: &str,
+) -> Result<(), Box<dyn Error>> {
+    let keystroke = Keystroke::parse(key)
+        .map_err(|error| io::Error::other(format!("Compose 菜单按键无效：{error}")))?;
+    window.update(cx, |_, window, app| {
+        let _ = window.dispatch_event(
+            KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            }
+            .to_platform_input(),
+            app,
+        );
+        let _ = window.dispatch_event(KeyUpEvent { keystroke }.to_platform_input(), app);
+    })?;
+    let _ = super::frame_signature(cx, window)?;
+    Ok(())
+}
+
+/// PopupMenu 的首个 Down 选择第一项，后续方向键与 Enter 经真实菜单执行生产回调。
+///
+/// @author kongweiguang
+async fn choose_compose_menu_action(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    target: &ComposeProjectTarget,
+    action_index: usize,
+) -> Result<(), Box<dyn Error>> {
+    if action_index > 3 {
+        return Err(io::Error::other("Compose 菜单动作序号无效").into());
+    }
+    open_compose_menu(cx, root, window, host, target).await?;
+    for _ in 0..=action_index {
+        send_compose_menu_key(cx, window, "down")?;
+    }
+    send_compose_menu_key(cx, window, "enter")?;
+    wait_compose_popup(cx, root, window, false).await
+}
+
+/// 列表只接受原完整项目的真实容器；Down 用空集合证明，重建允许产生新的 ID。
+///
+/// @author kongweiguang
+async fn wait_compose_container(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    fixture: (&HostId, &ComposeProjectTarget),
+    expected_id: Option<&str>,
+    expected_status: Option<ContainerStatus>,
+    label: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let (host, target) = fixture;
+    poll_root(cx, root, window, label, |root, _, cx| {
+        let Some(rows) = root.right_rail_acceptance_compose_owned_state(host, target, cx)? else {
+            return Ok(None);
+        };
+        match (expected_status, rows.as_slice()) {
+            (None, []) => Ok(Some(None)),
+            (Some(status), [(id, current)]) => {
+                if expected_id.is_some_and(|expected| expected != id.as_str()) {
+                    return Err("Compose fixture 容器 ID 与原对象不一致".to_owned());
+                }
+                if *current == status {
+                    Ok(Some(Some(id.clone())))
+                } else if matches!(
+                    current,
+                    ContainerStatus::Running
+                        | ContainerStatus::Exited
+                        | ContainerStatus::Created
+                        | ContainerStatus::Restarting
+                ) {
+                    Ok(None)
+                } else {
+                    Err(format!("Compose fixture 进入异常状态 {current:?}"))
+                }
+            }
+            (None, [_]) | (Some(_), []) => Ok(None),
+            _ => Err("Compose fixture 容器数量不符合隔离预期".to_owned()),
+        }
+    })
+    .await
+}
+
+/// 只把绑定完整项目的生产 Down 模态视为确认准备完成。
+///
+/// @author kongweiguang
+async fn wait_compose_confirmation(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    target: &ComposeProjectTarget,
+) -> Result<(), Box<dyn Error>> {
+    poll_root(cx, root, window, "Compose down 确认", |root, _, cx| {
+        root.right_rail_acceptance_compose_down_confirmation_ready(host, target, cx)
+            .map(|ready| ready.then_some(()))
+    })
+    .await
+}
+
+/// 失败后只恢复同一已验证项目；未知回执或无法确认所有权时停止并报告，不盲目重试。
+///
+/// @author kongweiguang
+async fn restore_compose_fixture(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    host: &HostId,
+    target: &ComposeProjectTarget,
+) -> Result<(), Box<dyn Error>> {
+    if window.update(cx, |_, window, _| {
+        window.debug_selector_bounds("rr-popup-menu").is_some()
+    })? {
+        send_compose_menu_key(cx, window, "escape")?;
+        wait_compose_popup(cx, root, window, false).await?;
+    }
+    let confirmation = window
+        .update(cx, |_, _, app| {
+            root.update(app, |root, cx| {
+                root.right_rail_acceptance_compose_down_confirmation_ready(host, target, cx)
+            })
+        })?
+        .map_err(io::Error::other)?;
+    if confirmation {
+        poll_root(
+            cx,
+            root,
+            window,
+            "取消剩余 Compose 确认",
+            |root, _, cx| {
+                root.right_rail_acceptance_cancel_compose_down(host, target, cx)
+                    .map(|()| Some(()))
+            },
+        )
+        .await?;
+    }
+    let rows = poll_root(
+        cx,
+        root,
+        window,
+        "Compose fixture 恢复前状态",
+        |root, _, cx| root.right_rail_acceptance_compose_owned_state(host, target, cx),
+    )
+    .await?;
+    match rows.as_slice() {
+        [(_, ContainerStatus::Running)] => Ok(()),
+        [] | [(_, ContainerStatus::Exited | ContainerStatus::Created)] => {
+            choose_compose_menu_action(cx, root, window, host, target, 0).await?;
+            wait_compose_container(
+                cx,
+                root,
+                window,
+                (host, target),
+                None,
+                Some(ContainerStatus::Running),
+                "恢复 Compose fixture",
+            )
+            .await?;
+            Ok(())
+        }
+        _ => Err(io::Error::other("Compose fixture 恢复状态不明确，未重试写入").into()),
     }
 }
 

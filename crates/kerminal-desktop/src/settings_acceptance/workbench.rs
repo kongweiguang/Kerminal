@@ -7,7 +7,7 @@ use gpui_pre::WindowBounds;
 use kerminal_application::{
     connections::management::{
         HostAuthenticationMode, HostDraft, HostGroupDraft, HostRouteSettings, HostSftpOptions,
-        HostTerminalOptions, RdpDisplayOptions,
+        HostTerminalOptions, LocalHostDraft, RdpDisplayOptions, RecoverableLocalHostSaveOutcome,
     },
     preferences::{ProfileDraft, ProfileRevision, VersionedProfile},
 };
@@ -16,6 +16,7 @@ use kerminal_domain::{
     preferences::ConfigRevision,
 };
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 const WORKBENCH_ACCEPTANCE_ENV: &str = "KERMINAL_WORKBENCH_ACCEPTANCE";
 const WORKBENCH_POWERSHELL_ENV: &str = "KERMINAL_WORKBENCH_ACCEPTANCE_POWERSHELL";
@@ -144,6 +145,8 @@ pub(super) fn requested() -> bool {
 }
 
 /// 使用全新配置根覆盖 fixture、终端和关闭流程，避免触碰用户配置并保证资源可独立回收。
+///
+/// @author kongweiguang
 pub(super) fn run() -> Result<(), Box<dyn Error>> {
     let options = requested_options()?;
     let output_directory = match options.output_directory {
@@ -156,6 +159,7 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     };
     let config_directory = output_directory.join("config");
     fs::create_dir(&config_directory)?;
+    drop(seed_isolated_mcp_port(&config_directory)?);
     let runtime = ApplicationRuntime::new()?;
     let mut composition = match runtime.block_on(DesktopComposition::build(
         runtime.handle(),
@@ -237,7 +241,7 @@ async fn prepare_fixture(
         id: Some(host_id.clone()),
         group_id: Some(WORKBENCH_GROUP_ID.to_owned()),
         name: WORKBENCH_HOST_NAME.to_owned(),
-        note: Some("Isolated host-details acceptance fixture; never connected.".to_owned()),
+        note: Some("Isolated sidebar menu acceptance fixture; never connected.".to_owned()),
         protocol: kerminal_domain::connections::RemoteProtocol::Ssh,
         endpoint: HostEndpoint {
             host: "127.0.0.1".to_owned(),
@@ -296,7 +300,7 @@ async fn prepare_fixture(
                         },
                         cwd: None,
                         env: std::collections::BTreeMap::new(),
-                        sidebar_group_id: Some(WORKBENCH_GROUP_ID.to_owned()),
+                        sidebar_group_id: None,
                         sort_order: 0,
                     },
                     None,
@@ -327,6 +331,46 @@ async fn prepare_fixture(
             profile_service
                 .set_default_profile(&default_profile_id, expected_revisions)
                 .await
+        })
+        .await?;
+
+    let local_host_service = services
+        .hosts
+        .clone()
+        .ok_or_else(|| io::Error::other("host management service is unavailable"))?;
+    let local_host_id = HostId::parse(WORKBENCH_PROFILE_ID)?;
+    let local_host_name = WORKBENCH_PROFILE_NAME.to_owned();
+    let local_host_group = Some(WORKBENCH_GROUP_ID.to_owned());
+    let local_shell = acceptance_profile_shell();
+    let local_args = if std::env::var_os(WORKBENCH_POWERSHELL_ENV).is_some() {
+        vec!["-NoLogo".to_owned(), "-NoProfile".to_owned()]
+    } else {
+        vec!["/D".to_owned(), "/Q".to_owned()]
+    };
+    services
+        .executor
+        .clone()
+        .run(move |_| async move {
+            let outcome = local_host_service
+                .save_local_host_recoverable(
+                    LocalHostDraft {
+                        id: Some(local_host_id),
+                        group_id: local_host_group,
+                        name: local_host_name,
+                        shell: local_shell,
+                        args: local_args,
+                        cwd: None,
+                        env: std::collections::BTreeMap::new(),
+                        sort_order: 0,
+                    },
+                    None,
+                    CancellationToken::new(),
+                )
+                .await?;
+            match outcome {
+                RecoverableLocalHostSaveOutcome::Saved { .. } => Ok(()),
+                RecoverableLocalHostSaveOutcome::OutcomeUnknown { error, .. } => Err(error),
+            }
         })
         .await?;
 
@@ -1128,7 +1172,7 @@ async fn capture_sidebar_themes(
             window,
             output_directory.join(format!("sidebar-{name}.png")),
         )?;
-        sidebar_menus::capture(cx, root, window, output_directory, name).await?;
+        sidebar_menus::capture(cx, window, output_directory, name).await?;
     }
     Ok(())
 }

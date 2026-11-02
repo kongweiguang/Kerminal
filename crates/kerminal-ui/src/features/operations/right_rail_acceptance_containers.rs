@@ -2,15 +2,265 @@
 //!
 //! @author kongweiguang
 
-use gpui_kit::{Context, Window};
+use gpui_kit::{Bounds, Context, Pixels, Window};
 use kerminal_domain::{
+    files::FileEndpoint,
     identity::HostId,
-    operations::{ContainerAction, ContainerStatus},
+    operations::{ComposeProjectTarget, ContainerAction, ContainerStatus},
 };
 
 use super::{ContainerMutationRequest, OperationsSection, OperationsView};
 
 impl OperationsView {
+    /// 读取真实编辑器及 fixture 末行的绘制边界，避免仅凭外围容器高度误判输入区已填满。
+    /// 只读查询接受 App，使根视图可核验子实体而不伪造其 Context。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_compose_editor_bounds(
+        &self,
+        host_id: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &gpui_kit::App,
+    ) -> Result<Option<(Bounds<Pixels>, Option<Bounds<Pixels>>)>, String> {
+        let Some((_, _, _, _, ready)) =
+            self.right_rail_acceptance_compose_presentation(host_id, target)?
+        else {
+            return Ok(None);
+        };
+        if !ready {
+            return Ok(None);
+        }
+        let preview = self
+            .compose_yaml
+            .preview()
+            .ok_or_else(|| "Compose 预览缺少文件回执".to_owned())?;
+        if preview.truncated {
+            return Err("Compose fixture 预览被截断".to_owned());
+        }
+        let text = std::str::from_utf8(&preview.bytes)
+            .map_err(|_| "Compose fixture 不是 UTF-8".to_owned())?;
+        let marker = "com.kerminal.fixture.kind";
+        let tail = text
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .ok_or_else(|| "Compose fixture 没有内容".to_owned())?;
+        if !tail.trim().starts_with(marker) || !tail.contains("right-rail-compose") {
+            return Err("Compose fixture 末行不符合本轮验收内容".to_owned());
+        }
+        let start = text
+            .rfind(marker)
+            .ok_or_else(|| "Compose fixture 缺少末行标识".to_owned())?;
+        let editor = self
+            .compose_yaml
+            .editor()
+            .ok_or_else(|| "Compose 预览编辑器不可用".to_owned())?
+            .read(cx);
+        if editor.value().as_ref() != text {
+            return Err("Compose 编辑器文本与原始文件回执不一致".to_owned());
+        }
+        Ok(Some((
+            editor.input_bounds(),
+            editor.range_to_bounds(&(start..start + marker.len())),
+        )))
+    }
+
+    /// 只读当前夹具项目的页面、展开和预览状态，确保真实点击没有跳到其他目标或复用旧文件回执。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_compose_presentation(
+        &self,
+        host_id: &HostId,
+        target: &ComposeProjectTarget,
+    ) -> Result<Option<(bool, bool, bool, bool, bool)>, String> {
+        use super::render::container_panel::{ComposeProjectTab, ContainerHostPage};
+
+        if self
+            .right_rail_acceptance_compose_owned_state(host_id, target)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let list = matches!(self.container_host.page(), ContainerHostPage::List);
+        let detail = matches!(
+            self.container_host.page(),
+            ContainerHostPage::ComposeProject { target: selected } if selected == target
+        );
+        let yaml = detail && self.container_host.project_tab() == ComposeProjectTab::Yaml;
+        let yaml_ready = if yaml && !self.compose_yaml.is_loading() {
+            if let Some(error) = self.compose_yaml.error() {
+                return Err(format!("Compose YAML 预览失败：{error}"));
+            }
+            self.compose_yaml.preview().is_some_and(|preview| {
+                matches!(
+                    &preview.endpoint,
+                    FileEndpoint::Remote { host_id: preview_host, path }
+                        if preview_host == host_id && path.as_str() == target.config_files[0]
+                ) && !preview.binary
+                    && !preview.bytes.is_empty()
+                    && self.compose_yaml.editor().is_some()
+            })
+        } else {
+            false
+        };
+        Ok(Some((
+            list,
+            self.container_host.is_project_expanded(target),
+            detail,
+            yaml,
+            yaml_ready,
+        )))
+    }
+
+    /// 只返回本轮隔离 Compose 项目在权威宿主列表中的实际对象；拆除后允许返回空集合。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_compose_owned_state(
+        &self,
+        host_id: &HostId,
+        target: &ComposeProjectTarget,
+    ) -> Result<Option<Vec<(String, ContainerStatus)>>, String> {
+        let run_id = validate_fixture_compose_target(host_id, target)?;
+        if self.busy || !self.right_rail_acceptance_ready(OperationsSection::Containers, host_id)? {
+            return Ok(None);
+        }
+        self.validate_container_host_context(host_id)?;
+        if !self.container_host.include_stopped() {
+            return Err("Compose fixture 回读必须包含停止容器".to_owned());
+        }
+        if target.runtime != self.runtime || !self.compose_projects.contains(target) {
+            return Err("Compose fixture 已不属于当前运行时的已知项目".to_owned());
+        }
+        if self.compose_projects.iter().any(|project| {
+            project.host_id == target.host_id
+                && project.runtime == target.runtime
+                && project.project == target.project
+                && project != target
+        }) {
+            return Err("同名 Compose 项目存在不同配置，拒绝操作 fixture".to_owned());
+        }
+        if let Some(status) = self.status.as_ref() {
+            return Err(format!("Compose 操作反馈：{status}"));
+        }
+        if self.container_write_scope_blocked() {
+            return Ok(None);
+        }
+        let rows = self
+            .containers
+            .data()
+            .ok_or_else(|| "Compose fixture 列表缺少快照".to_owned())?;
+        let mut result = Vec::new();
+        for row in rows.iter().filter(|row| {
+            row.compose
+                .as_ref()
+                .and_then(|metadata| metadata.project.as_deref())
+                == Some(target.project.as_str())
+        }) {
+            if super::state::compose_target(row).as_ref() != Some(target) {
+                return Err("同名 Compose 容器使用不同配置，拒绝操作 fixture".to_owned());
+            }
+            let owned_id = row
+                .labels
+                .iter()
+                .any(|(key, value)| key == "com.kerminal.fixture.id" && value == run_id);
+            let owned_kind = row.labels.iter().any(|(key, value)| {
+                key == "com.kerminal.fixture.kind" && value == "right-rail-compose"
+            });
+            if row.name != target.project
+                || !owned_id
+                || !owned_kind
+                || row.target.container_id.is_empty()
+            {
+                return Err("Compose 容器名称或所有权标签与本轮 fixture 不一致".to_owned());
+            }
+            result.push((row.target.container_id.clone(), row.status));
+        }
+        if result.len() > 1 {
+            return Err("Compose fixture 出现多个容器，拒绝执行验收".to_owned());
+        }
+        Ok(Some(result))
+    }
+
+    /// 同一项目拆除后仍通过已保留的完整目标打开详情，不能按同名项目重新猜路径。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_select_owned_compose(
+        &mut self,
+        host_id: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        validate_fixture_compose_target(host_id, target)?;
+        self.validate_container_host_context(host_id)?;
+        if !self.container_host.include_stopped() {
+            self.set_host_container_include_stopped(true, cx);
+            return Ok(false);
+        }
+        if self
+            .right_rail_acceptance_compose_owned_state(host_id, target)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.container_host.select_project(target.clone());
+        self.compose_yaml.select_project(target);
+        cx.notify();
+        Ok(true)
+    }
+
+    /// 模态只有在绑定本轮完整 Compose 目标时才视为就绪。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_compose_down_confirmation_ready(
+        &self,
+        host_id: &HostId,
+        target: &ComposeProjectTarget,
+    ) -> Result<bool, String> {
+        validate_fixture_compose_target(host_id, target)?;
+        self.validate_container_host_context(host_id)?;
+        Ok(self.active
+            && self.compose_pending_down.as_ref() == Some(target)
+            && self.compose_pending_context == self.container_panel_context
+            && self.root_confirmation_active())
+    }
+
+    /// 取消复用生产根模态并请求原宿主刷新，证明没有发出拆除。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_cancel_compose_down(
+        &mut self,
+        host_id: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if !self.right_rail_acceptance_compose_down_confirmation_ready(host_id, target)? {
+            return Err("没有本轮 Compose fixture 的拆除确认".to_owned());
+        }
+        self.cancel_root_confirmation(cx);
+        let ticket = self.container_action_ticket(None);
+        self.request_container_panel_refresh(self.runtime, &ticket, cx);
+        Ok(())
+    }
+
+    /// 确认仍经过原生产模态与 Root 事件，driver 必须随后回读空容器列表。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_confirm_compose_down(
+        &mut self,
+        host_id: &HostId,
+        target: &ComposeProjectTarget,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if !self.right_rail_acceptance_compose_down_confirmation_ready(host_id, target)? {
+            return Err("没有本轮 Compose fixture 的拆除确认".to_owned());
+        }
+        self.confirm_root_confirmation(cx);
+        if self.compose_pending_down.is_some() || self.status.is_some() {
+            return Err("生产 Compose 拆除确认未能提交".to_owned());
+        }
+        Ok(())
+    }
+
     /// 只从 Ready 列表返回 fixture 的真实容器 ID 和状态，避免旧快照或相似名称驱动动作。
     ///
     /// @author kongweiguang
@@ -309,6 +559,34 @@ impl OperationsView {
         }
         Ok(Some(container))
     }
+}
+
+/// 路径和项目名必须同时属于相同 run ID，禁止把验收动作转向其它 Compose 项目。
+///
+/// @author kongweiguang
+fn validate_fixture_compose_target<'a>(
+    host_id: &HostId,
+    target: &'a ComposeProjectTarget,
+) -> Result<&'a str, String> {
+    let run_id = target
+        .project
+        .strip_prefix("kerminal-rr-compose-")
+        .filter(|suffix| {
+            suffix.len() == 12
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| "Compose fixture 项目名称不符合本轮隔离规则".to_owned())?;
+    let root = format!("/run/kerminal-right-rail-{run_id}");
+    if target.host_id.as_ref() != Some(host_id)
+        || target.working_dir != root
+        || target.config_files.len() != 1
+        || target.config_files[0] != format!("{root}/compose.yml")
+    {
+        return Err("Compose fixture 宿主、目录或配置路径不匹配".to_owned());
+    }
+    Ok(run_id)
 }
 
 /// 固定 fixture 命名空间避免验收参数映射到任意用户容器。

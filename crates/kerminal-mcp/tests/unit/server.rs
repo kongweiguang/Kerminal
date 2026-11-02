@@ -16,6 +16,38 @@ use tokio_util::task::TaskTracker;
 
 use super::join_server_task;
 
+/// 远端必须使用唯一有效的 Bearer；伪造转发头不能获得回环豁免。
+#[test]
+fn lan_auth_uses_real_peer_and_rejects_missing_wrong_or_duplicate_tokens() {
+    let token = kerminal_application::mcp_runtime::McpAccessToken::new(
+        kerminal_application::mcp_runtime::MCP_TOKEN_REFERENCE.to_owned(),
+        zeroize::Zeroizing::new("synthetic-token".to_owned()),
+    )
+    .unwrap();
+    let local = "127.0.0.1".parse().unwrap();
+    let remote = "192.0.2.10".parse().unwrap();
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+    assert!(super::is_authorized_peer(local, &headers, Some(&token)));
+    assert!(!super::is_authorized_peer(remote, &headers, Some(&token)));
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        "Bearer wrong".parse().unwrap(),
+    );
+    assert!(!super::is_authorized_peer(remote, &headers, Some(&token)));
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        "Bearer synthetic-token".parse().unwrap(),
+    );
+    assert!(super::is_authorized_peer(remote, &headers, Some(&token)));
+    headers.append(
+        axum::http::header::AUTHORIZATION,
+        "Bearer synthetic-token".parse().unwrap(),
+    );
+    assert!(!super::is_authorized_peer(remote, &headers, Some(&token)));
+    assert!(!super::is_authorized_peer(remote, &headers, None));
+}
+
 /// 单次 poll 后真正丢弃等待 future；断言前释放 gate 并等待 tracker，旧实现失败也不泄漏任务。
 ///
 /// @author kongweiguang

@@ -9,6 +9,7 @@ use kerminal_domain::{
     identity::SessionId,
     sessions::{SessionInfo, SessionLifecycle, SessionOwner, SessionTarget},
 };
+use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -28,6 +29,7 @@ use crate::{
 };
 
 const RECONCILIATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const RECONCILIATION_PROMPT_WAIT: Duration = Duration::from_secs(2);
 
 /// 回读回执精确绑定原转发、session 和 transport generation。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,7 +87,7 @@ pub(super) enum ReconcileDecision {
 }
 
 impl TerminalProxyApplication {
-    /// 用同一受管 exec 通道回读未知操作；不会自动重发 apply 或 restore 脚本。
+    /// 用同一受管 exec 通道回读未知操作；完成标记与下一提示符之间的短暂间隙交给探针等待，不重发写入。
     pub async fn reconcile_current(
         &self,
         request: CurrentTerminalProxyRequest,
@@ -163,7 +165,9 @@ impl TerminalProxyApplication {
                 reason: TerminalProxyUnavailableReason::SessionBindingMismatch,
             }));
         }
-        if let Some(reason) = clean_prompt_reason(&context) {
+        if let Some(reason) = clean_prompt_reason(&context)
+            && reason != TerminalProxyUnavailableReason::PromptNotReady
+        {
             return Ok(result(TerminalProxyReconcileOutcome::NotAvailable {
                 reason,
             }));
@@ -224,7 +228,7 @@ impl TerminalProxyApplication {
             .await
     }
 
-    /// 依序查询 restore、active、backup 与环境匹配标记，任何不确定性都保留恢复状态。
+    /// 依序查询 restore、active、backup 与环境匹配标记，任何不确定性立即中断后续探针并保留恢复状态。
     async fn reconcile_application(
         &self,
         session: &SessionInfo,
@@ -274,7 +278,7 @@ impl TerminalProxyApplication {
             }
         }
 
-        let active = self
+        let active = match self
             .run_proxy_probe(
                 session,
                 context,
@@ -282,8 +286,12 @@ impl TerminalProxyApplication {
                 &probes.active,
                 cancellation.clone(),
             )
-            .await?;
-        let backups = self
+            .await?
+        {
+            ProbeResult::Value(active) => active,
+            other => return Ok(keep_probe_result(other)),
+        };
+        let backups = match self
             .run_proxy_probe(
                 session,
                 context,
@@ -291,15 +299,8 @@ impl TerminalProxyApplication {
                 &probes.backups_complete,
                 cancellation.clone(),
             )
-            .await?;
-        if let Some(decision) = unresolved_probe_pair(active.clone(), backups.clone()) {
-            return Ok(decision);
-        }
-        let active = match active {
-            ProbeResult::Value(active) => active,
-            other => return Ok(keep_probe_result(other)),
-        };
-        let backups = match backups {
+            .await?
+        {
             ProbeResult::Value(backups) => backups,
             other => return Ok(keep_probe_result(other)),
         };
@@ -363,7 +364,7 @@ impl TerminalProxyApplication {
         }
     }
 
-    /// 受管查询使用 expected binding 防止 reconnect 后向新 transport 写入探针。
+    /// 探针前后均等待原 shell 的干净提示符，防止最后一次 D 早于 B 时调用方误读终端可用性。
     async fn run_proxy_probe(
         &self,
         session: &SessionInfo,
@@ -375,6 +376,14 @@ impl TerminalProxyApplication {
         if cancellation.is_cancelled() {
             return Ok(ProbeResult::Unknown(ShellCommandUnknownReason::Cancelled));
         }
+        match self.wait_for_probe_prompt(binding, &cancellation).await {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => return Ok(ProbeResult::NotAvailable(reason)),
+            Err(error) if error.public_code() == PublicErrorCode::Cancelled => {
+                return Ok(ProbeResult::Unknown(ShellCommandUnknownReason::Cancelled));
+            }
+            Err(error) => return Err(error),
+        }
         let command_id = uuid::Uuid::new_v4().to_string();
         let request = ShellCommandRequest {
             session_id: session.session_id.clone(),
@@ -385,11 +394,20 @@ impl TerminalProxyApplication {
         };
         match self
             .sessions
-            .execute_shell_command(request, cancellation)
+            .execute_shell_command(request, cancellation.clone())
             .await
         {
-            Ok(ShellCommandOutcome::Finished { exit_code: 0, .. }) => Ok(ProbeResult::Value(true)),
-            Ok(ShellCommandOutcome::Finished { exit_code: 1, .. }) => Ok(ProbeResult::Value(false)),
+            Ok(ShellCommandOutcome::Finished {
+                exit_code: exit_code @ (0 | 1),
+                ..
+            }) => match self.wait_for_probe_prompt(binding, &cancellation).await {
+                Ok(Ok(())) => Ok(ProbeResult::Value(exit_code == 0)),
+                Ok(Err(reason)) => Ok(ProbeResult::NotAvailable(reason)),
+                Err(error) if error.public_code() == PublicErrorCode::Cancelled => {
+                    Ok(ProbeResult::Unknown(ShellCommandUnknownReason::Cancelled))
+                }
+                Err(error) => Err(error),
+            },
             Ok(ShellCommandOutcome::Finished { exit_code, .. }) => {
                 Ok(ProbeResult::Failed(exit_code))
             }
@@ -416,6 +434,69 @@ impl TerminalProxyApplication {
             },
         }
     }
+
+    /// D 表示命令结束而 B 可能稍后到达；订阅后再检查原会话，避免漏掉提示符及覆盖等待期间的用户输入。
+    ///
+    /// @author kongweiguang
+    async fn wait_for_probe_prompt(
+        &self,
+        binding: &UiSessionBinding,
+        cancellation: &CancellationToken,
+    ) -> AppResult<Result<(), TerminalProxyUnavailableReason>> {
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("代理回读已取消"));
+        }
+        let first = self
+            .sessions
+            .terminal_command_context(binding.session_id.clone())
+            .await?;
+        if first.session_id != binding.session_id
+            || first.owner != binding.owner
+            || first.session_generation != binding.session_generation
+        {
+            return Ok(Err(TerminalProxyUnavailableReason::SessionBindingMismatch));
+        }
+        let Some(reason) = clean_prompt_reason(&first) else {
+            return Ok(Ok(()));
+        };
+        if reason != TerminalProxyUnavailableReason::PromptNotReady || first.prompt_ready {
+            return Ok(Err(reason));
+        }
+
+        let mut changes = self.sessions.subscribe(binding.session_id.clone()).await?;
+        let deadline = Instant::now() + RECONCILIATION_PROMPT_WAIT;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(AppError::cancelled("代理回读已取消"));
+            }
+            let current = self
+                .sessions
+                .terminal_command_context(binding.session_id.clone())
+                .await?;
+            if current.session_id != binding.session_id
+                || current.owner != binding.owner
+                || current.session_generation != binding.session_generation
+            {
+                return Ok(Err(TerminalProxyUnavailableReason::SessionBindingMismatch));
+            }
+            if current.input_generation != first.input_generation {
+                return Ok(Err(TerminalProxyUnavailableReason::PromptNotReady));
+            }
+            match clean_prompt_reason(&current) {
+                None => return Ok(Ok(())),
+                Some(TerminalProxyUnavailableReason::PromptNotReady) if !current.prompt_ready => {}
+                Some(reason) => return Ok(Err(reason)),
+            }
+            match timeout_at(deadline, changes.recv(cancellation)).await {
+                Ok(Ok(Some(_))) => {}
+                Ok(Ok(None)) => {
+                    return Ok(Err(TerminalProxyUnavailableReason::SessionNotRunning));
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Ok(Err(TerminalProxyUnavailableReason::PromptNotReady)),
+            }
+        }
+    }
 }
 
 /// 将探针失败、取消和能力缺失转换为保留凭据的回读结果。
@@ -429,11 +510,6 @@ fn keep_probe_result(result: ProbeResult) -> ReconcileDecision {
         },
     };
     ReconcileDecision::Keep(outcome)
-}
-
-/// 两个前置布尔探针中有任一不确定值时，不推断 shell 内部代理状态。
-fn unresolved_probe_pair(first: ProbeResult, second: ProbeResult) -> Option<ReconcileDecision> {
-    unresolved_probe(first).or_else(|| unresolved_probe(second))
 }
 
 /// 将探针值之外的执行结果转换为安全的保留状态。

@@ -18,6 +18,15 @@ use super::{ContainerPanelContext, OperationsEvent, OperationsView};
 use crate::theme::ThemeTokens;
 
 impl OperationsView {
+    /// Root 只在实际隧道表单存在时抬高其提示，其他运维确认继续保留原有遮罩层级。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn is_forward_form_open(&self) -> bool {
+        self.inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.forward_form_open)
+    }
+
     /// 打开时一次性冻结目标与 pane cwd，并按 main 的目录/目标名和时间戳生成可编辑名称。
     /// @author kongweiguang
     pub(crate) fn request_tmux_create_dialog(
@@ -90,7 +99,7 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 保存会话创建身份并沿用原输入初始化；刷新可更新活动状态，但不能把旧 ID 换成新会话。
+    /// 旧快照只供浏览；就绪后冻结会话身份，避免刷新中的旧行打开可提交确认。
     /// @author kongweiguang
     pub(super) fn request_tmux_rename_dialog(
         &mut self,
@@ -98,7 +107,11 @@ impl OperationsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy || self.root_confirmation_active() || !self.tmux_target_available() {
+        if self.busy
+            || self.root_confirmation_active()
+            || !self.tmux_target_available()
+            || self.tmux.phase() != super::state::SectionPhase::Ready
+        {
             return;
         }
         let Some(session) = self.tmux.data().and_then(|snapshot| {
@@ -119,10 +132,14 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 结束确认绑定真实 ID 与 server 作用域，取消不发送命令，提交后必须等待实际回执。
+    /// 结束确认仅从就绪快照冻结真实身份；取消不发命令，提交后等待实际回执。
     /// @author kongweiguang
     pub(super) fn request_tmux_kill_dialog(&mut self, session_id: String, cx: &mut Context<Self>) {
-        if self.busy || self.root_confirmation_active() || !self.tmux_target_available() {
+        if self.busy
+            || self.root_confirmation_active()
+            || !self.tmux_target_available()
+            || self.tmux.phase() != super::state::SectionPhase::Ready
+        {
             return;
         }
         let Some(session) = self.tmux.data().and_then(|snapshot| {
@@ -352,10 +369,22 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 确认使用持有的完整目标/基线；消费后交给原用例处理取消、未知回执和资源所有权。
+    /// 确认使用持有的完整目标/基线；未知保存只核对原 ID，不重放可能已经提交的写入。
     /// @author kongweiguang
     pub(crate) fn confirm_root_confirmation(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.forward_save_pending.is_some() {
+        if self.busy {
+            return;
+        }
+        if let Some(pending) = self.forward_save_pending.as_ref() {
+            if self.is_forward_form_open()
+                && self.forward_form_host_id().as_ref() == Some(&pending.config.host_id)
+            {
+                self.reconcile_forward_save(cx);
+            }
+            return;
+        }
+        if self.is_forward_form_open() {
+            self.save_forward(true, cx);
             return;
         }
         if self.container_delete_confirmation.is_some() {
@@ -373,6 +402,21 @@ impl OperationsView {
             return;
         }
         if let Some(target) = self.compose_pending_down.clone() {
+            if !self.compose_mutation_allowed(&target) {
+                self.compose_pending_down = None;
+                self.compose_pending_context = None;
+                self.confirmed_compose_down = None;
+                self.status = Some(
+                    crate::locale::text(
+                        "Compose 目标或列表状态已变化，请刷新后重新选择。",
+                        "The Compose target or list changed. Refresh and select it again.",
+                    )
+                    .to_string(),
+                );
+                cx.emit(OperationsEvent::RootConfirmationChanged);
+                cx.notify();
+                return;
+            }
             self.compose_pending_down = None;
             let context = self.compose_pending_context.take();
             cx.emit(OperationsEvent::RootConfirmationChanged);
@@ -397,7 +441,7 @@ impl OperationsView {
             } else {
                 self.execute_compose(target, ComposeAction::Down, cx);
             }
-        } else if let Some(expected) = self.forward_pending_delete.clone() {
+        } else if let Some((expected, _)) = self.forward_pending_delete.clone() {
             self.delete_forward_definition(expected, cx);
         }
     }
@@ -462,12 +506,12 @@ impl OperationsView {
                 crate::locale::text("确认拆除", "Confirm down"),
             )
         } else {
-            let expected = self.forward_pending_delete.as_ref()?;
+            let (expected, _) = self.forward_pending_delete.as_ref()?;
             (
                 crate::locale::text("删除转发定义", "Delete forward definition"),
                 crate::locale::text(
                     format!(
-                        "名称：{}\nID：{}\nSSH 主机：{}\n类型：{:?}\n监听：{}\n目标：{}\n\n仅删除此停止态定义，不影响运行中的隧道。",
+                        "名称：{}\nID：{}\nSSH 主机：{}\n类型：{:?}\n监听：{}\n目标：{}\n\n若此隧道正在运行，将先停止，再删除此定义。",
                         expected.config.name,
                         expected.id,
                         expected.config.host_id,
@@ -480,7 +524,7 @@ impl OperationsView {
                             .map_or_else(|| "SOCKS5 动态目标".to_owned(), ToString::to_string,),
                     ),
                     format!(
-                        "Name: {}\nID: {}\nSSH host: {}\nType: {:?}\nBind: {}\nDestination: {}\n\nOnly this stopped definition will be deleted; running tunnels are unchanged.",
+                        "Name: {}\nID: {}\nSSH host: {}\nType: {:?}\nBind: {}\nDestination: {}\n\nIf this tunnel is running, it will be stopped before its definition is deleted.",
                         expected.config.name,
                         expected.id,
                         expected.config.host_id,

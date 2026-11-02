@@ -173,7 +173,9 @@ impl ConfigurationSyncService {
         self.repository.workspace_info().await
     }
 
-    /// 把安全的原子 Git 操作编排为设置页的单次同步动作；每一步失败都保留已完成阶段。
+    /// 按本地提交、远端变基和推送编排；部分完成必须保留阶段回执，不能冒充远端同步成功。
+    ///
+    /// @author kongweiguang
     pub async fn synchronize(
         &self,
         cancellation: CancellationToken,
@@ -215,7 +217,7 @@ impl ConfigurationSyncService {
                 Err(error) => {
                     return Ok(sync_run_from_stages(
                         sync_error_outcome(&error),
-                        error.public_message(),
+                        sync_error_summary(&error),
                         stages,
                     ));
                 }
@@ -230,7 +232,7 @@ impl ConfigurationSyncService {
                 Err(error) => {
                     return Ok(sync_run_from_stages(
                         sync_error_outcome(&error),
-                        error.public_message(),
+                        sync_error_summary(&error),
                         stages,
                     ));
                 }
@@ -243,7 +245,7 @@ impl ConfigurationSyncService {
                 Err(error) => {
                     return Ok(sync_run_from_stages(
                         sync_error_outcome(&error),
-                        error.public_message(),
+                        sync_error_summary(&error),
                         stages,
                     ));
                 }
@@ -262,7 +264,7 @@ impl ConfigurationSyncService {
                 Err(error) => {
                     return Ok(sync_run_from_stages(
                         sync_error_outcome(&error),
-                        error.public_message(),
+                        sync_error_summary(&error),
                         stages,
                     ));
                 }
@@ -275,7 +277,7 @@ impl ConfigurationSyncService {
                 Err(error) => {
                     return Ok(sync_run_from_stages(
                         sync_error_outcome(&error),
-                        error.public_message(),
+                        sync_error_summary(&error),
                         stages,
                     ));
                 }
@@ -287,15 +289,17 @@ impl ConfigurationSyncService {
             }
         }
 
-        let outcome = if stages.is_empty() {
+        let outcome = if status.upstream.is_none() {
+            Outcome::Blocked
+        } else if stages.is_empty() {
             Outcome::NoChanges
         } else {
             Outcome::Succeeded
         };
         let summary = if status.upstream.is_none() && stages.is_empty() {
-            "工作区没有需要提交的变更；当前分支没有上游，未执行远端同步。"
+            "工作区没有需要提交的变更；当前分支没有上游，未执行远端同步。请配置上游后重试。"
         } else if status.upstream.is_none() {
-            "本地变更已提交；当前分支没有上游，未执行远端同步。"
+            "本地变更已提交；当前分支没有上游，未执行远端同步。请配置上游后重试。"
         } else if stages.is_empty() {
             "配置已是最新状态，没有需要同步的变更。"
         } else {
@@ -382,5 +386,16 @@ fn sync_error_outcome(error: &AppError) -> ConfigurationSyncOutcome {
         PublicErrorCode::Conflict => ConfigurationSyncOutcome::Conflict,
         PublicErrorCode::Cancelled => ConfigurationSyncOutcome::Cancelled,
         _ => ConfigurationSyncOutcome::Blocked,
+    }
+}
+
+/// 认证失败只提供固定的 Git 恢复方向，不暴露远端地址或凭据助手的原始输出。
+///
+/// @author kongweiguang
+fn sync_error_summary(error: &AppError) -> &'static str {
+    if error.public_code() == PublicErrorCode::AuthenticationFailed {
+        "Git 远端认证失败，请检查系统 Git 凭据或 SSH 密钥后重试。"
+    } else {
+        error.public_message()
     }
 }

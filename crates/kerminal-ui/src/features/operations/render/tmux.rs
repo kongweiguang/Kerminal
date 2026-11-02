@@ -12,7 +12,7 @@ use super::{
 };
 use crate::theme::ThemeTokens;
 use gpui_kit::{
-    AnyElement, ClickEvent, Context, IntoElement, SharedString,
+    AnyElement, App, ClickEvent, Context, IntoElement, SharedString, Window,
     assets::IconName,
     component::{
         ActiveTheme, Disableable,
@@ -32,10 +32,17 @@ use kerminal_domain::operations::{TmuxSession, TmuxWindow};
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(in crate::features::operations) struct TmuxPanelPresentation {
     pub(super) expanded_session_ids: HashSet<String>,
-    pub(super) quickref_open: bool,
+    pub(in crate::features::operations) quickref_open: bool,
 }
 
 impl TmuxPanelPresentation {
+    /// 验收读取真实披露状态，不开放跨模块修改或额外网络入口。
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
+    pub(in crate::features::operations) fn acceptance_quickref_open(&self) -> bool {
+        self.quickref_open
+    }
+
     /// 同一面板可独立展开多个会话，稳定 session ID 使列表刷新和重排不改变用户选择。
     ///
     /// @author kongweiguang
@@ -643,7 +650,7 @@ impl OperationsView {
         .into_any_element()
     }
 
-    /// 固定右栏沿用 main 的 16px 卡片间距；无文案反馈不挂载为空节点，避免多占一组 flex gap。
+    /// 固定右栏沿用 main 的 16px 卡片间距；历史快照只供浏览，读取完成前不开放变更入口。
     ///
     /// @author kongweiguang
     fn render_tmux_tool_rail(
@@ -652,11 +659,12 @@ impl OperationsView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let capability = self.tmux.data().map(|snapshot| &snapshot.capability);
-        let create_enabled = super::super::actions::tmux_session_creation_enabled(
-            self.busy,
-            self.tmux_target_available(),
-            capability,
-        );
+        let create_enabled = self.tmux.phase() == SectionPhase::Ready
+            && super::super::actions::tmux_session_creation_enabled(
+                self.busy,
+                self.tmux_target_available(),
+                capability,
+            );
         let mut body = div()
             .w_full()
             .flex()
@@ -677,7 +685,7 @@ impl OperationsView {
                     theme,
                 ));
             }
-            body = body.child(self.render_tmux_tool_rail_sessions(theme, cx));
+            body = body.children(self.render_tmux_tool_rail_sessions(theme, cx));
         } else {
             body = body.child(tmux_empty_state(
                 crate::locale::text("目标不可用", "Target unavailable"),
@@ -715,7 +723,8 @@ impl OperationsView {
         tmux_ssh_host_display_label(display_name.as_deref(), host_id.as_str())
     }
 
-    /// 状态卡沿用 main 的中性描边图标表面；动作保留当前 pane 身份门禁，版本补充能力状态。
+    /// 刷新只在固定尺寸按钮内转动图标，版本与已有内容保持稳定，避免等待文案挤动正文。
+    /// 动作继续保留当前 pane 身份门禁，失败状态不冒充已就绪。
     ///
     /// @author kongweiguang
     fn render_tmux_tool_rail_header(
@@ -825,9 +834,12 @@ impl OperationsView {
                             .gap_1()
                             .child(
                                 Button::new("operations-tmux-refresh")
+                                    .debug_selector(|| "rr-tmux-refresh".into())
                                     .compact()
                                     .ghost()
                                     .icon(IconName::RefreshCw)
+                                    .loading_icon(IconName::RefreshCw)
+                                    .loading(self.tmux.phase() == SectionPhase::Loading)
                                     .accessibility_label(crate::locale::text("刷新", "Refresh"))
                                     .tooltip(crate::locale::text("刷新", "Refresh"))
                                     .disabled(!refresh_enabled)
@@ -870,6 +882,7 @@ impl OperationsView {
             .child(
                 div()
                     .w_full()
+                    .min_h_4()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -882,28 +895,33 @@ impl OperationsView {
             )
     }
 
-    /// 将会话状态压缩成 main 的四种空态，并只为已读到的可用列表创建稳定身份行。
+    /// 同目标刷新继续展示最后成功快照；首载仅由刷新按钮表示等待，不插入临时占位卡。
+    /// 无快照的失败由独立错误反馈承载，只有真实成功结果才能显示“暂无会话”。
     ///
     /// @author kongweiguang
     fn render_tmux_tool_rail_sessions(
         &self,
         theme: ThemeTokens,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        match self.tmux.phase() {
-            SectionPhase::Loading => {
-                return tmux_empty_state(
-                    crate::locale::text("正在读取会话", "Loading sessions"),
-                    crate::locale::text(
-                        "正在检测 tmux 能力与会话。",
-                        "Checking tmux availability and sessions.",
-                    ),
+    ) -> Option<AnyElement> {
+        let snapshot = self.tmux.data()?;
+        if !snapshot.capability.available {
+            let reason = snapshot.capability.reason.clone().unwrap_or_else(|| {
+                crate::locale::text("目标未安装 tmux。", "tmux is not installed on this target.")
+                    .to_string()
+            });
+            return Some(
+                tmux_empty_state(
+                    crate::locale::text("tmux 不可用", "tmux unavailable"),
+                    reason,
                     theme,
                 )
-                .into_any_element();
-            }
-            SectionPhase::NotLoaded | SectionPhase::Cancelled => {
-                return tmux_empty_state(
+                .into_any_element(),
+            );
+        }
+        if snapshot.sessions.is_empty() {
+            return Some(
+                tmux_empty_state(
                     crate::locale::text("暂无会话", "No sessions"),
                     crate::locale::text(
                         "新建一个会话即可开始。",
@@ -911,38 +929,8 @@ impl OperationsView {
                     ),
                     theme,
                 )
-                .into_any_element();
-            }
-            SectionPhase::Ready | SectionPhase::Failed => {}
-        }
-
-        let Some(snapshot) = self.tmux.data() else {
-            return tmux_empty_state(
-                crate::locale::text("暂无会话", "No sessions"),
-                crate::locale::text("新建一个会话即可开始。", "Create a session to get started."),
-                theme,
-            )
-            .into_any_element();
-        };
-        if !snapshot.capability.available {
-            let reason = snapshot.capability.reason.clone().unwrap_or_else(|| {
-                crate::locale::text("目标未安装 tmux。", "tmux is not installed on this target.")
-                    .to_string()
-            });
-            return tmux_empty_state(
-                crate::locale::text("tmux 不可用", "tmux unavailable"),
-                reason,
-                theme,
-            )
-            .into_any_element();
-        }
-        if snapshot.sessions.is_empty() {
-            return tmux_empty_state(
-                crate::locale::text("暂无会话", "No sessions"),
-                crate::locale::text("新建一个会话即可开始。", "Create a session to get started."),
-                theme,
-            )
-            .into_any_element();
+                .into_any_element(),
+            );
         }
 
         let current_session_id = self.tmux_panel_current_session_id();
@@ -955,6 +943,7 @@ impl OperationsView {
         );
         let count = sessions.len();
         let mut rows = div()
+            .debug_selector(|| "rr-tmux-sessions".into())
             .w_full()
             .flex()
             .flex_col()
@@ -970,10 +959,10 @@ impl OperationsView {
                 cx,
             ));
         }
-        rows.into_any_element()
+        Some(rows.into_any_element())
     }
 
-    /// 状态点与标题保持 main 的紧凑间距；结束操作保留危险色，展开只展示快照摘要而不发起网络读取。
+    /// 刷新期间旧行仍可展开浏览，但连接和变更必须等待当前快照就绪，避免误用历史会话。
     ///
     /// @author kongweiguang
     fn render_tmux_tool_rail_session(
@@ -1138,6 +1127,7 @@ impl OperationsView {
                                     .tooltip(crate::locale::text("连接", "Attach"))
                                     .disabled(
                                         self.busy
+                                            || self.tmux.phase() != SectionPhase::Ready
                                             || self.tmux_detach_pending.is_some()
                                             || !self.tmux_target_available()
                                             || !self.tmux_attach_ready(),
@@ -1161,7 +1151,11 @@ impl OperationsView {
                                         "Rename session",
                                     ))
                                     .tooltip(crate::locale::text("重命名", "Rename"))
-                                    .disabled(self.busy || !self.tmux_target_available())
+                                    .disabled(
+                                        self.busy
+                                            || self.tmux.phase() != SectionPhase::Ready
+                                            || !self.tmux_target_available(),
+                                    )
                                     .on_click(cx.listener(
                                         move |view, _: &ClickEvent, window, cx| {
                                             view.request_tmux_rename_dialog(
@@ -1194,7 +1188,11 @@ impl OperationsView {
                                         crate::locale::text("结束会话", "End session")
                                     })
                                     .tooltip(crate::locale::text("删除", "Delete"))
-                                    .disabled(self.busy || !self.tmux_target_available())
+                                    .disabled(
+                                        self.busy
+                                            || self.tmux.phase() != SectionPhase::Ready
+                                            || !self.tmux_target_available(),
+                                    )
                                     .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                                         view.request_tmux_kill_dialog(kill_id.clone(), cx);
                                     })),
@@ -1213,7 +1211,7 @@ impl OperationsView {
         row.into_any_element()
     }
 
-    /// 速查标签保持 main 的字号、计数靠右贴近展开图标；发送仍只看当前 pane binding 与忙碌状态。
+    /// 整行作为键盘和指针可操作的展开按钮；速查项发送仍只看当前 pane binding 与忙碌状态。
     ///
     /// @author kongweiguang
     fn render_tmux_tool_rail_quickref(
@@ -1234,54 +1232,16 @@ impl OperationsView {
             .border_1()
             .border_color(theme.border)
             .bg(theme.panel)
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("tmux-panel-quickref-toggle")
-                            .compact()
-                            .h_5()
-                            .ghost()
-                            .icon(
-                                gpui_kit::component::Icon::new(IconName::CircleDot)
-                                    .text_color(theme.accent),
-                            )
-                            .accessibility_label(if expanded {
-                                crate::locale::text("折叠快捷命令", "Collapse quick commands")
-                            } else {
-                                crate::locale::text("展开快捷命令", "Expand quick commands")
-                            })
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .child(crate::locale::text("快捷命令", "Quick commands")),
-                            )
-                            .on_click(move |_, _, app| {
-                                entity.update(app, |view, cx| {
-                                    view.tmux_panel.toggle_quickref();
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(theme.muted)
-                            .child(crate::locale::text("20 项", "20 items")),
-                    )
-                    .child(
-                        gpui_kit::component::Icon::new(if expanded {
-                            IconName::ChevronUp
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .text_color(theme.muted),
-                    ),
-            );
+            .child(tmux_tool_rail_quickref_toggle(
+                expanded,
+                theme,
+                move |_, _, app| {
+                    entity.update(app, |view, cx| {
+                        view.tmux_panel.toggle_quickref();
+                        cx.notify();
+                    });
+                },
+            ));
         if expanded {
             panel = panel
                 .child(
@@ -2450,6 +2410,57 @@ fn tmux_dialog_field_label(label: SharedString, theme: ThemeTokens) -> impl Into
         .child(label)
 }
 
+/// 标题、计数与箭头属于同一个全宽按钮，使命中区域和键盘焦点保持一致。
+///
+/// @author kongweiguang
+pub(super) fn tmux_tool_rail_quickref_toggle(
+    expanded: bool,
+    theme: ThemeTokens,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    Button::new("tmux-panel-quickref-toggle")
+        .debug_selector(|| "rr-tmux-quickref-toggle".into())
+        .compact()
+        .w_full()
+        .h_8()
+        .ghost()
+        .toggled(expanded)
+        .accessibility_label(if expanded {
+            crate::locale::text("折叠快捷命令", "Collapse quick commands")
+        } else {
+            crate::locale::text("展开快捷命令", "Expand quick commands")
+        })
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(gpui_kit::component::Icon::new(IconName::CircleDot).text_color(theme.accent))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .child(crate::locale::text("快捷命令", "Quick commands")),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.muted)
+                        .child(crate::locale::text("20 项", "20 items")),
+                )
+                .child(
+                    gpui_kit::component::Icon::new(if expanded {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .text_color(theme.muted),
+                ),
+        )
+        .on_click(on_click)
+}
+
 /// 右栏表单标签沿用 main 的 12px 中号字重，完整页表单继续保留原有紧凑层级。
 ///
 /// @author kongweiguang
@@ -2806,15 +2817,11 @@ pub(super) fn tmux_tool_rail_session_status(
     }
 }
 
-/// 有实际提示时保留反馈；就绪或无错误失败时省略空节点，避免 flex 布局增加不可见间距。
+/// 常规读取由按钮动画反馈，仅错误与取消需要正文恢复提示，避免重复加载文字占据布局。
 ///
 /// @author kongweiguang
 pub(super) fn tmux_tool_rail_feedback_visible(phase: SectionPhase, has_error: bool) -> bool {
-    has_error
-        || matches!(
-            phase,
-            SectionPhase::NotLoaded | SectionPhase::Loading | SectionPhase::Cancelled
-        )
+    has_error || phase == SectionPhase::Cancelled
 }
 
 /// 速查复制使用人类可读的显示形式；发送仍使用可能包含 tmux 前缀控制字节的 payload。
@@ -2826,7 +2833,7 @@ pub(super) fn tmux_quickref_copy_text(
     item.display
 }
 
-/// 标题副行优先给出 tmux 版本，缺少版本时回退到可恢复的能力状态。
+/// 标题副行优先给出 tmux 版本；刷新保留原能力文案，首次等待留空并由按钮表示进度。
 ///
 /// @author kongweiguang
 pub(super) fn tmux_tool_rail_header_status(
@@ -2838,9 +2845,8 @@ pub(super) fn tmux_tool_rail_header_status(
         return localized_text("目标不可用", "Target unavailable");
     }
     match phase {
-        SectionPhase::NotLoaded => localized_text("等待读取", "Waiting to load"),
-        SectionPhase::Loading => localized_text("正在检测 tmux…", "Checking tmux…"),
-        SectionPhase::Ready => match capability {
+        SectionPhase::NotLoaded => String::new(),
+        SectionPhase::Loading | SectionPhase::Ready => match capability {
             Some(capability) if capability.available => capability
                 .version
                 .clone()
@@ -2848,7 +2854,7 @@ pub(super) fn tmux_tool_rail_header_status(
             Some(capability) => capability.reason.clone().unwrap_or_else(|| {
                 localized_text("目标未安装 tmux", "tmux is unavailable on this target")
             }),
-            None => localized_text("状态未知", "Status unknown"),
+            None => String::new(),
         },
         SectionPhase::Failed => localized_text("读取失败，可重试", "Read failed; retry available"),
         SectionPhase::Cancelled => {

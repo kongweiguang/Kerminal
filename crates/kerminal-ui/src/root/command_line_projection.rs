@@ -7,8 +7,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use kerminal_application::sessions::{
-    TerminalCommandAvailability, TerminalCommandContext, TerminalCommandContextVersion,
-    TerminalCommandUnavailableReason, UiInputProjection, UiSessionBinding, UiTerminalInputRequest,
+    ShellEditingSnapshot, TerminalCommandAvailability, TerminalCommandContext,
+    TerminalCommandContextVersion, TerminalCommandUnavailableReason, UiInputProjection,
+    UiSessionBinding, UiTerminalInputRequest,
     command_blocks::{MAX_COMMAND_BLOCK_TEXT_BYTES, is_plain_command_enter},
 };
 use kerminal_domain::identity::SessionId;
@@ -83,6 +84,49 @@ enum EditEffect {
 }
 
 impl CommandLineProjection {
+    /// 使用会话内回读的真实编辑缓冲恢复历史捕获；仍有输入票据时绝不覆盖未回执的 FIFO 状态。
+    pub(super) fn seed_shell_snapshot(
+        &mut self,
+        snapshot: &ShellEditingSnapshot,
+        context: &TerminalCommandContext,
+    ) -> bool {
+        if !context_matches_binding(&snapshot.binding, context)
+            || snapshot.context != context.version()
+            || !context.prompt_ready
+            || context.alternate_screen
+            || snapshot.input.len() > MAX_COMMAND_BLOCK_TEXT_BYTES
+            || snapshot.input.chars().any(char::is_control)
+            || snapshot.cursor > snapshot.input.chars().count()
+            || (!self.sessions.contains_key(&snapshot.binding.session_id)
+                && self.sessions.len() >= MAX_TRACKED_SESSIONS)
+            || self
+                .sessions
+                .get(&snapshot.binding.session_id)
+                .is_some_and(|state| state.binding != snapshot.binding || !state.pending.is_empty())
+        {
+            return false;
+        }
+        let cursor = snapshot
+            .input
+            .char_indices()
+            .nth(snapshot.cursor)
+            .map_or(snapshot.input.len(), |(offset, _)| offset);
+        let state = self
+            .sessions
+            .entry(snapshot.binding.session_id.clone())
+            .or_insert_with(|| {
+                SessionLineProjection::from_context(snapshot.binding.clone(), context)
+            });
+        state.line_generation = state.line_generation.wrapping_add(1).max(1);
+        state.context = snapshot.context;
+        state.known_line = Some(LineBuffer {
+            text: snapshot.input.clone(),
+            cursor,
+        });
+        state.must_wait_for_prompt = false;
+        true
+    }
+
     /// 只有完整 UI 绑定和可信 shell context 同时匹配时，才允许空 prompt 建立已知基线。
     pub(super) fn observe_context(
         &mut self,

@@ -248,7 +248,7 @@ pub struct CompiledKeybindings {
 }
 
 impl CompiledKeybindings {
-    /// 使用 GPUI parser 构造平台快照；Windows alternate 与主绑定共享 action 和冲突校验。
+    /// 使用 GPUI parser 构造当前平台的单一绑定快照，并统一校验冲突。
     ///
     /// @author kongweiguang
     pub fn compile(preferences: &[KeybindingPreference], platform: KeybindingPlatform) -> Self {
@@ -257,100 +257,86 @@ impl CompiledKeybindings {
         let mut parsed: Vec<(String, String, KeybindingScope, String)> = Vec::new();
 
         for preference in preferences {
-            let selected_bindings = effective_bindings(preference, platform);
+            let selected = effective_binding(preference, platform);
             let Some(action) = KeybindingAction::from_id(&preference.action) else {
                 diagnostics.push(KeybindingDiagnostic {
                     kind: KeybindingDiagnosticKind::UnknownAction,
                     action: preference.action.clone(),
-                    binding: selected_bindings.join(" / "),
+                    binding: selected.to_owned(),
                     conflicts_with: None,
                     message: "未知快捷键动作已保留，但不会执行。".to_owned(),
                 });
                 continue;
             };
+            if selected.trim().is_empty() {
+                continue;
+            }
 
-            for selected in selected_bindings {
-                if selected.trim().is_empty() {
-                    continue;
-                }
-
-                let normalized = normalize_legacy_binding(selected);
-                let predicate =
-                    match KeyBindingContextPredicate::parse(context_predicate(preference.scope)) {
-                        Ok(predicate) => Rc::new(predicate),
-                        Err(error) => {
-                            diagnostics.push(KeybindingDiagnostic {
-                                kind: KeybindingDiagnosticKind::InvalidBinding,
-                                action: preference.action.clone(),
-                                binding: selected.to_owned(),
-                                conflicts_with: None,
-                                message: format!("快捷键作用范围无效：{error}"),
-                            });
-                            continue;
-                        }
-                    };
-                let binding = match KeyBinding::load(
-                    &normalized,
-                    Box::new(KerminalShortcutAction { action }),
-                    Some(predicate),
-                    false,
-                    None,
-                    &DummyKeyboardMapper,
-                ) {
-                    Ok(binding) => binding,
+            let normalized = normalize_legacy_binding(selected);
+            let predicate =
+                match KeyBindingContextPredicate::parse(context_predicate(preference.scope)) {
+                    Ok(predicate) => Rc::new(predicate),
                     Err(error) => {
                         diagnostics.push(KeybindingDiagnostic {
                             kind: KeybindingDiagnosticKind::InvalidBinding,
                             action: preference.action.clone(),
                             binding: selected.to_owned(),
                             conflicts_with: None,
-                            message: format!("快捷键格式无法解析：{error}"),
+                            message: format!("快捷键作用范围无效：{error}"),
                         });
                         continue;
                     }
                 };
-                let canonical = binding
-                    .keystrokes()
-                    .iter()
-                    .map(|stroke| stroke.unparse())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-
-                if parsed
-                    .iter()
-                    .any(|(previous_action, _, _, previous_sequence)| {
-                        previous_action == &preference.action && previous_sequence == &canonical
-                    })
-                {
+            let binding = match KeyBinding::load(
+                &normalized,
+                Box::new(KerminalShortcutAction { action }),
+                Some(predicate),
+                false,
+                None,
+                &DummyKeyboardMapper,
+            ) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    diagnostics.push(KeybindingDiagnostic {
+                        kind: KeybindingDiagnosticKind::InvalidBinding,
+                        action: preference.action.clone(),
+                        binding: selected.to_owned(),
+                        conflicts_with: None,
+                        message: format!("快捷键格式无法解析：{error}"),
+                    });
                     continue;
                 }
+            };
+            let canonical = binding
+                .keystrokes()
+                .iter()
+                .map(|stroke| stroke.unparse())
+                .collect::<Vec<_>>()
+                .join(" ");
 
-                for (previous_action, previous_binding, previous_scope, previous_sequence) in
-                    &parsed
+            for (previous_action, previous_binding, previous_scope, previous_sequence) in &parsed {
+                if sequences_overlap(previous_sequence, &canonical)
+                    && scopes_overlap(*previous_scope, preference.scope)
                 {
-                    if previous_sequence == &canonical
-                        && scopes_overlap(*previous_scope, preference.scope)
-                    {
-                        diagnostics.push(KeybindingDiagnostic {
-                            kind: KeybindingDiagnosticKind::Conflict,
-                            action: preference.action.clone(),
-                            binding: selected.to_owned(),
-                            conflicts_with: Some(previous_action.clone()),
-                            message: format!(
-                                "与动作 {previous_action} 的绑定 {previous_binding} 重叠；GPUI 按上下文深度及声明顺序决胜。"
-                            ),
-                        });
-                    }
+                    diagnostics.push(KeybindingDiagnostic {
+                        kind: KeybindingDiagnosticKind::Conflict,
+                        action: preference.action.clone(),
+                        binding: selected.to_owned(),
+                        conflicts_with: Some(previous_action.clone()),
+                        message: format!(
+                            "与动作 {previous_action} 的绑定 {previous_binding} 重叠或构成组合键前缀。"
+                        ),
+                    });
                 }
-
-                parsed.push((
-                    preference.action.clone(),
-                    selected.to_owned(),
-                    preference.scope,
-                    canonical,
-                ));
-                bindings.push(binding);
             }
+
+            parsed.push((
+                preference.action.clone(),
+                selected.to_owned(),
+                preference.scope,
+                canonical,
+            ));
+            bindings.push(binding);
         }
 
         Self {
@@ -397,24 +383,17 @@ impl CompiledKeybindings {
     }
 }
 
-/// 选择主绑定及同 action 的 Windows 备用绑定；旧 Linux 行缺字段时仍沿用 Windows 回退。
+/// 完整绑定与其前缀不能在同一作用域共存，否则较长组合永远到不了解析终态。
 ///
 /// @author kongweiguang
-fn effective_bindings(
-    preference: &KeybindingPreference,
-    platform: KeybindingPlatform,
-) -> Vec<&str> {
-    let primary = effective_binding(preference, platform);
-    let mut bindings = vec![primary];
-    if platform == KeybindingPlatform::Windows
-        && let Some(alternate) = preference
-            .windows_alternate_binding
-            .as_deref()
-            .filter(|binding| !binding.trim().is_empty())
-    {
-        bindings.push(alternate);
-    }
-    bindings
+fn sequences_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with(' '))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with(' '))
 }
 
 /// 保持旧 Windows/macOS 空 override 回退规则；Linux 的 Some 空串是显式关闭值。
@@ -439,7 +418,7 @@ fn effective_binding(preference: &KeybindingPreference, platform: KeybindingPlat
 }
 
 /// 把旧版加号分隔符与修饰键别名转换成 GPUI 格式，再交 GPUI parser 校验完整按键语法。
-fn normalize_legacy_binding(binding: &str) -> String {
+pub(crate) fn normalize_legacy_binding(binding: &str) -> String {
     binding
         .split_whitespace()
         .map(|stroke| {

@@ -37,6 +37,8 @@ pub struct LocalShellStartupPlan {
     pub lifetime_guard: Option<Box<dyn Send + Sync + 'static>>,
     pub bootstrap_status: ShellIntegrationBootstrapStatus,
     pub unavailable_reason: Option<ShellIntegrationUnavailableReason>,
+    /// 仅属于此启动实例的私有协议标识，不经环境变量传播到嵌套 Shell。
+    pub editing_nonce: Option<String>,
 }
 
 /// 表示是否已准备可由子进程读取的 shell hook 文件；不代表提示符标记已到达。
@@ -102,13 +104,18 @@ pub fn prepare_local_shell(target: &LocalSessionTarget) -> AppResult<LocalShellS
     let mut env_overrides = BTreeMap::new();
     let mut args = target.args.clone();
     let dialect = kind.dialect();
+    let editing_nonce = uuid::Uuid::new_v4().simple().to_string();
 
     let write_result = (|| -> AppResult<()> {
         match kind {
             LocalShellKind::Bash => {
                 let rc_path = temporary.directory.join("bashrc");
                 let user_rc = "if [ -n \"${HOME-}\" ] && [ -r \"$HOME/.bashrc\" ]; then\n  . \"$HOME/.bashrc\"\nfi\n";
-                temporary.write_script(&rc_path, &format!("{user_rc}{BASH_HOOK}"))?;
+                temporary.write_script(
+                    &rc_path,
+                    &format!("{user_rc}{BASH_HOOK}")
+                        .replace("__KERMINAL_EDIT_NONCE__", &editing_nonce),
+                )?;
                 args.splice(0..0, [OsString::from("--rcfile"), rc_path.into_os_string()]);
             }
             LocalShellKind::Zsh => {
@@ -135,7 +142,7 @@ pub fn prepare_local_shell(target: &LocalSessionTarget) -> AppResult<LocalShellS
                         "{}{}{}",
                         zsh_wrapper_prelude(user_zdotdir, &temporary.directory, false),
                         ZSH_RC,
-                        ZSH_HOOK
+                        ZSH_HOOK.replace("__KERMINAL_EDIT_NONCE__", &editing_nonce)
                     ),
                 )?;
                 env_overrides.insert(
@@ -145,7 +152,10 @@ pub fn prepare_local_shell(target: &LocalSessionTarget) -> AppResult<LocalShellS
             }
             LocalShellKind::Fish => {
                 let hook_path = temporary.directory.join("fish.fish");
-                temporary.write_script(&hook_path, FISH_HOOK)?;
+                temporary.write_script(
+                    &hook_path,
+                    &FISH_HOOK.replace("__KERMINAL_EDIT_NONCE__", &editing_nonce),
+                )?;
                 args.extend([
                     OsString::from("--init-command"),
                     OsString::from(format!("source {}", fish_quote(&hook_path)?)),
@@ -153,7 +163,10 @@ pub fn prepare_local_shell(target: &LocalSessionTarget) -> AppResult<LocalShellS
             }
             LocalShellKind::PowerShell => {
                 let hook_path = temporary.directory.join("powershell.ps1");
-                temporary.write_script(&hook_path, POWERSHELL_HOOK)?;
+                temporary.write_script(
+                    &hook_path,
+                    &POWERSHELL_HOOK.replace("__KERMINAL_EDIT_NONCE__", &editing_nonce),
+                )?;
                 args.extend([
                     OsString::from("-NoExit"),
                     OsString::from("-Command"),
@@ -178,6 +191,7 @@ pub fn prepare_local_shell(target: &LocalSessionTarget) -> AppResult<LocalShellS
         lifetime_guard: Some(Box::new(temporary)),
         bootstrap_status: ShellIntegrationBootstrapStatus::Prepared,
         unavailable_reason: None,
+        editing_nonce: Some(editing_nonce),
     })
 }
 
@@ -409,6 +423,7 @@ impl LocalShellStartupPlan {
             lifetime_guard: None,
             bootstrap_status: ShellIntegrationBootstrapStatus::Unsupported,
             unavailable_reason: Some(reason),
+            editing_nonce: None,
         }
     }
 }

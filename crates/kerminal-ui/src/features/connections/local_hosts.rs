@@ -1,4 +1,4 @@
-//! 持久本地主机复用现有 ProfileService；表单只提交 ProfileDraft，不自建存储或终端引擎。
+//! 终端模板与持久本地主机分别使用独立用例；表单仅保存用户确认的主机快照。
 //!
 //! @author kongweiguang
 
@@ -14,10 +14,15 @@ use gpui_kit::{
 };
 use kerminal_application::{
     AppError, ProfileService, PublicErrorCode,
+    connections::management::{
+        CredentialCleanupStatus, HostDeletionReceipt, LocalHostDraft, LocalHostSaveRecoveryToken,
+        ManagedLocalHost, RecoverableLocalHostSaveOutcome,
+    },
     local_shells::LocalShellCandidate,
-    preferences::{ProfileDraft, ProfileRevision, VersionedProfile},
+    preferences::{ProfileDraft, VersionedProfile},
 };
 use kerminal_domain::{
+    identity::HostId,
     preferences::{ConfigRevision, ConfigurationMode, TerminalProfile},
     sessions::LocalSessionTarget,
 };
@@ -30,6 +35,51 @@ use super::{
         SavedSelectionTarget, saved_selection_event,
     },
 };
+
+/// 将独立本地主机映射到旧表单的私有显示模型；列表调用方传空环境，只有编辑时才解密。
+/// @author kongweiguang
+pub(super) fn local_host_projection(
+    host: ManagedLocalHost,
+    env: BTreeMap<String, String>,
+) -> VersionedProfile {
+    VersionedProfile {
+        profile: TerminalProfile {
+            id: host.id.as_str().to_owned(),
+            name: host.name,
+            shell: host.shell,
+            args: host.args,
+            cwd: host.cwd,
+            env,
+            is_default: false,
+            sidebar_group_id: host.group_id,
+            sort_order: host.sort_order,
+            created_at: host.created_at,
+            updated_at: host.updated_at,
+        },
+        revision: host.revision,
+    }
+}
+
+/// 校验 UI 携带的稳定标识后才访问主机仓储，不以默认模板替代无效目标。
+/// @author kongweiguang
+fn local_host_id(value: &str) -> Result<HostId, AppError> {
+    HostId::parse(value).map_err(|_| AppError::invalid("本地主机标识无效"))
+}
+
+/// 在提交边界转换表单快照，确保主机与模板使用不同的持久化用例。
+/// @author kongweiguang
+fn local_host_draft(value: ProfileDraft) -> Result<LocalHostDraft, AppError> {
+    Ok(LocalHostDraft {
+        id: value.id.as_deref().map(local_host_id).transpose()?,
+        group_id: value.sidebar_group_id,
+        name: value.name,
+        shell: value.shell,
+        args: value.args,
+        cwd: value.cwd,
+        env: value.env,
+        sort_order: value.sort_order,
+    })
+}
 
 /// 本地主机表单模式；复制使用独立 ID 与空 revision，不继承默认项状态。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,58 +151,6 @@ enum LocalHostUnknownMutation {
         profile_id: String,
         revision: ConfigRevision,
     },
-    SetDefault {
-        profile_id: String,
-    },
-}
-
-/// 完整列表读回后的默认项事实；stable ID 用来避免以显示名称误认目标。
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct LocalHostDefaultReadback {
-    default_profile_ids: Vec<String>,
-    target_present: bool,
-    target_is_default: bool,
-}
-
-/// 按整个本地主机列表构造默认项 CAS 输入，防止局部快照遗漏需要清除的旧默认标记。
-fn local_host_profile_revisions(rows: &[VersionedProfile]) -> Vec<ProfileRevision> {
-    rows.iter()
-        .map(|row| ProfileRevision {
-            profile_id: row.profile.id.clone(),
-            revision: row.revision.clone(),
-        })
-        .collect()
-}
-
-/// 只允许从当前完整列表选择目标，并始终按稳定 Profile ID 匹配。
-fn local_host_default_target<'a>(
-    rows: &'a [VersionedProfile],
-    profile_id: &str,
-) -> Option<&'a VersionedProfile> {
-    rows.iter().find(|row| row.profile.id == profile_id)
-}
-
-/// 从显式列表读回提取目标与全部默认 ID，未知结果不会被转换成“原请求成功”。
-fn local_host_default_readback(
-    rows: &[VersionedProfile],
-    target_id: &str,
-) -> LocalHostDefaultReadback {
-    let default_profile_ids = rows
-        .iter()
-        .filter(|row| row.profile.is_default)
-        .map(|row| row.profile.id.clone())
-        .collect();
-    let target = local_host_default_target(rows, target_id);
-    LocalHostDefaultReadback {
-        default_profile_ids,
-        target_present: target.is_some(),
-        target_is_default: target.is_some_and(|row| row.profile.is_default),
-    }
-}
-
-/// 唯一默认项的不变量只有在显式读回不再观察到多个默认标记时才允许解除写入封锁。
-fn local_host_default_readback_can_release(readback: &LocalHostDefaultReadback) -> bool {
-    readback.default_profile_ids.len() <= 1
 }
 
 /// 统一提供“未分组、现存分组、已失效分组”选择项，保留旧 group ID 供用户明确调整。
@@ -377,7 +375,7 @@ fn local_host_needs_save(revision: Option<&ConfigRevision>, raw_dirty: bool) -> 
     revision.is_none() || raw_dirty
 }
 
-/// 只映射应用层已知 Profile 校验；复合错误按相同约束定位 cwd/argv，剩余落到环境变量。
+/// 将应用层主机校验映射到实际字段，复合错误按相同 cwd/argv 约束定位。
 /// @author kongweiguang
 pub(super) fn local_host_validation_field(
     message: &str,
@@ -385,9 +383,15 @@ pub(super) fn local_host_validation_field(
     working_directory: &str,
 ) -> Option<LocalHostValidationField> {
     match message {
-        "profile 名称不能为空或过长" => Some(LocalHostValidationField::Name),
-        "profile shell 路径不能为空或过长" => Some(LocalHostValidationField::Shell),
-        "profile 参数或环境变量超出限制" => {
+        "profile 名称不能为空或过长" | "本地主机名称不能为空或过长" => {
+            Some(LocalHostValidationField::Name)
+        }
+        "profile shell 路径不能为空或过长" | "本地主机 shell 路径不能为空或过长" => {
+            Some(LocalHostValidationField::Shell)
+        }
+        "本地主机环境变量超出限制" => Some(LocalHostValidationField::Environment),
+        "profile 参数或环境变量超出限制" | "本地主机参数或工作目录超出限制" =>
+        {
             if working_directory.len() > 4096 || working_directory.contains('\0') {
                 return Some(LocalHostValidationField::WorkingDirectory);
             }
@@ -404,9 +408,11 @@ pub(super) fn local_host_validation_field(
     }
 }
 
-/// 本地主机状态集中持有 ProfileService 回执、稳定 ID 快照与写入未知门禁。
+/// 本地主机和模板各持一份投影，写入未知与凭据清理由同一门禁管理。
 pub(super) struct LocalHostState {
     pub(super) service: Option<ProfileService>,
+    /// 模板只供启动参数选择，本地主机的 CRUD 始终使用 rows 和主机服务。
+    pub(super) templates: Vec<VersionedProfile>,
     pub(super) rows: Vec<VersionedProfile>,
     pub(super) selected_id: Option<String>,
     pub(super) selected: Option<VersionedProfile>,
@@ -420,6 +426,8 @@ pub(super) struct LocalHostState {
     pub(super) loading: bool,
     pub(super) saving: bool,
     pub(super) save_outcome_unknown: bool,
+    pub(super) cleanup_pending: bool,
+    startup_recovery_checked: bool,
     pub(super) pending_delete: Option<VersionedProfile>,
     pub(super) status: Option<String>,
     pub(super) delete_checking: bool,
@@ -428,7 +436,9 @@ pub(super) struct LocalHostState {
     pub(super) unknown_target_missing: bool,
     pub(super) pending_action: Option<LocalHostPendingAction>,
     unknown_mutation: Option<LocalHostUnknownMutation>,
+    unknown_save_recovery: Option<LocalHostSaveRecoveryToken>,
     generation: u64,
+    delete_check_generation: u64,
     editor_load_generation: u64,
     editor_generation: u64,
     shell_discovery_generation: u64,
@@ -437,11 +447,20 @@ pub(super) struct LocalHostState {
     pub(super) default_target_request: Option<LocalHostDefaultRequest>,
 }
 
+/// 列表快照与一次性核对结果共同返回，避免读回秘密进入普通列表投影。
+struct LocalHostCatalogLoad {
+    rows: Vec<VersionedProfile>,
+    templates: Vec<VersionedProfile>,
+    save_readback: Option<Option<VersionedProfile>>,
+    startup_recovery: Option<Result<CredentialCleanupStatus, AppError>>,
+}
+
 impl Default for LocalHostState {
     /// 构造不触碰磁盘的空状态，服务注入后再由应用 executor 执行首次读取。
     fn default() -> Self {
         Self {
             service: None,
+            templates: Vec::new(),
             rows: Vec::new(),
             selected_id: None,
             selected: None,
@@ -455,6 +474,8 @@ impl Default for LocalHostState {
             loading: false,
             saving: false,
             save_outcome_unknown: false,
+            cleanup_pending: false,
+            startup_recovery_checked: false,
             pending_delete: None,
             status: None,
             delete_checking: false,
@@ -463,7 +484,9 @@ impl Default for LocalHostState {
             unknown_target_missing: false,
             pending_action: None,
             unknown_mutation: None,
+            unknown_save_recovery: None,
             generation: 0,
+            delete_check_generation: 0,
             editor_load_generation: 0,
             editor_generation: 0,
             shell_discovery_generation: 0,
@@ -484,6 +507,7 @@ impl LocalHostState {
     pub(super) fn mutation_blocked(&self) -> bool {
         self.saving
             || self.save_outcome_unknown
+            || self.cleanup_pending
             || self.delete_checking
             || self.readback_in_progress
             || self.editor_load_intent.is_some()
@@ -713,7 +737,7 @@ impl ConnectionsPanel {
     pub(super) fn selected_local_profile_id(&self, cx: &Context<Self>) -> Option<String> {
         let editor = self.local_hosts.editor.as_ref()?;
         let current = read_editor_baseline(editor, cx);
-        let mut matches = self.local_hosts.rows.iter().filter(|row| {
+        let mut matches = self.local_hosts.templates.iter().filter(|row| {
             row.profile.shell == current.shell
                 && row.profile.cwd.as_deref().unwrap_or_default() == current.cwd
                 && row.profile.args.join("\n") == current.args
@@ -951,161 +975,11 @@ impl ConnectionsPanel {
         self.load_local_profiles(false, cx);
     }
 
-    /// 仅对当前完整列表中的稳定 ID 执行 ProfileService 的原子默认项切换，并保留未知回执所有权。
-    pub(super) fn request_set_default_local_host(
-        &mut self,
-        profile_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.recovery.mode == ConfigurationMode::ReadOnlyRecovery {
-            self.status = Some(crate::locale::text(
-                "当前配置处于只读恢复状态，不能设置默认本地主机。",
-                "The configuration is in read-only recovery mode; the default local host cannot be changed.",
-            ).to_string());
-            cx.notify();
-            return;
-        }
-        if self.local_hosts.mutation_blocked()
-            || self.local_hosts.loading
-            || self.local_hosts.pending_delete.is_some()
-        {
-            self.status = Some(crate::locale::text(
-                "本地主机配置正在读取、保存或等待核对，暂不能设置默认项。",
-                "Local host configuration is loading, saving, or awaiting reconciliation; the default cannot be changed yet.",
-            ).to_string());
-            cx.notify();
-            return;
-        }
-        let dirty_editor = self.local_host_is_dirty(cx)
-            || self
-                .editor
-                .as_ref()
-                .is_some_and(|editor| editor.is_dirty(cx));
-        if dirty_editor {
-            self.status = Some(crate::locale::text(
-                "请先保存或放弃未完成的连接编辑，再设置默认本地主机。",
-                "Save or discard the unfinished connection edits before changing the default local host.",
-            ).to_string());
-            cx.notify();
-            return;
-        }
-        let Some(target) = local_host_default_target(&self.local_hosts.rows, &profile_id) else {
-            self.status = Some(
-                crate::locale::text(
-                    "列表中已找不到这个本地主机，请刷新后重试。",
-                    "This local host is no longer in the list. Refresh and try again.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        };
-        let current_default_count = self
-            .local_hosts
-            .rows
-            .iter()
-            .filter(|row| row.profile.is_default)
-            .count();
-        if target.profile.is_default && current_default_count == 1 {
-            self.status = Some(
-                crate::locale::text(
-                    "这个本地主机已经是唯一的默认项。",
-                    "This local host is already the only default.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        let Some(service) = self.local_hosts.service.clone() else {
-            self.status = Some(
-                crate::locale::text(
-                    "本地主机服务尚未就绪，请稍后重试。",
-                    "The local host service is not ready yet. Try again shortly.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        };
-        let expected = local_host_profile_revisions(&self.local_hosts.rows);
-        let executor = self.executor.clone();
-        let request_id = profile_id.clone();
-        self.local_hosts.saving = true;
-        self.local_hosts.status = Some(
-            crate::locale::text("正在更新默认本地主机…", "Updating the default local host…")
-                .to_string(),
-        );
-        self.status = self.local_hosts.status.clone();
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result =
-                executor
-                    .run(move |_| async move {
-                        service.set_default_profile(&request_id, expected).await
-                    })
-                    .await;
-            let _ = this.update_in(cx, move |panel, _window, cx| {
-                panel.finish_local_host_set_default(profile_id, result, cx);
-            });
-        })
-        .detach();
-    }
-
-    /// 依据真实操作回执区分成功、普通失败与未知结果，成功后刷新完整列表和选中快照。
-    fn finish_local_host_set_default(
-        &mut self,
-        profile_id: String,
-        result: Result<VersionedProfile, AppError>,
-        cx: &mut Context<Self>,
-    ) {
-        self.local_hosts.saving = false;
-        match result {
-            Ok(saved) if saved.profile.id == profile_id => {
-                self.local_hosts.selected_id = Some(saved.profile.id.clone());
-                self.local_hosts.selected = Some(saved);
-                self.status = Some(
-                    crate::locale::text("默认本地主机已更新。", "Default local host updated.")
-                        .to_string(),
-                );
-                self.reload_local_hosts(cx);
-            }
-            Ok(_) => {
-                self.local_hosts.save_outcome_unknown = true;
-                self.local_hosts.unknown_mutation =
-                    Some(LocalHostUnknownMutation::SetDefault { profile_id });
-                self.local_hosts.unknown_readback = None;
-                self.local_hosts.unknown_target_missing = false;
-                self.status = Some(crate::locale::text(
-                    "默认项回执与请求目标不一致；结果需显式读回核对，不会自动重放。",
-                    "The default update receipt did not match the requested target. Read the list back to reconcile; the request will not be replayed automatically.",
-                ).to_string());
-            }
-            Err(error) if error.public_code() == PublicErrorCode::OutcomeUnknown => {
-                self.local_hosts.save_outcome_unknown = true;
-                self.local_hosts.unknown_mutation =
-                    Some(LocalHostUnknownMutation::SetDefault { profile_id });
-                self.local_hosts.unknown_readback = None;
-                self.local_hosts.unknown_target_missing = false;
-                self.status = Some(crate::locale::text(
-                    "设置默认项的结果未知。请显式核对当前默认状态；不会自动重放。",
-                    "The default change result is unknown. Explicitly verify the current default state; it will not be replayed automatically.",
-                ).to_string());
-            }
-            Err(error) => {
-                self.status = Some(super::panel::localized_error(&error));
-                if error.public_code() == PublicErrorCode::Conflict {
-                    self.reload_local_hosts(cx);
-                }
-            }
-        }
-        self.local_hosts.status = self.status.clone();
-        cx.notify();
-    }
-
     /// 未知结果必须由用户显式核对；普通 watcher 刷新不会擅自解除门禁。
     pub(super) fn review_local_host_unknown(&mut self, cx: &mut Context<Self>) {
-        if !self.local_hosts.save_outcome_unknown || self.local_hosts.operation_in_progress() {
+        if (!self.local_hosts.save_outcome_unknown && !self.local_hosts.cleanup_pending)
+            || self.local_hosts.operation_in_progress()
+        {
             return;
         }
         self.load_local_profiles(true, cx);
@@ -1137,18 +1011,6 @@ impl ConnectionsPanel {
         if !self.local_hosts.save_outcome_unknown || self.local_hosts.operation_in_progress() {
             return;
         }
-        if matches!(
-            self.local_hosts.unknown_mutation.as_ref(),
-            Some(LocalHostUnknownMutation::SetDefault { .. })
-        ) {
-            self.status = Some(crate::locale::text(
-                "设为默认只核对当前状态，不应用读回快照，也不会重放原操作。",
-                "Setting a default only reconciles the current state. The readback is not applied and the original operation is not replayed.",
-            ).to_string());
-            self.local_hosts.status = self.status.clone();
-            cx.notify();
-            return;
-        }
         let Some(snapshot) = self.local_hosts.unknown_readback.clone() else {
             self.status = Some(
                 crate::locale::text(
@@ -1175,7 +1037,9 @@ impl ConnectionsPanel {
                     cx,
                 ));
                 self.local_hosts.selected_id = Some(snapshot.profile.id.clone());
-                self.local_hosts.selected = Some(snapshot.clone());
+                let mut visible_snapshot = snapshot.clone();
+                visible_snapshot.profile.env.clear();
+                self.local_hosts.selected = Some(visible_snapshot);
                 self.clear_local_host_unknown();
                 self.discover_local_shells(cx);
                 self.status = Some(crate::locale::text(
@@ -1250,14 +1114,6 @@ impl ConnectionsPanel {
                 self.status = Some(crate::locale::text(
                     "删除操作不能从旧确认自动重试；请先采用读回版本，再重新发起删除。",
                     "A delete confirmation is never retried. Apply the readback, then start a new delete request.",
-                ).to_string());
-                cx.notify();
-                return;
-            }
-            LocalHostUnknownMutation::SetDefault { .. } => {
-                self.status = Some(crate::locale::text(
-                    "设为默认没有草稿可继续；请先核对当前状态，再明确发起新的操作。",
-                    "A default change has no draft to continue. Reconcile the current state first, then explicitly start a new operation.",
                 ).to_string());
                 cx.notify();
                 return;
@@ -1418,7 +1274,7 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 保存前检查配置恢复模式、组有效性及未知结果门禁，再把完整草稿提交给唯一 ProfileService。
+    /// 保存前检查恢复模式和组 revision；主机与加密环境作为同一可恢复操作提交。
     /// @author kongweiguang
     pub(super) fn save_local_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.refuse_conflict_reload_mutation(cx) {
@@ -1501,17 +1357,15 @@ impl ConnectionsPanel {
             cx.notify();
             return;
         }
-        let Some(service) = self.local_hosts.service.clone() else {
-            self.status = Some(
-                crate::locale::text(
-                    "本地主机服务尚未就绪。",
-                    "The local host service is not ready yet.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
+        let draft = match local_host_draft(draft) {
+            Ok(draft) => draft,
+            Err(error) => {
+                self.status = Some(super::panel::localized_error(&error));
+                cx.notify();
+                return;
+            }
         };
+        let service = self.hosts.clone();
         let executor = self.executor.clone();
         let id = profile_id.clone();
         self.local_hosts.saving = true;
@@ -1521,7 +1375,11 @@ impl ConnectionsPanel {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |_| async move { service.save_profile(draft, revision).await })
+                .run(move |cancel| async move {
+                    service
+                        .save_local_host_recoverable(draft, revision, cancel)
+                        .await
+                })
                 .await;
             let _ = this.update_in(cx, |panel, window, cx| {
                 panel.finish_local_host_save(id, result, window, cx)
@@ -1536,13 +1394,25 @@ impl ConnectionsPanel {
     fn finish_local_host_save(
         &mut self,
         profile_id: String,
-        result: Result<VersionedProfile, AppError>,
+        result: Result<RecoverableLocalHostSaveOutcome, AppError>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.local_hosts.saving = false;
+        let (result, unknown_receipt) = match result {
+            Ok(RecoverableLocalHostSaveOutcome::Saved {
+                host,
+                credential_cleanup,
+            }) => (Ok((host, credential_cleanup)), false),
+            Ok(RecoverableLocalHostSaveOutcome::OutcomeUnknown { error, recovery }) => {
+                self.local_hosts.unknown_save_recovery = Some(recovery);
+                (Err(error), true)
+            }
+            Err(error) => (Err(error), false),
+        };
         match result {
-            Ok(saved) => {
+            Ok((host, credential_cleanup)) => {
+                let saved = local_host_projection(host, BTreeMap::new());
                 let saved_profile_id = saved.profile.id.clone();
                 self.local_hosts.selected_id = Some(saved_profile_id.clone());
                 self.local_hosts.selected = Some(saved.clone());
@@ -1552,8 +1422,18 @@ impl ConnectionsPanel {
                 )));
                 self.local_hosts.pending_delete = None;
                 self.close_unified_editor(window, cx);
-                let success_status =
-                    crate::locale::text("本地主机已保存。", "Local host saved.").to_string();
+                self.local_hosts.cleanup_pending =
+                    matches!(credential_cleanup, CredentialCleanupStatus::Deferred { .. });
+                let success_status = match credential_cleanup {
+                    CredentialCleanupStatus::Complete => {
+                        crate::locale::text("本地主机已保存。", "Local host saved.").to_string()
+                    }
+                    CredentialCleanupStatus::Deferred { remaining } => crate::locale::text(
+                        format!("本地主机已保存；{remaining} 个旧凭据待清理。"),
+                        format!("Local host saved; {remaining} old credentials await cleanup."),
+                    )
+                    .to_string(),
+                };
                 self.local_hosts.status = Some(success_status.clone());
                 self.status = Some(success_status);
                 self.reload_local_hosts(cx);
@@ -1564,7 +1444,7 @@ impl ConnectionsPanel {
                     editor.validation_issue = None;
                     editor.validation_field = None;
                 }
-                if error.public_code() == PublicErrorCode::OutcomeUnknown {
+                if unknown_receipt || error.public_code() == PublicErrorCode::OutcomeUnknown {
                     self.local_hosts.save_outcome_unknown = true;
                     self.local_hosts.unknown_mutation =
                         Some(LocalHostUnknownMutation::Save { profile_id });
@@ -1677,6 +1557,7 @@ impl ConnectionsPanel {
     }
 
     /// 先取最新 versioned row 再打开删除确认，确认目标显示名与 revision 必须来自同一快照。
+    /// 删除核对独占自身代次，避免目录刷新和此前列表读取互相作废而遗留忙碌状态。
     /// @author kongweiguang
     pub(crate) fn request_delete_local_host(
         &mut self,
@@ -1710,12 +1591,10 @@ impl ConnectionsPanel {
             cx.notify();
             return;
         }
-        let Some(service) = self.local_hosts.service.clone() else {
-            return;
-        };
+        let service = self.hosts.clone();
         let executor = self.executor.clone();
-        let generation = self.local_hosts.generation.wrapping_add(1);
-        self.local_hosts.generation = generation;
+        let generation = self.local_hosts.delete_check_generation.wrapping_add(1);
+        self.local_hosts.delete_check_generation = generation;
         self.local_hosts.delete_checking = true;
         self.local_hosts.pending_delete = None;
         self.status = Some(
@@ -1724,10 +1603,18 @@ impl ConnectionsPanel {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |_| async move { service.get_profile(&profile_id).await })
+                .run(move |_| async move {
+                    let id = local_host_id(&profile_id)?;
+                    Ok(service
+                        .load_local_host(&id)
+                        .await?
+                        .map(|host| local_host_projection(host, BTreeMap::new())))
+                })
                 .await;
             let _ = this.update_in(cx, |panel, _window, cx| {
-                if panel.local_hosts.generation != generation {
+                if !panel.local_hosts.delete_checking
+                    || panel.local_hosts.delete_check_generation != generation
+                {
                     return;
                 }
                 panel.local_hosts.delete_checking = false;
@@ -1754,17 +1641,29 @@ impl ConnectionsPanel {
         .detach();
     }
 
-    /// 关闭根确认时只清除确认快照，不触及 ProfileService。
+    /// 取消只撤销只读意图；凭据待清理时仍可关闭确认以显示恢复入口，写入未知则保留上下文。
+    /// @author kongweiguang
     pub(crate) fn cancel_delete_local_host(&mut self, cx: &mut Context<Self>) {
-        if !self.local_hosts.mutation_blocked() {
+        if self.local_hosts.delete_checking {
+            self.local_hosts.delete_check_generation =
+                self.local_hosts.delete_check_generation.wrapping_add(1);
+            self.local_hosts.delete_checking = false;
+            self.local_hosts.pending_delete = None;
+            self.status = None;
+            cx.notify();
+            return;
+        }
+        if !self.local_hosts.saving && !self.local_hosts.save_outcome_unknown {
             self.local_hosts.pending_delete = None;
             cx.notify();
         }
     }
 
-    /// 根确认后才按确认快照中的精确 ID/revision 删除，重复确认和未知结果都受门禁约束。
+    /// 根确认后才按确认快照中的精确 ID/revision 删除；列表读取期间与按钮状态一致地拒绝提交。
+    /// @author kongweiguang
     pub(crate) fn confirm_delete_local_host(&mut self, cx: &mut Context<Self>) {
         if self.local_hosts.mutation_blocked()
+            || self.local_hosts.loading
             || self.recovery.mode == ConfigurationMode::ReadOnlyRecovery
         {
             return;
@@ -1774,9 +1673,7 @@ impl ConnectionsPanel {
         };
         let profile_id = pending.profile.id.clone();
         let revision = pending.revision.clone();
-        let Some(service) = self.local_hosts.service.clone() else {
-            return;
-        };
+        let service = self.hosts.clone();
         let executor = self.executor.clone();
         self.local_hosts.saving = true;
         self.status =
@@ -1786,7 +1683,10 @@ impl ConnectionsPanel {
             let expected_revision = revision.clone();
             let id = profile_id.clone();
             let result = executor
-                .run(move |_| async move { service.delete_profile(&id, expected_revision).await })
+                .run(move |_| async move {
+                    let id = local_host_id(&id)?;
+                    service.delete_local_host(&id, &expected_revision).await
+                })
                 .await;
             let _ = this.update_in(cx, |panel, _window, cx| {
                 panel.finish_local_host_delete(profile_id, revision, result, cx)
@@ -1800,12 +1700,12 @@ impl ConnectionsPanel {
         &mut self,
         profile_id: String,
         revision: ConfigRevision,
-        result: Result<bool, AppError>,
+        result: Result<HostDeletionReceipt, AppError>,
         cx: &mut Context<Self>,
     ) {
         self.local_hosts.saving = false;
         match result {
-            Ok(true) => {
+            Ok(receipt) => {
                 self.local_hosts.pending_delete = None;
                 self.local_hosts
                     .rows
@@ -1814,20 +1714,20 @@ impl ConnectionsPanel {
                     self.local_hosts.selected_id = None;
                     self.local_hosts.selected = None;
                 }
-                self.status = Some(
-                    crate::locale::text("本地主机已删除。", "Local host deleted.").to_string(),
+                self.local_hosts.cleanup_pending = matches!(
+                    receipt.credential_cleanup,
+                    CredentialCleanupStatus::Deferred { .. }
                 );
-                self.reload_local_hosts(cx);
-            }
-            Ok(false) => {
-                self.local_hosts.pending_delete = None;
-                self.status = Some(
-                    crate::locale::text(
-                        "本地主机已不存在，列表正在刷新。",
-                        "The local host no longer exists. Refreshing the list.",
+                self.status = Some(match receipt.credential_cleanup {
+                    CredentialCleanupStatus::Complete => {
+                        crate::locale::text("本地主机已删除。", "Local host deleted.").to_string()
+                    }
+                    CredentialCleanupStatus::Deferred { remaining } => crate::locale::text(
+                        format!("本地主机已删除；{remaining} 个旧凭据待清理。"),
+                        format!("Local host deleted; {remaining} old credentials await cleanup."),
                     )
                     .to_string(),
-                );
+                });
                 self.reload_local_hosts(cx);
             }
             Err(error) if error.public_code() == PublicErrorCode::OutcomeUnknown => {
@@ -1846,6 +1746,17 @@ impl ConnectionsPanel {
                     .to_string(),
                 );
             }
+            Err(error) if error.public_code() == PublicErrorCode::NotFound => {
+                self.local_hosts.pending_delete = None;
+                self.status = Some(
+                    crate::locale::text(
+                        "本地主机已不存在，列表正在刷新。",
+                        "The local host no longer exists. Refreshing the list.",
+                    )
+                    .to_string(),
+                );
+                self.reload_local_hosts(cx);
+            }
             Err(error) => {
                 self.local_hosts.pending_delete = None;
                 self.status = Some(super::panel::localized_error(&error));
@@ -1858,7 +1769,7 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 连接项异步加载统一走 executor；世代号阻止慢结果覆盖较新的选择或配置刷新。
+    /// 分别读取主机快照和模板候选；主机列表不读取环境秘密，世代号阻止旧结果覆盖。
     fn load_local_profiles(&mut self, explicit_readback: bool, cx: &mut Context<Self>) {
         let Some(service) = self.local_hosts.service.clone() else {
             return;
@@ -1867,10 +1778,88 @@ impl ConnectionsPanel {
             return;
         };
         let executor = self.executor.clone();
+        let hosts = self.hosts.clone();
+        let operation = explicit_readback
+            .then(|| self.local_hosts.unknown_mutation.clone())
+            .flatten();
+        let startup_recovery = !self.local_hosts.startup_recovery_checked && !explicit_readback;
+        let cleanup_pending = explicit_readback && self.local_hosts.cleanup_pending;
+        let recovery = explicit_readback
+            .then(|| self.local_hosts.unknown_save_recovery.clone())
+            .flatten();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |_| async move { service.list_profiles().await })
+                .run(move |cancel| async move {
+                    let startup_recovery = if startup_recovery {
+                        Some(hosts.recover_pending_local_host_save().await)
+                    } else {
+                        None
+                    };
+                    let save_readback = match operation {
+                        Some(LocalHostUnknownMutation::Save { profile_id }) => {
+                            let id = local_host_id(&profile_id)?;
+                            let current = hosts.load_local_host(&id).await?;
+                            let current = match current {
+                                Some(host) => {
+                                    let env = hosts.read_local_environment(&host, &cancel).await?;
+                                    Some(local_host_projection(host, env))
+                                }
+                                None => None,
+                            };
+                            let cleanup = match recovery {
+                                Some(recovery) => {
+                                    hosts.recover_unknown_local_host_save(&recovery).await?
+                                }
+                                None => hosts.recover_pending_local_host_save().await?,
+                            };
+                            if matches!(cleanup, CredentialCleanupStatus::Deferred { .. }) {
+                                return Err(AppError::infrastructure(
+                                    "本地主机恢复凭据清理尚未完成，请重新核对",
+                                ));
+                            }
+                            Some(current)
+                        }
+                        Some(LocalHostUnknownMutation::Delete { profile_id, .. }) => {
+                            let id = local_host_id(&profile_id)?;
+                            let _ = hosts.load_local_host(&id).await?;
+                            if matches!(
+                                hosts.recover_pending_local_host_save().await?,
+                                CredentialCleanupStatus::Deferred { .. }
+                            ) {
+                                return Err(AppError::infrastructure(
+                                    "本地主机恢复凭据清理尚未完成，请重新核对",
+                                ));
+                            }
+                            None
+                        }
+                        None if cleanup_pending => {
+                            if matches!(
+                                hosts.recover_pending_local_host_save().await?,
+                                CredentialCleanupStatus::Deferred { .. }
+                            ) {
+                                return Err(AppError::infrastructure(
+                                    "本地主机恢复凭据清理尚未完成，请重新核对",
+                                ));
+                            }
+                            None
+                        }
+                        None => None,
+                    };
+                    let rows = hosts
+                        .list_local_hosts()
+                        .await?
+                        .into_iter()
+                        .map(|host| local_host_projection(host, BTreeMap::new()))
+                        .collect();
+                    let templates = service.list_profiles().await?;
+                    Ok(LocalHostCatalogLoad {
+                        rows,
+                        templates,
+                        save_readback,
+                        startup_recovery,
+                    })
+                })
                 .await;
             let _ = this.update_in(cx, |panel, window, cx| {
                 if panel.local_hosts.generation != generation {
@@ -1882,10 +1871,10 @@ impl ConnectionsPanel {
         .detach();
     }
 
-    /// 读回只更新 profile 列表；脏编辑仍保留，未知写入必须经过单独的用户恢复动作。
+    /// 原子替换两个目录投影，脏编辑保留原值，未知写入仍需显式核对。
     fn finish_local_profiles_load(
         &mut self,
-        result: Result<Vec<VersionedProfile>, AppError>,
+        result: Result<LocalHostCatalogLoad, AppError>,
         explicit_readback: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -1893,8 +1882,36 @@ impl ConnectionsPanel {
         self.local_hosts.loading = false;
         self.local_hosts.readback_in_progress = false;
         match result {
-            Ok(rows) => {
+            Ok(LocalHostCatalogLoad {
+                rows,
+                templates,
+                save_readback,
+                startup_recovery,
+            }) => {
                 self.local_hosts.rows = rows;
+                self.local_hosts.templates = templates;
+                if let Some(recovery) = startup_recovery {
+                    self.local_hosts.startup_recovery_checked = true;
+                    match recovery {
+                        Ok(CredentialCleanupStatus::Complete) => {
+                            self.local_hosts.cleanup_pending = false;
+                        }
+                        Ok(CredentialCleanupStatus::Deferred { .. }) => {
+                            self.local_hosts.cleanup_pending = true;
+                            self.status = Some(
+                                crate::locale::text(
+                                    "本地主机旧凭据尚待清理，请点击核对后重试。",
+                                    "Local host credentials still need cleanup. Review and retry.",
+                                )
+                                .to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            self.local_hosts.cleanup_pending = true;
+                            self.status = Some(super::panel::localized_error(&error));
+                        }
+                    }
+                }
                 self.local_hosts.selected = self
                     .local_hosts
                     .selected_id
@@ -1916,7 +1933,21 @@ impl ConnectionsPanel {
                     editor.external_conflict = Some(&current.revision) != editor.revision.as_ref();
                 }
                 if explicit_readback {
-                    self.reconcile_local_host_readback(cx);
+                    if save_readback.is_some() {
+                        self.local_hosts.unknown_save_recovery = None;
+                    }
+                    if self.local_hosts.cleanup_pending && !self.local_hosts.save_outcome_unknown {
+                        self.local_hosts.cleanup_pending = false;
+                        self.status = Some(
+                            crate::locale::text(
+                                "本地主机凭据清理已完成。",
+                                "Local host credential cleanup is complete.",
+                            )
+                            .to_string(),
+                        );
+                    } else {
+                        self.reconcile_local_host_readback(save_readback, cx);
+                    }
                 } else if self
                     .local_hosts
                     .editor
@@ -1932,7 +1963,11 @@ impl ConnectionsPanel {
             Err(error) => {
                 self.status = Some(super::panel::localized_error(&error));
                 if explicit_readback {
-                    self.local_hosts.save_outcome_unknown = true;
+                    if !self.local_hosts.cleanup_pending {
+                        self.local_hosts.save_outcome_unknown = true;
+                    }
+                } else if !self.local_hosts.startup_recovery_checked {
+                    self.local_hosts.cleanup_pending = true;
                 }
             }
         }
@@ -1941,18 +1976,41 @@ impl ConnectionsPanel {
     }
 
     /// 显式读回后按稳定 ID 和原 revision 判断保存/删除当前事实，不把读回伪装成成功回执。
-    fn reconcile_local_host_readback(&mut self, cx: &mut Context<Self>) {
+    fn reconcile_local_host_readback(
+        &mut self,
+        save_readback: Option<Option<VersionedProfile>>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(operation) = self.local_hosts.unknown_mutation.clone() else {
             return;
         };
         match operation {
             LocalHostUnknownMutation::Save { profile_id } => {
-                let current = self
-                    .local_hosts
-                    .rows
-                    .iter()
-                    .find(|row| row.profile.id == profile_id)
-                    .cloned();
+                let Some(current) = save_readback else {
+                    self.status = Some(
+                        crate::locale::text(
+                            "恢复读回未完成，请重新核对。",
+                            "Recovery readback is incomplete; review it again.",
+                        )
+                        .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                };
+                if current
+                    .as_ref()
+                    .is_some_and(|row| row.profile.id != profile_id)
+                {
+                    self.status = Some(
+                        crate::locale::text(
+                            "恢复读回目标不匹配，写入保持暂停。",
+                            "The recovery target does not match. Writes remain paused.",
+                        )
+                        .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
                 self.local_hosts.unknown_readback = current.clone();
                 self.local_hosts.unknown_target_missing = current.is_none();
                 self.status = Some(match current {
@@ -2015,72 +2073,6 @@ impl ConnectionsPanel {
                     }
                 }
             }
-            LocalHostUnknownMutation::SetDefault { profile_id } => {
-                let readback = local_host_default_readback(&self.local_hosts.rows, &profile_id);
-                self.local_hosts.unknown_readback =
-                    local_host_default_target(&self.local_hosts.rows, &profile_id).cloned();
-                self.local_hosts.unknown_target_missing = !readback.target_present;
-                let default_count = readback.default_profile_ids.len();
-                self.status = Some(if default_count > 1 {
-                    crate::locale::text(
-                        format!(
-                            "已核对当前默认状态，未重放原操作。发现 {default_count} 个默认本地主机，请修复配置后再次读回；写入仍封锁。"
-                        ),
-                        format!(
-                            "The current default state was verified; the original operation was not replayed. Found {default_count} default local hosts. Repair the configuration and read it back again; writes remain blocked."
-                        ),
-                    )
-                    .to_string()
-                } else if default_count == 0 {
-                    let target_state = if readback.target_present {
-                        "目标仍存在，但当前没有默认本地主机。"
-                    } else {
-                        "目标已不存在，且当前没有默认本地主机。"
-                    };
-                    crate::locale::text(
-                        format!("已核对当前默认状态，未重放原操作。{target_state}"),
-                        if readback.target_present {
-                            "The current default state was verified; the original operation was not replayed. The target still exists, but no local host is currently default.".to_owned()
-                        } else {
-                            "The current default state was verified; the original operation was not replayed. The target no longer exists, and no local host is currently default.".to_owned()
-                        },
-                    )
-                    .to_string()
-                } else if readback.target_is_default {
-                    crate::locale::text(
-                        "已核对当前默认状态，未重放原操作。目标目前是唯一默认本地主机。",
-                        "The current default state was verified; the original operation was not replayed. The target is currently the only default local host.",
-                    )
-                    .to_string()
-                } else {
-                    let default_id = &readback.default_profile_ids[0];
-                    let default_name = self
-                        .local_hosts
-                        .rows
-                        .iter()
-                        .find(|row| row.profile.id.as_str() == default_id)
-                        .map(|row| row.profile.name.as_str())
-                        .unwrap_or(default_id.as_str());
-                    let target_state = if readback.target_present {
-                        "目标仍存在。"
-                    } else {
-                        "目标已不存在。"
-                    };
-                    crate::locale::text(
-                        format!(
-                            "已核对当前默认状态，未重放原操作。{target_state}当前默认项为“{default_name}”。"
-                        ),
-                        format!(
-                            "The current default state was verified; the original operation was not replayed. {}The current default is “{default_name}”.",
-                            if readback.target_present { "The target still exists. " } else { "The target no longer exists. " }
-                        ),
-                    )
-                    .to_string()
-                });
-                if local_host_default_readback_can_release(&readback) {
-                    self.clear_local_host_unknown();
-                }
-            }
         }
         self.local_hosts.status = self.status.clone();
         cx.notify();
@@ -2092,6 +2084,7 @@ impl ConnectionsPanel {
         self.local_hosts.unknown_mutation = None;
         self.local_hosts.unknown_readback = None;
         self.local_hosts.unknown_target_missing = false;
+        self.local_hosts.unknown_save_recovery = None;
     }
 
     /// 统一 dirty gate；确认后继续原始操作，取消则保留草稿和当前 Profile ID；远程恢复期间不切换表单。
@@ -2179,7 +2172,7 @@ impl ConnectionsPanel {
                 self.active_editor_kind = Some(ConnectionsEditorKind::Local);
                 self.start_default_local_target_resolution(cx);
                 self.discover_local_shells(cx);
-                self.status = Some(crate::locale::text("填写本地主机配置后保存；不会自动设为默认主机。", "Configure the local host and save it; it will not become the default host automatically.").to_string());
+                self.status = None;
             }
             LocalHostPendingAction::Edit(profile_id) => {
                 self.load_local_profile_editor(profile_id, LocalHostEditorMode::Edit, window, cx)
@@ -2207,7 +2200,7 @@ impl ConnectionsPanel {
         self.resolve_local_profile_target(None, None, cx);
     }
 
-    /// 基于稳定 Profile ID 读取最新快照；失败时保留现有编辑器，成功后才清理旧环境变量并替换。
+    /// 按本地主机 ID 重新读取 revision 和加密环境；任何读取失败均保留原编辑器。
     /// 编辑/复制/冲突重读不得用导航列表旧 revision 写回，也不能因读取失败丢失当前草稿。
     /// @author kongweiguang
     pub(super) fn load_local_profile_editor(
@@ -2217,9 +2210,7 @@ impl ConnectionsPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(service) = self.local_hosts.service.clone() else {
-            return;
-        };
+        let service = self.hosts.clone();
         self.local_hosts.editor_load_generation =
             self.local_hosts.editor_load_generation.wrapping_add(1);
         let editor_load_generation = self.local_hosts.editor_load_generation;
@@ -2238,7 +2229,14 @@ impl ConnectionsPanel {
         cx.spawn(async move |this, cx| {
             let requested_id = profile_id.clone();
             let result = executor
-                .run(move |_| async move { service.get_profile(&requested_id).await })
+                .run(move |cancel| async move {
+                    let id = local_host_id(&requested_id)?;
+                    let Some(host) = service.load_local_host(&id).await? else {
+                        return Ok(None);
+                    };
+                    let environment = service.read_local_environment(&host, &cancel).await?;
+                    Ok(Some(local_host_projection(host, environment)))
+                })
                 .await;
             let _ = this.update_in(cx, |panel, window, cx| {
                 if !panel
@@ -2299,8 +2297,10 @@ impl ConnectionsPanel {
                         panel.local_hosts.editor = Some(editor);
                         panel.active_editor_kind = Some(ConnectionsEditorKind::Local);
                         panel.local_hosts.selected_id = Some(snapshot.profile.id.clone());
-                        panel.local_hosts.selected = Some(snapshot.clone());
-                        upsert_profile(&mut panel.local_hosts.rows, snapshot);
+                        let mut visible_snapshot = snapshot;
+                        visible_snapshot.profile.env.clear();
+                        panel.local_hosts.selected = Some(visible_snapshot.clone());
+                        upsert_profile(&mut panel.local_hosts.rows, visible_snapshot);
                         panel.discover_local_shells(cx);
                         panel.status = None;
                     }
@@ -2326,7 +2326,7 @@ impl ConnectionsPanel {
         .detach();
     }
 
-    /// 按稳定 ID 重新读取详情，选择过程不写配置且不会将 profile ID 塞入临时 Local 目标。
+    /// 按稳定本地主机 ID 读取非秘密详情，不把模板 ID 解释成左栏主机。
     fn load_local_host_selection(&mut self, profile_id: Option<String>, cx: &mut Context<Self>) {
         let Some(profile_id) = profile_id else {
             self.local_hosts.selected_id = None;
@@ -2335,9 +2335,7 @@ impl ConnectionsPanel {
             cx.notify();
             return;
         };
-        let Some(service) = self.local_hosts.service.clone() else {
-            return;
-        };
+        let service = self.hosts.clone();
         self.local_hosts.generation = self.local_hosts.generation.wrapping_add(1);
         let generation = self.local_hosts.generation;
         let executor = self.executor.clone();
@@ -2348,7 +2346,13 @@ impl ConnectionsPanel {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |_| async move { service.get_profile(&profile_id).await })
+                .run(move |_| async move {
+                    let id = local_host_id(&profile_id)?;
+                    Ok(service
+                        .load_local_host(&id)
+                        .await?
+                        .map(|host| local_host_projection(host, BTreeMap::new())))
+                })
                 .await;
             let _ = this.update_in(cx, |panel, _window, cx| {
                 if panel.local_hosts.generation != generation {

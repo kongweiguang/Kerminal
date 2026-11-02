@@ -13,6 +13,7 @@ mod directx_renderer;
 mod dispatcher;
 mod display;
 mod events;
+mod external_drag;
 mod ime_composition;
 mod keyboard;
 mod platform;

@@ -13,7 +13,7 @@ use kerminal_domain::{
     identity::HostId,
 };
 
-use super::{RemoteCommandSuggestionProvider, syntax};
+use super::RemoteCommandSuggestionProvider;
 
 /// 遵从调用方显式 provider 选择；未提供筛选表示当前请求允许所有远端能力。
 pub(super) fn requested(
@@ -94,11 +94,6 @@ pub(super) fn command_cache_key_for_git(
     request: &CommandSuggestionRequest,
 ) -> (String, String) {
     RemoteCommandSuggestionProvider::cwd_cache_key(host_id, request)
-}
-
-/// 按安全 shell 语法转义远端名称；未知语法只允许跨 shell 裸 token。
-pub(super) fn quote(value: &str, shell: syntax::ShellFamily) -> Option<String> {
-    syntax::quote_literal(value, shell)
 }
 
 /// 让精确短前缀靠前，并使目录略高于普通路径文件。

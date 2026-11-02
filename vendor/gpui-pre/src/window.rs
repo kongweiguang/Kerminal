@@ -1287,6 +1287,8 @@ pub struct Window {
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
+    /// 当前输入是否真正命中了允许放置的 drop listener。
+    file_drop_accepted: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
@@ -2188,6 +2190,7 @@ impl Window {
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
             default_prevented: true,
+            file_drop_accepted: false,
             mouse_position,
             mouse_hit_test: HitTest::default(),
             modifiers,
@@ -2251,6 +2254,8 @@ impl Window {
 pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
+    /// 只有有效 drop listener 执行后为真，不能由其它鼠标处理器冒充。
+    pub file_drop_accepted: bool,
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -3385,6 +3390,13 @@ impl Window {
     /// parent elements from becoming focused on mouse down.
     pub fn prevent_default(&mut self) {
         self.default_prevented = true;
+    }
+
+    /// 放置受理独立于事件冒泡，供原生系统区分合法目标与普通鼠标事件。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn mark_file_drop_accepted(&mut self) {
+        self.file_drop_accepted = true;
     }
 
     /// Obtain whether default has been prevented for the event currently being dispatched.
@@ -5843,6 +5855,7 @@ impl Window {
         cx.propagate_event = true;
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
+        self.file_drop_accepted = false;
 
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
@@ -5988,6 +6001,7 @@ impl Window {
         DispatchEventResult {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
+            file_drop_accepted: self.file_drop_accepted,
         }
     }
 

@@ -377,9 +377,13 @@ impl RootView {
             let pane_for_task = pane.clone();
             let resolved = executor
                 .run(move |application_cancellation| async move {
-                    let resolve = resolve_cancellation.run_until_cancelled(
-                        resolve_workspace_open_target(&profiles, hosts.as_ref(), &pane_for_task),
-                    );
+                    let resolve =
+                        resolve_cancellation.run_until_cancelled(resolve_workspace_open_target(
+                            &profiles,
+                            hosts.as_ref(),
+                            &pane_for_task,
+                            &resolve_cancellation,
+                        ));
                     Ok::<_, AppError>(
                         match application_cancellation.run_until_cancelled(resolve).await {
                             Some(Some(result)) => result,
@@ -859,6 +863,7 @@ impl RootView {
         match sync_result {
             Ok(WorkspaceControllerEffect::Changed { .. }) => {
                 if activate_new_tab {
+                    self.cancel_visible_transfer_preparation(cx);
                     self.center_panel = super::CenterPanel::Terminal;
                 }
                 self.refresh_workspace_views(cx);
@@ -1060,6 +1065,7 @@ async fn resolve_workspace_open_target(
     profiles: &ProfileService,
     hosts: Option<&HostManagementService>,
     pane: &WorkspaceSessionPane,
+    cancel: &CancellationToken,
 ) -> Result<(WorkspaceTerminalOpenKind, SessionTarget), (WorkspaceRestoreFailure, AppError)> {
     if pane.mode == WorkspacePaneMode::Preview {
         return Err((
@@ -1109,7 +1115,7 @@ async fn resolve_workspace_open_target(
         ));
     }
 
-    let target = resolve_workspace_target(profiles, hosts, pane).await?;
+    let target = resolve_workspace_target(profiles, hosts, pane, cancel).await?;
     if let Some(binding) = pane.tmux_binding.as_ref() {
         let (host_id, profile_id) = match pane.target.as_ref() {
             Some(WorkspaceTargetRef::Local { profile_id }) => (
@@ -1220,11 +1226,13 @@ fn container_exec_command(
     Ok(command)
 }
 
-/// 按 v3 类型化 target 恢复连接，明确缺失 profile/host 时失败而不切换其它默认目标。
+/// 显式 local 引用解析独立本地主机；只有无引用目标可使用默认 Profile，避免模板修改改变已保存主机。
+/// 缺失 host 时保留可恢复失败，不能悄悄切换其它默认目标。
 async fn resolve_workspace_target(
     profiles: &ProfileService,
     hosts: Option<&HostManagementService>,
     pane: &WorkspaceSessionPane,
+    cancel: &CancellationToken,
 ) -> Result<SessionTarget, (WorkspaceRestoreFailure, AppError)> {
     let Some(target_ref) = pane.target.as_ref() else {
         return Err((
@@ -1240,14 +1248,27 @@ async fn resolve_workspace_target(
         WorkspaceTargetRef::Local { profile_id } => {
             let profile_id = profile_id.as_deref().or(pane.profile_id.as_deref());
             let mut target = if let Some(profile_id) = profile_id {
-                profiles
-                    .local_session_target(profile_id)
+                let host_id =
+                    kerminal_domain::identity::HostId::parse(profile_id).map_err(|_| {
+                        (
+                            WorkspaceRestoreFailure::MissingTarget,
+                            AppError::invalid("本地 Profile ID 无效"),
+                        )
+                    })?;
+                hosts
+                    .ok_or_else(|| {
+                        (
+                            WorkspaceRestoreFailure::MissingTarget,
+                            AppError::unsupported("本地主机目录服务尚未配置"),
+                        )
+                    })?
+                    .local_session_target(&host_id, cancel)
                     .await
                     .map_err(|error| (failure_for_error(&error), error))?
                     .ok_or_else(|| {
                         (
                             WorkspaceRestoreFailure::MissingTarget,
-                            AppError::not_found("工作区引用的本地 Profile"),
+                            AppError::not_found("工作区引用的本地主机"),
                         )
                     })?
             } else if let Some(shell) = pane.shell.as_deref() {

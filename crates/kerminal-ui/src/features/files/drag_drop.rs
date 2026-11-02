@@ -2,9 +2,12 @@
 //!
 //! @author kongweiguang
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
-use gpui_kit::{Context, IntoElement, ParentElement, Render, Styled, Window, div};
+use gpui_kit::{
+    Context, InteractiveElement as _, IntoElement, ParentElement, Pixels, Point, Render, Styled,
+    Window, div,
+};
 use kerminal_domain::files::{
     ConflictPolicy, FileEndpoint, FileEntry, FileEntryKind, TransferKind, TransferRequest,
 };
@@ -12,6 +15,8 @@ use kerminal_domain::files::{
 use crate::{locale, theme::ThemeTokens};
 
 mod external;
+#[cfg(windows)]
+mod native_drag;
 
 use super::{
     BatchEnqueueLabels, FilesPane, TransferBatchPlan, TransferEnqueueItem, child_endpoint,
@@ -21,11 +26,13 @@ use super::{
 /// 拖动载荷冻结来源面板、目录代次与选中根项，避免鼠标移动期间改用新目录。
 #[derive(Clone)]
 pub(super) struct FileTransferDrag {
+    source_pane_id: u64,
     pub(super) source_side: usize,
     source_directory: FileEndpoint,
     source_generation: u64,
     entries: DraggedEntries,
     included_descendants: usize,
+    tree_selection: Option<Arc<Vec<FileEntry>>>,
 }
 
 #[derive(Clone)]
@@ -39,6 +46,7 @@ impl FileTransferDrag {
     ///
     /// @author kongweiguang
     pub(super) fn new(
+        source_pane_id: u64,
         source_side: usize,
         source_directory: FileEndpoint,
         source_generation: u64,
@@ -46,11 +54,13 @@ impl FileTransferDrag {
         included_descendants: usize,
     ) -> Self {
         Self {
+            source_pane_id,
             source_side,
             source_directory,
             source_generation,
             entries: DraggedEntries::Selection(entries),
             included_descendants,
+            tree_selection: None,
         }
     }
 
@@ -58,17 +68,20 @@ impl FileTransferDrag {
     ///
     /// @author kongweiguang
     pub(super) fn single(
+        source_pane_id: u64,
         source_side: usize,
         source_directory: FileEndpoint,
         source_generation: u64,
         entry: FileEntry,
     ) -> Self {
         Self {
+            source_pane_id,
             source_side,
             source_directory,
             source_generation,
             entries: DraggedEntries::Single(entry),
             included_descendants: 0,
+            tree_selection: None,
         }
     }
 
@@ -80,6 +93,24 @@ impl FileTransferDrag {
             DraggedEntries::Selection(entries) => entries.as_slice(),
             DraggedEntries::Single(entry) => std::slice::from_ref(entry),
         }
+    }
+
+    /// 内部复制保留完整树选区，以便目标不安全的父目录不会吞掉可复制的已选子项。
+    /// 外部拖出仍使用原有根项，避免向操作系统重复暴露父子路径。
+    ///
+    /// @author kongweiguang
+    pub(super) fn with_tree_selection(mut self, entries: Arc<Vec<FileEntry>>) -> Self {
+        self.tree_selection = Some(entries);
+        self
+    }
+
+    /// 内部复制使用完整树选区；列表和单行仍使用冻结的普通拖动条目。
+    ///
+    /// @author kongweiguang
+    fn copy_entries(&self) -> &[FileEntry] {
+        self.tree_selection
+            .as_deref()
+            .map_or_else(|| self.entries(), |entries| entries.as_slice())
     }
     /// 预览优先展示原选择数量，树选择的已折叠子项也会计入用户提交的项目数。
     ///
@@ -93,40 +124,56 @@ impl FileTransferDrag {
 pub(super) struct FileDragPreview {
     label: String,
     theme: ThemeTokens,
+    cursor_offset: Point<Pixels>,
 }
 
 impl FileDragPreview {
-    /// 按主题构造不包含目标路径的拖动预览，避免拖拽时泄漏远端身份。
+    /// 保存 GPUI 相对整行的抓取偏移；紧凑预览需抵消它，才能始终贴近鼠标而非原行左缘。
+    /// 预览只表达数量，英文按单复数呈现，避免单项拖动出现错误文案。
     ///
     /// @author kongweiguang
-    pub(super) fn new(count: usize, theme: ThemeTokens) -> Self {
+    pub(super) fn new(count: usize, cursor_offset: Point<Pixels>, theme: ThemeTokens) -> Self {
         Self {
-            label: locale::text(format!("{count} 个项目"), format!("{count} items")).to_string(),
+            label: locale::text(
+                format!("{count} 个项目"),
+                format!("{count} {}", if count == 1 { "item" } else { "items" }),
+            )
+            .to_string(),
             theme,
+            cursor_offset,
         }
     }
 }
 
 impl Render for FileDragPreview {
-    /// 将文件数量压缩为主题一致的小型反馈，避免预览携带路径或泄漏连接身份。
+    /// GPUI 按鼠标减抓取偏移绘制根节点；偏移放在子节点，因为根布局会忽略自身的相对定位。
+    /// 子节点抵消整行抓取偏移并留出间距，让紧凑预览贴近鼠标且不遮挡落点。
     ///
     /// @author kongweiguang
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .border_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.secondary)
-            .text_color(self.theme.foreground)
-            .text_size(self.theme.text_sm)
-            .child(self.label.clone())
+        div().child(
+            div()
+                .relative()
+                .left(self.cursor_offset.x)
+                .top(self.cursor_offset.y)
+                .debug_selector(|| "files-drag-preview".into())
+                .ml_3()
+                .mt_3()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(self.theme.border)
+                .bg(self.theme.secondary)
+                .text_color(self.theme.foreground)
+                .text_size(self.theme.text_sm)
+                .child(self.label.clone()),
+        )
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DropRejection {
+pub(super) enum DropRejection {
     UnsupportedKind,
     InvalidName,
     SourceOutsideSnapshot,
@@ -140,6 +187,7 @@ enum DropRejection {
 struct InternalDropPlan {
     items: Vec<(String, TransferRequest)>,
     issues: Vec<String>,
+    included_descendants: usize,
 }
 
 /// 列表快照同时绑定 endpoint 与 generation，阻止用户切换目录后旧拖动误投到新视图。
@@ -203,6 +251,61 @@ fn validate_drop_entry(
     Ok((name, kind))
 }
 
+/// 只在没有任何可复制项时返回原因；混合选区仍可提交安全项目并报告其余拒绝项。
+///
+/// @author kongweiguang
+pub(super) fn copy_target_rejection<'a>(
+    entries: impl IntoIterator<Item = &'a FileEntry>,
+    source_directory: &FileEndpoint,
+    destination_directory: &FileEndpoint,
+) -> Option<DropRejection> {
+    let mut rejection = None;
+    for entry in entries {
+        match validate_drop_entry(entry, source_directory, destination_directory) {
+            Ok(_) => return None,
+            Err(reason) if reason != DropRejection::UnsupportedKind && rejection.is_none() => {
+                rejection = Some(reason);
+            }
+            Err(_) => {}
+        }
+    }
+    rejection
+}
+
+/// 仅由安全的已选目录覆盖后代；被拒绝的父目录不能使其安全子项从批次消失。
+///
+/// @author kongweiguang
+pub(super) fn copy_selection_roots(
+    entries: Vec<FileEntry>,
+    source_directory: &FileEndpoint,
+    destination_directory: &FileEndpoint,
+) -> (Vec<FileEntry>, usize) {
+    let safe_directories = entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == FileEntryKind::Directory
+                && validate_drop_entry(entry, source_directory, destination_directory).is_ok()
+        })
+        .map(|entry| entry.endpoint.clone())
+        .collect::<HashSet<_>>();
+    let total = entries.len();
+    let roots = entries
+        .into_iter()
+        .filter(|entry| {
+            let mut parent = parent_endpoint(&entry.endpoint);
+            while let Some(endpoint) = parent {
+                if safe_directories.contains(&endpoint) {
+                    return false;
+                }
+                parent = parent_endpoint(&endpoint).filter(|next| next != &endpoint);
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+    let included_descendants = total - roots.len();
+    (roots, included_descendants)
+}
+
 /// 父目录迭代只比较同一逻辑文件系统，覆盖本机 PathBuf 与 POSIX RemotePath 两种路径语义。
 ///
 /// @author kongweiguang
@@ -228,10 +331,13 @@ fn endpoint_is_same_or_descendant(candidate: &FileEndpoint, ancestor: &FileEndpo
 }
 
 /// 只有至少一个安全复制项、跨面板且两侧目录都已读取时，GPUI 才把内部拖动标成可放置。
+/// 资格函数显式接收来源身份与两侧渲染快照，不为一次拖放增加另一份可变状态。
 ///
 /// @author kongweiguang
+#[allow(clippy::too_many_arguments)]
 pub(super) fn internal_drop_is_allowed(
     drag: &FileTransferDrag,
+    current_pane_id: u64,
     current_source_side: usize,
     current_source: DropDirectorySnapshot<'_>,
     destination_side: usize,
@@ -241,6 +347,7 @@ pub(super) fn internal_drop_is_allowed(
 ) -> bool {
     if busy
         || !destination_ready
+        || drag.source_pane_id != current_pane_id
         || drag.source_side != current_source_side
         || !drop_directory_is_current(
             &drag.source_directory,
@@ -248,12 +355,12 @@ pub(super) fn internal_drop_is_allowed(
             current_source,
         )
         || drag.source_side == destination_side
-        || drag.entries().is_empty()
+        || drag.copy_entries().is_empty()
     {
         return false;
     }
 
-    drag.entries().iter().any(|entry| {
+    drag.copy_entries().iter().any(|entry| {
         validate_drop_entry(entry, &drag.source_directory, destination_directory).is_ok()
     })
 }
@@ -266,23 +373,55 @@ fn plan_internal_drop(
     destination_directory: &FileEndpoint,
     conflict_policy: ConflictPolicy,
 ) -> InternalDropPlan {
-    let mut plan = InternalDropPlan {
-        items: Vec::with_capacity(drag.entries().len()),
-        issues: Vec::new(),
+    let (selected, included_descendants) = if drag.tree_selection.is_some() {
+        copy_selection_roots(
+            drag.copy_entries().to_vec(),
+            &drag.source_directory,
+            destination_directory,
+        )
+    } else {
+        (drag.entries().to_vec(), drag.included_descendants)
     };
-    for entry in drag.entries() {
-        let (name, kind) =
-            match validate_drop_entry(entry, &drag.source_directory, destination_directory) {
-                Ok(candidate) => candidate,
-                Err(rejection) => {
-                    plan.issues.push(format!(
-                        "{}: {}",
-                        entry.name,
-                        drop_rejection_message(rejection)
-                    ));
-                    continue;
-                }
-            };
+    let (items, issues) = plan_copy_entries(
+        &selected,
+        &drag.source_directory,
+        destination_directory,
+        conflict_policy,
+    );
+    InternalDropPlan {
+        items,
+        issues,
+        included_descendants,
+    }
+}
+
+/// 菜单、工具栏和拖放共用逐项计划，避免同目录或目录自包含请求进入冲突预检。
+///
+/// @author kongweiguang
+pub(super) fn plan_copy_entries(
+    entries: &[FileEntry],
+    source_directory: &FileEndpoint,
+    destination_directory: &FileEndpoint,
+    conflict_policy: ConflictPolicy,
+) -> (Vec<(String, TransferRequest)>, Vec<String>) {
+    let mut plan = InternalDropPlan {
+        items: Vec::with_capacity(entries.len()),
+        issues: Vec::new(),
+        included_descendants: 0,
+    };
+    for entry in entries {
+        let (name, kind) = match validate_drop_entry(entry, source_directory, destination_directory)
+        {
+            Ok(candidate) => candidate,
+            Err(rejection) => {
+                plan.issues.push(format!(
+                    "{}: {}",
+                    entry.name,
+                    drop_rejection_message(rejection)
+                ));
+                continue;
+            }
+        };
         let Some(destination) = child_endpoint(destination_directory, &name) else {
             plan.issues.push(format!(
                 "{}: {}",
@@ -305,7 +444,7 @@ fn plan_internal_drop(
             },
         ));
     }
-    plan
+    (plan.items, plan.issues)
 }
 
 /// 只有拖动开始时记录的目录和代次仍显示对应列表时，拖放才可在释放时提交。
@@ -328,12 +467,17 @@ fn drop_directory_is_current(
 /// @author kongweiguang
 fn drop_targets_are_current(
     pane: &FilesPane,
+    pane_id: u64,
     drag: &FileTransferDrag,
     destination_side: usize,
     destination_directory: &FileEndpoint,
     destination_generation: u64,
 ) -> bool {
-    if drag.source_side >= pane.panels.len() || destination_side >= pane.panels.len() {
+    if drag.source_pane_id != pane_id
+        || drag.source_side == destination_side
+        || drag.source_side >= pane.panels.len()
+        || destination_side >= pane.panels.len()
+    {
         return false;
     }
     let source = &pane.panels[drag.source_side];
@@ -382,6 +526,7 @@ impl FilesPane {
         }
         if !drop_targets_are_current(
             self,
+            cx.entity_id().as_u64(),
             &drag,
             destination_side,
             &destination_directory,
@@ -409,8 +554,11 @@ impl FilesPane {
             return;
         };
 
-        let InternalDropPlan { items, issues } =
-            plan_internal_drop(&drag, &destination_directory, self.queue.conflict_policy);
+        let InternalDropPlan {
+            items,
+            issues,
+            included_descendants,
+        } = plan_internal_drop(&drag, &destination_directory, self.queue.conflict_policy);
         let items = items
             .into_iter()
             .map(|(name, request)| TransferEnqueueItem {
@@ -433,8 +581,8 @@ impl FilesPane {
         self.enqueue_transfer_batch(
             TransferBatchPlan {
                 items,
-                total: drag.entries().len() + drag.included_descendants,
-                included_by_selected_directories: drag.included_descendants,
+                total: drag.selected_count(),
+                included_by_selected_directories: included_descendants,
                 issues,
                 labels: BatchEnqueueLabels {
                     action_zh: "拖放复制任务已入队",
@@ -450,13 +598,13 @@ impl FilesPane {
 /// 将单项拖放拒绝原因投影为中英文可操作反馈，失败条目不会悄悄消失。
 ///
 /// @author kongweiguang
-fn drop_rejection_message(rejection: DropRejection) -> String {
+pub(super) fn drop_rejection_message(rejection: DropRejection) -> String {
     locale::text(
         match rejection {
             DropRejection::UnsupportedKind => "不传输符号链接或特殊文件。",
             DropRejection::InvalidName => "文件名无法安全表示。",
-            DropRejection::SourceOutsideSnapshot => "项目已不属于拖动时的来源目录。",
-            DropRejection::SameParent => "来源和目标是同一目录，已忽略无效复制。",
+            DropRejection::SourceOutsideSnapshot => "项目已不属于来源目录。",
+            DropRejection::SameParent => "来源和目标是同一目录。",
             DropRejection::SameObject => "来源和目标指向同一项目。",
             DropRejection::TargetInsideSourceDirectory => "不能把目录复制到自身或其子目录。",
             DropRejection::InvalidDestination => "目标文件系统不支持该名称。",
@@ -467,11 +615,9 @@ fn drop_rejection_message(rejection: DropRejection) -> String {
             }
             DropRejection::InvalidName => "the name cannot be represented safely.",
             DropRejection::SourceOutsideSnapshot => {
-                "the item no longer belongs to the dragged source directory."
+                "the item no longer belongs to the source directory."
             }
-            DropRejection::SameParent => {
-                "source and target are the same directory; the no-op copy was ignored."
-            }
+            DropRejection::SameParent => "source and target are the same directory.",
             DropRejection::SameObject => "source and target identify the same item.",
             DropRejection::TargetInsideSourceDirectory => {
                 "a directory cannot be copied into itself or a descendant."

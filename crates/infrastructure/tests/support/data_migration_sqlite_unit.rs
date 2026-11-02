@@ -267,6 +267,63 @@ fn current_schema_is_validated_without_rewriting_user_files() {
     );
 }
 
+/// 正常关闭的 WAL 库可没有 sidecar；读取备份不能自建空 WAL 再把自身写入误判成并发修改。
+///
+/// @author kongweiguang
+#[test]
+fn checkpointed_wal_without_sidecars_is_read_without_creating_source_files() {
+    for version in [2, 3] {
+        let mut fixture = MigrationFixture::new();
+        fixture.root = fixture.root.join("中文 # WAL%");
+        fixture.operation_dir = fixture
+            .root
+            .join(".kerminal-migration")
+            .join(Uuid::new_v4().hyphenated().to_string());
+        fs::create_dir_all(&fixture.operation_dir).expect("isolated encoded-path operation");
+        if version == 2 {
+            create_schema_two_database(&fixture.database());
+        } else {
+            create_current_database(&fixture.database());
+        }
+        let connection = Connection::open(fixture.database()).expect("open synthetic WAL source");
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("persist WAL mode in main header");
+        connection
+            .close()
+            .expect("checkpoint and close fixture writer");
+        let before = fs::read(fixture.database()).expect("checkpointed WAL main file");
+        assert_eq!(&before[18..20], &[2, 2]);
+        assert!(!sidecar_path(&fixture.database(), "-wal").exists());
+        assert!(!sidecar_path(&fixture.database(), "-shm").exists());
+
+        let prepared = prepare(&fixture.root, &fixture.operation_dir)
+            .expect("reading a stable WAL database must not create a conflict");
+
+        assert_eq!(prepared.changed, version == 2);
+        assert_eq!(prepared.journal.is_some(), version == 2);
+        assert_eq!(
+            fs::read(fixture.database()).expect("original main remains"),
+            before
+        );
+        assert!(!sidecar_path(&fixture.database(), "-wal").exists());
+        assert!(!sidecar_path(&fixture.database(), "-shm").exists());
+        if let Some(entry) = prepared.journal {
+            let (backup, _) = private_database_paths(&fixture.operation_dir);
+            let connection = Connection::open(backup).expect("consistent SQLite backup");
+            let command: String = connection
+                .query_row(
+                    "SELECT command FROM command_history WHERE id = 'migration-row'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("backup retains committed history");
+            assert_eq!(command, "printf migration-marker");
+            assert!(entry.source_wal_sha256.is_none());
+        }
+    }
+}
+
 /// staging 已进入固定 pending 后模拟进程中断；再次 apply 应沿用 pending 完成替换。
 ///
 /// @author kongweiguang

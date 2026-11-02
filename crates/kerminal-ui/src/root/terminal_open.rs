@@ -8,7 +8,7 @@ use std::{future::Future, sync::Arc};
 
 use gpui_kit::{AppContext as _, Context, SharedString};
 use kerminal_application::{
-    AppError,
+    AppError, PublicErrorCode,
     operations::OperationsService,
     platform::external_launch::ExternalTargetLease,
     sessions::{
@@ -55,6 +55,7 @@ struct PreparedWorkspaceSession {
 enum WorkspaceSessionOpenResult {
     Ready(PreparedWorkspaceSession),
     Failed {
+        code: PublicErrorCode,
         message: SharedString,
         cleanup_pending: Option<(SessionInfo, Option<RenderSnapshot>)>,
     },
@@ -466,6 +467,7 @@ impl RootView {
                 .run(move |task_cancellation| async move {
                     if task_cancellation.is_cancelled() || restore_cancel.is_cancelled() {
                         return Ok(WorkspaceSessionOpenResult::Failed {
+                            code: PublicErrorCode::Cancelled,
                             message: crate::locale::text(
                                 "终端 pane 恢复已取消。",
                                 "Terminal pane restore was cancelled.",
@@ -506,6 +508,7 @@ impl RootView {
             let result = match result {
                 Ok(result) => result,
                 Err(error) => WorkspaceSessionOpenResult::Failed {
+                    code: error.public_code(),
                     message: error.public_message().to_owned().into(),
                     cleanup_pending: None,
                 },
@@ -585,6 +588,7 @@ impl RootView {
                 };
                 match open_result {
                     WorkspaceSessionOpenResult::Ready(prepared) => {
+                        root.external_ssh_attempts.remove(&pane_id);
                         root.finish_pending_terminal_creation(&tab_id, &pane_id, generation);
                         let session_id = prepared.session.session_id.clone();
                         let target = prepared.session.target.clone();
@@ -823,9 +827,17 @@ impl RootView {
                         true
                     }
                     WorkspaceSessionOpenResult::Failed {
+                        code,
                         message,
                         cleanup_pending,
                     } => {
+                        root.offer_external_password_retry(
+                            &pane_id,
+                            generation,
+                            code,
+                            cleanup_pending.is_some(),
+                            cx,
+                        );
                         if let Some((session, snapshot)) = cleanup_pending {
                             root.finish_pending_terminal_creation(&tab_id, &pane_id, generation);
                             let safe = crate::locale::text(
@@ -990,6 +1002,7 @@ impl RootView {
                     WorkspaceSessionOpenResult::Failed {
                         cleanup_pending: Some((session, snapshot)),
                         message,
+                        ..
                     } => Some((session, snapshot, message)),
                     WorkspaceSessionOpenResult::Failed { cleanup_pending: None, .. } => None,
                 };
@@ -1360,6 +1373,13 @@ impl RootView {
     ///
     /// @author kongweiguang
     pub(super) fn refresh_workspace_views(&mut self, cx: &mut Context<RootView>) {
+        // 仅在原持久化门禁解除后提交仍属于现存标签的最新文件端点；未知结果继续等待显式处理。
+        if self.flush_pending_sftp_transfer_endpoints(cx) {
+            self.persist_workspace_snapshot(cx);
+        }
+        self.resume_editor_navigation_sync(cx);
+        self.external_ssh_attempts
+            .retain(|pane_id, _| self.workspace_runtime.pane(pane_id).is_some());
         self.reconcile_workspace_search_visibility(cx);
         let Some(controller) = self.workspace_controller.as_ref() else {
             if let Some(navigation) = self.host_navigation.clone() {
@@ -1397,6 +1417,7 @@ impl RootView {
         }
         let pending_split = self.pending_workspace_split_preview(cx);
         let mut tab_projections = controller.tab_projections();
+        self.project_file_dirty_titles(&mut tab_projections, cx);
         if self.sftp_workbench_tab_open {
             while tab_projections
                 .iter()
@@ -1505,7 +1526,8 @@ impl RootView {
             return;
         };
         let snapshot = controller.snapshot().clone();
-        let (transient_tabs, transient_panes) = self.workspace_runtime.transient_ids();
+        let (mut transient_tabs, transient_panes) = self.workspace_runtime.transient_ids();
+        transient_tabs.extend(self.workspace_files.transient_tab_ids());
         let persisted_snapshot = match super::workspace_transient::without_transient_resources(
             &snapshot,
             &transient_tabs,
@@ -1989,6 +2011,7 @@ async fn prepare_workspace_session(
         WorkspaceTerminalOpenKind::ContainerExec { target, command } => {
             let Some(operations) = operations else {
                 return WorkspaceSessionOpenResult::Failed {
+                    code: PublicErrorCode::Unsupported,
                     message: crate::locale::text(
                         "容器终端服务尚未配置。",
                         "Container terminal service is unavailable.",
@@ -2004,6 +2027,7 @@ async fn prepare_workspace_session(
         WorkspaceTerminalOpenKind::ContainerLogs { target } => {
             let Some(operations) = operations else {
                 return WorkspaceSessionOpenResult::Failed {
+                    code: PublicErrorCode::Unsupported,
                     message: crate::locale::text(
                         "容器日志服务尚未配置。",
                         "Container logs service is unavailable.",
@@ -2021,6 +2045,7 @@ async fn prepare_workspace_session(
         } => {
             let Some(operations) = operations else {
                 return WorkspaceSessionOpenResult::Failed {
+                    code: PublicErrorCode::Unsupported,
                     message: crate::locale::text(
                         "tmux 终端服务尚未配置。",
                         "tmux terminal service is unavailable.",
@@ -2038,6 +2063,7 @@ async fn prepare_workspace_session(
         Ok(session) => session,
         Err(error) => {
             return WorkspaceSessionOpenResult::Failed {
+                code: error.public_code(),
                 message: error.public_message().to_owned().into(),
                 cleanup_pending: None,
             };
@@ -2071,6 +2097,7 @@ async fn prepare_workspace_session(
             let message = SharedString::from(error.public_message());
             match sessions.close(session_id).await {
                 Ok(()) => WorkspaceSessionOpenResult::Failed {
+                    code: error.public_code(),
                     message,
                     cleanup_pending: None,
                 },
@@ -2087,6 +2114,7 @@ async fn prepare_workspace_session(
                         "Terminal initialization failed; resource cleanup still needs retry.",
                     );
                     WorkspaceSessionOpenResult::Failed {
+                        code: error.public_code(),
                         message: SharedString::from(format!(
                             "{safe} {}",
                             cleanup_error.public_message()

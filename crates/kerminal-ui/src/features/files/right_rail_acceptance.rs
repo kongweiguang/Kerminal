@@ -19,6 +19,91 @@ use super::{
 const ACCEPTANCE_NAME_PREFIX: &str = "rr-ui-";
 
 impl FilesPane {
+    /// 只读取同一 fixture 目录的刷新事实；在途状态也必须保留已提交清单。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_refresh_snapshot(
+        &self,
+        host_id: &HostId,
+        directory: &str,
+    ) -> Result<Option<(bool, usize, bool, u64)>, String> {
+        let expected = acceptance_directory_endpoint(host_id, directory)?;
+        let panel = &self.panels[1];
+        if !self.compact_layout || panel.endpoint != expected {
+            return Err("Refresh acceptance is not bound to the fixture directory".to_owned());
+        }
+        if panel.loading && panel.requested_endpoint.as_ref() != Some(&expected) {
+            return Err("Refresh acceptance observed a different requested directory".to_owned());
+        }
+        let Some(listing) = panel.listing.as_ref() else {
+            return Ok(None);
+        };
+        if listing.directory != expected {
+            return Err("Refresh acceptance observed a stale directory listing".to_owned());
+        }
+        Ok(Some((
+            panel.loading,
+            listing.entries.len(),
+            self.status.is_none(),
+            panel.generation,
+        )))
+    }
+
+    /// 同时验证当前目录与用户选择，供紧凑栏选择后的验收读取。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_file_selected(
+        &self,
+        host_id: &HostId,
+        directory: &str,
+        name: &str,
+    ) -> Result<bool, String> {
+        validate_acceptance_name(name)?;
+        let Some(listing) = self.acceptance_directory_listing(host_id, directory)? else {
+            return Ok(false);
+        };
+        let Some(entry) = self.acceptance_listing_entry(listing, directory, name)? else {
+            return Ok(false);
+        };
+        if entry.kind != FileEntryKind::File {
+            return Err("The fixture selection target is not a regular file".to_owned());
+        }
+        let panel = &self.panels[1];
+        Ok(self.compact_layout
+            && self.active_side == 1
+            && panel
+                .selected
+                .as_ref()
+                .is_some_and(|selected| selected.endpoint == entry.endpoint))
+    }
+
+    /// 只从已确认的 fixture listing 打开本轮文件，沿用生产双击的事件与目标租约门禁。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_open_file(
+        &mut self,
+        host_id: &HostId,
+        directory: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        validate_acceptance_name(name)?;
+        if !self.compact_layout || self.pending_global_dialog() {
+            return Ok(false);
+        }
+        let Some(listing) = self.acceptance_directory_listing(host_id, directory)? else {
+            return Ok(false);
+        };
+        let Some(entry) = self.acceptance_listing_entry(listing, directory, name)? else {
+            return Ok(false);
+        };
+        if entry.kind != FileEntryKind::File {
+            return Err("The fixture editor target is not a regular file".to_owned());
+        }
+        self.open_entry(1, entry, cx);
+        Ok(true)
+    }
+
     /// 验收读回生产关闭按钮的显式句柄，避免只凭表单可见推断初始焦点正确。
     ///
     /// @author kongweiguang

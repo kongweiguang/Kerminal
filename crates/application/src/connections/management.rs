@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use kerminal_domain::{
@@ -11,7 +11,7 @@ use kerminal_domain::{
     },
     connections::{CredentialRef, HostEndpoint, ProxyProfile, RemoteProtocol, SshAuthentication},
     identity::HostId,
-    preferences::ConfigRevision,
+    preferences::{ConfigDocumentPath, ConfigRevision},
     sessions::SerialSessionTarget,
 };
 use tokio_util::sync::CancellationToken;
@@ -19,8 +19,14 @@ use uuid::Uuid;
 
 use crate::{
     AppError, AppResult,
-    connections::credentials::{CredentialService, SaveCredentialRequest, SecretValue},
+    connections::{
+        CredentialResolver,
+        credentials::{CredentialService, SaveCredentialRequest, SecretValue},
+    },
 };
+
+mod local_hosts;
+pub use local_hosts::validate_local_environment_reference;
 
 /// 主机备注采用字符数而非 UTF-8 字节数限制，便于中文文本与多行备注保持直观边界。
 pub const HOST_NOTE_MAX_CHARS: usize = 4096;
@@ -154,6 +160,166 @@ pub struct ManagedHost {
     pub created_at: String,
     pub updated_at: String,
     pub revision: ConfigRevision,
+}
+
+/// 本地主机独立于终端模板保存；列表不解密环境变量，避免目录读取依赖可用密钥。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedLocalHost {
+    pub id: HostId,
+    pub group_id: Option<String>,
+    pub name: String,
+    pub shell: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub environment_ref: Option<CredentialRef>,
+    pub sort_order: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub revision: ConfigRevision,
+    pub migration_origin: Option<String>,
+}
+
+/// 编辑器提交完整环境快照；调试输出不泄露环境变量或其内容。
+///
+/// @author kongweiguang
+#[derive(Clone, Eq, PartialEq)]
+pub struct LocalHostDraft {
+    pub id: Option<HostId>,
+    pub group_id: Option<String>,
+    pub name: String,
+    pub shell: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub sort_order: i64,
+}
+
+impl std::fmt::Debug for LocalHostDraft {
+    /// 环境可能含敏感值，日志只记录字段存在性而不复制变量名或内容。
+    ///
+    /// @author kongweiguang
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalHostDraft")
+            .field("id", &self.id)
+            .field("group_id", &self.group_id)
+            .field("name", &self.name)
+            .field("shell", &self.shell)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("env", &"[redacted]")
+            .field("sort_order", &self.sort_order)
+            .finish()
+    }
+}
+
+/// 保存结果未知时保留本次新旧密文身份，供确认主机快照后安全清理。
+///
+/// @author kongweiguang
+#[derive(Clone, Eq, PartialEq)]
+pub struct LocalHostSaveRecoveryToken {
+    operation_id: String,
+    host_id: HostId,
+    baseline_revision: Option<ConfigRevision>,
+    old_reference: Option<CredentialRef>,
+    new_reference: Option<CredentialRef>,
+}
+
+impl LocalHostSaveRecoveryToken {
+    /// 只接受本地主机专属引用，确保恢复日志不能用于清理其他凭据。
+    ///
+    /// @author kongweiguang
+    pub fn from_parts(
+        operation_id: String,
+        host_id: HostId,
+        baseline_revision: Option<ConfigRevision>,
+        old_reference: Option<CredentialRef>,
+        new_reference: Option<CredentialRef>,
+    ) -> AppResult<Self> {
+        Uuid::parse_str(&operation_id).map_err(|_| AppError::invalid("本地主机恢复标识无效"))?;
+        ConfigDocumentPath::Host(host_id.as_str().to_owned())
+            .relative_path()
+            .map_err(|_| AppError::invalid("本地主机恢复目标无效"))?;
+        if baseline_revision.as_ref().is_some_and(|revision| {
+            revision.as_str().len() != 64
+                || !revision
+                    .as_str()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(AppError::invalid("本地主机恢复 revision 无效"));
+        }
+        for reference in old_reference.iter().chain(new_reference.iter()) {
+            validate_local_environment_reference(&host_id, reference)?;
+        }
+        Ok(Self {
+            operation_id,
+            host_id,
+            baseline_revision,
+            old_reference,
+            new_reference,
+        })
+    }
+
+    /// 持久化日志以随机操作 ID 区分不同保存，避免清理迟到的旧事务。
+    ///
+    /// @author kongweiguang
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// 将恢复动作绑定到原主机，避免迟到读回处理其他编辑器。
+    ///
+    /// @author kongweiguang
+    pub fn host_id(&self) -> &HostId {
+        &self.host_id
+    }
+
+    /// 保留原 CAS 基线，供编辑器区分提交前状态与更新后的第三方内容。
+    ///
+    /// @author kongweiguang
+    pub fn baseline_revision(&self) -> Option<&ConfigRevision> {
+        self.baseline_revision.as_ref()
+    }
+
+    /// 只供仓储持久化 opaque 引用，不提供环境变量明文。
+    ///
+    /// @author kongweiguang
+    pub fn old_reference(&self) -> Option<&CredentialRef> {
+        self.old_reference.as_ref()
+    }
+
+    /// 保存候选引用以便崩溃后判断是否需要清理。
+    ///
+    /// @author kongweiguang
+    pub fn new_reference(&self) -> Option<&CredentialRef> {
+        self.new_reference.as_ref()
+    }
+}
+
+impl std::fmt::Debug for LocalHostSaveRecoveryToken {
+    /// 恢复材料不应进入日志，避免暴露 vault 引用或本地主机身份。
+    ///
+    /// @author kongweiguang
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LocalHostSaveRecoveryToken([redacted])")
+    }
+}
+
+/// 区分确认提交与未知结果，避免调用方对可能已提交的写入盲目重试。
+///
+/// @author kongweiguang
+pub enum RecoverableLocalHostSaveOutcome {
+    Saved {
+        host: ManagedLocalHost,
+        credential_cleanup: CredentialCleanupStatus,
+    },
+    OutcomeUnknown {
+        error: AppError,
+        recovery: LocalHostSaveRecoveryToken,
+    },
 }
 
 /// 主机编辑草稿；不含明文凭据，也不承担磁盘 revision 的生成责任。
@@ -348,6 +514,78 @@ pub trait HostManagementRepository: Send + Sync + 'static {
     /// 按稳定主机 ID 读取配置；缺失以 None 表达，不创建默认主机。
     async fn load_host(&self, host_id: &HostId) -> AppResult<Option<ManagedHost>>;
 
+    /// 本地变体与远程主机共用目录；旧测试仓储未实现时保持无本地主机。
+    ///
+    /// @author kongweiguang
+    async fn list_local_hosts(&self) -> AppResult<Vec<ManagedLocalHost>> {
+        Ok(Vec::new())
+    }
+
+    /// 不把本地主机解释成远程 endpoint，缺失以 None 表示。
+    ///
+    /// @author kongweiguang
+    async fn load_local_host(&self, _host_id: &HostId) -> AppResult<Option<ManagedLocalHost>> {
+        Ok(None)
+    }
+
+    /// 仓储只持有已密封环境引用，不能从草稿把环境明文写入 host TOML。
+    ///
+    /// @author kongweiguang
+    async fn save_local_host(
+        &self,
+        _host_id: HostId,
+        _draft: LocalHostDraft,
+        _environment_ref: Option<CredentialRef>,
+        _expected_revision: Option<ConfigRevision>,
+    ) -> AppResult<ManagedLocalHost> {
+        Err(AppError::unsupported("本地主机保存不可用"))
+    }
+
+    /// 删除使用同一 host CAS，调用方在结果确认后才清理环境密文。
+    ///
+    /// @author kongweiguang
+    async fn delete_local_host(
+        &self,
+        _host_id: &HostId,
+        _expected_revision: &ConfigRevision,
+    ) -> AppResult<ManagedLocalHost> {
+        Err(AppError::unsupported("本地主机删除不可用"))
+    }
+
+    /// 租约覆盖整个异步操作，真实仓储用独立 OS 锁阻止其他进程抢先恢复。
+    ///
+    /// @author kongweiguang
+    async fn acquire_local_host_operation(&self) -> AppResult<Box<dyn Send>> {
+        Ok(Box::new(()))
+    }
+
+    /// 保存密文前登记恢复意图；真实仓储必须持久化，测试替身可保持内存行为。
+    ///
+    /// @author kongweiguang
+    async fn begin_local_host_recovery(
+        &self,
+        _token: &LocalHostSaveRecoveryToken,
+    ) -> AppResult<()> {
+        Ok(())
+    }
+
+    /// 读取上次未结束的本地主机意图，缺失表示没有待恢复操作。
+    ///
+    /// @author kongweiguang
+    async fn pending_local_host_recovery(&self) -> AppResult<Option<LocalHostSaveRecoveryToken>> {
+        Ok(None)
+    }
+
+    /// 删除前验证操作身份；重复清理缺失日志按幂等成功处理。
+    ///
+    /// @author kongweiguang
+    async fn finish_local_host_recovery(
+        &self,
+        _token: &LocalHostSaveRecoveryToken,
+    ) -> AppResult<()> {
+        Ok(())
+    }
+
     /// 按已读取 revision 保存主机；创建只允许 revision 缺失的文件路径。
     async fn save_host(
         &self,
@@ -388,6 +626,8 @@ pub trait HostManagementRepository: Send + Sync + 'static {
 pub struct HostManagementService {
     repository: Arc<dyn HostManagementRepository>,
     credentials: Option<CredentialService>,
+    local_environment_resolver: Option<Arc<dyn CredentialResolver>>,
+    local_host_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl HostManagementService {
@@ -396,6 +636,8 @@ impl HostManagementService {
         Self {
             repository,
             credentials: None,
+            local_environment_resolver: None,
+            local_host_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -407,7 +649,20 @@ impl HostManagementService {
         Self {
             repository,
             credentials: Some(credentials),
+            local_environment_resolver: None,
+            local_host_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// 本地环境仅在编辑或启动时解密，目录与普通远程连接仍无需读取秘密。
+    ///
+    /// @author kongweiguang
+    pub fn with_local_environment_resolver(
+        mut self,
+        resolver: Arc<dyn CredentialResolver>,
+    ) -> Self {
+        self.local_environment_resolver = Some(resolver);
+        self
     }
 
     /// 返回主机目录的稳定排序视图；目录损坏会回到调用方显示错误，而非部分成功。
@@ -910,7 +1165,9 @@ impl HostManagementService {
         self.repository.save_group(draft, expected_revision).await
     }
 
-    /// 删除分组前验证目的地并固定完整主机 revision 集合，供基础设施执行原子迁移。
+    /// 固定本地和远程主机的完整 revision 集合，避免分组事务漏掉并发编辑。
+    ///
+    /// @author kongweiguang
     pub async fn delete_group(
         &self,
         group_id: String,
@@ -945,7 +1202,7 @@ impl HostManagementService {
             return Err(AppError::not_found("主机迁移目标分组不存在"));
         }
 
-        let expected_hosts = self
+        let mut expected_hosts = self
             .repository
             .list_hosts()
             .await?
@@ -954,7 +1211,17 @@ impl HostManagementService {
                 host_id: host.id,
                 revision: host.revision,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        expected_hosts.extend(
+            self.repository
+                .list_local_hosts()
+                .await?
+                .into_iter()
+                .map(|host| HostDocumentRevision {
+                    host_id: host.id,
+                    revision: host.revision,
+                }),
+        );
         self.repository
             .delete_group_and_reassign(
                 group_id,

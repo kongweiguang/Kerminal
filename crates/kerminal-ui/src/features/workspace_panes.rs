@@ -998,7 +998,7 @@ fn split_button(
                 cx.stop_propagation();
                 cx.emit(split_event(pane_id.clone(), primary));
             })),
-        mouse_button: MouseButton::Right,
+        mouse_button: Some(MouseButton::Right),
         open,
         trigger_style: StyleRefinement::default().w(px(22.)).h(px(22.)).flex_none(),
         focus_handle,

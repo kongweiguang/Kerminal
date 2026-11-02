@@ -6,6 +6,7 @@ mod actions;
 mod compose_yaml;
 mod confirmations;
 mod container_delete;
+mod container_mutation;
 mod container_panel;
 mod forms;
 pub mod proxy_panel;
@@ -186,6 +187,8 @@ impl ToolRailOperationTarget {
 pub enum OperationsEvent {
     /// 根模态协调器重新投影唯一运维确认状态，不复制目标或业务前置条件。
     RootConfirmationChanged,
+    /// 隧道失败交给工作区短暂提示，避免在每个行或标题重复保留结果。
+    ForwardError { message: String },
     OpenContainerFilesRequested {
         container_panel_context: Option<ContainerPanelContext>,
         target: ContainerTarget,
@@ -770,6 +773,10 @@ pub struct OperationsView {
     compose_pending_context: Option<ContainerPanelContext>,
     /// Down 最终提交只消费确认回调登记的同目标一次性票据。
     confirmed_compose_down: Option<(ContainerPanelContext, ComposeProjectTarget)>,
+    /// 命令回执与同宿主列表刷新分开记录，未核对前禁止重复写入。
+    container_mutations: container_mutation::ContainerMutationTracker,
+    /// 容器操作的确定结果与错误分开呈现，避免成功提示误用危险色。
+    container_success_notice: Option<String>,
     /// 确认内容拥有独立焦点句柄，根层负责保存及恢复原工作区焦点。
     confirmation_focus: Option<gpui_kit::FocusHandle>,
     tmux: SectionState<TmuxSnapshot>,
@@ -784,8 +791,6 @@ pub struct OperationsView {
     /// 写操作使用独立取消令牌；只有拿到真实回执才可报告成功或失败。
     mutation_cancellation: Option<CancellationToken>,
     status: Option<String>,
-    /// main 的隧道成功提示与错误分开，避免按文案推断结果颜色。
-    forward_success_notice: Option<String>,
     /// 隐藏期间已提交写入的最新回执按 Host/runtime 暂存，回来时反馈并回读，不触碰当前其它目标。
     deferred_container_feedback: VecDeque<(Option<HostId>, ContainerRuntime, String)>,
     container_output: DetailReadState<ContainerOutputTarget, ContainerOutputData>,
@@ -829,8 +834,8 @@ pub struct OperationsView {
     forward_add_host_expected: Option<HostId>,
     /// 未知保存保留原事务 ID 与期望内容，核对前不允许再次写入。
     forward_save_pending: Option<PortForwardDefinition>,
-    /// 删除确认同时绑定 ID 和配置，过期确认不能删除别人刚修改的定义。
-    forward_pending_delete: Option<PortForwardDefinition>,
+    /// 删除确认冻结定义和目标代次，过期确认不能删除后来切换或修改的对象。
+    forward_pending_delete: Option<(PortForwardDefinition, u64)>,
     theme_mode: ThemeMode,
     compact_layout: bool,
     section_selection: SectionSelection,
@@ -879,6 +884,8 @@ impl OperationsView {
             compose_pending_down: None,
             compose_pending_context: None,
             confirmed_compose_down: None,
+            container_mutations: Default::default(),
+            container_success_notice: None,
             confirmation_focus: None,
             tmux: SectionState::new(),
             forwards: SectionState::new(),
@@ -889,7 +896,6 @@ impl OperationsView {
             busy: false,
             mutation_cancellation: None,
             status: None,
-            forward_success_notice: None,
             deferred_container_feedback: VecDeque::new(),
             container_output: DetailReadState::default(),
             container_inspect: DetailReadState::default(),
@@ -931,7 +937,7 @@ impl OperationsView {
     }
 
     /// 只在 Root 已把 attach 命令与回车排进精确终端 FIFO 后登记瞬时意图；
-    /// 提示核对回显后刷新会话，以真实服务回读决定分离入口是否可用。
+    /// 固定栏以终端回显反馈受理，不插入成功提示挤动正文，也不把排队当作连接完成。
     ///
     /// @author kongweiguang
     pub(crate) fn report_tmux_attach_queued(
@@ -948,7 +954,9 @@ impl OperationsView {
             && self.tmux_details.session_id.as_deref() == Some(session_id)
             && !session_id.trim().is_empty()
             && terminal.target.matches_tmux_target(target);
-        if current_context {
+        if current_context && self.is_fixed_tmux_view() {
+            self.status = None;
+        } else if current_context {
             self.status = Some(
                 crate::locale::text(
                     format!("已将 tmux 会话“{session_name}”的连接命令提交到当前终端；请核对回显后刷新会话，确认连接状态。"),
@@ -1030,8 +1038,7 @@ impl OperationsView {
         true
     }
 
-    /// Root 每次处理 detach event 都回报一次；仅真实入队显示已发送，拒绝时保留重试路径。
-    /// 终端快捷键没有执行回执，提示用户刷新服务状态核对 tmux 资源是否释放。
+    /// 固定栏受理后不插入已发送提示；失败仍展示原因，受理不冒充服务端已分离。
     ///
     /// @author kongweiguang
     pub(crate) fn report_tmux_detach_current_result(
@@ -1057,19 +1064,23 @@ impl OperationsView {
             cx.notify();
             return;
         }
-        self.status = Some(if queued {
-            crate::locale::text(
+        self.status = if queued && self.is_fixed_tmux_view() {
+            None
+        } else {
+            Some(if queued {
+                crate::locale::text(
                 "已发送默认 tmux 分离快捷键 Ctrl+B,d；核对回显后请刷新会话。自定义 prefix 请在快捷键参考中查看。",
                 "Sent the default tmux detach shortcut Ctrl+B,d; verify the terminal output, then refresh sessions. For a custom prefix, use the shortcut reference.",
             )
             .to_string()
-        } else {
-            crate::locale::text(
+            } else {
+                crate::locale::text(
                 "未能向当前终端发送 tmux 分离快捷键；检查目标绑定后重试。",
                 "Could not send the tmux detach shortcut to the current terminal; check the target binding and retry.",
             )
             .to_string()
-        });
+            })
+        };
         cx.notify();
     }
 
@@ -1160,7 +1171,7 @@ impl OperationsView {
         self.confirmed_compose_down = None;
         self.container_delete_confirmation = None;
         self.status = None;
-        self.forward_success_notice = None;
+        self.container_success_notice = None;
         self.restore_deferred_container_feedback(&context);
         cx.emit(OperationsEvent::RootConfirmationChanged);
         if self.active && self.initialized {
@@ -1406,6 +1417,17 @@ impl OperationsView {
     ///
     /// @author kongweiguang
     fn container_mutation_allowed(&self, target: &ContainerTarget) -> bool {
+        if self.containers.phase() != SectionPhase::Ready
+            || !self
+                .containers
+                .data()
+                .is_some_and(|rows| rows.iter().any(|row| row.target == *target))
+            || self
+                .container_mutations
+                .blocks_scope(&target.host_id, target.runtime)
+        {
+            return false;
+        }
         match self.container_panel_context.as_ref() {
             Some(context @ ContainerPanelContext::Host { host_id, .. }) => {
                 container_panel::host_context_matches_target(
@@ -1431,6 +1453,36 @@ impl OperationsView {
                     && self.runtime == target.runtime
             }
         }
+    }
+
+    /// 写入按完整 Compose 身份复核已知项目；同名或陈旧菜单不能提交到另一个目录。
+    ///
+    /// @author kongweiguang
+    fn compose_mutation_allowed(&self, target: &ComposeProjectTarget) -> bool {
+        self.active
+            && self.containers.phase() == SectionPhase::Ready
+            && self.host_target == target.host_id
+            && self.runtime == target.runtime
+            && self
+                .compose_projects
+                .iter()
+                .any(|project| project == target)
+            && !self
+                .container_mutations
+                .blocks_scope(&target.host_id, target.runtime)
+            && matches!(
+                self.container_panel_context,
+                None | Some(ContainerPanelContext::Host { .. })
+                    | Some(ContainerPanelContext::WorkspaceHost { .. })
+            )
+    }
+
+    /// 当前宿主还有未核对写入时，仅保留刷新入口以恢复可操作状态。
+    ///
+    /// @author kongweiguang
+    fn container_write_scope_blocked(&self) -> bool {
+        self.container_mutations
+            .blocks_scope(&self.host_target, self.runtime)
     }
 
     /// Host 行读取须命中当前列表范围；ContainerInfo 只能读取上下文唯一指定的容器。
@@ -1517,7 +1569,18 @@ impl OperationsView {
             )
             || self.host_target != target.host_id
             || self.runtime != target.runtime
+            || !self.compose_mutation_allowed(&target)
         {
+            if self.active && self.container_panel_context.as_ref() == Some(context) {
+                self.status = Some(
+                    crate::locale::text(
+                        "Compose 目标或列表状态已变化，请刷新后重新选择。",
+                        "The Compose target or list changed. Refresh and select it again.",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+            }
             return;
         }
         self.execute_compose(target, action, cx);
@@ -1752,6 +1815,7 @@ impl OperationsView {
     }
 
     /// 隐藏只暂停新的采样并撤销未提交确认；原目标在途读取正常收尾，避免反复开关制造取消错误。
+    /// 固定 tmux 已有结果或在途读取时，恢复焦点不额外刷新；首载与原目标的未核对变更仍须读取。
     ///
     /// @author kongweiguang
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -1764,6 +1828,7 @@ impl OperationsView {
             self.compose_pending_down = None;
             self.compose_pending_context = None;
             self.confirmed_compose_down = None;
+            self.forward_pending_delete = None;
             cx.emit(OperationsEvent::RootConfirmationChanged);
         }
         if active {
@@ -1774,7 +1839,15 @@ impl OperationsView {
             self.stop_forward_watch();
         } else if self.initialized {
             self.start_visible_services(cx);
-            self.reload_non_server(cx);
+            if !self.is_fixed_tmux_view()
+                || self.tmux.phase() == state::SectionPhase::NotLoaded
+                || (self.tmux.phase() != state::SectionPhase::Loading
+                    && self
+                        .dirty_targets
+                        .tmux_is_dirty(&self.tmux_target().host_id))
+            {
+                self.reload_non_server(cx);
+            }
         }
         cx.notify();
     }
@@ -1959,6 +2032,27 @@ impl OperationsView {
         }
     }
 
+    /// 当前快照就绪才允许按会话 ID 连接；Root 消费事件时复核，防止刷新使旧事件失效。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn tmux_session_attach_allowed(
+        &self,
+        target: &TmuxTarget,
+        session_id: &str,
+    ) -> bool {
+        self.active
+            && !self.busy
+            && self.tmux_detach_pending.is_none()
+            && self.tmux_target_available()
+            && target == &self.tmux_target()
+            && self.tmux.phase() == state::SectionPhase::Ready
+            && self.tmux.data().is_some_and(|snapshot| {
+                snapshot.sessions.iter().any(|session| {
+                    session.id == session_id && session.target_ref == snapshot.capability.target_ref
+                })
+            })
+    }
+
     /// attach 必须同时具备精确 pane binding 与相同的主机/profile，查询目标不能代替写入授权。
     ///
     /// @author kongweiguang
@@ -2109,7 +2203,6 @@ impl OperationsView {
             };
             self.clear_tmux_dialog();
             self.status = None;
-            self.forward_success_notice = None;
             cx.emit(OperationsEvent::RootConfirmationChanged);
             if self.active && self.initialized && self.tmux_target_available() {
                 self.load_tmux(cx);
@@ -2236,7 +2329,6 @@ impl OperationsView {
         self.container_delete_confirmation = None;
         self.container_output_target_label = None;
         self.status = None;
-        self.forward_success_notice = None;
         let generation = self.tmux_details.generation.wrapping_add(1).max(1);
         self.tmux_details = TmuxDetailState {
             generation,

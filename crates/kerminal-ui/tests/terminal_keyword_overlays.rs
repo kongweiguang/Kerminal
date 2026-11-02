@@ -80,6 +80,7 @@ fn test_snapshot(rows: Vec<TerminalRow>) -> RenderSnapshot {
             row: 0,
             column: 0,
             shape: TerminalCursorShape::Block,
+            blink_from_terminal: false,
             blinking: false,
             visible: false,
             style_from_terminal: false,

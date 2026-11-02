@@ -18,6 +18,21 @@ use kerminal_domain::commands::SuggestionQueryMode;
 const MAX_WHEEL_BATCH_EVENTS: usize = 256;
 const MAX_WHEEL_BATCH_BYTES: usize = 8 * 1024;
 
+/// 焦点通告和释放事件不更改编辑内容，其余协议输入保守视为可能改变 Shell 行状态。
+fn input_can_change_editing(event: &TerminalInputEvent) -> bool {
+    use kerminal_terminal::input::KeyPhase;
+
+    match event {
+        TerminalInputEvent::Focus(_) => false,
+        TerminalInputEvent::Key(key) | TerminalInputEvent::KeyWithText { event: key, .. }
+            if key.phase == KeyPhase::Release =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
 /// 同会话保序、跨会话并行，并同时限制队列内存与活跃写入数。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SessionQueueLimits {
@@ -381,6 +396,22 @@ impl SessionCommandQueues {
         self.lanes
             .get(session_id)
             .is_none_or(|lane| !lane.in_flight && lane.pending.is_empty())
+    }
+
+    /// 当前 ACK 尚占用 lane，因此只检查其后排队的编辑输入；尺寸和只读滚动不会阻止最新查询。
+    pub fn has_pending_edit_input(&self, session_id: &SessionId) -> bool {
+        self.lanes.get(session_id).is_some_and(|lane| {
+            lane.pending.iter().any(|work| match work {
+                SessionWork::Input { event, .. } => input_can_change_editing(event),
+                SessionWork::UiInput(work) => input_can_change_editing(&work.request.event),
+                SessionWork::WheelInputBatch(_) => true,
+                SessionWork::Scroll { .. }
+                | SessionWork::ScrollTo { .. }
+                | SessionWork::SelectionScroll { .. }
+                | SessionWork::Resize { .. }
+                | SessionWork::HistoryResize { .. } => false,
+            })
+        })
     }
 
     /// 把同一输入按固定 binding 原子加入各 session FIFO，并让每个目标只分配一次工作 Box。

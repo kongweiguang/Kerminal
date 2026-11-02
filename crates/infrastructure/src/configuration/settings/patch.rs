@@ -18,6 +18,12 @@ pub(super) fn apply_settings_snapshot(
     let mut projected = super::serialize_settings_document(settings)?;
     let projected_bindings = projected.as_table_mut().remove("keybindings");
     expand_projected_inline_tables(projected.as_table_mut());
+    if settings.terminal.legacy_color_scheme_missing
+        && let Some(terminal) = projected.get_mut("terminal").and_then(Item::as_table_mut)
+    {
+        // 无窗口外观上下文时保留旧设置，不能把解码默认值误写成用户选择。
+        terminal.remove("colorScheme");
+    }
     merge_table(document.as_table_mut(), projected.as_table());
 
     if let Some(projected_bindings) = projected_bindings {
@@ -216,9 +222,6 @@ fn keybinding_values(binding: &KeybindingPreference) -> Vec<(&'static str, &str)
     ];
     if let Some(value) = binding.linux_binding.as_deref() {
         values.push(("linuxBinding", value));
-    }
-    if let Some(value) = binding.windows_alternate_binding.as_deref() {
-        values.push(("windowsAlternateBinding", value));
     }
     values
 }

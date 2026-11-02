@@ -113,7 +113,9 @@ impl ConfigDocumentPath {
     }
 }
 
-/// 按旧配置仓储的文件名字符集校验 ID；拒绝而不静默 trim，避免碰撞或错读文件。
+/// 保留文件名字符集并按不区分大小写拒绝保留名，避免 Windows 上覆盖分组文档。
+///
+/// @author kongweiguang
 fn file_id(value: &str, host_id: bool) -> Result<&str, ConfigPathError> {
     if value.is_empty() {
         return Err(ConfigPathError::EmptyId);
@@ -126,7 +128,7 @@ fn file_id(value: &str, host_id: bool) -> Result<&str, ConfigPathError> {
     {
         return Err(ConfigPathError::InvalidId);
     }
-    if host_id && value == "groups" {
+    if host_id && value.eq_ignore_ascii_case("groups") {
         return Err(ConfigPathError::ReservedHostId);
     }
     Ok(value)

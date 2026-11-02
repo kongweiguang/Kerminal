@@ -9,6 +9,7 @@ use crate::{AppError, AppResult};
 
 mod advanced;
 mod keybindings;
+mod mcp;
 mod terminal;
 
 use self::keybindings::default_keybindings;
@@ -18,6 +19,7 @@ pub use advanced::{
     ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId, WorkbenchLayoutSettings,
 };
 pub use keybindings::{KeybindingPreference, KeybindingScope};
+pub use mcp::{McpBindMode, McpSettings};
 pub use terminal::{
     TerminalColorScheme, TerminalCommandSuggestionMenuShortcut,
     TerminalCommandSuggestionPresentation, TerminalCommandSuggestionRemoteRefresh,
@@ -45,6 +47,8 @@ pub struct SettingsSnapshot {
     pub keybindings: Vec<KeybindingPreference>,
     pub desktop_notifications: DesktopNotificationSettings,
     pub external_launch: ExternalLaunchSettings,
+    #[serde(default)]
+    pub mcp: McpSettings,
     pub agent_launcher: AgentLauncherSettings,
     pub sftp: SftpPerformanceSettings,
     pub tool_rail: ToolRailSettings,
@@ -70,6 +74,7 @@ impl Default for SettingsSnapshot {
             keybindings: default_keybindings(),
             desktop_notifications: DesktopNotificationSettings::default(),
             external_launch: ExternalLaunchSettings::default(),
+            mcp: McpSettings::default(),
             agent_launcher: AgentLauncherSettings::default(),
             sftp: SftpPerformanceSettings::default(),
             tool_rail: ToolRailSettings::default(),
@@ -105,6 +110,7 @@ impl SettingsSnapshot {
         self.terminal = self.terminal.validated()?;
         self.desktop_notifications = self.desktop_notifications.normalized();
         self.external_launch = self.external_launch.normalized();
+        self.mcp = self.mcp.validated()?;
         self.agent_launcher = self.agent_launcher.validated()?;
         self.sftp = self.sftp.normalized();
         self.tool_rail = self.tool_rail.normalized();
@@ -117,10 +123,6 @@ impl SettingsSnapshot {
                 || binding.mac_binding.len() > 128
                 || binding
                     .linux_binding
-                    .as_ref()
-                    .is_some_and(|value| value.len() > 128)
-                || binding
-                    .windows_alternate_binding
                     .as_ref()
                     .is_some_and(|value| value.len() > 128)
                 || !actions.insert(binding.action.clone())

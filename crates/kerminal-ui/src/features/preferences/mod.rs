@@ -4,6 +4,7 @@
 
 mod color_picker;
 mod draft;
+pub(crate) mod legacy_terminal_theme;
 mod panel;
 mod render;
 mod render_app_palette;
@@ -11,6 +12,7 @@ mod render_command_suggestions;
 mod render_connectivity;
 mod render_desktop_about;
 mod render_keyword_highlights;
+mod render_mcp;
 mod render_profiles;
 mod render_settings;
 mod render_sftp;

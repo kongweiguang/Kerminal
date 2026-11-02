@@ -169,6 +169,42 @@ struct VisualSet {
     black_pixel: u32,
 }
 
+/// 确认无合成器时优先不透明 visual；结果未知时保留上游透明行为。
+///
+/// @author kongweiguang
+fn select_window_visual(visuals: &VisualSet, compositor_present: Option<bool>) -> Visual {
+    match (compositor_present, visuals.opaque, visuals.transparent) {
+        (Some(false), Some(visual), _) | (_, _, Some(visual)) => visual,
+        _ => {
+            log::warn!("Unable to find a transparent visual");
+            visuals.inherit
+        }
+    }
+}
+
+/// 合成器 selection 按 X11 屏幕区分；查询失败不能静默关闭透明能力。
+///
+/// @author kongweiguang
+fn compositor_present(xcb: &XCBConnection, screen_index: usize) -> Option<bool> {
+    let name = format!("_NET_WM_CM_S{screen_index}");
+    let atom = get_reply(
+        || "X11 compositor atom lookup failed",
+        xcb.intern_atom(true, name.as_bytes()),
+    )
+    .log_err()?
+    .atom;
+    if atom == x11rb::NONE {
+        return Some(false);
+    }
+    let owner = get_reply(
+        || "X11 compositor owner lookup failed",
+        xcb.get_selection_owner(atom),
+    )
+    .log_err()?
+    .owner;
+    Some(owner != x11rb::NONE)
+}
+
 fn find_visuals(xcb: &XCBConnection, screen_index: usize) -> VisualSet {
     let screen = &xcb.setup().roots[screen_index];
     let mut set = VisualSet {
@@ -457,6 +493,7 @@ pub(crate) fn handle_connection_error(err: ConnectionError) -> anyhow::Error {
 }
 
 impl X11WindowState {
+    /// 原生窗口创建后无法更改 X11 色深，因此必须先选定适合合成环境的 visual。
     pub fn new(
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
@@ -487,13 +524,7 @@ impl X11WindowState {
 
         let visual_set = find_visuals(xcb, x_screen_index);
 
-        let visual = match visual_set.transparent {
-            Some(visual) => visual,
-            None => {
-                log::warn!("Unable to find a transparent visual",);
-                visual_set.inherit
-            }
-        };
+        let visual = select_window_visual(&visual_set, compositor_present(xcb, x_screen_index));
         log::info!("Using {:?}", visual);
 
         let colormap = if visual.colormap != 0 {
@@ -2138,5 +2169,52 @@ struct TrivialDeactivationHandler {
 impl accesskit::DeactivationHandler for TrivialDeactivationHandler {
     fn deactivate_accessibility(&mut self) {
         (self.callback)();
+    }
+}
+
+#[cfg(test)]
+mod visual_selection_tests {
+    use super::{Visual, VisualSet, select_window_visual};
+
+    /// 使用稳定 visual ID，在不连接 X 服务时验证回退选择。
+    fn visuals() -> VisualSet {
+        let visual = |id, depth| Visual {
+            id,
+            colormap: 0,
+            depth,
+        };
+        VisualSet {
+            inherit: visual(1, 24),
+            opaque: Some(visual(2, 24)),
+            transparent: Some(visual(3, 32)),
+            root: 0,
+            black_pixel: 0,
+        }
+    }
+
+    /// 只有明确确认没有合成器时才优先选择不透明 visual。
+    #[test]
+    fn chooses_opaque_only_without_a_compositor() {
+        let visuals = visuals();
+        assert_eq!(select_window_visual(&visuals, Some(false)).id, 2);
+        assert_eq!(select_window_visual(&visuals, Some(true)).id, 3);
+        assert_eq!(select_window_visual(&visuals, None).id, 3);
+    }
+
+    /// 可用 visual 缺失时保留原有透明 visual 与继承 visual 的回退顺序。
+    #[test]
+    fn retains_original_visual_fallbacks() {
+        let mut visuals = visuals();
+        visuals.opaque = None;
+        assert_eq!(select_window_visual(&visuals, Some(false)).id, 3);
+        visuals.transparent = None;
+        assert_eq!(select_window_visual(&visuals, Some(false)).id, 1);
+        visuals.opaque = Some(Visual {
+            id: 2,
+            colormap: 0,
+            depth: 24,
+        });
+        assert_eq!(select_window_visual(&visuals, Some(true)).id, 1);
+        assert_eq!(select_window_visual(&visuals, None).id, 1);
     }
 }

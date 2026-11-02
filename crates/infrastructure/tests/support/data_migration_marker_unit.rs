@@ -1,4 +1,4 @@
-//! 当前格式只接受契约 2；契约 1 只能通过显式迁移，未知代不猜测。
+//! 当前格式只接受契约 3；契约 1、2 只能通过显式迁移，未知代不猜测。
 //!
 //! @author kongweiguang
 
@@ -6,14 +6,18 @@ use super::*;
 
 /// 精确列举支持边界，防止用小于当前版本的宽泛判断放行未知旧契约。
 #[test]
-fn only_the_exact_previous_contract_is_migratable() {
+fn only_known_previous_contracts_are_migratable() {
     assert_eq!(
         classify_marker_bytes(&current_marker_bytes()).expect("当前 marker 可分类"),
         MarkerRead::Current
     );
     assert_eq!(
         classify_marker_bytes(&previous_marker_bytes()).expect("旧 marker 可分类"),
-        MarkerRead::PreviousSupported
+        MarkerRead::PreviousSupported(2)
+    );
+    assert_eq!(
+        classify_marker_bytes(&earliest_marker_bytes()).expect("最早已发布 marker 可分类"),
+        MarkerRead::PreviousSupported(1)
     );
     for (format, contract, expected) in [
         (
@@ -25,9 +29,9 @@ fn only_the_exact_previous_contract_is_migratable() {
         ),
         (
             4,
-            3,
+            4,
             DataMigrationBlocker::FutureMigrationContract {
-                migration_contract: 3,
+                migration_contract: 4,
             },
         ),
         (
@@ -55,7 +59,7 @@ fn previous_marker_preserves_semantic_scope_without_accepting_unknown_fields() {
     let source = b"# previous candidate\r\nmigration_contract = 1\r\ndata_format = 4\r\n";
     assert_eq!(
         classify_marker_bytes(source).expect("旧 marker 原文可分类"),
-        MarkerRead::PreviousSupported
+        MarkerRead::PreviousSupported(1)
     );
     assert_eq!(
         classify_marker_bytes(b"data_format = 4\nmigration_contract = 1\nfuture = true\n")

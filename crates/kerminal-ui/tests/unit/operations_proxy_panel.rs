@@ -487,3 +487,216 @@ fn future_result_requires_matching_host_revision_and_target() {
         10
     ));
 }
+
+/// 已停止的隧道仍可恢复原终端；请求在途只禁用入口，不能令入口跳动或换目标。
+///
+/// @author kongweiguang
+#[test]
+fn recovery_action_survives_stopped_forward_and_busy_state() {
+    let host_id = host("host-a");
+    let mut snapshot = projection(host_id.clone(), Vec::new());
+    let mut current = ui_session(host_id.clone(), RemoteShellDialect::Posix);
+    current.application = ProxyCurrentApplication::Applied;
+    snapshot.current_session = Some(current.clone());
+    let mut panel = ProxyApplicationPanel::new(snapshot);
+    panel.recovery_forward_id = Some("forward-a".to_owned());
+    assert!(panel.action_state_for_forward("forward-a").restore_current);
+    assert!(!panel.action_state_for_forward("forward-b").restore_current);
+
+    panel.pending = Some(PendingProxyOperation {
+        request_id: 1,
+        kind: ProxyOperationKind::RestoreCurrent,
+        host_id: Some(host_id),
+        forward_name: "forward-a".to_owned(),
+        forward_id: Some("forward-a".to_owned()),
+        binding: Some(current.binding),
+        expected_revision: None,
+        desired_future_forward: None,
+        cancellable: true,
+    });
+    let state = panel.action_state_for_forward("forward-a");
+    assert!(state.busy && state.restore_current);
+    assert!(!state.reconcile_current);
+    panel
+        .projection
+        .current_session
+        .as_mut()
+        .unwrap()
+        .application = ProxyCurrentApplication::OutcomeUnknown;
+    let state = panel.action_state_for_forward("forward-a");
+    assert!(state.busy && state.reconcile_current);
+    assert!(!state.restore_current);
+}
+
+/// 同一终端与主机刷新时保留恢复入口和未来策略勾选，但在回读结束前禁用操作。
+///
+/// @author kongweiguang
+#[test]
+fn same_target_refresh_keeps_proxy_actions_in_place_and_disabled() {
+    let host_id = host("host-a");
+    let forward = forward_snapshot(
+        "forward-a",
+        host_id.clone(),
+        ForwardKind::RemoteDynamic,
+        ForwardState::Active,
+        Some("socks5h://127.0.0.1:18080"),
+    );
+    let mut snapshot = projection(host_id.clone(), vec![forward]);
+    let mut current = ui_session(host_id.clone(), RemoteShellDialect::Posix);
+    current.application = ProxyCurrentApplication::Applied;
+    snapshot.current_session = Some(current.clone());
+    snapshot.future = ProxyFutureProjection::Ready {
+        host_id: host_id.clone(),
+        forward_id: Some("forward-a".into()),
+        revision: 3,
+    };
+    let mut panel = ProxyApplicationPanel::new(snapshot);
+    panel.recovery_forward_id = Some("forward-a".into());
+
+    panel.begin_current_refresh_state(&host_id, Some(&current.binding));
+    panel.begin_future_refresh_state(&host_id);
+    let state = panel.action_state_for_forward("forward-a");
+    assert_eq!(panel.current_session(), Some(&current));
+    assert_eq!(panel.current_recovery_forward_id(), Some("forward-a"));
+    assert!(state.restore_current && state.future_active && state.busy);
+    assert!(!state.current_enabled && !state.future_enabled);
+    assert!(
+        panel
+            .begin_operation(ProxyOperationRequest {
+                kind: ProxyOperationKind::RestoreCurrent,
+                host_id: Some(host_id),
+                forward_name: "forward-a".into(),
+                forward_id: Some("forward-a".into()),
+                binding: Some(current.binding),
+                expected_revision: None,
+                desired_future_forward: None,
+                cancellable: true,
+            })
+            .is_none()
+    );
+}
+
+/// 没有已确认的同代 binding 或切换主机时立即舍弃旧快照，避免把旧结果用于新目标。
+///
+/// @author kongweiguang
+#[test]
+fn refresh_discards_unverified_terminal_and_other_host_policy() {
+    let host_id = host("host-a");
+    let mut snapshot = projection(host_id.clone(), Vec::new());
+    let current = ui_session(host_id.clone(), RemoteShellDialect::Posix);
+    snapshot.current_session = Some(current.clone());
+    snapshot.future = ProxyFutureProjection::Ready {
+        host_id,
+        forward_id: Some("forward-a".into()),
+        revision: 3,
+    };
+    let mut panel = ProxyApplicationPanel::new(snapshot);
+    panel.recovery_forward_id = Some("forward-a".into());
+    let changed = UiSessionBinding {
+        session_generation: current.binding.session_generation + 1,
+        ..current.binding
+    };
+    panel.begin_current_refresh_state(&host("host-a"), Some(&changed));
+    panel.begin_future_refresh_state(&host("host-b"));
+    assert!(panel.current_session().is_none());
+    assert!(panel.current_recovery_forward_id().is_none());
+    assert!(
+        matches!(panel.projection.future, ProxyFutureProjection::Loading { host_id: ref value } if value == &host("host-b"))
+    );
+}
+
+/// 同代回读失败保留原事务但降为未知；换代或无法证明 binding 时不能保留恢复入口。
+///
+/// @author kongweiguang
+#[test]
+fn failed_current_readback_preserves_only_the_verified_transaction() {
+    let host_id = host("host-a");
+    let mut snapshot = projection(host_id.clone(), Vec::new());
+    let mut current = ui_session(host_id.clone(), RemoteShellDialect::Posix);
+    current.application = ProxyCurrentApplication::Applied;
+    snapshot.current_session = Some(current.clone());
+    let mut panel = ProxyApplicationPanel::new(snapshot);
+    panel.recovery_forward_id = Some("forward-a".into());
+    panel.begin_current_refresh_state(&host_id, Some(&current.binding));
+    panel.finish_failed_current_refresh_state(&host_id, Some(&current.binding));
+    assert_eq!(
+        panel.current_session().map(|session| session.application),
+        Some(ProxyCurrentApplication::OutcomeUnknown)
+    );
+    assert_eq!(panel.current_recovery_forward_id(), Some("forward-a"));
+    let state = panel.action_state_for_forward("forward-a");
+    assert!(state.reconcile_current && !state.restore_current && !state.busy);
+
+    panel.begin_current_refresh_state(&host_id, Some(&current.binding));
+    let next_binding = UiSessionBinding {
+        session_generation: current.binding.session_generation + 1,
+        ..current.binding
+    };
+    panel.finish_failed_current_refresh_state(&host_id, Some(&next_binding));
+    assert!(panel.current_session().is_none());
+    assert!(panel.current_recovery_forward_id().is_none());
+}
+
+/// 策略读取失败保留最后核实的勾选，但在成功回读前不能写入或假称状态已确认。
+///
+/// @author kongweiguang
+#[test]
+fn failed_future_readback_keeps_known_check_but_blocks_policy_writes() {
+    let host_id = host("host-a");
+    let forward = forward_snapshot(
+        "forward-a",
+        host_id.clone(),
+        ForwardKind::RemoteDynamic,
+        ForwardState::Active,
+        Some("socks5h://127.0.0.1:18080"),
+    );
+    let mut snapshot = projection(host_id.clone(), vec![forward]);
+    snapshot.current_session = Some(ui_session(host_id.clone(), RemoteShellDialect::Posix));
+    snapshot.future = ProxyFutureProjection::Ready {
+        host_id: host_id.clone(),
+        forward_id: Some("forward-a".into()),
+        revision: 3,
+    };
+    let mut panel = ProxyApplicationPanel::new(snapshot);
+    panel.begin_future_refresh_state(&host_id);
+    panel.finish_failed_future_refresh_state(&host_id);
+    let state = panel.action_state_for_forward("forward-a");
+    assert!(state.future_active && !state.future_enabled && state.current_enabled);
+    assert!(
+        panel
+            .begin_operation(ProxyOperationRequest {
+                kind: ProxyOperationKind::SetFuture,
+                host_id: Some(host_id.clone()),
+                forward_name: "forward-a".into(),
+                forward_id: Some("forward-a".into()),
+                binding: None,
+                expected_revision: Some(3),
+                desired_future_forward: Some(None),
+                cancellable: false,
+            })
+            .is_none()
+    );
+    panel.set_future_projection_state(ProxyFutureProjection::Ready {
+        host_id,
+        forward_id: Some("forward-a".into()),
+        revision: 4,
+    });
+    assert!(panel.action_state_for_forward("forward-a").future_enabled);
+}
+
+/// 代理失败和未确认需要提示，确定成功或主动取消不生成重复结果消息。
+///
+/// @author kongweiguang
+#[test]
+fn only_proxy_failures_are_promoted_to_toasts() {
+    assert!(
+        proxy_status_error(&ProxyOperationStatus::NotApplied(
+            ProxyUnavailableReason::PromptNotReady
+        ))
+        .is_some()
+    );
+    assert!(proxy_status_error(&ProxyOperationStatus::OutcomeUnknown).is_some());
+    assert!(proxy_status_error(&ProxyOperationStatus::Failed("error".into())).is_some());
+    assert!(proxy_status_error(&ProxyOperationStatus::Applied).is_none());
+    assert!(proxy_status_error(&ProxyOperationStatus::Cancelled).is_none());
+}

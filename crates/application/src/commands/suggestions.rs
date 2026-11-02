@@ -2,19 +2,24 @@
 //!
 //! @author kongweiguang
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use kerminal_domain::{
     commands::{
         BroadcastAnalysis, BroadcastRisk, CommandHistoryListRequest, CommandSuggestionActivation,
         CommandSuggestionCandidate, CommandSuggestionReplacementRange, CommandSuggestionRequest,
-        CommandSuggestionSensitivity, NormalizedCommandHistory, SnippetCatalogListRequest,
-        SnippetCatalogOrigin, SuggestionPresentation, SuggestionProviderKind, SuggestionQueryMode,
+        CommandSuggestionResult, CommandSuggestionSensitivity, NormalizedCommandHistory,
+        SnippetCatalogListRequest, SnippetCatalogOrigin, SuggestionPresentation,
+        SuggestionProviderKind, SuggestionQueryMode, SuggestionSourceState, SuggestionSourceStatus,
     },
     identity::{HostId, PaneId, SessionId},
 };
-use tokio::task::JoinSet;
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -40,6 +45,114 @@ impl CompositeCommandSuggestionProvider {
         }
         Ok(Self { providers })
     }
+
+    /// 每个来源独立运行并先推送已就绪快照；超时先协作取消，再有界等待资源回收。
+    async fn collect(
+        &self,
+        request: CommandSuggestionRequest,
+        cancellation: CancellationToken,
+        updates: Option<mpsc::Sender<CommandSuggestionResult>>,
+    ) -> AppResult<CommandSuggestionResult> {
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("命令建议查询已取消"));
+        }
+        let operation = cancellation.child_token();
+        let mut tasks = JoinSet::new();
+        let mut task_sources = HashMap::new();
+        let mut sources = Vec::new();
+        for provider in &self.providers {
+            for kind in provider.supported_providers() {
+                if !provider_requested(&request, kind)
+                    || !provider.supports_provider_target(kind, request.target)
+                {
+                    continue;
+                }
+                let mut source_request = request.clone();
+                source_request.providers = Some(vec![kind]);
+                let source_provider = Arc::clone(provider);
+                let token = operation.clone();
+                let handle = tasks
+                    .spawn(async move { source_provider.suggest(source_request, token).await });
+                task_sources.insert(handle.id(), kind);
+                sources.push(SuggestionSourceStatus {
+                    provider: kind,
+                    state: SuggestionSourceState::Pending,
+                });
+            }
+        }
+        let mut candidates = Vec::new();
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let mut cancelled = false;
+        while !tasks.is_empty() {
+            let joined = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => { cancelled = true; break; }
+                _ = &mut deadline => break,
+                result = tasks.join_next_with_id() => result,
+            };
+            let Some(joined) = joined else { break };
+            let (id, result) = match joined {
+                Ok((id, result)) => (id, result),
+                Err(error) => (
+                    error.id(),
+                    Err(AppError::infrastructure("命令建议来源任务异常终止")),
+                ),
+            };
+            let Some(kind) = task_sources.remove(&id) else {
+                continue;
+            };
+            if let Some(status) = sources.iter_mut().find(|status| status.provider == kind) {
+                status.state = if result.is_ok() {
+                    SuggestionSourceState::Ready
+                } else {
+                    SuggestionSourceState::Failed
+                };
+            }
+            if let Ok(source_candidates) = result {
+                candidates.extend(
+                    source_candidates
+                        .into_iter()
+                        .filter(|item| item.provider == kind),
+                );
+            }
+            if let Some(updates) = &updates {
+                let mut snapshot = candidates.clone();
+                filter_rank_and_deduplicate(&request, &mut snapshot);
+                let _ = updates.try_send(CommandSuggestionResult {
+                    candidates: snapshot,
+                    sources: sources.clone(),
+                });
+            }
+        }
+        if !tasks.is_empty() {
+            operation.cancel();
+            let cleanup = async { while tasks.join_next().await.is_some() {} };
+            if tokio::time::timeout(Duration::from_millis(4_500), cleanup)
+                .await
+                .is_err()
+            {
+                tasks.abort_all();
+                let _ = tokio::time::timeout(Duration::from_millis(100), async {
+                    while tasks.join_next().await.is_some() {}
+                })
+                .await;
+            }
+            for status in &mut sources {
+                if status.state == SuggestionSourceState::Pending {
+                    status.state = SuggestionSourceState::Failed;
+                }
+            }
+        }
+        if cancelled || cancellation.is_cancelled() {
+            return Err(AppError::cancelled("命令建议查询已取消"));
+        }
+        filter_rank_and_deduplicate(&request, &mut candidates);
+        Ok(CommandSuggestionResult {
+            candidates,
+            sources,
+        })
+    }
 }
 
 #[async_trait]
@@ -52,59 +165,32 @@ impl CommandSuggestionProvider for CompositeCommandSuggestionProvider {
             .collect()
     }
 
-    /// 同时调用选中的来源，并在取消时等各来源观察协作 token 后再释放聚合任务。
+    /// 旧调用方仍接收单批候选；全部来源失败时保留可见错误而不伪装成空结果。
     async fn suggest(
         &self,
         request: CommandSuggestionRequest,
         cancellation: CancellationToken,
     ) -> AppResult<Vec<CommandSuggestionCandidate>> {
-        let requested = request.providers.as_deref();
-        let selected = self
-            .providers
-            .iter()
-            .filter(|provider| {
-                requested.is_none_or(|requested| {
-                    provider
-                        .supported_providers()
-                        .into_iter()
-                        .any(|kind| requested.contains(&kind))
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut tasks = JoinSet::new();
-        for provider in selected {
-            let request = request.clone();
-            let cancellation = cancellation.clone();
-            tasks.spawn(async move { provider.suggest(request, cancellation).await });
+        let result = self.collect(request, cancellation, None).await?;
+        if !result.sources.is_empty()
+            && result
+                .sources
+                .iter()
+                .all(|source| source.state == SuggestionSourceState::Failed)
+        {
+            return Err(AppError::infrastructure("所有命令建议来源均不可用"));
         }
+        Ok(result.candidates)
+    }
 
-        let mut candidates = Vec::new();
-        let mut first_error = None;
-        while !tasks.is_empty() {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    while tasks.join_next().await.is_some() {}
-                    return Err(AppError::cancelled("命令建议查询已取消"));
-                }
-                result = tasks.join_next() => {
-                    match result {
-                        Some(Ok(Ok(mut source_candidates))) => candidates.append(&mut source_candidates),
-                        Some(Ok(Err(error))) if first_error.is_none() => first_error = Some(error),
-                        Some(Err(_)) if first_error.is_none() => {
-                            first_error = Some(AppError::infrastructure("命令建议来源任务异常终止"));
-                        }
-                        Some(Ok(Err(_))) | Some(Err(_)) | None => {}
-                    }
-                }
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        filter_rank_and_deduplicate(&request, &mut candidates);
-        Ok(candidates)
+    /// 增量快照不包含底层错误正文，调用方通过来源状态提示部分失败。
+    async fn suggest_with_progress(
+        &self,
+        request: CommandSuggestionRequest,
+        cancellation: CancellationToken,
+        updates: Option<mpsc::Sender<CommandSuggestionResult>>,
+    ) -> AppResult<CommandSuggestionResult> {
+        self.collect(request, cancellation, updates).await
     }
 }
 
@@ -172,7 +258,7 @@ impl CommandSuggestionProvider for HistoryCommandSuggestionProvider {
 }
 
 impl HistoryCommandSuggestionProvider {
-    /// 查询匹配当前会话上下文的历史，并再次过滤敏感文本和非前缀命中。
+    /// 本地按环境召回、SSH 严格按主机召回；会话和目录只影响排序而不阻断新会话复用。
     async fn history_candidates(
         &self,
         request: &CommandSuggestionRequest,
@@ -186,23 +272,49 @@ impl HistoryCommandSuggestionProvider {
         let session_id = parse_optional_id(request.session_id.as_deref(), SessionId::parse)?;
         let pane_id = parse_optional_id(request.pane_id.as_deref(), PaneId::parse)?;
         let remote_host_id = parse_optional_id(request.remote_host_id.as_deref(), HostId::parse)?;
+        if request.target == kerminal_domain::commands::CommandHistoryTarget::Ssh
+            && remote_host_id.is_none()
+        {
+            return Ok(Vec::new());
+        }
+        let reusable_target = matches!(
+            request.target,
+            kerminal_domain::commands::CommandHistoryTarget::Local
+                | kerminal_domain::commands::CommandHistoryTarget::Ssh
+        );
         let entries = self
             .history
-            .list(CommandHistoryListRequest {
-                query: (!prefix.trim().is_empty()).then(|| prefix.to_owned()),
-                source: None,
-                target: Some(request.target),
-                pane_id,
-                remote_host_id,
-                session_id,
-                limit: Some(100),
-            })
+            .list_prefix(
+                CommandHistoryListRequest {
+                    query: None,
+                    source: None,
+                    target: Some(request.target),
+                    pane_id: if reusable_target { None } else { pane_id },
+                    remote_host_id,
+                    session_id: if reusable_target {
+                        None
+                    } else {
+                        session_id.clone()
+                    },
+                    limit: Some(100),
+                },
+                prefix.to_owned(),
+            )
             .await?;
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("命令历史建议已取消"));
         }
-        let mut seen = HashSet::new();
-        Ok(entries
+        let mut frequency = HashMap::<String, usize>::new();
+        for entry in &entries {
+            if let Ok(command) = NormalizedCommandHistory::new(&entry.command)
+                && command.sensitive_skip_reason().is_none()
+                && command.command.starts_with(prefix)
+                && !command.command.chars().any(char::is_control)
+            {
+                *frequency.entry(command.command).or_default() += 1;
+            }
+        }
+        let mut candidates = entries
             .into_iter()
             .enumerate()
             .filter_map(|(index, entry)| {
@@ -210,9 +322,7 @@ impl HistoryCommandSuggestionProvider {
                     Ok(command) if command.sensitive_skip_reason().is_none() => command.command,
                     _ => return None,
                 };
-                if !command.to_lowercase().starts_with(&prefix.to_lowercase())
-                    || !seen.insert(command.clone())
-                {
+                if !command.starts_with(prefix) || command.chars().any(char::is_control) {
                     return None;
                 }
                 let danger = BroadcastAnalysis::analyze(&command, Vec::new())
@@ -242,7 +352,25 @@ impl HistoryCommandSuggestionProvider {
                         end: cursor,
                     },
                     suffix: command.chars().skip(cursor).collect(),
-                    score: 1.0 / (index as f64 + 1.0),
+                    score: 0.5
+                        + if request.cwd.is_some() && entry.cwd == request.cwd {
+                            0.3
+                        } else {
+                            0.0
+                        }
+                        + if request.shell.is_some() && entry.shell == request.shell {
+                            0.06
+                        } else {
+                            0.0
+                        }
+                        + if session_id.is_some() && entry.session_id == session_id {
+                            0.03
+                        } else {
+                            0.0
+                        }
+                        + (frequency.get(&command).copied().unwrap_or_default().min(10) as f64
+                            * 0.005)
+                        + (0.05 / (index as f64 + 1.0)),
                     sensitivity,
                     description: Some("命令历史".to_owned()),
                     source_explanation: Some("来自当前目标的本地命令历史".to_owned()),
@@ -253,7 +381,16 @@ impl HistoryCommandSuggestionProvider {
                     context_key: request.context_key.clone(),
                 })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let mut seen = HashSet::new();
+        candidates.retain(|candidate| seen.insert(candidate.replacement_text.clone()));
+        Ok(candidates)
     }
 
     /// 只在用户显式输入 `::` 前缀时建议片段，避免把模板变量误当成可直接执行命令。
@@ -388,8 +525,8 @@ fn filter_rank_and_deduplicate(
 fn provider_order(provider: SuggestionProviderKind) -> u8 {
     match provider {
         SuggestionProviderKind::History => 0,
-        SuggestionProviderKind::RemotePath => 1,
-        SuggestionProviderKind::RemoteCommand => 2,
+        SuggestionProviderKind::LocalPath | SuggestionProviderKind::RemotePath => 1,
+        SuggestionProviderKind::LocalCommand | SuggestionProviderKind::RemoteCommand => 2,
         SuggestionProviderKind::Git => 3,
         SuggestionProviderKind::Spec => 4,
         SuggestionProviderKind::Snippet => 5,

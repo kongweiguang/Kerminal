@@ -16,5 +16,7 @@ pub use quit_gate::{
     EditorQuitGate, EditorSaveFailureAction, EditorSaveSuccessAction, editor_save_failure_action,
     editor_save_success_action, evaluate_editor_quit_gate,
 };
-pub(crate) use workspace::{EditorTabProjection, EditorWorkspaceProjection};
+#[cfg(test)]
+pub(crate) use workspace::EditorTabProjection;
+pub(crate) use workspace::EditorWorkspaceProjection;
 pub use workspace::{FileEditorWorkspace, FileEditorWorkspaceEvent};

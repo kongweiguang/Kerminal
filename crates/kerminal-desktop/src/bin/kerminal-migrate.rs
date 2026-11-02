@@ -6,6 +6,8 @@
 mod bootstrap;
 #[path = "../config_root.rs"]
 mod config_root;
+#[path = "../profile_import.rs"]
+mod profile_import;
 
 use std::{
     ffi::OsString,
@@ -34,10 +36,17 @@ struct CommandOutput {
     document: Value,
 }
 
-/// console 独立处理错误并只写安全 JSON，不引入桌面 main 的消息框或运行态装配。
+/// console 共用导入与迁移用例并只写安全 JSON，不引入桌面消息框或运行态装配。
 ///
 /// @author kongweiguang
 fn main() -> ExitCode {
+    if let Some(exit_code) = profile_import::run_from_args(std::env::args_os().skip(1)) {
+        return match exit_code {
+            0 => ExitCode::SUCCESS,
+            1 => ExitCode::FAILURE,
+            _ => ExitCode::from(2),
+        };
+    }
     let output = match run_command(std::env::args_os().skip(1)) {
         Ok(output) => output,
         Err(error) => CommandOutput {

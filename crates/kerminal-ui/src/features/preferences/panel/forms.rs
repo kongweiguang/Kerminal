@@ -185,33 +185,6 @@ impl PreferencesPanel {
             refresh_input_placeholder(input, placeholder, window, cx);
         }
 
-        for shortcut in &self.shortcut_inputs {
-            refresh_input_placeholder(
-                &shortcut.windows,
-                crate::locale::text("主键组合", "Primary shortcut"),
-                window,
-                cx,
-            );
-            refresh_input_placeholder(
-                &shortcut.windows_alternate,
-                crate::locale::text("备用组合（可选）", "Alternate shortcut (optional)"),
-                window,
-                cx,
-            );
-            refresh_input_placeholder(
-                &shortcut.linux,
-                crate::locale::text("按键组合", "Key combination"),
-                window,
-                cx,
-            );
-            refresh_input_placeholder(
-                &shortcut.mac,
-                crate::locale::text("按键组合", "Key combination"),
-                window,
-                cx,
-            );
-        }
-
         let profile_inputs = [
             (
                 &self.profile_inputs.name,

@@ -43,6 +43,8 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
 
 use crate::configuration::ConfigurationStore;
 
+mod local_hosts;
+
 const HOST_SCHEMA_VERSION: u32 = 3;
 const GROUP_SCHEMA_VERSION: u32 = 1;
 const FAVORITE_TAG: &str = "favorite";
@@ -397,7 +399,11 @@ impl HostManagementRepository for HostConfigurationRepository {
                 self.configuration.read(path).await?.ok_or_else(|| {
                     AppError::conflict("主机目录在读取期间发生变化，请刷新后重试")
                 })?;
-            hosts.push(Self::decode_host(document, &id)?);
+            if Self::document_is_local(&document)? {
+                Self::decode_local_host(document, &id)?;
+            } else {
+                hosts.push(Self::decode_host(document, &id)?);
+            }
         }
         Ok(hosts)
     }
@@ -408,12 +414,122 @@ impl HostManagementRepository for HostConfigurationRepository {
             .configuration
             .read(ConfigDocumentPath::Host(host_id.as_str().to_owned()))
             .await?;
-        document
-            .map(|document| Self::decode_host(document, host_id))
-            .transpose()
+        match document {
+            Some(document) if Self::document_is_local(&document)? => {
+                Self::decode_local_host(document, host_id)?;
+                Ok(None)
+            }
+            Some(document) => Self::decode_host(document, host_id).map(Some),
+            None => Ok(None),
+        }
     }
 
-    /// 仅更新主机编辑器负责的字段，并保留未知 TOML 字段和注释。
+    /// 本地和远程文件同目录，使用同一解码入口验证后才提供本地视图。
+    ///
+    /// @author kongweiguang
+    async fn list_local_hosts(
+        &self,
+    ) -> AppResult<Vec<kerminal_application::connections::management::ManagedLocalHost>> {
+        self.list_local_host_records().await
+    }
+
+    /// 本地读取不会将远程主机的网络字段解释成 shell 参数。
+    ///
+    /// @author kongweiguang
+    async fn load_local_host(
+        &self,
+        host_id: &HostId,
+    ) -> AppResult<Option<kerminal_application::connections::management::ManagedLocalHost>> {
+        self.load_local_host_record(host_id).await
+    }
+
+    /// 密文引用和 host 草稿通过配置仓储既有 CAS 一起提交。
+    ///
+    /// @author kongweiguang
+    async fn save_local_host(
+        &self,
+        host_id: HostId,
+        draft: kerminal_application::connections::management::LocalHostDraft,
+        environment_ref: Option<CredentialRef>,
+        expected_revision: Option<ConfigRevision>,
+    ) -> AppResult<kerminal_application::connections::management::ManagedLocalHost> {
+        self.save_local_host_record(host_id, draft, environment_ref, expected_revision)
+            .await
+    }
+
+    /// 删除继续使用 host 文件的共享锁、revision 与结果未知门禁。
+    ///
+    /// @author kongweiguang
+    async fn delete_local_host(
+        &self,
+        host_id: &HostId,
+        expected_revision: &ConfigRevision,
+    ) -> AppResult<kerminal_application::connections::management::ManagedLocalHost> {
+        self.delete_local_host_record(host_id, expected_revision)
+            .await
+    }
+
+    /// 租约文件与共享存储锁分离，只持有可跨 await 安全释放的 OS 句柄。
+    ///
+    /// @author kongweiguang
+    async fn acquire_local_host_operation(&self) -> AppResult<Box<dyn Send>> {
+        let store = self.store.clone();
+        let file = task::spawn_blocking(move || store.acquire_local_host_operation())
+            .await
+            .map_err(|source| {
+                AppError::infrastructure_with_source("获取本地主机操作锁失败", source)
+            })??;
+        Ok(Box::new(file))
+    }
+
+    /// 恢复日志与 host 使用同一存储锁，避免并发本地写入共享候选引用。
+    ///
+    /// @author kongweiguang
+    async fn begin_local_host_recovery(
+        &self,
+        token: &kerminal_application::connections::management::LocalHostSaveRecoveryToken,
+    ) -> AppResult<()> {
+        let store = self.store.clone();
+        let token = token.clone();
+        task::spawn_blocking(move || store.begin_local_host_recovery(&token))
+            .await
+            .map_err(|source| {
+                AppError::outcome_unknown_with_source("本地主机恢复记录登记结果未知", source)
+            })?
+    }
+
+    /// 启动和 UI 重试都读取同一份脱敏 journal，不依赖上一次进程内 token。
+    ///
+    /// @author kongweiguang
+    async fn pending_local_host_recovery(
+        &self,
+    ) -> AppResult<Option<kerminal_application::connections::management::LocalHostSaveRecoveryToken>>
+    {
+        let store = self.store.clone();
+        task::spawn_blocking(move || store.pending_local_host_recovery())
+            .await
+            .map_err(|source| {
+                AppError::infrastructure_with_source("读取本地主机恢复记录失败", source)
+            })?
+    }
+
+    /// 只清理匹配本次操作的恢复日志，避免旧 UI 回执移除后来的操作。
+    ///
+    /// @author kongweiguang
+    async fn finish_local_host_recovery(
+        &self,
+        token: &kerminal_application::connections::management::LocalHostSaveRecoveryToken,
+    ) -> AppResult<()> {
+        let store = self.store.clone();
+        let token = token.clone();
+        task::spawn_blocking(move || store.finish_local_host_recovery(&token))
+            .await
+            .map_err(|source| {
+                AppError::outcome_unknown_with_source("本地主机恢复记录清理结果未知", source)
+            })?
+    }
+
+    /// 仅更新远程主机字段并保留扩展；相同 ID 的本地主机不能被跨类型覆盖。
     ///
     /// @author kongweiguang
     async fn save_host(
@@ -425,6 +541,11 @@ impl HostManagementRepository for HostConfigurationRepository {
         let (mut document, existing) = self
             .editable_document(&host_id, expected_revision.as_ref())
             .await?;
+        if let Some(current) = existing.as_ref()
+            && Self::document_is_local(current)?
+        {
+            return Err(AppError::conflict("主机标识已被本地主机使用"));
+        }
         let now = timestamp_now();
         if existing.is_none() {
             set_integer(

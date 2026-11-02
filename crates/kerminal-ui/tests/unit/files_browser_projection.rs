@@ -7,8 +7,6 @@ use crate::features::files::{
     permissions::{PermissionEditor, supports_posix_mode_endpoint},
     transfer_queue::TransferQueueUi,
     view_mode::FileEntryFilter,
-    workspace_projection_push_is_newer, workspace_projection_request_is_current,
-    workspace_projection_response_is_fresh,
 };
 use kerminal_application::preferences::InterfaceDensity;
 use kerminal_domain::{
@@ -43,11 +41,13 @@ fn browser_toolbar_projects_two_rows_and_compact_ssh_follow() {
     assert!(!compact_local.show_terminal_follow);
 }
 
-/// 表格宽度边界与紧凑工具栏固定图标布局相互独立。
+/// 表格列按实际宽度切换；动作条固定为同一组高频按钮，不再按宽度换组。
 ///
 /// @author kongweiguang
 #[test]
 fn browser_columns_respect_width_boundary() {
+    assert!(!FileBrowserLayout::for_width(px(319.)).columns.modified);
+    assert!(FileBrowserLayout::for_width(px(320.)).columns.modified);
     assert!(!FileBrowserLayout::for_width(px(399.)).columns.size);
     assert!(FileBrowserLayout::for_width(px(400.)).columns.size);
     assert!(!FileBrowserLayout::for_width(px(539.)).columns.permissions);
@@ -131,38 +131,6 @@ fn file_rows_follow_interface_density() {
     assert_eq!(file_list_row_height(InterfaceDensity::Compact), 36.0);
     assert_eq!(file_list_row_height(InterfaceDensity::Comfortable), 44.0);
     assert_eq!(file_list_row_height(InterfaceDensity::Spacious), 48.0);
-}
-
-/// 目录请求可填充同版本首个快照，但过期返回不能覆盖已经推送的新状态。
-///
-/// @author kongweiguang
-#[test]
-fn editor_projection_request_rejects_older_revision() {
-    assert!(workspace_projection_response_is_fresh(None, 0));
-    assert!(workspace_projection_response_is_fresh(Some(4), 4));
-    assert!(workspace_projection_response_is_fresh(Some(4), 5));
-    assert!(!workspace_projection_response_is_fresh(Some(5), 4));
-}
-
-/// 快速切出并重进工作区后，旧视图代次的回包不能填充新请求。
-///
-/// @author kongweiguang
-#[test]
-fn editor_projection_request_rejects_stale_view_generation() {
-    assert!(workspace_projection_request_is_current(true, 7, 7));
-    assert!(!workspace_projection_request_is_current(true, 6, 7));
-    assert!(!workspace_projection_request_is_current(false, 7, 7));
-}
-
-/// 实时推送只接受新代次，重复及迟到快照不能覆盖活动 pane。
-///
-/// @author kongweiguang
-#[test]
-fn editor_projection_push_requires_a_newer_revision() {
-    assert!(workspace_projection_push_is_newer(None, 0));
-    assert!(workspace_projection_push_is_newer(Some(4), 5));
-    assert!(!workspace_projection_push_is_newer(Some(4), 4));
-    assert!(!workspace_projection_push_is_newer(Some(5), 4));
 }
 
 /// 路径输入必须保留 endpoint 身份，并按当前主机的原生路径规则解析相对段。

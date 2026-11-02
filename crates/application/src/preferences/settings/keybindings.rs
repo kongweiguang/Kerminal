@@ -21,9 +21,6 @@ pub struct KeybindingPreference {
     /// Linux 专用绑定；缺失时保留旧版非 macOS 的 Windows 字段回退语义。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux_binding: Option<String>,
-    /// Windows 附加绑定；None 表示旧配置未提供该字段，Some 空串表示显式禁用。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub windows_alternate_binding: Option<String>,
     pub scope: KeybindingScope,
     pub editable: bool,
 }
@@ -213,7 +210,6 @@ pub(super) fn default_keybindings() -> Vec<KeybindingPreference> {
             windows_binding: windows_binding.to_owned(),
             mac_binding: mac_binding.to_owned(),
             linux_binding: None,
-            windows_alternate_binding: None,
             scope,
             editable: true,
         },
@@ -236,7 +232,6 @@ pub(super) fn default_terminal_paste_keybinding() -> KeybindingPreference {
         windows_binding: "Ctrl+V".to_owned(),
         mac_binding: "Cmd+V".to_owned(),
         linux_binding: Some("Ctrl+Shift+V".to_owned()),
-        windows_alternate_binding: Some("Ctrl+Shift+V".to_owned()),
         scope: KeybindingScope::Terminal,
         editable: true,
     }

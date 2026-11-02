@@ -44,6 +44,10 @@ const CONFIG_GUIDE_REVISION_11_SHA256: &str =
     "8e0bbf0bfd3ab7323e3a55a97c0000b06c1dfd74307ed8aa538c543a80d0b676";
 const CONFIG_GUIDE_REVISION_12_SHA256: &str =
     "4acb8caac57c0696275684ac0eb6a9190192472af4c3fb3c576f9495c1b70864";
+const CONFIG_GUIDE_REVISION_13_SHA256: &str =
+    "cc45a78fadb32f0f7d6fb8e482177f22df55b78f9baa2c54a2265583cfab4444";
+const CONFIG_GUIDE_REVISION_14_SHA256: &str =
+    "6b3128c7addb0b5a98b2789f705f382b6376f70055cc5b16251290bd2f168b44";
 const LEGACY_TAURI_CONFIG_GUIDE_SHA256: &str =
     "e70de091c515a0a143cd04f379a4274fbe18f810a411a6ca273277bc743220ad";
 
@@ -285,22 +289,26 @@ fn ensure_recovery_state_is_migratable(root: &Path, sources: &[DocumentSource]) 
             if normalized_path(&source.relative_path) != issue.relative_path {
                 return false;
             }
-            matches!(
-                (
-                    source.kind,
-                    source_schema_version(&source.bytes),
-                    issue.kind
-                ),
-                (
-                    DocumentKind::Host,
-                    Some(HOST_SCHEMA_V1 | HOST_SCHEMA_V2),
-                    ConfigurationIssueKind::UnsupportedSchema,
-                ) | (
-                    DocumentKind::Snippet,
-                    Some(DOCUMENT_SCHEMA_V1),
-                    ConfigurationIssueKind::MalformedToml,
+            let known_profile_group = source.kind == DocumentKind::Profile
+                && source_schema_version(&source.bytes) == Some(DOCUMENT_SCHEMA_V1)
+                && legacy_profile_without_group_is_valid(source);
+            known_profile_group
+                || matches!(
+                    (
+                        source.kind,
+                        source_schema_version(&source.bytes),
+                        issue.kind
+                    ),
+                    (
+                        DocumentKind::Host,
+                        Some(HOST_SCHEMA_V1 | HOST_SCHEMA_V2),
+                        ConfigurationIssueKind::UnsupportedSchema,
+                    ) | (
+                        DocumentKind::Snippet,
+                        Some(DOCUMENT_SCHEMA_V1),
+                        ConfigurationIssueKind::MalformedToml,
+                    )
                 )
-            )
         });
         if !has_migratable_source {
             return Err(AppError::conflict(
@@ -309,6 +317,24 @@ fn ensure_recovery_state_is_migratable(root: &Path, sources: &[DocumentSource]) 
         }
     }
     Ok(())
+}
+
+/// 只有删除旧分组字段后能通过当前校验的 Profile 才能跨过恢复门禁。
+fn legacy_profile_without_group_is_valid(source: &DocumentSource) -> bool {
+    let Ok(text) = std::str::from_utf8(&source.bytes) else {
+        return false;
+    };
+    let Ok(mut document) = text.parse::<DocumentMut>() else {
+        return false;
+    };
+    if document.remove("sidebar_group_id").is_none() {
+        return false;
+    }
+    configuration::validate_current_configuration_document(
+        &source.document_path,
+        &document.to_string(),
+    )
+    .is_ok()
 }
 
 /// 在只读源上规划一份配置文件编辑，并用当前 validator 检查输出文档。
@@ -357,7 +383,11 @@ fn plan_document_edit(source: DocumentSource) -> AppResult<Option<super::FileEdi
             }
             migrated
         }
-        DocumentKind::Profile | DocumentKind::HostGroups | DocumentKind::Workflow => {
+        DocumentKind::Profile => {
+            require_document_schema(schema_version)?;
+            document.remove("sidebar_group_id").is_some()
+        }
+        DocumentKind::HostGroups | DocumentKind::Workflow => {
             require_document_schema(schema_version)?;
             false
         }
@@ -486,11 +516,6 @@ fn paste_default_preserving_existing_bindings(
     ) {
         paste.windows_binding.clear();
     }
-    if let Some(alternate) = paste.windows_alternate_binding.as_mut()
-        && binding_exists_on_platform(existing, KeybindingPlatform::Windows, alternate)
-    {
-        alternate.clear();
-    }
     if let Some(linux) = paste.linux_binding.as_mut()
         && binding_exists_on_platform(existing, KeybindingPlatform::Linux, linux)
     {
@@ -525,16 +550,7 @@ fn binding_exists_on_platform(
                 fallback_binding(&preference.mac_binding, &preference.binding)
             }
         };
-        let primary_conflicts =
-            first_canonical_stroke(binding).as_deref() == Some(candidate.as_str());
-        let alternate_conflicts = platform == KeybindingPlatform::Windows
-            && preference
-                .windows_alternate_binding
-                .as_deref()
-                .and_then(first_canonical_stroke)
-                .as_deref()
-                == Some(candidate.as_str());
-        primary_conflicts || alternate_conflicts
+        first_canonical_stroke(binding).as_deref() == Some(candidate.as_str())
     })
 }
 
@@ -1260,6 +1276,10 @@ fn outdated_guide_revision(contents: &[u8]) -> Option<u32> {
     if digest == configuration::config_guide_digest(kerminal_application::preferences::CONFIG_GUIDE)
     {
         None
+    } else if digest == CONFIG_GUIDE_REVISION_14_SHA256 {
+        Some(14)
+    } else if digest == CONFIG_GUIDE_REVISION_13_SHA256 {
+        Some(13)
     } else if digest == CONFIG_GUIDE_REVISION_12_SHA256 {
         Some(12)
     } else if digest == CONFIG_GUIDE_REVISION_11_SHA256 {
@@ -1313,6 +1333,8 @@ fn known_previous_guide_digest(revision: u32) -> Option<&'static str> {
         10 => Some(CONFIG_GUIDE_REVISION_10_SHA256),
         11 => Some(CONFIG_GUIDE_REVISION_11_SHA256),
         12 => Some(CONFIG_GUIDE_REVISION_12_SHA256),
+        13 => Some(CONFIG_GUIDE_REVISION_13_SHA256),
+        14 => Some(CONFIG_GUIDE_REVISION_14_SHA256),
         _ => None,
     }
 }

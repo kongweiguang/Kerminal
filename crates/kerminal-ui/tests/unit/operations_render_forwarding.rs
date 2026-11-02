@@ -3,11 +3,11 @@
 //! @author kongweiguang
 
 use super::{
-    ForwardBindScope, ForwardScenarioCard, bind_scope_mode, forward_copy_address,
-    forward_direction_labels, forward_host_endpoint_label, forward_host_id_detail,
-    forward_host_label, forward_kind_for_scenario, forward_matches_host, forward_proxy_url,
-    forward_scenario_card, forward_session_endpoints, forward_socks_kind,
-    forward_socks_proxy_preview,
+    ForwardBindScope, ForwardProxyAction, ForwardScenarioCard, ProxyForwardActionState,
+    bind_scope_mode, forward_copy_address, forward_direction_labels, forward_host_endpoint_label,
+    forward_host_id_detail, forward_host_label, forward_kind_for_scenario, forward_matches_host,
+    forward_proxy_url, forward_scenario_card, forward_session_endpoints, forward_socks_kind,
+    forward_socks_proxy_preview, missing_forward_recovery_action,
 };
 use kerminal_application::operations::ManagedPortForwardSnapshot;
 use kerminal_domain::identity::HostId;
@@ -231,6 +231,48 @@ fn managed_forward(
         proxy_application: None,
         failure_code: None,
     }
+}
+
+/// 原转发行仍在时由行菜单承接恢复，消失后按已核实状态保留唯一操作入口。
+///
+/// @author kongweiguang
+#[test]
+fn missing_forward_keeps_only_the_original_recovery_action() {
+    let forward = managed_forward(ForwardKind::RemoteDynamic, "127.0.0.1", 1080, None, None);
+    let mut state = ProxyForwardActionState {
+        busy: false,
+        current_enabled: false,
+        current_reason: None,
+        future_enabled: false,
+        future_active: false,
+        future_reason: None,
+        restore_current: true,
+        reconcile_current: false,
+    };
+    assert_eq!(
+        missing_forward_recovery_action(&[forward], "forward-id", &state),
+        None
+    );
+    assert_eq!(
+        missing_forward_recovery_action(&[], "forward-id", &state),
+        Some(ForwardProxyAction::Restore)
+    );
+    state.busy = true;
+    assert_eq!(
+        missing_forward_recovery_action(&[], "forward-id", &state),
+        Some(ForwardProxyAction::Restore)
+    );
+    state.restore_current = false;
+    state.reconcile_current = true;
+    assert_eq!(
+        missing_forward_recovery_action(&[], "forward-id", &state),
+        Some(ForwardProxyAction::Reconcile)
+    );
+    state.reconcile_current = false;
+    assert_eq!(
+        missing_forward_recovery_action(&[], "forward-id", &state),
+        None
+    );
 }
 
 /// 全局转发清单可混有其它 SSH 主机；切换或失去目标时不能把它们投影到当前右栏。

@@ -544,7 +544,7 @@ fn service_for_kind_with_options(
     (service, backend, request, request_receiver)
 }
 
-/// 构造精简终态记录，让 prune_history 回归直接覆盖记录保留策略而无需运行异步后端。
+/// 构造普通传输的精简终态记录，不持有拖动暂存，直接覆盖历史保留策略而无需运行异步后端。
 ///
 /// @author kongweiguang
 fn terminal_record(kind: TransferFailureKind, sequence: u64) -> (TransferId, TransferRecord) {
@@ -578,6 +578,8 @@ fn terminal_record(kind: TransferFailureKind, sequence: u64) -> (TransferId, Tra
         id,
         TransferRecord {
             task,
+            drag_staging: false,
+            drag_evidence_pending: false,
             checkpoint: None,
             staging_ownership: Vec::new(),
             sftp_policy: None,
@@ -1375,6 +1377,7 @@ async fn clear_completed_leaves_active_transfer_available() {
 }
 
 /// 历史容量仅裁剪最旧的普通终态，CommitUnknown 必须保留到人工核对。
+/// 裁剪当下同步移除拖出标记，后台无人读取列表时也不得积累孤立缓存。
 ///
 /// @author kongweiguang
 #[test]
@@ -1388,12 +1391,75 @@ fn history_pruning_retains_unknown_commit_beyond_ordinary_limit() {
         (recent_id.clone(), recent),
     ]);
 
-    prune_history(&mut records, 1);
+    let markers = Mutex::new(std::collections::HashMap::from([
+        (unknown_id.clone(), false),
+        (old_id.clone(), false),
+        (recent_id.clone(), false),
+    ]));
+    prune_history(&mut records, 1, &markers);
 
     assert!(records.contains_key(&unknown_id));
     assert!(!records.contains_key(&old_id));
     assert!(records.contains_key(&recent_id));
     assert_eq!(records.len(), 2);
+    let markers = markers.lock().expect("fixture marker lock is healthy");
+    assert_eq!(markers.len(), 2);
+    assert!(!markers.contains_key(&old_id));
+}
+
+/// 清理已结束任务直接释放其拖出标记，不要求打开文件面板或调用列表查询。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn clear_completed_releases_drag_markers_without_a_list_observer() {
+    let (service, _, _, _) = service_for(BackendMode::NoChanges);
+    let (id, mut record) = terminal_record(TransferFailureKind::Connection, 1);
+    record.drag_staging = true;
+    service
+        .inner
+        .records
+        .lock()
+        .await
+        .insert(id.clone(), record);
+    service
+        .inner
+        .drag_staging_ids
+        .lock()
+        .expect("healthy marker cache")
+        .insert(id.clone(), false);
+    assert!(service.is_drag_staging(&id));
+    assert_eq!(
+        service
+            .clear_completed(CancellationToken::new())
+            .await
+            .expect("settled history can be cleared"),
+        (1, 0)
+    );
+    assert!(!service.is_drag_staging(&id));
+}
+
+/// 列表以入队序号倒序返回，不能依赖随机 UUID 或任务终态推测最近顺序。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn transfer_list_returns_newest_enqueued_first() {
+    let (service, _, _, _) = service_for(BackendMode::NoChanges);
+    let (first_id, first) = terminal_record(TransferFailureKind::Connection, 1);
+    let (second_id, second) = terminal_record(TransferFailureKind::CommitUnknown, 2);
+    let (third_id, third) = terminal_record(TransferFailureKind::Connection, 3);
+    {
+        let mut records = service.inner.records.lock().await;
+        records.insert(first_id.clone(), first);
+        records.insert(second_id.clone(), second);
+        records.insert(third_id.clone(), third);
+    }
+    let ids = service
+        .list()
+        .await
+        .into_iter()
+        .map(|summary| summary.id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![third_id, second_id, first_id]);
 }
 
 /// 在提交控制请求排队前完成 shutdown 取消，验证 worker 收到撤销后不会触发目标写入。

@@ -46,8 +46,8 @@ pub(in crate::features::preferences) struct ConnectivityState {
     key_generation: u64,
     key_edit_generation: u64,
     key_edited: bool,
-    runtime: Option<Arc<dyn McpRuntimeControl>>,
-    executor: ApplicationTaskExecutor,
+    pub(super) runtime: Option<Arc<dyn McpRuntimeControl>>,
+    pub(super) executor: ApplicationTaskExecutor,
     notifications: Option<Arc<DesktopNotificationService>>,
     pub(in crate::features::preferences) mcp_snapshot: McpRuntimeSnapshot,
     pub(in crate::features::preferences) mcp_operation: Option<McpOperation>,
@@ -409,6 +409,9 @@ impl ConnectivityState {
                 panel
                     .connectivity
                     .finish_mcp_operation(generation, result, cx);
+                if panel.connectivity.current_mcp_snapshot().state == McpRuntimeState::Running {
+                    panel.refresh_mcp_addresses(cx);
+                }
             });
         })
         .detach();

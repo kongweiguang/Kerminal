@@ -15,6 +15,41 @@ use super::RootView;
 use crate::features::commands::CommandsView;
 
 impl RootView {
+    /// 布局验收仍以当前可信 fixture pane 为界，只读 Commands 的真实预览阶段。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_snippet_preview_phase(
+        &self,
+        host_id: &HostId,
+        snippet_id: &str,
+        cx: &Context<Self>,
+    ) -> Result<&'static str, String> {
+        let binding = self
+            .right_rail_acceptance_snippets_binding(host_id)?
+            .ok_or_else(|| "片段布局验收的 fixture 绑定不可用".to_owned())?;
+        self.right_rail_acceptance_commands_view()?
+            .read(cx)
+            .right_rail_acceptance_snippet_preview_phase(&binding, snippet_id)
+    }
+
+    /// 通过生产查询入口清理本轮筛选，原数据和片段定义均不写入。
+    ///
+    /// @author kongweiguang
+    pub fn restore_right_rail_acceptance_snippet_catalog(
+        &mut self,
+        host_id: &HostId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.right_rail_acceptance_snippets_binding(host_id)?
+            .ok_or_else(|| "片段布局验收的 fixture 绑定不可用".to_owned())?;
+        self.right_rail_acceptance_commands_view()?
+            .update(cx, |view, cx| {
+                view.right_rail_acceptance_restore_snippet_catalog(window, cx);
+            });
+        Ok(())
+    }
+
     /// 验收只替代系统文件选择结果，仍由 Commands 的真实读取和校验流程生成预览。
     /// 先校验活动 fixture 目标，避免隐藏测试误触其它工作区的片段视图。
     ///

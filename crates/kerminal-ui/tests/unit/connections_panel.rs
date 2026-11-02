@@ -332,38 +332,38 @@ fn sftp_host_creation_receipt_is_scoped_and_capability_checked() {
     assert!(host_sftp_capable(RemoteProtocol::Ssh, true));
 }
 
-/// 主机选择始终对应详情展示；完整目录由左侧导航独立承载。
+/// 主机选择对应普通展示态；完整目录由左侧导航独立承载。
 ///
 /// @author kongweiguang
 #[test]
 fn host_presentation_has_no_duplicate_directory_mode() {
     let mut presentation = ConnectionsPresentation::default();
 
-    assert_eq!(presentation, ConnectionsPresentation::HostDetails);
+    assert_eq!(presentation, ConnectionsPresentation::HostSelection);
 
-    presentation.show_host_details();
-    assert_eq!(presentation, ConnectionsPresentation::HostDetails);
+    presentation.show_host_selection();
+    assert_eq!(presentation, ConnectionsPresentation::HostSelection);
 }
 
-/// 分组编辑不因主机选择而关闭，结束时统一回到详情态，由 Root generation 恢复原工作区。
+/// 分组编辑不因主机选择而关闭，结束时统一回到普通展示态，由 Root generation 恢复原工作区。
 ///
 /// @author kongweiguang
 #[test]
-fn group_rename_uses_full_width_mode_and_returns_to_details() {
+fn group_rename_uses_full_width_mode_and_returns_to_selection() {
     let mut presentation = ConnectionsPresentation::default();
 
     presentation.show_group_editor();
     assert!(presentation.shows_group_editor());
-    presentation.show_host_details();
+    presentation.show_host_selection();
     assert!(presentation.shows_group_editor());
     presentation.finish_group_editor();
-    assert_eq!(presentation, ConnectionsPresentation::HostDetails);
+    assert_eq!(presentation, ConnectionsPresentation::HostSelection);
 
     presentation.show_group_editor();
-    presentation.show_host_details();
+    presentation.show_host_selection();
     assert!(presentation.shows_group_editor());
     presentation.finish_group_editor();
-    assert_eq!(presentation, ConnectionsPresentation::HostDetails);
+    assert_eq!(presentation, ConnectionsPresentation::HostSelection);
 }
 
 /// 保存失败或旧组回执不得关闭当前草稿；只有同一重命名的成功回执结束编辑。

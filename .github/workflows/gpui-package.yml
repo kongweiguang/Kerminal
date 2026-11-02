@@ -1,8 +1,17 @@
 # @author kongweiguang
-name: GPUI unsigned candidate packages
+name: GPUI candidate packages
 
 on:
   workflow_dispatch:
+    inputs:
+      signed_candidate:
+        description: "Generate a verified signed candidate set without publishing"
+        type: boolean
+        default: false
+      release_tag:
+        description: "Required for signed candidates; must equal v plus the workspace version"
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -94,10 +103,40 @@ jobs:
         shell: bash
         env:
           PACKAGE_TARGET: ${{ matrix.target }}
+          SIGNED_CANDIDATE: ${{ inputs.signed_candidate }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          KERMINAL_GPUI_UPDATER_PUBLIC_KEY: ${{ vars.KERMINAL_GPUI_UPDATER_PUBLIC_KEY }}
         run: |
           set -euo pipefail
+          PACKAGE_VERSION="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [[ "$SIGNED_CANDIDATE" == "true" ]]; then
+            [[ "$GITHUB_REPOSITORY" == "kongweiguang/Kerminal" ]] || { echo 'Signed candidates require the official repository.'; exit 1; }
+            [[ "$RELEASE_TAG" == "v$PACKAGE_VERSION" ]] || { echo 'Release tag must match the workspace version.'; exit 1; }
+            python packaging/updater_key.py
+          elif [[ -n "$KERMINAL_GPUI_UPDATER_PUBLIC_KEY" ]]; then
+            python packaging/updater_key.py
+          fi
           cargo --locked build --release --package kerminal-desktop --target "$PACKAGE_TARGET"
+          if [[ "$SIGNED_CANDIDATE" == "true" ]]; then
+            BINARY_PATH="target/$PACKAGE_TARGET/release/kerminal"
+            if [[ "$PACKAGE_TARGET" == *-windows-* ]]; then BINARY_PATH+=".exe"; fi
+            python packaging/updater_key.py \
+              --binary "$BINARY_PATH" \
+              --target "$PACKAGE_TARGET" \
+              --source-commit "$GITHUB_SHA" \
+              --version "$PACKAGE_VERSION" \
+              --attestation "target/updater-attestations/$PACKAGE_TARGET.json"
+          fi
           cargo --locked xtask package --target "$PACKAGE_TARGET"
+
+      - name: Upload trust-root build attestation
+        if: inputs.signed_candidate == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: updater-attestation-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/updater-attestations/${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload unsigned candidate packages
         uses: actions/upload-artifact@v7
@@ -146,6 +185,113 @@ jobs:
         with:
           name: unsigned-candidate-set-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/candidate-set/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  signed-candidate:
+    name: Sign and verify GPUI and legacy update contracts
+    if: inputs.signed_candidate == true
+    needs: validate-candidate-set
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout the same source revision
+        uses: actions/checkout@v7
+
+      - name: Set up validation Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Download candidate matrix
+        uses: actions/download-artifact@v7
+        with:
+          name: unsigned-candidate-set-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/candidate-set
+
+      - name: Download platform trust-root attestations
+        uses: actions/download-artifact@v7
+        with:
+          pattern: updater-attestation-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/updater-attestations
+          merge-multiple: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Validate all embedded public keys
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          KERMINAL_GPUI_UPDATER_PUBLIC_KEY: ${{ vars.KERMINAL_GPUI_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          PACKAGE_VERSION="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          [[ "$GITHUB_REPOSITORY" == "kongweiguang/Kerminal" && "$RELEASE_TAG" == "v$PACKAGE_VERSION" ]] || { echo 'Release identity does not match this source.'; exit 1; }
+          python packaging/updater_key.py \
+            --verify-attestations target/updater-attestations \
+            --source-commit "$GITHUB_SHA" \
+            --version "$PACKAGE_VERSION" \
+            --public-key-file target/keys/gpui-updater.pub
+
+      - name: Install pinned signer and Minisign verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends minisign
+          cargo install cargo-packager --version 0.11.8 --locked --root target/tools/cargo-packager
+
+      - name: Sign required updater packages
+        shell: bash
+        env:
+          KERMINAL_GPUI_SIGNING_PRIVATE_KEY: ${{ secrets.KERMINAL_GPUI_SIGNING_PRIVATE_KEY }}
+          KERMINAL_GPUI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.KERMINAL_GPUI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python packaging/sign_candidates.py \
+            --candidate-dir target/candidate-set \
+            --signer target/tools/cargo-packager/bin/cargo-packager
+
+      - name: Verify signatures and prepare GitHub release assets
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          PACKAGE_VERSION="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          [[ "$RELEASE_TAG" == "v$PACKAGE_VERSION" ]] || { echo 'Release tag changed.'; exit 1; }
+          RELEASE_BASE="https://github.com/kongweiguang/Kerminal/releases/download/$RELEASE_TAG"
+          python packaging/build_candidate_inventory.py \
+            --candidate-dir target/candidate-set \
+            --new-signatures-dir signatures/new \
+            --legacy-signatures-dir signatures/legacy \
+            --new-public-key target/keys/gpui-updater.pub \
+            --legacy-public-key packaging/tauri-legacy-updater.pub \
+            --inventory target/release-metadata/inventory.json \
+            --metadata-output target/release-metadata \
+            --version "$PACKAGE_VERSION" \
+            --source-commit "$GITHUB_SHA" \
+            --base-url "$RELEASE_BASE" \
+            --signing-class production \
+            --github-release-assets
+          python packaging/stage_release_assets.py \
+            --candidate-dir target/candidate-set \
+            --metadata-dir target/release-metadata \
+            --output-dir target/release-assets \
+            --base-url "$RELEASE_BASE"
+          printf '%s\n' 'Signed candidate assets validated; no GitHub Release was created or published.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload signed candidate assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpui-signed-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/release-assets/
           if-no-files-found: error
           retention-days: 7
           compression-level: 0

@@ -372,7 +372,9 @@ pub struct TerminalCursor {
     pub shape: TerminalCursorShape,
     /// 自上次 RIS 或 DECSTR 以来是否实际观察到 DECSCUSR；false 时 UI 可用用户默认形状。
     pub style_from_terminal: bool,
-    /// 当前 DECSCUSR 样式是否要求闪烁；UI 可再与用户偏好相与，不猜协议状态。
+    /// 是否由 DECSCUSR 或 DEC 私有模式 12 显式指定闪烁；否则使用用户默认值。
+    pub blink_from_terminal: bool,
+    /// 当前终端协议所要求的闪烁状态；用户关闭闪烁时 UI 保持常亮。
     pub blinking: bool,
     pub visible: bool,
 }

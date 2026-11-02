@@ -91,7 +91,7 @@ impl Render for ProxyApplicationPanel {
         let theme = ThemeTokens::current(window, cx);
         let forwards = eligible_socks_forwards(&self.projection);
         let selected_id = self.selected_forward_id.clone();
-        let busy = self.pending.is_some();
+        let busy = self.is_busy();
         let selected = self.selected_forward().cloned();
         let current_reason = selected.as_ref().and_then(|_| self.current_binding().err());
         let current_application = self
@@ -116,7 +116,8 @@ impl Render for ProxyApplicationPanel {
             current_host,
             current_application,
             &self.projection.future,
-            busy || self.last_status.is_some()
+            self.pending.is_some()
+                || self.last_status.is_some()
                 || self.last_history_result.is_some()
                 || self.review_script.is_some()
                 || self.recovery_forward_id.is_some(),
@@ -274,7 +275,7 @@ impl Render for ProxyApplicationPanel {
                         } else {
                             crate::locale::text("应用到后续终端", "Apply to future terminals")
                         })
-                        .disabled(!future_enabled_button || future_unknown)
+                        .disabled(!future_enabled_button || future_unknown || self.future_uncertain)
                         .on_click(
                             cx.listener(|panel, _: &ClickEvent, _, cx| panel.toggle_future(cx)),
                         ),
@@ -288,7 +289,7 @@ impl Render for ProxyApplicationPanel {
                             panel.request_profile_script(cx)
                         })),
                 )
-                .when(busy, |row| {
+                .when(self.pending.is_some(), |row| {
                     let cancellable = self
                         .pending
                         .as_ref()
@@ -351,7 +352,7 @@ impl Render for ProxyApplicationPanel {
                         )
                     }),
             );
-        } else if selected.is_some() {
+        } else if selected.is_some() && !self.future_uncertain {
             root = root.child(
                 div()
                     .id("proxy-future-scope")

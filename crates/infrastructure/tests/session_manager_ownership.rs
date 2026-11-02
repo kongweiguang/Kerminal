@@ -98,6 +98,7 @@ impl SessionTransportFactory for DelayedFactory {
             shell_dialect: kerminal_domain::connections::RemoteShellDialect::Unknown,
             process_id: None,
             shell_integration_enabled: false,
+            shell_editing_nonce: None,
         })
     }
 }
@@ -186,6 +187,7 @@ impl SessionTransportFactory for FailOnceThenOpenFactory {
             shell_dialect: kerminal_domain::connections::RemoteShellDialect::Unknown,
             process_id: None,
             shell_integration_enabled: false,
+            shell_editing_nonce: None,
         })
     }
 }

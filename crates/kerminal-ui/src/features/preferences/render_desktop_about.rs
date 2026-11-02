@@ -5,8 +5,9 @@
 use std::rc::Rc;
 
 use gpui_kit::{
-    ClickEvent, Context, Entity, IntoElement, SharedString,
+    ClickEvent, Context, Entity, FocusHandle, IntoElement, Keystroke, SharedString,
     assets::IconName,
+    base::Selectable,
     component::{
         Disableable, Icon,
         button::{Button, ButtonCustomVariant, ButtonVariants},
@@ -24,9 +25,14 @@ use crate::{
     theme::ThemeTokens,
 };
 
-use super::{KeyboardPlatform, panel::PreferencesPanel};
+use super::{
+    KeyboardPlatform,
+    panel::{PreferencesPanel, ShortcutBindingField, keyboard_platform},
+    validate_settings,
+    validation::{binding_for_platform, binding_is_customized},
+};
 
-/// main v0.3.48 的设置页动作目录；GPUI 专属运行态动作不改变这份可见目录。
+/// main v0.3.48 的动作说明作为默认文案，实际范围始终来自配置。
 #[derive(Clone, Copy)]
 pub(super) struct MainShortcutPresentation {
     pub(super) action: &'static str,
@@ -34,7 +40,6 @@ pub(super) struct MainShortcutPresentation {
     pub(super) label_en: &'static str,
     pub(super) description_zh: &'static str,
     pub(super) description_en: &'static str,
-    pub(super) scope: KeybindingScope,
 }
 
 /// 保留 main 的动作顺序与文案；显示层投影不覆盖配置中的用户绑定。
@@ -45,7 +50,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Open settings",
         description_zh: "参考 IntelliJ IDEA 的设置入口打开设置。",
         description_en: "Open Settings using the IntelliJ IDEA shortcut.",
-        scope: KeybindingScope::Global,
     },
     MainShortcutPresentation {
         action: "settings.keybindings",
@@ -53,7 +57,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "View shortcuts and actions",
         description_zh: "打开快捷键与动作列表。",
         description_en: "Open the shortcut and action list directly.",
-        scope: KeybindingScope::Global,
     },
     MainShortcutPresentation {
         action: "terminal.focus",
@@ -61,7 +64,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Return to terminal",
         description_zh: "显示终端工作区并收起右栏。",
         description_en: "Show the terminal workspace and collapse the right pane.",
-        scope: KeybindingScope::Global,
     },
     MainShortcutPresentation {
         action: "terminal.newTab",
@@ -69,7 +71,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "New local terminal",
         description_zh: "新建本地终端 tab。",
         description_en: "Open a new local terminal workspace tab.",
-        scope: KeybindingScope::Workspace,
     },
     MainShortcutPresentation {
         action: "terminal.closeTab",
@@ -77,7 +78,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Close current terminal tab",
         description_zh: "关闭当前终端 tab。",
         description_en: "Close the current terminal workspace tab.",
-        scope: KeybindingScope::Workspace,
     },
     MainShortcutPresentation {
         action: "terminal.closePane",
@@ -85,7 +85,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Close current pane",
         description_zh: "关闭当前分屏，多分屏时生效。",
         description_en: "Close the current split when multiple panes are open.",
-        scope: KeybindingScope::Terminal,
     },
     MainShortcutPresentation {
         action: "terminal.splitHorizontal",
@@ -93,7 +92,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Split right",
         description_zh: "在当前终端右侧创建分屏。",
         description_en: "Create a pane to the right of the current terminal.",
-        scope: KeybindingScope::Workspace,
     },
     MainShortcutPresentation {
         action: "terminal.splitVertical",
@@ -101,7 +99,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Split below",
         description_zh: "在当前终端下方创建分屏。",
         description_en: "Create a pane below the current terminal.",
-        scope: KeybindingScope::Workspace,
     },
     MainShortcutPresentation {
         action: "terminal.previousTab",
@@ -109,7 +106,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Previous terminal tab",
         description_zh: "切到左侧终端 tab。",
         description_en: "Switch to the terminal tab immediately to the left.",
-        scope: KeybindingScope::Workspace,
     },
     MainShortcutPresentation {
         action: "terminal.nextTab",
@@ -117,7 +113,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Next terminal tab",
         description_zh: "切到右侧终端 tab。",
         description_en: "Switch to the terminal tab immediately to the right.",
-        scope: KeybindingScope::Workspace,
     },
     MainShortcutPresentation {
         action: "tool.agentLauncher",
@@ -125,7 +120,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Open Agent Launcher",
         description_zh: "打开 Agent Launcher。",
         description_en: "Open the Agent Launcher tool window.",
-        scope: KeybindingScope::Global,
     },
     MainShortcutPresentation {
         action: "tool.system",
@@ -133,7 +127,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Open system information",
         description_zh: "打开系统信息。",
         description_en: "Open the system information tool window.",
-        scope: KeybindingScope::Global,
     },
     MainShortcutPresentation {
         action: "tool.sftp",
@@ -141,7 +134,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Open SFTP",
         description_zh: "打开 SFTP。",
         description_en: "Open the SFTP tool window.",
-        scope: KeybindingScope::Global,
     },
     MainShortcutPresentation {
         action: "tool.ports",
@@ -149,7 +141,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Open port forwarding",
         description_zh: "打开端口转发。",
         description_en: "Open the port forwarding tool window.",
-        scope: KeybindingScope::Global,
     },
     MainShortcutPresentation {
         action: "tool.snippets",
@@ -157,7 +148,6 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Open snippets",
         description_zh: "打开脚本片段。",
         description_en: "Open the snippets tool window.",
-        scope: KeybindingScope::Global,
     },
     MainShortcutPresentation {
         action: "tool.logs",
@@ -165,17 +155,46 @@ pub(super) const MAIN_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 16] = [
         label_en: "Open command history",
         description_zh: "打开当前终端的命令历史。",
         description_en: "Open the current terminal's command history.",
-        scope: KeybindingScope::Global,
     },
 ];
 
-/// GPUI 新增动作仍留在设置快照和运行时，只从 main 基线设置目录中排除。
-pub(super) const GPUI_ONLY_SHORTCUT_ACTIONS: [&str; 5] = [
-    "terminal.search",
-    "workspace.quickOpen",
-    "workspace.commandPalette",
-    "application.quit",
-    "terminal.paste",
+/// GPUI 专属动作提供本地化文案，同时保持 main 动作在各组内的既有排序。
+const GPUI_SHORTCUT_PRESENTATIONS: [MainShortcutPresentation; 5] = [
+    MainShortcutPresentation {
+        action: "terminal.search",
+        label_zh: "搜索终端",
+        label_en: "Search terminal",
+        description_zh: "搜索当前终端的内容。",
+        description_en: "Search the current terminal.",
+    },
+    MainShortcutPresentation {
+        action: "terminal.paste",
+        label_zh: "粘贴到终端",
+        label_en: "Paste into terminal",
+        description_zh: "将剪贴板内容粘贴到当前终端。",
+        description_en: "Paste clipboard text into the current terminal.",
+    },
+    MainShortcutPresentation {
+        action: "workspace.quickOpen",
+        label_zh: "快速打开",
+        label_en: "Quick open",
+        description_zh: "打开快速选择。",
+        description_en: "Open quick navigation.",
+    },
+    MainShortcutPresentation {
+        action: "workspace.commandPalette",
+        label_zh: "命令面板",
+        label_en: "Command palette",
+        description_zh: "打开命令面板。",
+        description_en: "Open the command palette.",
+    },
+    MainShortcutPresentation {
+        action: "application.quit",
+        label_zh: "退出 Kerminal",
+        label_en: "Quit Kerminal",
+        description_zh: "退出应用。",
+        description_en: "Quit the application.",
+    },
 ];
 
 /// 返回 main 默认列表中的动作位置；未知自定义动作由稳定排序放在其后。
@@ -185,9 +204,9 @@ pub(super) fn main_shortcut_order(action: &str) -> Option<usize> {
         .position(|presentation| presentation.action == action)
 }
 
-/// GPUI-only 动作仅从设置目录隐藏，避免删除仍由运行时消费的配置项。
-pub(super) fn main_settings_shortcut_visible(action: &str) -> bool {
-    !GPUI_ONLY_SHORTCUT_ACTIONS.contains(&action)
+/// 保留未知配置并展示所有当前可执行动作，避免运行中的快捷键无法在设置中修改。
+pub(super) fn main_settings_shortcut_visible(_action: &str) -> bool {
+    true
 }
 
 /// 返回 main 对应动作的静态文案投影，用户自定义 action 继续使用其配置字段。
@@ -196,16 +215,17 @@ pub(super) fn main_shortcut_presentation(
 ) -> Option<&'static MainShortcutPresentation> {
     MAIN_SHORTCUT_PRESENTATIONS
         .iter()
+        .chain(GPUI_SHORTCUT_PRESENTATIONS.iter())
         .find(|presentation| presentation.action == action)
 }
 
-/// 已知动作遵从 main 的固定作用域，自定义动作沿用配置作用域避免丢失用户分组。
+/// 展示配置中的真实作用域，避免界面分组与运行态编译出的作用域不一致。
 /// @author kongweiguang
 pub(super) fn shortcut_display_scope(
-    action: &str,
+    _action: &str,
     configured_scope: KeybindingScope,
 ) -> KeybindingScope {
-    main_shortcut_presentation(action).map_or(configured_scope, |presentation| presentation.scope)
+    configured_scope
 }
 
 /// 将通知开关的稳定身份与当前设置投影放在同一组，避免行构造器依赖多组位置参数。
@@ -345,10 +365,7 @@ impl PreferencesPanel {
                 PolicyToggleConfig {
                     id: "desktop-notifications-background-only".into(),
                     icon: IconName::Clock,
-                    label: crate::locale::text(
-                        "优先通知后台和耗时事件",
-                        "Prefer background and long-running events",
-                    ),
+                    label: crate::locale::text("仅在后台通知", "Notify only in the background"),
                     checked: notifications.background_only,
                     disabled: controls_locked,
                 },
@@ -656,7 +673,7 @@ impl PreferencesPanel {
             .child(self.render_save_notice(theme))
     }
 
-    /// Windows 与 macOS 分段选择只改变当前投影，保存时仅修改所选平台字段。
+    /// 三平台分段选择只改变当前投影，保存时仅修改所选平台字段。
     /// @author kongweiguang
     pub(super) fn render_keybindings_settings(
         &mut self,
@@ -668,6 +685,11 @@ impl PreferencesPanel {
         };
         let platform = self.shortcut_platform;
         let disabled = self.settings_controls_locked();
+        let platform_issues = if platform == keyboard_platform() {
+            self.settings_issues.clone()
+        } else {
+            validate_settings(&settings, platform)
+        };
         let defaults = SettingsSnapshot::default().keybindings;
         let groups = [
             KeybindingScope::Global,
@@ -728,6 +750,13 @@ impl PreferencesPanel {
                     .flex_shrink_0()
                     .child(platform_button(
                         KeyboardPlatform::Windows,
+                        platform,
+                        disabled,
+                        theme,
+                        cx,
+                    ))
+                    .child(platform_button(
+                        KeyboardPlatform::Linux,
                         platform,
                         disabled,
                         theme,
@@ -799,22 +828,34 @@ impl PreferencesPanel {
                 .bg(theme.panel);
             for (row_index, (_, binding)) in bindings.iter().enumerate() {
                 let binding = *binding;
-                let input = self
-                    .shortcut_inputs
+                let capture = self
+                    .shortcut_capture
+                    .as_ref()
+                    .filter(|capture| capture.action == binding.action)
+                    .map(|capture| ShortcutCaptureProjection {
+                        field: capture.field,
+                        focus: capture.focus.clone(),
+                        strokes: capture.strokes.clone(),
+                        recording: capture.recording,
+                        error: capture.error.clone(),
+                    });
+                let field = ShortcutBindingField::from_editor_platform(platform);
+                let default_binding = defaults
                     .iter()
-                    .find(|inputs| inputs.action == binding.action)
-                    .map(|inputs| shortcut_input(inputs, platform));
-                let current = binding_for_platform(binding, platform);
-                let default = defaults
+                    .find(|candidate| candidate.action == binding.action);
+                let customized = default_binding
+                    .is_some_and(|default| binding_is_customized(binding, default, platform));
+                let mut issues = platform_issues
                     .iter()
-                    .find(|candidate| candidate.action == binding.action)
-                    .map(|candidate| binding_for_platform(candidate, platform))
-                    .unwrap_or_else(|| current.clone());
-                let customized = current != default;
-                let issues = self
-                    .settings_issues
-                    .iter()
-                    .filter(|issue| issue.actions.iter().any(|action| action == &binding.action));
+                    .filter(|issue| issue.actions.iter().any(|action| action == &binding.action))
+                    .map(|issue| issue.message.clone())
+                    .collect::<Vec<_>>();
+                if let Some(message) =
+                    self.shortcut_field_errors
+                        .get(&format!("{}:{}", binding.action, field.key()))
+                {
+                    issues.push(message.clone());
+                }
                 let (label, description, display_scope) =
                     main_shortcut_presentation(&binding.action)
                         .map(|presentation| {
@@ -844,13 +885,13 @@ impl PreferencesPanel {
                         label,
                         description,
                         scope: display_scope,
-                        input,
+                        capture,
                         platform,
                         customized,
                         disabled,
                         last_in_group: row_index + 1 == bindings.len(),
                         theme,
-                        issues: issues.map(|issue| issue.message.clone()).collect(),
+                        issues,
                     },
                     cx,
                 ));
@@ -869,52 +910,11 @@ impl PreferencesPanel {
                 .text_size(theme.text_xs)
                 .text_color(theme.muted)
                 .child(crate::locale::text(
-                    "使用 Ctrl+Shift+T 格式；留空表示禁用。",
-                    "Use Ctrl+Shift+T syntax; leave empty to disable.",
+                    "选择平台后点击铅笔录制；恢复默认只影响当前平台。",
+                    "Pick a platform, then use the pencil to record. Restore affects only that platform.",
                 )),
         )
         .child(self.render_save_notice(theme))
-    }
-
-    /// 只恢复选中平台的默认值，并同步输入实体，避免其它平台自定义绑定被覆盖。
-    fn reset_shortcut(
-        &mut self,
-        action: &str,
-        platform: KeyboardPlatform,
-        input: Option<Entity<InputState>>,
-        window: &mut gpui_kit::Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(default) = SettingsSnapshot::default()
-            .keybindings
-            .into_iter()
-            .find(|binding| binding.action == action)
-        else {
-            return;
-        };
-        let value = binding_for_platform(&default, platform);
-        self.edit_settings(
-            |settings| {
-                if let Some(binding) = settings
-                    .keybindings
-                    .iter_mut()
-                    .find(|binding| binding.action == action)
-                {
-                    match platform {
-                        KeyboardPlatform::Windows => {
-                            binding.binding = default.binding;
-                            binding.windows_binding = default.windows_binding;
-                        }
-                        KeyboardPlatform::Mac => binding.mac_binding = default.mac_binding,
-                        KeyboardPlatform::Linux => {}
-                    }
-                }
-            },
-            cx,
-        );
-        if let Some(input) = input {
-            input.update(cx, |state, cx| state.set_value(value, window, cx));
-        }
     }
 }
 
@@ -1146,11 +1146,15 @@ fn platform_button(
     ))
     .compact()
     .label(platform_label(platform))
+    .selected(platform == selected)
     .disabled(disabled);
     if platform == selected {
         button = button.custom(
             ButtonCustomVariant::new(cx)
-                .color(theme.surface_selected())
+                // Custom 按钮会把基础色再混入 20% 透明；先补偿，静止态才与其它分段控件一致。
+                .color(super::render_settings::settings_choice_variant_fill(
+                    theme.surface_selected(),
+                ))
                 .foreground(theme.settings_choice_foreground(true))
                 .hover(theme.surface_selected())
                 .active(theme.surface_selected()),
@@ -1161,12 +1165,289 @@ fn platform_button(
             .custom(super::render_settings::settings_ghost_variant(theme, cx));
     }
     button.on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
+        panel.cancel_shortcut_capture(cx);
         panel.shortcut_platform = platform;
         cx.notify();
     }))
 }
 
-/// 一条快捷键保留 main 文案投影、作用域和行分隔，并继续驱动真实绑定输入。
+/// 将录制实体投影为只读值，避免渲染期间重新读取正在更新的面板实体。
+///
+/// @author kongweiguang
+struct ShortcutCaptureProjection {
+    field: ShortcutBindingField,
+    focus: FocusHandle,
+    strokes: Vec<String>,
+    recording: bool,
+    error: Option<String>,
+}
+
+/// 三个平台共用同一条录制控件，不再为其他平台退回文本输入。
+///
+/// @author kongweiguang
+struct ShortcutControlConfig<'a> {
+    action: &'a str,
+    field: ShortcutBindingField,
+    value: String,
+    editable: bool,
+    capture: Option<&'a ShortcutCaptureProjection>,
+    theme: ThemeTokens,
+}
+
+/// 录制值在确认前只存在于局部草稿；显示值始终来自所选平台的有效绑定。
+///
+/// @author kongweiguang
+fn shortcut_control(
+    config: ShortcutControlConfig<'_>,
+    cx: &mut Context<PreferencesPanel>,
+) -> gpui_kit::AnyElement {
+    let ShortcutControlConfig {
+        action,
+        field,
+        value,
+        editable,
+        capture,
+        theme,
+    } = config;
+    let suffix = format!("{action}-{}", field.key());
+    let platform = field.editor_platform();
+    if let Some(capture) = capture {
+        let recorded = capture
+            .strokes
+            .iter()
+            .map(|stroke| display_shortcut(stroke, platform))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let preview = if capture.recording {
+            if recorded.is_empty() {
+                crate::locale::text("按下组合键", "Press a shortcut").to_string()
+            } else {
+                format!("{recorded} …")
+            }
+        } else {
+            recorded
+        };
+        let mut control = div()
+            .id(format!("shortcut-capture-{suffix}"))
+            .track_focus(&capture.focus)
+            .aria_label(crate::locale::text("快捷键录制", "Shortcut recording"))
+            .w_full()
+            .min_w(px(0.))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded(theme.radius_sm)
+            .border_1()
+            .border_color(theme.accent)
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .text_size(theme.text_xs)
+                    .font_family("monospace")
+                    .child(preview),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new(format!("shortcut-add-stroke-{suffix}"))
+                            .compact()
+                            .ghost()
+                            .icon(IconName::Plus)
+                            .tooltip(crate::locale::text("添加下一段", "Add next stroke"))
+                            .accessibility_label(crate::locale::text(
+                                "添加下一段",
+                                "Add next stroke",
+                            ))
+                            .disabled(capture.recording || capture.strokes.is_empty())
+                            .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                                panel.add_shortcut_stroke(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("shortcut-confirm-{suffix}"))
+                            .compact()
+                            .ghost()
+                            .icon(IconName::Check)
+                            .tooltip(crate::locale::text("确认快捷键", "Confirm shortcut"))
+                            .accessibility_label(crate::locale::text(
+                                "确认快捷键",
+                                "Confirm shortcut",
+                            ))
+                            .disabled(capture.recording || capture.strokes.is_empty())
+                            .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                                panel.confirm_shortcut_capture(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("shortcut-cancel-{suffix}"))
+                            .compact()
+                            .ghost()
+                            .icon(IconName::X)
+                            .tooltip(crate::locale::text("取消录制", "Cancel recording"))
+                            .accessibility_label(crate::locale::text(
+                                "取消录制",
+                                "Cancel recording",
+                            ))
+                            .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                                panel.finish_shortcut_capture(window, cx)
+                            })),
+                    ),
+            );
+        if let Some(error) = &capture.error {
+            control = control.child(
+                div()
+                    .text_size(theme.text_xs)
+                    .text_color(theme.error)
+                    .child(error.clone()),
+            );
+        }
+        return control.into_any_element();
+    }
+
+    let action_for_capture = action.to_owned();
+    let unassigned = value.is_empty();
+    let display_value = if unassigned {
+        crate::locale::text("未设置", "Unassigned").to_string()
+    } else {
+        display_shortcut(&value, platform)
+    };
+    div()
+        .id(format!("shortcut-value-{suffix}"))
+        .w_full()
+        .min_w(px(0.))
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .px_2()
+                .py_1()
+                .rounded(theme.radius_sm)
+                .border_1()
+                .border_color(theme.border)
+                .text_size(theme.text_xs)
+                .text_color(if unassigned {
+                    theme.muted
+                } else {
+                    theme.foreground
+                })
+                .font_family("monospace")
+                .child(display_value),
+        )
+        .child(
+            Button::new(format!("shortcut-record-{suffix}"))
+                .compact()
+                .ghost()
+                .icon(IconName::Pencil)
+                .tooltip(crate::locale::text("录制快捷键", "Record shortcut"))
+                .accessibility_label(crate::locale::text("录制快捷键", "Record shortcut"))
+                .disabled(!editable)
+                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                    panel.start_shortcut_capture(action_for_capture.clone(), field, window, cx);
+                })),
+        )
+        .into_any_element()
+}
+
+/// 展示层统一为 `Ctrl+Shift+F12`；存储仍保留 GPUI 规范串，避免显示格式反写配置。
+///
+/// @author kongweiguang
+pub(super) fn display_shortcut(binding: &str, platform: KeyboardPlatform) -> String {
+    binding
+        .split_whitespace()
+        .map(|stroke| display_shortcut_stroke(stroke, platform))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 单个按键按目标平台显示修饰键名称，解析失败时保留原始输入。
+fn display_shortcut_stroke(stroke: &str, platform: KeyboardPlatform) -> String {
+    let normalized = crate::keybindings::normalize_legacy_binding(stroke);
+    let Ok(keystroke) = Keystroke::parse(&normalized) else {
+        return stroke.to_owned();
+    };
+    let modifiers = keystroke.modifiers;
+    let mut parts = Vec::with_capacity(5);
+    if modifiers.function {
+        parts.push("Fn".to_owned());
+    }
+    if modifiers.control {
+        parts.push("Ctrl".to_owned());
+    }
+    if modifiers.alt {
+        parts.push(
+            if platform == KeyboardPlatform::Mac {
+                "Option"
+            } else {
+                "Alt"
+            }
+            .to_owned(),
+        );
+    }
+    if modifiers.platform {
+        parts.push(
+            match platform {
+                KeyboardPlatform::Mac => "Cmd",
+                KeyboardPlatform::Windows => "Win",
+                KeyboardPlatform::Linux => "Super",
+            }
+            .to_owned(),
+        );
+    }
+    if modifiers.shift {
+        parts.push("Shift".to_owned());
+    }
+    parts.push(display_shortcut_key(&keystroke.key));
+    parts.join("+")
+}
+
+/// 单字母和功能键统一大写，导航与编辑键使用可读名称。
+fn display_shortcut_key(key: &str) -> String {
+    let key = key.to_ascii_lowercase();
+    let named = match key.as_str() {
+        "left" => Some("Left"),
+        "right" => Some("Right"),
+        "up" => Some("Up"),
+        "down" => Some("Down"),
+        "pageup" => Some("PageUp"),
+        "pagedown" => Some("PageDown"),
+        "home" => Some("Home"),
+        "end" => Some("End"),
+        "tab" => Some("Tab"),
+        "enter" => Some("Enter"),
+        "escape" | "esc" => Some("Esc"),
+        "space" => Some("Space"),
+        "backspace" => Some("Backspace"),
+        "delete" => Some("Delete"),
+        "insert" => Some("Insert"),
+        _ => None,
+    };
+    if let Some(name) = named {
+        return name.to_owned();
+    }
+    if key.len() == 1 {
+        return key.to_ascii_uppercase();
+    }
+    if key
+        .strip_prefix('f')
+        .is_some_and(|digits| digits.chars().all(|digit| digit.is_ascii_digit()))
+        && key.len() > 1
+    {
+        return key.to_ascii_uppercase();
+    }
+    key
+}
+
+/// 一条快捷键保留 main 文案投影、作用域和行分隔，并继续驱动真实绑定。
 ///
 /// @author kongweiguang
 struct ShortcutRowConfig<'a> {
@@ -1174,7 +1455,7 @@ struct ShortcutRowConfig<'a> {
     label: SharedString,
     description: SharedString,
     scope: KeybindingScope,
-    input: Option<Entity<InputState>>,
+    capture: Option<ShortcutCaptureProjection>,
     platform: KeyboardPlatform,
     customized: bool,
     disabled: bool,
@@ -1183,7 +1464,7 @@ struct ShortcutRowConfig<'a> {
     issues: Vec<String>,
 }
 
-/// 把同一行的显示与编辑上下文组合传入，保留输入实体和草稿状态的单一 owner。
+/// 行配置只组合显示上下文；绑定值的唯一来源仍是设置草稿。
 ///
 /// @author kongweiguang
 fn shortcut_row(
@@ -1195,7 +1476,7 @@ fn shortcut_row(
         label,
         description,
         scope,
-        input,
+        capture,
         platform,
         customized,
         disabled,
@@ -1204,59 +1485,32 @@ fn shortcut_row(
         issues,
     } = config;
     let action = binding.action.clone();
-    let reset_input = input.clone();
-    let editable = binding.editable && !disabled;
+    let editable = binding.editable
+        && !disabled
+        && crate::keybindings::KeybindingAction::from_id(&binding.action).is_some();
     let reset = Button::new(format!("shortcut-reset-{}", binding.action))
         .compact()
         .ghost()
-        .custom(super::render_settings::settings_ghost_variant(theme, cx))
         .icon(IconName::RotateCcw)
         .disabled(!editable || !customized)
         .tooltip(crate::locale::text("恢复默认", "Restore default"))
+        .accessibility_label(crate::locale::text("恢复默认", "Restore default"))
         .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-            panel.reset_shortcut(&action, platform, reset_input.clone(), window, cx);
+            panel.finish_shortcut_capture(window, cx);
+            panel.reset_shortcut(&action, platform, cx);
         }));
-    let binding_control = if binding.editable {
-        match input {
-            Some(input) => div()
-                .id(format!(
-                    "shortcut-input-{}-{}",
-                    binding.action,
-                    platform_key(platform)
-                ))
-                .flex_1()
-                .min_w(px(0.))
-                .child(
-                    super::render_settings::settings_input(&input, theme)
-                        .disabled(disabled)
-                        .w_full()
-                        .min_w(px(0.)),
-                )
-                .into_any_element(),
-            None => div()
-                .flex_1()
-                .min_w(px(0.))
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(crate::locale::text("加载中…", "Loading…"))
-                .into_any_element(),
-        }
-    } else {
-        div()
-            .flex_1()
-            .min_w(px(0.))
-            .px_2()
-            .py_1()
-            .rounded(theme.radius_sm)
-            .border_1()
-            .border_color(theme.accent.opacity(0.3))
-            .bg(theme.selected)
-            .text_size(theme.text_xs)
-            .text_color(theme.accent)
-            .font_family("monospace")
-            .child(binding_for_platform(binding, platform))
-            .into_any_element()
-    };
+    let field = ShortcutBindingField::from_editor_platform(platform);
+    let binding_control = shortcut_control(
+        ShortcutControlConfig {
+            action: &binding.action,
+            field,
+            value: binding_for_platform(binding, platform),
+            editable,
+            capture: capture.as_ref().filter(|capture| capture.field == field),
+            theme,
+        },
+        cx,
+    );
     let mut row = div()
         .id(format!("shortcut-row-{}", binding.action))
         .w_full()
@@ -1337,47 +1591,11 @@ fn shortcut_row(
     row
 }
 
-/// 平台输入状态由 panel 的稳定 action 集合维护，视图只选择对应的既有实体。
-fn shortcut_input(
-    inputs: &super::panel::ShortcutInputs,
-    platform: KeyboardPlatform,
-) -> Entity<InputState> {
-    match platform {
-        KeyboardPlatform::Windows | KeyboardPlatform::Linux => inputs.windows.clone(),
-        KeyboardPlatform::Mac => inputs.mac.clone(),
-    }
-}
-
-/// 配置模型的历史回退语义与快捷键验证器一致，兼容只填写通用字段的旧配置。
-fn binding_for_platform(binding: &KeybindingPreference, platform: KeyboardPlatform) -> String {
-    match platform {
-        KeyboardPlatform::Windows => effective_binding(&binding.windows_binding, &binding.binding),
-        KeyboardPlatform::Mac => effective_binding(&binding.mac_binding, &binding.binding),
-        KeyboardPlatform::Linux => binding
-            .linux_binding
-            .clone()
-            .unwrap_or_else(|| effective_binding(&binding.windows_binding, &binding.binding)),
-    }
-}
-
-/// 只把 platform-specific 字段非空值作为覆盖，保留历史通用快捷键回退规则。
-fn effective_binding(platform: &str, fallback: &str) -> String {
-    if platform.is_empty() {
-        fallback.to_owned()
-    } else {
-        platform.to_owned()
-    }
-}
-
-/// Git clone suffix 只属于打开地址，About 文本沿用 main 展示的仓库路径形式。
+/// 页面保留完整 HTTPS 地址，仅移除供 Git clone 使用的后缀。
 ///
 /// @author kongweiguang
 pub(super) fn display_repository_url(url: &str) -> String {
-    let visible_url = url.strip_prefix("https://").unwrap_or(url);
-    visible_url
-        .strip_suffix(".git")
-        .unwrap_or(visible_url)
-        .to_owned()
+    url.strip_suffix(".git").unwrap_or(url).to_owned()
 }
 
 /// 标签和 action ID 保持稳定键，不依赖本地化字符串作为持久化身份。
@@ -1458,7 +1676,7 @@ fn scope_key(scope: KeybindingScope) -> &'static str {
     }
 }
 
-/// Only Windows and macOS are offered because these are the two platforms in main's settings UI.
+/// 三个桌面平台使用稳定的配置字段名作为控件身份。
 fn platform_key(platform: KeyboardPlatform) -> &'static str {
     match platform {
         KeyboardPlatform::Windows => "windows",
@@ -1467,7 +1685,7 @@ fn platform_key(platform: KeyboardPlatform) -> &'static str {
     }
 }
 
-/// Segment labels follow the application's platform naming used in main.
+/// 平台名称只在标签和辅助文案中显示，不参与持久化身份。
 fn platform_label(platform: KeyboardPlatform) -> SharedString {
     match platform {
         KeyboardPlatform::Windows => crate::locale::text("Windows", "Windows"),

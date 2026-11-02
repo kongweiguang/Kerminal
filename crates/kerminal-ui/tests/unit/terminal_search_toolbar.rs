@@ -278,6 +278,7 @@ mod accepted_revision_gpui {
                 column: 0,
                 shape: TerminalCursorShape::Block,
                 style_from_terminal: false,
+                blink_from_terminal: false,
                 blinking: false,
                 visible: false,
             },

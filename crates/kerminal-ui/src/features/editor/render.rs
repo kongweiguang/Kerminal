@@ -197,7 +197,7 @@ fn endpoint_source_identity(endpoint: &FileEndpoint, target_names: &FileTargetNa
 }
 
 impl Render for FileEditorWorkspace {
-    /// 外壳保持不透明正文；标签关闭使用通用图标但仍绑定 endpoint 与读取代次，沿用未保存保护。
+    /// 外壳保持不透明正文与未保存保护；恢复提示使用单一状态来源，窄面板也必须完整保留操作入口。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -246,6 +246,7 @@ impl Render for FileEditorWorkspace {
                 );
                 div()
                     .id(format!("file-editor-tab-{index}"))
+                    .debug_selector(move || format!("rr-file-editor-tab-{index}"))
                     .h_full()
                     .max_w(px(240.))
                     .flex_shrink_0()
@@ -407,14 +408,16 @@ impl Render for FileEditorWorkspace {
                     .px_3()
                     .py_2()
                     .flex()
-                    .items_center()
+                    .flex_col()
+                    .items_start()
+                    .flex_shrink_0()
                     .gap_2()
                     .bg(theme.panel)
                     .text_color(theme.muted)
-                    .child(crate::locale::text(
+                    .child(div().w_full().min_w(px(0.)).child(crate::locale::text(
                         "正在读取文件；取消不会替换当前编辑内容。",
                         "Reading the file. Cancelling keeps the current editor contents.",
-                    ))
+                    )))
                     .child(
                         Button::new("file-editor-cancel-load")
                             .compact()
@@ -428,7 +431,10 @@ impl Render for FileEditorWorkspace {
 
         if let Some((endpoint, error, session_state, _loading, _dirty, _cancel_requested)) = active
         {
-            if let Some(message) = error {
+            let has_recovery_banner = session_state.is_some_and(|(phase, _, _)| {
+                matches!(phase, EditorPhase::Conflict | EditorPhase::OutcomeUnknown)
+            });
+            if let Some(message) = error.filter(|_| !has_recovery_banner) {
                 content = content.child(self.render_error_banner(
                     endpoint.clone(),
                     message,
@@ -460,8 +466,8 @@ impl Render for FileEditorWorkspace {
                             .bg(theme.panel)
                             .text_color(theme.muted)
                             .child(crate::locale::text(
-                                "此文件由文件系统标记为只读；仍可选择和复制内容。",
-                                "The file system marks this file read-only. You can still select and copy its contents.",
+                                "当前文件以只读方式打开；仍可选择和复制内容。",
+                                "This file is open read-only. You can still select and copy its contents.",
                             )),
                     );
                 }
@@ -565,7 +571,7 @@ fn tab_is_fully_visible(scroll_handle: &ScrollHandle, index: usize) -> bool {
 }
 
 impl FileEditorWorkspace {
-    /// 顶部使用 chrome 材料，路径区域可收缩；查找入口仅在有实际编辑器时启用，避免无目标空操作。
+    /// 顶部使用 chrome 材料并允许路径收缩；验收定位真实保存按钮，不引入额外操作路径。
     ///
     /// @author kongweiguang
     fn render_toolbar(
@@ -581,7 +587,6 @@ impl FileEditorWorkspace {
             cancel_requested,
             endpoint: save_endpoint,
         } = save;
-        let has_active_editor = self.active_tab().is_some_and(|tab| tab.editor.is_some());
         let save_button = if saving {
             if let Some(endpoint) = save_endpoint {
                 Button::new("file-editor-cancel-save")
@@ -606,6 +611,7 @@ impl FileEditorWorkspace {
             }
         } else {
             Button::new("file-editor-save")
+                .debug_selector(|| "rr-file-editor-save".to_owned())
                 .compact()
                 .primary()
                 .flex_shrink_0()
@@ -665,30 +671,6 @@ impl FileEditorWorkspace {
                         )),
                 )
             })
-            .child(
-                Button::new("file-editor-find")
-                    .compact()
-                    .flex_shrink_0()
-                    .disabled(!has_active_editor)
-                    .label(if !self.search_visible() {
-                        crate::locale::text("查找替换", "Find and replace")
-                    } else if self.replace_visible() {
-                        crate::locale::text("收起替换", "Hide replace")
-                    } else {
-                        crate::locale::text("展开替换", "Show replace")
-                    })
-                    .accessibility_label(crate::locale::text(
-                        "切换查找与替换面板",
-                        "Toggle find and replace panel",
-                    ))
-                    .tooltip(crate::locale::text(
-                        "Ctrl/Cmd+F 查找，Ctrl/Cmd+H 展开替换",
-                        "Ctrl/Cmd+F finds; Ctrl/Cmd+H opens replace",
-                    ))
-                    .on_click(cx.listener(|workspace, _: &ClickEvent, window, cx| {
-                        workspace.toggle_search(window, cx);
-                    })),
-            )
     }
 
     /// 查找条允许窄栏换行，通用导航图标与终端搜索一致；替换及搜索选项保留能区分语义的文字。
@@ -932,7 +914,7 @@ impl FileEditorWorkspace {
             }))
     }
 
-    /// 首读失败显示安全错误和重试/关闭操作，避免二进制、过大或无权限文件落入空白假成功态。
+    /// 错误说明与操作分行布局，让窄面板中的重试/关闭始终可达，避免长路径挤出恢复按钮。
     fn render_error_banner(
         &mut self,
         endpoint: FileEndpoint,
@@ -947,32 +929,45 @@ impl FileEditorWorkspace {
             .px_3()
             .py_2()
             .flex()
-            .items_center()
+            .flex_col()
+            .items_start()
+            .flex_shrink_0()
             .gap_2()
             .bg(theme.panel)
             .text_color(theme.error)
-            .child(message)
-            .when(can_retry, |banner| {
-                banner.child(
-                    Button::new("file-editor-retry-open")
-                        .compact()
-                        .label(crate::locale::text("重试", "Retry"))
-                        .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                            workspace.open_file(retry_endpoint.clone(), cx);
-                        })),
-                )
-            })
+            .child(div().w_full().min_w(px(0.)).child(message))
             .child(
-                Button::new("file-editor-close-failed")
-                    .compact()
-                    .label(crate::locale::text("关闭文件", "Close file"))
-                    .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                        workspace.request_close(endpoint.clone(), cx);
-                    })),
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .when(can_retry, |actions| {
+                        actions.child(
+                            Button::new("file-editor-retry-open")
+                                .compact()
+                                .flex_shrink_0()
+                                .label(crate::locale::text("重试", "Retry"))
+                                .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                                    workspace.open_file(retry_endpoint.clone(), cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("file-editor-close-failed")
+                            .compact()
+                            .flex_shrink_0()
+                            .label(crate::locale::text("关闭文件", "Close file"))
+                            .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                                workspace.request_close(endpoint.clone(), cx);
+                            })),
+                    ),
             )
     }
 
-    /// revision 冲突必须提供明确的重载和二次确认覆盖，禁止普通保存自动清掉远端修改。
+    /// 冲突操作独立成可换行按钮组，保证窄面板中重载和二次确认覆盖均可达；定位沿用真实处理器。
+    ///
+    /// @author kongweiguang
     fn render_conflict_banner(
         &mut self,
         endpoint: FileEndpoint,
@@ -985,33 +980,45 @@ impl FileEditorWorkspace {
             .px_3()
             .py_2()
             .flex()
-            .items_center()
+            .flex_col()
+            .items_start()
+            .flex_shrink_0()
             .gap_2()
             .bg(theme.panel)
             .text_color(theme.error)
-            .child(crate::locale::text(
+            .child(div().w_full().min_w(px(0.)).child(crate::locale::text(
                 "远端文件已变化；先重载远端版本，或确认覆盖远端内容。",
                 "The remote file changed. Reload the latest version or explicitly confirm an overwrite.",
-            ))
+            )))
             .child(
-                Button::new("file-editor-reload-conflict")
-                    .compact()
-                    .label(crate::locale::text("重载远端", "Reload remote"))
-                    .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                        workspace.request_reload(reload_endpoint.clone(), cx);
-                    })),
-            )
-            .child(
-                Button::new("file-editor-overwrite-conflict")
-                    .compact()
-                    .label(crate::locale::text("确认覆盖…", "Confirm overwrite…"))
-                    .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                        workspace.request_overwrite(endpoint.clone(), cx);
-                    })),
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        Button::new("file-editor-reload-conflict")
+                            .debug_selector(|| "rr-file-editor-reload-conflict".to_owned())
+                            .compact()
+                            .flex_shrink_0()
+                            .label(crate::locale::text("重载远端", "Reload remote"))
+                            .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                                workspace.request_reload(reload_endpoint.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("file-editor-overwrite-conflict")
+                            .compact()
+                            .flex_shrink_0()
+                            .label(crate::locale::text("确认覆盖…", "Confirm overwrite…"))
+                            .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                                workspace.request_overwrite(endpoint.clone(), cx);
+                            })),
+                    ),
             )
     }
 
-    /// 未知提交只提供显式读回入口，避免用户在结果未确认时重复写入或覆盖文件。
+    /// 未知提交只提供显式读回入口并与说明分行，避免窄面板隐藏恢复操作或诱导重复写入。
     fn render_unknown_result_banner(
         &mut self,
         endpoint: FileEndpoint,
@@ -1023,17 +1030,20 @@ impl FileEditorWorkspace {
             .px_3()
             .py_2()
             .flex()
-            .items_center()
+            .flex_col()
+            .items_start()
+            .flex_shrink_0()
             .gap_2()
             .bg(theme.panel)
             .text_color(theme.error)
-            .child(crate::locale::text(
+            .child(div().w_full().min_w(px(0.)).child(crate::locale::text(
                 "保存结果尚未确认；重新读取可确认文件当前内容，期间不会自动重试保存。",
                 "The save result is unconfirmed. Reload the file to check its current contents; saving will not be retried automatically.",
-            ))
+            )))
             .child(
                 Button::new("file-editor-readback-unknown-save")
                     .compact()
+                    .flex_shrink_0()
                     .label(crate::locale::text("重新读取文件…", "Reload file…"))
                     .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
                         workspace.request_reload(endpoint.clone(), cx);

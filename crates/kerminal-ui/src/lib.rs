@@ -22,6 +22,10 @@ mod ui_button;
 mod ui_popup;
 pub mod window_state;
 
+#[cfg(test)]
+#[path = "../tests/unit/focus_trap.rs"]
+mod focus_trap_tests;
+
 #[cfg(feature = "right-rail-acceptance")]
 pub use features::files::{RightRailSftpTransferItem, RightRailSftpTransferTarget};
 pub use features::{editor::FileEditorWorkspace, preferences::PreferencesPanel};
@@ -29,6 +33,8 @@ pub use features::{editor::FileEditorWorkspace, preferences::PreferencesPanel};
 pub use root::RightRailAcceptanceShellSnapshot;
 #[cfg(feature = "right-rail-acceptance")]
 pub use root::SettingsAcceptanceState;
+#[cfg(feature = "right-rail-acceptance")]
+pub use root::SuggestionsAcceptanceState;
 #[cfg(feature = "right-rail-acceptance")]
 pub use root::{AgentAcceptanceSetup, ComposeAcceptanceOpenRequest};
 pub use root::{AppServices, QuitIntent, RootHostLifecycle, RootView, RootViewEvent};

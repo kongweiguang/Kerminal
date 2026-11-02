@@ -20,6 +20,7 @@ fn ime_projection(scrollback_offset: usize) -> PaneImeProjection {
             column: 5,
             shape: TerminalCursorShape::Block,
             style_from_terminal: false,
+            blink_from_terminal: false,
             blinking: false,
             visible: true,
         },

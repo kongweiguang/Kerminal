@@ -4,27 +4,32 @@
 //!
 //! @author kongweiguang
 
+use crate::features::commands::inline_suggestions::appendable_suffix;
 pub use crate::features::commands::inline_suggestions::{
     InlineSuggestionController, TerminalSuggestionAcceptance,
 };
 mod menu;
 use kerminal_application::{
     AppResult,
-    commands::{CommandsService, TerminalSuggestionBatch, TerminalSuggestionQuery},
+    commands::{CommandsService, TerminalSuggestionProgress, TerminalSuggestionQuery},
     executor::ApplicationTaskExecutor,
     preferences::{
         TerminalCommandSuggestionMenuShortcut, TerminalCommandSuggestionPresentation,
         TerminalInlineSuggestionAcceptKey, TerminalInlineSuggestionSettings,
     },
     sessions::{
-        TerminalCommandContext, TerminalCommandContextVersion, UiInputProjection, UiSessionBinding,
-        UiTerminalInputRequest,
+        ShellEditingAvailability, ShellEditingShell, ShellEditingSnapshot,
+        ShellEditingUnavailableReason, TerminalCommandContext, TerminalCommandContextVersion,
+        UiInputProjection, UiSessionBinding, UiTerminalInputRequest,
     },
 };
 use kerminal_domain::commands::{
-    CommandSuggestionActivation, CommandSuggestionCandidate, SuggestionQueryMode,
+    CommandHistoryTarget, CommandSuggestionActivation, CommandSuggestionCandidate,
+    CommandSuggestionFeedbackAction, CommandSuggestionFeedbackRequest, SuggestionQueryMode,
+    SuggestionSourceState,
 };
-use kerminal_terminal::input::{KeyPhase, TerminalInputEvent, TerminalKey, TerminalKeyEvent};
+use kerminal_domain::sessions::{SessionOwner, SessionTarget};
+use kerminal_terminal::input::{KeyPhase, TerminalKey, TerminalKeyEvent};
 pub use menu::{
     TerminalCommandSuggestionMenu, TerminalCommandSuggestionMenuEvent,
     TerminalCommandSuggestionMenuKey, TerminalSuggestionMenuProjection,
@@ -36,6 +41,48 @@ use tokio_util::sync::CancellationToken;
 pub struct TerminalSuggestionJob {
     query: TerminalSuggestionQuery,
     request_cancellation: CancellationToken,
+    snapshot: Option<ShellEditingSnapshot>,
+}
+
+/// 一次尚未完成的只读 Shell 探测；代次用于拒绝切 pane 和继续输入后的迟到读回。
+pub struct TerminalSuggestionSnapshotJob {
+    pub binding: UiSessionBinding,
+    pub request_generation: u64,
+    pub cancellation: CancellationToken,
+}
+
+struct PendingSnapshot {
+    binding: UiSessionBinding,
+    generation: u64,
+    mode: SuggestionQueryMode,
+    cancellation: CancellationToken,
+    previous_input: Option<DismissedSuggestionInput>,
+}
+
+/// 只保存关闭时已确认的最小身份；不使用会因无效按键而变化的输入代次。
+#[derive(Clone, Eq, PartialEq)]
+struct DismissedSuggestionInput {
+    binding: UiSessionBinding,
+    prompt_epoch: u64,
+    input: String,
+    cursor: usize,
+}
+
+impl DismissedSuggestionInput {
+    /// 身份必须来自已校验的 Shell 读回，正文不进入 Debug 或诊断日志。
+    fn from_snapshot(snapshot: &ShellEditingSnapshot) -> Self {
+        Self {
+            binding: snapshot.binding.clone(),
+            prompt_epoch: snapshot.context.prompt_epoch,
+            input: snapshot.input.clone(),
+            cursor: snapshot.cursor,
+        }
+    }
+}
+
+enum DismissedSuggestion {
+    Confirmed(DismissedSuggestionInput),
+    PendingInput(UiSessionBinding),
 }
 
 /// 可安全绘制的 inline ghost；session 与 prompt 代次用于避免跨 pane 复用视觉状态。
@@ -53,9 +100,9 @@ pub struct InlineSuggestionGhost {
 pub enum AcceptanceInputProgress {
     /// 当前事件已写入，调用方可以从 returned context 请求下一个事件。
     Next { event_index: usize },
-    /// 全部事件成功；可选 job 是按最终输入发起的一次新查询。
+    /// 全部事件成功；仅为存在的后续查询分配空间，避免放大常见回执。
     Complete {
-        follow_up: Option<TerminalSuggestionJob>,
+        follow_up: Option<Box<TerminalSuggestionJob>>,
     },
     /// 绑定、代次、事件次序或终端状态失效，调用方必须停止接受队列。
     Invalidated,
@@ -75,6 +122,10 @@ pub enum TerminalSuggestionQueryState {
     Empty,
     /// 当前代次查询失败，可由后续输入或再次打开菜单重试。
     Failed,
+    /// 当前 Shell 不能响应探测；保留关闭入口和具体恢复指引，不承诺原样重试有效。
+    Unavailable(ShellEditingUnavailableReason),
+    /// 输入超限只影响这一行；由缩短后的真实输入触发恢复，不让用户反复提交同一超限探测。
+    InputTooLong,
 }
 
 struct PendingAcceptance {
@@ -84,16 +135,38 @@ struct PendingAcceptance {
     input_in_flight: bool,
 }
 
-/// 让 Root 通过同一 controller 管理 terminal 建议生命周期，不缓存第二份输入或候选状态。
+/// 让 Root 通过同一 controller 管理建议生命周期；关闭标记只保存必要的短期输入身份。
 #[derive(Default)]
 pub struct TerminalCommandSuggestionBridge {
     controller: InlineSuggestionController,
     settings: Option<TerminalInlineSuggestionSettings>,
     pending_acceptance: Option<PendingAcceptance>,
     query_state: TerminalSuggestionQueryState,
+    pending_snapshot: Option<PendingSnapshot>,
+    next_snapshot_generation: u64,
+    confirmed_snapshot: Option<ShellEditingSnapshot>,
+    dismissed_suggestion: Option<DismissedSuggestion>,
+    progress_final: bool,
+    partial_failure: bool,
 }
 
 impl TerminalCommandSuggestionBridge {
+    /// 原生验收失败仅暴露状态与长度，不输出用户输入或候选正文。
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn acceptance_diagnostic(&self) -> String {
+        format!(
+            "state={:?},pending={},confirmed={},suspended={},query={:?},candidates={}",
+            self.query_state,
+            self.pending_snapshot.is_some(),
+            self.confirmed_snapshot.is_some(),
+            self.controller.is_suspended(),
+            self.controller
+                .current_query()
+                .map(|q| (q.input.chars().count(), q.cursor, q.mode)),
+            self.controller.candidates().len()
+        )
+    }
+
     /// 首帧没有可信偏好快照时保持关闭，避免设置尚未载入就向用户输入附加行为。
     pub fn new() -> Self {
         Self::default()
@@ -129,6 +202,21 @@ impl TerminalCommandSuggestionBridge {
                 return false;
             }
         }
+        if self.pending_snapshot.as_ref().is_some_and(|pending| {
+            pending.binding == binding_for_context(context)
+                && context.prompt_ready
+                && !context.alternate_screen
+        }) {
+            return true;
+        }
+        if self.confirmed_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.binding == binding_for_context(context)
+                && snapshot.context == context.version()
+                && context.prompt_ready
+                && !context.alternate_screen
+        }) {
+            return true;
+        }
         self.controller.observe_context(context)
     }
 
@@ -160,37 +248,173 @@ impl TerminalCommandSuggestionBridge {
         Some(TerminalSuggestionJob {
             query,
             request_cancellation,
+            snapshot: None,
         })
     }
 
-    /// 在 UI 输入成功写入且收到新 context 后更新唯一投影；无法模拟的编辑由 controller 清除投影。
-    ///
-    /// @author kongweiguang
-    pub fn tracked_input_written(
+    /// 手动菜单允许重开已关闭状态；仅保留仍可归因的上一份真实快照作为关闭基线。
+    pub fn begin_snapshot(
         &mut self,
-        context: &TerminalCommandContext,
-        event: &TerminalInputEvent,
+        binding: UiSessionBinding,
         mode: SuggestionQueryMode,
+    ) -> Option<TerminalSuggestionSnapshotJob> {
+        if self.pending_acceptance.is_some() || !self.mode_enabled(mode) {
+            return None;
+        }
+        let previous_input = if mode != SuggestionQueryMode::Menu || self.controller.is_suspended()
+        {
+            None
+        } else {
+            self.confirmed_snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.binding == binding)
+                .map(DismissedSuggestionInput::from_snapshot)
+                .or_else(|| match self.dismissed_suggestion.as_ref() {
+                    Some(DismissedSuggestion::Confirmed(input)) if input.binding == binding => {
+                        Some(input.clone())
+                    }
+                    _ => None,
+                })
+        };
+        if mode == SuggestionQueryMode::Menu {
+            self.dismissed_suggestion = None;
+        }
+        self.cancel_pending_snapshot();
+        self.controller.cancel_query();
+        self.confirmed_snapshot = None;
+        self.partial_failure = false;
+        self.progress_final = false;
+        self.next_snapshot_generation = self.next_snapshot_generation.wrapping_add(1).max(1);
+        // 快照等待态与 controller 的候选代次分属不同命名空间，避免重开菜单时复用高亮。
+        let generation = self.next_snapshot_generation | (1_u64 << 63);
+        let cancellation = CancellationToken::new();
+        self.pending_snapshot = Some(PendingSnapshot {
+            binding: binding.clone(),
+            generation,
+            mode,
+            cancellation: cancellation.clone(),
+            previous_input,
+        });
+        self.query_state = TerminalSuggestionQueryState::Loading;
+        Some(TerminalSuggestionSnapshotJob {
+            binding,
+            request_generation: generation,
+            cancellation,
+        })
+    }
+
+    /// 只接受仍在当前 pane 且没有被新输入撤销的探测结果。
+    pub fn snapshot_is_current(&self, generation: u64, binding: &UiSessionBinding) -> bool {
+        self.pending_snapshot.as_ref().is_some_and(|pending| {
+            pending.generation == generation
+                && &pending.binding == binding
+                && !pending.cancellation.is_cancelled()
+        })
+    }
+
+    /// 先校验真实读回，再按正文、光标及 prompt 抑制已关闭的自动提示。
+    pub fn snapshot_received(
+        &mut self,
+        generation: u64,
+        context: &TerminalCommandContext,
+        snapshot: ShellEditingSnapshot,
     ) -> Option<TerminalSuggestionJob> {
-        if self.pending_acceptance.is_some() {
-            self.clear();
+        if !self.snapshot_is_current(generation, &snapshot.binding) {
             return None;
         }
-        if !self.mode_enabled(mode) {
-            self.clear();
-            return None;
-        }
-        let Some((query, request_cancellation)) =
-            self.controller.apply_tracked_input(context, event, mode)
+        let mode = self.pending_snapshot.as_ref()?.mode;
+        let Some((query, request_cancellation)) = self
+            .controller
+            .update_shell_snapshot(context, &snapshot, mode)
         else {
-            self.query_state = TerminalSuggestionQueryState::Closed;
+            self.query_state = TerminalSuggestionQueryState::Failed;
             return None;
         };
+        let dismissed = mode == SuggestionQueryMode::Inline
+            && match self.dismissed_suggestion.as_ref() {
+                Some(DismissedSuggestion::Confirmed(previous)) => {
+                    previous.binding == snapshot.binding
+                        && previous.prompt_epoch == snapshot.context.prompt_epoch
+                        && previous.input == snapshot.input
+                        && previous.cursor == snapshot.cursor
+                }
+                Some(DismissedSuggestion::PendingInput(binding)) => binding == &snapshot.binding,
+                None => false,
+            };
+        self.pending_snapshot = None;
+        if dismissed {
+            self.dismissed_suggestion = Some(DismissedSuggestion::Confirmed(
+                DismissedSuggestionInput::from_snapshot(&snapshot),
+            ));
+            self.controller.cancel_query();
+            self.confirmed_snapshot = None;
+            self.query_state = TerminalSuggestionQueryState::Closed;
+            return None;
+        }
+        self.dismissed_suggestion = None;
+        self.confirmed_snapshot = Some(snapshot.clone());
+        self.progress_final = false;
+        self.partial_failure = false;
         self.query_state = TerminalSuggestionQueryState::Loading;
         Some(TerminalSuggestionJob {
             query,
             request_cancellation,
+            snapshot: Some(snapshot),
         })
+    }
+
+    /// 仅主动菜单解释能力降级；未收到握手不等于来源查询失败，不能诱导无效重试。
+    /// 此处不改变连接能力，稍后启动完成仍可重新请求；旧绑定的失败不能覆盖当前输入。
+    pub fn snapshot_failed(
+        &mut self,
+        generation: u64,
+        binding: &UiSessionBinding,
+        availability: Option<ShellEditingAvailability>,
+    ) -> bool {
+        if !self.snapshot_is_current(generation, binding) {
+            return false;
+        }
+        if self
+            .pending_snapshot
+            .as_ref()
+            .is_some_and(|pending| pending.mode == SuggestionQueryMode::Menu)
+        {
+            self.query_state = match availability {
+                Some(ShellEditingAvailability::Pending) => {
+                    TerminalSuggestionQueryState::Unavailable(
+                        ShellEditingUnavailableReason::IntegrationNotObserved,
+                    )
+                }
+                Some(ShellEditingAvailability::Unavailable(reason)) => {
+                    TerminalSuggestionQueryState::Unavailable(reason)
+                }
+                _ => TerminalSuggestionQueryState::Failed,
+            };
+        } else {
+            self.pending_snapshot = None;
+            self.query_state = TerminalSuggestionQueryState::Closed;
+        }
+        true
+    }
+
+    /// 超限响应已完成并排空本次探测，保留连接能力；只有主动菜单解释缩短输入即可恢复。
+    pub fn snapshot_input_too_long(&mut self, generation: u64, binding: &UiSessionBinding) -> bool {
+        if !self.snapshot_failed(generation, binding, None) {
+            return false;
+        }
+        if self.menu_is_open() {
+            self.query_state = TerminalSuggestionQueryState::InputTooLong;
+        }
+        true
+    }
+
+    /// 为自动刷新保留已打开菜单的交互模式，避免继续输入时菜单跳回行内模式。
+    pub fn active_mode(&self) -> SuggestionQueryMode {
+        if self.menu_is_open() {
+            SuggestionQueryMode::Menu
+        } else {
+            SuggestionQueryMode::Inline
+        }
     }
 
     /// 打开菜单时基于 controller 已跟踪的文本和 cursor 查询，防止 Root 再维护一份输入副本。
@@ -199,7 +423,7 @@ impl TerminalCommandSuggestionBridge {
         context: &TerminalCommandContext,
         mode: SuggestionQueryMode,
     ) -> Option<TerminalSuggestionJob> {
-        if self.pending_acceptance.is_some() {
+        if self.pending_acceptance.is_some() || self.controller.is_suspended() {
             return None;
         }
         if !self.observe_context(Some(context)) {
@@ -209,15 +433,13 @@ impl TerminalCommandSuggestionBridge {
         self.request(context, input.to_owned(), cursor, mode)
     }
 
-    /// 按键触发和显式入口共用一个菜单查询，只有能从可信输入投影创建 job 时才拦截按键。
-    pub fn request_menu_on_key(
-        &mut self,
-        event: TerminalKeyEvent,
-        context: &TerminalCommandContext,
-    ) -> Option<TerminalSuggestionJob> {
-        let settings = self.settings.as_ref()?;
+    /// 识别菜单快捷键不依赖旧输入投影；按键被接管后再异步读取真实 Shell 行。
+    pub fn is_menu_shortcut(&self, event: TerminalKeyEvent) -> bool {
+        let Some(settings) = self.settings.as_ref() else {
+            return false;
+        };
         if !self.mode_enabled(SuggestionQueryMode::Menu) || event.phase != KeyPhase::Press {
-            return None;
+            return false;
         }
         let ctrl_space = settings.menu_shortcut == TerminalCommandSuggestionMenuShortcut::CtrlSpace
             && event.key == TerminalKey::Character(' ')
@@ -228,25 +450,24 @@ impl TerminalCommandSuggestionBridge {
         let tab = settings.tab_opens_menu
             && event.key == TerminalKey::Tab
             && event.modifiers == Default::default();
-        if !ctrl_space && !tab {
-            return None;
-        }
-        self.request_current(context, SuggestionQueryMode::Menu)
-    }
-
-    /// 供 Root 在菜单快捷键或工具入口触发查询；候选始终来自当前 controller 投影。
-    pub fn request_menu(
-        &mut self,
-        context: &TerminalCommandContext,
-    ) -> Option<TerminalSuggestionJob> {
-        self.request_current(context, SuggestionQueryMode::Menu)
+        let alt_slash = event.key == TerminalKey::Character('/')
+            && event.modifiers.alt
+            && !event.modifiers.control
+            && !event.modifiers.shift
+            && !event.modifiers.super_key;
+        ctrl_space || alt_slash || tab
     }
 
     /// 菜单只在有效菜单查询代次内绘制，Loading/Empty/Failed 由 query_state 单独表达。
     pub fn menu_is_open(&self) -> bool {
-        self.controller
-            .current_query()
-            .is_some_and(|query| query.mode == SuggestionQueryMode::Menu)
+        (self
+            .pending_snapshot
+            .as_ref()
+            .is_some_and(|pending| pending.mode == SuggestionQueryMode::Menu)
+            || self
+                .controller
+                .current_query()
+                .is_some_and(|query| query.mode == SuggestionQueryMode::Menu))
             && self.query_state != TerminalSuggestionQueryState::Closed
     }
 
@@ -261,6 +482,19 @@ impl TerminalCommandSuggestionBridge {
 
     /// 为 GPUI 菜单生成短期只读快照；候选仍以 controller 当前 batch 为唯一业务来源。
     pub fn menu_projection(&self) -> Option<TerminalSuggestionMenuProjection> {
+        if let Some(pending) = self.pending_snapshot.as_ref()
+            && pending.mode == SuggestionQueryMode::Menu
+            && self.query_state != TerminalSuggestionQueryState::Closed
+        {
+            return Some(TerminalSuggestionMenuProjection {
+                request_generation: pending.generation,
+                state: self.query_state,
+                partial_accept: false,
+                candidates: Arc::from([]),
+                selection_keys: Arc::from([]),
+                partial_failure: false,
+            });
+        }
         let query = self.controller.current_query()?;
         if !self.menu_is_open() {
             return None;
@@ -269,97 +503,215 @@ impl TerminalCommandSuggestionBridge {
         Some(TerminalSuggestionMenuProjection {
             request_generation: query.request_generation,
             state: self.query_state,
-            partial_accept: self
-                .settings
-                .as_ref()
-                .is_some_and(|settings| settings.partial_accept),
+            partial_accept: false,
             candidates: Arc::from(self.menu_candidates().to_vec()),
+            partial_failure: self.partial_failure,
+            selection_keys: self
+                .menu_candidates()
+                .iter()
+                .map(|candidate| {
+                    if candidate.activation == CommandSuggestionActivation::OpenSnippetPanel {
+                        format!("snippet:{}", candidate.id)
+                    } else {
+                        format!(
+                            "append:{}",
+                            appendable_suffix(candidate, query).unwrap_or_default()
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into(),
         })
     }
 
-    /// 关闭菜单时取消当前 provider 查询，但保留输入投影以便继续输入或重开菜单。
+    /// 关闭菜单时保留关闭身份而非接受权限，手动重开仍会请求新的 Shell 快照。
     pub fn dismiss_menu(&mut self) -> bool {
         if !self.menu_is_open() {
             return false;
         }
+        self.remember_dismissed_input();
+        self.cancel_pending_snapshot();
         self.controller.cancel_query();
+        self.confirmed_snapshot = None;
         self.query_state = TerminalSuggestionQueryState::Closed;
         true
     }
 
-    /// 只把当前请求的失败标为 Failed，迟到的旧请求不能覆盖新菜单或新输入状态。
-    pub fn fail_request(&mut self, request_generation: u64) -> bool {
-        if self.query_state != TerminalSuggestionQueryState::Loading
-            || !self.is_request_current(request_generation)
-        {
+    /// 行内提示只在确实存在可绘制候选时关闭，普通 Escape 仍留给终端。
+    pub fn dismiss_inline(&mut self) -> bool {
+        if self.inline_ghost().is_none() {
             return false;
         }
-        self.query_state = TerminalSuggestionQueryState::Failed;
+        self.remember_dismissed_input();
+        self.controller.cancel_query();
+        self.confirmed_snapshot = None;
+        self.query_state = TerminalSuggestionQueryState::Closed;
         true
     }
 
-    /// 仅在 ApplicationTaskExecutor 的受管 runtime 中查询，并同时传播 UI 代次与应用退出取消。
+    /// 可见菜单代次与活动 provider 代次分离，使暂停或加载中的菜单仍能关闭。
+    pub fn is_menu_projection_current(&self, request_generation: u64) -> bool {
+        if !self.menu_is_open() {
+            return false;
+        }
+        if let Some(pending) = self.pending_snapshot.as_ref()
+            && pending.mode == SuggestionQueryMode::Menu
+        {
+            return pending.generation == request_generation;
+        }
+        self.controller.current_query().is_some_and(|query| {
+            query.mode == SuggestionQueryMode::Menu
+                && query.request_generation == request_generation
+        })
+    }
+
+    /// 只把当前请求的失败标为 Failed，迟到的旧请求不能覆盖新菜单或新输入状态。
+    pub fn fail_request(&mut self, request_generation: u64) -> bool {
+        if !self.is_request_current(request_generation) || self.progress_final {
+            return false;
+        }
+        self.progress_final = true;
+        if self.controller.candidates().is_empty() {
+            self.query_state = TerminalSuggestionQueryState::Failed;
+        } else {
+            self.partial_failure = true;
+            self.query_state = TerminalSuggestionQueryState::Ready;
+        }
+        true
+    }
+
+    /// 仅在共享 executor 中查询；Shell 快照同时固定目录、Shell 身份和增量结果代次。
     pub async fn run(
         job: TerminalSuggestionJob,
         executor: ApplicationTaskExecutor,
         commands: Arc<CommandsService>,
-    ) -> AppResult<TerminalSuggestionBatch> {
+        updates: Option<kerminal_application::commands::TerminalSuggestionProgressPublisher>,
+    ) -> AppResult<TerminalSuggestionProgress> {
         executor
             .run(move |task_cancellation| async move {
-                commands
-                    .terminal_suggestions(job.query, job.request_cancellation, task_cancellation)
-                    .await
+                match job.snapshot {
+                    Some(snapshot) => {
+                        commands
+                            .terminal_suggestions_from_snapshot(
+                                snapshot,
+                                job.query.request_generation,
+                                job.query.mode,
+                                job.request_cancellation,
+                                task_cancellation,
+                                updates,
+                            )
+                            .await
+                    }
+                    None => commands
+                        .terminal_suggestions(
+                            job.query,
+                            job.request_cancellation,
+                            task_cancellation,
+                        )
+                        .await
+                        .map(|batch| TerminalSuggestionProgress {
+                            batch,
+                            snapshot_revision: 0,
+                            sources: Vec::new(),
+                        }),
+                }
             })
             .await
     }
 
-    /// 仅接受与 controller 当前 binding、context 和 request generation 匹配的 batch。
-    pub fn apply_batch(&mut self, batch: TerminalSuggestionBatch) -> bool {
-        if !self.is_enabled() || !self.controller.apply_batch(batch) {
+    /// 增量结果只能更新同一真实快照；最终结果提交后，排队的旧增量不得倒退界面。
+    pub fn apply_progress(&mut self, progress: TerminalSuggestionProgress, is_final: bool) -> bool {
+        if self.progress_final
+            || self.confirmed_snapshot.as_ref().is_none_or(|snapshot| {
+                snapshot.revision != progress.snapshot_revision
+                    || snapshot.binding != progress.batch.binding
+                    || snapshot.context != progress.batch.expected_context
+            })
+            || !self.controller.apply_batch(progress.batch)
+        {
             return false;
         }
-        self.query_state = if self.controller.candidates().is_empty() {
-            TerminalSuggestionQueryState::Empty
-        } else {
+        let failed = progress
+            .sources
+            .iter()
+            .any(|source| source.state == SuggestionSourceState::Failed);
+        let pending = progress
+            .sources
+            .iter()
+            .any(|source| source.state == SuggestionSourceState::Pending);
+        self.partial_failure = failed;
+        self.query_state = if !self.controller.candidates().is_empty() {
             TerminalSuggestionQueryState::Ready
+        } else if pending && !is_final {
+            TerminalSuggestionQueryState::Loading
+        } else if failed {
+            TerminalSuggestionQueryState::Failed
+        } else {
+            TerminalSuggestionQueryState::Empty
         };
+        self.progress_final = is_final;
         true
     }
 
-    /// UI 用请求代次过滤异步错误，旧查询失败不应覆盖当前输入状态。
+    /// 只把未取消的请求视为活动代次，已暂停菜单可以关闭但不能触发接受或重试。
     pub fn is_request_current(&self, request_generation: u64) -> bool {
-        self.controller
-            .current_query()
-            .is_some_and(|query| query.request_generation == request_generation)
+        self.pending_snapshot.as_ref().is_some_and(|pending| {
+            pending.generation == request_generation && !pending.cancellation.is_cancelled()
+        }) || self.controller.is_request_active()
+            && self
+                .controller
+                .current_query()
+                .is_some_and(|query| query.request_generation == request_generation)
     }
 
-    /// 仅暴露 cursor 正好位于替换范围末尾的普通文本建议，避免重叠终端内容或危险动作伪装成 ghost。
+    /// 输入入队立即撤销旧候选；未知关闭边界以首次排空后的快照为准，旧 ACK 不能撤销 Esc。
+    /// 无法证明正文变化时保持关闭，之后的新快照或显式菜单才恢复候选。
+    pub fn suspend_for_pending_input(&mut self) {
+        let menu_open = self.menu_is_open();
+        if let Some(pending) = self.pending_snapshot.as_ref() {
+            pending.cancellation.cancel();
+        }
+        if !menu_open {
+            self.pending_snapshot = None;
+        }
+        self.confirmed_snapshot = None;
+        self.controller.suspend_query();
+        self.query_state = if menu_open {
+            TerminalSuggestionQueryState::Loading
+        } else {
+            TerminalSuggestionQueryState::Closed
+        };
+    }
+
+    /// 未知原生预测交由渲染网格门禁判断；Shell 明确报告已绘制时始终让位。
     pub fn inline_ghost(&self) -> Option<InlineSuggestionGhost> {
         if !self.mode_enabled(SuggestionQueryMode::Inline) {
+            return None;
+        }
+        if self
+            .confirmed_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.shell_prediction_visible == Some(true))
+        {
             return None;
         }
         let query = self.controller.current_query()?;
         if query.mode != SuggestionQueryMode::Inline {
             return None;
         }
-        let candidate = self.controller.candidates().iter().find(|candidate| {
-            candidate.activation == CommandSuggestionActivation::Insert
-                && candidate
-                    .allowed_presentations
-                    .contains(&kerminal_domain::commands::SuggestionPresentation::Inline)
-                && candidate.replacement_range.end == query.cursor
-                && !candidate.suffix.is_empty()
+        let (candidate, suffix) = self.controller.candidates().iter().find_map(|candidate| {
+            appendable_suffix(candidate, query).map(|suffix| (candidate, suffix))
         })?;
         Some(InlineSuggestionGhost {
             binding: query.binding.clone(),
             expected_context: query.expected_context,
             request_generation: query.request_generation,
             candidate_id: candidate.id.clone(),
-            text: candidate.suffix.clone(),
+            text: suffix.to_owned(),
         })
     }
 
-    /// 配置为 RightArrow 时仅截获无修饰的首次按下，候选失效时按键仍交给 terminal。
+    /// 右方向键完整接受，显式启用时 Alt+右方向分段接受；其他按键继续交给 Shell。
     pub fn accept_on_key(
         &mut self,
         event: TerminalKeyEvent,
@@ -367,12 +719,16 @@ impl TerminalCommandSuggestionBridge {
     ) -> Option<TerminalSuggestionAcceptance> {
         let settings = self.settings.as_ref()?;
         let accept_key = settings.accept_key;
-        let partial_accept = settings.partial_accept;
+        let partial_accept = settings.partial_accept
+            && event.modifiers.alt
+            && !event.modifiers.control
+            && !event.modifiers.shift
+            && !event.modifiers.super_key;
         if !self.mode_enabled(SuggestionQueryMode::Inline)
             || accept_key != TerminalInlineSuggestionAcceptKey::RightArrow
             || event.key != TerminalKey::Right
             || event.phase != KeyPhase::Press
-            || event.modifiers != Default::default()
+            || (event.modifiers != Default::default() && !partial_accept)
         {
             return None;
         }
@@ -380,9 +736,10 @@ impl TerminalCommandSuggestionBridge {
             return None;
         }
         let ghost = self.inline_ghost()?;
-        let acceptance = self
+        let mut acceptance = self
             .controller
             .accept(&ghost.candidate_id, partial_accept)?;
+        acceptance.shell_snapshot = self.confirmed_snapshot.take();
         self.begin_acceptance(acceptance.clone());
         Some(acceptance)
     }
@@ -402,7 +759,8 @@ impl TerminalCommandSuggestionBridge {
             self.clear();
             return None;
         }
-        let acceptance = self.controller.accept(candidate_id, partial_accept)?;
+        let mut acceptance = self.controller.accept(candidate_id, partial_accept)?;
+        acceptance.shell_snapshot = self.confirmed_snapshot.take();
         self.begin_acceptance(acceptance.clone());
         Some(acceptance)
     }
@@ -438,8 +796,9 @@ impl TerminalCommandSuggestionBridge {
             || !self
                 .controller
                 .projection_matches(&acceptance.binding, context.version())
-            || context.availability
-                != kerminal_application::sessions::TerminalCommandAvailability::Available
+            || (acceptance.shell_snapshot.is_none()
+                && context.availability
+                    != kerminal_application::sessions::TerminalCommandAvailability::Available)
             || context.alternate_screen
             || !context.prompt_ready
         {
@@ -455,7 +814,7 @@ impl TerminalCommandSuggestionBridge {
         })
     }
 
-    /// 只在同一接受计划的上一事件产生精确新版本时推进序号，失败会清掉剩余写入。
+    /// 只在同一接受计划的上一事件产生精确新版本时推进序号，失败清掉剩余写入；后续查询按需装箱。
     pub fn acceptance_input_written(
         &mut self,
         acceptance: &TerminalSuggestionAcceptance,
@@ -515,7 +874,7 @@ impl TerminalCommandSuggestionBridge {
         }
         self.pending_acceptance = None;
         AcceptanceInputProgress::Complete {
-            follow_up: self.request_current(context, mode),
+            follow_up: self.request_current(context, mode).map(Box::new),
         }
     }
 
@@ -539,9 +898,85 @@ impl TerminalCommandSuggestionBridge {
     ///
     /// @author kongweiguang
     pub fn clear(&mut self) {
+        self.cancel_pending_snapshot();
         self.controller.clear();
         self.pending_acceptance = None;
+        self.confirmed_snapshot = None;
+        self.dismissed_suggestion = None;
+        self.progress_final = false;
+        self.partial_failure = false;
         self.query_state = TerminalSuggestionQueryState::Closed;
+    }
+
+    /// 接受只在服务回读与预期正文、prompt 和新修订一致时确认；任何不确定结果均停止。
+    pub fn confirm_shell_acceptance(
+        &mut self,
+        acceptance: &TerminalSuggestionAcceptance,
+        result: &ShellEditingSnapshot,
+        context: &TerminalCommandContext,
+    ) -> bool {
+        let Some(before) = acceptance.shell_snapshot.as_ref() else {
+            return false;
+        };
+        let valid = self.pending_acceptance.as_ref().is_some_and(|pending| {
+            pending.input_in_flight
+                && pending.acceptance.request_generation == acceptance.request_generation
+                && pending.acceptance.binding == acceptance.binding
+                && before.binding == result.binding
+                && result.binding == binding_for_context(context)
+                && result.context == context.version()
+                && result.context.session_generation == before.context.session_generation
+                && result.context.prompt_epoch == before.context.prompt_epoch
+                && before.context.input_generation.checked_add(1)
+                    == Some(result.context.input_generation)
+                && result.revision > before.revision
+                && result.input == acceptance.input_after
+                && result.cursor == acceptance.cursor_after
+                && result.cursor_at_end()
+                && context.prompt_ready
+                && !context.alternate_screen
+        });
+        self.pending_acceptance = None;
+        self.controller.clear();
+        self.confirmed_snapshot = None;
+        self.query_state = TerminalSuggestionQueryState::Closed;
+        valid
+    }
+
+    /// 取消探测只发协作取消，底层任务仍须自行收尾并释放 Shell 请求资源。
+    fn cancel_pending_snapshot(&mut self) {
+        if let Some(pending) = self.pending_snapshot.take() {
+            pending.cancellation.cancel();
+        }
+    }
+
+    /// 没有可靠正文时只等待已在途输入的首次读回，绝不把旧投影冒充当前 Shell 状态。
+    fn remember_dismissed_input(&mut self) {
+        let binding = self
+            .pending_snapshot
+            .as_ref()
+            .map(|pending| pending.binding.clone())
+            .or_else(|| {
+                self.controller
+                    .current_query()
+                    .map(|query| query.binding.clone())
+            });
+        let dismissed = binding.and_then(|binding| {
+            if self.controller.is_suspended() {
+                return Some(DismissedSuggestion::PendingInput(binding));
+            }
+            self.confirmed_snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.binding == binding)
+                .map(DismissedSuggestionInput::from_snapshot)
+                .or_else(|| {
+                    self.pending_snapshot
+                        .as_ref()
+                        .and_then(|pending| pending.previous_input.clone())
+                })
+                .map(DismissedSuggestion::Confirmed)
+        });
+        self.dismissed_suggestion = dismissed;
     }
 
     /// 固定一次 controller 接受结果；无输入事件的动作（例如打开片段面板）不占用终端写入序列。
@@ -605,6 +1040,59 @@ impl TerminalSuggestionJob {
     pub const fn request_generation(&self) -> u64 {
         self.query.request_generation
     }
+}
+
+/// 仅从已确认的原始快照和固定目标构造反馈；敏感内容仍由 application 统一过滤。
+pub(super) fn accepted_feedback_request(
+    acceptance: &TerminalSuggestionAcceptance,
+    target: &SessionTarget,
+) -> Option<CommandSuggestionFeedbackRequest> {
+    let snapshot = acceptance.shell_snapshot.as_ref()?;
+    let SessionOwner::Ui { pane_id, .. } = &acceptance.binding.owner else {
+        return None;
+    };
+    if snapshot.binding != acceptance.binding
+        || snapshot.context != acceptance.expected_context
+        || snapshot.input != acceptance.input_before
+        || !snapshot.cursor_at_end()
+        || acceptance.activation != CommandSuggestionActivation::Insert
+        || acceptance
+            .input_after
+            .strip_prefix(&snapshot.input)
+            .is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    let (target, remote_host_id) = match target {
+        SessionTarget::Local(_) => (CommandHistoryTarget::Local, None),
+        SessionTarget::Ssh(target) => (
+            CommandHistoryTarget::Ssh,
+            Some(target.host_id.as_str().to_owned()),
+        ),
+        SessionTarget::Telnet(_) | SessionTarget::Serial(_) | SessionTarget::Container(_) => {
+            return None;
+        }
+    };
+    let shell = match snapshot.shell {
+        ShellEditingShell::Bash => "bash",
+        ShellEditingShell::Zsh => "zsh",
+        ShellEditingShell::Fish => "fish",
+        ShellEditingShell::PowerShell => "powershell",
+    };
+    Some(CommandSuggestionFeedbackRequest {
+        action: CommandSuggestionFeedbackAction::Accepted,
+        provider: acceptance.provider,
+        replacement_text: acceptance.replacement_text.clone(),
+        input: snapshot.input.clone(),
+        target,
+        source_id: acceptance.source_id.clone(),
+        session_id: Some(acceptance.binding.session_id.as_str().to_owned()),
+        pane_id: Some(pane_id.as_str().to_owned()),
+        profile_id: None,
+        remote_host_id,
+        cwd: snapshot.cwd.clone(),
+        shell: Some(shell.to_owned()),
+    })
 }
 
 #[cfg(test)]

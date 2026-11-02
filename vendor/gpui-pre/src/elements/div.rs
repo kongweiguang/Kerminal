@@ -2945,6 +2945,7 @@ impl Interactivity {
 
                                 if can_drop {
                                     listener(drag.value.as_ref(), window, cx);
+                                    window.mark_file_drop_accepted();
                                     window.refresh();
                                     cx.stop_propagation();
                                 }

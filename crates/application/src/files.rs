@@ -16,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{AppError, AppResult};
 
 pub mod clipboard_download;
+pub mod drag_manifest;
+pub mod drag_out;
 pub mod editor;
 
 /// 文本读取与编辑共享领域层预算，避免多个入口各自漂移出不同上限。
@@ -29,6 +31,13 @@ pub const MAX_FILE_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 pub trait FileAccessProvider: Send + Sync + 'static {
     /// 判断适配器能否操作此目标，避免在服务层按协议字符串散落分支。
     fn supports(&self, endpoint: &FileEndpoint) -> bool;
+
+    /// 拖出暂存目录由本机适配器拥有，默认拒绝以避免其他协议误提供宿主路径。
+    ///
+    /// @author kongweiguang
+    async fn create_drag_staging(&self) -> AppResult<Arc<dyn drag_out::DragStaging>> {
+        Err(AppError::unsupported("当前文件适配器不支持拖出暂存"))
+    }
 
     /// 列出目录的一层内容；递归加载由调用方显式发起以限制网络和 UI 工作量。
     async fn list_directory(
@@ -147,6 +156,17 @@ impl FileService {
             return Err(AppError::infrastructure("文件目标匹配到多个适配器"));
         }
         Ok(provider)
+    }
+
+    /// 只由本机适配器创建隔离暂存，调用方不直接操作磁盘或推断目录所有权。
+    ///
+    /// @author kongweiguang
+    pub async fn create_drag_staging(&self) -> AppResult<Arc<dyn drag_out::DragStaging>> {
+        self.provider_for(&FileEndpoint::Local {
+            path: PathBuf::from("."),
+        })?
+        .create_drag_staging()
+        .await
     }
 
     /// 返回指定路径的一层目录内容，避免 UI 递归扫描大型远端目录。

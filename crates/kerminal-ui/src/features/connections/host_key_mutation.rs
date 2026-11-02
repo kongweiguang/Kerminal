@@ -16,7 +16,8 @@ use kerminal_domain::identity::HostId;
 use tokio_util::sync::CancellationToken;
 
 use super::panel::{
-    ConnectionRequestCancellation, ConnectionsPanel, PendingTrust, localized_error,
+    ConnectionRequestCancellation, ConnectionsEvent, ConnectionsPanel, PendingAction, PendingTrust,
+    localized_error,
 };
 
 /// 两种信任写入使用同一提交闭环，只在确认、成功和失败文案上有所区别。
@@ -325,8 +326,17 @@ pub(super) fn start_host_key_mutation<R, Write, Fut>(
                     }
                     (Err(error), None) => {
                         if error.public_code() == PublicErrorCode::OutcomeUnknown {
+                            let cancelled_host = external_action_host(&retry_pending.action);
                             panel.pending_trust = None;
                             panel.status = Some(kind.unknown_message(&error));
+                            panel.finish_sftp_selection(
+                                &retry_pending.action,
+                                panel.status.clone(),
+                                cx,
+                            );
+                            if let Some(host_id) = cancelled_host {
+                                cx.emit(ConnectionsEvent::ExternalTargetCancelled { host_id });
+                            }
                         } else {
                             panel.pending_trust = Some(reset_pending(retry_pending));
                             panel.status = Some(kind.retry_message(&error));
@@ -434,6 +444,33 @@ fn start_late_readback(
     .detach();
 }
 
+/// 只从外部连接动作取得取消身份，普通主机操作不参与外部重试状态。
+///
+/// @author kongweiguang
+fn external_action_host(action: &PendingAction) -> Option<HostId> {
+    match action {
+        PendingAction::External(target) => Some(target.host_id().clone()),
+        _ => None,
+    }
+}
+
+/// 成功续接或可重新确认的挑战仍属于原请求，其余回读状态终止连接。
+///
+/// @author kongweiguang
+fn readback_ends_action(readback: &HostKeyMutationReadback, user_cancelled: bool) -> bool {
+    if user_cancelled {
+        return true;
+    }
+    match readback {
+        HostKeyMutationReadback::Trusted => false,
+        HostKeyMutationReadback::Current(actual) => !matches!(
+            &actual.status,
+            HostKeyStatus::Unknown | HostKeyStatus::Changed { .. }
+        ),
+        HostKeyMutationReadback::EndpointChanged | HostKeyMutationReadback::Failed(_) => true,
+    }
+}
+
 /// 回读状态完成后再关闭 busy；未知、变化或不同端点均要求重新核对。
 ///
 /// @author kongweiguang
@@ -450,7 +487,13 @@ fn apply_readback(
         panel.connection_request.cancel();
     }
     pending = reset_pending(pending);
-    match classify_readback(expected, readback) {
+    let readback = classify_readback(expected, readback);
+    let action_ended = readback_ends_action(&readback, user_cancelled);
+    let finished_action = action_ended.then(|| pending.action.clone());
+    let cancelled_host = action_ended
+        .then(|| external_action_host(&pending.action))
+        .flatten();
+    match readback {
         HostKeyMutationReadback::Trusted if user_cancelled => {
             panel.pending_trust = None;
             panel.status = Some(crate::locale::text(
@@ -551,4 +594,22 @@ fn apply_readback(
             cx.notify();
         }
     }
+    if let Some(host_id) = cancelled_host {
+        cx.emit(ConnectionsEvent::ExternalTargetCancelled { host_id });
+    }
+    if let Some(action) = finished_action {
+        panel.finish_sftp_selection(
+            &action,
+            if user_cancelled {
+                None
+            } else {
+                panel.status.clone()
+            },
+            cx,
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/connections_host_key_mutation.rs"]
+mod tests;

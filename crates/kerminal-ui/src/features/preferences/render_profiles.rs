@@ -9,7 +9,6 @@ use gpui_kit::{
         Disableable,
         button::{Button, ButtonVariants},
         input::{Input, Textarea},
-        select::Select,
     },
     div,
     prelude::*,
@@ -18,11 +17,7 @@ use gpui_kit::{
 
 use crate::theme::ThemeTokens;
 
-use super::{
-    ProfileDraft,
-    panel::{PreferencesPanel, ProfileGroupOption},
-    render::settings_error_banner,
-};
+use super::{ProfileDraft, panel::PreferencesPanel, render::settings_error_banner};
 
 impl PreferencesPanel {
     /// Profile 列表选中态采用中性次级表面，避免与保存等主操作争夺视觉层级。
@@ -35,7 +30,6 @@ impl PreferencesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        self.ensure_profile_groups_loaded(cx);
         let readonly =
             self.recovery.mode == kerminal_domain::preferences::ConfigurationMode::ReadOnlyRecovery;
         let draft = self
@@ -54,14 +48,6 @@ impl PreferencesPanel {
         let controls_locked =
             saving || operation_running || outcome_unknown || self.loading_profiles;
         let form_locked = readonly || controls_locked || draft.is_none();
-        let selected_group_id = draft
-            .as_ref()
-            .and_then(|profile| profile.sidebar_group_id.as_deref());
-        let group_invalid = selected_group_id.is_some_and(|id| {
-            self.profile_groups_load_started
-                && !self.profile_group_loading
-                && !self.profile_groups.iter().any(|group| group.id == id)
-        });
         let selected_id = self.selected_profile_id.clone();
         let rows = self.profile_rows.iter().map(|row| {
             let id = row.profile.id.clone();
@@ -118,7 +104,7 @@ impl PreferencesPanel {
                     } else {
                         crate::locale::text("保存", "Save")
                     })
-                    .disabled(form_locked || group_invalid || !self.profile_input_errors.is_empty())
+                    .disabled(form_locked || !self.profile_input_errors.is_empty())
                     .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| panel.save_profile(cx))),
             )
             .child(
@@ -250,12 +236,9 @@ impl PreferencesPanel {
                     .child(actions)
                     .child(profile_fields(ProfileFieldSet {
                         name: &self.profile_inputs.name,
-                        group: &self.profile_group_select,
                         shell: &self.profile_inputs.shell,
                         working_directory: &self.profile_inputs.working_directory,
                         disabled: form_locked,
-                        group_disabled: self.profile_group_loading
-                            || self.host_management.is_none(),
                         theme,
                     }))
                     .child(
@@ -334,15 +317,6 @@ impl PreferencesPanel {
                             .values()
                             .map(|message| issue_row(message, theme)),
                     )
-                    .when(self.profile_group_loading, |form| {
-                        form.child(issue_hint(
-                            &crate::locale::text("正在读取主机分组…", "Loading host groups…"),
-                            theme,
-                        ))
-                    })
-                    .when_some(self.profile_group_error.clone(), |form, error| {
-                        form.child(issue_row(&error, theme))
-                    })
                     .children(settings_error_banner(
                         self.profile_list_error.as_deref(),
                         theme,
@@ -383,11 +357,9 @@ fn profile_heading(draft: Option<&ProfileDraft>, theme: ThemeTokens) -> impl Int
 /// @author kongweiguang
 struct ProfileFieldSet<'a> {
     name: &'a gpui_kit::Entity<gpui_kit::component::input::InputState>,
-    group: &'a gpui_kit::Entity<gpui_kit::component::select::SelectState<Vec<ProfileGroupOption>>>,
     shell: &'a gpui_kit::Entity<gpui_kit::component::input::InputState>,
     working_directory: &'a gpui_kit::Entity<gpui_kit::component::input::InputState>,
     disabled: bool,
-    group_disabled: bool,
     theme: ThemeTokens,
 }
 
@@ -398,11 +370,9 @@ struct ProfileFieldSet<'a> {
 fn profile_fields(fields: ProfileFieldSet<'_>) -> impl IntoElement {
     let ProfileFieldSet {
         name,
-        group,
         shell,
         working_directory,
         disabled,
-        group_disabled,
         theme,
     } = fields;
     div()
@@ -418,15 +388,6 @@ fn profile_fields(fields: ProfileFieldSet<'_>) -> impl IntoElement {
                 .debug_selector(|| "profile-name-field".into())
                 .w_full()
                 .child(Input::new(name).disabled(disabled).w_full()),
-            theme,
-        ))
-        .child(profile_field(
-            crate::locale::text("分组", "Group"),
-            "",
-            Select::new(group)
-                .w_full()
-                .h(px(36.))
-                .disabled(disabled || group_disabled),
             theme,
         ))
         .child(profile_field(

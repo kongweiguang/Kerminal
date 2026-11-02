@@ -97,8 +97,9 @@ impl ConfigurationStore {
         }
     }
 
-    /// 锁内复核引用再删除分组；现有 journal 仅迁移远程主机，本地主机须先显式调整归属。
-    /// 不把 Profile 悄悄纳入未确认的跨文件写入，也不允许留下校验失败的悬空引用。
+    /// 锁内复核本地和远程 host 的完整 revision 后迁移分组，模板不参与主机归属。
+    ///
+    /// @author kongweiguang
     pub(crate) fn delete_host_group_and_reassign(
         &self,
         group_id: String,
@@ -139,16 +140,6 @@ impl ConfigurationStore {
             .is_some_and(|destination| !group_ids.contains(destination))
         {
             return Err(AppError::not_found("目标主机分组不存在"));
-        }
-
-        if self
-            .list_profiles_document_unlocked()?
-            .iter()
-            .any(|profile| profile.sidebar_group_id.as_deref() == Some(group_id.as_str()))
-        {
-            return Err(AppError::conflict(
-                "分组仍有本地主机，请先调整本地主机分组后再删除",
-            ));
         }
 
         let hosts = read_host_documents(&self.inner.root, &group_ids)?;

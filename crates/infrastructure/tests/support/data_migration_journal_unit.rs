@@ -144,7 +144,7 @@ fn malformed_active_and_missing_operation_are_blocked() {
 fn previous_marker_digest_is_accepted_only_as_the_original_contract() {
     let mut journal = valid_journal();
     let marker = journal.files.last_mut().expect("存在 marker 项");
-    marker.after_sha256 = sha256(&marker::previous_marker_bytes());
+    marker.after_sha256 = sha256(&marker::earliest_marker_bytes());
     assert!(validate_journal(&journal));
     journal
         .files

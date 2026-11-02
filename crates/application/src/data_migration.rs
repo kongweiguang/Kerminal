@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +78,17 @@ pub struct DataMigrationReport {
     pub backup_relative_paths: Vec<String>,
 }
 
+/// 预演仅暴露数量和是否需要更新密文，不包含配置正文、路径或凭据。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileImportPreview {
+    pub source_profiles: usize,
+    pub new_profiles: usize,
+    pub new_hosts: usize,
+    pub groups_changed: bool,
+    pub vault_changed: bool,
+}
+
 /// 用有限结果区分空根初始化、旧数据转换、重启前滚与当前格式幂等回执。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,6 +106,20 @@ pub trait DataMigrationRepository: Send + Sync + 'static {
 
     /// 在 adapter 的共享根锁内重新检查输入 revision，再按 journal 执行或恢复迁移。
     fn migrate(&self) -> AppResult<DataMigrationReport>;
+
+    /// 导入预演不写来源或目标，旧测试端口默认明确报告未实现。
+    fn preview_legacy_profiles(&self, _source_root: &Path) -> AppResult<ProfileImportPreview> {
+        Err(crate::AppError::unsupported(
+            "当前数据仓储不支持旧 Profile 导入",
+        ))
+    }
+
+    /// 显式导入使用目标当前契约的独立事务；不允许自动选择来源。
+    fn import_legacy_profiles(&self, _source_root: &Path) -> AppResult<DataMigrationReport> {
+        Err(crate::AppError::unsupported(
+            "当前数据仓储不支持旧 Profile 导入",
+        ))
+    }
 }
 
 /// desktop/console 共用的用例 facade；磁盘事务细节留在 repository adapter。
@@ -117,6 +142,16 @@ impl DataMigrationService {
     /// 执行一次迁移或幂等读回；结果未知时 adapter 保留 journal 供后续安全前滚。
     pub fn migrate(&self) -> AppResult<DataMigrationReport> {
         self.repository.migrate()
+    }
+
+    /// 只读计算导入影响，供命令行或界面在执行前展示真实数量。
+    pub fn preview_legacy_profiles(&self, source_root: &Path) -> AppResult<ProfileImportPreview> {
+        self.repository.preview_legacy_profiles(source_root)
+    }
+
+    /// 由已选择的源根触发导入；冲突和结果未知分类由唯一仓储原样返回。
+    pub fn import_legacy_profiles(&self, source_root: &Path) -> AppResult<DataMigrationReport> {
+        self.repository.import_legacy_profiles(source_root)
     }
 }
 

@@ -239,17 +239,8 @@ pub(super) fn supports_posix_mode_endpoint(endpoint: &FileEndpoint) -> bool {
     }
 }
 
-/// 仅把 Windows 本机普通文件/目录的 ACL 能力说明压成紧凑行，其他具体权限错误仍完整展示。
-///
-/// @author kongweiguang
-pub(super) fn is_windows_local_acl_limitation(entry: &FileEntry) -> bool {
-    matches!(entry.kind, FileEntryKind::File | FileEntryKind::Directory)
-        && matches!(&entry.endpoint, FileEndpoint::Local { .. })
-        && !cfg!(target_family = "unix")
-}
-
 impl super::FilesPane {
-    /// 校验完整 octal 草稿并经 FileService 提交；metadata 缺失时拒绝猜测权限值。
+    /// 校验完整 octal 草稿；缺失元数据时拒绝猜测，成功由回读呈现，不新增短暂提示条。
     ///
     /// @author kongweiguang
     pub(super) fn apply_permissions(&mut self, cx: &mut Context<Self>) {
@@ -314,10 +305,7 @@ impl super::FilesPane {
                             {
                                 pane.permission_dialog_target = None;
                             }
-                            pane.status = Some(
-                                locale::text("文件权限已更新。", "Permissions updated.")
-                                    .to_string(),
-                            );
+                            pane.status = None;
                             pane.permissions.reset_selection();
                             pane.panels[side].pending_selection = Some(selected_name);
                             pane.load_panel(side, cx);

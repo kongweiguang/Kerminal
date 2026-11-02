@@ -107,7 +107,7 @@ impl ComposeYamlPreviewState {
         true
     }
 
-    /// 为一个路径选择分配新 request id；溢出时拒绝发请求，不复用已用过的身份。
+    /// 为路径分配单调 request id；同路径刷新保留正文，切换路径时由 select_path 清除旧快照。
     ///
     /// @author kongweiguang
     fn begin_request(
@@ -136,7 +136,6 @@ impl ComposeYamlPreviewState {
             request_id,
             ticket,
         });
-        self.preview = None;
         self.error = None;
         Some(request_id)
     }
@@ -404,36 +403,6 @@ fn line_ending(bytes: &[u8]) -> Option<&'static str> {
 }
 
 impl OperationsView {
-    /// 右栏 YAML 选择与 main 一样把冻结项目路径交给中央只读工作区，显式刷新仍可读取页内预览。
-    ///
-    /// @author kongweiguang
-    pub(super) fn request_compose_yaml_workspace(
-        &mut self,
-        project: &ComposeProjectTarget,
-        path: &str,
-        ticket: &ContainerPanelActionTicket,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.container_action_ticket_is_current(ticket, None)
-            || self.host_target != project.host_id
-            || self.runtime != project.runtime
-            || !matches!(self.container_host.page(), ContainerHostPage::ComposeProject { target } if target == project)
-        {
-            return;
-        }
-        self.compose_yaml.select_project(project);
-        if !self.compose_yaml.select_path(path) {
-            return;
-        }
-        self.request_compose_config(
-            project.host_id.clone(),
-            path.to_owned(),
-            Some(project.working_dir.clone()),
-            ticket,
-            cx,
-        );
-    }
-
     /// 预览请求固定项目、路径、session ticket 和 endpoint；Root 仍是唯一文件服务调用方。
     ///
     /// @author kongweiguang
@@ -488,14 +457,8 @@ impl OperationsView {
             path,
             Some(&project.working_dir),
         ) else {
-            self.compose_yaml.fail_selected_path(
-                path,
-                crate::locale::text(
-                    "Compose 配置路径不是可定位的主机文件。",
-                    "The Compose config path is not a resolvable host file.",
-                )
-                .to_string(),
-            );
+            self.compose_yaml
+                .fail_selected_path(path, compose_yaml_unresolvable_path());
             cx.notify();
             return None;
         };
@@ -536,6 +499,16 @@ impl OperationsView {
         }
         accepted
     }
+}
+
+/// Compose 标签可能记录了另一台客户端的路径；不把它猜成当前主机上的同名文件。
+///
+/// @author kongweiguang
+fn compose_yaml_unresolvable_path() -> String {
+    crate::locale::text(
+        "无法在当前主机定位标签中的配置路径，请确认该路径所属主机和文件位置。",
+        "The config path in the labels cannot be located on this host. Check which host and file the path refers to.",
+    ).to_string()
 }
 
 #[cfg(test)]

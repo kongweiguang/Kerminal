@@ -21,7 +21,7 @@ use kerminal_domain::connections::RemoteProtocol;
 
 use crate::theme::ThemeTokens;
 
-use super::{panel::ConnectionsPanel, panel::PendingAction};
+use super::panel::{ConnectionsEvent, ConnectionsPanel, PendingAction};
 
 impl ConnectionsPanel {
     /// Root 观察同一面板的待确认事实，把 trust、一次性认证和本地主机删除提升到全工作区 modal。
@@ -132,7 +132,7 @@ impl ConnectionsPanel {
             return;
         }
 
-        self.cancel_connection_request();
+        self.cancel_connection_request(cx);
         self.pending_external_username = Some(request);
         self.external_username_submitting = false;
         self.status = Some(
@@ -263,7 +263,7 @@ impl ConnectionsPanel {
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
-        self.cancel_connection_request();
+        self.cancel_connection_request(cx);
         self.external_username_generation = self.external_username_generation.wrapping_add(1);
         self.external_username_submitting = false;
         self.pending_external_username.take();
@@ -309,7 +309,7 @@ impl ConnectionsPanel {
             cx.notify();
             return;
         }
-        self.cancel_connection_request();
+        self.cancel_connection_request(cx);
         if target.authentication_required {
             if self.external_launch.is_none() {
                 self.status = Some(
@@ -335,6 +335,37 @@ impl ConnectionsPanel {
             return;
         }
         self.preflight_external_target(target, cx);
+    }
+
+    /// 只有同一 SSH agent 目标可进入密码重试；面板忙时返回未受理以保留上层待处理请求。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn request_external_password_retry(
+        &mut self,
+        mut target: ExternalRoutedTarget,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !target.password_retry_available
+            || target.identity.protocol != RemoteProtocol::Ssh
+            || !matches!(&target.intent, ExternalLaunchIntent::SshTerminal { .. })
+        {
+            self.status = Some(
+                crate::locale::text(
+                    "该外部连接不能切换为密码重试。",
+                    "This external connection cannot retry using a password.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return false;
+        }
+        if self.root_confirmation_active() || self.external_launch.is_none() {
+            return false;
+        }
+        target.authentication_required = true;
+        target.password_retry_available = false;
+        self.request_external_target(target, cx);
+        self.pending_external_password.is_some()
     }
 
     /// 只将一次性输入交给同一外部启动服务；应用入口负责立即零化，失败时保留目标供用户重输。
@@ -425,16 +456,24 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 取消密码提示清空输入并释放当前面板持有的临时目标 lease。
+    /// 内存凭据提交期间不能取消，避免提交结果迟到后悄然改变仍持有的外部目标。
+    ///
+    /// @author kongweiguang
     pub(super) fn cancel_external_password(
         &mut self,
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
-        self.cancel_connection_request();
+        if self.external_authenticating {
+            return;
+        }
+        self.cancel_connection_request(cx);
         self.external_auth_generation = self.external_auth_generation.wrapping_add(1);
         self.external_authenticating = false;
-        self.pending_external_password.take();
+        let host_id = self
+            .pending_external_password
+            .take()
+            .map(|target| target.host_id().clone());
         super::form::clear_input(&self.external_password_input, window, cx);
         self.status = Some(
             crate::locale::text(
@@ -443,6 +482,9 @@ impl ConnectionsPanel {
             )
             .to_string(),
         );
+        if let Some(host_id) = host_id {
+            cx.emit(ConnectionsEvent::ExternalTargetCancelled { host_id });
+        }
         cx.notify();
     }
 
@@ -664,6 +706,7 @@ pub(super) fn render_external_password_prompt(
                             .child(
                                 Button::new("connections-external-password-cancel")
                                     .compact()
+                                    .disabled(panel.external_authenticating)
                                     .label(crate::locale::text("取消", "Cancel"))
                                     .on_click(cx.listener(
                                         |panel, _: &ClickEvent, window, cx| {

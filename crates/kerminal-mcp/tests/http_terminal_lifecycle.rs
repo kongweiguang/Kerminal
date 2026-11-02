@@ -233,6 +233,91 @@ async fn http_origin_policy_allows_native_clients_and_rejects_untrusted_headers(
         .expect("MCP shutdown completes");
 }
 
+/// 真实网卡连接按 TCP 对端要求令牌；本机回环仍能为现有 Agent 直接连接。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lan_listener_authenticates_real_network_connections() {
+    let token = kerminal_application::mcp_runtime::McpAccessToken::new(
+        kerminal_application::mcp_runtime::MCP_TOKEN_REFERENCE.to_owned(),
+        zeroize::Zeroizing::new("isolated-synthetic-token".to_owned()),
+    )
+    .unwrap();
+    let mut server = McpServer::start_with_token(
+        &Handle::current(),
+        McpServices::new(Arc::new(FakeSessionService::default()))
+            .with_profiles(test_profile_service()),
+        McpServerConfig::new("0.0.0.0:0".parse().unwrap()).unwrap(),
+        token,
+    )
+    .await
+    .unwrap();
+    let port = server
+        .endpoint()
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|value| value.split_once('/').map(|(port, _)| port))
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    assert_eq!(
+        post_initialize_status(
+            server.endpoint(),
+            &format!("127.0.0.1:{port}"),
+            &[],
+            initialize_body()
+        )
+        .await,
+        200
+    );
+    if let Some(address) = server.lan_addresses().first().copied() {
+        let endpoint = format!("http://{address}:{port}/mcp");
+        assert_eq!(lan_status(&endpoint, None, true).await, 401);
+        assert_eq!(lan_status(&endpoint, Some("wrong-token"), false).await, 401);
+        assert_eq!(
+            lan_status(&endpoint, Some("isolated-synthetic-token"), false).await,
+            200
+        );
+    }
+    timeout(Duration::from_secs(7), server.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// 发送受控原始 HTTP 字段，覆盖真实连接来源及伪造的代理头。
+async fn lan_status(endpoint: &str, token: Option<&str>, spoof_loopback: bool) -> u16 {
+    let (authority, path) = endpoint
+        .strip_prefix("http://")
+        .unwrap()
+        .split_once('/')
+        .unwrap();
+    let mut stream = TcpStream::connect(authority).await.unwrap();
+    let body = initialize_body();
+    let mut request = format!(
+        "POST /{path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    if let Some(token) = token {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    if spoof_loopback {
+        request.push_str("X-Forwarded-For: 127.0.0.1\r\n");
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    timeout(Duration::from_secs(3), reader.read_line(&mut status_line))
+        .await
+        .unwrap()
+        .unwrap();
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
 /// 构造合法 MCP initialize 消息，隔离 HTTP 安全测试对 RMCP client helper 的依赖。
 fn initialize_body() -> &'static str {
     r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"origin-test","version":"1.0.0"}}}"#

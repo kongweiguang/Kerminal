@@ -22,7 +22,8 @@ use super::super::super::{CommandsView, snippet_browser::SnippetInlinePreview};
 
 impl CommandsView {
     /// 预览从表单实体读取模板，与发送共享同一未保存正文，避免编辑器关闭后展示旧定义。
-    /// 宽工作台仍保留独立的草稿填入入口；展开预览本身不执行片段。
+    /// 宽工作台仍保留独立的草稿填入入口；动作按管理与终端操作分组，避免宽面板撑开按钮。
+    /// 加载由列表行尾图标反馈，不创建临时详情行挤动相邻内容；失败才展开原因和原目标重试入口。
     ///
     /// @author kongweiguang
     pub(super) fn render_snippet_inline_preview(
@@ -39,24 +40,6 @@ impl CommandsView {
         let state = self.snippet_inline_preview.clone();
         match state {
             SnippetInlinePreview::Collapsed => None,
-            SnippetInlinePreview::Loading(loading_key) if loading_key == *key => Some(
-                div()
-                    .id(format!(
-                        "snippet-preview-loading-{}-{}",
-                        preview_origin(key),
-                        key.snippet_id
-                    ))
-                    .w_full()
-                    .px_3()
-                    .pb_2()
-                    .text_size(theme.text_xs)
-                    .text_color(theme.muted)
-                    .child(crate::locale::text(
-                        "正在读取片段详情…",
-                        "Loading snippet details…",
-                    ))
-                    .into_any_element(),
-            ),
             SnippetInlinePreview::Failed {
                 key: failed_key,
                 message,
@@ -231,202 +214,214 @@ impl CommandsView {
                                 .flex()
                                 .flex_wrap()
                                 .items_center()
-                                .justify_between()
-                                .gap_3()
+                                .gap_2()
                                 .border_t_1()
                                 .border_color(theme.border)
                                 .pt_2()
                                 .child(
-                                    Button::new(format!(
-                                        "snippet-preview-copy-{}-{}",
-                                        preview_origin(key),
-                                        key.snippet_id
-                                    ))
-                                    .compact()
-                                    .ghost()
-                                    .w(px(32.))
-                                    .h(px(32.))
-                                    .icon(IconName::Copy)
-                                    .accessibility_label(copy_label.clone())
-                                    .tooltip(copy_label)
-                                    .on_click(cx.listener({
-                                        let key = key.clone();
-                                        move |view, _: &ClickEvent, _, cx| {
-                                            view.copy_snippet_inline_preview(key.clone(), cx);
-                                        }
-                                    })),
-                                )
-                                .when(
-                                    key.origin
-                                        == kerminal_domain::commands::SnippetCatalogOrigin::Builtin,
-                                    |actions| {
-                                        actions.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
                                             Button::new(format!(
-                                                "snippet-preview-save-to-mine-{}",
+                                                "snippet-preview-copy-{}-{}",
+                                                preview_origin(key),
                                                 key.snippet_id
                                             ))
                                             .compact()
                                             .ghost()
                                             .w(px(32.))
                                             .h(px(32.))
-                                            .icon(IconName::Plus)
-                                            .accessibility_label(crate::locale::text(
-                                                "保存到我的片段",
-                                                "Save to my snippets",
+                                            .icon(IconName::Copy)
+                                            .accessibility_label(copy_label.clone())
+                                            .tooltip(copy_label)
+                                            .on_click(cx.listener({
+                                                let key = key.clone();
+                                                move |view, _: &ClickEvent, _, cx| {
+                                                    view.copy_snippet_inline_preview(key.clone(), cx);
+                                                }
+                                            })),
+                                        )
+                                        .when(
+                                            key.origin
+                                                == kerminal_domain::commands::SnippetCatalogOrigin::Builtin,
+                                            |actions| {
+                                                actions.child(
+                                                    Button::new(format!(
+                                                        "snippet-preview-save-to-mine-{}",
+                                                        key.snippet_id
+                                                    ))
+                                                    .compact()
+                                                    .ghost()
+                                                    .w(px(32.))
+                                                    .h(px(32.))
+                                                    .icon(IconName::Plus)
+                                                    .accessibility_label(crate::locale::text(
+                                                        "保存到我的片段",
+                                                        "Save to my snippets",
+                                                    ))
+                                                    .tooltip(crate::locale::text(
+                                                        "保存到我的片段",
+                                                        "Save to my snippets",
+                                                    ))
+                                                    .disabled(!can_edit)
+                                                    .on_click(cx.listener(
+                                                        |view, _: &ClickEvent, window, cx| {
+                                                            view.save_builtin_snippet_as_user(window, cx);
+                                                        },
+                                                    )),
+                                                )
+                                            },
+                                        )
+                                        .when(
+                                            key.origin
+                                                == kerminal_domain::commands::SnippetCatalogOrigin::User,
+                                            |actions| {
+                                                actions
+                                                    .child(
+                                                        Button::new(format!(
+                                                            "snippet-preview-edit-{}-{}",
+                                                            preview_origin(key),
+                                                            key.snippet_id
+                                                        ))
+                                                        .compact()
+                                                        .h(px(32.))
+                                                        .secondary()
+                                                        .label(crate::locale::text("编辑", "Edit"))
+                                                        .disabled(!can_edit)
+                                                        .on_click(cx.listener({
+                                                            let key = key.clone();
+                                                            move |view, _: &ClickEvent, window, cx| {
+                                                                view.open_snippet_key(
+                                                                    key.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        })),
+                                                    )
+                                                    .child(
+                                                        Button::new(format!(
+                                                            "snippet-preview-delete-{}-{}",
+                                                            preview_origin(key),
+                                                            key.snippet_id
+                                                        ))
+                                                        .compact()
+                                                        .danger()
+                                                        .w(px(32.))
+                                                        .h(px(32.))
+                                                        .icon(IconName::Trash)
+                                                        .accessibility_label(crate::locale::text(
+                                                            "删除我的片段",
+                                                            "Delete my snippet",
+                                                        ))
+                                                        .tooltip(crate::locale::text(
+                                                            "删除我的片段",
+                                                            "Delete my snippet",
+                                                        ))
+                                                        .disabled(!can_edit)
+                                                        .on_click(cx.listener({
+                                                            let key = key.clone();
+                                                            move |view, _: &ClickEvent, window, cx| {
+                                                                view.open_snippet_key(
+                                                                    key.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                                if view.snippet_editor_open() {
+                                                                    view.delete_snippet(window, cx);
+                                                                }
+                                                            }
+                                                        })),
+                                                    )
+                                            },
+                                        )
+                                )
+                                .child(
+                                    div()
+                                        .ml_auto()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .when(!self.compact_layout, |actions| {
+                                            actions.child(
+                                                Button::new(format!(
+                                                    "snippet-preview-fill-{}-{}",
+                                                    preview_origin(key),
+                                                    key.snippet_id
+                                                ))
+                                                .compact()
+                                                .h(px(32.))
+                                                .when(fill_primary, Button::primary)
+                                                .when(!fill_primary, Button::secondary)
+                                                .label(crate::locale::text("填入草稿", "Fill draft"))
+                                                .tooltip(crate::locale::text(
+                                                    "把展开后的命令填入工作台草稿",
+                                                    "Put the rendered command in the workbench draft",
+                                                ))
+                                                .disabled(!can_fill)
+                                                .on_click(
+                                                    cx.listener(|view, _: &ClickEvent, window, cx| {
+                                                        view.fill_snippet(window, cx);
+                                                    }),
+                                                ),
+                                            )
+                                        })
+                                        .when(self.compact_layout, |actions| {
+                                            actions.child(
+                                                Button::new(format!(
+                                                    "snippet-preview-terminal-fill-{}-{}",
+                                                    preview_origin(key),
+                                                    key.snippet_id
+                                                ))
+                                                .compact()
+                                                .h(px(32.))
+                                                .when(fill_primary, Button::primary)
+                                                .when(!fill_primary, Button::secondary)
+                                                .label(crate::locale::text("填入", "Fill"))
+                                                .tooltip(crate::locale::text(
+                                                    "填入当前终端输入行，不提交命令",
+                                                    "Fill the terminal input without submitting the command",
+                                                ))
+                                                .disabled(!can_fill_terminal)
+                                                .on_click(cx.listener(
+                                                    |view, _: &ClickEvent, window, cx| {
+                                                        view.fill_snippet(window, cx);
+                                                    },
+                                                )),
+                                            )
+                                        })
+                                        .child(
+                                            Button::new(format!(
+                                                "snippet-preview-send-{}-{}",
+                                                preview_origin(key),
+                                                key.snippet_id
                                             ))
+                                            .compact()
+                                            .h(px(32.))
+                                            .when(run_primary, Button::primary)
+                                            .when(!run_primary, Button::secondary)
+                                            .label(if self.compact_layout {
+                                                crate::locale::text("运行", "Run")
+                                            } else {
+                                                crate::locale::text("发送", "Send")
+                                            })
                                             .tooltip(crate::locale::text(
-                                                "保存到我的片段",
-                                                "Save to my snippets",
+                                                "运行片段到当前终端",
+                                                "Run the snippet in the current terminal",
                                             ))
-                                            .disabled(!can_edit)
+                                            .disabled(!can_send)
                                             .on_click(cx.listener(
                                                 |view, _: &ClickEvent, window, cx| {
-                                                    view.save_builtin_snippet_as_user(window, cx);
+                                                    if view.compact_layout {
+                                                        view.request_snippet_run_terminal(window, cx);
+                                                    } else {
+                                                        view.send_snippet_terminal(window, cx);
+                                                    }
                                                 },
                                             )),
                                         )
-                                    },
-                                )
-                                .when(
-                                    key.origin
-                                        == kerminal_domain::commands::SnippetCatalogOrigin::User,
-                                    |actions| {
-                                        actions
-                                            .child(
-                                                Button::new(format!(
-                                                    "snippet-preview-edit-{}-{}",
-                                                    preview_origin(key),
-                                                    key.snippet_id
-                                                ))
-                                                .compact()
-                                                .h(px(32.))
-                                                .secondary()
-                                                .label(crate::locale::text("编辑", "Edit"))
-                                                .disabled(!can_edit)
-                                                .on_click(cx.listener({
-                                                    let key = key.clone();
-                                                    move |view, _: &ClickEvent, window, cx| {
-                                                        view.open_snippet_key(
-                                                            key.clone(),
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    }
-                                                })),
-                                            )
-                                            .child(
-                                                Button::new(format!(
-                                                    "snippet-preview-delete-{}-{}",
-                                                    preview_origin(key),
-                                                    key.snippet_id
-                                                ))
-                                                .compact()
-                                                .danger()
-                                                .w(px(32.))
-                                                .h(px(32.))
-                                                .icon(IconName::Trash)
-                                                .accessibility_label(crate::locale::text(
-                                                    "删除我的片段",
-                                                    "Delete my snippet",
-                                                ))
-                                                .tooltip(crate::locale::text(
-                                                    "删除我的片段",
-                                                    "Delete my snippet",
-                                                ))
-                                                .disabled(!can_edit)
-                                                .on_click(cx.listener({
-                                                    let key = key.clone();
-                                                    move |view, _: &ClickEvent, window, cx| {
-                                                        view.open_snippet_key(
-                                                            key.clone(),
-                                                            window,
-                                                            cx,
-                                                        );
-                                                        if view.snippet_editor_open() {
-                                                            view.delete_snippet(window, cx);
-                                                        }
-                                                    }
-                                                })),
-                                            )
-                                    },
-                                )
-                                .when(!self.compact_layout, |actions| {
-                                    actions.child(
-                                        Button::new(format!(
-                                            "snippet-preview-fill-{}-{}",
-                                            preview_origin(key),
-                                            key.snippet_id
-                                        ))
-                                        .compact()
-                                        .h(px(32.))
-                                        .when(fill_primary, Button::primary)
-                                        .when(!fill_primary, Button::secondary)
-                                        .label(crate::locale::text("填入草稿", "Fill draft"))
-                                        .tooltip(crate::locale::text(
-                                            "把展开后的命令填入工作台草稿",
-                                            "Put the rendered command in the workbench draft",
-                                        ))
-                                        .disabled(!can_fill)
-                                        .on_click(
-                                            cx.listener(|view, _: &ClickEvent, window, cx| {
-                                                view.fill_snippet(window, cx);
-                                            }),
-                                        ),
-                                    )
-                                })
-                                .when(self.compact_layout, |actions| {
-                                    actions.child(
-                                        Button::new(format!(
-                                            "snippet-preview-terminal-fill-{}-{}",
-                                            preview_origin(key),
-                                            key.snippet_id
-                                        ))
-                                        .compact()
-                                        .h(px(32.))
-                                        .when(fill_primary, Button::primary)
-                                        .when(!fill_primary, Button::secondary)
-                                        .label(crate::locale::text("填入", "Fill"))
-                                        .tooltip(crate::locale::text(
-                                            "填入当前终端输入行，不提交命令",
-                                            "Fill the terminal input without submitting the command",
-                                        ))
-                                        .disabled(!can_fill_terminal)
-                                        .on_click(cx.listener(
-                                            |view, _: &ClickEvent, window, cx| {
-                                                view.fill_snippet(window, cx);
-                                            },
-                                        )),
-                                    )
-                                })
-                                .child(
-                                    Button::new(format!(
-                                        "snippet-preview-send-{}-{}",
-                                        preview_origin(key),
-                                        key.snippet_id
-                                    ))
-                                    .compact()
-                                    .h(px(32.))
-                                    .when(run_primary, Button::primary)
-                                    .when(!run_primary, Button::secondary)
-                                    .label(if self.compact_layout {
-                                        crate::locale::text("运行", "Run")
-                                    } else {
-                                        crate::locale::text("发送", "Send")
-                                    })
-                                    .tooltip(crate::locale::text(
-                                        "运行片段到当前终端",
-                                        "Run the snippet in the current terminal",
-                                    ))
-                                    .disabled(!can_send)
-                                    .on_click(cx.listener(
-                                        |view, _: &ClickEvent, window, cx| {
-                                            if view.compact_layout {
-                                                view.request_snippet_run_terminal(window, cx);
-                                            } else {
-                                                view.send_snippet_terminal(window, cx);
-                                            }
-                                        },
-                                    )),
                                 ),
                         )
                         .into_any_element(),

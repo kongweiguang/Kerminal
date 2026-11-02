@@ -2,14 +2,184 @@
 //!
 //! @author kongweiguang
 
+use gpui_kit::{KeyDownEvent, Keystroke};
 use kerminal_terminal::input::InputModifiers;
 
 use super::{
     KeyPhase, TerminalClipboardAction, TerminalInputEvent, TerminalKey, TerminalKeyEvent,
-    TerminalModes, TerminalViewportScroll, encode_input, terminal_clipboard_action,
-    terminal_key_input, terminal_key_release_input, viewport_scroll_action,
-    viewport_scroll_action_for_keys,
+    TerminalModes, TerminalViewportScroll, encode_input, resolve_terminal_shortcut,
+    terminal_clipboard_action, terminal_key_input, terminal_key_release_input,
+    viewport_scroll_action, viewport_scroll_action_for_keys,
 };
+
+/// 用户修改后只有新粘贴键在终端解析器生效，旧键不再被本地剪贴板手势抢占。
+///
+/// @author kongweiguang
+#[test]
+fn configured_paste_replaces_the_previous_terminal_shortcut() {
+    let mut settings = kerminal_application::preferences::SettingsSnapshot::default();
+    let paste = settings
+        .keybindings
+        .iter_mut()
+        .find(|binding| binding.action == "terminal.paste")
+        .unwrap();
+    let old = if cfg!(target_os = "macos") {
+        paste.mac_binding = "Cmd+Shift+F12".to_owned();
+        "cmd-v"
+    } else if cfg!(target_os = "windows") {
+        paste.windows_binding = "Ctrl+Shift+F12".to_owned();
+        "ctrl-shift-v"
+    } else {
+        paste.linux_binding = Some("Ctrl+Shift+F12".to_owned());
+        "ctrl-shift-v"
+    };
+    let new = if cfg!(target_os = "macos") {
+        "cmd-shift-f12"
+    } else {
+        "ctrl-shift-f12"
+    };
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    runtime.update(&settings.keybindings);
+    let event = |text| KeyDownEvent {
+        keystroke: Keystroke::parse(text).unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event(old), false),
+        super::keybindings::KeybindingDispatch::Unhandled
+    );
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event(new), false),
+        super::keybindings::KeybindingDispatch::Action(
+            crate::keybindings::KeybindingAction::TerminalPaste
+        )
+    );
+}
+
+/// 真实平台声明字符输入优先时，AltGr 按键不会触发匹配的应用快捷键。
+///
+/// @author kongweiguang
+#[test]
+fn character_preference_keeps_altgr_in_the_terminal_input_path() {
+    let mut settings = kerminal_application::preferences::SettingsSnapshot::default();
+    let binding = settings
+        .keybindings
+        .iter_mut()
+        .find(|binding| binding.action == "terminal.search")
+        .unwrap();
+    binding.windows_binding = "Ctrl+Alt+E".to_owned();
+    binding.mac_binding = "Ctrl+Alt+E".to_owned();
+    binding.linux_binding = Some("Ctrl+Alt+E".to_owned());
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    runtime.update(&settings.keybindings);
+    let mut event = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-alt-e").unwrap(),
+        is_held: false,
+        prefer_character_input: true,
+    };
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event, false),
+        super::keybindings::KeybindingDispatch::Unhandled
+    );
+    event.prefer_character_input = false;
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event, false),
+        super::keybindings::KeybindingDispatch::Action(
+            crate::keybindings::KeybindingAction::TerminalSearch
+        )
+    );
+}
+
+/// 已消费的 chord 每段只执行一次，长按和修饰键先松开都不得泄漏到 PTY。
+///
+/// @author kongweiguang
+#[test]
+fn consumed_terminal_shortcut_repeats_are_swallowed_until_key_release() {
+    let mut settings = kerminal_application::preferences::SettingsSnapshot::default();
+    let paste = settings
+        .keybindings
+        .iter_mut()
+        .find(|binding| binding.action == "terminal.paste")
+        .unwrap();
+    paste.windows_binding = "Ctrl+K Ctrl+V".to_owned();
+    paste.mac_binding = "Ctrl+K Ctrl+V".to_owned();
+    paste.linux_binding = Some("Ctrl+K Ctrl+V".to_owned());
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    runtime.update(&settings.keybindings);
+    let event = |key: &str, is_held| KeyDownEvent {
+        keystroke: Keystroke::parse(key).unwrap(),
+        is_held,
+        prefer_character_input: false,
+    };
+    let first = event("ctrl-k", false);
+    let last = event("ctrl-v", false);
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &first, false),
+        super::keybindings::KeybindingDispatch::Pending
+    );
+    runtime.remember_terminal_shortcut_key(&first.keystroke);
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event("ctrl-k", true), false),
+        super::keybindings::KeybindingDispatch::Pending
+    );
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &last, false),
+        super::keybindings::KeybindingDispatch::Action(
+            crate::keybindings::KeybindingAction::TerminalPaste
+        )
+    );
+    runtime.remember_terminal_shortcut_key(&last.keystroke);
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event("v", true), false),
+        super::keybindings::KeybindingDispatch::Pending
+    );
+    assert!(runtime.release_terminal_shortcut_key(&Keystroke::parse("v").unwrap()));
+    assert!(!runtime.release_terminal_shortcut_key(&Keystroke::parse("v").unwrap()));
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event("v", true), false),
+        super::keybindings::KeybindingDispatch::Unhandled
+    );
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event("ctrl-x", true), false),
+        super::keybindings::KeybindingDispatch::Unhandled
+    );
+}
+
+/// 焦点和配置变更清除旧终端的已消费按键，防止吞掉新目标的普通重复输入。
+///
+/// @author kongweiguang
+#[test]
+fn terminal_shortcut_repeat_tracking_is_reset_by_focus_and_configuration() {
+    let settings = kerminal_application::preferences::SettingsSnapshot::default();
+    let key = Keystroke::parse("ctrl-shift-v").unwrap();
+    let event = KeyDownEvent {
+        keystroke: key.clone(),
+        is_held: true,
+        prefer_character_input: false,
+    };
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    runtime.remember_terminal_shortcut_key(&key);
+    runtime.clear_terminal_shortcut_keys();
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event, false),
+        super::keybindings::KeybindingDispatch::Unhandled
+    );
+    runtime.remember_terminal_shortcut_key(&key);
+    runtime.update(&settings.keybindings);
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event, false),
+        super::keybindings::KeybindingDispatch::Unhandled
+    );
+    runtime.remember_terminal_shortcut_key(&key);
+    let mut altgr = event.clone();
+    altgr.prefer_character_input = true;
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &altgr, false),
+        super::keybindings::KeybindingDispatch::Unhandled
+    );
+    assert!(!runtime.release_terminal_shortcut_key(&key));
+}
 
 /// 测试直接构造协议事件，避免依赖系统键盘布局掩盖普通字符被误消费的问题。
 ///
@@ -193,7 +363,7 @@ fn key_release_is_routed_only_when_the_terminal_protocol_encodes_it() {
     assert!(encode_input(&release, kitty_modes).is_some());
 }
 
-/// Ctrl+C 有选择时复制、无选择时中断；Ctrl+Shift+C/V 固定保留剪贴板语义。
+/// Ctrl+C 有选择时复制、无选择时中断；粘贴键必须交由用户配置的 keymap 解析。
 ///
 /// @author kongweiguang
 #[test]
@@ -221,7 +391,7 @@ fn clipboard_shortcuts_route_selection_and_interrupt_without_selection() {
     );
     assert_eq!(
         terminal_clipboard_action(TerminalKey::Character('v'), control_shift, false),
-        Some(TerminalClipboardAction::Paste)
+        None
     );
     assert_eq!(
         terminal_clipboard_action(

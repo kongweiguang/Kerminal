@@ -125,7 +125,6 @@ pub enum HostNavigationEvent {
     CopyLocalProfileRequested { profile_id: String },
     DeleteLocalProfileRequested { profile_id: String },
     HostSelected { host_id: HostId },
-    ShowHostDetailsRequested { host_id: HostId },
     EditHostRequested { host_id: HostId },
     CopyHostRequested { host_id: HostId },
     CopyHostAsSshRequested { host_id: HostId },
@@ -133,7 +132,6 @@ pub enum HostNavigationEvent {
     ConnectRequested { host_id: HostId },
     OpenSftpRequested { host_id: HostId },
     CreateSftpTransferTabRequested { host_id: HostId },
-    OpenHostContainersRequested { host_id: HostId },
     PinnedContainerSelected { stable_id: String },
     PinnedContainerOpenRequested { stable_id: String },
     PinnedContainerRemoveRequested { stable_id: String },
@@ -190,7 +188,6 @@ pub struct HostSessionProjection {
 
 #[derive(Clone, Copy)]
 enum HostAction {
-    Details,
     Edit,
     Copy,
     CopyAsSsh,
@@ -230,7 +227,9 @@ pub struct HostNavigation {
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
     rows: Vec<ManagedHost>,
+    /// 为保留现有导航渲染，主机列表使用无环境变量的私有投影；不包含模板。
     profile_rows: Vec<VersionedProfile>,
+    default_profile_name: Option<gpui_kit::SharedString>,
     groups: Vec<HostGroup>,
     group_revision: Option<ConfigRevision>,
     selected_host: Option<HostId>,
@@ -291,6 +290,7 @@ impl HostNavigation {
             _search_subscription: search_subscription,
             rows: Vec::new(),
             profile_rows: Vec::new(),
+            default_profile_name: None,
             groups: Vec::new(),
             group_revision: None,
             selected_host: None,
@@ -323,7 +323,7 @@ impl HostNavigation {
         cx.notify();
     }
 
-    /// 接入同一 Profile 用例，让持久本地终端与远程主机共享分组导航但保留独立 schema。
+    /// 接入模板用例供默认终端显示名称；左栏主机只来自独立主机目录。
     /// @author kongweiguang
     pub fn with_profiles(mut self, profiles: ProfileService, cx: &mut Context<Self>) -> Self {
         self.profiles = Some(profiles);
@@ -407,23 +407,34 @@ impl HostNavigation {
             let result = executor
                 .run(move |_| async move {
                     let rows = hosts.list_hosts().await?;
+                    let local_hosts = hosts.list_local_hosts().await?;
                     let groups = hosts.load_groups().await?;
                     let profiles = match profiles {
                         Some(profiles) => profiles.list_profiles().await?,
                         None => Vec::new(),
                     };
-                    Ok((rows, groups, profiles))
+                    Ok((rows, local_hosts, groups, profiles))
                 })
                 .await;
             cx.update(|app| {
                 let _ = this.update(app, |navigation, cx| {
                     navigation.loading = false;
                     match result {
-                        Ok((rows, groups, profiles)) => {
+                        Ok((rows, local_hosts, groups, profiles)) => {
                             navigation.rows = rows;
                             navigation.groups = groups.groups;
                             navigation.group_revision = groups.revision;
-                            navigation.profile_rows = profiles;
+                            navigation.default_profile_name =
+                                unique_default_profile_name(&profiles);
+                            navigation.profile_rows = local_hosts
+                                .into_iter()
+                                .map(|host| {
+                                    super::local_hosts::local_host_projection(
+                                        host,
+                                        Default::default(),
+                                    )
+                                })
+                                .collect();
                             if navigation.selected_host.as_ref().is_some_and(|selected| {
                                 !navigation.rows.iter().any(|host| &host.id == selected)
                             }) {
@@ -512,7 +523,7 @@ impl HostNavigation {
         if self.loading {
             return None;
         }
-        unique_default_profile_name(&self.profile_rows)
+        self.default_profile_name.clone()
     }
 
     /// 分屏选择器复用导航的过滤规则，但只投影终端目标 ID、名称和端点摘要，避免复制完整连接配置。
@@ -688,18 +699,6 @@ impl HostNavigation {
         }
     }
 
-    /// 容器管理只面向明确的 SSH 宿主；Root 负责等待其真实会话就绪后再展开工具。
-    /// @author kongweiguang
-    fn request_host_containers(&mut self, host_id: HostId, cx: &mut Context<Self>) {
-        if self
-            .rows
-            .iter()
-            .any(|host| host.id == host_id && host.protocol == RemoteProtocol::Ssh)
-        {
-            cx.emit(HostNavigationEvent::OpenHostContainersRequested { host_id });
-        }
-    }
-
     /// 右键菜单只允许移除仍投影的 pin，避免过期菜单删除后续重加的目标。
     /// @author kongweiguang
     fn request_remove_pinned_container(&mut self, stable_id: String, cx: &mut Context<Self>) {
@@ -872,6 +871,31 @@ impl HostNavigation {
         cx.notify();
     }
 
+    /// 快速打开和上下文导航按当前目录校验目标；失效主机只显示反馈并刷新，不伪造选择。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn select_host_from_external(
+        &mut self,
+        host_id: &HostId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.rows.iter().any(|host| &host.id == host_id) {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "主机已不存在，请刷新列表后重试。",
+                    "This host no longer exists. Refresh the list and try again.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            self.reload(cx);
+            cx.notify();
+            return false;
+        }
+        self.select_host(host_id.clone(), cx);
+        true
+    }
+
     /// 明确保存远端主机后按 HostId 选中并重读目录，避免依赖旧列表快照或普通 reload 推断选择。
     /// @author kongweiguang
     pub(crate) fn select_saved_host(&mut self, host_id: HostId, cx: &mut Context<Self>) {
@@ -1004,7 +1028,6 @@ impl HostNavigation {
     fn request_host_action(&mut self, host_id: HostId, action: HostAction, cx: &mut Context<Self>) {
         self.select_host(host_id.clone(), cx);
         let event = match action {
-            HostAction::Details => HostNavigationEvent::ShowHostDetailsRequested { host_id },
             HostAction::Edit => HostNavigationEvent::EditHostRequested { host_id },
             HostAction::Copy => HostNavigationEvent::CopyHostRequested { host_id },
             HostAction::CopyAsSsh => {
@@ -1830,7 +1853,7 @@ fn host_context_menu_actions(host: &ManagedHost) -> HostContextMenuActions {
     }
 }
 
-/// Kit 将 Enter/Space 确认投影成单次 Keyboard click，必须与只选择详情的鼠标单击区分。
+/// Kit 将 Enter/Space 确认投影成单次 Keyboard click，必须与仅选择主机的鼠标单击区分。
 /// 鼠标仅第二击连接，后续三击不重放，避免一次连击创建多个会话。
 /// @author kongweiguang
 fn is_open_gesture(event: &ClickEvent) -> bool {
@@ -2030,6 +2053,7 @@ fn render_navigation_header(
     );
     let actions = actions.child(
         Button::new("host-navigation-sftp-workbench")
+            .debug_selector(|| "host-navigation-sftp-workbench".into())
             .compact()
             .ghost()
             .w(px(metrics.action_width))
@@ -2595,6 +2619,7 @@ fn local_profile_row(
             let delete_id = id.clone();
             menu = menu.item(
                 PopupMenuItem::new(crate::locale::text("删除本地主机…", "Delete local host…"))
+                    .danger()
                     .on_click(move |_, _, app| {
                         delete_entity.update(app, |navigation, cx| {
                             navigation.request_local_profile_action(
@@ -2681,6 +2706,7 @@ fn group_context_menu(
     let delete_id = group_id;
     menu.item(
         PopupMenuItem::new(crate::locale::text("删除分组…", "Delete group…"))
+            .danger()
             .icon(gpui_kit::assets::IconName::Trash)
             .on_click(move |_, _, app| {
                 delete_entity.update(app, |navigation, cx| {
@@ -2851,6 +2877,7 @@ fn pinned_container_row(
         .separator()
         .item(
             PopupMenuItem::new(crate::locale::text("从侧栏移除", "Remove from sidebar"))
+                .danger()
                 .icon(gpui_kit::assets::IconName::Trash)
                 .on_click(move |_, _, app| {
                     remove_entity.update(app, |navigation, cx| {
@@ -2863,12 +2890,11 @@ fn pinned_container_row(
     div().w_full().pl_4().child(row)
 }
 
-/// 整行一次性构造连接行；右键按协议提供连接、文件、容器与配置动作，始终绑定此行主机。
+/// 整行一次性构造连接行；右键按协议提供连接、文件与配置动作，始终绑定此行主机。
 /// 外层按钮占满可用宽度，选中与悬停色沿用主题令牌，协议动作仍绑定稳定 HostId。
 /// 键盘确认与鼠标双击共享明确连接意图，鼠标单击只更新目录选中态。
 /// 行焦点按 HostId 保持，点击后的 Enter 不依赖 Kit 默认禁止的鼠标聚焦行为。
 /// 状态点依附图标绘制，未打开会话用中性色，不占用名称或右侧列宽。
-/// 容器入口只对 SSH 可见，动作携带此行 HostId，不能借用当前其它标签的工具上下文。
 /// @author kongweiguang
 fn host_row(
     navigation: &mut HostNavigation,
@@ -3057,19 +3083,6 @@ fn host_row(
                     }),
             );
         }
-        if protocol == RemoteProtocol::Ssh {
-            let container_entity = menu_entity.clone();
-            let container_id = menu_id.clone();
-            menu = menu.item(
-                PopupMenuItem::new(crate::locale::text("容器", "Containers"))
-                    .icon(gpui_kit::assets::IconName::Box)
-                    .on_click(move |_, _, app| {
-                        container_entity.update(app, |navigation, cx| {
-                            navigation.request_host_containers(container_id.clone(), cx);
-                        });
-                    }),
-            );
-        }
         if !readonly {
             let group_entity = menu_entity.clone();
             let group_id = menu_group_id.clone();
@@ -3102,18 +3115,6 @@ fn host_row(
                 }),
             );
         }
-
-        let details_entity = menu_entity.clone();
-        let details_id = menu_id.clone();
-        menu = menu.separator().item(
-            PopupMenuItem::new(crate::locale::text("查看连接详情", "Connection details"))
-                .icon(gpui_kit::assets::IconName::Info)
-                .on_click(move |_, _, app| {
-                    details_entity.update(app, |navigation, cx| {
-                        navigation.request_host_action(details_id.clone(), HostAction::Details, cx)
-                    });
-                }),
-        );
 
         if !readonly {
             menu = menu.separator();
@@ -3212,6 +3213,7 @@ fn host_row(
             let delete_id = menu_id.clone();
             menu = menu.separator().item(
                 PopupMenuItem::new(crate::locale::text("删除连接…", "Delete connection…"))
+                    .danger()
                     .icon(gpui_kit::assets::IconName::Trash)
                     .on_click(move |_, _, app| {
                         delete_entity.update(app, |navigation, cx| {

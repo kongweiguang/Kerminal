@@ -706,22 +706,200 @@ impl ExternalPaths {
 pub enum ExternalDragPayload {
     /// Real on-disk paths, handed to the platform as an outbound file drag.
     Files(FileDragPaths),
+    /// 延迟发布远端内容，目标请求文件流时才准备正文。
+    #[cfg(windows)]
+    DeferredFiles(DeferredFileDrag),
 }
+
+/// 持有暂存文件直到原生目标确认读取结束。
+#[cfg(windows)]
+pub trait ExternalFileDragOwner: Send + Sync + 'static {
+    /// 无法确认目标完成时保留暂存材料。
+    fn preserve(&self);
+}
+
+/// 已准备的路径与其生命周期 owner 一起传递。
+#[cfg(windows)]
+#[non_exhaustive]
+pub struct PreparedExternalFileDrag {
+    /// 已完成且可由系统文件管理器读取的本机路径。
+    pub paths: FileDragPaths,
+    /// 与路径共同持有的暂存所有权，直到目标结束读取。
+    pub owner: std::sync::Arc<dyn ExternalFileDragOwner>,
+}
+
+#[cfg(windows)]
+impl PreparedExternalFileDrag {
+    /// 路径必须与 owner 一起建立，后续可扩展交接状态而不让调用方依赖字段穷举。
+    pub fn new(paths: FileDragPaths, owner: std::sync::Arc<dyn ExternalFileDragOwner>) -> Self {
+        Self { paths, owner }
+    }
+}
+
+/// 一个虚拟文件或目录及其相对路径；顺序与系统 FileContents 索引一致。
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ExternalFileDescriptor {
+    /// 不含父级跳转的相对路径，路径层级以 `/` 表示。
+    pub relative_path: String,
+    /// 目录不提供内容流，但必须保留空目录。
+    pub is_directory: bool,
+    /// 源可确认的文件长度；未知长度不向系统编造。
+    pub size: Option<u64>,
+    /// 该项属于哪一个已冻结的来源根。
+    pub root_index: usize,
+}
+
+#[cfg(windows)]
+impl ExternalFileDescriptor {
+    /// 保留根索引和完整相对路径，平台只负责序列化，来源验证仍由 provider 完成。
+    pub fn new(
+        relative_path: String,
+        is_directory: bool,
+        size: Option<u64>,
+        root_index: usize,
+    ) -> Self {
+        Self {
+            relative_path,
+            is_directory,
+            size,
+            root_index,
+        }
+    }
+}
+
+/// 区分准备、放置和目标复制结果，不把放置回执当作复制完成。
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub enum ExternalFileDragOutcome {
+    /// 用户取消拖动，目标没有确认复制。
+    Cancelled,
+    /// 目标明确报告异步复制完成。
+    Completed,
+    /// 目标未返回可靠完成回执，暂存材料应保留。
+    OutcomeUnknown,
+    /// 准备或系统拖放失败，包含可展示的错误原因。
+    Failed(String),
+}
+
+/// 准备运行在前台线程之外，取消必须通知底层传输。
+#[cfg(windows)]
+pub trait DeferredFileDragProvider: Send + Sync + 'static {
+    /// 仅读取目录元数据并返回完整清单，不预取文件正文。
+    fn describe(&self) -> Result<Vec<ExternalFileDescriptor>, String>;
+    /// 在后台准备完整路径，避免把未完成文件交给系统。
+    fn prepare(&self) -> Result<PreparedExternalFileDrag, String>;
+    /// 取消来源准备，调用方仍需等待资源安全收尾。
+    fn cancel(&self);
+    /// 平台收尾时识别已取消的准备，避免把活跃传输误判为超时。
+    fn is_cancelled(&self) -> bool;
+    /// 反馈真实终态，供原界面展示而不改绑新的目标。
+    fn finish(&self, outcome: ExternalFileDragOutcome);
+}
+
+/// 仅比较载荷身份，不暴露或比较捕获的服务状态。
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct DeferredFileDrag(
+    /// 为本次手势独立冻结的后台准备与结果回执。
+    pub std::sync::Arc<dyn DeferredFileDragProvider>,
+);
+
+#[cfg(windows)]
+impl std::fmt::Debug for DeferredFileDrag {
+    /// 调试输出不暴露路径、凭据或服务内部状态。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DeferredFileDrag(..)")
+    }
+}
+
+#[cfg(windows)]
+impl PartialEq for DeferredFileDrag {
+    /// 只有同一捕获的 provider 才表示同一次手势。
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[cfg(windows)]
+impl Eq for DeferredFileDrag {}
 
 /// Paths handed to the platform for a native file drag. Directory metadata is
 /// provided by the caller to avoid querying it when the platform drag starts.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct FileDragPaths(SmallVec<[(PathBuf, bool); 2]>);
+pub struct FileDragPaths {
+    entries: SmallVec<[(PathBuf, bool); 2]>,
+    #[cfg(windows)]
+    feedback: Option<ExternalDragFeedback>,
+}
+
+/// 本机拖出也需回传失败；共享一次性回执避免多个平台载荷副本重复通知。
+#[cfg(windows)]
+#[derive(Clone)]
+struct ExternalDragFeedback(
+    std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnOnce(ExternalFileDragOutcome) + Send>>>>,
+);
+
+#[cfg(windows)]
+impl std::fmt::Debug for ExternalDragFeedback {
+    /// 不在调试输出中暴露应用回调或捕获的上下文。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ExternalDragFeedback(..)")
+    }
+}
+
+#[cfg(windows)]
+impl PartialEq for ExternalDragFeedback {
+    /// 回执由其共享 owner 的身份区分，不比较闭包内部状态。
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[cfg(windows)]
+impl Eq for ExternalDragFeedback {}
 
 impl FileDragPaths {
     /// Creates a native file-drag payload from paths paired with whether each path is a directory.
     pub fn new(entries: impl IntoIterator<Item = (PathBuf, bool)>) -> Self {
-        Self(entries.into_iter().collect())
+        Self {
+            entries: entries.into_iter().collect(),
+            #[cfg(windows)]
+            feedback: None,
+        }
     }
 
     /// The dragged paths, each paired with whether it is a directory.
     pub fn entries(&self) -> &[(PathBuf, bool)] {
-        &self.0
+        &self.entries
+    }
+
+    /// Windows 源面板可接收真实系统结果，回调至多执行一次。
+    #[cfg(windows)]
+    pub fn on_finished(
+        mut self,
+        callback: impl FnOnce(ExternalFileDragOutcome) + Send + 'static,
+    ) -> Self {
+        self.feedback = Some(ExternalDragFeedback(std::sync::Arc::new(
+            std::sync::Mutex::new(Some(Box::new(callback))),
+        )));
+        self
+    }
+
+    /// 由平台线程交付回执；先取出回调再执行，避免回调重入造成死锁。
+    #[cfg(windows)]
+    pub fn finish(&self, outcome: ExternalFileDragOutcome) {
+        let callback = self.feedback.as_ref().and_then(|feedback| {
+            feedback
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+        });
+        if let Some(callback) = callback {
+            callback(outcome);
+        }
     }
 }
 

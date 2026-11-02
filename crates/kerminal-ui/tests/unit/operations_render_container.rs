@@ -5,7 +5,8 @@
 use super::super::add_container_detail_soft_breaks;
 use super::{
     ComposeProjectDisplayMetadata, ContainerRowActivation, ContainerStatsDisplay,
-    compose_project_display_metadata, container_row_activation, container_stats_display,
+    compose_project_display_metadata, compose_project_element_key, container_row_activation,
+    container_stats_display, format_container_stats_raw,
 };
 use kerminal_domain::{
     identity::HostId,
@@ -174,6 +175,41 @@ fn container_stats_display_has_stable_empty_state_before_first_response() {
     assert!(display.raw.is_empty());
 }
 
+/// JSON 展示可折行但不能丢字段或裁掉长 ID；反序列化对比防止漂亮输出改变原始语义。
+///
+/// @author kongweiguang
+#[test]
+fn container_stats_json_is_multiline_and_preserves_complete_values() {
+    let original = serde_json::json!({
+        "Container": "a".repeat(128),
+        "CPUPerc": "12.5%",
+        "nested": { "samples": [1, 2, 3], "名称": "容器统计" }
+    });
+    let raw = serde_json::to_string(&original).expect("serialize sample");
+    let formatted = format_container_stats_raw(&raw);
+
+    assert!(formatted.lines().count() > 5);
+    assert!(formatted.contains(&"a".repeat(128)));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&formatted).expect("valid pretty JSON"),
+        original
+    );
+}
+
+/// 非 JSON 诊断须逐字保留，不能因格式化失败把可恢复的原始输出变为空白。
+///
+/// @author kongweiguang
+#[test]
+fn container_stats_non_json_keeps_complete_diagnostic() {
+    for raw in [
+        "",
+        "runtime returned no sample\nretry later",
+        "{\"partial\":",
+    ] {
+        assert_eq!(format_container_stats_raw(raw), raw);
+    }
+}
+
 /// Compose 空项目仍使用完整目标解析相对 YAML 路径并稳定显示 runtime family。
 ///
 /// @author kongweiguang
@@ -196,6 +232,30 @@ fn compose_project_display_resolves_paths_for_retained_empty_projects() {
             config_paths: vec!["/srv/web/compose.yaml".to_owned()],
             warnings: Vec::new(),
         }
+    );
+}
+
+/// 同名项目在列表重排后仍按完整身份保留菜单及焦点，不能复用另一个目录的控件。
+///
+/// @author kongweiguang
+#[test]
+fn compose_project_controls_use_full_stable_identity() {
+    let first = ComposeProjectTarget {
+        host_id: Some(HostId::new()),
+        runtime: ContainerRuntime::Docker,
+        project: "web".to_owned(),
+        working_dir: "/srv/one".to_owned(),
+        config_files: vec!["compose.yaml".to_owned()],
+    };
+    let mut second = first.clone();
+    second.working_dir = "/srv/two".to_owned();
+    assert_eq!(
+        compose_project_element_key(&first),
+        compose_project_element_key(&first.clone())
+    );
+    assert_ne!(
+        compose_project_element_key(&first),
+        compose_project_element_key(&second)
     );
 }
 

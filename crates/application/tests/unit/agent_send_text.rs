@@ -2689,26 +2689,51 @@ async fn unknown_writer_ack_is_returned_without_retry() {
     assert_eq!(sessions.submitted_text(), vec!["confirmed text".to_owned()]);
 }
 
-/// 当前目标仅在候选存在时显示匹配历史；全部与归档视图保持独立列表及准确计数。
+/// 当前视图按会话归属而非临时终端身份筛选；全部和归档仍隔离且计数准确。
 ///
 /// @author kongweiguang
 #[tokio::test]
-async fn history_modes_filter_by_target_and_keep_archived_count() {
-    let current_target = stale_target("local://terminal-a");
-    let other_target = stale_target("local://terminal-b");
-    let current = agent_with_history_binding(
+async fn history_modes_filter_by_scope_and_keep_archived_count() {
+    let current_tab = TabId::new();
+    let mut current_target = stale_target("local://terminal-a");
+    current_target.tab_id = Some(current_tab.clone());
+    let mut other_target = stale_target("local://terminal-b");
+    other_target.tab_id = Some(current_tab.clone());
+    let mut current = agent_with_history_binding(
         AgentSessionId::new(),
         AgentSessionStatus::Stale,
         current_target.clone(),
     );
-    let other = agent_with_history_binding(
+    current.scope = Some(AgentSessionScope::Tab {
+        tab_id: current_tab.clone(),
+    });
+    let mut other = agent_with_history_binding(
         AgentSessionId::new(),
         AgentSessionStatus::Stale,
         other_target,
     );
+    other.scope = current.scope.clone();
+    let foreign_tab = TabId::new();
+    let mut foreign_target = stale_target("local://terminal-c");
+    foreign_target.tab_id = Some(foreign_tab.clone());
+    let mut foreign = agent_with_history_binding(
+        AgentSessionId::new(),
+        AgentSessionStatus::Stale,
+        foreign_target,
+    );
+    foreign.scope = Some(AgentSessionScope::Tab {
+        tab_id: foreign_tab.clone(),
+    });
+    let global = agent_with_history_binding(
+        AgentSessionId::new(),
+        AgentSessionStatus::Stale,
+        AgentTargetBinding::unbound(0),
+    );
     let archived = custom_history_agent(AgentSessionId::new());
     let current_id = current.agent_session_id.clone();
     let other_id = other.agent_session_id.clone();
+    let foreign_id = foreign.agent_session_id.clone();
+    let global_id = global.agent_session_id.clone();
     let archived_id = archived.agent_session_id.clone();
     let workspace = Arc::new(MemoryAgentWorkspace::new(
         current,
@@ -2716,6 +2741,8 @@ async fn history_modes_filter_by_target_and_keep_archived_count() {
         CommitBehavior::Accept,
     ));
     workspace.insert_history_session(other, codex_provider_session());
+    workspace.insert_history_session(foreign, codex_provider_session());
+    workspace.insert_history_session(global, codex_provider_session());
     workspace.insert_history_session(archived, custom_provider_session());
     let service = agent_service(
         workspace,
@@ -2729,7 +2756,9 @@ async fn history_modes_filter_by_target_and_keep_archived_count() {
     let current_view = service
         .history(
             AgentHistoryRequest {
-                scope: AgentSessionScope::Global,
+                scope: AgentSessionScope::Tab {
+                    tab_id: current_tab.clone(),
+                },
                 target_candidate: Some(current_target),
                 mode: AgentHistoryMode::CurrentTarget,
             },
@@ -2737,12 +2766,54 @@ async fn history_modes_filter_by_target_and_keep_archived_count() {
         )
         .await
         .expect("current target history is a read-only projection");
-    assert_eq!(current_view.visible_session_ids, vec![current_id.clone()]);
-    assert_eq!(current_view.current_target_count, 1);
-    assert_eq!(current_view.all_count, 2);
+    assert!(current_view.visible_session_ids.contains(&current_id));
+    assert!(current_view.visible_session_ids.contains(&other_id));
+    assert!(!current_view.visible_session_ids.contains(&foreign_id));
+    assert!(!current_view.visible_session_ids.contains(&global_id));
+    assert_eq!(current_view.visible_session_ids.len(), 2);
+    assert_eq!(current_view.current_target_count, 2);
+    assert_eq!(current_view.all_count, 4);
     assert_eq!(current_view.archived_count, 1);
 
     let no_candidate_view = service
+        .history(
+            AgentHistoryRequest {
+                scope: AgentSessionScope::Tab {
+                    tab_id: current_tab,
+                },
+                target_candidate: None,
+                mode: AgentHistoryMode::CurrentTarget,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("losing a target candidate does not hide chats in the current scope");
+    assert!(no_candidate_view.visible_session_ids.contains(&current_id));
+    assert!(no_candidate_view.visible_session_ids.contains(&other_id));
+    assert!(!no_candidate_view.visible_session_ids.contains(&foreign_id));
+    assert!(!no_candidate_view.visible_session_ids.contains(&global_id));
+    assert_eq!(no_candidate_view.visible_session_ids.len(), 2);
+    assert_eq!(no_candidate_view.current_target_count, 2);
+    assert_eq!(no_candidate_view.all_count, 4);
+    assert_eq!(no_candidate_view.archived_count, 1);
+
+    let foreign_view = service
+        .history(
+            AgentHistoryRequest {
+                scope: AgentSessionScope::Tab {
+                    tab_id: foreign_tab,
+                },
+                target_candidate: None,
+                mode: AgentHistoryMode::CurrentTarget,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("another tab shows only its own chats");
+    assert_eq!(foreign_view.visible_session_ids, vec![foreign_id.clone()]);
+    assert_eq!(foreign_view.current_target_count, 1);
+
+    let global_view = service
         .history(
             AgentHistoryRequest {
                 scope: AgentSessionScope::Global,
@@ -2752,11 +2823,9 @@ async fn history_modes_filter_by_target_and_keep_archived_count() {
             CancellationToken::new(),
         )
         .await
-        .expect("without a new-session target the current-target view is empty");
-    assert!(no_candidate_view.visible_session_ids.is_empty());
-    assert_eq!(no_candidate_view.current_target_count, 0);
-    assert_eq!(no_candidate_view.all_count, 2);
-    assert_eq!(no_candidate_view.archived_count, 1);
+        .expect("the global scope retains its own unbound chat");
+    assert_eq!(global_view.visible_session_ids, vec![global_id.clone()]);
+    assert_eq!(global_view.current_target_count, 1);
 
     let all_view = service
         .history(
@@ -2771,8 +2840,10 @@ async fn history_modes_filter_by_target_and_keep_archived_count() {
         .expect("all mode includes non-archived sessions across target candidates");
     assert!(all_view.visible_session_ids.contains(&current_id));
     assert!(all_view.visible_session_ids.contains(&other_id));
+    assert!(all_view.visible_session_ids.contains(&foreign_id));
+    assert!(all_view.visible_session_ids.contains(&global_id));
     assert!(!all_view.visible_session_ids.contains(&archived_id));
-    assert_eq!(all_view.visible_session_ids.len(), 2);
+    assert_eq!(all_view.visible_session_ids.len(), 4);
 
     let archived_view = service
         .history(

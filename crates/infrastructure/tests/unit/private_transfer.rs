@@ -175,6 +175,7 @@ fn recovery_evidence_accepts_original_stage_owner_for_a_retry_successor() -> App
     };
     let record = TransferRecoveryRecord {
         id: successor_id.clone(),
+        drag_staging: false,
         request: TransferRequest {
             source: FileEndpoint::Local {
                 path: PathBuf::from("source.bin"),

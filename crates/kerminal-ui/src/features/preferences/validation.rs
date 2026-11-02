@@ -95,6 +95,55 @@ pub type SettingsDraft = SettingsSnapshot;
 /// 快捷键表单直接编辑应用投影，不复制 action 元数据和扩展字段语义。
 pub type KeybindingDraft = KeybindingPreference;
 
+/// 取某一平台的当前生效绑定；Linux 未设置时保持旧版 Windows 字段回退语义。
+///
+/// @author kongweiguang
+pub(super) fn binding_for_platform(
+    binding: &KeybindingPreference,
+    platform: KeyboardPlatform,
+) -> String {
+    match platform {
+        KeyboardPlatform::Windows => effective_binding(&binding.windows_binding, &binding.binding),
+        KeyboardPlatform::Mac => effective_binding(&binding.mac_binding, &binding.binding),
+        KeyboardPlatform::Linux => binding
+            .linux_binding
+            .clone()
+            .unwrap_or_else(|| effective_binding(&binding.windows_binding, &binding.binding)),
+    }
+}
+
+/// 平台字段为空时只回退通用字段；显式空字符串仍表示该平台禁用。
+///
+/// @author kongweiguang
+pub(super) fn effective_binding(platform: &str, fallback: &str) -> String {
+    if platform.trim().is_empty() {
+        fallback.to_owned()
+    } else {
+        platform.to_owned()
+    }
+}
+
+/// 恢复按钮只比较该平台自己的持久字段；Linux 的缺省表示跟随，不应被当成自定义。
+///
+/// @author kongweiguang
+pub(super) fn binding_is_customized(
+    binding: &KeybindingPreference,
+    default: &KeybindingPreference,
+    platform: KeyboardPlatform,
+) -> bool {
+    match platform {
+        KeyboardPlatform::Windows => {
+            effective_binding(&binding.windows_binding, &binding.binding)
+                != effective_binding(&default.windows_binding, &default.binding)
+        }
+        KeyboardPlatform::Mac => {
+            effective_binding(&binding.mac_binding, &binding.binding)
+                != effective_binding(&default.mac_binding, &default.binding)
+        }
+        KeyboardPlatform::Linux => binding.linux_binding != default.linux_binding,
+    }
+}
+
 /// 校验完整 typed snapshot；快捷键使用运行时同一 GPUI parser，保留未知 action 警告。
 ///
 /// @author kongweiguang
@@ -222,10 +271,6 @@ pub fn validate_settings(draft: &SettingsDraft, platform: KeyboardPlatform) -> V
             || keybinding.mac_binding.len() > 128
             || keybinding
                 .linux_binding
-                .as_ref()
-                .is_some_and(|binding| binding.len() > 128)
-            || keybinding
-                .windows_alternate_binding
                 .as_ref()
                 .is_some_and(|binding| binding.len() > 128)
         {

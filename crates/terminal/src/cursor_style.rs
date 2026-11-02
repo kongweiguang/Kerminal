@@ -1,4 +1,4 @@
-//! 追踪 DECSCUSR 的来源状态，让 UI 用户默认形状不覆盖终端显式设置。
+//! 追踪光标形状和闪烁来源，让用户默认值与终端显式协议保持各自的优先级。
 //!
 //! @author kongweiguang
 
@@ -18,7 +18,7 @@ enum ScanState {
     ControlStringEscape,
 }
 
-/// 有界扫描 VT 控制序列，只标记有效 DECSCUSR，避免文本与 OSC 内容误设 UI 优先级。
+/// 有界扫描 VT 光标序列，避免文本与 OSC 内容误设形状或闪烁的来源优先级。
 ///
 /// @author kongweiguang
 #[derive(Default)]
@@ -28,10 +28,11 @@ pub(crate) struct CursorStyleTracker {
     intermediates: Vec<u8>,
     overflowed: bool,
     terminal_styled: bool,
+    terminal_blink_styled: bool,
 }
 
 impl CursorStyleTracker {
-    /// 按原始字节顺序跨 PTY 分块识别 DECSCUSR、RIS 和 DECSTR；序列缓冲固定有界。
+    /// 按原始字节顺序跨 PTY 分块识别光标协议及复位；序列缓冲固定有界。
     ///
     /// @author kongweiguang
     pub(crate) fn advance(&mut self, bytes: &[u8]) {
@@ -48,6 +49,7 @@ impl CursorStyleTracker {
                     b'P' | b'X' | b'^' | b'_' => self.state = ScanState::ControlString,
                     b'c' => {
                         self.terminal_styled = false;
+                        self.terminal_blink_styled = false;
                         self.state = ScanState::Ground;
                     }
                     0x1b => self.state = ScanState::Escape,
@@ -86,6 +88,13 @@ impl CursorStyleTracker {
         self.terminal_styled
     }
 
+    /// 与形状分开追踪 DEC 模式 12；未显式指定闪烁时允许界面使用用户默认值。
+    ///
+    /// @author kongweiguang
+    pub(crate) const fn is_terminal_blink_styled(&self) -> bool {
+        self.terminal_blink_styled
+    }
+
     /// 初始化一个全新 CSI 候选并清空上次有界参数缓存。
     ///
     /// @author kongweiguang
@@ -96,7 +105,7 @@ impl CursorStyleTracker {
         self.state = ScanState::Csi;
     }
 
-    /// 解析 CSI 参数/中间字节直到 final；仅接受明确的 DECSCUSR/DECSTR 形式。
+    /// 解析 CSI 参数/中间字节直到 final，交由有界规则判断光标来源与复位。
     ///
     /// @author kongweiguang
     fn advance_csi(&mut self, byte: u8, in_intermediate: bool) {
@@ -133,7 +142,7 @@ impl CursorStyleTracker {
         }
     }
 
-    /// 只有单个合法光标参数会切换来源位，RIS/DECSTR 则恢复用户默认优先级。
+    /// 只接受有效光标形态或 DEC 私有模式 12；重置序列恢复用户默认优先级。
     ///
     /// @author kongweiguang
     fn finish_csi(&mut self, final_byte: u8) {
@@ -146,12 +155,31 @@ impl CursorStyleTracker {
             && (self.parameters.is_empty()
                 || (self.parameters.len() == 1 && (b'0'..=b'6').contains(&self.parameters[0])))
         {
-            self.terminal_styled = true;
+            let uses_terminal_style = !self.parameters.is_empty() && self.parameters != b"0";
+            self.terminal_styled = uses_terminal_style;
+            self.terminal_blink_styled = uses_terminal_style;
+        } else if matches!(final_byte, b'h' | b'l')
+            && self.intermediates.is_empty()
+            && self.parameters.first() == Some(&b'?')
+            && self.parameters[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b';')
+            && self.parameters[1..]
+                .split(|byte| *byte == b';')
+                .any(|value| {
+                    std::str::from_utf8(value)
+                        .ok()
+                        .and_then(|value| value.parse::<u16>().ok())
+                        == Some(12)
+                })
+        {
+            self.terminal_blink_styled = true;
         } else if final_byte == b'p'
             && self.intermediates.as_slice() == b"!"
             && self.parameters.is_empty()
         {
             self.terminal_styled = false;
+            self.terminal_blink_styled = false;
         }
     }
 }

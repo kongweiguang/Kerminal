@@ -350,7 +350,8 @@ fn validate_external_tests(name: &str, package: &Value, violations: &mut Vec<Str
     }
 }
 
-/// 以语法锚定的属性检查避免把注释或测试文案当成实现，同时验证 path 确实落在 tests/。
+/// 以语法锚定的属性检查区分外置测试的导入与实现；受限重导出同样不携带测试行为。
+/// 同时验证 path 确实落在 tests/，不因导入可见性放宽测试函数和状态的边界。
 fn validate_source_test_policy(
     package_name: &str,
     package_root: &Path,
@@ -368,6 +369,8 @@ fn validate_source_test_policy(
     let module_declaration =
         Regex::new(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;")
             .expect("static external module expression is valid");
+    let import_declaration =
+        Regex::new(r"^(?:pub(?:\([^)]*\))?\s+)?use\s+").expect("static import expression is valid");
     let lines = contents.lines().collect::<Vec<_>>();
 
     for (index, line) in lines.iter().enumerate() {
@@ -398,7 +401,8 @@ fn validate_source_test_policy(
         }
 
         // cfg(test) 的 use 仅准备外置测试编译环境，不包含测试行为或产品状态。
-        if next_attribute_item(&lines, index).is_some_and(|item| item.starts_with("use ")) {
+        if next_attribute_item(&lines, index).is_some_and(|item| import_declaration.is_match(item))
+        {
             continue;
         }
 

@@ -428,6 +428,22 @@ impl OperationsView {
         ))
     }
 
+    /// 只读生产请求代次与呈现状态，验收不通过额外请求或伪造快照掩盖交互问题。
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_tmux_presentation(
+        &self,
+        host_id: &HostId,
+    ) -> Result<(u64, bool, bool, bool, bool), String> {
+        self.validate_acceptance_target(OperationsSection::Tmux, host_id)?;
+        Ok((
+            self.tmux.acceptance_request_id(),
+            self.tmux_panel.acceptance_quickref_open(),
+            self.tmux.phase() == super::state::SectionPhase::Loading,
+            self.tmux.data().is_some(),
+            self.status.is_some(),
+        ))
+    }
+
     /// 读取当前 tmux 快照内首个属于其 capability target 的真实会话，拒绝跨目标展开。
     ///
     /// @author kongweiguang

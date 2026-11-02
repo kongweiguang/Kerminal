@@ -57,7 +57,10 @@ pub(super) fn inspect_root(
     match marker_read {
         marker::MarkerRead::Blocked(blocker) => blockers.push(blocker),
         marker::MarkerRead::Current => {
-            if journal_scan.target_migration_contract == Some(marker::PREVIOUS_MIGRATION_CONTRACT) {
+            if journal_scan
+                .target_migration_contract
+                .is_some_and(|contract| contract != marker::CURRENT_MIGRATION_CONTRACT)
+            {
                 blockers.push(DataMigrationBlocker::CorruptMigrationJournal);
             }
             if let Err(blocker) = operational_state::validate_current_operational_state(root) {
@@ -76,10 +79,12 @@ pub(super) fn inspect_root(
                 journal_scan.recovery_pending,
             ));
         }
-        marker::MarkerRead::PreviousSupported => {
-            if journal_scan.committed
-                && journal_scan.target_migration_contract
-                    == Some(marker::CURRENT_MIGRATION_CONTRACT)
+        marker::MarkerRead::PreviousSupported(contract) => {
+            if journal_scan
+                .target_migration_contract
+                .is_some_and(|target| {
+                    target < contract || journal_scan.committed && target != contract
+                })
             {
                 blockers.push(DataMigrationBlocker::CorruptMigrationJournal);
             }
@@ -100,7 +105,7 @@ pub(super) fn inspect_root(
                     DataMigrationReadiness::Blocked
                 },
                 Some(marker::CURRENT_DATA_FORMAT),
-                Some(marker::PREVIOUS_MIGRATION_CONTRACT),
+                Some(contract),
                 blockers,
                 vec![],
                 journal_scan.recovery_pending,
@@ -195,7 +200,10 @@ pub(super) fn inspect_current_fast_path(root: &Path) -> AppResult<Option<DataMig
     match marker::read_marker(root)? {
         marker::MarkerRead::Current => {
             let mut journal_scan = transaction::inspect_journals(root)?;
-            if journal_scan.target_migration_contract == Some(marker::PREVIOUS_MIGRATION_CONTRACT) {
+            if journal_scan
+                .target_migration_contract
+                .is_some_and(|contract| contract != marker::CURRENT_MIGRATION_CONTRACT)
+            {
                 journal_scan
                     .blockers
                     .push(DataMigrationBlocker::CorruptMigrationJournal);
@@ -218,7 +226,7 @@ pub(super) fn inspect_current_fast_path(root: &Path) -> AppResult<Option<DataMig
             )))
         }
         marker::MarkerRead::Blocked(blocker) => Ok(Some(blocked(blocker))),
-        marker::MarkerRead::Missing | marker::MarkerRead::PreviousSupported => Ok(None),
+        marker::MarkerRead::Missing | marker::MarkerRead::PreviousSupported(_) => Ok(None),
     }
 }
 
@@ -228,12 +236,20 @@ pub(super) fn collect_plan(
     legacy_window_state: Option<&Path>,
 ) -> Result<Vec<FileEdit>, DataMigrationBlocker> {
     let mut edits = Vec::new();
+    let mut vault_edits = vault::plan_vault_migration(root).map_err(|_| {
+        DataMigrationBlocker::ManagedDataInvalid {
+            relative_path: "secrets/vault.toml".to_owned(),
+        }
+    })?;
+    let profiles =
+        super::profile_hosts::plan_profile_hosts(root, root, &mut vault_edits, &Default::default())
+            .map_err(|_| DataMigrationBlocker::ConfigurationNotMigratable)?;
     edits.extend(
         configuration::plan_configuration_migration(root)
             .map_err(|_| DataMigrationBlocker::ConfigurationNotMigratable)?,
     );
     edits.extend(
-        agents::plan_agent_migration(root)
+        agents::plan_agent_migration_with_profiles(root, &profiles.mapping)
             .map_err(|_| DataMigrationBlocker::AgentWorkspaceNotMigratable)?,
     );
     let workspace_source = read_optional_regular_file(
@@ -244,18 +260,15 @@ pub(super) fn collect_plan(
     .map_err(|_| DataMigrationBlocker::ManagedDataInvalid {
         relative_path: "workspace/session.json".to_owned(),
     })?;
-    if let Some(edit) = workspace::plan_workspace_migration(workspace_source).map_err(|_| {
-        DataMigrationBlocker::ManagedDataInvalid {
+    if let Some(edit) = workspace::plan_workspace_migration(workspace_source, &profiles.mapping)
+        .map_err(|_| DataMigrationBlocker::ManagedDataInvalid {
             relative_path: "workspace/session.json".to_owned(),
-        }
-    })? {
+        })?
+    {
         edits.push(edit);
     }
-    edits.extend(vault::plan_vault_migration(root).map_err(|_| {
-        DataMigrationBlocker::ManagedDataInvalid {
-            relative_path: "secrets/vault.toml".to_owned(),
-        }
-    })?);
+    edits.extend(profiles.edits);
+    edits.extend(vault_edits);
     edits.extend(
         window_state::plan_window_state_migration(root, legacy_window_state)
             .map_err(|_| DataMigrationBlocker::WindowStateNotMigratable)?,
@@ -329,6 +342,7 @@ pub(super) fn validate_edits(root: &Path, edits: &[FileEdit]) -> Result<(), Data
             || normalized == "settings.toml"
             || normalized == "hosts/groups.toml"
             || normalized == "secrets/vault.toml"
+            || normalized == "secrets/vault-key.toml" && edit.before.is_none()
             || normalized == "kerminal-config.md"
             || normalized == marker::MARKER_FILE_NAME
             || agent_shape
@@ -835,8 +849,12 @@ fn edit_path_is_safe(root: &Path, relative: &Path, before: Option<&[u8]>) -> boo
     }
     let mut current = root.to_path_buf();
     let parts = relative.components().collect::<Vec<_>>();
+    let mut missing_parent = false;
     for (index, part) in parts.iter().enumerate() {
         current.push(part.as_os_str());
+        if missing_parent {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink()
@@ -849,11 +867,14 @@ fn edit_path_is_safe(root: &Path, relative: &Path, before: Option<&[u8]>) -> boo
                     return false;
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound && index + 1 == parts.len() => {
-                return before.is_none();
+            Err(error) if error.kind() == io::ErrorKind::NotFound && before.is_none() => {
+                missing_parent = true;
             }
             Err(_) => return false,
         }
+    }
+    if missing_parent {
+        return true;
     }
     match (before, fs::read(current)) {
         (Some(expected), Ok(actual)) => expected == actual,

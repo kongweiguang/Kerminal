@@ -6,12 +6,19 @@ use std::{
     future::Future,
     io,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::storage::{AtomicCommitError, CommitMode, commit_staged_file};
 use async_trait::async_trait;
-use kerminal_application::{AppError, AppResult, files::FileAccessProvider};
+use kerminal_application::{
+    AppError, AppResult,
+    files::{FileAccessProvider, drag_out::DragStaging},
+};
 use kerminal_domain::files::{
     DeleteTargetKind, DirectoryListing, FileEndpoint, FileEntry, FileEntryKind, FilePreview,
     FileRevision, LineEnding, TextDocument, WriteTextRequest, WriteTextResult, WriteTextStrategy,
@@ -28,11 +35,168 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalFileProvider;
 
+/// 暂存目录由最后一个系统拖放 owner 释放；未知提交时永久保留以便恢复。
+struct LocalDragStaging {
+    root: PathBuf,
+    directory: Mutex<Option<tempfile::TempDir>>,
+    preserve: AtomicBool,
+    removed: AtomicBool,
+}
+
+#[async_trait]
+impl DragStaging for LocalDragStaging {
+    /// 校验单层 Windows 名称后才拼接到私有根，避免路径穿越和设备名重定向。
+    ///
+    /// @author kongweiguang
+    fn path_for(&self, name: &str) -> AppResult<PathBuf> {
+        if !valid_drag_name(name) {
+            return Err(AppError::invalid(
+                "文件名不能安全保存到本机，请重命名后重试",
+            ));
+        }
+        Ok(self.root.join(name))
+    }
+
+    /// 原 owner 返回其私有根，避免从临时目录扫描推断恢复位置。
+    ///
+    /// @author kongweiguang
+    fn directory(&self) -> PathBuf {
+        self.root.clone()
+    }
+
+    /// 结果不明时保留原始目录，不能把超时解释为后端已停止写入。
+    ///
+    /// @author kongweiguang
+    fn preserve(&self) {
+        if !self.removed.load(Ordering::Acquire) {
+            self.preserve.store(true, Ordering::Release);
+        }
+    }
+
+    /// 只有明确保留的目录可作为恢复位置向用户展示。
+    ///
+    /// @author kongweiguang
+    fn is_preserved(&self) -> bool {
+        self.preserve.load(Ordering::Acquire) && !self.removed.load(Ordering::Acquire)
+    }
+
+    /// 清理在阻塞池执行并返回真实回执；失败保留恢复记录供人工核对。
+    ///
+    /// @author kongweiguang
+    async fn cleanup(&self) -> AppResult<()> {
+        let directory = self
+            .directory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let Some(directory) = directory else {
+            return if self.preserve.load(Ordering::Acquire) {
+                Err(AppError::outcome_unknown("拖出暂存清理结果未知"))
+            } else {
+                Ok(())
+            };
+        };
+        tokio::task::spawn_blocking(move || directory.close())
+            .await
+            .map_err(|error| AppError::infrastructure_with_source("拖出暂存清理任务失败", error))?
+            .map_err(|error| AppError::infrastructure_with_source("拖出暂存目录清理失败", error))?;
+        self.removed.store(true, Ordering::Release);
+        self.preserve.store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for LocalDragStaging {
+    /// 清理由独立线程执行，销毁 COM/GPUI owner 时不会同步遍历大目录。
+    ///
+    /// @author kongweiguang
+    fn drop(&mut self) {
+        let directory = self
+            .directory
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let Some(directory) = directory else { return };
+        let path = directory.keep();
+        if self.preserve.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(error) = std::thread::Builder::new()
+            .name("kerminal-drag-cleanup".into())
+            .spawn(move || {
+                if let Err(error) = std::fs::remove_dir_all(&path) {
+                    tracing::warn!(kind = ?error.kind(), "drag staging cleanup failed");
+                }
+            })
+        {
+            tracing::warn!(kind = ?error.kind(), "drag staging cleanup thread failed");
+        }
+    }
+}
+
+/// 即便当前在其他平台构建也按 Windows 目标校验，保证拖出名称不会改变含义。
+///
+/// @author kongweiguang
+fn valid_drag_name(name: &str) -> bool {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.ends_with([' ', '.'])
+        || name.encode_utf16().count() > 255
+        || name.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        })
+    {
+        return false;
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) {
+        return false;
+    }
+    if let Some(number) = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        && matches!(
+            number,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    {
+        return false;
+    }
+    true
+}
+
 #[async_trait]
 impl FileAccessProvider for LocalFileProvider {
     /// 本机适配器只接受 Local，避免把远程路径误交给宿主操作系统。
     fn supports(&self, endpoint: &FileEndpoint) -> bool {
         matches!(endpoint, FileEndpoint::Local { .. })
+    }
+
+    /// 临时目录只服务一次拖出；创建和后续删除都离开 GPUI 前台线程。
+    ///
+    /// @author kongweiguang
+    async fn create_drag_staging(&self) -> AppResult<Arc<dyn DragStaging>> {
+        let directory = tokio::task::spawn_blocking(|| {
+            tempfile::Builder::new().prefix("kerminal-drag-").tempdir()
+        })
+        .await
+        .map_err(|error| AppError::infrastructure_with_source("创建拖出暂存任务失败", error))?
+        .map_err(|error| AppError::infrastructure_with_source("创建拖出暂存目录失败", error))?;
+        Ok(Arc::new(LocalDragStaging {
+            root: directory.path().to_path_buf(),
+            directory: Mutex::new(Some(directory)),
+            preserve: AtomicBool::new(false),
+            removed: AtomicBool::new(false),
+        }))
     }
 
     /// 目录枚举只读且可能较慢，取消时丢弃未完成查询并释放迭代器，不保留后台工作。

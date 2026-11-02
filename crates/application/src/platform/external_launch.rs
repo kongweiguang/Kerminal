@@ -251,10 +251,14 @@ pub struct ExternalLaunchRequest {
     pub intent: ExternalLaunchIntent,
     pub display_name: Option<String>,
     pub identity_file: Option<PathBuf>,
+    /// 此请求显式要求 SSH 连接成功后打开 SFTP，不改变连接的主协议或意图。
+    pub open_sftp_after_connect: bool,
 }
 
 impl fmt::Debug for ExternalLaunchRequest {
     /// 外部请求中的命令、主机名和本机密钥路径不应进入默认 Debug 输出。
+    ///
+    /// @author kongweiguang
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ExternalLaunchRequest")
@@ -262,6 +266,7 @@ impl fmt::Debug for ExternalLaunchRequest {
             .field("protocol", &self.target.protocol)
             .field("username_present", &self.target.username.is_some())
             .field("identity_file_present", &self.identity_file.is_some())
+            .field("open_sftp_after_connect", &self.open_sftp_after_connect)
             .field("intent", &self.intent)
             .finish()
     }
@@ -359,6 +364,8 @@ pub struct ExternalRoutedTarget {
     pub intent: ExternalLaunchIntent,
     pub display_name: Option<String>,
     pub authentication_required: bool,
+    /// 仅初始使用 SSH agent 的目标允许用户选择一次性密码重试。
+    pub password_retry_available: bool,
     /// SSH 连接成功后额外打开同一目标的 SFTP；不改变 SSH 的主意图。
     pub open_sftp_after_connect: bool,
 }
@@ -372,12 +379,15 @@ impl ExternalRoutedTarget {
 
 impl fmt::Debug for ExternalRoutedTarget {
     /// 路由结果携带用户主机信息，诊断仅显示安全分类和会话动作。
+    ///
+    /// @author kongweiguang
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ExternalRoutedTarget")
             .field("lease", &self.lease)
             .field("classification", &self.classification)
             .field("authentication_required", &self.authentication_required)
+            .field("password_retry_available", &self.password_retry_available)
             .field("open_sftp_after_connect", &self.open_sftp_after_connect)
             .field("intent", &self.intent)
             .finish()
@@ -455,7 +465,10 @@ impl ExternalLaunchService {
         self.route_request(request).await
     }
 
-    /// 将已解析请求物化为一次性 host；精确保存匹配只影响安全分类，不继承其 Vault 凭据。
+    /// 将已解析请求物化为一次性 host；显式 SFTP 后续动作与偏好合并，但不改变 SSH 主意图。
+    /// 精确保存匹配只影响安全分类，不继承其 Vault 凭据。
+    ///
+    /// @author kongweiguang
     pub async fn route_request(
         &self,
         request: ExternalLaunchRequest,
@@ -479,9 +492,14 @@ impl ExternalLaunchService {
         };
         // 查找可能等待磁盘或缓存；再次读取策略可阻止等待期间被禁用的请求创建临时目标。
         self.ensure_source_enabled(request.source)?;
-        let open_sftp_after_connect = self.open_sftp_after_connect(&request.intent)?;
+        let open_sftp_after_connect = self.open_sftp_after_connect(&request.intent)?
+            || (request.open_sftp_after_connect
+                && matches!(&request.intent, ExternalLaunchIntent::SshTerminal { .. }));
         let authentication = authentication_hint(&request);
         let authentication_required = authentication == ExternalAuthenticationHint::PasswordPrompt;
+        let password_retry_available = authentication == ExternalAuthenticationHint::Agent
+            && matches!(&request.intent, ExternalLaunchIntent::SshTerminal { .. })
+            && identity.jump_hosts.is_empty();
         let lease = self
             .temporary_targets
             .register(ExternalTemporaryTargetSpec {
@@ -502,6 +520,7 @@ impl ExternalLaunchService {
             intent: request.intent,
             display_name: request.display_name,
             authentication_required,
+            password_retry_available,
             open_sftp_after_connect,
         };
         if authentication_required {

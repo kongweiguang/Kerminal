@@ -38,6 +38,8 @@ pub struct TransferStagingOwnership {
 pub struct TransferRecoveryRecord {
     pub id: TransferId,
     pub request: TransferRequest,
+    /// 此记录只描述拖出前的本机暂存，不能解释为系统目标已完成复制。
+    pub drag_staging: bool,
     pub actual_destination: Option<FileEndpoint>,
     pub checkpoint: Option<TransferCheckpoint>,
     pub staging_ownership: Vec<TransferStagingOwnership>,

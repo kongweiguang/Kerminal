@@ -599,6 +599,8 @@ impl PlatformWindow for TestWindow {
             crate::ExternalDragPayload::Files(paths) => {
                 state.external_drag_files.extend_from_slice(paths.entries());
             }
+            #[cfg(windows)]
+            crate::ExternalDragPayload::DeferredFiles(_) => {}
         }
         state.start_external_drag_result
     }

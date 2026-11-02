@@ -638,7 +638,26 @@ impl RootView {
         Some((endpoint, lease, binding.clone()))
     }
 
-    /// 同步同标签文件面板的可信 pane；切换过渡期间不把新目标写进旧实体，也不触碰 Agent 绑定。
+    /// 只有实际显示的活动文件可以提供浏览目录；后台文件与其它中央工具不能恢复已失效的目标。
+    ///
+    /// @author kongweiguang
+    pub(super) fn active_file_browser_target(
+        &self,
+    ) -> Option<(FileEndpoint, Option<ExternalTargetLease>)> {
+        if self.center_panel != CenterPanel::Editor {
+            return None;
+        }
+        let tab_id = self
+            .workspace_controller
+            .as_ref()?
+            .snapshot()
+            .active_tab_id
+            .as_ref()?;
+        self.workspace_files.file_browser_target(tab_id)
+    }
+
+    /// 优先绑定可信终端，文件 Tab 则只提供父目录及 lease，使连续浏览不依赖来源终端继续活动。
+    /// 文件来源不携带终端 binding；切换过渡期间不把新目标写进旧实体，也不触碰 Agent 绑定。
     ///
     /// @author kongweiguang
     fn try_bind_files_from_active_terminal(&mut self, cx: &mut Context<Self>) {
@@ -648,6 +667,10 @@ impl RootView {
         let (endpoint, lease, binding) = self
             .active_terminal_files_target()
             .map(|(endpoint, lease, binding)| (Some(endpoint), lease, Some(binding)))
+            .or_else(|| {
+                self.active_file_browser_target()
+                    .map(|(endpoint, lease)| (Some(endpoint), lease, None))
+            })
             .unwrap_or((None, None, None));
         if let Some(files) = self.sftp_panel.clone() {
             files.update(cx, move |files, cx| {

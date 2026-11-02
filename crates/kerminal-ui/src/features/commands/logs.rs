@@ -5,9 +5,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, Entity, IntoElement, Render, SharedString, Subscription,
-    Window,
+    AppContext as _, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
+    IntoElement, Render, SharedString, Subscription, Window,
     assets::IconName,
+    canvas,
     component::input::{Input, InputEvent, InputState},
     component::{
         Disableable as _,
@@ -20,8 +21,10 @@ use gpui_kit::{
     px,
 };
 use kerminal_application::{
-    AppError, ApplicationTaskExecutor,
-    commands::{CommandHistoryAvailability, CommandsService},
+    AppError, ApplicationTaskExecutor, PublicErrorCode,
+    commands::{
+        CommandHistoryAvailability, CommandsService, SnippetExecutionService, SnippetRenderResult,
+    },
     preferences::ThemeMode,
     sessions::UiSessionBinding,
 };
@@ -32,7 +35,7 @@ use kerminal_domain::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::history_query::{HistoryScope, PAGE_SIZE, page_window};
+use super::history_query::{HistoryScope, PAGE_SIZE, page_window as logs_page_window};
 use crate::theme::ThemeTokens;
 
 #[cfg(feature = "right-rail-acceptance")]
@@ -40,6 +43,9 @@ use crate::theme::ThemeTokens;
 pub(super) mod right_rail_acceptance;
 
 const HISTORY_LIMIT: usize = 100;
+const HISTORY_ROW_HEIGHT: f32 = 52.;
+const HISTORY_HEADER_HEIGHT: f32 = 37.;
+const HISTORY_PAGINATION_HEIGHT: f32 = 45.;
 
 /// Logs 当前绑定的 pane、目标和可信 host；session generation 只用于迟到响应保护。
 #[derive(Clone, Debug)]
@@ -226,10 +232,82 @@ struct HistoryReadKey {
     source: Option<CommandHistorySource>,
 }
 
+/// 终端写入结果携带点击时的 binding 和焦点，Root 仍需确认当前视图及焦点后再归还终端。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug)]
+pub(crate) struct LogsTerminalFillCompleted {
+    pub(crate) binding: UiSessionBinding,
+    pub(crate) expected_focus: Option<FocusHandle>,
+    pub(crate) generation: u64,
+}
+
+/// 单次填入独占写入槽，切换目标只请求取消并等待原 writer 的真实回执。
+struct HistoryFillOperation {
+    generation: u64,
+    entry_id: String,
+    target: LogsTarget,
+    cancellation: CancellationToken,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HistoryFillStatus {
+    Confirmed(String),
+    Problem(String),
+}
+
+/// 将焦点票据和反馈状态放在一起，使列表交互只能丢弃已确认的提示。
+#[derive(Default)]
+struct HistoryFillFeedback {
+    generation: u64,
+    status: Option<HistoryFillStatus>,
+    unknown_target: Option<LogsTarget>,
+}
+
+impl HistoryFillFeedback {
+    /// 用户开始新的列表交互后，旧成功与焦点票据失效；未解决结果仍须等待用户处理。
+    ///
+    /// @author kongweiguang
+    fn begin_interaction(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        if matches!(self.status, Some(HistoryFillStatus::Confirmed(_))) {
+            self.status = None;
+        }
+        self.generation
+    }
+
+    /// 只展示仍属于当前交互的成功；过期回执不能恢复提示或触发焦点转移。
+    ///
+    /// @author kongweiguang
+    fn confirm(&mut self, generation: u64, message: String) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.status = Some(HistoryFillStatus::Confirmed(message));
+        true
+    }
+
+    /// 失败即使迟到也要告知用户，不能因为列表变化而丢弃。
+    ///
+    /// @author kongweiguang
+    fn fail(&mut self, message: String) {
+        self.status = Some(HistoryFillStatus::Problem(message));
+    }
+
+    /// 未知结果独立保留原目标和重试门禁，避免列表交互造成重复写入。
+    ///
+    /// @author kongweiguang
+    fn outcome_unknown(&mut self, target: LogsTarget) {
+        self.unknown_target = Some(target);
+        self.status = None;
+    }
+}
+
 /// 独立 Logs Entity；只持有筛选与展示状态，所有历史数据仍由共享 CommandsService 读取。
 pub struct LogsView {
     commands: Arc<CommandsService>,
     executor: ApplicationTaskExecutor,
+    terminal_fill_service: Option<Arc<SnippetExecutionService>>,
     query: Entity<InputState>,
     query_value: String,
     target: Option<LogsTarget>,
@@ -239,10 +317,14 @@ pub struct LogsView {
     active: bool,
     source: Option<CommandHistorySource>,
     page: usize,
+    page_size: usize,
     entries: Vec<CommandHistoryEntry>,
     loading: bool,
     error: Option<String>,
     status: Option<String>,
+    /// 写入反馈与历史查询分开保存，避免刷新结果覆盖待用户检查的操作结果。
+    fill_feedback: HistoryFillFeedback,
+    fill_operation: Option<HistoryFillOperation>,
     clear_target_in_flight: Option<LogsTarget>,
     generation: u64,
     read_key: Option<HistoryReadKey>,
@@ -255,8 +337,10 @@ pub struct LogsView {
     _query_subscription: Subscription,
 }
 
+impl EventEmitter<LogsTerminalFillCompleted> for LogsView {}
+
 impl LogsView {
-    /// 在 Root 单独创建工具 Entity 并订阅输入变化；接受性加载证据从未加载状态初始化。
+    /// 在 Root 单独创建工具 Entity 并订阅输入变化；搜索变更使旧成功反馈和焦点票据失效。
     ///
     /// @author kongweiguang
     pub fn new(
@@ -274,14 +358,14 @@ impl LogsView {
                 if matches!(event, InputEvent::Change)
                     && view.query_value != view.query.read(cx).value()
                 {
-                    view.query_value = view.query.read(cx).value().to_string();
-                    view.page = 1;
-                    view.reload_history(cx);
+                    let query = view.query.read(cx).value().to_string();
+                    view.set_query(query, cx);
                 }
             });
         Self {
             commands,
             executor,
+            terminal_fill_service: None,
             query,
             query_value: String::new(),
             target: None,
@@ -290,10 +374,13 @@ impl LogsView {
             active: false,
             source: None,
             page: 1,
+            page_size: PAGE_SIZE,
             entries: Vec::new(),
             loading: false,
             error: None,
             status: None,
+            fill_feedback: HistoryFillFeedback::default(),
+            fill_operation: None,
             clear_target_in_flight: None,
             generation: 0,
             read_key: None,
@@ -304,6 +391,35 @@ impl LogsView {
             read_cancellation: None,
             _query_subscription: query_subscription,
         }
+    }
+
+    /// 注入组合根持有的终端填入用例；日志视图不自行创建会话服务或绕过 writer。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn set_terminal_fill_service(
+        &mut self,
+        service: Option<Arc<SnippetExecutionService>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_fill_service = service;
+        cx.notify();
+    }
+
+    /// 焦点票据必须仍属于相同活动视图及目标，避免异步完成后抢占新导航。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn terminal_fill_completion_is_current(
+        &self,
+        event: &LogsTerminalFillCompleted,
+    ) -> bool {
+        history_fill_completion_matches(
+            self.active,
+            self.fill_feedback.generation,
+            self.target.as_ref(),
+            self.fill_operation.is_some(),
+            self.fill_feedback.unknown_target.is_some(),
+            event,
+        )
     }
 
     /// 同步 Root 已加载的主机名投影，仅改变历史上下文的可读标签，不触碰冻结筛选目标。
@@ -334,7 +450,7 @@ impl LogsView {
         cx.notify();
     }
 
-    /// pane/session generation 改变时取消旧查询和验收种子，并清除成功证据；同一 binding 仅改标题时保留数据。
+    /// pane/session generation 改变时取消旧查询与待接纳的填入，并保留仍在收敛或待核对的写入结果。
     ///
     /// @author kongweiguang
     pub fn set_target(&mut self, target: Option<LogsTarget>, cx: &mut Context<Self>) {
@@ -351,6 +467,8 @@ impl LogsView {
             return;
         }
         self.cancel_read();
+        self.cancel_terminal_fill();
+        self.fill_feedback.begin_interaction();
         #[cfg(feature = "right-rail-acceptance")]
         self.acceptance
             .invalidate_pending("Logs target changed during acceptance seeding");
@@ -381,7 +499,7 @@ impl LogsView {
         }
     }
 
-    /// 隐藏时允许当前读取收敛；验收写入在面板隐藏时协作取消，重新显示时复用匹配查询。
+    /// 隐藏时允许读取收敛，并协作取消尚未接纳的填入；返回后不能沿用旧成功提示或焦点票据。
     ///
     /// @author kongweiguang
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -392,6 +510,8 @@ impl LogsView {
         if active {
             self.reload_history(cx);
         } else {
+            self.cancel_terminal_fill();
+            self.fill_feedback.begin_interaction();
             #[cfg(feature = "right-rail-acceptance")]
             if self
                 .acceptance
@@ -401,6 +521,139 @@ impl LogsView {
             }
         }
         cx.notify();
+    }
+
+    /// 根据当前已确认的记录与 pane 范围取正文，避免旧行点击复制另一个目标的数据；有效操作使旧成功提示失效。
+    ///
+    /// @author kongweiguang
+    fn copy_entry(&mut self, entry_id: &str, cx: &mut Context<Self>) {
+        let Some(target) = self.target.as_ref().filter(|_| self.active) else {
+            return;
+        };
+        let Some(command) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == entry_id && target.scope().contains_entry(entry))
+            .map(|entry| entry.command.clone())
+        else {
+            return;
+        };
+        self.fill_feedback.begin_interaction();
+        cx.write_to_clipboard(ClipboardItem::new_string(command));
+        self.status = Some(crate::locale::text("命令已复制", "Command copied").to_string());
+        cx.notify();
+    }
+
+    /// 仅向点击时冻结的可见终端写入单行 Paste；不追加回车，并保留迟到的失败或未知回执。
+    ///
+    /// @author kongweiguang
+    fn fill_entry(&mut self, entry_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.active
+            || self.loading
+            || self.clear_target_in_flight.is_some()
+            || self.fill_operation.is_some()
+            || self.fill_feedback.unknown_target.is_some()
+        {
+            return;
+        }
+        let (Some(target), Some(service)) =
+            (self.target.clone(), self.terminal_fill_service.clone())
+        else {
+            return;
+        };
+        let Some(command) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == entry_id && target.scope().contains_entry(entry))
+            .map(|entry| entry.command.clone())
+            .filter(|command| history_fill_command_is_valid(command))
+        else {
+            return;
+        };
+
+        let generation = self.fill_feedback.begin_interaction();
+        let binding = target.binding().clone();
+        let expected_focus = window.focused(cx);
+        let cancellation = CancellationToken::new();
+        self.fill_operation = Some(HistoryFillOperation {
+            generation,
+            entry_id: entry_id.to_owned(),
+            target: target.clone(),
+            cancellation: cancellation.clone(),
+        });
+        let executor = self.executor.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let fill_binding = binding.clone();
+            let result = executor
+                .run_cancellable(cancellation, move |operation_cancellation| async move {
+                    service
+                        .fill_direct(
+                            SnippetRenderResult {
+                                command,
+                                sensitive: false,
+                            },
+                            fill_binding,
+                            operation_cancellation,
+                        )
+                        .await
+                        .map(|_| ())
+                })
+                .await;
+            let _ = cx.update(|_, app| {
+                let _ = this.update(app, |view, cx| {
+                    if !view.fill_operation.as_ref().is_some_and(|operation| {
+                        operation.generation == generation && operation.target == target
+                    }) {
+                        return;
+                    }
+                    view.fill_operation = None;
+                    let same_target = view.target.as_ref() == Some(&target);
+                    match result {
+                        Ok(()) => {
+                            let current = view.fill_feedback.confirm(
+                                generation,
+                                crate::locale::text(
+                                    "已向原终端填入命令，可在终端编辑",
+                                    "Command filled in the original terminal; you can keep editing",
+                                )
+                                .to_string(),
+                            );
+                            if same_target && view.active && current {
+                                cx.emit(LogsTerminalFillCompleted {
+                                    binding,
+                                    expected_focus,
+                                    generation,
+                                });
+                            }
+                        }
+                        Err(error) if error.public_code() == PublicErrorCode::OutcomeUnknown => {
+                            view.fill_feedback.outcome_unknown(target);
+                        }
+                        Err(error) if error.public_code() == PublicErrorCode::Cancelled => {
+                            view.fill_feedback.fail(
+                                crate::locale::text("终端填入已取消", "Terminal fill cancelled")
+                                    .to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            view.fill_feedback.fail(error.public_message().to_owned());
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 切换目标只通知用例停止尚未提交的写入；在途操作保留到收到明确或未知回执。
+    ///
+    /// @author kongweiguang
+    fn cancel_terminal_fill(&mut self) {
+        if let Some(operation) = self.fill_operation.as_ref() {
+            operation.cancellation.cancel();
+        }
     }
 
     /// 仅接受当前活动 UI binding 的成功查询；空历史是有效的实际回执，未完成或失败则不通过。
@@ -423,7 +676,7 @@ impl LogsView {
             && self.loaded_read_key.as_ref() == Some(&expected_key)
     }
 
-    /// 只查询明确 pane 目标的最近一百条；成功回执单独记录完整筛选键，空结果也能证明读取完成。
+    /// 只查询明确 pane 目标的最近一百条；权威刷新不改变填入反馈，空结果也能证明读取完成。
     ///
     /// @author kongweiguang
     fn reload_history(&mut self, cx: &mut Context<Self>) {
@@ -522,7 +775,8 @@ impl LogsView {
                 match result {
                     Ok(entries) => {
                         view.entries = entries.into_iter().take(HISTORY_LIMIT).collect();
-                        view.page = page_window(view.page, view.entries.len()).0;
+                        view.page =
+                            logs_page_window(view.page, view.entries.len(), view.page_size).0;
                         view.status = None;
                         #[cfg(feature = "right-rail-acceptance")]
                         {
@@ -544,7 +798,7 @@ impl LogsView {
         cx.notify();
     }
 
-    /// 删除时从当前列表按 ID 重新取得行并校验 pane scope，避免渲染闭包持有整条记录或旧 binding。
+    /// 删除时重新校验行与 pane scope，并使此前的成功提示失效；后台权威刷新不会重复作废反馈。
     ///
     /// @author kongweiguang
     fn delete_entry(&mut self, requested_entry_id: &str, cx: &mut Context<Self>) {
@@ -562,6 +816,7 @@ impl LogsView {
         else {
             return;
         };
+        self.fill_feedback.begin_interaction();
         let commands = self.commands.clone();
         let executor = self.executor.clone();
         self.loading = true;
@@ -616,7 +871,7 @@ impl LogsView {
         cx.notify();
     }
 
-    /// 清空直接使用点击时冻结的 pane scope；同一目标的重复点击在首个异步清理收敛前被合并。
+    /// 清空使用点击时冻结的 pane scope 并作废旧成功提示；重复点击在异步清理收敛前被合并。
     ///
     /// @author kongweiguang
     fn clear_history(&mut self, cx: &mut Context<Self>) {
@@ -626,6 +881,7 @@ impl LogsView {
         if self.loading || self.clear_target_in_flight.is_some() || !self.active {
             return;
         }
+        self.fill_feedback.begin_interaction();
         let scope = target.scope().clone();
         let request = scope.clear_request();
         let commands = self.commands.clone();
@@ -685,22 +941,37 @@ impl LogsView {
         cx.notify();
     }
 
-    /// 改变来源时复位分页；旧请求会由 reload_history 协作取消并检查 generation。
+    /// 搜索输入和原生验收共用同一变更入口，避免缓存提前更新绕过成功反馈及焦点失效规则。
+    ///
+    /// @author kongweiguang
+    fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.query_value == query {
+            return;
+        }
+        self.fill_feedback.begin_interaction();
+        self.query_value = query;
+        self.page = 1;
+        self.reload_history(cx);
+    }
+
+    /// 改变来源时复位分页并作废旧成功反馈；旧查询会协作取消并检查 generation。
     ///
     /// @author kongweiguang
     fn set_source(&mut self, source: Option<CommandHistorySource>, cx: &mut Context<Self>) {
         if self.source == source {
             return;
         }
+        self.fill_feedback.begin_interaction();
         self.source = source;
         self.page = 1;
         self.reload_history(cx);
     }
 
-    /// 只清除搜索词并保留来源筛选；先同步缓存值，避免输入订阅重复发起同一查询。
+    /// 只清除搜索词并保留来源筛选；先作废旧反馈并同步缓存，避免订阅重复查询。
     ///
     /// @author kongweiguang
     fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.fill_feedback.begin_interaction();
         self.query_value.clear();
         self.page = 1;
         self.query.update(cx, |input, cx| {
@@ -710,12 +981,13 @@ impl LogsView {
         cx.notify();
     }
 
-    /// 分页按钮只调整当前最多一百条查询结果的本地投影，不发起重复数据库请求。
+    /// 分页只调整现有查询结果的本地投影，同时使旧成功提示与焦点票据失效。
     ///
     /// @author kongweiguang
     fn set_page(&mut self, page: usize, cx: &mut Context<Self>) {
-        let (page, _, _) = page_window(page, self.entries.len());
+        let (page, _, _) = logs_page_window(page, self.entries.len(), self.page_size);
         if self.page != page {
+            self.fill_feedback.begin_interaction();
             self.page = page;
             cx.notify();
         }
@@ -769,11 +1041,38 @@ fn operation_matches_target(
     active && current_target == Some(request_target)
 }
 
+/// 粘贴遵循片段填入的单行约束，避免历史中的换行在终端隐式执行前一行。
+///
+/// @author kongweiguang
+fn history_fill_command_is_valid(command: &str) -> bool {
+    let command = command.trim();
+    !command.is_empty() && !command.contains(['\r', '\n'])
+}
+
+/// 写入完成不等于焦点授权；视图、目标和代次均未变化且结果已收敛才可归还焦点。
+///
+/// @author kongweiguang
+fn history_fill_completion_matches(
+    active: bool,
+    generation: u64,
+    target: Option<&LogsTarget>,
+    operation_pending: bool,
+    outcome_unknown: bool,
+    event: &LogsTerminalFillCompleted,
+) -> bool {
+    active
+        && generation == event.generation
+        && !operation_pending
+        && !outcome_unknown
+        && target.is_some_and(|target| target.binding() == &event.binding)
+}
+
 impl Render for LogsView {
     /// 窄栏把刷新/清理移到标题行，搜索输入变化即刷新并保留来源筛选。
     /// 主机名只用于卡片可读性，HostId 留在悬浮与辅助标签；独立右栏使用 main 中性色阶且保留冻结 pane scope。
-    /// 标题和按内容收缩的历史卡遵循 main；滚动由面板统一承接，避免空态被 flex 撑满。
-    /// 单行搜索用 Styled 设置高度，不能调用 Input 的多行专用 h。
+    /// 历史卡占满剩余高度，按实际卡片高度分页；被动布局不作废操作反馈或焦点票据。
+    /// 只有列表负责溢出滚动，分页始终留在底部。
+    /// 单行搜索用 Styled 设置高度；显式刷新作废旧成功提示，异步刷新则保留待核对结果。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -832,16 +1131,84 @@ impl Render for LogsView {
         );
         let loading = self.loading;
         let clearing = self.clear_target_in_flight.is_some();
-        let (current_page, start, end) = page_window(self.page, self.entries.len());
-        let page_count = self.entries.len().div_ceil(PAGE_SIZE).max(1);
+        let filling_entry = self
+            .fill_operation
+            .as_ref()
+            .map(|operation| operation.entry_id.clone());
+        let fill_blocked = !self.active
+            || loading
+            || clearing
+            || self.target.is_none()
+            || self.terminal_fill_service.is_none()
+            || self.fill_operation.is_some()
+            || self.fill_feedback.unknown_target.is_some();
+        let fill_status = self
+            .fill_feedback
+            .status
+            .as_ref()
+            .map(|status| match status {
+                HistoryFillStatus::Confirmed(message) | HistoryFillStatus::Problem(message) => {
+                    message.clone()
+                }
+            });
+        let status = self.status.clone();
+        let unknown_target = self.fill_feedback.unknown_target.clone();
+        let (current_page, start, end) =
+            logs_page_window(self.page, self.entries.len(), self.page_size);
+        let page_count = self.entries.len().div_ceil(self.page_size).max(1);
+        let view = cx.entity().downgrade();
+        let card_measurement = canvas(
+            move |bounds, _, cx| {
+                let Some(entity) = view.upgrade() else {
+                    return;
+                };
+                let height = f32::from(bounds.size.height);
+                let state = entity.read(cx);
+                if state.page_size == history_page_size(height, state.entries.len()) {
+                    return;
+                }
+                // 延后更新避免在布局阶段重入；保持页码，防止翻页清除反馈后容量增加又跳回上一页。
+                cx.defer(move |cx| {
+                    entity.update(cx, |state, cx| {
+                        let page_size = history_page_size(height, state.entries.len());
+                        if state.page_size != page_size {
+                            state.page_size = page_size;
+                            state.page =
+                                logs_page_window(state.page, state.entries.len(), page_size).0;
+                            cx.notify();
+                        }
+                    });
+                });
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .inset_0();
         let page_row_count = end.saturating_sub(start);
         let rows = self.entries[start..end]
             .iter()
             .enumerate()
             .map(|(index, entry)| {
                 let entry_id = entry.id.clone();
+                let copy_entry_id = entry_id.clone();
+                let fill_entry_id = entry_id.clone();
+                let copy_selector = format!("rr-logs-copy-{entry_id}");
+                let fill_selector = format!("rr-logs-fill-{entry_id}");
+                let row_selector = format!("rr-logs-row-{entry_id}");
                 let command = entry.command.clone();
                 let command_tooltip = command.clone();
+                let valid_fill_command = history_fill_command_is_valid(&command);
+                let fill_label =
+                    crate::locale::text("填入终端，不执行", "Fill terminal without executing");
+                let fill_tooltip = if valid_fill_command {
+                    fill_label.clone()
+                } else {
+                    crate::locale::text(
+                        "仅支持填入单行命令；多行内容可复制",
+                        "Only single-line commands can be filled; copy multiline content instead",
+                    )
+                };
+                let copy_label = crate::locale::text("复制命令", "Copy command");
                 let context =
                     history_entry_context(entry, target.as_ref(), &self.host_display_names);
                 let context_tooltip =
@@ -862,11 +1229,14 @@ impl Render for LogsView {
                 let delete_label = crate::locale::text("删除历史记录", "Delete history entry");
                 div()
                     .id(format!("logs-history-row-{entry_id}"))
+                    .debug_selector(move || row_selector)
                     .w_full()
+                    .h(px(HISTORY_ROW_HEIGHT))
+                    .flex_shrink_0()
                     .px_3()
-                    .py(px(10.))
+                    .py(px(6.))
                     .flex()
-                    .items_start()
+                    .items_center()
                     .gap_2()
                     .when(index + 1 < page_row_count, |row| {
                         row.border_b_1().border_color(theme.border)
@@ -877,7 +1247,7 @@ impl Render for LogsView {
                             .min_w(px(0.))
                             .flex()
                             .flex_col()
-                            .gap_1()
+                            .gap(px(2.))
                             .child(
                                 div()
                                     .id(format!("logs-history-command-{entry_id}"))
@@ -914,16 +1284,51 @@ impl Render for LogsView {
                             ),
                     )
                     .child(
-                        Button::new(format!("logs-history-delete-{entry_id}"))
-                            .compact()
-                            .ghost()
-                            .icon(IconName::Trash)
-                            .accessibility_label(delete_label.clone())
-                            .tooltip(delete_label)
-                            .disabled(loading || clearing)
-                            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                                view.delete_entry(&entry_id, cx);
-                            })),
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new(format!("logs-history-fill-{entry_id}"))
+                                    .debug_selector(move || fill_selector)
+                                    .compact()
+                                    .ghost()
+                                    .icon(IconName::Send)
+                                    .accessibility_label(fill_label)
+                                    .tooltip(fill_tooltip)
+                                    .loading(filling_entry.as_deref() == Some(entry_id.as_str()))
+                                    .disabled(fill_blocked || !valid_fill_command)
+                                    .on_click(cx.listener(
+                                        move |view, _: &ClickEvent, window, cx| {
+                                            view.fill_entry(&fill_entry_id, window, cx);
+                                        },
+                                    )),
+                            )
+                            .child(
+                                Button::new(format!("logs-history-copy-{entry_id}"))
+                                    .debug_selector(move || copy_selector)
+                                    .compact()
+                                    .ghost()
+                                    .icon(IconName::Copy)
+                                    .accessibility_label(copy_label.clone())
+                                    .tooltip(copy_label)
+                                    .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+                                        view.copy_entry(&copy_entry_id, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("logs-history-delete-{entry_id}"))
+                                    .compact()
+                                    .ghost()
+                                    .icon(IconName::Trash)
+                                    .accessibility_label(delete_label.clone())
+                                    .tooltip(delete_label)
+                                    .disabled(loading || clearing)
+                                    .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+                                        view.delete_entry(&entry_id, cx);
+                                    })),
+                            ),
                     )
             });
         let unbound = self.target.is_none();
@@ -988,7 +1393,7 @@ impl Render for LogsView {
             .flex_col()
             .gap_3()
             .p_3()
-            .overflow_y_scroll()
+            .overflow_hidden()
             .child(
                 div()
                     .flex_shrink_0()
@@ -1059,6 +1464,7 @@ impl Render for LogsView {
                                     .tooltip(refresh_label)
                                     .disabled(unbound || !available || loading || clearing)
                                     .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
+                                        view.fill_feedback.begin_interaction();
                                         view.reload_history(cx);
                                     })),
                             )
@@ -1094,11 +1500,69 @@ impl Render for LogsView {
                     .child(query_input)
                     .child(source_filter),
             )
+            .when_some(status, |content, status| {
+                content.child(
+                    div()
+                        .id("logs-action-status")
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(status),
+                )
+            })
+            .when_some(fill_status, |content, status| {
+                content.child(
+                    div()
+                        .id("logs-fill-status")
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(status),
+                )
+            })
+            .when_some(unknown_target, |content, target| {
+                let detail = target.detail().to_owned();
+                content.child(
+                    div()
+                        .id("logs-fill-unknown")
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.error)
+                        .child(crate::locale::text(
+                            format!("填入结果未知，请检查原终端：{detail}"),
+                            format!("Fill result unknown; check the original terminal: {detail}"),
+                        ))
+                        .child(
+                            Button::new("logs-fill-reviewed")
+                                .compact()
+                                .ghost()
+                                .label(crate::locale::text(
+                                    "已检查原终端，允许再次填入",
+                                    "Original terminal checked; allow another fill",
+                                ))
+                                .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
+                                    view.fill_feedback.unknown_target = None;
+                                    view.fill_feedback.status = Some(HistoryFillStatus::Confirmed(
+                                        crate::locale::text(
+                                            "已核对原终端",
+                                            "Original terminal checked",
+                                        )
+                                        .to_string(),
+                                    ));
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(
                 div()
                     .id("logs-history-card")
+                    .debug_selector(|| "rr-logs-card".into())
                     .w_full()
-                    .flex_shrink_0()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .relative()
                     .flex()
                     .flex_col()
                     .rounded(theme.radius)
@@ -1106,10 +1570,13 @@ impl Render for LogsView {
                     .border_color(theme.border)
                     .bg(theme.panel)
                     .overflow_hidden()
+                    .child(card_measurement)
                     .child(
                         div()
                             .id("logs-history-card-header")
                             .w_full()
+                            .h(px(HISTORY_HEADER_HEIGHT))
+                            .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_between()
@@ -1136,7 +1603,11 @@ impl Render for LogsView {
                     .child(
                         div()
                             .id("logs-history-list")
+                            .debug_selector(|| "rr-logs-list".into())
                             .w_full()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
                             .flex()
                             .flex_col()
                             .children(rows)
@@ -1169,76 +1640,93 @@ impl Render for LogsView {
                                 ))
                             }),
                     )
-                    .when(pagination_visible(self.entries.len()), |card| {
-                        card.child(
-                            div()
-                                .id("logs-history-pagination")
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .gap_1()
-                                .px_2()
-                                .py(px(6.))
-                                .border_t_1()
-                                .border_color(theme.border)
-                                .text_color(theme.muted)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .gap_1()
-                                        .child(
-                                            Button::new("logs-page-previous")
-                                                .compact()
-                                                .ghost()
-                                                .icon(IconName::ChevronLeft)
-                                                .w(px(32.))
-                                                .h(px(32.))
-                                                .accessibility_label(crate::locale::text(
-                                                    "上一页命令历史",
-                                                    "Previous history page",
-                                                ))
-                                                .disabled(current_page <= 1)
-                                                .on_click(cx.listener(
-                                                    |view, _: &ClickEvent, _, cx| {
-                                                        view.set_page(
-                                                            view.page.saturating_sub(1).max(1),
-                                                            cx,
-                                                        );
-                                                    },
-                                                )),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w(px(64.))
-                                                .text_center()
-                                                .text_size(px(12.))
-                                                .child(format!("{current_page} / {page_count}")),
-                                        )
-                                        .child(
-                                            Button::new("logs-page-next")
-                                                .compact()
-                                                .ghost()
-                                                .icon(IconName::ChevronRight)
-                                                .w(px(32.))
-                                                .h(px(32.))
-                                                .accessibility_label(crate::locale::text(
-                                                    "下一页命令历史",
-                                                    "Next history page",
-                                                ))
-                                                .disabled(current_page >= page_count)
-                                                .on_click(cx.listener(
-                                                    |view, _: &ClickEvent, _, cx| {
-                                                        view.set_page(
-                                                            view.page.saturating_add(1),
-                                                            cx,
-                                                        );
-                                                    },
-                                                )),
-                                        ),
-                                ),
-                        )
-                    }),
+                    .when(
+                        pagination_visible(self.entries.len(), self.page_size),
+                        |card| {
+                            card.child(
+                                div()
+                                    .id("logs-history-pagination")
+                                    .debug_selector(|| "rr-logs-pagination".into())
+                                    .w_full()
+                                    .h(px(HISTORY_PAGINATION_HEIGHT))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap_1()
+                                    .px_2()
+                                    .py(px(6.))
+                                    .border_t_1()
+                                    .border_color(theme.border)
+                                    .text_color(theme.muted)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("logs-page-previous")
+                                                    .debug_selector(|| "rr-logs-previous".into())
+                                                    .compact()
+                                                    .ghost()
+                                                    .icon(IconName::ChevronLeft)
+                                                    .w(px(32.))
+                                                    .h(px(32.))
+                                                    .accessibility_label(crate::locale::text(
+                                                        "上一页命令历史",
+                                                        "Previous history page",
+                                                    ))
+                                                    .disabled(current_page <= 1)
+                                                    .on_click(cx.listener(
+                                                        |view, _: &ClickEvent, _, cx| {
+                                                            view.set_page(
+                                                                view.page.saturating_sub(1).max(1),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .debug_selector(|| "rr-logs-page-label".into())
+                                                    .min_w(px(64.))
+                                                    .h(px(32.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_center()
+                                                    .text_size(px(12.))
+                                                    .line_height(px(20.))
+                                                    .child(format!(
+                                                        "{current_page} / {page_count}"
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("logs-page-next")
+                                                    .debug_selector(|| "rr-logs-next".into())
+                                                    .compact()
+                                                    .ghost()
+                                                    .icon(IconName::ChevronRight)
+                                                    .w(px(32.))
+                                                    .h(px(32.))
+                                                    .accessibility_label(crate::locale::text(
+                                                        "下一页命令历史",
+                                                        "Next history page",
+                                                    ))
+                                                    .disabled(current_page >= page_count)
+                                                    .on_click(cx.listener(
+                                                        |view, _: &ClickEvent, _, cx| {
+                                                            view.set_page(
+                                                                view.page.saturating_add(1),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                        },
+                    ),
             );
 
         if let Some(error) = error {
@@ -1368,8 +1856,23 @@ fn history_entry_context_detail(
 /// 只有存在下一页时显示分页控件，避免空列表和单页列表占用窄面板底部空间。
 ///
 /// @author kongweiguang
-fn pagination_visible(entry_count: usize) -> bool {
-    entry_count > PAGE_SIZE
+fn pagination_visible(entry_count: usize, page_size: usize) -> bool {
+    entry_count > page_size
+}
+
+/// 容量取决于卡片实际高度；仅在需要分页时预留底栏，避免高面板仍被固定八条限制。
+/// 极小窗口至少保留一条，额外溢出由列表滚动承接，不挤走分页按钮。
+///
+/// @author kongweiguang
+fn history_page_size(card_height: f32, total: usize) -> usize {
+    let available = (card_height - 2. - HISTORY_HEADER_HEIGHT).max(0.);
+    let without_footer = (available / HISTORY_ROW_HEIGHT).floor() as usize;
+    let available = if total > without_footer {
+        (available - HISTORY_PAGINATION_HEIGHT).max(0.)
+    } else {
+        available
+    };
+    ((available / HISTORY_ROW_HEIGHT).floor() as usize).clamp(1, HISTORY_LIMIT)
 }
 
 /// 列表卡片沿用 main 的页内范围格式；空列表始终显示 `0 / 0`。

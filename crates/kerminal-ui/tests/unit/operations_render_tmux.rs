@@ -11,11 +11,141 @@ use super::{
         tmux_detach_shortcut, tmux_header_status, tmux_header_tone,
         tmux_panel_session_matches_current, tmux_quickref_copy_text, tmux_ssh_host_display_label,
         tmux_tool_rail_feedback_visible, tmux_tool_rail_header_status,
-        tmux_tool_rail_session_status,
+        tmux_tool_rail_quickref_toggle, tmux_tool_rail_session_status,
     },
 };
 use kerminal_application::operations::TmuxCapability;
 use kerminal_domain::operations::TmuxSession;
+
+/// 用生产按钮检查全宽命中与独立子操作，避免仅测试布尔状态而漏掉实际 hitbox。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn quickref_toggle_accepts_the_entire_row_and_keyboard_without_swallowing_children(
+    app: &mut gpui_kit::TestAppContext,
+) {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui_kit::{
+        AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, KeyDownEvent,
+        KeyUpEvent, Keystroke, MouseButton, Render, Window, component::button::Button, div, point,
+        prelude::*, px,
+    };
+
+    struct Harness {
+        expanded: bool,
+        copied: usize,
+        header_focus: FocusHandle,
+    }
+
+    impl Render for Harness {
+        /// 保留真实速查标题按钮，子按钮作为独立区域验证事件不会误触折叠。
+        ///
+        /// @author kongweiguang
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = crate::theme::ThemeTokens::current(window, cx);
+            let header = tmux_tool_rail_quickref_toggle(
+                self.expanded,
+                theme,
+                cx.listener(|view, _, _, cx| {
+                    view.expanded = !view.expanded;
+                    cx.notify();
+                }),
+            )
+            .focus_handle(&self.header_focus)
+            .debug_selector(|| "quickref-test-header".into());
+            div()
+                .tab_group()
+                .w(px(420.))
+                .flex()
+                .flex_col()
+                .child(header)
+                .when(self.expanded, |panel| {
+                    panel.child(
+                        Button::new("quickref-test-copy")
+                            .label("Copy")
+                            .debug_selector(|| "quickref-test-copy".into())
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.copied += 1;
+                                cx.notify();
+                            })),
+                    )
+                })
+        }
+    }
+
+    app.update(gpui_kit::init);
+    let result: Rc<RefCell<Option<Entity<Harness>>>> = Rc::new(RefCell::new(None));
+    let result_out = result.clone();
+    let (_, visual) = app.add_window_view(move |window, app| {
+        let view = app.new(|cx| Harness {
+            expanded: false,
+            copied: 0,
+            header_focus: cx.focus_handle(),
+        });
+        *result_out.borrow_mut() = Some(view.clone());
+        gpui_kit::base::Root::new(view, window, app)
+    });
+    let view = result
+        .borrow_mut()
+        .take()
+        .expect("quickref fixture mounted");
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bounds = visual
+        .debug_bounds("quickref-test-header")
+        .expect("quickref header rendered");
+    assert!(bounds.size.width.as_f32() >= 400.);
+    for fraction in [0.03_f32, 0.5, 0.97] {
+        let position =
+            bounds.origin + point(bounds.size.width * fraction, bounds.size.height * 0.5);
+        visual.simulate_mouse_move(position, None, Default::default());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.simulate_mouse_down(position, MouseButton::Left, Default::default());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.simulate_mouse_up(position, MouseButton::Left, Default::default());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            let expected = fraction != 0.5;
+            assert_eq!(view.read(cx).expanded, expected);
+        });
+    }
+
+    let child = visual
+        .debug_bounds("quickref-test-copy")
+        .expect("expanded copy action rendered");
+    let position = child.origin + point(child.size.width * 0.5, child.size.height * 0.5);
+    visual.simulate_mouse_move(position, None, Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.simulate_mouse_down(position, MouseButton::Left, Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.simulate_mouse_up(position, MouseButton::Left, Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        assert!(view.read(cx).expanded);
+        assert_eq!(view.read(cx).copied, 1);
+        window.blur(cx);
+        window.focus_next(cx);
+        assert!(
+            view.read(cx).header_focus.is_focused(window),
+            "the header must be reachable as the first keyboard tab stop"
+        );
+        window.draw(cx).clear(cx);
+    });
+    // 当前 GPUI 在同一焦点的按下和释放配对后触发按钮，不把单独的 KeyDown 当作点击。
+    let keystroke = Keystroke::parse("space").unwrap();
+    visual.simulate_event(KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    visual.update(|_, cx| assert!(view.read(cx).expanded));
+    visual.simulate_event(KeyUpEvent { keystroke });
+    visual.run_until_parked();
+    visual.update(|_, cx| assert!(!view.read(cx).expanded));
+}
 
 /// 就绪状态不占正文，未绑定与目标不匹配时保留各自的可执行原因。
 ///
@@ -185,16 +315,16 @@ fn tmux_tool_rail_session_status_names_connection_scope() {
     );
 }
 
-/// 显示反馈时必须有真实状态文案，避免空 flex 子项在标题卡与会话列表间累加间距。
+/// 加载期间只使用刷新图标，取消或实际错误仍需可见，避免正文抖动或隐藏恢复信息。
 ///
 /// @author kongweiguang
 #[test]
-fn tmux_tool_rail_feedback_visibility_omits_only_empty_rows() {
-    assert!(tmux_tool_rail_feedback_visible(
+fn tmux_tool_rail_feedback_visibility_omits_loading_but_keeps_errors() {
+    assert!(!tmux_tool_rail_feedback_visible(
         SectionPhase::NotLoaded,
         false
     ));
-    assert!(tmux_tool_rail_feedback_visible(
+    assert!(!tmux_tool_rail_feedback_visible(
         SectionPhase::Loading,
         false
     ));
@@ -262,7 +392,7 @@ fn tmux_create_working_directory_uses_frozen_snapshot_even_when_empty() {
     );
 }
 
-/// 标题状态优先展示版本并保留重试语义；并行测试共享全局 locale，状态文案接受两种产品语言。
+/// 加载沿用已知版本，首载不添加状态行；失败信息继续保留重试语义。
 ///
 /// @author kongweiguang
 #[test]
@@ -288,11 +418,11 @@ fn tmux_tool_rail_header_shows_capability_and_recovery_state() {
         tmux_tool_rail_header_status(SectionPhase::Ready, Some(&unavailable), true),
         "tmux command was not found"
     );
-    let loading = tmux_tool_rail_header_status(SectionPhase::Loading, Some(&available), true);
-    assert!(matches!(
-        loading.as_str(),
-        "正在检测 tmux…" | "Checking tmux…"
-    ));
+    assert_eq!(
+        tmux_tool_rail_header_status(SectionPhase::Loading, Some(&available), true),
+        "tmux 3.2a"
+    );
+    assert!(tmux_tool_rail_header_status(SectionPhase::Loading, None, true).is_empty());
     let unavailable_target =
         tmux_tool_rail_header_status(SectionPhase::Ready, Some(&available), false);
     assert!(matches!(

@@ -3,15 +3,15 @@
 //! @author kongweiguang
 
 use super::{
-    begin_panel_load_request, completed_transfer_refresh_directories, finish_panel_load_request,
-    panel_needs_transfer_refresh, panel_refresh_target,
+    TransferRefreshScope, begin_panel_load_request, completed_transfer_refresh_directories,
+    finish_panel_load_request, panel_needs_transfer_refresh, panel_refresh_target,
 };
 use kerminal_domain::{
     files::{
         ConflictPolicy, FileEndpoint, TransferCommitSummary, TransferFailureKind, TransferKind,
         TransferRequest, TransferStatus, TransferSummary, TransferTask,
     },
-    identity::TransferId,
+    identity::{HostId, TransferId},
 };
 use std::path::PathBuf;
 
@@ -22,6 +22,13 @@ fn local(path: &str) -> FileEndpoint {
     FileEndpoint::Local {
         path: PathBuf::from(path),
     }
+}
+
+/// 不同 HostId 即使展示相同路径，也必须保持独立的刷新范围。
+///
+/// @author kongweiguang
+fn remote(host_id: &HostId, path: &str) -> FileEndpoint {
+    FileEndpoint::remote(host_id.clone(), path).expect("test remote path must be valid")
 }
 
 /// 构造领域摘要的实际公开字段形状，回执数只由测试显式指定。
@@ -130,7 +137,10 @@ fn earlier_completion_does_not_regress_navigation_and_requested_completion_refre
     assert_eq!(target, &requested_endpoint);
 
     let a_directories = completed_transfer_refresh_directories(&previous, &a_completed);
-    assert_eq!(a_directories, vec![local("A")]);
+    assert_eq!(
+        a_directories,
+        vec![TransferRefreshScope::Directory(local("A"))]
+    );
     assert!(!panel_needs_transfer_refresh(
         &committed_endpoint,
         pending_endpoint.as_ref(),
@@ -150,7 +160,10 @@ fn earlier_completion_does_not_regress_navigation_and_requested_completion_refre
     );
 
     let b_directories = completed_transfer_refresh_directories(&a_completed, &b_completed);
-    assert_eq!(b_directories, vec![local("B")]);
+    assert_eq!(
+        b_directories,
+        vec![TransferRefreshScope::Directory(local("B"))]
+    );
     assert!(panel_needs_transfer_refresh(
         &committed_endpoint,
         pending_endpoint.as_ref(),
@@ -235,7 +248,13 @@ fn merged_successes_refresh_requested_endpoint_once() {
     );
 
     let merged_directories = completed_transfer_refresh_directories(&previous, &completed);
-    assert_eq!(merged_directories, vec![local("A"), local("B")]);
+    assert_eq!(
+        merged_directories,
+        vec![
+            TransferRefreshScope::Directory(local("A")),
+            TransferRefreshScope::Directory(local("B")),
+        ],
+    );
     assert!(panel_needs_transfer_refresh(
         &committed_endpoint,
         pending_endpoint.as_ref(),
@@ -303,11 +322,11 @@ fn stale_load_result_cannot_clear_new_pending_endpoint() {
     assert!(pending.is_none());
 }
 
-/// 文件与目录都依赖实际提交回执；未知、无回执成功和 Unchanged 不刷新。
+/// 失败中的明确提交回执只触发只读刷新，不改变提交未知状态或授权重试。
 ///
 /// @author kongweiguang
 #[test]
-fn only_confirmed_success_receipts_produce_refresh_targets() {
+fn confirmed_terminal_receipts_refresh_without_reinterpreting_outcome() {
     let file = summary(
         TransferId::new(),
         TransferStatus::Succeeded,
@@ -320,8 +339,8 @@ fn only_confirmed_success_receipts_produce_refresh_targets() {
         TransferId::new(),
         TransferStatus::Failed,
         TransferKind::File,
-        local("out/unknown"),
-        Some(local("out/unknown")),
+        local("uncertain/unknown"),
+        Some(local("uncertain/unknown")),
         1,
     );
     unknown.failure_kind = Some(TransferFailureKind::CommitUnknown);
@@ -342,8 +361,246 @@ fn only_confirmed_success_receipts_produce_refresh_targets() {
         0,
     );
 
-    assert_eq!(
-        completed_transfer_refresh_directories(&[], &[file, unknown, empty_success, unchanged]),
-        vec![local("out")],
+    let cancelled = summary(
+        TransferId::new(),
+        TransferStatus::Cancelled,
+        TransferKind::Directory,
+        local("partial/tree"),
+        Some(local("partial/tree")),
+        2,
     );
+    let current = vec![file, unknown, cancelled, empty_success, unchanged];
+    assert_eq!(
+        completed_transfer_refresh_directories(&[], &current),
+        vec![
+            TransferRefreshScope::Directory(local("out")),
+            TransferRefreshScope::Directory(local("uncertain")),
+            TransferRefreshScope::Directory(local("partial")),
+            TransferRefreshScope::Tree(local("partial/tree")),
+        ],
+    );
+    assert_eq!(current[1].status, TransferStatus::Failed);
+    assert_eq!(
+        current[1].failure_kind,
+        Some(TransferFailureKind::CommitUnknown)
+    );
+    assert!(!current[1].retryable);
+    assert_eq!(current[2].status, TransferStatus::Cancelled);
+    assert!(completed_transfer_refresh_directories(&current, &current).is_empty());
+}
+
+/// 队列尚无明确实际目标或提交回执时不能凭请求路径猜测刷新位置。
+///
+/// @author kongweiguang
+#[test]
+fn refresh_requires_terminal_status_actual_destination_and_receipt() {
+    let id = TransferId::new();
+    let requested = local("out/tree");
+    let cases = [
+        summary(
+            id.clone(),
+            TransferStatus::Transferring,
+            TransferKind::Directory,
+            requested.clone(),
+            Some(requested.clone()),
+            1,
+        ),
+        summary(
+            id.clone(),
+            TransferStatus::Failed,
+            TransferKind::Directory,
+            requested.clone(),
+            None,
+            1,
+        ),
+        summary(
+            id.clone(),
+            TransferStatus::Cancelled,
+            TransferKind::Directory,
+            requested.clone(),
+            Some(requested.clone()),
+            0,
+        ),
+        summary(
+            id.clone(),
+            TransferStatus::Skipped,
+            TransferKind::Directory,
+            requested.clone(),
+            Some(requested.clone()),
+            1,
+        ),
+        summary(
+            id.clone(),
+            TransferStatus::Unchanged,
+            TransferKind::Directory,
+            requested.clone(),
+            Some(requested.clone()),
+            1,
+        ),
+    ];
+    for case in &cases {
+        assert!(completed_transfer_refresh_directories(&[], std::slice::from_ref(case)).is_empty());
+    }
+    let no_receipt = summary(
+        id.clone(),
+        TransferStatus::Failed,
+        TransferKind::Directory,
+        requested.clone(),
+        Some(requested.clone()),
+        0,
+    );
+    let with_receipt = summary(
+        id,
+        TransferStatus::Failed,
+        TransferKind::Directory,
+        requested.clone(),
+        Some(requested),
+        1,
+    );
+    assert_eq!(
+        completed_transfer_refresh_directories(&[no_receipt], &[with_receipt]),
+        vec![
+            TransferRefreshScope::Directory(local("out")),
+            TransferRefreshScope::Tree(local("out/tree"))
+        ],
+    );
+}
+
+/// 同名远端路径必须绑定 HostId 和 POSIX 组件边界，目录后代按当前浏览目标回读。
+///
+/// @author kongweiguang
+#[test]
+fn directory_scope_refreshes_only_matching_host_and_descendants() {
+    let host = HostId::new();
+    let other_host = HostId::new();
+    let destination = remote(&host, "/data/tree");
+    let finished = summary(
+        TransferId::new(),
+        TransferStatus::Failed,
+        TransferKind::Directory,
+        destination.clone(),
+        Some(destination.clone()),
+        1,
+    );
+    let scopes = completed_transfer_refresh_directories(&[], &[finished]);
+    for endpoint in [
+        remote(&host, "/data"),
+        destination,
+        remote(&host, "/data/tree/nested/deep"),
+    ] {
+        assert!(panel_needs_transfer_refresh(
+            &endpoint, None, false, true, &scopes
+        ));
+    }
+    for endpoint in [
+        remote(&other_host, "/data"),
+        remote(&other_host, "/data/tree/nested"),
+        remote(&host, "/data/tree-other"),
+        remote(&host, "/data/tree/../outside"),
+        local("/data/tree/nested"),
+    ] {
+        assert!(!panel_needs_transfer_refresh(
+            &endpoint, None, false, true, &scopes
+        ));
+    }
+    assert!(!panel_needs_transfer_refresh(
+        &remote(&host, "/data/tree"),
+        None,
+        false,
+        false,
+        &scopes
+    ));
+    assert!(!panel_needs_transfer_refresh(
+        &remote(&host, "/data/tree/nested"),
+        Some(&remote(&other_host, "/data/tree/nested")),
+        true,
+        true,
+        &scopes,
+    ));
+}
+
+/// 本机路径使用组件而非字符串前缀，并拒绝通过父目录段误判为目标树后代。
+///
+/// @author kongweiguang
+#[test]
+fn local_directory_scope_matches_component_boundaries() {
+    let scopes = vec![TransferRefreshScope::Tree(local("out/tree"))];
+    for endpoint in [local("out/tree"), local("out/tree/nested")] {
+        assert!(panel_needs_transfer_refresh(
+            &endpoint, None, false, true, &scopes
+        ));
+    }
+    for endpoint in [local("out/tree-other"), local("out/tree/../outside")] {
+        assert!(!panel_needs_transfer_refresh(
+            &endpoint, None, false, true, &scopes
+        ));
+    }
+    let relative_root = vec![TransferRefreshScope::Tree(local("."))];
+    assert!(panel_needs_transfer_refresh(
+        &local("nested/child"),
+        None,
+        false,
+        true,
+        &relative_root
+    ));
+    assert!(!panel_needs_transfer_refresh(
+        &local("../outside"),
+        None,
+        false,
+        true,
+        &relative_root
+    ));
+}
+
+/// 文件只影响实际目标父目录，不能因相近名称或子目录而触发无关读取。
+///
+/// @author kongweiguang
+#[test]
+fn file_scope_does_not_refresh_child_directories() {
+    let finished = summary(
+        TransferId::new(),
+        TransferStatus::Succeeded,
+        TransferKind::File,
+        local("out/name"),
+        Some(local("out/name (1)")),
+        1,
+    );
+    let scopes = completed_transfer_refresh_directories(&[], &[finished]);
+    assert!(panel_needs_transfer_refresh(
+        &local("out"),
+        None,
+        false,
+        true,
+        &scopes
+    ));
+    assert!(!panel_needs_transfer_refresh(
+        &local("out/nested"),
+        None,
+        false,
+        true,
+        &scopes
+    ));
+}
+
+/// 清理或丢帧后无法确定影响路径，已缓存和在途目录都必须重新读取。
+///
+/// @author kongweiguang
+#[test]
+fn uncertain_queue_change_refreshes_cached_and_in_flight_directories() {
+    let scopes = [TransferRefreshScope::All];
+    let current = local("current");
+    let requested = local("requested");
+    assert!(panel_needs_transfer_refresh(
+        &current, None, false, true, &scopes
+    ));
+    assert!(panel_needs_transfer_refresh(
+        &current,
+        Some(&requested),
+        true,
+        false,
+        &scopes,
+    ));
+    assert!(!panel_needs_transfer_refresh(
+        &current, None, false, false, &scopes
+    ));
 }

@@ -12,6 +12,51 @@ use self::keybinding_compiler::{
 use gpui_kit::{KeyContext, Keystroke};
 use kerminal_application::preferences::{KeybindingPreference, KeybindingScope, SettingsSnapshot};
 
+/// 短绑定先于 chord 触发，因此任一声明顺序都要报告同作用域的前缀冲突。
+///
+/// @author kongweiguang
+#[test]
+fn reports_unreachable_chord_prefixes_in_either_order() {
+    let short = preference("settings.open", "Ctrl+K", "", "", KeybindingScope::Global);
+    let long = preference(
+        "terminal.search",
+        "Ctrl+K Ctrl+F",
+        "",
+        "",
+        KeybindingScope::Terminal,
+    );
+    for preferences in [[short.clone(), long.clone()], [long.clone(), short.clone()]] {
+        let compiled = CompiledKeybindings::compile(&preferences, KeybindingPlatform::Windows);
+        assert!(compiled.diagnostics().iter().any(|diagnostic| {
+            diagnostic.kind == KeybindingDiagnosticKind::Conflict
+                && diagnostic.conflicts_with.is_some()
+        }));
+    }
+
+    let unrelated = preference(
+        "terminal.search",
+        "Ctrl+K Ctrl+F",
+        "",
+        "",
+        KeybindingScope::Terminal,
+    );
+    let different = preference(
+        "settings.open",
+        "Ctrl+K Ctrl+S",
+        "",
+        "",
+        KeybindingScope::Global,
+    );
+    let compiled =
+        CompiledKeybindings::compile(&[unrelated, different], KeybindingPlatform::Windows);
+    assert!(
+        !compiled
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.kind == KeybindingDiagnosticKind::Conflict })
+    );
+}
+
 /// 构造包含新增可选平台字段的测试配置，避免测试依赖用户配置文件。
 ///
 /// @author kongweiguang
@@ -30,7 +75,6 @@ fn preference(
         windows_binding: windows_binding.to_owned(),
         mac_binding: mac_binding.to_owned(),
         linux_binding: None,
-        windows_alternate_binding: None,
         scope,
         editable: true,
     }
@@ -296,12 +340,11 @@ fn empty_effective_binding_disables_action() {
     );
 }
 
-/// Windows 主/备用组合、Linux 专用绑定与 macOS 粘贴键由同一 typed action 覆盖。
-/// 本机选择还需通过实际组合键解析，确保 Ctrl/Cmd 与 Windows 备用键按当前平台生效。
+/// Windows、Linux 与 macOS 粘贴键各由自己的平台字段覆盖，并需通过实际组合键解析。
 ///
 /// @author kongweiguang
 #[test]
-fn terminal_paste_uses_platform_defaults_and_windows_alternate() {
+fn terminal_paste_uses_platform_defaults() {
     let mut paste = preference(
         "terminal.paste",
         "",
@@ -310,14 +353,16 @@ fn terminal_paste_uses_platform_defaults_and_windows_alternate() {
         KeybindingScope::Terminal,
     );
     paste.linux_binding = Some("Ctrl+Shift+V".to_owned());
-    paste.windows_alternate_binding = Some("Ctrl+Shift+V".to_owned());
     let contexts = terminal_context_stack();
 
     let current =
         CompiledKeybindings::compile(std::slice::from_ref(&paste), KeybindingPlatform::current());
     for (shortcut, enabled) in [
         ("ctrl-v", cfg!(target_os = "windows")),
-        ("ctrl-shift-v", !cfg!(target_os = "macos")),
+        (
+            "ctrl-shift-v",
+            !cfg!(target_os = "windows") && !cfg!(target_os = "macos"),
+        ),
         ("cmd-v", cfg!(target_os = "macos")),
     ] {
         assert_eq!(
@@ -336,7 +381,6 @@ fn terminal_paste_uses_platform_defaults_and_windows_alternate() {
 
     for (platform, shortcut) in [
         (KeybindingPlatform::Windows, "ctrl-v"),
-        (KeybindingPlatform::Windows, "ctrl-shift-v"),
         (KeybindingPlatform::Linux, "ctrl-shift-v"),
         (KeybindingPlatform::Mac, "cmd-v"),
     ] {
@@ -369,80 +413,6 @@ fn terminal_paste_uses_platform_defaults_and_windows_alternate() {
         None,
         "Linux Ctrl+V remains available to the terminal as a control key"
     );
-}
-
-/// Windows 主/备用绑定相同时仅注册一次同 action chord，不制造自身冲突诊断。
-///
-/// @author kongweiguang
-#[test]
-fn duplicate_windows_paste_chord_is_registered_once_without_self_conflict() {
-    let mut paste = preference(
-        "terminal.paste",
-        "",
-        "Ctrl+Shift+V",
-        "Cmd+V",
-        KeybindingScope::Terminal,
-    );
-    paste.windows_alternate_binding = Some("control+shift+v".to_owned());
-
-    let compiled = CompiledKeybindings::compile(&[paste], KeybindingPlatform::Windows);
-    assert!(!compiled.diagnostics().iter().any(|diagnostic| {
-        diagnostic.kind == KeybindingDiagnosticKind::Conflict
-            && diagnostic.action == "terminal.paste"
-            && diagnostic.conflicts_with.as_deref() == Some("terminal.paste")
-    }));
-    assert_eq!(
-        compiled
-            .resolve(
-                &[Keystroke::parse("ctrl-shift-v").expect("valid paste key")],
-                &terminal_context_stack(),
-                false,
-                false,
-                false,
-            )
-            .action,
-        Some(KeybindingAction::TerminalPaste)
-    );
-}
-
-/// Windows 主绑定和备用绑定分别保留冲突来源与绑定文本，方便设置页定位冲突。
-///
-/// @author kongweiguang
-#[test]
-fn windows_paste_conflicts_report_each_effective_binding() {
-    let settings = preference("settings.open", "", "Ctrl+V", "", KeybindingScope::Global);
-    let new_tab = preference(
-        "terminal.newTab",
-        "",
-        "Ctrl+Shift+V",
-        "",
-        KeybindingScope::Workspace,
-    );
-    let mut paste = preference(
-        "terminal.paste",
-        "",
-        "Ctrl+V",
-        "Cmd+V",
-        KeybindingScope::Terminal,
-    );
-    paste.windows_alternate_binding = Some("Ctrl+Shift+V".to_owned());
-
-    let compiled =
-        CompiledKeybindings::compile(&[settings, new_tab, paste], KeybindingPlatform::Windows);
-    let paste_conflicts = compiled
-        .diagnostics()
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic.kind == KeybindingDiagnosticKind::Conflict
-                && diagnostic.action == "terminal.paste"
-        })
-        .map(|diagnostic| diagnostic.binding.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-
-    let expected = ["Ctrl+Shift+V", "Ctrl+V"]
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(paste_conflicts, expected);
 }
 
 /// 显式空 Linux 字段关闭 paste，旧条目缺失该字段时仍回退到 Windows 覆盖值。

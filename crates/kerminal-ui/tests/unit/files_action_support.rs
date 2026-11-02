@@ -8,7 +8,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+use gpui_kit::{AppContext as _, Context, Entity, TestAppContext, VisualTestContext};
 use kerminal_application::{
     AppError, AppResult, ApplicationTaskExecutor,
     files::{FileAccessProvider, FileBookmarkRepository, FileService},
@@ -24,7 +24,7 @@ use kerminal_domain::files::{
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 
-use crate::features::files::{FileTargetNameLookup, FilesPane};
+use crate::features::files::{FilePaneSide, FileTargetNameLookup, FilesPane};
 
 /// 仅记录文件写操作，确认取消路径没有越过 UI 边界提交任何变更。
 #[derive(Default)]
@@ -162,8 +162,23 @@ pub(crate) fn seed_listing(
     pane.panels[side].listing = Some(DirectoryListing { directory, entries });
 }
 
+/// 为 Root 的真实抽屉绘制提供已加载目标，避免异步文件服务和真实磁盘干扰焦点回归。
+///
+/// @author kongweiguang
+pub(crate) fn seed_compact_listing(
+    pane: &mut FilesPane,
+    endpoint: FileEndpoint,
+    entries: Vec<FileEntry>,
+) {
+    pane.initialized = true;
+    pane.current_terminal_endpoint = Some(endpoint.clone());
+    pane.panels[1].endpoint = endpoint;
+    pane.panels[1].requested_endpoint = None;
+    seed_listing(pane, 1, 1, entries);
+}
+
 /// 绘制边界测试使用严格隔离 runtime 和不执行传输/文件 IO 的 ports。
-fn services() -> (
+pub(crate) fn services() -> (
     Runtime,
     FileService,
     TransferService,
@@ -190,6 +205,78 @@ fn services() -> (
     .expect("test transfer backend is registered");
     let executor = ApplicationTaskExecutor::new(runtime.handle().clone());
     (runtime, files, transfers, executor, mutations)
+}
+
+/// 通过生产请求入口驱动 Root 回归，避免测试直接伪造面板的目标与代次状态。
+///
+/// @author kongweiguang
+pub(crate) fn request_saved_host(
+    pane: &mut FilesPane,
+    side: FilePaneSide,
+    host_id: kerminal_domain::identity::HostId,
+    cx: &mut Context<FilesPane>,
+) {
+    pane.request_sftp_host(side, host_id, cx);
+}
+
+/// 按已通过预检的生产入口切换目标，使持久化回归同时验证真实面板状态和事件。
+///
+/// @author kongweiguang
+pub(crate) fn bind_host_target(
+    pane: &mut FilesPane,
+    side: FilePaneSide,
+    endpoint: FileEndpoint,
+    cx: &mut Context<FilesPane>,
+) {
+    pane.bind_selected_endpoint(side, endpoint, cx);
+}
+
+/// 使用当前活动身份关闭主机标签，不伪造右侧未选择的文件面板状态。
+///
+/// @author kongweiguang
+pub(crate) fn close_active_host_tab(
+    pane: &mut FilesPane,
+    side: FilePaneSide,
+    cx: &mut Context<FilesPane>,
+) {
+    if let Some(id) = pane.host_picker.host_tabs.active[side.index()] {
+        pane.close_host_tab(side, id, cx);
+    }
+}
+
+/// 读取真实面板端点，以确认迟到回执不会改写随后替换的标签。
+///
+/// @author kongweiguang
+pub(crate) fn panel_endpoint(pane: &FilesPane, side: FilePaneSide) -> FileEndpoint {
+    pane.panels[side.index()].endpoint.clone()
+}
+
+/// 模拟已卸载文件面板的迟到导航事件，仍经生产租约与 Root 订阅门禁。
+///
+/// @author kongweiguang
+pub(crate) fn request_fixture_open(
+    pane: &mut FilesPane,
+    endpoint: FileEndpoint,
+    cx: &mut Context<FilesPane>,
+) {
+    pane.request_open_file(endpoint, cx);
+}
+
+/// Root 关闭回归只控制受理屏障，避免依赖真实文件系统或传输后端时序。
+///
+/// @author kongweiguang
+pub(crate) fn begin_enqueue_barrier(pane: &mut FilesPane, cx: &mut Context<FilesPane>) {
+    pane.begin_transfer_preparation([true, true], cx)
+        .expect("test enqueue preparation");
+    pane.transfer_submission.as_mut().expect("submission").phase =
+        super::TransferSubmissionPhase::Enqueuing;
+}
+
+/// 模拟真实入队回执释放屏障，关闭测试可再次执行原来的用户操作。
+///
+/// @author kongweiguang
+pub(crate) fn finish_enqueue_barrier(pane: &mut FilesPane) {
+    pane.end_transfer_submission();
 }
 
 /// 不支持任何真实传输，防止 UI 生命周期测试误触队列执行。

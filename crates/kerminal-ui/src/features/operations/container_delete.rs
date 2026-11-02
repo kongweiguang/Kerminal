@@ -118,7 +118,18 @@ impl OperationsView {
         }
         if !self
             .container_action_ticket_is_current(&confirmation.ticket, Some(&confirmation.target))
+            || !self.container_mutation_allowed(&confirmation.target)
         {
+            self.container_delete_confirmation = None;
+            self.status = Some(
+                crate::locale::text(
+                    "容器目标或列表状态已变化，请刷新后重新选择。",
+                    "The container target or list changed. Refresh and select it again.",
+                )
+                .to_string(),
+            );
+            cx.emit(OperationsEvent::RootConfirmationChanged);
+            cx.notify();
             return;
         }
         let confirmation = self

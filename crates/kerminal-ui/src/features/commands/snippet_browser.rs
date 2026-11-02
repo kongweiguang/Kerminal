@@ -2,11 +2,13 @@
 //!
 //! @author kongweiguang
 
+use std::collections::HashSet;
+
 use gpui_kit::{ClipboardItem, Context, IntoElement, Window};
 #[cfg(feature = "right-rail-acceptance")]
 use kerminal_application::sessions::UiSessionBinding;
 use kerminal_application::{
-    AppError, PublicErrorCode,
+    AppError, AppResult, PublicErrorCode,
     commands::{
         SnippetCatalogCursor, SnippetCatalogPageOutcome, SnippetCatalogPageRequest,
         SnippetCatalogRevision, SnippetCatalogSection, SnippetExecutionCatalogSnapshot,
@@ -14,8 +16,8 @@ use kerminal_application::{
     },
 };
 use kerminal_domain::commands::{
-    SnippetCatalogOrigin, SnippetDefaultAction, SnippetDefinition, SnippetPreferenceKey,
-    SnippetRisk, SnippetScope, SnippetVariableKind,
+    SnippetCatalogItem, SnippetCatalogOrigin, SnippetDefaultAction, SnippetDefinition,
+    SnippetPreference, SnippetPreferenceKey, SnippetRisk, SnippetScope, SnippetVariableKind,
 };
 use kerminal_domain::preferences::ConfigRevision;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +29,85 @@ use super::{
 };
 
 const SNIPPET_PAGE_SIZE: usize = 100;
+
+/// 收藏回执只受精确来源和 ID 的写入门禁约束，不受异步目录查询或筛选代次影响。
+/// 成功时先更新当前仍可见的行，避免新目录页返回前用户根据旧星标再次提交错误的目标值。
+///
+/// @author kongweiguang
+fn finish_snippet_favorite_request(
+    pending: &mut HashSet<SnippetPreferenceKey>,
+    items: &mut [SnippetCatalogItem],
+    key: &SnippetPreferenceKey,
+    expected: bool,
+    result: AppResult<SnippetPreference>,
+) -> Option<AppResult<()>> {
+    if !pending.remove(key) {
+        return None;
+    }
+    Some(result.and_then(|preference| {
+        if preference.key != *key || preference.favorite != expected {
+            return Err(AppError::conflict(command_error_context(
+                "收藏结果与请求不一致，请刷新后检查",
+                "The favorite receipt does not match the request; refresh and check",
+            )));
+        }
+        if let Some(item) = items
+            .iter_mut()
+            .find(|item| item.origin == key.origin && item.id == key.snippet_id)
+        {
+            item.favorite = preference.favorite;
+        }
+        Ok(())
+    }))
+}
+
+/// 重试只撤下原片段的收藏错误，且仅在状态条仍显示收藏错误时替换它，避免清除其他操作反馈。
+///
+/// @author kongweiguang
+fn clear_snippet_favorite_error(
+    errors: &mut Vec<(SnippetPreferenceKey, String)>,
+    status: &mut Option<String>,
+    key: &SnippetPreferenceKey,
+) {
+    let previous = errors
+        .iter()
+        .map(|(_, message)| message.as_str())
+        .collect::<Vec<_>>()
+        .join("；");
+    errors.retain(|(failed_key, _)| failed_key != key);
+    if !previous.is_empty() && status.as_deref() == Some(previous.as_str()) {
+        *status = (!errors.is_empty()).then(|| {
+            errors
+                .iter()
+                .map(|(_, message)| message.as_str())
+                .collect::<Vec<_>>()
+                .join("；")
+        });
+    }
+}
+
+/// 并发收藏失败需要同时可见；同一条目的新错误覆盖旧错误，避免重复堆积。
+///
+/// @author kongweiguang
+fn record_snippet_favorite_error(
+    errors: &mut Vec<(SnippetPreferenceKey, String)>,
+    status: &mut Option<String>,
+    key: SnippetPreferenceKey,
+    message: String,
+) {
+    if let Some((_, existing)) = errors.iter_mut().find(|(failed_key, _)| failed_key == &key) {
+        *existing = message;
+    } else {
+        errors.push((key, message));
+    }
+    *status = Some(
+        errors
+            .iter()
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>()
+            .join("；"),
+    );
+}
 
 /// 敏感命令只允许预览或填入终端，不进入系统剪贴板；按钮和处理函数共用此门禁。
 ///
@@ -137,7 +218,7 @@ impl SnippetInlinePreview {
     /// 异步预览只在仍等待同一来源键时接收；收起或切走后旧回执不能安装旧详情。
     ///
     /// @author kongweiguang
-    fn is_loading_key(&self, key: &SnippetPreferenceKey) -> bool {
+    pub(super) fn is_loading_key(&self, key: &SnippetPreferenceKey) -> bool {
         matches!(self, Self::Loading(current) if current == key)
     }
 
@@ -414,7 +495,7 @@ impl CommandsView {
         self.load_snippet_page(None, cx);
     }
 
-    /// 请求边界核对代次并串行续读右栏目录；目录响应只清理自己的错误，不吞掉导入等操作反馈。
+    /// 请求边界核对代次并串行续读右栏目录；读取错误只在目录内呈现一次，不占用全局状态条。
     ///
     /// @author kongweiguang
     pub(super) fn load_snippet_page(
@@ -479,8 +560,6 @@ impl CommandsView {
                 }
                 match result {
                     Ok(SnippetCatalogPageOutcome::Page(page)) => {
-                        let clear_directory_status = view.snippet_page_error.is_some()
-                            && view.status == view.snippet_page_error;
                         apply_snippet_page_success(
                             SnippetPageSuccessState {
                                 items: &mut view.snippet_page_items,
@@ -500,9 +579,6 @@ impl CommandsView {
                                 append,
                             },
                         );
-                        if clear_directory_status {
-                            view.status = None;
-                        }
                         // main 的右栏展示完整目录；使用既有分页串行续读，不从 render 发起 I/O。
                         if view.compact_layout
                             && let Some(next) = view.snippet_next_cursor.clone()
@@ -521,10 +597,9 @@ impl CommandsView {
                         record_snippet_page_failure(
                             &mut view.snippet_page_error,
                             &mut view.snippet_page_retry_cursor,
-                            message.clone(),
+                            message,
                             None,
                         );
-                        view.status = Some(message);
                         if append {
                             view.load_snippet_page(None, cx);
                         }
@@ -534,10 +609,9 @@ impl CommandsView {
                         record_snippet_page_failure(
                             &mut view.snippet_page_error,
                             &mut view.snippet_page_retry_cursor,
-                            message.clone(),
+                            message,
                             failed_cursor,
                         );
-                        view.status = Some(message);
                     }
                 }
                 cx.notify();
@@ -1040,7 +1114,8 @@ impl CommandsView {
         (self.snippet_copy_generation, cancellation)
     }
 
-    /// 收藏动作使用应用层 origin+ID 身份校验，失败时不乐观伪造收藏状态。
+    /// 收藏写入按 origin+ID 独立排重，完成后刷新当前筛选，不因查询切换丢弃真实回执。
+    /// 成功回执先更新行内星标；失败只清除对应请求并保留可见反馈，不伪造收藏成功。
     ///
     /// @author kongweiguang
     pub fn set_snippet_favorite(
@@ -1049,40 +1124,57 @@ impl CommandsView {
         favorite: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self.snippet_favorite_pending.insert(key.clone()) {
+            return;
+        }
+        let title = self
+            .snippet_page_items
+            .iter()
+            .find(|item| item.origin == key.origin && item.id == key.snippet_id)
+            .map(|item| item.title.clone())
+            .unwrap_or_else(|| key.snippet_id.clone());
+        clear_snippet_favorite_error(&mut self.snippet_favorite_errors, &mut self.status, &key);
         let commands = self.commands.clone();
         let executor = self.executor.clone();
-        let generation = self.snippet_page_generation;
-        let query_generation = self.snippet_query_generation;
-        self.status = Some(command_message("正在保存收藏…", "Saving favorite…"));
+        let completion_key = key.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |cancel| async move {
-                    let preference = commands.set_snippet_favorite(key, favorite).await?;
                     if cancel.is_cancelled() {
                         return Err(AppError::cancelled(command_error_context(
                             "片段收藏更新已取消",
                             "Snippet favorite update was cancelled",
                         )));
                     }
-                    Ok(preference)
+                    commands.set_snippet_favorite(key, favorite).await
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                if view.snippet_page_generation != generation
-                    || view.snippet_query_generation != query_generation
-                {
+                let Some(result) = finish_snippet_favorite_request(
+                    &mut view.snippet_favorite_pending,
+                    &mut view.snippet_page_items,
+                    &completion_key,
+                    favorite,
+                    result,
+                ) else {
                     return;
+                };
+                if let Err(error) = result {
+                    let message = command_message(
+                        format!("更新收藏“{title}”：{}", error.public_message()),
+                        format!("Updating favorite “{title}”: {}", error.public_message()),
+                    );
+                    record_snippet_favorite_error(
+                        &mut view.snippet_favorite_errors,
+                        &mut view.status,
+                        completion_key,
+                        message,
+                    );
                 }
-                match result {
-                    Ok(_) => {
-                        view.status = None;
-                        view.snippet_next_cursor = None;
-                        view.snippet_page_retry_cursor = None;
-                        view.snippet_page_error = None;
-                        view.load_snippet_page(None, cx);
-                    }
-                    Err(error) => view.status = Some(error.public_message().to_owned()),
-                }
+                view.snippet_next_cursor = None;
+                view.snippet_page_retry_cursor = None;
+                view.snippet_page_error = None;
+                view.load_snippet_page(None, cx);
                 cx.notify();
             });
         })
@@ -1227,6 +1319,7 @@ impl CommandsView {
 
     /// 加载 exact catalog identity；内联预览只在仍为该键的 Loading 时接收回执，避免折叠后迟到内容覆盖选择。
     /// 用户项继续用文件 revision，内置项保持只读。
+    /// 读取进度交给行尾图标；预览失败由原行提供重试，避免同一错误又挤出底部状态条。
     ///
     /// @author kongweiguang
     pub(super) fn load_snippet_key(
@@ -1242,7 +1335,6 @@ impl CommandsView {
         let completion_key = key.clone();
         self.snippet_generation = self.snippet_generation.wrapping_add(1).max(1);
         let generation = self.snippet_generation;
-        self.status = Some(command_message("正在读取片段…", "Loading snippet…"));
         cx.spawn_in(window, async move |this, cx| {
             let loaded = executor
                 .run(move |cancel| async move {
@@ -1323,7 +1415,9 @@ impl CommandsView {
                             let message = error.public_message().to_owned();
                             view.snippet_inline_preview
                                 .finish_loading(&completion_key, Err(message.clone()));
-                            view.status = Some(message);
+                            if !preview_only {
+                                view.status = Some(message);
+                            }
                         }
                     }
                     cx.notify();

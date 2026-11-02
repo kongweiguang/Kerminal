@@ -81,14 +81,9 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 在指定的已加载分组中新建 Profile，组关系只进入既有 Profile CAS 草稿。
+    /// 新建模板始终与主机分组无关，分组只属于已保存的主机。
     /// @author kongweiguang
-    pub(super) fn create_profile_in_group(
-        &mut self,
-        group_id: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn create_profile_in_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.section = PreferencesSection::Profiles;
         let next_order = self
             .profile_rows
@@ -105,7 +100,7 @@ impl PreferencesPanel {
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
-                sidebar_group_id: group_id,
+                sidebar_group_id: None,
                 sort_order: next_order,
             },
             None,
@@ -130,18 +125,6 @@ impl PreferencesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.request_profile_selection_in_group(selection, None, window, cx);
-    }
-
-    /// 创建新 Profile 时保留来源分组；切换已保存 Profile 时 group override 必须为空。
-    /// @author kongweiguang
-    pub(in crate::features::preferences) fn request_profile_selection_in_group(
-        &mut self,
-        selection: Option<String>,
-        new_profile_group: Option<Option<String>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         if self
             .profile_draft
             .as_ref()
@@ -163,25 +146,22 @@ impl PreferencesPanel {
             .is_some_and(ConfigDraft::is_dirty)
         {
             self.pending_profile_selection = Some(selection);
-            self.pending_profile_group_id = new_profile_group;
             self.profile_switch_confirmation = true;
             cx.notify();
             return;
         }
-        self.apply_profile_selection(selection, new_profile_group, window, cx);
+        self.apply_profile_selection(selection, window, cx);
     }
 
     /// 切换时重用已加载 revision；新建动作不经过任何配置文件读写。
     fn apply_profile_selection(
         &mut self,
         selection: Option<String>,
-        new_profile_group: Option<Option<String>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.profile_switch_confirmation = false;
         self.pending_profile_selection = None;
-        self.pending_profile_group_id = None;
         match selection {
             Some(id) => {
                 if let Some(row) = self
@@ -193,7 +173,7 @@ impl PreferencesPanel {
                     self.install_profile(row, window, cx);
                 }
             }
-            None => self.create_profile_in_group(new_profile_group.unwrap_or(None), window, cx),
+            None => self.create_profile_in_group(window, cx),
         }
         cx.notify();
     }
@@ -205,39 +185,11 @@ impl PreferencesPanel {
         cx: &mut Context<Self>,
     ) {
         let selection = self.pending_profile_selection.take();
-        let new_profile_group = self.pending_profile_group_id.take();
         self.profile_switch_confirmation = false;
         if let Some(draft) = self.profile_draft.as_mut() {
             let _ = draft.discard_changes();
         }
-        self.apply_profile_selection(selection.unwrap_or(None), new_profile_group, window, cx);
-    }
-
-    /// 分组控件只替换 typed 草稿值；保存/重载期间忽略迟到事件，避免更改 CAS 请求。
-    /// @author kongweiguang
-    pub(super) fn update_profile_group(
-        &mut self,
-        group_id: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        if self.loading_profiles || self.profile_operation_running {
-            return;
-        }
-        let Some(draft) = self.profile_draft.as_mut() else {
-            return;
-        };
-        if matches!(
-            draft.status(),
-            DraftStatus::Saving | DraftStatus::OutcomeUnknown | DraftStatus::ExternalConflict
-        ) {
-            return;
-        }
-        let mut value = draft.value().clone();
-        value.sidebar_group_id = group_id;
-        if draft.replace_value(value).is_ok() {
-            self.profile_group_error = None;
-        }
-        cx.notify();
+        self.apply_profile_selection(selection.unwrap_or(None), window, cx);
     }
 
     /// 向 application 提交完整 typed Profile draft，保存結果回傳的 ID/revision 才建立新基線。
@@ -266,22 +218,6 @@ impl PreferencesPanel {
                 )
                 .to_string(),
             );
-            cx.notify();
-            return;
-        }
-        if let Some(group_id) = self
-            .profile_draft
-            .as_ref()
-            .and_then(|draft| draft.value().sidebar_group_id.as_deref())
-            && (self.host_management.is_none()
-                || self.profile_group_loading
-                || !self.profile_groups.iter().any(|group| group.id == group_id))
-        {
-            self.profile_group_error = Some(crate::locale::text(
-                "无法确认所选分组仍然存在；刷新分组或选择未分组后再保存。",
-                "The selected group could not be verified. Refresh groups or choose Ungrouped before saving.",
-            ).to_string());
-            self.status = self.profile_group_error.clone();
             cx.notify();
             return;
         }

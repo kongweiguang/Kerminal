@@ -327,7 +327,7 @@ pub(super) fn next_forward_form_open(
 }
 
 impl OperationsView {
-    /// 输入和 Enter 订阅只创建一次并由视图持有；提交只路由当前弹层，继续复用原目标门禁。
+    /// 输入和 Enter 订阅只创建一次并由视图持有；统一确认入口保留原目标及未知保存核对门禁。
     ///
     /// @author kongweiguang
     pub(super) fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -485,14 +485,13 @@ impl OperationsView {
                     ) {
                         return;
                     }
-                    if view.tmux_dialog_context.is_some() {
-                        view.confirm_root_confirmation(cx);
-                    } else if view
-                        .inputs
-                        .as_ref()
-                        .is_some_and(|inputs| inputs.forward_form_open)
+                    if view.tmux_dialog_context.is_some()
+                        || view
+                            .inputs
+                            .as_ref()
+                            .is_some_and(|inputs| inputs.forward_form_open)
                     {
-                        view.save_forward(true, cx);
+                        view.confirm_root_confirmation(cx);
                     }
                 }));
         }

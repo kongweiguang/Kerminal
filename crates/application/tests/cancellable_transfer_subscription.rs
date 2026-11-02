@@ -44,6 +44,33 @@ async fn lagged_receiver_is_prompted_to_reload_snapshot() {
     );
 }
 
+/// 清理与丢帧必须区别于普通唤醒，UI 才能补偿已从队列移除的提交项。
+#[tokio::test]
+async fn event_subscription_preserves_clear_and_reports_lag() {
+    let (sender, mut receiver) = broadcast::channel(1);
+    sender
+        .send(TransferQueueEvent::Cleared)
+        .expect("receiver exists");
+    assert_eq!(
+        subscription::receive_transfer_event(&mut receiver, &CancellationToken::new()).await,
+        Some(TransferQueueEvent::Cleared),
+    );
+    sender
+        .send(TransferQueueEvent::Changed)
+        .expect("receiver exists");
+    sender
+        .send(TransferQueueEvent::Changed)
+        .expect("receiver exists");
+    assert_eq!(
+        subscription::receive_transfer_event(&mut receiver, &CancellationToken::new()).await,
+        Some(TransferQueueEvent::Resync),
+    );
+    assert_eq!(
+        subscription::receive_transfer_event(&mut receiver, &CancellationToken::new()).await,
+        Some(TransferQueueEvent::Changed),
+    );
+}
+
 /// receiver 关闭时返回 None，与有事件或 lag 的唤醒区分。
 #[tokio::test]
 async fn closed_sender_ends_subscription() {

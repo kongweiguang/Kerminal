@@ -19,6 +19,17 @@ use kerminal_domain::connections::RemoteProtocol;
 
 const DEFAULT_SSH_PORT: u16 = 22;
 
+/// JSON 入口只接收公开的连接身份，未知字段（包括认证秘密）一律拒绝。
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalSshJson {
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default, alias = "user")]
+    username: Option<String>,
+}
+
 /// 只按显式协议前缀或可验证客户端名预识别来源，供应用在完整解析前执行用户禁用策略。
 pub(super) fn source_hint(activation: &ExternalActivation) -> Option<ExternalLaunchSource> {
     let arguments = &activation.arguments;
@@ -33,7 +44,9 @@ pub(super) fn source_hint(activation: &ExternalActivation) -> Option<ExternalLau
     }
 }
 
-/// 识别 Kerminal 协议链接或明确支持的终端客户端，再按其窄白名单解析参数。
+/// 单一 Kerminal 链接与命令参数分别解析，避免额外参数被悄然忽略。
+///
+/// @author kongweiguang
 pub(super) fn parse_activation(
     activation: &ExternalActivation,
 ) -> AppResult<Option<ExternalLaunchRequest>> {
@@ -48,6 +61,9 @@ pub(super) fn parse_activation(
             .get(.."kerminal:".len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("kerminal:"))
     }) {
+        if index != 1 || arguments.len() != 2 {
+            return Err(AppError::invalid("Kerminal 外部链接不能与其他参数混用"));
+        }
         return parse_kerminal_url(raw_url, index).map(Some);
     }
 
@@ -57,7 +73,13 @@ pub(super) fn parse_activation(
     };
 
     match source {
-        ExternalLaunchSource::Kerminal => parse_kerminal_cli(arguments).map(Some),
+        ExternalLaunchSource::Kerminal => {
+            if has_named_option(arguments, &["--external-ssh-json"]) {
+                parse_kerminal_json(arguments).map(Some)
+            } else {
+                parse_kerminal_cli(arguments).map(Some)
+            }
+        }
         ExternalLaunchSource::OpenSsh => parse_openssh(arguments, source).map(Some),
         ExternalLaunchSource::Putty => parse_putty(arguments).map(Some),
         ExternalLaunchSource::SecureCrt => parse_securecrt(arguments).map(Some),
@@ -71,10 +93,10 @@ pub(super) fn parse_activation(
 ///
 /// @author kongweiguang
 fn identify_source(arguments: &[String]) -> Option<ExternalLaunchSource> {
-    if arguments.iter().skip(1).any(|argument| {
-        argument.eq_ignore_ascii_case("--external-ssh")
-            || argument.eq_ignore_ascii_case("--external-sftp")
-    }) {
+    if has_named_option(
+        arguments,
+        &["--external-ssh", "--external-sftp", "--external-ssh-json"],
+    ) {
         return Some(ExternalLaunchSource::Kerminal);
     }
     if arguments.iter().skip(1).any(|argument| {
@@ -100,9 +122,8 @@ fn identify_source(arguments: &[String]) -> Option<ExternalLaunchSource> {
         Some("securecrt" | "securecrt.exe") => {
             return Some(ExternalLaunchSource::SecureCrt);
         }
-        Some("kerminal" | "kerminal.exe") => {
-            return Some(ExternalLaunchSource::Kerminal);
-        }
+        // 自身可执行文件接收的是外部客户端参数，需要继续检查参数签名。
+        Some("kerminal" | "kerminal.exe") => {}
         Some("winscp" | "winscp.exe" | "filezilla" | "filezilla.exe" | "flashfxp") => {
             return Some(ExternalLaunchSource::SftpClient);
         }
@@ -121,20 +142,33 @@ fn identify_source(arguments: &[String]) -> Option<ExternalLaunchSource> {
     {
         Some(ExternalLaunchSource::Xshell)
     } else if has_named_option(arguments, &["--host", "--hostname", "--remote-host"]) {
-        None
-    } else if has_named_option(arguments, &["-ssh", "-load", "-P"]) {
-        Some(ExternalLaunchSource::Putty)
+        Some(ExternalLaunchSource::Kerminal)
     } else if has_named_option(
         arguments,
-        &["-J", "-p", "-i", "-l", "--jump", "--identity-file"],
-    ) {
+        &["-ssh", "-load", "-pw", "-pwfile", "-passphrase"],
+    ) || arguments.iter().skip(1).any(|argument| {
+        argument.starts_with("-P") || argument.to_ascii_lowercase().starts_with("-pw")
+    }) {
+        Some(ExternalLaunchSource::Putty)
+    } else if arguments.iter().skip(1).any(|argument| {
+        ["-J", "-p", "-i", "-l"]
+            .iter()
+            .any(|option| argument.starts_with(option))
+    }) || (arguments.len() == 2
+        && arguments[1].contains('@')
+        && !arguments[1].starts_with('-')
+        && !arguments[1].starts_with('/')
+        && !arguments[1].contains('\\'))
+    {
         Some(ExternalLaunchSource::OpenSsh)
     } else {
         None
     }
 }
 
-/// 解析 Kerminal 自有 ssh/sftp URL；未知查询字段和凭据字段都必须失败关闭。
+/// 解析 Kerminal 自有 ssh/sftp URL；SSH 的 SFTP 选项只登记后续动作，避免破坏协议匹配。
+///
+/// @author kongweiguang
 fn parse_kerminal_url(raw_url: &str, _argument_index: usize) -> AppResult<ExternalLaunchRequest> {
     let url = Url::parse(raw_url).map_err(|_| AppError::invalid("Kerminal 外部链接无效"))?;
     if url.scheme() != "kerminal"
@@ -171,23 +205,17 @@ fn parse_kerminal_url(raw_url: &str, _argument_index: usize) -> AppResult<Extern
             let open_sftp = query_value(&pairs, "openSftp")
                 .or_else(|| query_value(&pairs, "open_sftp"))
                 .is_some_and(|value| truthy(&value));
-            let intent = if open_sftp {
-                ExternalLaunchIntent::SftpTransfer {
-                    remote_path: "/".to_owned(),
-                    expected_host_key: None,
-                }
-            } else {
-                ExternalLaunchIntent::SshTerminal {
-                    remote_command: Vec::new(),
-                }
-            };
-            Ok(request(
+            let mut parsed = request(
                 ExternalLaunchSource::Kerminal,
                 target,
-                intent,
+                ExternalLaunchIntent::SshTerminal {
+                    remote_command: Vec::new(),
+                },
                 display_name,
                 None,
-            ))
+            );
+            parsed.open_sftp_after_connect = open_sftp;
+            Ok(parsed)
         }
         "sftp" => {
             ensure_allowed_keys(&pairs, &["host", "port", "user", "username", "path"])?;
@@ -209,7 +237,52 @@ fn parse_kerminal_url(raw_url: &str, _argument_index: usize) -> AppResult<Extern
     }
 }
 
-/// 把 Kerminal 命令行输入映射到与深链接相同的安全字段，拒绝未知参数。
+/// JSON 按单一参数解码并复用普通主机校验，拒绝混合选项或未经声明的秘密字段。
+///
+/// @author kongweiguang
+fn parse_kerminal_json(arguments: &[String]) -> AppResult<ExternalLaunchRequest> {
+    let option = arguments
+        .get(1)
+        .ok_or_else(|| AppError::invalid("外部启动 JSON 参数不完整"))?;
+    let (name, inline) = split_long_option(option);
+    if !name.eq_ignore_ascii_case("--external-ssh-json") {
+        return Err(AppError::invalid("外部启动 JSON 不能与其他参数混用"));
+    }
+    let raw_json = match inline {
+        Some(value) if arguments.len() == 2 => value,
+        None if arguments.len() == 3 => &arguments[2],
+        _ => return Err(AppError::invalid("外部启动 JSON 不能与其他参数混用")),
+    };
+    let parsed: ExternalSshJson = serde_json::from_str(raw_json)
+        .map_err(|_| AppError::invalid("外部启动 JSON 格式或字段无效，认证信息请在应用内输入"))?;
+    let port = parsed.port.unwrap_or(DEFAULT_SSH_PORT);
+    if port == 0 {
+        return Err(AppError::invalid("外部连接端口无效"));
+    }
+    Ok(request(
+        ExternalLaunchSource::Kerminal,
+        ExternalTargetDraft {
+            protocol: RemoteProtocol::Ssh,
+            host: validated_host(&parsed.host)?,
+            port,
+            username: parsed
+                .username
+                .as_deref()
+                .map(validated_username)
+                .transpose()?,
+            jump_hosts: Vec::new(),
+        },
+        ExternalLaunchIntent::SshTerminal {
+            remote_command: Vec::new(),
+        },
+        None,
+        None,
+    ))
+}
+
+/// 按选项解析游标消费参数，避免紧邻主机名的选项被二次跳过。
+///
+/// @author kongweiguang
 fn parse_kerminal_cli(arguments: &[String]) -> AppResult<ExternalLaunchRequest> {
     let mut protocol = RemoteProtocol::Ssh;
     let mut host = None;
@@ -281,7 +354,6 @@ fn parse_kerminal_cli(arguments: &[String]) -> AppResult<ExternalLaunchRequest> 
             _ => return Err(AppError::invalid("Kerminal 外部启动参数不受支持")),
         };
         host = Some(validated_host(&value)?);
-        index += 1;
     }
 
     let host = host.ok_or_else(|| AppError::invalid("外部连接缺少主机"))?;
@@ -292,7 +364,10 @@ fn parse_kerminal_cli(arguments: &[String]) -> AppResult<ExternalLaunchRequest> 
         username,
         jump_hosts: jumps,
     };
-    let intent = if protocol == RemoteProtocol::Sftp || remote_path.is_some() {
+    if protocol == RemoteProtocol::Ssh && remote_path.is_some() {
+        return Err(AppError::invalid("SSH 终端参数不能包含 SFTP 远端路径"));
+    }
+    let intent = if protocol == RemoteProtocol::Sftp {
         let path = remote_path.unwrap_or_else(|| "/".to_owned());
         validate_remote_path(&path)?;
         ExternalLaunchIntent::SftpTransfer {
@@ -933,7 +1008,9 @@ fn validate_remote_path(path: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 排除内联秘密与秘密包络，即便调用方声称来自可信外部客户端也不例外。
+/// 排除内联秘密与密钥信封；普通 SSH JSON 由独立的白名单解析器检查字段。
+///
+/// @author kongweiguang
 fn reject_secret_arguments(arguments: &[String]) -> AppResult<()> {
     for argument in arguments {
         let normalized = argument
@@ -950,11 +1027,11 @@ fn reject_secret_arguments(arguments: &[String]) -> AppResult<()> {
                 | "-passphrase"
                 | "/password"
                 | "/passphrase"
-                | "--external-ssh-json"
                 | "--external-key-json"
                 | "--password-file"
                 | "--key-passphrase-file"
-        ) || argument.to_ascii_lowercase().starts_with("b64%3e%3e")
+        ) || argument.to_ascii_lowercase().starts_with("-pw")
+            || argument.to_ascii_lowercase().starts_with("b64%3e%3e")
             || argument.to_ascii_lowercase().starts_with("b64>>")
         {
             return Err(AppError::invalid("外部启动不能携带密码、口令或私钥信封"));
@@ -1125,7 +1202,9 @@ fn truthy(value: &str) -> bool {
     )
 }
 
-/// 从参数数组创建不带诊断原文的应用请求，秘密与未经验证的命令不会被串接。
+/// 默认不附加 SFTP；只有显式 URL 字段或已保存偏好能开启后续动作。
+///
+/// @author kongweiguang
 fn request(
     source: ExternalLaunchSource,
     target: ExternalTargetDraft,
@@ -1139,5 +1218,6 @@ fn request(
         intent,
         display_name: display_name.filter(|value| !value.trim().is_empty()),
         identity_file,
+        open_sftp_after_connect: false,
     }
 }

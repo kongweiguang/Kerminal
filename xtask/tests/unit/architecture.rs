@@ -331,7 +331,7 @@ fn legacy_web_scan_allows_only_the_pinned_workspace_decoder_helper() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// 验证测试实现留在外置文件，并识别平台门控下的异步测试宏。
+/// 验证外置测试的普通导入和受限重导出可用，函数及平台门控的测试宏仍被拒绝。
 #[test]
 fn source_test_gate_rejects_inline_helpers_and_tokio_tests() {
     let root = fixture_root("test-policy");
@@ -344,12 +344,12 @@ fn source_test_gate_rejects_inline_helpers_and_tokio_tests() {
     ));
     assert!(!is_external_test_path(&root, &source, "../src/lib.rs"));
 
-    let valid_module = "#[cfg(test)]\n#[path = \"../tests/unit/cases.rs\"]\nmod tests;\n#[cfg(not(test))]\nfn product_code() {}\n#[cfg(test)]\nuse crate::PrivateType;\n";
+    let valid_module = "#[cfg(test)]\n#[path = \"../tests/unit/cases.rs\"]\nmod tests;\n#[cfg(not(test))]\nfn product_code() {}\n#[cfg(test)]\nuse crate::PrivateType;\n#[cfg(test)]\npub(crate) use crate::PrivateType as TestType;\n#[cfg(test)]\npub(super) use crate::OtherType;\n";
     let mut violations = Vec::new();
     validate_source_test_policy("fixture", &root, &source, valid_module, &mut violations);
     assert!(violations.is_empty());
 
-    let invalid_items = "#[cfg(test)]\nfn helper() {}\n#[cfg(windows)]\n#[tokio::test]\nasync fn async_case() {}\n#[cfg(test)]\nmod inline { fn body() {} }\n";
+    let invalid_items = "#[cfg(test)]\npub(crate) fn helper() {}\n#[cfg(windows)]\n#[tokio::test]\nasync fn async_case() {}\n#[cfg(test)]\nmod inline { fn body() {} }\n";
     validate_source_test_policy("fixture", &root, &source, invalid_items, &mut violations);
     assert_eq!(violations.len(), 3);
     assert!(

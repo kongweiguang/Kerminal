@@ -271,6 +271,18 @@ impl FilesPane {
         Ok(Some(self.transfer_rows.clone()))
     }
 
+    /// 仅在两个 fixture 目录仍匹配时读取展开状态，避免把其他面板的操作误记为验收结果。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_transfer_history_expanded(
+        &self,
+        target: &RightRailSftpTransferTarget<'_>,
+    ) -> Result<Option<bool>, String> {
+        Ok(self
+            .right_rail_acceptance_transfer_rows(target)?
+            .map(|_| self.queue.history_expanded))
+    }
+
     /// Return the application file service only after both paths are bound to the isolated fixture listings.
     ///
     /// @author kongweiguang

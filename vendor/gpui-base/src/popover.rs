@@ -1,6 +1,6 @@
 // @author kongweiguang
 
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 use gpui::{
     Anchor, AnyElement, App, Context, DismissEvent, ElementId, EventEmitter, FocusHandle,
@@ -186,12 +186,13 @@ pub struct Popover {
     trigger: Option<TriggerBuilder>,
     content: Option<ContentBuilder>,
     mouse_button: MouseButton,
+    trigger_on_mouse_down: bool,
     overlay_closable: bool,
     on_open_change: Option<OpenChangeHandler>,
 }
 
 impl Popover {
-    /// 保持 corner 定位作为兼容默认值，避免为现有调用方改变弹层位置。
+    /// 保持 corner 定位和鼠标切换作为兼容默认值，受控输入锚点需显式关闭鼠标切换。
     pub fn new(id: impl Into<ElementId>) -> Self {
         Self {
             id: id.into(),
@@ -208,6 +209,7 @@ impl Popover {
             trigger: None,
             content: None,
             mouse_button: MouseButton::Left,
+            trigger_on_mouse_down: true,
             overlay_closable: true,
             on_open_change: None,
         }
@@ -261,6 +263,14 @@ impl Popover {
 
     pub fn mouse_button(mut self, mouse_button: MouseButton) -> Self {
         self.mouse_button = mouse_button;
+        self
+    }
+
+    /// 输入框等受控锚点自行管理打开意图；锚点内点击不视为外点，仍保留外点与 Escape 关闭。
+    ///
+    /// @author kongweiguang
+    pub fn trigger_on_mouse_down(mut self, enabled: bool) -> Self {
+        self.trigger_on_mouse_down = enabled;
         self
     }
 
@@ -334,7 +344,7 @@ impl Styled for Popover {
 }
 
 impl RenderOnce for Popover {
-    /// 仅透传 opt-in 定位约束；状态机、焦点和关闭路径仍由 PopoverState 管理。
+    /// 受控锚点可跳过鼠标切换监听；定位、焦点和关闭路径仍由同一个 PopoverState 管理。
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = window.use_keyed_state(self.id.clone(), cx, |_, cx| {
             PopoverState::new(self.default_open, cx)
@@ -353,6 +363,10 @@ impl RenderOnce for Popover {
             return div().id("empty").into_any_element();
         };
         let parent_view_id = window.current_view();
+        let trigger_bounds = Rc::new(Cell::new(None));
+        let observed_trigger_bounds = trigger_bounds.clone();
+        let on_position = self.on_position;
+        let trigger_on_mouse_down = self.trigger_on_mouse_down;
         let popup = Popup::new(self.id, trigger(open, window, cx))
             .refine_style(&self.style)
             .anchor(self.anchor)
@@ -364,8 +378,11 @@ impl RenderOnce for Popover {
             .when_some(self.available_height, |this, (minimum, maximum)| {
                 this.available_height(minimum, maximum)
             })
-            .when_some(self.on_position, |this, callback| {
-                this.on_position(callback)
+            .on_position(move |position, trigger| {
+                observed_trigger_bounds.set(Some(trigger));
+                if let Some(callback) = &on_position {
+                    callback(position, trigger);
+                }
             })
             .key_context(CONTEXT)
             .on_action({
@@ -375,17 +392,19 @@ impl RenderOnce for Popover {
                     cx.notify(parent_view_id);
                 }
             })
-            .on_mouse_down(self.mouse_button, {
-                let state = state.clone();
-                move |_, window, cx| {
-                    cx.stop_propagation();
-                    state.update(cx, |state, cx| {
-                        if state.is_open() == open {
-                            state.toggle_open(window, cx);
-                        }
-                    });
-                    cx.notify(parent_view_id);
-                }
+            .when(self.trigger_on_mouse_down, |popup| {
+                popup.on_mouse_down(self.mouse_button, {
+                    let state = state.clone();
+                    move |_, window, cx| {
+                        cx.stop_propagation();
+                        state.update(cx, |state, cx| {
+                            if state.is_open() == open {
+                                state.toggle_open(window, cx);
+                            }
+                        });
+                        cx.notify(parent_view_id);
+                    }
+                })
             });
         if !open {
             return popup.into_any_element();
@@ -408,7 +427,14 @@ impl RenderOnce for Popover {
             .when(self.overlay_closable, |this| {
                 this.on_mouse_down_out({
                     let state = state.clone();
-                    move |_, window, cx| {
+                    move |event, window, cx| {
+                        if !trigger_on_mouse_down
+                            && trigger_bounds
+                                .get()
+                                .is_some_and(|bounds| bounds.contains(&event.position))
+                        {
+                            return;
+                        }
                         state.update(cx, |state, cx| state.dismiss(window, cx));
                         cx.notify(parent_view_id);
                     }

@@ -28,8 +28,87 @@ impl McpRuntimeControl for McpRuntimeController {
         }
     }
 
-    /// 启动唯一 listener 并同步 Agent workspace endpoint；失败保留 listener 及重试 owner。
+    /// 串行读取已保存设置后启动，避免与端口替换或停止操作交错。
     async fn start(&self, cancellation: CancellationToken) -> AppResult<McpRuntimeSnapshot> {
+        let _configuration = tokio::select! {
+            _ = cancellation.cancelled() => return Err(AppError::cancelled("MCP start was cancelled")),
+            guard = self.configuration_gate.lock() => guard,
+        };
+        if self.owner.lock().await.server.is_none()
+            && let Some(preferences) = &self.preferences
+        {
+            let loaded = preferences.load_settings().await?;
+            self.set_config(loaded.settings.mcp)?;
+        }
+        self.start_core(cancellation, None).await
+    }
+
+    /// 停止 listener 后清理活动 Agent endpoint；超时仍由 controller 持有句柄供再次尝试。
+    async fn stop_until(&self, deadline: Instant) -> AppResult<McpRuntimeSnapshot> {
+        let _configuration = tokio::time::timeout_at(deadline, self.configuration_gate.lock())
+            .await
+            .map_err(|_| AppError::timeout("MCP configuration operation"))?;
+        self.stop_inner(deadline).await
+    }
+
+    /// 监听和设置写入复用同一串行 owner，避免与启停并发交错。
+    async fn apply_settings(
+        &self,
+        settings: kerminal_application::preferences::settings::McpSettings,
+        expected_revision: Option<kerminal_domain::preferences::ConfigRevision>,
+        cancellation: CancellationToken,
+    ) -> AppResult<kerminal_application::preferences::settings::VersionedSettings> {
+        self.apply_configuration(settings, expected_revision, cancellation)
+            .await
+    }
+
+    /// 只列出当前 listener 已允许的网卡地址。
+    async fn lan_addresses(&self) -> AppResult<Vec<std::net::Ipv4Addr>> {
+        self.current_lan_addresses().await
+    }
+
+    /// 敏感客户端配置只在显式复制时创建，不写入普通状态快照。
+    async fn lan_client_config(
+        &self,
+        address: std::net::Ipv4Addr,
+    ) -> AppResult<kerminal_application::mcp_runtime::McpClientConfig> {
+        self.create_lan_client_config(address).await
+    }
+
+    /// 同步关闭 intake 并向当前 listener/启动中的 Agent context 同步发取消信号。
+    fn begin_shutdown(&self) {
+        request_runtime_shutdown(&self.active_shutdown, &self.shutting_down);
+        let current = self.snapshot();
+        if matches!(
+            current.state,
+            State::Starting | State::Synchronizing | State::Running
+        ) {
+            self.publish(Snapshot {
+                state: State::Stopping,
+                bind_mode: current.bind_mode,
+                endpoint: current.endpoint,
+                client_json: None,
+                endpoint_sync_pending: current.endpoint_sync_pending,
+                unavailable_reason: current.unavailable_reason,
+                failure_reason: Some("MCP runtime is shutting down".to_owned()),
+            });
+        }
+    }
+
+    /// 用桌面统一 deadline 停止 runtime；失败时保留 handle 与 endpoint sync task。
+    async fn shutdown_until(&self, deadline: Instant) -> AppResult<()> {
+        self.begin_shutdown();
+        self.stop_until(deadline).await.map(|_| ())
+    }
+}
+
+impl McpRuntimeController {
+    /// 启动唯一 listener 并同步 Agent workspace endpoint；失败保留 listener 及重试 owner。
+    pub(super) async fn start_core(
+        &self,
+        cancellation: CancellationToken,
+        reserved: Option<tokio::net::TcpListener>,
+    ) -> AppResult<McpRuntimeSnapshot> {
         self.ensure_available()?;
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("MCP start was cancelled"));
@@ -52,12 +131,7 @@ impl McpRuntimeControl for McpRuntimeController {
                 .progress_endpoint_sync(None, Some(cancellation.clone()), None)
                 .await
             {
-                self.publish(Self::snapshot_with_failure(
-                    State::Stopped,
-                    None,
-                    true,
-                    &error,
-                ));
+                self.publish(self.snapshot_with_failure(State::Stopped, None, true, &error));
                 drop(_gate);
                 if error.public_code() != PublicErrorCode::Cancelled {
                     self.notify_start_failure(&error).await;
@@ -73,6 +147,7 @@ impl McpRuntimeControl for McpRuntimeController {
             let endpoint = server.endpoint().to_owned();
             self.publish(Snapshot {
                 state: State::Stopping,
+                bind_mode: self.current_bind_mode(),
                 endpoint: Some(endpoint),
                 client_json: None,
                 endpoint_sync_pending: owner.pending_sync.is_some(),
@@ -96,28 +171,55 @@ impl McpRuntimeControl for McpRuntimeController {
         if owner.server.is_none() {
             self.publish(Snapshot {
                 state: State::Starting,
+                bind_mode: self.current_bind_mode(),
                 endpoint: None,
                 client_json: None,
                 endpoint_sync_pending: false,
                 unavailable_reason: None,
                 failure_reason: None,
             });
-            let server =
-                match McpServer::start(&self.runtime, self.services.clone(), self.config).await {
-                    Ok(server) => server,
-                    Err(error) => {
-                        self.publish(Self::snapshot_with_failure(
-                            State::Failed,
-                            None,
-                            false,
-                            &error,
-                        ));
-                        drop(owner);
-                        drop(_gate);
-                        self.notify_start_failure(&error).await;
-                        return Err(error);
-                    }
+            let config = self.current_config();
+            let settings = self
+                .settings
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let server_result = async {
+                let token = if settings.bind_mode
+                    == kerminal_application::preferences::settings::McpBindMode::Lan
+                {
+                    let reference = settings
+                        .token_ref
+                        .as_deref()
+                        .ok_or_else(|| AppError::invalid("局域网 MCP 缺少访问令牌引用"))?;
+                    let store = self
+                        .token_store
+                        .as_ref()
+                        .ok_or_else(|| AppError::unsupported("MCP 令牌服务不可用"))?;
+                    Some(store.load_or_create(Some(reference)).await?)
+                } else {
+                    None
                 };
+                McpServer::start_authorized(
+                    &self.runtime,
+                    self.services.clone(),
+                    config,
+                    token,
+                    reserved,
+                )
+                .await
+            }
+            .await;
+            let server = match server_result {
+                Ok(server) => server,
+                Err(error) => {
+                    self.publish(self.snapshot_with_failure(State::Failed, None, false, &error));
+                    drop(owner);
+                    drop(_gate);
+                    self.notify_start_failure(&error).await;
+                    return Err(error);
+                }
+            };
             let endpoint = server.endpoint().to_owned();
             let shutdown_signal = server.shutdown_signal();
             let server_identity = std::sync::Arc::new(());
@@ -147,6 +249,7 @@ impl McpRuntimeControl for McpRuntimeController {
                 }
                 self.publish(Snapshot {
                     state: State::Stopping,
+                    bind_mode: self.current_bind_mode(),
                     endpoint: Some(endpoint),
                     client_json: None,
                     endpoint_sync_pending: true,
@@ -165,6 +268,7 @@ impl McpRuntimeControl for McpRuntimeController {
             .ok_or_else(|| AppError::infrastructure("MCP listener owner identity is missing"))?;
         self.publish(Snapshot {
             state: State::Synchronizing,
+            bind_mode: self.current_bind_mode(),
             endpoint: Some(endpoint.clone()),
             client_json: None,
             endpoint_sync_pending: true,
@@ -176,7 +280,7 @@ impl McpRuntimeControl for McpRuntimeController {
             .progress_endpoint_sync(Some(endpoint.clone()), Some(cancellation), None)
             .await
         {
-            self.publish(Self::snapshot_with_failure(
+            self.publish(self.snapshot_with_failure(
                 State::Synchronizing,
                 Some(endpoint),
                 true,
@@ -193,38 +297,6 @@ impl McpRuntimeControl for McpRuntimeController {
         self.publish_running_if_current(&owner, &identity, endpoint)
     }
 
-    /// 停止 listener 后清理活动 Agent endpoint；超时仍由 controller 持有句柄供再次尝试。
-    async fn stop_until(&self, deadline: Instant) -> AppResult<McpRuntimeSnapshot> {
-        self.stop_inner(deadline).await
-    }
-
-    /// 同步关闭 intake 并向当前 listener/启动中的 Agent context 同步发取消信号。
-    fn begin_shutdown(&self) {
-        request_runtime_shutdown(&self.active_shutdown, &self.shutting_down);
-        let current = self.snapshot();
-        if matches!(
-            current.state,
-            State::Starting | State::Synchronizing | State::Running
-        ) {
-            self.publish(Snapshot {
-                state: State::Stopping,
-                endpoint: current.endpoint,
-                client_json: None,
-                endpoint_sync_pending: current.endpoint_sync_pending,
-                unavailable_reason: current.unavailable_reason,
-                failure_reason: Some("MCP runtime is shutting down".to_owned()),
-            });
-        }
-    }
-
-    /// 用桌面统一 deadline 停止 runtime；失败时保留 handle 与 endpoint sync task。
-    async fn shutdown_until(&self, deadline: Instant) -> AppResult<()> {
-        self.begin_shutdown();
-        self.stop_inner(deadline).await.map(|_| ())
-    }
-}
-
-impl McpRuntimeController {
     /// 仅在当前 listener、endpoint 同步与 shutdown token 仍属于同一代 owner 时发布 Running。
     fn publish_running_if_current(
         &self,
@@ -254,6 +326,7 @@ impl McpRuntimeController {
             };
             self.publish(Snapshot {
                 state,
+                bind_mode: self.current_bind_mode(),
                 endpoint: Self::current_endpoint(owner),
                 client_json: None,
                 endpoint_sync_pending: owner.pending_sync.is_some(),
@@ -274,6 +347,7 @@ impl McpRuntimeController {
         let running = self.running_snapshot(endpoint.clone());
         let stopping = Snapshot {
             state: State::Stopping,
+            bind_mode: self.current_bind_mode(),
             endpoint: Some(endpoint),
             client_json: None,
             endpoint_sync_pending: false,

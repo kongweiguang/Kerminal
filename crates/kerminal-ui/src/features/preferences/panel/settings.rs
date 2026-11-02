@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use super::forms::set_input;
 use super::{
-    PreferencesEvent, PreferencesPanel, SettingsTextField, ShortcutBindingField, keyboard_platform,
+    PreferencesEvent, PreferencesPanel, SettingsTextField, ShortcutBindingField,
+    ShortcutBindingUpdate, keyboard_platform,
 };
 use crate::features::preferences::{
-    ConfigDraft, DraftSnapshot, DraftStatus, DraftTransitionError, validate_settings,
+    ConfigDraft, DraftSnapshot, DraftStatus, DraftTransitionError, validate_settings, validation,
 };
 use gpui_kit::{Context, PathPromptOptions, Window};
 use kerminal_application::{
@@ -245,16 +246,54 @@ impl PreferencesPanel {
         .detach();
     }
 
-    /// 仅更新用户编辑的具体平台字段，避免把旧快照回退值写成显式覆盖。
+    /// 录制与恢复默认共用一次候选提交：先按目标平台编译，再整体替换草稿。
+    ///
+    /// 只有 Linux 接受 `Inherit`；Windows 和 macOS 始终要求显式值，
+    /// 避免把空字符串误当成禁用写回。
     ///
     /// @author kongweiguang
-    pub(in crate::features::preferences) fn update_shortcut(
+    pub(in crate::features::preferences) fn commit_shortcut_binding(
         &mut self,
         action: &str,
         field: ShortcutBindingField,
-        binding: String,
+        update: ShortcutBindingUpdate,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), String> {
+        if self.settings_controls_locked() {
+            return Err(crate::locale::text(
+                "当前设置处于只读状态，暂时不能修改快捷键。",
+                "Shortcuts are read-only until the settings are editable again.",
+            )
+            .to_string());
+        }
+        let Some(mut candidate) = self.settings.as_ref().map(|draft| draft.value().clone()) else {
+            return Err(crate::locale::text(
+                "设置尚未载入，请稍后重试。",
+                "Settings are not loaded yet. Try again shortly.",
+            )
+            .to_string());
+        };
+        let Some(item) = candidate
+            .keybindings
+            .iter_mut()
+            .find(|item| item.action == action)
+        else {
+            return Err(crate::locale::text(
+                "快捷键动作已不存在，请重新载入设置。",
+                "The shortcut action no longer exists. Reload the settings.",
+            )
+            .to_string());
+        };
+        set_shortcut_binding(item, field, update.clone());
+        let effective = validation::binding_for_platform(item, field.editor_platform());
+        if let Some(message) =
+            shortcut_binding_error(&candidate.keybindings, action, field, &effective)
+        {
+            return Err(message);
+        }
+        self.shortcut_field_errors
+            .remove(&shortcut_error_key(action, field));
+        let committed = update.clone();
         self.edit_settings(
             |settings| {
                 if let Some(item) = settings
@@ -262,18 +301,59 @@ impl PreferencesPanel {
                     .iter_mut()
                     .find(|item| item.action == action)
                 {
-                    match field {
-                        ShortcutBindingField::Windows => item.windows_binding = binding,
-                        ShortcutBindingField::WindowsAlternate => {
-                            item.windows_alternate_binding = Some(binding);
-                        }
-                        ShortcutBindingField::Linux => item.linux_binding = Some(binding),
-                        ShortcutBindingField::Mac => item.mac_binding = binding,
-                    }
+                    set_shortcut_binding(item, field, update);
                 }
             },
             cx,
         );
+        if self.settings.as_ref().is_none_or(|draft| {
+            !draft.value().keybindings.iter().any(|item| {
+                item.action == action && shortcut_binding_matches(item, field, &committed)
+            })
+        }) {
+            return Err(crate::locale::text(
+                "快捷键未能写入当前草稿，请重新载入设置后重试。",
+                "The shortcut could not be written to the current draft. Reload the settings and try again.",
+            )
+            .to_string());
+        }
+        Ok(())
+    }
+
+    /// 只恢复所选平台的默认值；Linux 的缺省绑定清除覆盖并重新跟随 Windows 回退。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn reset_shortcut(
+        &mut self,
+        action: &str,
+        platform: crate::features::preferences::KeyboardPlatform,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(default) = SettingsSnapshot::default()
+            .keybindings
+            .into_iter()
+            .find(|binding| binding.action == action)
+        else {
+            return;
+        };
+        let field = ShortcutBindingField::from_editor_platform(platform);
+        let update = match field {
+            ShortcutBindingField::Windows => ShortcutBindingUpdate::Set(
+                validation::effective_binding(&default.windows_binding, &default.binding),
+            ),
+            ShortcutBindingField::Mac => ShortcutBindingUpdate::Set(validation::effective_binding(
+                &default.mac_binding,
+                &default.binding,
+            )),
+            ShortcutBindingField::Linux => default
+                .linux_binding
+                .map_or(ShortcutBindingUpdate::Inherit, ShortcutBindingUpdate::Set),
+        };
+        if let Err(message) = self.commit_shortcut_binding(action, field, update, cx) {
+            self.shortcut_field_errors
+                .insert(shortcut_error_key(action, field), message);
+            cx.notify();
+        }
     }
 
     /// 校验当前值后以单飞 CAS 保存；保存中到期的较新编辑排队使用回执 revision。
@@ -380,7 +460,8 @@ impl PreferencesPanel {
         true
     }
 
-    /// 仅应用确认的快照能更新基线；布局保存发带 request 的窄收据，不能用旧全快照回滚 Root 新布局。
+    /// 已知失败先撤回关键词投影再锁定冲突；未知结果保留提交快照等待回读。
+    /// 仅应用确认的快照能更新基线，布局收据不能回滚 Root 的较新布局。
     ///
     /// @author kongweiguang
     fn finish_settings_save(
@@ -444,6 +525,9 @@ impl PreferencesPanel {
                     error.public_code(),
                     PublicErrorCode::Conflict | PublicErrorCode::OutcomeUnknown
                 );
+                if error.public_code() != PublicErrorCode::OutcomeUnknown {
+                    self.fail_keyword_rule_save(cx);
+                }
                 if let Some(draft) = self.settings.as_mut() {
                     if error.public_code() == PublicErrorCode::Conflict {
                         let _ = draft.save_conflicted();
@@ -454,9 +538,6 @@ impl PreferencesPanel {
                     }
                 }
                 let message = super::localized_error(&error);
-                if error.public_code() != PublicErrorCode::OutcomeUnknown {
-                    self.fail_keyword_rule_save(cx);
-                }
                 self.finish_agent_launcher_save_failed(error.public_code(), message.clone(), cx);
                 self.fail_workbench_layout_save(error.public_code(), message.clone(), cx);
                 self.status = Some(message.clone());
@@ -503,6 +584,93 @@ fn parse_update<T: std::str::FromStr>(
             Some(crate::locale::text("请输入有效的数值。", "Enter a valid number.").to_string()),
         ),
     }
+}
+
+/// 平台字段必须按原格式更新，避免普通修改覆盖其他平台或丢失显式空值。
+///
+/// @author kongweiguang
+fn set_shortcut_binding(
+    preference: &mut kerminal_application::preferences::KeybindingPreference,
+    field: ShortcutBindingField,
+    update: ShortcutBindingUpdate,
+) {
+    match (field, update) {
+        (ShortcutBindingField::Windows, ShortcutBindingUpdate::Set(binding)) => {
+            preference.windows_binding = binding;
+        }
+        (ShortcutBindingField::Mac, ShortcutBindingUpdate::Set(binding)) => {
+            preference.mac_binding = binding;
+        }
+        (ShortcutBindingField::Linux, update) => {
+            preference.linux_binding = match update {
+                ShortcutBindingUpdate::Set(binding) => Some(binding),
+                ShortcutBindingUpdate::Inherit => None,
+            };
+        }
+        // Windows 与 macOS 没有可清除的覆盖字段，忽略无意义上写请求。
+        (_, ShortcutBindingUpdate::Inherit) => {}
+    }
+}
+
+/// 提交流程必须能读回同一平台的写入意图，避免草稿状态拒绝替换后仍显示成功。
+///
+/// @author kongweiguang
+fn shortcut_binding_matches(
+    preference: &kerminal_application::preferences::KeybindingPreference,
+    field: ShortcutBindingField,
+    update: &ShortcutBindingUpdate,
+) -> bool {
+    match (field, update) {
+        (ShortcutBindingField::Windows, ShortcutBindingUpdate::Set(binding)) => {
+            preference.windows_binding == *binding
+        }
+        (ShortcutBindingField::Mac, ShortcutBindingUpdate::Set(binding)) => {
+            preference.mac_binding == *binding
+        }
+        (ShortcutBindingField::Linux, ShortcutBindingUpdate::Set(binding)) => {
+            preference.linux_binding.as_deref() == Some(binding.as_str())
+        }
+        (ShortcutBindingField::Linux, ShortcutBindingUpdate::Inherit) => {
+            preference.linux_binding.is_none()
+        }
+        (_, ShortcutBindingUpdate::Inherit) => false,
+    }
+}
+
+/// 目标平台的有效绑定必须能编译且不与其他动作冲突；录制与恢复默认共用。
+///
+/// @author kongweiguang
+fn shortcut_binding_error(
+    keybindings: &[kerminal_application::preferences::KeybindingPreference],
+    action: &str,
+    field: ShortcutBindingField,
+    effective: &str,
+) -> Option<String> {
+    if let Some(message) = super::shortcut_capture::shortcut_sequence_issue(effective) {
+        return Some(message);
+    }
+    let compiled = crate::keybindings::CompiledKeybindings::compile(keybindings, field.platform());
+    compiled
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.kind != crate::keybindings::KeybindingDiagnosticKind::UnknownAction
+                && (diagnostic.action == action
+                    || diagnostic.conflicts_with.as_deref() == Some(action))
+        })
+        .map(|diagnostic| diagnostic.message.clone())
+}
+
+/// action 与平台字段共同组成错误身份，避免不同平台的就地提示互相覆盖。
+///
+/// @author kongweiguang
+fn shortcut_error_key(action: &str, field: ShortcutBindingField) -> String {
+    let field = match field {
+        ShortcutBindingField::Windows => "windows",
+        ShortcutBindingField::Linux => "linux",
+        ShortcutBindingField::Mac => "macos",
+    };
+    format!("{action}:{field}")
 }
 
 /// 秒数或 MiB 字段先按显示单位转换并四舍五入到存储单位，避免输入时做整数截断。

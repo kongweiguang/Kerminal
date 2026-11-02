@@ -21,7 +21,7 @@ use crate::features::quick_open::{
     QuickOpenTerminalTarget,
 };
 
-use super::{CenterPanel, RootView, SessionCommand, terminal_keyboard};
+use super::{RootView, SessionCommand, terminal_keyboard};
 
 impl RootView {
     /// 打开时固定 workspace 快照和当前可信 prompt binding，并镜像模态状态以隔离底层输入。
@@ -186,7 +186,7 @@ impl RootView {
                     }
                 }
                 QuickOpenSelection::Host(host_id) => {
-                    self.select_quick_open_host(host_id, window, cx);
+                    self.select_quick_open_host(host_id, cx);
                 }
                 QuickOpenSelection::Tab(tab_id) => {
                     self.activate_quick_open_tab(tab_id, window, cx);
@@ -269,23 +269,19 @@ impl RootView {
         true
     }
 
-    /// Host 选择只进入现有连接详情，不自动连接或从面板结果推断认证意图。
+    /// Host 选择只更新左栏与运维目标，不自动连接，也不打开已移除的中央详情页。
     fn select_quick_open_host(
         &mut self,
         host_id: &kerminal_domain::identity::HostId,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(panel) = self.connections_panel.clone() else {
+        if !self.reveal_host_in_navigation(host_id, cx) {
             self.set_quick_open_status(
-                "连接面板尚未装配。",
-                "The connections panel is unavailable.",
+                "该主机已不存在，请刷新后重试。",
+                "This host no longer exists. Refresh and try again.",
                 cx,
             );
-            return;
-        };
-        self.set_center_panel(CenterPanel::Connections, window, cx);
-        panel.update(cx, |panel, cx| panel.select_host_id(host_id, cx));
+        }
     }
 
     /// 按当前 workspace 中的精确 TabId 激活标签，过期搜索结果不会映射到相邻标签；只有 reducer 接受后才同步 Root 可见页。

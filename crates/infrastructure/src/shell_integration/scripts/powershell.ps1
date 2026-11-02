@@ -6,7 +6,10 @@ if ($global:__kerminal_shell_integration_active) {
 }
 
 # PSReadLine 2.0.0 没有查询用的 Chord 参数；按真实能力选择查询，不隐藏参数绑定错误。
-$getKeyHandler = Get-Command Get-PSReadLineKeyHandler
+$getKeyHandler = Get-Command Get-PSReadLineKeyHandler -ErrorAction SilentlyContinue
+if (-not $getKeyHandler) {
+    return
+}
 $handler = @(if ($getKeyHandler.Parameters.ContainsKey('Chord')) {
     & $getKeyHandler -Chord Enter
 } else {
@@ -20,6 +23,52 @@ $global:__kerminal_shell_integration_active = $true
 $global:__kerminal_prompt_ready = $false
 $global:__kerminal_command_active = $false
 $global:__kerminal_original_prompt = ${function:prompt}
+
+# .NET Framework 仍保留 RFC2396 的五个标点；统一编码为协议接受的 RFC3986 子集。
+# @author kongweiguang
+function global:ConvertTo-KerminalEditingField([string]$Value) {
+    return [Uri]::EscapeDataString($Value).Replace('!', '%21').Replace("'", '%27').Replace('(', '%28').Replace(')', '%29').Replace('*', '%2A')
+}
+
+# 专用组合键只在未绑定时安装；真实行由 PSReadLine 读取，不修改光标、正文或预测设置。
+# @author kongweiguang
+$global:__kerminal_edit_nonce = '__KERMINAL_EDIT_NONCE__'
+$global:__kerminal_edit_pid = $PID
+$editingChord = 'Ctrl+Alt+Shift+F12'
+$editingHandler = @(if ($getKeyHandler.Parameters.ContainsKey('Chord')) {
+    & $getKeyHandler -Chord $editingChord
+} else {
+    & $getKeyHandler | Where-Object { $_.Key -match 'Ctrl' -and $_.Key -match 'Alt' -and $_.Key -match 'Shift' -and $_.Key -match 'F12$' }
+})
+$editingInstalled = 0
+if ($editingHandler.Count -eq 0) {
+    Set-PSReadLineKeyHandler -Chord $editingChord -ScriptBlock {
+        if ($PID -ne $global:__kerminal_edit_pid -or -not $global:__kerminal_prompt_ready) { return }
+        $line = ''
+        $cursor = 0
+        [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+        if ($line.Length -gt 4000) {
+            $tooLong = $line.Length -gt 8000
+            if (-not $tooLong) {
+                # PSReadLine 的 Length 是 UTF-16，配对代理项各自只占一个 Unicode 标量。
+                $pairs = [regex]::Matches($line, '[\uD800-\uDBFF][\uDC00-\uDFFF]').Count
+                $tooLong = ($line.Length - $pairs) -gt 4000
+            }
+            if ($tooLong) {
+                [Console]::Write("$([char]27)]6977;Kerminal;1;R;$global:__kerminal_edit_nonce;powershell;input_too_long;$(ConvertTo-KerminalEditingField $PSVersionTable.PSVersion.ToString())`a")
+                return
+            }
+        }
+        $directory = '-'
+        if ($PWD.Provider.Name -eq 'FileSystem') { $directory = ConvertTo-KerminalEditingField $PWD.ProviderPath }
+        $prediction = '?'
+        $readLineOptions = Get-PSReadLineOption
+        if (-not $readLineOptions.PSObject.Properties['PredictionSource'] -or [string]$readLineOptions.PredictionSource -eq 'None') { $prediction = '0' }
+        [Console]::Write("$([char]27)]6977;Kerminal;1;S;$global:__kerminal_edit_nonce;powershell;utf16;$cursor;$(ConvertTo-KerminalEditingField $PSVersionTable.PSVersion.ToString());$directory;$(ConvertTo-KerminalEditingField $line);$prediction`a")
+    } -BriefDescription 'KerminalReadEditingSnapshot' -LongDescription 'Read the current line without editing or executing it'
+    $editingInstalled = 1
+}
+[Console]::Write("$([char]27)]6977;Kerminal;1;H;$global:__kerminal_edit_nonce;powershell;$editingInstalled;$(ConvertTo-KerminalEditingField $PSVersionTable.PSVersion.ToString())`a")
 
 # Enter 只包装已确认的默认绑定；显式 ESC 字符兼容不支持 `e 的 Windows PowerShell 5.1。
 # @author kongweiguang

@@ -12,6 +12,8 @@ mod keyboard;
 mod local_hosts;
 mod panel;
 mod render;
+#[cfg(feature = "right-rail-acceptance")]
+mod settings_acceptance;
 mod trust;
 
 pub(crate) use form_layout::host_editor_size;

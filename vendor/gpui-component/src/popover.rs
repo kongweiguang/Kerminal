@@ -127,6 +127,7 @@ pub struct Popover {
     /// and measured to anchor the popup.
     trigger_style: Option<StyleRefinement>,
     mouse_button: MouseButton,
+    trigger_on_mouse_down: bool,
     appearance: bool,
     overlay_closable: bool,
     on_open_change: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
@@ -135,7 +136,7 @@ pub struct Popover {
 impl Popover {
     /// Create a new Popover with `view` mode.
     ///
-    /// 翻转默认关闭，保留现有 anchor 与弹层位置契约。
+    /// 翻转默认关闭，鼠标切换默认开启，保留现有锚点位置和触发契约。
     pub fn new(id: impl Into<ElementId>) -> Self {
         Self {
             id: id.into(),
@@ -152,6 +153,7 @@ impl Popover {
             tracked_focus_handle: None,
             children: vec![],
             mouse_button: MouseButton::Left,
+            trigger_on_mouse_down: true,
             appearance: true,
             overlay_closable: true,
             default_open: false,
@@ -207,6 +209,14 @@ impl Popover {
     /// Set the mouse button to trigger the popover, default is `MouseButton::Left`.
     pub fn mouse_button(mut self, mouse_button: MouseButton) -> Self {
         self.mouse_button = mouse_button;
+        self
+    }
+
+    /// 受控输入锚点可保持光标定位与选择，避免默认点击切换打断编辑；其它入口保持原行为。
+    ///
+    /// @author kongweiguang
+    pub fn trigger_on_mouse_down(mut self, enabled: bool) -> Self {
+        self.trigger_on_mouse_down = enabled;
         self
     }
 
@@ -340,7 +350,7 @@ impl Popover {
 }
 
 impl RenderOnce for Popover {
-    /// 复用 Base 的定位和开关状态机；默认箭头几何保持原 anchor 行为。
+    /// 触发方式与定位均透传给 Base 的同一状态机；受控输入不另建关闭或焦点路径。
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let anchor = self.anchor;
         let auto_flip = self.auto_flip;
@@ -381,6 +391,7 @@ impl RenderOnce for Popover {
             })
             .on_position(move |position, trigger| resolved.set(Some((position, trigger))))
             .mouse_button(self.mouse_button)
+            .trigger_on_mouse_down(self.trigger_on_mouse_down)
             .default_open(self.default_open)
             .overlay_closable(self.overlay_closable)
             .content(move |state, window, cx| {

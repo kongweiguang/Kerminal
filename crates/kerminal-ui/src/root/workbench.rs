@@ -2,7 +2,10 @@
 //!
 //! @author kongweiguang
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use gpui_kit::{
     AnyElement, App, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
@@ -194,6 +197,7 @@ pub(super) struct ToolRailPanelState {
     active_tab_id: Option<TabId>,
     tab_open_orders: BTreeMap<Option<TabId>, Vec<ToolRailToolId>>,
     tab_right_dock_collapsed: BTreeMap<Option<TabId>, bool>,
+    compact_hidden_tabs: BTreeSet<Option<TabId>>,
     floating_positions: BTreeMap<ToolRailToolId, workbench_layout::FloatingPanelPosition>,
     floating_drag: Option<FloatingPanelDrag>,
     viewport_width: u16,
@@ -221,6 +225,7 @@ impl Default for ToolRailPanelState {
             active_tab_id: None,
             tab_open_orders: BTreeMap::new(),
             tab_right_dock_collapsed: BTreeMap::new(),
+            compact_hidden_tabs: BTreeSet::new(),
             floating_positions: BTreeMap::new(),
             floating_drag: None,
             viewport_width: 1_440,
@@ -233,7 +238,8 @@ impl Default for ToolRailPanelState {
 
 impl ToolRailPanelState {
     /// 新 Tab 继承切换时的工具集合；已访问 Tab 即使集合为空也优先恢复自身快照。
-    /// 收起状态同样保留显式 false，只有从未初始化的新 Tab 才继承当前状态；Tab 切换同时终止旧浮窗拖动。
+    /// 收起状态同样保留显式 false；临时遮罩隐藏保留无标签状态和仍存在的 Tab，不改变宽窗工具状态。
+    /// Tab 切换同时终止旧浮窗拖动，只有从未初始化的新 Tab 才继承当前工具集合。
     ///
     /// @author kongweiguang
     pub(super) fn activate_tab(
@@ -242,6 +248,8 @@ impl ToolRailPanelState {
         live_tab_ids: &[TabId],
         right_dock_collapsed: bool,
     ) -> Option<bool> {
+        self.compact_hidden_tabs
+            .retain(|id| id.as_ref().is_none_or(|id| live_tab_ids.contains(id)));
         if self.active_tab_id == tab_id {
             self.tab_open_orders.retain(|cached_tab_id, _| {
                 cached_tab_id
@@ -282,6 +290,27 @@ impl ToolRailPanelState {
                 .is_none_or(|cached_tab_id| live_tab_ids.contains(cached_tab_id))
         });
         Some(restored_collapsed)
+    }
+
+    /// 中央导航只隐藏当前标签或无标签状态的窄窗遮罩，保留各工具打开顺序和宽窗布局。
+    ///
+    /// @author kongweiguang
+    pub(super) fn hide_compact_drawer_for_tab(&mut self, tab_id: Option<&TabId>) {
+        self.compact_hidden_tabs.insert(tab_id.cloned());
+    }
+
+    /// 用户显式打开工具时撤销当前标签或无标签状态的临时隐藏，不影响其它标签的导航意图。
+    ///
+    /// @author kongweiguang
+    fn show_compact_drawer_for_tab(&mut self, tab_id: Option<&TabId>) {
+        self.compact_hidden_tabs.remove(&tab_id.cloned());
+    }
+
+    /// 隐藏状态跟随当前投影标签，包括没有活动标签的窗口；常规停靠不受影响。
+    ///
+    /// @author kongweiguang
+    fn compact_drawer_is_hidden(&self) -> bool {
+        self.compact_hidden_tabs.contains(&self.active_tab_id)
     }
 
     /// Remember the latest logical viewport so non-render callbacks can restore the same panel baseline.
@@ -950,7 +979,7 @@ impl RootView {
         self.show_compact_tool_panel(tool, window, cx);
     }
 
-    /// 新工具按 main 的单面板 compact 语义替换既有打开项；已打开工具只切换抽屉焦点。
+    /// 新工具按 main 的单面板 compact 语义替换既有打开项；显式打开撤销该 Tab 的临时遮罩隐藏。
     /// 关闭仍经共享切换路径完成，以同步 Agent 搜索、Dock 宽度与工具专属状态。
     ///
     /// @author kongweiguang
@@ -960,6 +989,12 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let current_tab = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.snapshot().active_tab_id.clone());
+        self.tool_rail_state
+            .show_compact_drawer_for_tab(current_tab.as_ref());
         if !self.tool_rail_state.open_order.contains(&tool) {
             let right_dock_was_collapsed = self.right_dock_collapsed;
             self.right_dock_collapsed = false;
@@ -1129,11 +1164,13 @@ fn panel_slot_mut(
 /// 两侧分隔槽平时透明，悬停光效只由 Kit 的拖动状态驱动；收起右栏仍补齐与左侧相同的留白。
 /// 运维表单接收扣除边框的宿主高度，正文滚动不能挤出固定操作栏。
 /// 右栏决策弹框按 main 先过滤背景再绘制主题玻璃表面；紧凑遮罩覆盖 body，面板单独内缩 8px。
-/// 窄屏工具抽屉从当前 Tab 活动工具派生，常规停靠宿主只处理精确 owner 冒泡到达的未消费 Escape。
-/// Root 确认、连接提示与 Kit 模态优先持有焦点；只暂停抽屉的焦点回收，保留 main 的模态背景。
+/// 窄屏工具抽屉从当前 Tab 活动工具与临时隐藏意图派生，常规停靠仍使用自己的持久投影。
+/// Root 确认、连接提示与 Kit 模态优先持有焦点；抽屉仅在新挂载时交接焦点，重绘不夺取菜单或输入焦点。
 /// 主机弹层统一按 rem 缩放并夹紧视口；主机树插槽允许收缩，使内部滚动区能接收剩余高度。
 /// 工作台与决策遮罩共用应用语义色板；侧栏细分隔保证终端自选背景或壁纸相近时仍有区域边界。
 /// 标签区的唯一前导间距与抽屉按钮到分隔线的距离一致。
+/// 设置离开确认独占焦点陷阱，避免父子陷阱同时包含焦点时 Tab 落回遮罩后的设置控件。
+/// 隧道表单的状态提示位于其遮罩之上，其余模态继续维持原有层级和计时规则。
 ///
 /// @author kongweiguang
 pub(super) fn render_workbench(
@@ -1147,19 +1184,30 @@ pub(super) fn render_workbench(
 ) -> impl IntoElement + use<> {
     // 主机行只展示从真实 pane 生命周期汇总的状态，导航叶子按值去重通知。
     super::connections::refresh_host_session_projection(root, cx);
-    let feedback_obscured = logical_input_modal_blocked(
-        root.preferences_modal_open,
-        root.connections_modal_open,
-        root.snippet_editor_modal_open || root.custom_agent_manager.is_some(),
-        root.root_confirmation_owner.is_some(),
-        root.pending_quit_intent.is_some() || root.quit_ready_intent.is_some(),
-    ) || root.connection_prompt_modal_open
+    let higher_priority_modal = root.connection_prompt_modal_open
+        || root.pending_quit_intent.is_some()
+        || root.quit_ready_intent.is_some()
         || root.split_target_picker.read(cx).is_open()
         || root
             .quick_open_view
             .as_ref()
             .is_some_and(|view| view.read(cx).is_open())
         || window.has_active_prompt();
+    let forward_form_status_on_top = forward_form_status_on_top(
+        root.root_confirmation_owner == Some(RootConfirmationOwner::Operations),
+        root.root_confirmation_operations_view
+            .as_ref()
+            .is_some_and(|view| view.read(cx).is_forward_form_open()),
+        higher_priority_modal,
+    );
+    let feedback_obscured = !forward_form_status_on_top
+        && (logical_input_modal_blocked(
+            root.preferences_modal_open,
+            root.connections_modal_open,
+            root.snippet_editor_modal_open || root.custom_agent_manager.is_some(),
+            root.root_confirmation_owner.is_some(),
+            root.pending_quit_intent.is_some() || root.quit_ready_intent.is_some(),
+        ) || higher_priority_modal);
     track_workbench_status_toast(root, feedback_obscured, cx);
     let theme = ThemeTokens::current(window, cx).for_workbench();
     let resize_handle_appearance = super::workbench_resize::appearance(theme.accent);
@@ -1240,8 +1288,8 @@ pub(super) fn render_workbench(
         compact_panels,
         compact_active_tool,
         root.compact_host_drawer_open,
-    );
-    // 显隐由活动工具投影驱动；只在焦点离开抽屉时回收，保留最初的返回焦点。
+    ) && !root.tool_rail_state.compact_drawer_is_hidden();
+    // 新挂载时交接焦点；普通重绘不得抢走刚获得焦点但尚未绘制的子菜单或输入控件。
     if !compact_drawer_focus_blocked {
         if should_show_active_compact_tool {
             if !root.compact_tool_drawer_open {
@@ -1249,11 +1297,6 @@ pub(super) fn render_workbench(
                     root.compact_drawer_return_focus = window.focused(cx);
                 }
                 root.compact_tool_drawer_open = true;
-                window.focus(&root.compact_drawer_focus_handle, cx);
-            } else if !root
-                .compact_drawer_focus_handle
-                .contains_focused(window, cx)
-            {
                 window.focus(&root.compact_drawer_focus_handle, cx);
             }
         } else if root.compact_tool_drawer_open && !root.compact_host_drawer_open {
@@ -1851,10 +1894,7 @@ pub(super) fn render_workbench(
         .gap(px(density.item_gap / 2.0))
         .items_center()
         .pt(px(density.item_gap / 2.0))
-        .overflow_y_scroll()
-        .when(!entries.main.is_empty(), |this| {
-            this.border_t_1().border_color(theme.tool_panel_border)
-        });
+        .overflow_y_scroll();
     for tool in entries.bottom.iter().copied() {
         let selected = if compact_panels {
             show_compact_tool_drawer && compact_active_tool == Some(tool)
@@ -1918,6 +1958,20 @@ pub(super) fn render_workbench(
             }
         }))
         .child(rail_main)
+        // 分区线只占图标列宽，两端留白，避免像边界线一样与 Rail 左右边缘相连；
+        // 底部没有工具时不画线，否则空的底区会在 Rail 底部留下孤立细线。
+        .when(
+            !entries.main.is_empty() && !entries.bottom.is_empty(),
+            |this| {
+                this.child(
+                    div()
+                        .w(px(rail_button_height))
+                        .h(px(1.))
+                        .flex_none()
+                        .bg(theme.tool_panel_border),
+                )
+            },
+        )
         .child(rail_bottom);
     let has_agent_terminal = agent_terminal_content.is_some();
     let show_agent_terminal =
@@ -2581,9 +2635,18 @@ pub(super) fn render_workbench(
     }
 
     let feedback_max_width = (viewport.width.as_f32() - TOOL_RAIL_WIDTH - 32.0).max(0.0);
-    if let Some(feedback) =
-        render_workbench_feedback(root, theme, panel_background, feedback_max_width, cx)
-    {
+    if let Some(feedback) = render_workbench_feedback(
+        root,
+        theme,
+        panel_background,
+        FeedbackPlacement {
+            max_width: feedback_max_width,
+            bottom: 12.,
+        },
+        !forward_form_status_on_top,
+        true,
+        cx,
+    ) {
         workbench_body = workbench_body.child(feedback);
     }
     if let Some(tool_rail) = tool_rail {
@@ -2608,6 +2671,33 @@ pub(super) fn render_workbench(
     {
         let focus_handle = root.preferences_modal_focus_handle.clone();
         let preferences_panel = root.preferences_panel.clone();
+        let nested_confirmation = preferences_panel.read(cx).has_leave_confirmation();
+        let surface = div()
+            .id("workbench-preferences-modal-surface")
+            .w_full()
+            .h_full()
+            .max_w(px(1152.))
+            .max_h(px(780.))
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .occlude()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(20.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.floating_surface)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(preferences_panel);
+        let surface = if nested_confirmation {
+            surface.into_any_element()
+        } else {
+            surface
+                .focus_trap("workbench-preferences-focus-trap", &focus_handle)
+                .into_any_element()
+        };
         workbench = workbench.child(crate::ui_backdrop::modal_backdrop(
             div()
                 .id("workbench-preferences-modal-overlay")
@@ -2629,26 +2719,7 @@ pub(super) fn render_workbench(
                     }),
                 )
                 .child(crate::ui_backdrop::floating_surface(
-                    div()
-                        .id("workbench-preferences-modal-surface")
-                        .w_full()
-                        .h_full()
-                        .max_w(px(1152.))
-                        .max_h(px(780.))
-                        .min_w(px(0.))
-                        .min_h(px(0.))
-                        .occlude()
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .rounded(px(20.))
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.floating_surface)
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(preferences_panel)
-                        .focus_trap("workbench-preferences-focus-trap", &focus_handle),
+                    surface,
                     theme,
                     theme.radius_dialog,
                 )),
@@ -2763,6 +2834,24 @@ pub(super) fn render_workbench(
         };
         if let Some(confirmation) = confirmation {
             let focus_handle = root.connections_modal_focus_handle.clone();
+            let form_width =
+                (viewport.width.as_f32() - confirmation_padding * 2.).min(confirmation_width);
+            let modal_feedback = if forward_form_status_on_top {
+                render_workbench_feedback(
+                    root,
+                    theme,
+                    panel_background,
+                    FeedbackPlacement {
+                        max_width: (form_width - 32.).clamp(0., 360.),
+                        bottom: forward_form_status_bottom(form_width),
+                    },
+                    true,
+                    false,
+                    cx,
+                )
+            } else {
+                None
+            };
             workbench = workbench.child(
                 div()
                     .id("workbench-root-confirmation-overlay")
@@ -2780,6 +2869,7 @@ pub(super) fn render_workbench(
                     .child(
                         div()
                             .id("workbench-root-confirmation-surface")
+                            .relative()
                             .w_full()
                             .max_w(px(confirmation_width))
                             .max_h(px(confirmation_height))
@@ -2811,6 +2901,7 @@ pub(super) fn render_workbench(
                                     .overflow_y_scroll()
                                     .child(confirmation),
                             )
+                            .children(modal_feedback)
                             .focus_trap("workbench-root-confirmation-focus-trap", &focus_handle)
                             .map(|surface| {
                                 if rail_dialog {
@@ -2835,6 +2926,34 @@ pub(super) fn render_workbench(
         }
     }
     workbench
+}
+
+/// 只有隧道表单自身处于最上层时才抬高其状态提示，避免覆盖认证或其他确认。
+///
+/// @author kongweiguang
+fn forward_form_status_on_top(
+    operations_confirmation: bool,
+    forward_form_open: bool,
+    higher_priority_modal: bool,
+) -> bool {
+    operations_confirmation && forward_form_open && !higher_priority_modal
+}
+
+/// 与隧道表单 36px 按钮、上下 16px 内边距及 8px 行距对齐；窄窗为双行页脚留出空间。
+///
+/// @author kongweiguang
+fn forward_form_status_bottom(form_width: f32) -> f32 {
+    const BUTTON_HEIGHT: f32 = 36.;
+    const FOOTER_PADDING: f32 = 16.;
+    const FOOTER_ROW_GAP: f32 = 8.;
+    const STATUS_GAP: f32 = 12.;
+    const TWO_ROW_FOOTER_WIDTH: f32 = 420.;
+    let extra_row = if form_width < TWO_ROW_FOOTER_WIDTH {
+        BUTTON_HEIGHT + FOOTER_ROW_GAP
+    } else {
+        0.
+    };
+    2. * FOOTER_PADDING + BUTTON_HEIGHT + extra_row + STATUS_GAP
 }
 
 /// 仅本次计算的只读投影；不增加 Root 缓存、延迟重试或第二份响应式状态。
@@ -3020,22 +3139,33 @@ fn track_workbench_status_toast(root: &mut RootView, obscured: bool, cx: &mut Co
     .detach();
 }
 
+/// 合并浮层几何约束，避免普通工作区和模态调用互换宽度与底部偏移。
+struct FeedbackPlacement {
+    max_width: f32,
+    bottom: f32,
+}
+
 /// 用短暂浮层替代常驻状态栏；普通状态可关闭并自动消失，布局保存异常仍带恢复入口。
 /// 宽度按真实视口扣除 ToolRail 与两侧留白，恢复操作允许换行以免窄窗溢出。
-/// 同时显示一般状态与布局错误，保留设置的反馈间距密度，避免持久的布局问题遮住其他操作反馈。
+/// 常规工作区可合并布局状态；隧道模态上方只渲染短暂状态，不暴露遮罩后的布局操作。
 ///
 /// @author kongweiguang
 fn render_workbench_feedback(
     root: &RootView,
     theme: ThemeTokens,
     panel_background: gpui_kit::Hsla,
-    max_width: f32,
+    placement: FeedbackPlacement,
+    show_status: bool,
+    show_layout: bool,
     cx: &mut Context<RootView>,
 ) -> Option<AnyElement> {
+    let FeedbackPlacement { max_width, bottom } = placement;
     let density = super::preferences::interface_density_metrics(root);
-    let status = root.status.clone();
-    let layout_error = root.workbench_layout_save_error.clone();
-    let has_pending_layout = root.workbench_layout_intent.is_some();
+    let status = show_status.then(|| root.status.clone()).flatten();
+    let layout_error = show_layout
+        .then(|| root.workbench_layout_save_error.clone())
+        .flatten();
+    let has_pending_layout = show_layout && root.workbench_layout_intent.is_some();
     let has_layout_feedback = has_pending_layout || layout_error.is_some();
     if status.is_none() && !has_layout_feedback {
         return None;
@@ -3047,10 +3177,21 @@ fn render_workbench_feedback(
             .read(cx)
             .is_workbench_layout_save_in_flight();
     let mut feedback = div()
-        .id("workbench-feedback-toast")
+        .id(if show_layout {
+            "workbench-feedback-toast"
+        } else {
+            "workbench-modal-status-toast"
+        })
+        .when(status.is_some(), |feedback| {
+            feedback.debug_selector(|| "rr-workbench-feedback-toast".to_owned())
+        })
         .absolute()
-        .bottom(px(12.))
-        .right(px(TOOL_RAIL_WIDTH + 16.0))
+        .bottom(px(bottom))
+        .right(px(if show_layout {
+            TOOL_RAIL_WIDTH + 16.0
+        } else {
+            16.
+        }))
         .max_w(px(max_width))
         .min_w(px(max_width.min(220.)))
         .flex()
@@ -3127,33 +3268,33 @@ fn render_workbench_feedback(
 
     if let Some(status) = status {
         let dismiss_label = crate::locale::text("关闭提示", "Dismiss notification");
-        feedback = feedback.child(
-            div()
-                .id("workbench-status-toast-message-row")
-                .w_full()
-                .flex()
-                .items_start()
-                .gap_2()
-                .text_size(theme.text_xs)
-                .text_color(theme.foreground)
-                .child(div().flex_1().min_w(px(0.)).child(status))
-                .child(
-                    Button::new("workbench-dismiss-status-toast")
-                        .compact()
-                        .ghost()
-                        .with_size(px(24.))
-                        .icon(IconName::X)
-                        .accessibility_label(dismiss_label.clone())
-                        .tooltip(dismiss_label)
-                        .on_click(cx.listener(|root, _, _, cx| {
-                            root.status = None;
-                            root.status_toast_observed = None;
-                            root.status_toast_revision =
-                                root.status_toast_revision.wrapping_add(1).max(1);
-                            cx.notify();
-                        })),
-                ),
-        );
+        let status_row = div()
+            .id("workbench-status-toast-message-row")
+            .w_full()
+            .flex()
+            .items_start()
+            .gap_2()
+            .text_size(theme.text_xs)
+            .text_color(theme.foreground)
+            .child(div().flex_1().min_w(px(0.)).child(status));
+        feedback = feedback.child(status_row.when(show_layout, |status_row| {
+            status_row.child(
+                Button::new("workbench-dismiss-status-toast")
+                    .compact()
+                    .ghost()
+                    .with_size(px(24.))
+                    .icon(IconName::X)
+                    .accessibility_label(dismiss_label.clone())
+                    .tooltip(dismiss_label)
+                    .on_click(cx.listener(|root, _, _, cx| {
+                        root.status = None;
+                        root.status_toast_observed = None;
+                        root.status_toast_revision =
+                            root.status_toast_revision.wrapping_add(1).max(1);
+                        cx.notify();
+                    })),
+            )
+        }));
     }
 
     Some(feedback.into_any_element())

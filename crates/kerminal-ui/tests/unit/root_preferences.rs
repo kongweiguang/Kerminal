@@ -77,41 +77,26 @@ fn palette_change_does_not_hide_other_runtime_changes() {
     assert!(!app_palette_only_update(Some(&baseline), &next));
 }
 
-/// 分别选择的浅深色盘必须被生产运行态消费，跟随系统切换也不能退回旧通用值。
+/// 外观只切换同一主题的浅深色盘，遗留的独立主题字段不得覆盖当前主题身份。
 /// @author kongweiguang
 #[test]
-fn terminal_palette_selection_tracks_theme_and_system_appearance() {
+fn terminal_palette_selection_keeps_theme_identity_across_appearances() {
     use crate::root::preferences::terminal_scheme_for_snapshot;
     use gpui_kit::WindowAppearance;
     let mut snapshot = SettingsSnapshot::default();
+    snapshot.terminal.color_scheme = TerminalColorScheme::Solarized;
     snapshot.terminal.light_color_scheme = TerminalColorScheme::Github;
     snapshot.terminal.dark_color_scheme = TerminalColorScheme::TokyoNight;
-    for (mode, appearance, expected) in [
-        (
-            ThemeMode::Light,
-            WindowAppearance::Dark,
-            TerminalColorScheme::Github,
-        ),
-        (
-            ThemeMode::Dark,
-            WindowAppearance::Light,
-            TerminalColorScheme::TokyoNight,
-        ),
-        (
-            ThemeMode::System,
-            WindowAppearance::Light,
-            TerminalColorScheme::Github,
-        ),
-        (
-            ThemeMode::System,
-            WindowAppearance::Dark,
-            TerminalColorScheme::TokyoNight,
-        ),
+    for (mode, appearance) in [
+        (ThemeMode::Light, WindowAppearance::Dark),
+        (ThemeMode::Dark, WindowAppearance::Light),
+        (ThemeMode::System, WindowAppearance::Light),
+        (ThemeMode::System, WindowAppearance::Dark),
     ] {
         snapshot.theme_mode = mode;
         assert_eq!(
             terminal_scheme_for_snapshot(&snapshot, appearance),
-            expected
+            TerminalColorScheme::Solarized
         );
     }
 }

@@ -1605,6 +1605,269 @@ mod workspace_tabs_gpui_chrome {
         visual.run_until_parked();
     }
 
+    /// 三次关闭使列表入口消失，再重开文件标签让入口出现；必须按最终视口测量并可命中关闭按钮。
+    /// 150% 缩放使用真实 GPUI 布局，避免仅凭固定宽度算术通过回归。
+    ///
+    /// @author kongweiguang
+    #[gpui::test]
+    fn reopened_file_tab_reveals_after_picker_appears_at_fractional_scale(cx: &mut TestAppContext) {
+        let (harness, visual) = fixture_with_tab_count(cx, 6);
+        visual.simulate_scale_factor_change(1.5);
+        visual.simulate_resize(size(px(600.), px(160.)));
+        draw(visual);
+        let tabs = visual.update(|_, app| harness.read(app).tabs.clone());
+        let original = visual.update(|_, app| tabs.read(app).projection.clone());
+        for length in (3..6).rev() {
+            visual.update(|_, app| {
+                tabs.update(app, |tabs, cx| {
+                    let mut next = tabs.projection.clone();
+                    next.truncate(length);
+                    tabs.set_projection(next, cx);
+                });
+            });
+            draw(visual);
+        }
+        assert!(!visual.update(|_, app| tabs.read(app).show_tab_picker));
+
+        let mut reopened = original[3].clone();
+        reopened.kind = WorkspaceTabKind::WorkspaceFile;
+        reopened.active = true;
+        let reopened_id = reopened.id.clone();
+        visual.update(|_, app| {
+            tabs.update(app, |tabs, cx| {
+                let mut next = tabs.projection.clone();
+                for tab in &mut next {
+                    tab.active = false;
+                }
+                next.push(reopened);
+                tabs.set_projection(next, cx);
+            });
+        });
+        draw(visual);
+        draw(visual);
+
+        let close_selector = format!("workspace-tab-close-{}", reopened_id.as_str());
+        let tab_selector = format!("workspace-tab-hitbox-{}", reopened_id.as_str());
+        let (viewport, tab_bounds, close_bounds, picker, pending, offset) =
+            visual.update(|window, app| {
+                let tabs = tabs.read(app);
+                (
+                    tabs.scroll_handle.bounds(),
+                    window.debug_selector_bounds(&tab_selector).unwrap(),
+                    window.debug_selector_bounds(&close_selector).unwrap(),
+                    tabs.show_tab_picker,
+                    tabs.pending_tab_reveal.is_some(),
+                    tabs.scroll_handle.offset(),
+                )
+            });
+        assert!(picker, "reopening must cause the real picker to appear");
+        assert!(!pending, "the settled reveal must be consumed");
+        assert!(
+            tab_bounds.left() >= viewport.left() && tab_bounds.right() <= viewport.right(),
+            "active tab must fit the final viewport: tab={tab_bounds:?}, viewport={viewport:?}, offset={offset:?}"
+        );
+        assert!(close_bounds.left() >= viewport.left() && close_bounds.right() <= viewport.right());
+        visual.simulate_click(close_bounds.center(), Modifiers::default());
+        draw(visual);
+        assert!(visual.update(|_, app| {
+            harness
+                .read(app)
+                .events
+                .borrow()
+                .contains(&WorkspaceTabEvent::Close(reopened_id))
+        }));
+    }
+
+    /// 内容缩短触发 GPUI 自动夹紧时，活动标签的新请求仍须定位到目标而非误判成人工滚动。
+    ///
+    /// @author kongweiguang
+    #[gpui::test]
+    fn active_tab_reveal_survives_automatic_scroll_clamp(cx: &mut TestAppContext) {
+        let (harness, visual) = fixture_with_tab_count(cx, 8);
+        visual.simulate_scale_factor_change(1.5);
+        visual.simulate_resize(size(px(600.), px(160.)));
+        draw(visual);
+        let tabs = visual.update(|_, app| harness.read(app).tabs.clone());
+        visual.update(|_, app| {
+            tabs.update(app, |tabs, cx| {
+                let mut next = tabs.projection.clone();
+                for tab in &mut next {
+                    tab.active = false;
+                }
+                next.last_mut().unwrap().active = true;
+                tabs.set_projection(next, cx);
+            });
+        });
+        draw(visual);
+        draw(visual);
+        let previous_offset = visual.update(|_, app| tabs.read(app).scroll_handle.offset());
+        assert!(
+            previous_offset.x < px(-400.),
+            "fixture must begin near the end"
+        );
+
+        visual.update(|_, app| {
+            tabs.update(app, |tabs, cx| {
+                let mut next = tabs.projection.clone();
+                next.truncate(5);
+                next[0].active = true;
+                tabs.set_projection(next, cx);
+            });
+        });
+        draw(visual);
+        draw(visual);
+        let (viewport, first, offset) = visual.update(|window, app| {
+            let tabs = tabs.read(app);
+            (
+                tabs.scroll_handle.bounds(),
+                window
+                    .debug_selector_bounds("workspace-tab-hitbox-tab-chrome-first")
+                    .unwrap(),
+                tabs.scroll_handle.offset(),
+            )
+        });
+        assert!(
+            first.left() >= viewport.left() && first.right() <= viewport.right(),
+            "automatic clamp must not discard the active reveal: tab={first:?}, viewport={viewport:?}, before={previous_offset:?}, after={offset:?}"
+        );
+    }
+
+    /// 新选择的下一帧到来前若用户已改变偏移，旧自动定位不能覆盖手动位置。
+    ///
+    /// @author kongweiguang
+    #[gpui::test]
+    fn manual_scroll_after_selection_cancels_pending_reveal(cx: &mut TestAppContext) {
+        let (harness, visual) = fixture_with_tab_count(cx, 8);
+        visual.simulate_resize(size(px(600.), px(160.)));
+        draw(visual);
+        let tabs = visual.update(|_, app| harness.read(app).tabs.clone());
+        visual.update(|_, app| {
+            tabs.update(app, |tabs, cx| {
+                let mut next = tabs.projection.clone();
+                next[0].active = false;
+                next.last_mut().unwrap().active = true;
+                tabs.set_projection(next, cx);
+                tabs.scroll_handle.set_offset(point(px(-40.), px(0.)));
+            });
+        });
+        draw(visual);
+        draw(visual);
+        let (offset, pending) = visual.update(|_, app| {
+            let tabs = tabs.read(app);
+            (
+                tabs.scroll_handle.offset(),
+                tabs.pending_tab_reveal.is_some(),
+            )
+        });
+        assert_eq!(offset, point(px(-40.), px(0.)));
+        assert!(!pending, "manual scrolling supersedes the pending reveal");
+    }
+
+    /// 真实滚轮事件直接撤销尚未执行的自动定位，避免后续布局变化误判用户意图。
+    ///
+    /// @author kongweiguang
+    #[gpui::test]
+    fn wheel_input_supersedes_pending_active_tab_reveal(cx: &mut TestAppContext) {
+        let (harness, visual) = fixture_with_tab_count(cx, 8);
+        visual.simulate_resize(size(px(600.), px(160.)));
+        draw(visual);
+        let tabs = visual.update(|_, app| harness.read(app).tabs.clone());
+        let viewport = visual.update(|_, app| tabs.read(app).scroll_handle.bounds());
+        visual.update(|_, app| {
+            tabs.update(app, |tabs, cx| {
+                let mut next = tabs.projection.clone();
+                next[0].active = false;
+                next.last_mut().unwrap().active = true;
+                tabs.set_projection(next, cx);
+                assert!(tabs.pending_tab_reveal.is_some());
+            });
+        });
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: viewport.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(-40.), px(0.))),
+            modifiers: Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        assert!(!visual.update(|_, app| tabs.read(app).pending_tab_reveal.is_some()));
+        draw(visual);
+        draw(visual);
+        assert_eq!(
+            visual.update(|_, app| tabs.read(app).scroll_handle.offset()),
+            point(px(-40.), px(0.))
+        );
+    }
+
+    /// 上一帧的延迟测量不能消费后来选择的代次；新目标仍按其真实边界显示。
+    ///
+    /// @author kongweiguang
+    #[gpui::test]
+    fn stale_tab_reveal_callback_preserves_new_selection(cx: &mut TestAppContext) {
+        let (harness, visual) = fixture_with_tab_count(cx, 8);
+        visual.simulate_resize(size(px(600.), px(160.)));
+        draw(visual);
+        let tabs = visual.update(|_, app| harness.read(app).tabs.clone());
+        let target = visual.update(|window, app| {
+            tabs.update(app, |tabs, cx| {
+                let mut next = tabs.projection.clone();
+                next[0].active = false;
+                next[7].active = true;
+                tabs.set_projection(next, cx);
+            });
+            window.draw(app).clear(app);
+            let target = tabs.update(app, |tabs, cx| {
+                let mut next = tabs.projection.clone();
+                next[7].active = false;
+                next[4].active = true;
+                let target = next[4].id.clone();
+                tabs.set_projection(next, cx);
+                target
+            });
+            assert!(window.simulate_next_frame(app) > 0);
+            assert_eq!(
+                tabs.read(app)
+                    .pending_tab_reveal
+                    .as_ref()
+                    .map(|pending| pending.tab_id.clone()),
+                Some(target.clone())
+            );
+            target
+        });
+        draw(visual);
+        draw(visual);
+        let selector = format!("workspace-tab-hitbox-{}", target.as_str());
+        let (viewport, target_bounds) = visual.update(|window, app| {
+            (
+                tabs.read(app).scroll_handle.bounds(),
+                window.debug_selector_bounds(&selector).unwrap(),
+            )
+        });
+        assert!(target_bounds.left() >= viewport.left());
+        assert!(target_bounds.right() <= viewport.right());
+    }
+
+    /// 折叠组不会挂载活动标签；该目标不能因为缺少 bounds 永久保留定位请求。
+    ///
+    /// @author kongweiguang
+    #[gpui::test]
+    fn collapsed_active_tab_does_not_keep_unmeasurable_reveal(cx: &mut TestAppContext) {
+        let (harness, visual) = fixture(cx);
+        let tabs = visual.update(|_, app| harness.read(app).tabs.clone());
+        visual.update(|_, app| {
+            tabs.update(app, |tabs, cx| {
+                let mut collapsed = group("collapsed", "Collapsed", 0);
+                collapsed.collapsed = true;
+                tabs.set_groups(vec![collapsed], cx);
+                let mut next = tabs.projection.clone();
+                next[0].active = false;
+                next[1].active = true;
+                next[1].group_id = Some("collapsed".into());
+                tabs.set_projection(next, cx);
+            });
+        });
+        draw(visual);
+        assert!(!visual.update(|_, app| tabs.read(app).pending_tab_reveal.is_some()));
+    }
+
     /// Home/End move real GPUI focus to clipped tabs and reveal them from their measured bounds, even when Home targets the already-focused tab.
     /// Modified chords remain unhandled so Alt+Space reaches the window system.
     /// 固定 12 个测试标签对应静态 selector，满足 GPUI 测试查询的静态生命周期约束。

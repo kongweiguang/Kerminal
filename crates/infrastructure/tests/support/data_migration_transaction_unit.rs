@@ -57,6 +57,122 @@ impl Drop for RelativeRoot {
     }
 }
 
+/// Windows ACL 接口必须接受长相对路径，否则 Fresh 根中的标准 Profile 无法暂存。
+#[cfg(windows)]
+#[test]
+fn migration_staging_protects_long_relative_paths() {
+    let relative = RelativeRoot(PathBuf::from(format!(
+        "./.kerminal-migration-acl-test-{}",
+        Uuid::new_v4().simple()
+    )));
+    let path = relative
+        .0
+        .join(".kerminal-migration")
+        .join(Uuid::new_v4().to_string())
+        .join("staged/managed/profiles")
+        .join(format!("standard-{}.toml", "a".repeat(64)));
+    let absolute = std::env::current_dir()
+        .expect("读取测试工作目录")
+        .join(&path);
+    assert!(absolute.as_os_str().len() > 260);
+    journal::write_new_file(&path, b"isolated test data").expect("长路径文件可建立私有 ACL");
+    assert_eq!(
+        fs::read(&path).expect("已保护文件可读"),
+        b"isolated test data"
+    );
+}
+
+/// 当前数据根的显式导入中断后必须沿原 journal 前滚，保留已有组并避免二次创建。
+#[test]
+fn interrupted_profile_import_resumes_original_plan_and_is_idempotent() {
+    let parent = tempfile::tempdir().expect("创建隔离来源和目标");
+    let source = parent.path().join("source");
+    let target = parent.path().join("target");
+    fs::create_dir_all(source.join("profiles")).unwrap();
+    fs::create_dir_all(source.join("hosts")).unwrap();
+    fs::create_dir_all(target.join("hosts")).unwrap();
+    let marker_bytes = marker::current_marker_bytes();
+    fs::write(target.join(marker::MARKER_FILE_NAME), &marker_bytes).unwrap();
+    let original_groups = concat!(
+        "schema_version = 1\n[[groups]]\nid = \"existing\"\nname = \"Existing\"\n",
+        "sort_order = 0\ncreated_at = \"1\"\nupdated_at = \"2\"\n",
+    );
+    fs::write(target.join("hosts/groups.toml"), original_groups).unwrap();
+    fs::write(
+        source.join("hosts/groups.toml"),
+        concat!(
+            "schema_version = 1\n[[groups]]\nid = \"ops\"\nname = \"Ops\"\n",
+            "sort_order = 1\ncreated_at = \"1\"\nupdated_at = \"2\"\n",
+        ),
+    )
+    .unwrap();
+    let original_profile = concat!(
+        "schema_version = 1\nid = \"work\"\nname = \"Work\"\nshell = \"cmd.exe\"\n",
+        "args = []\nenv = { PASSWORD = \"isolated-secret\" }\nis_default = true\n",
+        "sidebar_group_id = \"ops\"\nsort_order = 0\ncreated_at = \"1\"\nupdated_at = \"2\"\n",
+    );
+    fs::write(source.join("profiles/work.toml"), original_profile).unwrap();
+    let plan = super::super::profile_import::plan_profile_import(&source, &target)
+        .expect("完整来源可规划");
+    assert_eq!(plan.preview.new_profiles, 1);
+    assert_eq!(plan.preview.new_hosts, 1);
+    assert!(plan.preview.groups_changed && plan.preview.vault_changed);
+    let mut edits = plan.edits;
+    edits.push(FileEdit {
+        relative_path: marker::MARKER_FILE_NAME.into(),
+        before: Some(marker_bytes.clone()),
+        after: marker_bytes.clone(),
+    });
+    let operation_id = Uuid::new_v4().to_string();
+    let operation_dir = journal::operation_directory(&target, &operation_id);
+    journal::ensure_directory(&target, &operation_dir).unwrap();
+    secure_operation_directory(&target, &operation_dir).unwrap();
+    let mut active =
+        prepare_file_journal(&target, &operation_id, edits, None).expect("真实导入计划可暂存");
+    journal::write_journal(&target, &active, true).unwrap();
+    let interrupted = resume_journal_with_hook(&target, &mut active, |point| {
+        if point == FaultPoint::AfterManagedFile(0) {
+            Err(AppError::conflict("注入导入中断"))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(interrupted.is_err());
+    let repository = FileDataMigrationRepository::new(&target);
+    assert!(repository.inspect().unwrap().recovery_pending);
+    assert!(repository.import_legacy_profiles(&source).is_err());
+
+    let resumed = repository.migrate().expect("按原导入计划恢复");
+    assert_eq!(resumed.outcome, DataMigrationOutcome::Resumed);
+    assert!(resumed.resumed);
+    assert_eq!(
+        fs::read(target.join(marker::MARKER_FILE_NAME)).unwrap(),
+        marker_bytes
+    );
+    assert_eq!(
+        fs::read_to_string(operation_dir.join("before/managed/hosts/groups.toml")).unwrap(),
+        original_groups
+    );
+    let groups: toml::Value =
+        toml::from_str(&fs::read_to_string(target.join("hosts/groups.toml")).unwrap()).unwrap();
+    let group_ids = groups["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(group_ids, vec!["existing", "ops"]);
+    assert_eq!(
+        fs::read_to_string(source.join("profiles/work.toml")).unwrap(),
+        original_profile
+    );
+    assert_eq!(
+        repository.import_legacy_profiles(&source).unwrap().outcome,
+        DataMigrationOutcome::AlreadyCurrent
+    );
+    assert_eq!(fs::read_dir(target.join("hosts")).unwrap().count(), 2);
+}
+
 /// pending sibling 已发布但目标仍为 before 时，重入应复用 pending 并完成 marker 最后提交。
 #[test]
 fn interrupted_after_pending_resumes_without_rebuilding_stage() {
@@ -294,7 +410,22 @@ fn fresh_root_migrates_and_then_is_idempotent() {
     let first = <FileDataMigrationRepository as DataMigrationRepository>::migrate(&repository)
         .expect("Fresh 根可初始化");
     assert_eq!(first.outcome, DataMigrationOutcome::Initialized);
-    assert_eq!(first.changed_file_count, 1);
+    let profiles_dir = relative.0.join("profiles");
+    let mut default_count = 0;
+    let mut profile_count = 0;
+    if profiles_dir.exists() {
+        for entry in fs::read_dir(profiles_dir).expect("已发现的标准 Profile 可读取") {
+            let entry = entry.expect("Profile 条目可读取");
+            let value: toml::Value =
+                toml::from_str(&fs::read_to_string(entry.path()).expect("Profile 可读"))
+                    .expect("Profile 是有效 TOML");
+            default_count +=
+                usize::from(value.get("is_default").and_then(toml::Value::as_bool) == Some(true));
+            profile_count += 1;
+        }
+    }
+    assert_eq!(default_count, usize::from(profile_count > 0));
+    assert_eq!(first.changed_file_count, 1 + profile_count);
     assert!(
         first
             .backup_relative_path

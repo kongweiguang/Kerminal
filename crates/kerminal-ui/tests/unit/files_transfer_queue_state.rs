@@ -17,6 +17,7 @@ use kerminal_domain::{
 fn archive_record() -> TransferRecoveryRecord {
     TransferRecoveryRecord {
         id: TransferId::new(),
+        drag_staging: false,
         request: TransferRequest {
             source: FileEndpoint::Local {
                 path: "source".into(),

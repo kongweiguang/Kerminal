@@ -23,7 +23,7 @@ use kerminal_application::{
             CredentialService, CredentialVaultRepository, VaultKeyManagementService,
             VaultKeyRepository,
         },
-        management::{HostManagementRepository, HostManagementService},
+        management::{CredentialCleanupStatus, HostManagementRepository, HostManagementService},
         probe::{ConnectionProbeBackend, ConnectionProbeService},
     },
     executor::ApplicationTaskExecutor,
@@ -31,7 +31,7 @@ use kerminal_application::{
         FileAccessProvider, FileBookmarkRepository, FileService,
         clipboard_download::{FileClipboardDownloadService, FileClipboardPort},
     },
-    mcp_runtime::{McpRuntimeControl, McpRuntimeSnapshot},
+    mcp_runtime::{McpRuntimeControl, McpRuntimeSnapshot, McpTokenStore},
     operations::{
         OperationsCommandExecutor, OperationsService, PortForwardRuntime, ServerInfoCollector,
     },
@@ -57,8 +57,9 @@ use kerminal_infrastructure::{
     agents::FileAgentWorkspaceRepository,
     command_history::SqliteCommandHistoryRepository,
     commands::{
-        FileCommandCatalogRepository, RemoteCommandSuggestionProvider, RemoteSuggestionPolicy,
-        StaticSpecSuggestionProvider, SystemSnippetTransferFileAdapter,
+        FileCommandCatalogRepository, LocalCommandSuggestionProvider,
+        RemoteCommandSuggestionProvider, RemoteSuggestionPolicy, StaticSpecSuggestionProvider,
+        SystemSnippetTransferFileAdapter,
     },
     configuration::ConfigurationStore,
     configuration_changes::ConfigurationChangeWatcher,
@@ -81,7 +82,7 @@ use kerminal_infrastructure::{
         PortForwardDefinitionStore, SshPortForwardRuntime, StructuredOperationsCommandExecutor,
         SystemServerInfoCollector,
     },
-    platform::updater::{CargoPackagerUpdater, UpdaterSettings},
+    platform::updater::CargoPackagerUpdater,
     platform::{
         configuration_directory::SystemConfigurationDirectoryOpener,
         default_shell::SystemDefaultLocalShellProvider,
@@ -95,7 +96,7 @@ use kerminal_infrastructure::{
     vault::VaultStore,
     workspace::WorkspaceSessionStore,
 };
-use kerminal_mcp::{McpRuntimeController, McpServerConfig, McpServices};
+use kerminal_mcp::{McpRuntimeController, McpServices};
 use kerminal_ui::AppServices;
 use tokio::{
     runtime::Handle,
@@ -174,6 +175,7 @@ impl DesktopComposition {
     /// 允许注入 updater；主机默认值、SFTP 开关及持久恢复仓储复用同一配置根与服务实例。
     /// 命令历史、建议反馈和片段偏好共享 SQLite；连接测试复用正式认证与 transport 而不建会话。
     /// 恢复仓储与配置、主机信任共用 coordinator，避免同进程读取误争跨进程根锁。
+    /// 本地建议在同一聚合器内注册；其有界缓存无常驻任务，不创建第二套历史或执行器。
     ///
     /// @author kongweiguang
     pub async fn build_with_update_service(
@@ -187,10 +189,23 @@ impl DesktopComposition {
         })?;
         let update_service = match update_service {
             Some(service) => service,
-            None => UpdateService::new(Arc::new(CargoPackagerUpdater::new(
-                None::<UpdaterSettings>,
-                config_root.join("updates").join("recovery"),
-            )?)),
+            None => {
+                // 更新信任根有误只禁用升级；工作台和既有更新恢复记录仍须能够启动。
+                let settings = match crate::update_configuration::production_updater_settings() {
+                    Ok(settings) => settings,
+                    Err(error) => {
+                        tracing::warn!(
+                            event = "UPDATER_BUILD_CONFIGURATION_UNAVAILABLE",
+                            code = error.public_code().as_str(),
+                        );
+                        None
+                    }
+                };
+                UpdateService::new(Arc::new(CargoPackagerUpdater::new(
+                    settings,
+                    config_root.join("updates").join("recovery"),
+                )?))
+            }
         };
         let storage = configuration.storage_coordinator();
         let writable = configuration.recovery_state().mode == ConfigurationMode::ReadWrite;
@@ -237,7 +252,23 @@ impl DesktopComposition {
         let host_management = HostManagementService::with_credentials(
             host_management_repository,
             credential_service.clone(),
-        );
+        )
+        .with_local_environment_resolver(vault_credential_resolver.clone());
+        if writable {
+            // 恢复失败保留本地主机写门禁；整个工作台仍可启动，并由主机面板展示重试入口。
+            match host_management.recover_pending_local_host_save().await {
+                Ok(CredentialCleanupStatus::Complete) => {}
+                Ok(CredentialCleanupStatus::Deferred { remaining }) => {
+                    tracing::warn!(event = "LOCAL_HOST_RECOVERY_DEFERRED", remaining);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "LOCAL_HOST_RECOVERY_UNAVAILABLE",
+                        code = error.public_code().as_str(),
+                    );
+                }
+            }
+        }
 
         let saved_target_lookup: Arc<dyn SavedExternalTargetLookup> = saved_host_repository.clone();
         let temporary_target_registry: Arc<dyn ExternalTemporaryTargetRegistry> =
@@ -372,12 +403,15 @@ impl DesktopComposition {
             ));
         let spec_suggestions: Arc<dyn CommandSuggestionProvider> =
             Arc::new(StaticSpecSuggestionProvider::new()?);
+        let local_suggestions: Arc<dyn CommandSuggestionProvider> =
+            Arc::new(LocalCommandSuggestionProvider::new());
         let remote_suggestions: Arc<dyn CommandSuggestionProvider> =
             remote_command_suggestions.clone();
         let suggestions: Arc<dyn CommandSuggestionProvider> =
             Arc::new(CompositeCommandSuggestionProvider::new(vec![
                 history_suggestions,
                 spec_suggestions,
+                local_suggestions,
                 remote_suggestions,
             ])?);
         let commands = Arc::new(
@@ -402,6 +436,7 @@ impl DesktopComposition {
                 server_info_collector,
                 port_forward_runtime,
             )
+            .with_local_host_service(host_management.clone())
             .with_port_forward_definition_repository(Arc::new(PortForwardDefinitionStore::new(
                 storage.clone(),
             )))
@@ -483,12 +518,14 @@ impl DesktopComposition {
             .with_commands(commands.as_ref().clone())
             .with_profiles(profiles.clone())
             .with_configuration_validation(configuration_validation.clone());
-        let mcp_runtime: Arc<dyn McpRuntimeControl> = Arc::new(McpRuntimeController::new(
-            runtime.clone(),
-            mcp_services,
-            McpServerConfig::default(),
-            notifications.as_ref().clone(),
-        ));
+        let mcp_runtime: Arc<dyn McpRuntimeControl> =
+            Arc::new(McpRuntimeController::with_preferences(
+                runtime.clone(),
+                mcp_services,
+                preferences.clone(),
+                vault.clone() as Arc<dyn McpTokenStore>,
+                notifications.as_ref().clone(),
+            ));
         agent_manager.set_mcp_runtime(Arc::downgrade(&mcp_runtime))?;
         let external_protocol =
             ExternalProtocolService::new(Arc::new(SystemExternalProtocolAdapter));
@@ -1197,3 +1234,7 @@ mod serial_port_composition_tests;
 #[cfg(test)]
 #[path = "../tests/support/mcp_live/mod.rs"]
 mod mcp_live_acceptance;
+
+#[cfg(test)]
+#[path = "../tests/support/mcp_configuration.rs"]
+mod mcp_configuration_tests;

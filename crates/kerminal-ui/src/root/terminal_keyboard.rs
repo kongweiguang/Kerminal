@@ -20,7 +20,6 @@ use super::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalClipboardAction {
     CopySelection,
-    Paste,
     Interrupt,
 }
 
@@ -99,10 +98,32 @@ fn terminal_clipboard_action(
             TerminalClipboardAction::Interrupt
         });
     }
-    if character == 'v' && (command || (modifiers.control && modifiers.shift)) {
-        return Some(TerminalClipboardAction::Paste);
-    }
     None
+}
+
+/// 尊重平台标记的字符输入优先级，避免 AltGr 或 IME 按键被用户快捷键误消费。
+///
+/// @author kongweiguang
+fn resolve_terminal_shortcut(
+    runtime: &mut keybindings::RootKeybindingRuntime,
+    event: &KeyDownEvent,
+    ime_composing: bool,
+) -> keybindings::KeybindingDispatch {
+    if ime_composing || event.prefer_character_input {
+        runtime.clear_pending();
+        runtime.clear_terminal_shortcut_keys();
+        return keybindings::KeybindingDispatch::Unhandled;
+    }
+    if event.is_held && runtime.is_terminal_shortcut_repeat(&event.keystroke) {
+        return keybindings::KeybindingDispatch::Pending;
+    }
+    runtime.dispatch(
+        &event.keystroke,
+        keybindings::KeybindingFocusScope::Terminal,
+        ime_composing,
+        false,
+        event.is_held,
+    )
 }
 
 /// 复用已聚焦 pane 的固定 binding 和输入队列投递剪贴板内容，不另建异步输入通道。
@@ -265,50 +286,110 @@ impl RootView {
             .is_some_and(|owner| self.terminal_tools_runtime.selection_may_be_present(&owner));
         let has_selection =
             snapshot_has_selection || selection_gesture_active || selection_update_pending;
+        let suggestion_anchor_available = self
+            .snapshot_for_session(&binding.session_id)
+            .is_some_and(|snapshot| {
+                super::suggestion_overlay::anchor_available(snapshot, has_selection)
+            });
+        let native_prediction_visible = self
+            .snapshot_for_session(&binding.session_id)
+            .is_some_and(super::suggestion_overlay::has_native_prediction);
 
-        if self.suggestion_menu_binding.as_ref() == Some(&binding)
+        if !suggestion_anchor_available
+            && self.suggestion_menu_binding.as_ref() == Some(&binding)
+            && self.terminal_command_suggestions.menu_is_open()
+        {
+            self.terminal_command_suggestions.dismiss_menu();
+            self.suggestion_menu_binding = None;
+            self.sync_suggestion_menu(cx);
+            if terminal_event
+                .is_some_and(|key| key.key == TerminalKey::Enter && key.phase == KeyPhase::Press)
+            {
+                cx.stop_propagation();
+                return;
+            }
+        }
+
+        if suggestion_anchor_available
+            && !event.prefer_character_input
+            && self.suggestion_menu_binding.as_ref() == Some(&binding)
             && self.terminal_command_suggestions.menu_is_open()
             && let Some(menu) = self.suggestion_menu.as_ref()
         {
+            if terminal_event.is_some_and(|key| {
+                matches!(key.key, TerminalKey::Enter | TerminalKey::Escape)
+                    && key.phase == KeyPhase::Repeat
+                    && key.modifiers == InputModifiers::default()
+            }) {
+                cx.stop_propagation();
+                return;
+            }
             let menu_key = terminal_event.as_ref().and_then(|event| match event.key {
+                _ if event.modifiers != InputModifiers::default() => None,
                 TerminalKey::Up => Some(command_suggestions::TerminalCommandSuggestionMenuKey::Up),
                 TerminalKey::Down => {
                     Some(command_suggestions::TerminalCommandSuggestionMenuKey::Down)
                 }
-                TerminalKey::Enter => {
+                TerminalKey::Enter if event.phase == KeyPhase::Press => {
                     Some(command_suggestions::TerminalCommandSuggestionMenuKey::Enter)
                 }
-                TerminalKey::Escape => {
+                TerminalKey::Escape if event.phase == KeyPhase::Press => {
                     Some(command_suggestions::TerminalCommandSuggestionMenuKey::Escape)
                 }
                 _ => None,
             });
             if let Some(menu_key) = menu_key {
                 self.keybinding_runtime.clear_pending();
-                menu.update(cx, |menu, cx| menu.handle_key(menu_key, cx));
-                cx.stop_propagation();
-                return;
+                if menu.update(cx, |menu, cx| menu.handle_key(menu_key, cx)) {
+                    cx.stop_propagation();
+                    return;
+                }
+                self.terminal_command_suggestions.dismiss_menu();
+                self.suggestion_menu_binding = None;
+                self.sync_suggestion_menu(cx);
+                cx.notify();
             }
         }
 
-        let suggestion_context = self.suggestion_context_for_binding(&binding);
-        if let (Some(context), Some(terminal_event)) =
-            (suggestion_context.as_ref(), terminal_event.as_ref())
+        if suggestion_anchor_available
+            && !event.prefer_character_input
+            && let Some(terminal_event) = terminal_event.as_ref()
         {
-            if let Some(job) = self
-                .terminal_command_suggestions
-                .request_menu_on_key(*terminal_event, context)
+            if !native_prediction_visible
+                && terminal_event.key == TerminalKey::Escape
+                && terminal_event.phase == KeyPhase::Press
+                && terminal_event.modifiers == InputModifiers::default()
+                && self
+                    .terminal_command_suggestions
+                    .inline_ghost()
+                    .is_some_and(|ghost| ghost.binding == binding)
+                && self.terminal_command_suggestions.dismiss_inline()
             {
                 self.keybinding_runtime.clear_pending();
-                self.suggestion_menu_binding = Some(binding.clone());
-                self.sync_suggestion_menu(cx);
-                self.run_terminal_suggestion_job(job, cx);
+                cx.notify();
                 cx.stop_propagation();
                 return;
             }
-            if let Some(acceptance) = self
+            if self
                 .terminal_command_suggestions
-                .accept_on_key(*terminal_event, context)
+                .is_menu_shortcut(*terminal_event)
+                && self.request_suggestion_snapshot(
+                    binding.clone(),
+                    SuggestionQueryMode::Menu,
+                    true,
+                    cx,
+                )
+            {
+                self.keybinding_runtime.clear_pending();
+                cx.stop_propagation();
+                return;
+            }
+            let suggestion_context = self.suggestion_context_for_binding(&binding);
+            if !native_prediction_visible
+                && let Some(context) = suggestion_context.as_ref()
+                && let Some(acceptance) = self
+                    .terminal_command_suggestions
+                    .accept_on_key(*terminal_event, context)
             {
                 let mode = if self.terminal_command_suggestions.menu_is_open() {
                     SuggestionQueryMode::Menu
@@ -375,15 +456,6 @@ impl RootView {
                         cx.notify();
                     }
                 }
-                TerminalClipboardAction::Paste => {
-                    if !paste_bound_terminal(self, &binding, input_handler.clone(), cx) {
-                        self.status = Some(crate::locale::text(
-                            "当前终端不可用，剪贴板内容未能粘贴。",
-                            "The focused terminal is unavailable; clipboard text was not pasted.",
-                        ));
-                        cx.notify();
-                    }
-                }
                 TerminalClipboardAction::Interrupt => {
                     if let Some(key_event) = terminal_event
                         && let Some(input) = terminal_key_input(key_event, modes, None)
@@ -399,21 +471,25 @@ impl RootView {
             return;
         }
 
-        match self.keybinding_runtime.dispatch(
-            &event.keystroke,
-            keybindings::KeybindingFocusScope::Terminal,
-            ime_composing,
-            false,
-            event.is_held,
-        ) {
+        match resolve_terminal_shortcut(&mut self.keybinding_runtime, event, ime_composing) {
             keybindings::KeybindingDispatch::Unhandled => {}
             keybindings::KeybindingDispatch::Pending => {
+                self.keybinding_runtime
+                    .remember_terminal_shortcut_key(&event.keystroke);
                 cx.stop_propagation();
                 return;
             }
             keybindings::KeybindingDispatch::Action(action) => {
+                self.keybinding_runtime
+                    .remember_terminal_shortcut_key(&event.keystroke);
                 if action == crate::keybindings::KeybindingAction::TerminalPaste {
-                    let _ = paste_bound_terminal(self, &binding, input_handler.clone(), cx);
+                    if !paste_bound_terminal(self, &binding, input_handler.clone(), cx) {
+                        self.status = Some(crate::locale::text(
+                            "当前终端不可用，剪贴板内容未能粘贴。",
+                            "The focused terminal is unavailable; clipboard text was not pasted.",
+                        ));
+                        cx.notify();
+                    }
                     cx.stop_propagation();
                     return;
                 }
@@ -433,6 +509,8 @@ impl RootView {
                     cx.stop_propagation();
                     return;
                 }
+                self.keybinding_runtime
+                    .release_terminal_shortcut_key(&event.keystroke);
             }
         }
 
@@ -582,13 +660,6 @@ impl RootView {
                     ));
                     cx.notify();
                 }
-                TerminalClipboardAction::Paste => {
-                    self.status = Some(crate::locale::text(
-                        "终端已退出，历史内容只读，无法粘贴。",
-                        "The terminal has exited; its history is read-only and cannot receive paste input.",
-                    ));
-                    cx.notify();
-                }
             }
             self.keybinding_runtime.clear_pending();
             return true;
@@ -603,13 +674,7 @@ impl RootView {
             return true;
         }
 
-        match self.keybinding_runtime.dispatch(
-            &event.keystroke,
-            keybindings::KeybindingFocusScope::Terminal,
-            false,
-            false,
-            event.is_held,
-        ) {
+        match resolve_terminal_shortcut(&mut self.keybinding_runtime, event, false) {
             keybindings::KeybindingDispatch::Unhandled => false,
             keybindings::KeybindingDispatch::Pending => true,
             keybindings::KeybindingDispatch::Action(action) => {

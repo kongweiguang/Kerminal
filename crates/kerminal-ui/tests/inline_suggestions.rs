@@ -19,7 +19,7 @@ use kerminal_domain::{
     identity::{PaneId, SessionId, TabId},
     sessions::SessionOwner,
 };
-use kerminal_terminal::input::{KeyPhase, TerminalInputEvent, TerminalKey};
+use kerminal_terminal::input::TerminalInputEvent;
 use kerminal_ui::features::commands::inline_suggestions::InlineSuggestionController;
 
 /// 构造只包含 runtime 可验证数据的 UI owner context，避免测试用 screen text 伪造 prompt。
@@ -81,7 +81,33 @@ fn batch(
     }
 }
 
-/// 逐步接受沿候选声明的 Unicode boundary 替换文本，输入 suffix 和光标位置保持正确。
+/// 菜单和 ghost 共同拒绝 writer 必定拒绝的整行或 UTF-8 后缀，边界内 emoji 仍可接受。
+#[test]
+fn candidates_respect_shell_append_size_limits_before_display() {
+    let context = available_context("session-size", 3, 12, 4);
+    for (input, suffix, expected) in [
+        ("echo ".to_owned(), "😀".repeat(1_024), true),
+        ("echo ".to_owned(), "😀".repeat(1_025), false),
+        ("x".repeat(3_999), "a".to_owned(), true),
+        ("x".repeat(3_999), "ab".to_owned(), false),
+    ] {
+        let mut controller = InlineSuggestionController::new();
+        let cursor = input.chars().count();
+        let (query, _) = controller
+            .update_input(&context, input, cursor, SuggestionQueryMode::Menu)
+            .unwrap();
+        let mut value = candidate();
+        value.replacement_text = suffix;
+        value.replacement_range = CommandSuggestionReplacementRange {
+            start: cursor,
+            end: cursor,
+        };
+        assert!(controller.apply_batch(batch(&query, vec![value])));
+        assert_eq!(!controller.candidates().is_empty(), expected);
+    }
+}
+
+/// 行尾分段接受只发送缺失后缀，保留原命令并且不生成执行按键。
 #[test]
 fn partial_accept_builds_a_versioned_edit_plan() {
     let context = available_context("session-test", 3, 12, 4);
@@ -89,7 +115,7 @@ fn partial_accept_builds_a_versioned_edit_plan() {
     let (query, _) = controller
         .update_input(
             &context,
-            "git che --force".to_owned(),
+            "git che".to_owned(),
             7,
             SuggestionQueryMode::Inline,
         )
@@ -105,17 +131,11 @@ fn partial_accept_builds_a_versioned_edit_plan() {
     assert_eq!(acceptance.expected_context.prompt_epoch, 12);
     assert_eq!(acceptance.expected_context.input_generation, 4);
     assert_eq!(acceptance.replacement_text, "chec");
-    assert_eq!(acceptance.input_after, "git chec --force");
+    assert_eq!(acceptance.input_after, "git chec");
     assert_eq!(acceptance.cursor_after, 8);
-    assert_eq!(acceptance.events.len(), 4);
-    assert!(acceptance.events[..3].iter().all(|event| matches!(
-        event,
-        TerminalInputEvent::Key(key)
-            if key.key == TerminalKey::Backspace && key.phase == KeyPhase::Press
-    )));
     assert_eq!(
-        acceptance.events[3],
-        TerminalInputEvent::Paste("chec".to_owned())
+        acceptance.events,
+        vec![TerminalInputEvent::Paste("c".to_owned())]
     );
     assert!(controller.accept("spec:git:checkout", false).is_none());
 }
@@ -149,6 +169,42 @@ fn newer_input_cancels_and_rejects_stale_batch() {
     assert!(old_cancellation.is_cancelled());
     assert!(!controller.apply_batch(late_batch));
     assert!(controller.apply_batch(batch(&current_query, vec![candidate()])));
+}
+
+/// 输入入队即可撤销候选；迟到结果即使携带原始代次，也不能重新开放接受权限。
+#[test]
+fn pending_input_suspends_query_and_rejects_late_results() {
+    let context = available_context("session-pending", 3, 12, 4);
+    let mut controller = InlineSuggestionController::new();
+    let (query, cancellation) = controller
+        .update_input(
+            &context,
+            "git che".to_owned(),
+            7,
+            SuggestionQueryMode::Inline,
+        )
+        .expect("trusted prompt should allow a suggestion query");
+    let late = batch(&query, vec![candidate()]);
+    assert!(controller.apply_batch(late.clone()));
+
+    controller.suspend_query();
+    assert!(cancellation.is_cancelled());
+    assert!(controller.is_suspended());
+    assert!(controller.candidates().is_empty());
+    assert!(!controller.apply_batch(late));
+    assert!(controller.accept("spec:git:checkout", false).is_none());
+
+    let (next, _) = controller
+        .update_input(
+            &context,
+            "git chec".to_owned(),
+            8,
+            SuggestionQueryMode::Inline,
+        )
+        .expect("a new confirmed input resumes querying");
+    assert!(!controller.is_suspended());
+    assert!(controller.is_request_active());
+    assert_ne!(query.request_generation, next.request_generation);
 }
 
 /// session 切换、raw 输入或不可信 prompt 状态清除所有候选与临时输入。
@@ -247,9 +303,9 @@ fn dangerous_candidate_is_never_inline() {
     assert!(controller.candidates().is_empty());
 }
 
-/// 建议范围位于当前光标之前时先移动到 range 末尾，再替换并保留后缀。
+/// 行中光标和非前缀候选均不能改写既有输入。
 #[test]
-fn replacement_moves_to_range_end_and_preserves_suffix() {
+fn non_tail_and_non_prefix_candidates_are_rejected() {
     let context = available_context("session-test", 3, 12, 4);
     let mut controller = InlineSuggestionController::new();
     let (query, _) = controller
@@ -262,20 +318,40 @@ fn replacement_moves_to_range_end_and_preserves_suffix() {
         .expect("trusted prompt should allow a query");
     assert!(controller.apply_batch(batch(&query, vec![candidate()])));
 
-    let acceptance = controller
-        .accept("spec:git:checkout", false)
-        .expect("current candidate should be accepted");
+    assert!(controller.candidates().is_empty());
+    assert!(controller.accept("spec:git:checkout", false).is_none());
 
-    assert_eq!(acceptance.input_after, "git checkout --force");
-    assert_eq!(acceptance.cursor_after, 12);
-    assert!(matches!(
-        acceptance.events.first(),
-        Some(TerminalInputEvent::Key(key)) if key.key == TerminalKey::Left
-    ));
-    assert!(matches!(
-        acceptance.events.get(1),
-        Some(TerminalInputEvent::Key(key)) if key.key == TerminalKey::Left
-    ));
+    let (query, _) = controller
+        .update_input(&context, "git che".to_owned(), 7, SuggestionQueryMode::Menu)
+        .expect("valid tail input can be queried");
+    let mut mismatch = candidate();
+    mismatch.replacement_text = "change".to_owned();
+    assert!(controller.apply_batch(batch(&query, vec![mismatch])));
+    assert!(controller.candidates().is_empty());
+}
+
+/// 组合字符边界使用 Unicode 字素而非字节或单独的 combining mark，且接受结果只追加一次。
+#[test]
+fn unicode_partial_accept_preserves_grapheme_clusters() {
+    let context = available_context("session-test", 3, 12, 4);
+    let mut controller = InlineSuggestionController::new();
+    let (query, _) = controller
+        .update_input(&context, "cd 中".to_owned(), 4, SuggestionQueryMode::Inline)
+        .expect("Unicode input is trusted");
+    let mut unicode = candidate();
+    unicode.replacement_text = "中e\u{301}/路径".to_owned();
+    unicode.replacement_range = CommandSuggestionReplacementRange { start: 3, end: 4 };
+    unicode.suffix = "untrusted".to_owned();
+    unicode.accept_boundaries = vec![2, 3];
+    assert!(controller.apply_batch(batch(&query, vec![unicode])));
+    let acceptance = controller
+        .accept("spec:git:checkout", true)
+        .expect("safe partial result");
+    assert_eq!(acceptance.input_after, "cd 中e\u{301}");
+    assert_eq!(
+        acceptance.events,
+        vec![TerminalInputEvent::Paste("e\u{301}".to_owned())]
+    );
 }
 
 /// 建议查询使用的 context version 与终端 UI 写请求共享同一字段顺序和值类型。

@@ -2,11 +2,102 @@
 //!
 //! @author kongweiguang
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
 use gpui_kit::{KeyDownEvent, Keystroke, MouseButton, TestAppContext, VisualTestContext};
-use kerminal_application::preferences::InterfaceDensity;
-use kerminal_domain::{files::FileEntryKind, identity::HostId};
+use kerminal_application::{
+    AppError, AppResult,
+    platform::external_launch::{ExternalTargetLease, ExternalTargetLeaseOwner},
+    preferences::InterfaceDensity,
+};
+use kerminal_domain::{
+    files::{FileEndpoint, FileEntryKind},
+    identity::HostId,
+};
 
 use super::{NameAction, action_test_support as support};
+
+struct FileLeaseOwner {
+    scopes: AtomicUsize,
+    accepting: AtomicBool,
+}
+
+impl ExternalTargetLeaseOwner for FileLeaseOwner {
+    /// 模拟临时目标关闭门禁，使测试能区分独立 owner 与普通克隆。
+    ///
+    /// @author kongweiguang
+    fn retain_scope(&self, _host_id: &HostId) -> AppResult<()> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(AppError::conflict("临时连接已关闭"));
+        }
+        self.scopes.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// 每个独立 scope 最后一次释放只减少一次计数，反映真实租约生命周期。
+    ///
+    /// @author kongweiguang
+    fn release_scope(&self, _host_id: &HostId) {
+        self.scopes.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 文件打开必须从同一临时目标取得独立租约，来源关闭不影响新标签。
+///
+/// @author kongweiguang
+#[test]
+fn file_open_retains_the_matching_external_target() {
+    let owner = Arc::new(FileLeaseOwner {
+        scopes: AtomicUsize::new(1),
+        accepting: AtomicBool::new(true),
+    });
+    let host = HostId::parse("external:file-fixture").expect("valid external id");
+    let source = ExternalTargetLease::new_registered(host.clone(), owner.clone())
+        .expect("registered fixture lease");
+    let endpoint = FileEndpoint::remote(host, "/tmp/file.txt").expect("valid remote path");
+    let retained = super::retain_file_target_lease(&endpoint, Some(&source))
+        .expect("matching scope can be retained")
+        .expect("external file requires an owner");
+    assert_eq!(owner.scopes.load(Ordering::Acquire), 2);
+    drop(source);
+    assert_eq!(owner.scopes.load(Ordering::Acquire), 1);
+    drop(retained);
+    assert_eq!(owner.scopes.load(Ordering::Acquire), 0);
+}
+
+/// 缺失、错主机或已失效租约不能创建文件目标，保存主机不依赖临时 scope。
+///
+/// @author kongweiguang
+#[test]
+fn file_open_rejects_missing_mismatched_and_expired_external_lease() {
+    let owner = Arc::new(FileLeaseOwner {
+        scopes: AtomicUsize::new(1),
+        accepting: AtomicBool::new(true),
+    });
+    let host = HostId::parse("external:file-fixture").expect("valid external id");
+    let source = ExternalTargetLease::new_registered(host.clone(), owner.clone())
+        .expect("registered fixture lease");
+    let endpoint = FileEndpoint::remote(host, "/tmp/file.txt").expect("valid remote path");
+    let other = FileEndpoint::remote(
+        HostId::parse("external:other-fixture").expect("valid other id"),
+        "/tmp/file.txt",
+    )
+    .expect("valid remote path");
+    assert!(super::retain_file_target_lease(&endpoint, None).is_err());
+    assert!(super::retain_file_target_lease(&other, Some(&source)).is_err());
+    owner.accepting.store(false, Ordering::Release);
+    assert!(super::retain_file_target_lease(&endpoint, Some(&source)).is_err());
+    let saved = FileEndpoint::remote(HostId::new(), "/tmp/file.txt").expect("valid remote path");
+    assert!(
+        super::retain_file_target_lease(&saved, None)
+            .expect("saved host needs no lease")
+            .is_none()
+    );
+    assert_eq!(owner.scopes.load(Ordering::Acquire), 1);
+}
 
 /// 新建文件工作区与 main 一样默认显示隐藏项目，避免首次进入时遗漏配置文件。
 ///
@@ -20,51 +111,6 @@ fn files_pane_defaults_to_showing_hidden_entries(app: &mut TestAppContext) {
     app.update(|cx| {
         fixture.pane.read_with(cx, |pane, _| {
             assert!(pane.show_hidden_files);
-        });
-    });
-    let _runtime = fixture.runtime;
-}
-
-/// 旧下载回执不得清除或覆盖之后发出的剪贴板请求状态。
-///
-/// @author kongweiguang
-#[gpui_kit::test]
-fn stale_clipboard_receipt_cannot_complete_the_latest_request(app: &mut TestAppContext) {
-    let host = HostId::new();
-    let directory = support::remote_endpoint(&host, "/srv");
-    let fixture = support::entity_fixture(app, directory, |_| {});
-    let pane = fixture.pane.clone();
-
-    app.update(|cx| {
-        pane.update(cx, |pane, _| {
-            pane.active_clipboard_download_request_id = Some(8);
-            pane.status = Some("latest request is pending".to_owned());
-            pane.status_details_expanded = true;
-        });
-    });
-    app.update(|cx| {
-        pane.update(cx, |pane, cx| {
-            pane.complete_clipboard_download(7, Err("late failure".to_owned()), cx);
-        });
-    });
-    app.update(|cx| {
-        pane.read_with(cx, |pane, _| {
-            assert_eq!(pane.active_clipboard_download_request_id, Some(8));
-            assert_eq!(pane.status.as_deref(), Some("latest request is pending"));
-            assert!(pane.status_details_expanded);
-        });
-    });
-
-    app.update(|cx| {
-        pane.update(cx, |pane, cx| {
-            pane.complete_clipboard_download(8, Ok(()), cx);
-        });
-    });
-    app.update(|cx| {
-        pane.read_with(cx, |pane, _| {
-            assert_eq!(pane.active_clipboard_download_request_id, None);
-            assert_eq!(pane.status, None);
-            assert!(!pane.status_details_expanded);
         });
     });
     let _runtime = fixture.runtime;
@@ -251,6 +297,86 @@ fn compact_file_rows_and_toolbar_follow_reference_geometry(app: &mut TestAppCont
     let _runtime = runtime;
 }
 
+/// 单行导航让路径可编辑且次要控件不换行；传输元数据不越过窄栏边界。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn compact_sftp_path_and_transfer_rate_fit_narrow_panel(app: &mut TestAppContext) {
+    use gpui_kit::{px, size};
+    use kerminal_domain::{
+        files::{ConflictPolicy, TransferKind, TransferRequest, TransferStatus, TransferTask},
+        identity::TransferId,
+    };
+
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv/a-meaningful-directory");
+    let request = TransferRequest {
+        source: FileEndpoint::Local {
+            path: std::path::PathBuf::from("source.txt"),
+        },
+        destination: support::remote_endpoint(&host, "/srv/a-meaningful-directory/destination.txt"),
+        kind: TransferKind::File,
+        conflict_policy: ConflictPolicy::Rename,
+        idle_timeout_seconds: None,
+    };
+    let mut summary = TransferTask::queued(TransferId::new(), request)
+        .expect("fixture endpoints are distinct")
+        .summary();
+    summary.status = TransferStatus::Succeeded;
+    summary.bytes_transferred = 65;
+    summary.total_bytes = Some(65);
+    summary.speed_bytes_per_second = 2048;
+    let transfer_selector = format!("rr-files-transfer-{}", summary.id);
+    let speed_selector = format!("rr-files-transfer-speed-{}", summary.id);
+    let percent_selector = format!("rr-files-transfer-percent-{}", summary.id);
+    let (runtime, _, _, visual) = support::window_fixture(app, directory, move |pane| {
+        pane.compact_layout = true;
+        pane.current_terminal_endpoint = Some(pane.panels[1].endpoint.clone());
+        pane.queue_watch_started = true;
+        pane.transfer_rows = vec![summary];
+    });
+    visual.simulate_resize(size(px(296.), px(600.)));
+    support::draw(visual);
+
+    let path_input = visual
+        .debug_bounds("rr-files-path-input-1")
+        .expect("remote path input is visible");
+    let bookmarks = visual
+        .debug_bounds("rr-files-bookmarks-1")
+        .expect("bookmark menu remains visible on the navigation row");
+    assert!(
+        (bookmarks.center().y - path_input.center().y).abs() <= px(1.),
+        "navigation controls wrapped: path={path_input:?}, bookmarks={bookmarks:?}"
+    );
+    let transfer = visual
+        .update(|window, _| window.debug_selector_bounds(&transfer_selector))
+        .expect("transfer row is visible");
+    let speed = visual
+        .update(|window, _| window.debug_selector_bounds(&speed_selector))
+        .expect("transfer rate is visible");
+    let percent = visual
+        .update(|window, _| window.debug_selector_bounds(&percent_selector))
+        .expect("transfer percentage is visible");
+    assert!(
+        path_input.size.width >= px(80.),
+        "path input is too narrow: {path_input:?}"
+    );
+    assert!(
+        speed.size.width > px(40.),
+        "transfer rate has no readable width: {speed:?}"
+    );
+    assert!(
+        speed.right() <= transfer.right() - px(12.),
+        "transfer rate exceeds the padded row: rate={speed:?}, row={transfer:?}"
+    );
+    assert!(
+        percent.size.width >= px(24.) && percent.right() <= transfer.right() - px(12.),
+        "transfer percentage is clipped: percent={percent:?}, row={transfer:?}"
+    );
+
+    let _runtime = runtime;
+}
+
 /// 取消新建、重命名、权限和删除对话框只清理待处理状态，不提交文件写操作。
 ///
 /// @author kongweiguang
@@ -394,12 +520,12 @@ fn delete_and_f2_keep_the_entry_selected_when_the_key_was_pressed(app: &mut Test
     let _runtime = runtime;
 }
 
-/// 将列表中心的真实鼠标按下/抬起事件分发给 GPUI，以建立生产焦点路由。
+/// 工作台与右栏使用不同 selector；此宽布局夹具点击工作台列表以建立生产焦点路由。
 ///
 /// @author kongweiguang
 fn click_list(visual: &mut VisualTestContext) {
     let position = visual
-        .debug_bounds("files-browser-list-1")
+        .debug_bounds("central-files-browser-list-1")
         .expect("FilesPane browser list was rendered")
         .center();
     visual.simulate_mouse_move(position, None, Default::default());
@@ -420,4 +546,188 @@ fn send_key(visual: &mut VisualTestContext, binding: &str) {
         prefer_character_input: false,
     });
     support::draw(visual);
+}
+
+/// 路径复制不产生成功状态栏，也不覆盖用户尚待处理的错误；无损复制失败仍必须可见。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn copy_path_is_quiet_and_preserves_existing_feedback(app: &mut TestAppContext) {
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv");
+    let fixture = support::entity_fixture(app, directory.clone(), |_| {});
+    app.update(|cx| {
+        fixture.pane.update(cx, |pane, cx| {
+            pane.status = None;
+            pane.copy_path_to_clipboard(&directory, cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("/srv".to_owned())
+            );
+            assert!(pane.status.is_none());
+            pane.status = Some("existing transfer error".to_owned());
+            pane.copy_path_to_clipboard(&directory, cx);
+            assert_eq!(pane.status.as_deref(), Some("existing transfer error"));
+            let invalid = FileEndpoint::Local {
+                path: "invalid\npath".into(),
+            };
+            pane.copy_path_to_clipboard(&invalid, cx);
+            assert_ne!(pane.status.as_deref(), Some("existing transfer error"));
+        });
+    });
+    let _runtime = fixture.runtime;
+}
+
+/// 窄宽工作区都保留单行动作栏；宽布局复制、计数和更多入口在栏内，窄布局优先保留复制与更多。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn wide_file_actions_keep_core_controls_on_one_row(app: &mut TestAppContext) {
+    use gpui_kit::{px, size};
+
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv/app");
+    let (runtime, _, _, visual) = support::window_fixture(app, directory, |_| {});
+    visual.simulate_resize(size(px(1180.), px(700.)));
+    support::draw(visual);
+
+    let actions = visual
+        .debug_bounds("rr-files-actions-0")
+        .expect("wide action toolbar is visible");
+    assert!(
+        actions.size.height <= px(41.5),
+        "normal split must keep the action toolbar on one row: {actions:?}"
+    );
+    let view_modes = visual
+        .debug_bounds("rr-files-more-menu-0")
+        .expect("more actions stay visible");
+    assert!(
+        view_modes.origin.x >= actions.origin.x
+            && view_modes.right() <= actions.right()
+            && view_modes.bottom() <= actions.bottom(),
+        "more actions escaped the toolbar: actions={actions:?}, more={view_modes:?}"
+    );
+    for selector in ["files-copy-to-other-0", "files-toolbar-count-0"] {
+        let control = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing wide toolbar control {selector}"));
+        assert!(
+            control.origin.x >= actions.origin.x
+                && control.right() <= actions.right()
+                && control.bottom() <= actions.bottom(),
+            "core control escaped the toolbar: selector={selector}, actions={actions:?}, control={control:?}"
+        );
+    }
+    let copy_bounds = visual
+        .debug_bounds("files-copy-to-other-0")
+        .expect("copy action remains visible");
+    let count_bounds = visual
+        .debug_bounds("files-toolbar-count-0")
+        .expect("file count remains visible");
+    assert!(
+        count_bounds.origin.x >= copy_bounds.right(),
+        "file count must sit to the right of the actions: copy={copy_bounds:?}, count={count_bounds:?}"
+    );
+
+    visual.simulate_resize(size(px(760.), px(700.)));
+    support::draw(visual);
+    let narrow_actions = visual
+        .debug_bounds("rr-files-actions-0")
+        .expect("narrow action toolbar is visible");
+    let narrow_more = visual
+        .debug_bounds("rr-files-more-menu-0")
+        .expect("narrow more actions stay visible");
+    assert!(
+        narrow_actions.size.height <= px(41.5),
+        "narrow action toolbar must remain on one row: {narrow_actions:?}"
+    );
+    assert!(
+        narrow_more.origin.x >= narrow_actions.origin.x
+            && narrow_more.right() <= narrow_actions.right()
+            && narrow_more.bottom() <= narrow_actions.bottom(),
+        "more actions escaped the toolbar: actions={narrow_actions:?}, more={narrow_more:?}"
+    );
+    let copy = visual
+        .debug_bounds("files-copy-to-other-0")
+        .expect("copy action remains visible");
+    assert!(
+        copy.origin.x >= narrow_actions.origin.x
+            && copy.right() <= narrow_actions.right()
+            && copy.bottom() <= narrow_actions.bottom(),
+        "copy action escaped the toolbar: actions={narrow_actions:?}, copy={copy:?}"
+    );
+
+    let _runtime = runtime;
+}
+
+/// 宽布局分栏必须响应真实拖拽，左右两栏尺寸同时变化且保持可见。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn dragging_file_workbench_divider_resizes_both_panels(app: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, point, px, size};
+
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv/app");
+    let (runtime, _, _, visual) = support::window_fixture(app, directory, |_| {});
+    visual.simulate_resize(size(px(1180.), px(800.)));
+    support::draw(visual);
+
+    let left = visual
+        .debug_bounds("rr-files-browser-0")
+        .expect("left browser is visible");
+    let right = visual
+        .debug_bounds("rr-files-browser-1")
+        .expect("right browser is visible");
+    let boundary = right.left();
+    let y = left.center().y;
+    let start = point(boundary - px(2.), y);
+    let end = point(boundary + px(80.), y);
+
+    visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    support::draw(visual);
+    visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    support::draw(visual);
+    visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    support::draw(visual);
+
+    let left_after = visual
+        .debug_bounds("rr-files-browser-0")
+        .expect("left browser remains visible");
+    let right_after = visual
+        .debug_bounds("rr-files-browser-1")
+        .expect("right browser remains visible");
+    assert!(
+        left_after.size.width > left.size.width + px(60.),
+        "left pane did not grow after dragging: before={left:?}, after={left_after:?}"
+    );
+    assert!(
+        right_after.size.width < right.size.width - px(60.),
+        "right pane did not shrink after dragging: before={right:?}, after={right_after:?}"
+    );
+
+    let _runtime = runtime;
+}
+
+/// 选择文件只更新行状态，不再在底部打开正文预览面板。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn selecting_a_file_does_not_open_a_preview_panel(app: &mut TestAppContext) {
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv");
+    let entry = support::remote_entry(&directory, "upload.txt", FileEntryKind::File);
+    let (runtime, _, _, visual) = support::window_fixture(app, directory, move |pane| {
+        support::seed_listing(pane, 1, 2, vec![entry.clone()]);
+        pane.active_side = 1;
+        pane.panels[1].selected = Some(entry);
+    });
+    support::draw(visual);
+
+    assert!(
+        visual.debug_bounds("rr-files-preview").is_none(),
+        "selecting a file must not open a bottom preview panel"
+    );
+
+    let _runtime = runtime;
 }

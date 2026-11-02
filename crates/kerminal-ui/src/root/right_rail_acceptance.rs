@@ -375,6 +375,29 @@ impl RootView {
             })
     }
 
+    /// 仅允许活动夹具的 tmux 面板暴露只读呈现状态，避免验收借用其它主机的快照。
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_tmux_presentation(
+        &self,
+        host_id: &HostId,
+        cx: &Context<Self>,
+    ) -> Result<Option<(u64, bool, bool, bool, bool)>, String> {
+        if self.right_rail_acceptance_active_tool() != Some(ToolRailToolId::Tmux)
+            || self
+                .right_rail_acceptance_fixture_binding(host_id)?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        self.right_rail_acceptance_operations_view(ToolRailToolId::Tmux)
+            .map_or(Ok(None), |operations| {
+                operations
+                    .read(cx)
+                    .right_rail_acceptance_tmux_presentation(host_id)
+                    .map(Some)
+            })
+    }
+
     /// 展开操作前后都核对 session 仍属于当前 SSH host 的 tmux 快照。
     ///
     /// @author kongweiguang
@@ -850,6 +873,83 @@ impl RootView {
         let (binding, view) = self.right_rail_acceptance_logs_context(host_id)?;
         view.read(cx)
             .right_rail_acceptance_snapshot(run_id, &binding)
+    }
+
+    /// 原始光标前缀包含提示符尾空格，用它证明填入未提交且清理后回到原位置，而不只检查按钮回执。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_logs_terminal_cursor_line(
+        &self,
+        host_id: &HostId,
+        run_id: &str,
+        cx: &Context<Self>,
+    ) -> Result<Option<String>, String> {
+        use unicode_width::UnicodeWidthChar as _;
+        let (binding, view) = self.right_rail_acceptance_logs_context(host_id)?;
+        if !view
+            .read(cx)
+            .right_rail_acceptance_seed_ready(run_id, &binding)?
+        {
+            return Ok(None);
+        }
+        let Some(snapshot) = self.terminal_snapshot_for_binding(&binding) else {
+            return Ok(None);
+        };
+        let Some(row) = snapshot
+            .rows
+            .iter()
+            .find(|row| row.viewport_row == snapshot.cursor.row)
+        else {
+            return Ok(None);
+        };
+        let target_width = usize::from(snapshot.cursor.column);
+        if target_width == 0 {
+            return Ok(None);
+        }
+        let mut width = 0;
+        let mut prefix = String::new();
+        for character in row.runs.iter().flat_map(|run| run.text.chars()) {
+            let character_width = character.width().unwrap_or(0);
+            if width + character_width > target_width {
+                break;
+            }
+            prefix.push(character);
+            width += character_width;
+            if width == target_width {
+                return Ok(Some(prefix));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 焦点必须来自同一 fixture binding 的真实 pane handler，不能以工具标签仍选中推定终端可接收按键。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_logs_terminal_focused(
+        &self,
+        host_id: &HostId,
+        run_id: &str,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Result<bool, String> {
+        let (binding, view) = self.right_rail_acceptance_logs_context(host_id)?;
+        if !view
+            .read(cx)
+            .right_rail_acceptance_seed_ready(run_id, &binding)?
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .pane_input_handlers
+            .get(&binding.session_id)
+            .filter(|registration| registration.binding == binding)
+            .is_some_and(|registration| {
+                registration
+                    .entity
+                    .read(cx)
+                    .focus_handle()
+                    .is_focused(window)
+            }))
     }
 
     /// 保留本次命令前缀，通过生产查询输入路径修改搜索条件。

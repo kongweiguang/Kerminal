@@ -83,6 +83,8 @@ fn external_username_requires_explicit_safe_input() {
 }
 
 /// 取消后迟到的续接结果不得进入工作区，且结果中的临时目标 lease 必须释放。
+///
+/// @author kongweiguang
 #[test]
 fn cancelled_username_prompt_drops_late_target_lease() {
     let released = Arc::new(AtomicUsize::new(0));
@@ -109,6 +111,7 @@ fn cancelled_username_prompt_drops_late_target_lease() {
             },
             display_name: None,
             authentication_required: false,
+            password_retry_available: true,
             open_sftp_after_connect: false,
         },
     });

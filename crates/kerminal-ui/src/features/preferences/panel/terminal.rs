@@ -2,11 +2,14 @@
 //!
 //! @author kongweiguang
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::component::searchable_list::SearchableListItem;
 use gpui_kit::{
-    AppContext as _, Context, Entity, SharedString, Subscription, Task, Window,
+    AppContext as _, Context, Entity, ScrollHandle, SharedString, Subscription, Task, Window,
     component::{
         Colorize as _,
         color_picker::{ColorPickerEvent, ColorPickerState},
@@ -22,10 +25,10 @@ use kerminal_application::preferences::{
     TerminalKeywordHighlightRule, TerminalKeywordHighlightStyle,
 };
 
-use super::PreferencesPanel;
 use super::forms::{set_input, set_textarea};
+use super::{PreferencesEvent, PreferencesPanel};
 
-const KEYWORD_RULE_LIMIT: usize = 64;
+pub(in crate::features::preferences) const KEYWORD_RULE_LIMIT: usize = 64;
 const KEYWORD_PATTERN_LIMIT: usize = 256;
 const KEYWORD_NOTE_LIMIT: usize = 160;
 const KEYWORD_DELETE_UNDO_WINDOW: Duration = Duration::from_secs(15);
@@ -398,17 +401,37 @@ pub(in crate::features::preferences) struct KeywordColorField {
         Entity<super::super::color_picker::ColorPickerView>,
 }
 
+#[derive(Clone)]
 pub(in crate::features::preferences) struct KeywordEditSession {
     pub(in crate::features::preferences) base: Option<TerminalKeywordHighlightRule>,
     pub(in crate::features::preferences) draft: TerminalKeywordHighlightRule,
     pub(in crate::features::preferences) is_new: bool,
     return_rule_id: Option<String>,
+    generation: u64,
+    last_submitted: Option<TerminalKeywordHighlightRule>,
+}
+
+/// 保存收据必须同时对应规则身份和编辑会话，避免迟到回执覆盖后来选中的草稿。
+pub(in crate::features::preferences) struct KeywordPendingSave {
+    rule: TerminalKeywordHighlightRule,
+    draft: TerminalKeywordHighlightRule,
+    generation: u64,
+}
+
+impl KeywordPendingSave {
+    /// 回执仅属于同一规则和会话代次，不能把其他暂存草稿视为已提交。
+    ///
+    /// @author kongweiguang
+    fn owns_session(&self, session: &KeywordEditSession) -> bool {
+        self.generation == session.generation && self.rule.id == session.draft.id
+    }
 }
 
 pub(in crate::features::preferences) struct KeywordDeleteUndoReceipt {
     pub(in crate::features::preferences) expires_at: Instant,
     pub(in crate::features::preferences) index: usize,
     pub(in crate::features::preferences) rule: TerminalKeywordHighlightRule,
+    session: KeywordEditSession,
     generation: u64,
 }
 
@@ -422,16 +445,23 @@ pub(in crate::features::preferences) struct KeywordEditorState {
     pub(in crate::features::preferences) colors: Vec<KeywordColorField>,
     pub(in crate::features::preferences) query: String,
     pub(in crate::features::preferences) session: Option<KeywordEditSession>,
-    pub(in crate::features::preferences) save_pending: Option<TerminalKeywordHighlightRule>,
+    pub(in crate::features::preferences) save_pending: Option<KeywordPendingSave>,
     pub(in crate::features::preferences) error: Option<String>,
     pub(in crate::features::preferences) undo_receipt: Option<KeywordDeleteUndoReceipt>,
+    pub(in crate::features::preferences) list_scroll: ScrollHandle,
+    pub(in crate::features::preferences) editor_scroll: ScrollHandle,
+    pub(in crate::features::preferences) wide_layout: Option<bool>,
+    parked_sessions: BTreeMap<String, KeywordEditSession>,
+    session_generation: u64,
     _subscriptions: Vec<Subscription>,
     undo_task: Option<Task<()>>,
     undo_generation: u64,
 }
 
 impl KeywordEditorState {
-    /// 在面板创建时固定编辑器输入实体，避免切换规则或重绘时丢失输入焦点。
+    /// 在面板创建时固定编辑器输入与滚动状态，避免重绘重建实体或丢失焦点。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn new(
         window: &mut Window,
         cx: &mut Context<PreferencesPanel>,
@@ -543,26 +573,119 @@ impl KeywordEditorState {
             save_pending: None,
             error: None,
             undo_receipt: None,
+            list_scroll: ScrollHandle::default(),
+            editor_scroll: ScrollHandle::default(),
+            wide_layout: None,
+            parked_sessions: BTreeMap::new(),
+            session_generation: 0,
             _subscriptions: subscriptions,
             undo_task: None,
             undo_generation: 0,
         }
     }
+
+    /// 每次创建新会话都分配代次，规则 ID 相同也不能复用旧异步回执。
+    ///
+    /// @author kongweiguang
+    fn next_session_generation(&mut self) -> u64 {
+        self.session_generation = self.session_generation.wrapping_add(1);
+        self.session_generation
+    }
+
+    /// 仅保留有修改或待确认的会话，切换规则不会丢失未提交输入。
+    ///
+    /// @author kongweiguang
+    fn park_current_session(&mut self) {
+        if let Some(session) = self.session.take()
+            && (session.is_new
+                || session.base.as_ref() != Some(&session.draft)
+                || self.save_pending.as_ref().is_some_and(|pending| {
+                    pending.generation == session.generation && pending.rule.id == session.draft.id
+                }))
+        {
+            self.parked_sessions
+                .insert(session.draft.id.clone(), session);
+        }
+    }
+
+    /// 优先恢复同一规则的本地草稿，清洁会话则以最新已保存值建立基线。
+    ///
+    /// @author kongweiguang
+    fn session_for_rule(&mut self, rule: TerminalKeywordHighlightRule) -> KeywordEditSession {
+        if let Some(mut session) = self.parked_sessions.remove(&rule.id) {
+            if !session.is_new && session.base.as_ref() == Some(&session.draft) {
+                session.base = Some(rule.clone());
+                session.draft = rule;
+            }
+            session
+        } else {
+            let generation = self.next_session_generation();
+            existing_session(rule, generation)
+        }
+    }
+
+    /// 新建草稿可在切回已保存规则后恢复，按钮据此显示真实后续操作。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn has_parked_new(&self) -> bool {
+        self.parked_sessions.values().any(|session| session.is_new)
+    }
+
+    /// 关闭门禁覆盖所有局部草稿，但不把已提交且尚未收到回执的快照误判为未提交。
+    ///
+    /// @author kongweiguang
+    pub(super) fn has_unsaved_drafts(&self) -> bool {
+        self.session
+            .iter()
+            .chain(self.parked_sessions.values())
+            .any(|session| {
+                let dirty = session.is_new || session.base.as_ref() != Some(&session.draft);
+                let submitted = self.save_pending.as_ref().is_some_and(|pending| {
+                    pending.owns_session(session) && pending.draft == session.draft
+                });
+                dirty && !submitted
+            })
+    }
 }
 
 impl PreferencesPanel {
-    /// 关闭设置时丢弃未提交的局部编辑；CAS 已开始的提交保留到确认或失败回调完成。
+    /// 关闭只丢弃未提交编辑；已发出的 CAS 保留所属会话，以便迟到回执仍能核对。
     ///
     /// @author kongweiguang
     pub(in crate::features::preferences) fn discard_pending_keyword_rule(&mut self) {
-        if self.keyword_editor.save_pending.is_some() {
-            return;
+        let pending = self.keyword_editor.save_pending.as_ref().map(|pending| {
+            (
+                pending.rule.id.clone(),
+                pending.generation,
+                pending.draft.clone(),
+            )
+        });
+        if let Some((id, generation, draft)) = pending {
+            if let Some(session) = self.keyword_editor.session.as_mut() {
+                if session.generation == generation && session.draft.id == id {
+                    session.draft.clone_from(&draft);
+                } else {
+                    self.keyword_editor.session = None;
+                }
+            }
+            self.keyword_editor.parked_sessions.retain(|_, session| {
+                if session.generation == generation && session.draft.id == id {
+                    session.draft.clone_from(&draft);
+                    true
+                } else {
+                    false
+                }
+            });
+        } else {
+            self.keyword_editor.session = None;
+            self.keyword_editor.parked_sessions.clear();
         }
-        self.keyword_editor.session = None;
         self.keyword_editor.error = None;
     }
 
     /// 已保存规则改变时仅同步干净草稿；用户正在编辑的草稿不被后台刷新覆盖。
+    ///
+    /// @author kongweiguang
     pub(super) fn reconcile_keyword_editor(
         &mut self,
         rules: &[TerminalKeywordHighlightRule],
@@ -579,6 +702,7 @@ impl PreferencesPanel {
             .as_deref()
             .and_then(|id| rules.iter().find(|rule| rule.id == id));
 
+        let mut replacement = None;
         match self.keyword_editor.session.as_mut() {
             Some(session) if session.is_new => return,
             Some(session) if session.base.as_ref() != Some(&session.draft) => return,
@@ -587,15 +711,28 @@ impl PreferencesPanel {
                     session.base = Some(rule.clone());
                     session.draft = rule.clone();
                 } else {
-                    self.keyword_editor.session = rules.first().cloned().map(existing_session);
+                    replacement = rules.first().cloned();
                 }
             }
-            None => self.keyword_editor.session = rules.first().cloned().map(existing_session),
+            None => replacement = rules.first().cloned(),
+        }
+        if let Some(rule) = replacement {
+            self.keyword_editor.session = Some(self.keyword_editor.session_for_rule(rule));
+        } else if selected.is_none()
+            && self
+                .keyword_editor
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.is_new)
+        {
+            self.keyword_editor.session = None;
         }
         self.sync_keyword_editor_inputs(window, cx);
     }
 
     /// 从单条规则加载编辑字段；无已选规则时保持输入空白，供新建规则使用。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn sync_keyword_editor_inputs(
         &mut self,
         window: &mut Window,
@@ -632,7 +769,9 @@ impl PreferencesPanel {
         }
     }
 
-    /// 新规则在写入设置快照前固定 ID，保存失败或重复点击都复用同一编辑会话。
+    /// 恢复已有草稿不占用新容量；真正创建或保存新规则仍受数量上限保护。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn start_keyword_rule(
         &mut self,
         window: &mut Window,
@@ -642,10 +781,20 @@ impl PreferencesPanel {
         if self.settings_controls_locked() {
             return;
         }
+        if self
+            .keyword_editor
+            .session
+            .as_ref()
+            .is_some_and(|session| session.is_new)
+        {
+            return;
+        }
         let Some(settings) = self.settings.as_ref().map(|draft| draft.value()) else {
             return;
         };
-        if settings.terminal.keyword_highlights.rules.len() >= KEYWORD_RULE_LIMIT {
+        if settings.terminal.keyword_highlights.rules.len() >= KEYWORD_RULE_LIMIT
+            && !self.keyword_editor.has_parked_new()
+        {
             self.keyword_editor.error = Some(
                 crate::locale::text(
                     "关键词规则最多保存 64 条。",
@@ -669,18 +818,36 @@ impl PreferencesPanel {
                     .first()
                     .map(|rule| rule.id.clone())
             });
-        self.keyword_editor.session = Some(KeywordEditSession {
-            base: None,
-            draft: TerminalKeywordHighlightRule::new("", ""),
-            is_new: true,
-            return_rule_id,
-        });
+        self.keyword_editor.park_current_session();
+        let pending_new = self
+            .keyword_editor
+            .parked_sessions
+            .iter()
+            .find_map(|(id, session)| session.is_new.then(|| id.clone()));
+        self.keyword_editor.session = if let Some(id) = pending_new {
+            self.keyword_editor.parked_sessions.remove(&id)
+        } else {
+            let generation = self.keyword_editor.next_session_generation();
+            Some(KeywordEditSession {
+                base: None,
+                draft: TerminalKeywordHighlightRule::new("", ""),
+                is_new: true,
+                return_rule_id,
+                generation,
+                last_submitted: None,
+            })
+        };
         self.keyword_editor.error = None;
+        self.keyword_editor
+            .editor_scroll
+            .set_offset(Default::default());
         self.sync_keyword_editor_inputs(window, cx);
         cx.notify();
     }
 
-    /// 编辑已有规则时从当前持久化快照复制值，草稿文本不会即时污染规则列表。
+    /// 切换规则时按稳定 ID 暂存当前草稿，避免点击列表或新建时丢失编辑。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn select_keyword_rule(
         &mut self,
         id: &str,
@@ -688,6 +855,14 @@ impl PreferencesPanel {
         cx: &mut Context<Self>,
     ) {
         self.screen_color_sampling.cancel();
+        if self
+            .keyword_editor
+            .session
+            .as_ref()
+            .is_some_and(|session| session.draft.id == id)
+        {
+            return;
+        }
         let Some(rule) = self.settings.as_ref().and_then(|draft| {
             draft
                 .value()
@@ -700,8 +875,12 @@ impl PreferencesPanel {
         }) else {
             return;
         };
-        self.keyword_editor.session = Some(existing_session(rule));
+        self.keyword_editor.park_current_session();
+        self.keyword_editor.session = Some(self.keyword_editor.session_for_rule(rule));
         self.keyword_editor.error = None;
+        self.keyword_editor
+            .editor_scroll
+            .set_offset(Default::default());
         self.sync_keyword_editor_inputs(window, cx);
         cx.notify();
     }
@@ -821,7 +1000,9 @@ impl PreferencesPanel {
         }
     }
 
-    /// 保存先执行与 application 相同的长度、正则和自定义颜色校验，失败保留草稿。
+    /// 保存先执行同一规则校验，并冻结会话代次和原草稿以隔离后续规则切换。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn save_keyword_rule(
         &mut self,
         window: &mut Window,
@@ -838,11 +1019,25 @@ impl PreferencesPanel {
         };
         let mut candidate = session.draft.clone();
         let is_new = session.is_new;
+        let draft = session.draft.clone();
+        let generation = session.generation;
+        let base = session.base.clone();
+        let last_submitted = session.last_submitted.clone();
         let Some(settings) = self.settings.as_ref().map(|draft| draft.value().clone()) else {
             return;
         };
         let rules = &settings.terminal.keyword_highlights.rules;
-        let error = validate_keyword_rule(&candidate, rules, is_new);
+        let existing = rules.iter().find(|rule| rule.id == candidate.id);
+        let retrying = existing.is_some() && existing == last_submitted.as_ref();
+        if is_new && existing.is_some() && !retrying {
+            self.keyword_editor.error = Some(
+                crate::locale::text("规则 ID 冲突。", "The rule ID conflicts with another rule.")
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let error = validate_keyword_rule(&candidate, rules, is_new && !retrying);
         if let Some(error) = error {
             self.keyword_editor.error = Some(error);
             cx.notify();
@@ -852,10 +1047,28 @@ impl PreferencesPanel {
         candidate.pattern = candidate.pattern.trim().to_owned();
         candidate.note = candidate.note.trim().to_owned();
         normalize_rule_colors(&mut candidate);
+        if !is_new && !retrying && base.as_ref() == Some(&candidate) && existing == Some(&candidate)
+        {
+            if let Some(session) = self.keyword_editor.session.as_mut() {
+                session.draft = candidate;
+            }
+            self.keyword_editor.error = None;
+            self.sync_keyword_editor_inputs(window, cx);
+            cx.notify();
+            return;
+        }
         let mut next = settings.terminal.keyword_highlights.clone();
-        if is_new {
+        if is_new && !retrying {
             next.rules.push(candidate.clone());
         } else if let Some(rule) = next.rules.iter_mut().find(|rule| rule.id == candidate.id) {
+            if base.as_ref() != Some(&*rule) && !retrying {
+                self.keyword_editor.error = Some(crate::locale::text(
+                    "规则已在外部更改，草稿仍保留；请核对后取消或重新编辑。",
+                    "This rule changed externally. The draft is retained; review it before cancelling or editing again.",
+                ).to_string());
+                cx.notify();
+                return;
+            }
             *rule = candidate.clone();
         } else {
             self.keyword_editor.error = Some(
@@ -868,7 +1081,14 @@ impl PreferencesPanel {
             cx.notify();
             return;
         }
-        self.keyword_editor.save_pending = Some(candidate);
+        if let Some(session) = self.keyword_editor.session.as_mut() {
+            session.last_submitted = Some(candidate.clone());
+        }
+        self.keyword_editor.save_pending = Some(KeywordPendingSave {
+            rule: candidate,
+            draft,
+            generation,
+        });
         self.edit_settings(|settings| settings.terminal.keyword_highlights = next, cx);
         self.keyword_editor.error = None;
         if !self.save_settings(cx) {
@@ -878,7 +1098,7 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 只有真实 CAS 或确认读回与当前待保存规则相等时才推进草稿基线。
+    /// 回执仅更新同一规则和会话代次，切换后的编辑器及较新的草稿保持原状。
     ///
     /// @author kongweiguang
     pub(in crate::features::preferences) fn confirm_keyword_rule_saved(
@@ -895,17 +1115,30 @@ impl PreferencesPanel {
             .keyword_highlights
             .rules
             .iter()
-            .find(|rule| rule.id == pending.id)
+            .find(|rule| rule.id == pending.rule.id)
         else {
             return;
         };
-        if rule != pending {
+        if rule != &pending.rule {
             return;
         }
-        self.keyword_editor.session = Some(existing_session(rule.clone()));
-        self.keyword_editor.save_pending = None;
-        self.keyword_editor.error = None;
-        self.sync_keyword_editor_inputs(window, cx);
+        let Some(pending) = self.keyword_editor.save_pending.take() else {
+            return;
+        };
+        let active_matches = self.keyword_editor.session.as_ref().is_some_and(|session| {
+            session.generation == pending.generation && session.draft.id == rule.id
+        });
+        if active_matches {
+            if let Some(session) = self.keyword_editor.session.as_mut() {
+                apply_keyword_save_receipt(session, &pending, rule);
+            }
+            self.keyword_editor.error = None;
+            self.sync_keyword_editor_inputs(window, cx);
+        } else if let Some(session) = self.keyword_editor.parked_sessions.get_mut(&rule.id)
+            && session.generation == pending.generation
+        {
+            apply_keyword_save_receipt(session, &pending, rule);
+        }
         cx.notify();
     }
 
@@ -916,25 +1149,97 @@ impl PreferencesPanel {
         &mut self,
         cx: &mut Context<Self>,
     ) {
-        if self.keyword_editor.save_pending.take().is_some() {
-            self.keyword_editor.error = Some(
-                crate::locale::text(
-                    "规则未保存，编辑内容仍保留；修正后可以重试。",
-                    "The rule was not saved. The draft is retained and can be retried.",
-                )
-                .to_string(),
-            );
+        if let Some(pending) = self.keyword_editor.save_pending.take() {
+            self.restore_failed_keyword_projection(&pending.rule, cx);
+            if self.keyword_editor.session.as_ref().is_some_and(|session| {
+                session.generation == pending.generation && session.draft.id == pending.rule.id
+            }) {
+                self.keyword_editor.error = Some(
+                    crate::locale::text(
+                        "规则未保存，编辑内容仍保留；修正后可以重试。",
+                        "The rule was not saved. The draft is retained and can be retried.",
+                    )
+                    .to_string(),
+                );
+            }
             cx.notify();
         }
     }
 
-    /// 取消恢复最新已保存规则；新建取消则回到进入新建前仍存在的规则。
+    /// 仅回撤仍等于失败提交的规则；保存中直接修正当前投影，不重放写入或覆盖其他编辑。
+    ///
+    /// @author kongweiguang
+    fn restore_failed_keyword_projection(
+        &mut self,
+        submitted: &TerminalKeywordHighlightRule,
+        cx: &mut Context<Self>,
+    ) {
+        let rollback = self.settings.as_ref().and_then(|settings| {
+            let current = settings
+                .value()
+                .terminal
+                .keyword_highlights
+                .rules
+                .iter()
+                .find(|rule| rule.id == submitted.id);
+            (current == Some(submitted)).then(|| {
+                let confirmed = settings
+                    .baseline_value()
+                    .terminal
+                    .keyword_highlights
+                    .rules
+                    .iter()
+                    .find(|rule| rule.id == submitted.id)
+                    .cloned();
+                (settings.value().clone(), confirmed, settings.status())
+            })
+        });
+        let Some((mut value, confirmed, status)) = rollback else {
+            return;
+        };
+        let rules = &mut value.terminal.keyword_highlights.rules;
+        if let Some(index) = rules.iter().position(|rule| rule.id == submitted.id) {
+            if let Some(confirmed) = confirmed {
+                rules[index] = confirmed;
+            } else {
+                rules.remove(index);
+            }
+        }
+        if status == super::super::DraftStatus::Saving {
+            if self
+                .settings
+                .as_mut()
+                .is_some_and(|draft| draft.replace_value_during_save(value.clone()).is_ok())
+            {
+                self.refresh_settings_issues();
+                cx.emit(PreferencesEvent::SettingsPreview(value));
+                cx.notify();
+            }
+        } else if !self.settings_controls_locked() {
+            self.edit_settings(|settings| *settings = value, cx);
+        }
+    }
+
+    /// 取消只丢弃当前会话，返回先前规则时恢复它独立保存的草稿。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn cancel_keyword_rule(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.keyword_editor.save_pending.is_some() {
+            return;
+        }
         self.screen_color_sampling.cancel();
+        let failed_submission = self
+            .keyword_editor
+            .session
+            .as_ref()
+            .and_then(|session| session.last_submitted.as_ref().cloned());
+        if let Some(submitted) = failed_submission {
+            self.restore_failed_keyword_projection(&submitted, cx);
+        }
         let return_rule_id = self
             .keyword_editor
             .session
@@ -956,19 +1261,33 @@ impl PreferencesPanel {
                 .or_else(|| rules.first())
                 .cloned()
         });
-        self.keyword_editor.session = rule.map(existing_session);
+        self.keyword_editor.session = None;
+        self.keyword_editor.session = rule.map(|rule| {
+            if current_id.is_some() {
+                self.keyword_editor.parked_sessions.remove(&rule.id);
+            }
+            self.keyword_editor.session_for_rule(rule)
+        });
         self.keyword_editor.error = None;
+        self.keyword_editor
+            .editor_scroll
+            .set_offset(Default::default());
         self.sync_keyword_editor_inputs(window, cx);
         cx.notify();
     }
 
-    /// 切换规则启用状态立即更新列表，并同步当前规则的草稿基线。
+    /// 切换规则启用状态同步已暂存草稿，避免恢复旧草稿时回滚列表操作。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn toggle_keyword_rule(
         &mut self,
         id: &str,
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.settings_controls_locked() || self.keyword_editor.save_pending.is_some() {
+            return;
+        }
         self.edit_settings(
             |settings| {
                 if let Some(rule) = settings
@@ -994,15 +1313,26 @@ impl PreferencesPanel {
                 base.enabled = enabled;
             }
         }
+        if let Some(session) = self.keyword_editor.parked_sessions.get_mut(id) {
+            session.draft.enabled = enabled;
+            if let Some(base) = session.base.as_mut() {
+                base.enabled = enabled;
+            }
+        }
     }
 
-    /// 上下移动与拖放排序共用此按 ID 重排入口，列表顺序保持匹配优先级。
+    /// 保存期间禁止重排，避免列表操作和待确认的规则快照相互覆盖。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn move_keyword_rule(
         &mut self,
         id: &str,
         offset: isize,
         cx: &mut Context<Self>,
     ) {
+        if self.settings_controls_locked() || self.keyword_editor.save_pending.is_some() {
+            return;
+        }
         self.edit_settings(
             |settings| {
                 let rules = &mut settings.terminal.keyword_highlights.rules;
@@ -1021,14 +1351,19 @@ impl PreferencesPanel {
         );
     }
 
-    /// 拖放按源与目标 ID 定位规则，不依赖当前筛选结果的行号。
+    /// 拖放按稳定 ID 定位并服从保存门禁，不依赖筛选结果的临时位置。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn move_keyword_rule_before(
         &mut self,
         source_id: &str,
         target_id: &str,
         cx: &mut Context<Self>,
     ) {
-        if source_id == target_id {
+        if source_id == target_id
+            || self.settings_controls_locked()
+            || self.keyword_editor.save_pending.is_some()
+        {
             return;
         }
         self.edit_settings(
@@ -1052,13 +1387,15 @@ impl PreferencesPanel {
         );
     }
 
-    /// 删除仅针对已保存规则，保存原始索引和快照以支持 15 秒内精确撤销。
+    /// 删除保留原顺序和当前草稿，撤销时两者一起恢复。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn delete_selected_keyword_rule(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings_controls_locked() {
+        if self.settings_controls_locked() || self.keyword_editor.save_pending.is_some() {
             return;
         }
         let Some(session) = self
@@ -1070,6 +1407,7 @@ impl PreferencesPanel {
             return;
         };
         let id = session.draft.id.clone();
+        let deleted_session = session.clone();
         let Some(settings) = self.settings.as_ref().map(|draft| draft.value().clone()) else {
             return;
         };
@@ -1090,8 +1428,11 @@ impl PreferencesPanel {
             cx,
         );
         let next = rules.get(index.min(rules.len().saturating_sub(1))).cloned();
-        self.keyword_editor.session = next.map(existing_session);
+        self.keyword_editor.session = next.map(|rule| self.keyword_editor.session_for_rule(rule));
         self.keyword_editor.error = None;
+        self.keyword_editor
+            .editor_scroll
+            .set_offset(Default::default());
         self.sync_keyword_editor_inputs(window, cx);
         self.keyword_editor.undo_generation = self.keyword_editor.undo_generation.wrapping_add(1);
         let generation = self.keyword_editor.undo_generation;
@@ -1099,6 +1440,7 @@ impl PreferencesPanel {
             expires_at: Instant::now() + KEYWORD_DELETE_UNDO_WINDOW,
             index,
             rule: deleted,
+            session: deleted_session,
             generation,
         });
         let timer_generation = generation;
@@ -1117,7 +1459,9 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 撤销仅在原规则 ID 尚未出现时恢复，避免覆盖并发刷新后的不同规则。
+    /// 撤销仅在原规则 ID 尚未出现时恢复，先暂存当前草稿以免覆盖后续编辑。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn undo_keyword_rule_delete(
         &mut self,
         window: &mut Window,
@@ -1152,16 +1496,32 @@ impl PreferencesPanel {
             cx.notify();
             return;
         }
+        if settings.terminal.keyword_highlights.rules.len() >= KEYWORD_RULE_LIMIT {
+            self.keyword_editor.undo_receipt = Some(receipt);
+            self.status = Some(
+                crate::locale::text(
+                    "规则已达 64 条，无法撤销删除。",
+                    "The 64-rule limit prevents restoring this rule.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         let mut rules = settings.terminal.keyword_highlights.rules;
         rules.insert(receipt.index.min(rules.len()), receipt.rule.clone());
         self.edit_settings(
             |settings| settings.terminal.keyword_highlights.rules = rules,
             cx,
         );
-        self.keyword_editor.session = Some(existing_session(receipt.rule));
+        self.keyword_editor.park_current_session();
+        self.keyword_editor.session = Some(receipt.session);
         self.keyword_editor.undo_generation = self.keyword_editor.undo_generation.wrapping_add(1);
         self.keyword_editor.undo_task = None;
         self.keyword_editor.error = None;
+        self.keyword_editor
+            .editor_scroll
+            .set_offset(Default::default());
         self.sync_keyword_editor_inputs(window, cx);
         cx.notify();
     }
@@ -1170,13 +1530,31 @@ impl PreferencesPanel {
 /// 在重载时恢复已有规则的清洁编辑基线，规则身份始终由 application 构造器生成。
 ///
 /// @author kongweiguang
-fn existing_session(rule: TerminalKeywordHighlightRule) -> KeywordEditSession {
+fn existing_session(rule: TerminalKeywordHighlightRule, generation: u64) -> KeywordEditSession {
     KeywordEditSession {
         base: Some(rule.clone()),
         draft: rule,
         is_new: false,
         return_rule_id: None,
+        generation,
+        last_submitted: None,
     }
+}
+
+/// 只推进已提交的基线；若会话已产生更新输入，回执不能覆盖这些输入。
+///
+/// @author kongweiguang
+fn apply_keyword_save_receipt(
+    session: &mut KeywordEditSession,
+    pending: &KeywordPendingSave,
+    rule: &TerminalKeywordHighlightRule,
+) {
+    if session.draft == pending.draft {
+        session.draft = rule.clone();
+    }
+    session.base = Some(rule.clone());
+    session.is_new = false;
+    session.last_submitted = None;
 }
 
 /// 以 Unicode 字符而非 UTF-8 字节截断，和 main 的字符计数约束保持一致。
@@ -1264,7 +1642,9 @@ fn validate_keyword_rule(
     }
     if stored
         .iter()
-        .any(|candidate| candidate.id == rule.id && candidate.id != rule.id)
+        .filter(|candidate| candidate.id == rule.id)
+        .count()
+        > 1
     {
         return Some(
             crate::locale::text("规则 ID 冲突。", "The rule ID conflicts with another rule.")

@@ -503,7 +503,7 @@ fn sync_directory(path: &Path) -> Result<(), VaultError> {
 }
 
 /// 在支持的平台上为新 staging 文件设置 owner-only 权限。
-fn set_private_creation_mode(options: &mut OpenOptions) {
+pub(super) fn set_private_creation_mode(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -513,8 +513,8 @@ fn set_private_creation_mode(options: &mut OpenOptions) {
     let _ = options;
 }
 
-/// Unix secrets 路径限制为 owner-only；Windows 继承用户 profile 的 ACL。
-fn set_private_directory_permissions(path: &Path) -> Result<(), VaultError> {
+/// Unix secrets 目录限制为 owner-only；Windows 显式设置当前用户的可继承 ACL。
+pub(super) fn set_private_directory_permissions(path: &Path) -> Result<(), VaultError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -527,8 +527,8 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
-/// Unix vault/key 文件只允许 owner 读写，Windows 保留 profile ACL 继承语义。
-fn set_private_file_permissions(path: &Path) -> Result<(), VaultError> {
+/// Unix vault/key 文件只允许 owner 读写；Windows 显式限制当前用户的访问权限。
+pub(super) fn set_private_file_permissions(path: &Path) -> Result<(), VaultError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -562,7 +562,7 @@ fn secure_existing_tree(directory: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
-/// 在 Windows 上把 DACL 限定为当前用户 SID，并关闭父目录权限继承。
+/// 在 Windows 上把 DACL 限定为当前用户 SID；规范化路径以支持相对路径及长路径。
 #[cfg(windows)]
 fn set_windows_private_acl(path: &Path, is_directory: bool) -> Result<(), VaultError> {
     use std::{mem::size_of, os::windows::ffi::OsStrExt, ptr};
@@ -646,7 +646,10 @@ fn set_windows_private_acl(path: &Path, is_directory: bool) -> Result<(), VaultE
         )));
     }
     let _acl = AclHandle(acl);
-    let path = path
+    // SetNamedSecurityInfoW 不会像 Rust 文件 API 一样自动处理超长相对路径。
+    // Windows canonicalize 返回带扩展前缀的已存在路径，避免回退到不安全的宽松 ACL。
+    let canonical_path = fs::canonicalize(path)?;
+    let path = canonical_path
         .as_os_str()
         .encode_wide()
         .chain(Some(0))

@@ -1031,7 +1031,7 @@ fn local_shell_picker(
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
     let candidates = panel.local_hosts.shell_candidates.clone();
-    let profiles = panel.local_hosts.rows.clone();
+    let profiles = panel.local_hosts.templates.clone();
     let selected_profile = panel.selected_local_profile_id(cx);
     let selected_program = panel
         .local_hosts

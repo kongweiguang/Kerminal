@@ -2,6 +2,13 @@
 //!
 //! @author kongweiguang
 
+use super::{
+    BackgroundFit, InterfaceDensity, ThemeMode,
+    panel::{PreferencesPanel, keyboard_platform},
+    render::settings_error_banner,
+    render_app_palette::app_color_scheme_choices,
+    validate_settings,
+};
 use crate::theme::ThemeTokens;
 use gpui_kit::{
     ClickEvent, Context, Entity, IntoElement, SharedString, StatefulInteractiveElement, Window,
@@ -18,15 +25,6 @@ use gpui_kit::{
     div,
     prelude::*,
     px,
-};
-use kerminal_application::preferences::SettingsSnapshot;
-
-use super::{
-    BackgroundFit, InterfaceDensity, ThemeMode,
-    panel::{PreferencesPanel, ShortcutBindingField, ShortcutInputs, keyboard_platform},
-    render::settings_error_banner,
-    render_app_palette::app_color_scheme_choices,
-    validate_settings,
 };
 
 const THEME_CHOICE_HEIGHT_PX: f32 = 80.0;
@@ -155,9 +153,13 @@ const BACKGROUND_FIT_CHOICES: [BackgroundFitChoiceSpec; 3] = [
 ];
 
 impl PreferencesPanel {
-    /// 加载、只读恢复、冲突与未知写入结果锁定表单；保存中仍允许编辑以保留连续输入体验。
+    /// MCP 应用占用同一 CAS 基线时锁定其它表单；普通保存中继续保留连续输入体验。
+    /// 加载、只读恢复、冲突与未知写入结果也必须阻止新提交。
+    ///
+    /// @author kongweiguang
     pub(super) fn settings_controls_locked(&self) -> bool {
         self.loading_settings
+            || self.mcp_settings.busy
             || self.recovery.mode
                 == kerminal_domain::preferences::ConfigurationMode::ReadOnlyRecovery
             || self.settings.as_ref().is_some_and(|draft| {
@@ -557,118 +559,6 @@ impl PreferencesPanel {
             .text_color(theme.muted)
             .child(message)
     }
-
-    /// 异步载入设置后为各平台字段建独立输入，旧 Linux 回退值不写回直到用户明确编辑。
-    ///
-    /// @author kongweiguang
-    pub(super) fn rebuild_shortcut_inputs(
-        &mut self,
-        settings: &SettingsSnapshot,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.shortcut_subscriptions.clear();
-        self.shortcut_inputs.clear();
-        for binding in &settings.keybindings {
-            let windows_value = effective_binding(&binding.windows_binding, &binding.binding);
-            let alternate_value = binding
-                .windows_alternate_binding
-                .clone()
-                .unwrap_or_default();
-            // 旧 Linux 的 None 保持为空编辑框，实际继承值由每次渲染计算后显示。
-            let linux_value = binding.linux_binding.clone().unwrap_or_default();
-            let mac_value = effective_binding(&binding.mac_binding, &binding.binding);
-            let windows = cx.new(|cx| {
-                gpui_kit::component::input::InputState::new(window, cx)
-                    .placeholder(crate::locale::text("主键组合", "Primary shortcut"))
-                    .default_value(windows_value)
-            });
-            let windows_alternate = cx.new(|cx| {
-                gpui_kit::component::input::InputState::new(window, cx)
-                    .placeholder(crate::locale::text(
-                        "备用组合（可选）",
-                        "Alternate shortcut (optional)",
-                    ))
-                    .default_value(alternate_value)
-            });
-            let linux = cx.new(|cx| {
-                gpui_kit::component::input::InputState::new(window, cx)
-                    .placeholder(crate::locale::text("按键组合", "Key combination"))
-                    .default_value(linux_value)
-            });
-            let mac = cx.new(|cx| {
-                gpui_kit::component::input::InputState::new(window, cx)
-                    .placeholder(crate::locale::text("按键组合", "Key combination"))
-                    .default_value(mac_value)
-            });
-            let windows_action = binding.action.clone();
-            let windows_subscription = cx.subscribe(
-                &windows,
-                move |panel, input, event: &gpui_kit::component::input::InputEvent, cx| {
-                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
-                        let value = input.read(cx).value().to_string();
-                        panel.update_shortcut(
-                            &windows_action,
-                            ShortcutBindingField::Windows,
-                            value,
-                            cx,
-                        );
-                    }
-                },
-            );
-            let alternate_action = binding.action.clone();
-            let alternate_subscription = cx.subscribe(
-                &windows_alternate,
-                move |panel, input, event: &gpui_kit::component::input::InputEvent, cx| {
-                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
-                        let value = input.read(cx).value().to_string();
-                        panel.update_shortcut(
-                            &alternate_action,
-                            ShortcutBindingField::WindowsAlternate,
-                            value,
-                            cx,
-                        );
-                    }
-                },
-            );
-            let linux_action = binding.action.clone();
-            let linux_subscription = cx.subscribe(
-                &linux,
-                move |panel, input, event: &gpui_kit::component::input::InputEvent, cx| {
-                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
-                        let value = input.read(cx).value().to_string();
-                        panel.update_shortcut(
-                            &linux_action,
-                            ShortcutBindingField::Linux,
-                            value,
-                            cx,
-                        );
-                    }
-                },
-            );
-            let mac_action = binding.action.clone();
-            let mac_subscription = cx.subscribe(
-                &mac,
-                move |panel, input, event: &gpui_kit::component::input::InputEvent, cx| {
-                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
-                        let value = input.read(cx).value().to_string();
-                        panel.update_shortcut(&mac_action, ShortcutBindingField::Mac, value, cx);
-                    }
-                },
-            );
-            self.shortcut_inputs.push(ShortcutInputs {
-                action: binding.action.clone(),
-                windows,
-                windows_alternate,
-                linux,
-                mac,
-            });
-            self.shortcut_subscriptions.push(windows_subscription);
-            self.shortcut_subscriptions.push(alternate_subscription);
-            self.shortcut_subscriptions.push(linux_subscription);
-            self.shortcut_subscriptions.push(mac_subscription);
-        }
-    }
 }
 
 /// 输入修改后立即更新格式/冲突问题，让错误在保存之前显示。
@@ -797,7 +687,7 @@ fn section_panel(theme: ThemeTokens) -> gpui_kit::Div {
 /// Hover and active colors remain untouched so pointer feedback keeps the component's native state transitions.
 ///
 /// @author kongweiguang
-fn settings_choice_variant_fill(fill: gpui_kit::Hsla) -> gpui_kit::Hsla {
+pub(super) fn settings_choice_variant_fill(fill: gpui_kit::Hsla) -> gpui_kit::Hsla {
     fill.alpha((fill.a / 0.2).min(1.0))
 }
 
@@ -1095,15 +985,6 @@ pub(in crate::features::preferences) fn settings_issue_row(
             theme.muted
         })
         .child(issue.message.clone())
-}
-
-/// 回退通用键位用于显示和初始编辑，但仅在用户保存时写入对应平台字段。
-fn effective_binding(platform: &str, generic: &str) -> String {
-    if platform.is_empty() {
-        generic.to_owned()
-    } else {
-        platform.to_owned()
-    }
 }
 
 #[cfg(test)]

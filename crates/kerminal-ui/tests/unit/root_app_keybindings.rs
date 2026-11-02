@@ -19,7 +19,6 @@ fn preference(action: &str, binding: &str, scope: KeybindingScope) -> Keybinding
         windows_binding: binding.to_owned(),
         mac_binding: binding.to_owned(),
         linux_binding: None,
-        windows_alternate_binding: None,
         scope,
         editable: true,
     }

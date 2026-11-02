@@ -7,6 +7,9 @@ use kerminal_application::configuration_changes::ConfigurationChangeMessage;
 use kerminal_application::preferences::{SettingsSnapshot, VersionedProfile, VersionedSettings};
 use kerminal_domain::preferences::{ConfigRevision, ConfigurationMode};
 
+use crate::features::preferences::legacy_terminal_theme::{
+    commit_legacy_terminal_theme, preview_legacy_terminal_theme,
+};
 use crate::features::preferences::{ConfigDraft, DraftSnapshot, DraftStatus};
 
 use super::PreferencesPanel;
@@ -89,14 +92,9 @@ impl PreferencesPanel {
                                 || paths_change_settings(&event.relative_paths);
                             let profiles_changed = event.full_rescan_required
                                 || paths_change_profiles(&event.relative_paths);
-                            let groups_changed = event.full_rescan_required
-                                || paths_change_host_groups(&event.relative_paths);
                             let recovery = event.recovery_state;
                             this.update(cx, |panel, cx| {
                                 panel.recovery = recovery;
-                                if groups_changed {
-                                    panel.reload_profile_groups(cx);
-                                }
                                 let settings_generation =
                                     settings_changed.then(|| panel.begin_settings_revision_check());
                                 let profiles_generation = profiles_changed
@@ -111,7 +109,6 @@ impl PreferencesPanel {
                             let recovery = service.recovery_state();
                             this.update(cx, |panel, cx| {
                                 panel.recovery = recovery;
-                                panel.reload_profile_groups(cx);
                                 let settings_generation =
                                     Some(panel.begin_settings_revision_check());
                                 let profiles_generation = panel.prepare_external_profile_change();
@@ -195,8 +192,9 @@ impl PreferencesPanel {
         }
     }
 
-    /// 外部快照按 baseline/local/remote 三方合并；未知写入只在回读等于提交快照时确认，
-    /// 同 revision 的成功写入回声则续存保存期间已排队的后续编辑。
+    /// 外部快照按 baseline/local/remote 三方合并；MCP 独立提交也核对同 revision 回读，
+    /// 普通设置的未知写入只在回读等于提交快照时确认，
+    /// 同 revision 的成功写入回声则续存保存期间已排队的后续编辑，丢弃的快照不能修改主题缓存。
     ///
     /// @author kongweiguang
     fn finish_settings_revision_check(
@@ -225,7 +223,9 @@ impl PreferencesPanel {
 
         let mut resave_settings_after_readback = false;
         match result {
-            Ok(versioned) => {
+            Ok(mut versioned) => {
+                self.mcp_settings
+                    .reconcile_readback(&versioned.settings.mcp, window, cx);
                 if self
                     .settings
                     .as_ref()
@@ -245,6 +245,7 @@ impl PreferencesPanel {
                 );
                 match action {
                     SettingsRevisionAction::Install => {
+                        Self::resolve_legacy_terminal_theme(&mut versioned.settings, window, cx);
                         let previous_theme_mode = self.theme_mode;
                         let loaded_theme_mode = versioned.settings.theme_mode;
                         let loaded_settings = versioned.settings.clone();
@@ -269,12 +270,18 @@ impl PreferencesPanel {
                         if let Some(draft) = self.settings.as_mut()
                             && draft.status() == DraftStatus::ExternalConflict
                         {
+                            let resolution = preview_legacy_terminal_theme(
+                                &mut versioned.settings,
+                                window.appearance(),
+                                cx,
+                            );
                             let local = draft.value().clone();
                             let snapshot = DraftSnapshot {
                                 value: versioned.settings.clone(),
                                 revision: versioned.revision.clone(),
                             };
                             if draft.rebase(snapshot, local).is_ok() {
+                                commit_legacy_terminal_theme(resolution, cx);
                                 self.settings_autosave.invalidate_pending();
                                 resave_settings_after_readback = draft.is_dirty();
                             }
@@ -287,6 +294,11 @@ impl PreferencesPanel {
                         self.settings_error = None;
                     }
                     SettingsRevisionAction::ExternalConflict => {
+                        let resolution = preview_legacy_terminal_theme(
+                            &mut versioned.settings,
+                            window.appearance(),
+                            cx,
+                        );
                         let merged = self.settings.as_ref().and_then(|draft| {
                             merge_settings_snapshot(
                                 draft.baseline_value(),
@@ -301,9 +313,9 @@ impl PreferencesPanel {
                                 revision: versioned.revision,
                             };
                             if draft.rebase(snapshot, merged.clone()).is_ok() {
+                                commit_legacy_terminal_theme(resolution, cx);
                                 resave_settings_after_readback = draft.is_dirty();
                                 self.sync_settings_inputs_preserving_errors(&merged, window, cx);
-                                self.rebuild_shortcut_inputs(&merged, window, cx);
                                 self.reconcile_keyword_editor(
                                     &merged.terminal.keyword_highlights.rules,
                                     window,
@@ -348,12 +360,12 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 未知结果读回必须匹配提交快照；确认基线后再 CAS 保存期间产生的较新编辑。
+    /// 未知结果读回必须匹配提交快照；确认基线后才提交主题缓存和保存期间产生的较新编辑。
     ///
     /// @author kongweiguang
     fn finish_unknown_settings_readback(
         &mut self,
-        versioned: VersionedSettings,
+        mut versioned: VersionedSettings,
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
@@ -370,6 +382,8 @@ impl PreferencesPanel {
             ).to_string());
             return;
         };
+        let resolution =
+            preview_legacy_terminal_theme(&mut versioned.settings, window.appearance(), cx);
         if !unknown_settings_readback_matches(&submitted, &versioned.settings) {
             self.settings_error = Some(crate::locale::text(
                 "写入结果仍未确认；回读配置与提交内容不一致，当前草稿已保留。",
@@ -394,12 +408,12 @@ impl PreferencesPanel {
             ).to_string());
             return;
         }
+        commit_legacy_terminal_theme(resolution, cx);
         self.confirm_keyword_rule_saved(&versioned.settings, window, cx);
 
         let current = self.settings.as_ref().map(|draft| draft.value().clone());
         if let Some(settings) = current.as_ref() {
             self.sync_settings_inputs_preserving_errors(settings, window, cx);
-            self.rebuild_shortcut_inputs(settings, window, cx);
             self.reconcile_keyword_editor(&settings.terminal.keyword_highlights.rules, window, cx);
             self.set_theme_mode(settings.theme_mode, cx);
         }
@@ -697,14 +711,6 @@ fn paths_change_profiles(paths: &[String]) -> bool {
         let path = normalize_relative_path(path);
         path.starts_with("profiles/") || path.starts_with("profile-transactions/")
     })
-}
-
-/// Profile 分组引用受 hosts/groups.toml 管理，变更时刷新选项但不改写 Profile 草稿。
-/// @author kongweiguang
-fn paths_change_host_groups(paths: &[String]) -> bool {
-    paths
-        .iter()
-        .any(|path| normalize_relative_path(path) == "hosts/groups.toml")
 }
 
 /// 把 watcher 的平台分隔符归一化为配置契约中的斜杠路径。

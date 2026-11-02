@@ -405,6 +405,7 @@ def build_and_validate(arguments: argparse.Namespace) -> None:
         legacy_public_key=legacy_key,
         verifier=arguments.minisign,
         verify_crypto=True,
+        github_release_assets=getattr(arguments, "github_release_assets", False),
     )
 
     names = build_manifests.build_output_names(arguments.signing_class)
@@ -440,6 +441,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-url")
     parser.add_argument("--signing-class", choices=("test", "production"))
     parser.add_argument("--minisign")
+    parser.add_argument("--github-release-assets", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -463,7 +465,9 @@ def main(argv: list[str] | None = None) -> int:
                 "signing_class",
                 "minisign",
             )
-            if any(getattr(arguments, name) is not None for name in signing_only):
+            if arguments.github_release_assets or any(
+                getattr(arguments, name) is not None for name in signing_only
+            ):
                 raise CandidateInventoryError(
                     "unsigned 结构检查不能接收签名或 feed 参数；请使用双信任签验模式"
                 )

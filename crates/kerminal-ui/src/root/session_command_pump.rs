@@ -12,7 +12,7 @@ use gpui_kit::Context;
 use kerminal_application::{
     AppResult,
     sessions::{
-        ScrollRequest, TerminalCommandAvailability, TerminalCommandContext,
+        ScrollRequest, ShellEditingSnapshot, TerminalCommandAvailability, TerminalCommandContext,
         TerminalCommandUnavailableReason, UiInputProjection, UiSessionBinding,
         UiTerminalCommandSubmissionRequest, UiTerminalInputRequest,
         command_blocks::is_plain_command_enter,
@@ -24,6 +24,16 @@ use kerminal_domain::{
     sessions::{SessionOwner, SessionTarget, TerminalSize},
 };
 use kerminal_terminal::{input::TerminalInputEvent, snapshot::RenderSnapshotRequest};
+
+/// 同一次 writer 回执的状态与证据一起传递，避免将不同代次的提交证明或 Shell 回读混用。
+struct UiInputAcknowledgement {
+    request: UiTerminalInputRequest,
+    context: TerminalCommandContext,
+    acceptance: Option<session_queue::SuggestionAcceptanceWrite>,
+    command_line_ticket: Option<command_line_projection::CommandLineInputTicket>,
+    command_submitted: bool,
+    shell_editing_receipt: Option<ShellEditingSnapshot>,
+}
 
 /// 准入拒绝或失败回执只抑制同一 session 的同一尺寸；改变布局后允许新尝试，不建立重绘重试循环。
 /// 绑定失效时由 Root 清理条目，旧 session 的失败不会阻断重连或其它 pane。
@@ -388,13 +398,17 @@ impl RootView {
     /// 焦点报告只刷新真实上下文，不把无编辑语义的通知交给正文/建议编辑器。
     fn complete_ui_input_ack(
         &mut self,
-        request: UiTerminalInputRequest,
-        context: TerminalCommandContext,
-        acceptance: Option<session_queue::SuggestionAcceptanceWrite>,
-        command_line_ticket: Option<command_line_projection::CommandLineInputTicket>,
-        command_submitted: bool,
+        acknowledgement: UiInputAcknowledgement,
         cx: &mut Context<Self>,
     ) {
+        let UiInputAcknowledgement {
+            request,
+            context,
+            acceptance,
+            command_line_ticket,
+            command_submitted,
+            shell_editing_receipt,
+        } = acknowledgement;
         if context.session_id != request.binding.session_id
             || context.owner != request.binding.owner
             || context.session_generation != request.binding.session_generation
@@ -461,6 +475,39 @@ impl RootView {
                 self.sync_suggestion_menu(cx);
                 return;
             }
+            if write.acceptance.shell_snapshot.is_some() {
+                let confirmed = shell_editing_receipt.as_ref().is_some_and(|snapshot| {
+                    self.terminal_command_suggestions.confirm_shell_acceptance(
+                        &write.acceptance,
+                        snapshot,
+                        &context,
+                    )
+                });
+                if confirmed {
+                    self.record_confirmed_suggestion_feedback(&write.acceptance, cx);
+                }
+                if confirmed
+                    && !self
+                        .session_commands
+                        .has_pending_edit_input(&request.binding.session_id)
+                {
+                    if let Some(snapshot) = shell_editing_receipt.as_ref() {
+                        self.command_line_projection
+                            .seed_shell_snapshot(snapshot, &context);
+                    }
+                    self.request_suggestion_snapshot(
+                        request.binding.clone(),
+                        SuggestionQueryMode::Inline,
+                        false,
+                        cx,
+                    );
+                } else if !confirmed {
+                    self.terminal_command_suggestions.clear();
+                }
+                self.suggestion_menu_binding = None;
+                self.sync_suggestion_menu(cx);
+                return;
+            }
             match self.terminal_command_suggestions.acceptance_input_written(
                 &write.acceptance,
                 write.event_index,
@@ -507,7 +554,7 @@ impl RootView {
                 }
                 command_suggestions::AcceptanceInputProgress::Complete { follow_up } => {
                     if let Some(job) = follow_up {
-                        self.run_terminal_suggestion_job(job, cx);
+                        self.run_terminal_suggestion_job(*job, cx);
                     }
                 }
                 command_suggestions::AcceptanceInputProgress::Invalidated => {}
@@ -516,31 +563,56 @@ impl RootView {
             return;
         }
 
-        if request.projection == UiInputProjection::Tracked
-            && self.is_active_suggestion_binding(&request.binding)
-        {
-            let mode = if self.terminal_command_suggestions.menu_is_open() {
-                SuggestionQueryMode::Menu
+        if self.is_active_suggestion_binding(&request.binding) {
+            if self
+                .session_commands
+                .has_pending_edit_input(&request.binding.session_id)
+            {
+                self.terminal_command_suggestions
+                    .suspend_for_pending_input();
+                self.sync_suggestion_menu(cx);
             } else {
-                SuggestionQueryMode::Inline
-            };
-            let job = self.terminal_command_suggestions.tracked_input_written(
-                &context,
-                &request.event,
-                mode,
-            );
-            if self.terminal_command_suggestions.menu_is_open() {
-                self.suggestion_menu_binding = Some(request.binding.clone());
+                let mode = self.terminal_command_suggestions.active_mode();
+                self.request_suggestion_snapshot(request.binding.clone(), mode, false, cx);
             }
-            self.sync_suggestion_menu(cx);
-            if let Some(job) = job {
-                self.run_terminal_suggestion_job(job, cx);
-            }
-        } else if self.is_active_suggestion_binding(&request.binding) {
-            self.terminal_command_suggestions.clear();
-            self.suggestion_menu_binding = None;
-            self.sync_suggestion_menu(cx);
         }
+    }
+
+    /// 已确认追加才后台记录排序反馈；目标失配或存储故障不改变终端输入和回执。
+    fn record_confirmed_suggestion_feedback(
+        &self,
+        acceptance: &command_suggestions::TerminalSuggestionAcceptance,
+        cx: &mut Context<Self>,
+    ) {
+        let SessionOwner::Ui { pane_id, .. } = &acceptance.binding.owner else {
+            return;
+        };
+        let Some(pane) = self.workspace_runtime.pane(pane_id) else {
+            return;
+        };
+        if pane.session_id.as_ref() != Some(&acceptance.binding.session_id) {
+            return;
+        }
+        let Some(request) = pane
+            .target
+            .as_ref()
+            .and_then(|target| command_suggestions::accepted_feedback_request(acceptance, target))
+        else {
+            return;
+        };
+        let Some(commands) = self.services.commands.clone() else {
+            return;
+        };
+        let executor = self.services.executor.clone();
+        cx.spawn(async move |_, _| {
+            let result = executor
+                .run(move |_| async move { commands.record_suggestion_feedback(request).await })
+                .await;
+            if let Err(error) = result {
+                tracing::warn!(code = ?error.public_code(), "terminal suggestion feedback unavailable");
+            }
+        })
+        .detach();
     }
 
     /// 一个固定 binding 的广播目标拒绝 CAS 后，停止其余待发项并同步清除工具视图的活动态。
@@ -787,6 +859,7 @@ impl RootView {
             };
             cx.spawn(async move |this, cx| {
                 let mut selection_scroll_min_revision = None;
+                let mut shell_editing_receipt = None;
                 let (work_result, history_receipt) = match ready.work {
                     session_queue::SessionWork::Input { event, .. } => {
                         let scroll_binding = session_input_binding.clone();
@@ -808,8 +881,36 @@ impl RootView {
                     session_queue::SessionWork::UiInput(work) => {
                         #[cfg(feature = "acceptance-metrics")]
                         let executor_probe_id = echo_probe_id.clone();
-                        let session_queue::UiInputWork { request, .. } = *work;
-                        if let Some((input, command, before)) = ui_input_submission {
+                        let session_queue::UiInputWork { request, acceptance, .. } = *work;
+                        let shell_acceptance = acceptance.and_then(|write| {
+                            write.acceptance.shell_snapshot.clone().map(|before| (write.acceptance, before))
+                        });
+                        if let Some((acceptance, before)) = shell_acceptance {
+                            let suffix = match &request.event {
+                                TerminalInputEvent::Paste(text)
+                                    if acceptance.events.len() == 1
+                                        && request.binding == before.binding
+                                        && request.expected_context == Some(before.context)
+                                        && acceptance.input_before == before.input
+                                        && acceptance.input_after.strip_prefix(&before.input) == Some(text.as_str())
+                                        && !text.is_empty() => Some(text.clone()),
+                                _ => None,
+                            };
+                            match suffix {
+                                Some(suffix) => match executor.run(move |cancellation| async move {
+                                    let after = sessions.append_shell_editing_suffix(before, suffix, cancellation).await?;
+                                    let context = sessions.terminal_command_context(after.binding.session_id.clone()).await?;
+                                    Ok((after, context))
+                                }).await {
+                                    Ok((after, context)) => {
+                                        shell_editing_receipt = Some(after);
+                                        (Ok(Some(context)), None)
+                                    }
+                                    Err(error) => (Err(error), None),
+                                },
+                                None => (Err(kerminal_application::AppError::invalid("终端建议追加上下文无效")), None),
+                            }
+                        } else if let Some((input, command, before)) = ui_input_submission {
                             let commands_for_write = commands.clone();
                             let should_return_to_bottom =
                                 input_returns_viewport_to_bottom(&input.event);
@@ -1132,11 +1233,14 @@ impl RootView {
                                 (context, ui_input_completion)
                             {
                                 root.complete_ui_input_ack(
-                                    request,
-                                    context,
-                                    acceptance,
-                                    ticket,
-                                    command_submitted,
+                                    UiInputAcknowledgement {
+                                        request,
+                                        context,
+                                        acceptance,
+                                        command_line_ticket: ticket,
+                                        command_submitted,
+                                        shell_editing_receipt,
+                                    },
                                     cx,
                                 );
                             }
@@ -1202,6 +1306,7 @@ impl RootView {
                     };
                     // 先处理 ACK/失败并在需要时将接受计划的下一事件放到同一 lane 队首，再释放当前 in-flight。
                     root.session_commands.complete(&completion_session_id);
+                    root.start_pending_suggestion_snapshot(cx);
                     if !succeeded {
                         cx.notify();
                     }

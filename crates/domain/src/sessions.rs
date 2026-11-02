@@ -120,12 +120,26 @@ pub enum SessionOwner {
 /// 本地命令的完整启动参数，避免 Agent、WSL 与 mock CLI 被折叠成隐式 shell 选择。
 ///
 /// @author kongweiguang
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct LocalSessionTarget {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
     pub environment: BTreeMap<OsString, OsString>,
+}
+
+impl fmt::Debug for LocalSessionTarget {
+    /// 环境快照在启动时已解密，诊断只能显示数量，避免上层派生 Debug 意外泄露凭据。
+    ///
+    /// @author kongweiguang
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalSessionTarget")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("working_directory", &self.working_directory)
+            .field("environment_entries", &self.environment.len())
+            .finish()
+    }
 }
 
 /// SSH 连接目标只保存主机引用和可选命令，不把任何凭据放进会话请求。

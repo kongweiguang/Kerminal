@@ -717,7 +717,7 @@ impl RootView {
         )
     }
 
-    /// 显式重启只作用于事件捕获时的 session binding，并在服务 ACK 与新代次回读后解除 pane 锁。
+    /// 显式重启绑定原 session；开始时撤销代理旧代投影，即使 SessionId 在重启后保持不变。
     ///
     /// @author kongweiguang
     pub(super) fn restart_workspace_pane(
@@ -759,6 +759,7 @@ impl RootView {
             return;
         };
 
+        self.refresh_proxy_panel(cx);
         self.invalidate_pane_input_handler(&binding.session_id, cx);
         let sessions = Arc::clone(&self.services.sessions);
         let executor = self.services.executor.clone();
@@ -832,7 +833,7 @@ impl RootView {
         .detach();
     }
 
-    /// 对一个明确终端 session 发起单次原位重连；请求前重查 pane、owner 与缓存 generation。
+    /// 原位重连固定 pane 和 owner；开始时撤销代理旧代投影，即使 SessionId 不变也不能复用。
     ///
     /// @author kongweiguang
     pub(super) fn start_session_reconnect(
@@ -873,6 +874,7 @@ impl RootView {
             cx.notify();
             return;
         };
+        self.refresh_proxy_panel(cx);
         let sessions = Arc::clone(&self.services.sessions);
         let executor = self.services.executor.clone();
         let task_pane = pane_id.clone();

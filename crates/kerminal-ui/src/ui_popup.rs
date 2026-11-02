@@ -4,6 +4,7 @@
 
 use gpui_kit::{
     Hsla, Pixels, StyleRefinement,
+    base::StyledExt as _,
     component::{Side, menu::PopupMenu},
     div,
     prelude::*,
@@ -40,7 +41,7 @@ pub(crate) fn dropdown_menu(menu: PopupMenu, theme: ThemeTokens) -> PopupMenu {
         })
 }
 
-/// Agent 选择器保留 main 的宽度和滚动上限；152px 仅属于定位翻转阈值，不应制造空白菜单行。
+/// Agent 选择器保留 main 的宽度和滚动上限；条目左边距与触发器图标对齐，不重复计入内容自绘图标。
 ///
 /// @author kongweiguang
 pub(crate) fn agent_launcher_menu(menu: PopupMenu, theme: ThemeTokens) -> PopupMenu {
@@ -50,6 +51,13 @@ pub(crate) fn agent_launcher_menu(menu: PopupMenu, theme: ThemeTokens) -> PopupM
         .max_h(px(320.))
         .scrollable(true)
         .items_style(agent_items_style())
+        .item_style(
+            div()
+                .refine_style(&dropdown_item_style(theme))
+                .px(px(5.))
+                .style()
+                .clone(),
+        )
 }
 
 /// 右键菜单维持 main 的中性 hover；只有给定固定宽度的容器操作菜单才收窄到 176px。

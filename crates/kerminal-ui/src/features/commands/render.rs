@@ -4,7 +4,11 @@
 
 use gpui_kit::{
     ClickEvent, Context, IntoElement, Render, Window,
-    component::button::{Button, ButtonVariants},
+    assets::IconName,
+    component::{
+        Disableable,
+        button::{Button, ButtonVariants},
+    },
     div,
     prelude::*,
     px,
@@ -64,7 +68,7 @@ impl Render for CommandsView {
                 },
             )
             .text_color(theme.foreground)
-            .child(self.render_header(theme))
+            .child(self.render_header(theme, cx))
             .when_some(navigation, |view, navigation| view.child(navigation))
             .child(
                 div()
@@ -102,10 +106,11 @@ impl Render for CommandsView {
 }
 
 impl CommandsView {
-    /// 片段标题占用 main 抽屉内边距、标题和下方间距的总高度；其它紧凑页保留目标与加载提示。
+    /// 片段刷新固定在标题栏，用同尺寸旋转图标反馈请求，避免临时文字改变内容区几何。
+    /// 其它命令页维持原有目标和反馈，不扩大本次片段面板的改动范围。
     ///
     /// @author kongweiguang
-    fn render_header(&self, theme: ThemeTokens) -> impl IntoElement {
+    fn render_header(&self, theme: ThemeTokens, cx: &mut Context<Self>) -> impl IntoElement {
         let session = self
             .session_info
             .as_ref()
@@ -176,14 +181,33 @@ impl CommandsView {
                         .child(session),
                 )
             })
-            .when(self.loading, |bar| {
+            .when(self.section == CommandsSection::Snippets, |bar| {
                 bar.child(
-                    div()
-                        .text_size(theme.text_xs)
-                        .text_color(theme.muted)
-                        .child(crate::locale::text("同步中…", "Refreshing…")),
+                    Button::new("snippet-catalog-refresh")
+                        .compact()
+                        .ghost()
+                        .icon(IconName::RefreshCw)
+                        .loading_icon(IconName::RefreshCw)
+                        .loading(self.snippet_page_loading)
+                        .disabled(self.snippet_page_loading)
+                        .accessibility_label(crate::locale::text("刷新片段", "Refresh snippets"))
+                        .tooltip(crate::locale::text("刷新片段", "Refresh snippets"))
+                        .on_click(cx.listener(|view, _: &ClickEvent, window, cx| {
+                            view.retry_snippet_page(window, cx);
+                        })),
                 )
             })
+            .when(
+                self.loading && self.section != CommandsSection::Snippets,
+                |bar| {
+                    bar.child(
+                        div()
+                            .text_size(theme.text_xs)
+                            .text_color(theme.muted)
+                            .child(crate::locale::text("同步中…", "Refreshing…")),
+                    )
+                },
+            )
     }
 
     /// 导航使用 chrome 材质区分工作区标题层与内部卡片，并在紧凑槽位换行保留操作空间。

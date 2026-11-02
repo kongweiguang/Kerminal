@@ -12,8 +12,8 @@ use kerminal_domain::{
 
 use super::{
     CachedDirectoryEntry, CandidateContext, RemoteCommandSuggestionProvider, RemoteSuggestionQuery,
-    candidate, prefix_score, quote,
-    syntax::{accepts_bare_path, command_name},
+    candidate, prefix_score,
+    syntax::{ShellFamily, accepts_bare_path, command_name},
 };
 
 /// 仅对旧版支持的路径命令或显式路径片段查询当前目录的一层项。
@@ -32,8 +32,24 @@ pub(super) async fn suggestions(
         return Ok(Vec::new());
     }
 
-    let (typed_directory, basename_prefix) = split_path_prefix(&prefix.token.value);
-    let Some(directory) = resolve_directory(typed_directory, request.cwd.as_deref()) else {
+    let windows_path = prefix.shell == ShellFamily::PowerShell
+        && request.cwd.as_deref().is_some_and(has_windows_drive_root);
+    if prefix.shell == ShellFamily::PowerShell
+        && ((!windows_path && has_windows_drive_prefix(&prefix.token.value))
+            || (windows_path
+                && (prefix.token.value.starts_with(['/', '\\'])
+                    || has_windows_drive_relative_prefix(&prefix.token.value))))
+    {
+        return Ok(Vec::new());
+    }
+    let (typed_directory, basename_prefix) = split_path_prefix(&prefix.token.value, windows_path);
+    let sftp_directory = if windows_path {
+        typed_directory.replace('\\', "/")
+    } else {
+        typed_directory.to_owned()
+    };
+    let Some(directory) = resolve_directory(&sftp_directory, request.cwd.as_deref(), windows_path)
+    else {
         return Ok(Vec::new());
     };
     let entries = provider
@@ -57,21 +73,30 @@ pub(super) async fn suggestions(
     ))
 }
 
-/// 把当前路径 token 分成用户可见的目录前缀与待补全 basename。
-fn split_path_prefix(value: &str) -> (&str, &str) {
-    match value.rfind('/') {
+/// 仅已确认的 Windows PowerShell 路径将反斜杠视为分隔符，原输入仍供安全追加。
+fn split_path_prefix(value: &str, windows_path: bool) -> (&str, &str) {
+    let separator = if windows_path {
+        value.rfind(['/', '\\'])
+    } else {
+        value.rfind('/')
+    };
+    match separator {
         Some(separator) => (&value[..=separator], &value[separator + 1..]),
         None => ("", value),
     }
 }
 
-/// 相对用户输入路径按 session cwd 查询，绝对路径直接使用，RemotePath 负责规范分隔符。
-fn resolve_directory(typed_directory: &str, cwd: Option<&str>) -> Option<RemotePath> {
-    let value = if typed_directory.starts_with('/') {
-        typed_directory.to_owned()
+/// 已转换的路径按 session cwd 查询；只有已确认的 Windows 快照才映射盘符。
+fn resolve_directory(
+    typed_directory: &str,
+    cwd: Option<&str>,
+    windows_path: bool,
+) -> Option<RemotePath> {
+    let value = if let Some(absolute) = sftp_absolute_path(typed_directory, windows_path) {
+        absolute
     } else {
-        let base = cwd.filter(|value| !value.trim().is_empty()).unwrap_or(".");
-        let base = RemotePath::parse(base).ok()?;
+        let base = sftp_absolute_path(cwd?, windows_path)?;
+        let base = RemotePath::parse(&base).ok()?;
         if typed_directory.is_empty() {
             base.as_str().to_owned()
         } else if base.as_str() == "." {
@@ -81,6 +106,38 @@ fn resolve_directory(typed_directory: &str, cwd: Option<&str>) -> Option<RemoteP
         }
     };
     RemotePath::parse(&value).ok()
+}
+
+/// PowerShell 的盘符也可能是自定义 PSDrive，不能仅凭输入推断远端操作系统。
+fn has_windows_drive_prefix(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// 只有带根分隔符的盘符才是可映射的绝对路径，避免猜测盘符相对目录。
+fn has_windows_drive_root(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3 && has_windows_drive_prefix(value) && matches!(bytes[2], b'\\' | b'/')
+}
+
+/// 盘符相对路径依赖远端进程的每盘工作目录，快照没有该信息时不应猜测。
+fn has_windows_drive_relative_prefix(value: &str) -> bool {
+    has_windows_drive_prefix(value) && !has_windows_drive_root(value)
+}
+
+/// POSIX 绝对路径直接使用，盘符转换仅对已确认的 Windows PowerShell 快照启用。
+fn sftp_absolute_path(value: &str, windows_path: bool) -> Option<String> {
+    if value.starts_with('/') {
+        return Some(value.to_owned());
+    }
+    if !windows_path || !has_windows_drive_root(value) {
+        return None;
+    }
+    Some(format!(
+        "/{}/{}",
+        &value[..2],
+        value[3..].replace('\\', "/")
+    ))
 }
 
 /// 候选名称只来自当前远端目录；未知 shell 丢弃无法安全裸插入的特殊文件名。
@@ -94,7 +151,6 @@ fn path_candidates(
     let request = query.request;
     let prefix = query.prefix;
     let host_id = query.host_id;
-    let shell = prefix.shell;
     let mut candidates = entries
         .iter()
         .filter_map(|entry| {
@@ -106,7 +162,8 @@ fn path_candidates(
             if is_directory {
                 completed.push('/');
             }
-            let replacement = quote(&completed, shell)?;
+            let replacement =
+                super::syntax::append_literal(&request.input, request.cursor, prefix, &completed)?;
             let display = if is_directory {
                 format!("{}/", entry.name)
             } else {

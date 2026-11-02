@@ -211,7 +211,8 @@ if (${{function:prompt}}.ToString() -cne $installedPrompt) {{ throw 'Repeated in
     }
 }
 
-/// Bash 编码器必须按 UTF8 字节处理特殊目录，且完整生产 hook 不依赖每次 prompt 的外部进程。
+/// Bash 编码器必须按 UTF8 字节处理特殊目录，且新提示符只在目录上报后发布一次 A。
+/// 安装握手另由 PTY 验收覆盖，此处隔离其输出，避免将能力帧误认成提示符正文。
 ///
 /// @author kongweiguang
 #[cfg(unix)]
@@ -230,11 +231,13 @@ fn bash_hook_reports_uri_encoded_directory() {
             write!(&mut expected, "%{byte:02X}").expect("write to String");
         }
     }
-    expected.push('\x07');
+    expected.push_str("\x07\x1b]133;A\x07");
     let hook = include_str!("../src/shell_integration/scripts/bash.sh");
     let output = Command::new("bash")
         .args(["--noprofile", "--norc", "-c"])
-        .arg(format!("{hook}\n__kerminal_finish_prompt\n"))
+        .arg(format!(
+            "{{\n{hook}\n}} >/dev/null\n__kerminal_finish_prompt\n"
+        ))
         .current_dir(&directory)
         .output()
         .expect("run isolated Bash hook");
@@ -244,7 +247,8 @@ fn bash_hook_reports_uri_encoded_directory() {
     assert_eq!(output.stdout, expected.as_bytes());
 }
 
-/// 用户 Fish prompt 可在打印过程中 cd；保留原输出逐字节顺序，并只在完成后报告最终目录。
+/// 用户 Fish prompt 可在打印过程中 cd；保留原输出顺序，并只在完成后报告最终目录。
+/// 新提示符事件发布 A，纯重绘不发布 A，二者均须保留用户正文与末尾 B。
 ///
 /// @author kongweiguang
 #[cfg(unix)]
@@ -255,20 +259,21 @@ fn fish_hook_reports_directory_after_user_prompt_changes_it() {
     let fixture = tempfile::tempdir().expect("create private Fish cwd fixture");
     let directory = fixture.path().join("prompt 中文 #%");
     std::fs::create_dir(&directory).expect("create prompt target directory");
-    let mut expected = String::from("\x1b]133;A\x07user-before\nuser-after\x1b]7;file://");
+    let mut rendered = String::from("user-before\nuser-after\x1b]7;file://");
     for byte in directory.to_str().expect("UTF-8 fixture path").bytes() {
         if byte.is_ascii_alphanumeric() || b"/._~-".contains(&byte) {
-            expected.push(char::from(byte));
+            rendered.push(char::from(byte));
         } else {
-            write!(&mut expected, "%{byte:02X}").expect("write to String");
+            write!(&mut rendered, "%{byte:02X}").expect("write to String");
         }
     }
-    expected.push_str("\x07\x1b]133;B\x07");
+    rendered.push_str("\x07\x1b]133;B\x07");
+    let expected = format!("\x1b]133;A\x07{rendered}{rendered}");
     let hook = include_str!("../src/shell_integration/scripts/fish.fish");
     let output = Command::new("fish")
         .args(["--no-config", "-c"])
         .arg(format!(
-            "function fish_prompt\n    printf 'user-before\\n'\n    builtin cd \"$KERMINAL_PROMPT_CWD\"; or exit 97\n    printf 'user-after'\nend\n{hook}\nfish_prompt\n"
+            "function fish_prompt\n    printf 'user-before\\n'\n    builtin cd \"$KERMINAL_PROMPT_CWD\"; or exit 97\n    printf 'user-after'\nend\nbegin\n{hook}\nend >/dev/null\nemit fish_prompt\nfish_prompt\nfish_prompt\n"
         ))
         .env("KERMINAL_PROMPT_CWD", &directory)
         .current_dir(fixture.path())

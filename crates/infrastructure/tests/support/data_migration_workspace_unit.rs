@@ -2,6 +2,8 @@
 //!
 //! @author kongweiguang
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use super::plan_workspace_migration;
@@ -33,7 +35,7 @@ fn missing_and_null_fields_are_planned_without_mutating_source() {
     panes[0]["migrationExtension"] = json!({"keep": [1, 2]});
     let before = serde_json::to_vec(&value).expect("encode source fixture");
 
-    let edit = plan_workspace_migration(Some(before.clone()))
+    let edit = plan_workspace_migration(Some(before.clone()), &BTreeMap::new())
         .expect("known missing fields are migratable")
         .expect("migration should produce one edit");
     assert_eq!(edit.relative_path.to_str(), Some("workspace/session.json"));
@@ -68,12 +70,12 @@ fn current_explicit_values_need_no_migration() {
     let before = serde_json::to_vec(&value).expect("encode source fixture");
 
     assert!(
-        plan_workspace_migration(Some(before))
+        plan_workspace_migration(Some(before), &BTreeMap::new())
             .expect("current document validates")
             .is_none()
     );
     assert!(
-        plan_workspace_migration(None)
+        plan_workspace_migration(None, &BTreeMap::new())
             .expect("missing workspace is a no-op")
             .is_none()
     );
@@ -91,15 +93,16 @@ fn unknown_or_invalid_workspace_values_are_not_normalized() {
         .unwrap()
         .remove("prompt");
     let source = serde_json::to_vec(&unknown_status).expect("encode invalid fixture");
-    assert!(plan_workspace_migration(Some(source.clone())).is_err());
+    assert!(plan_workspace_migration(Some(source.clone()), &BTreeMap::new()).is_err());
 
     for field in ["prompt", "status"] {
         let mut invalid = current_fixture();
         invalid["terminalPanes"][0][field] = json!(42);
         assert!(
-            plan_workspace_migration(Some(
-                serde_json::to_vec(&invalid).expect("encode invalid fixture")
-            ))
+            plan_workspace_migration(
+                Some(serde_json::to_vec(&invalid).expect("encode invalid fixture")),
+                &BTreeMap::new()
+            )
             .is_err()
         );
     }
@@ -108,20 +111,79 @@ fn unknown_or_invalid_workspace_values_are_not_normalized() {
         let mut unsupported = current_fixture();
         unsupported["version"] = json!(version);
         assert!(
-            plan_workspace_migration(Some(
-                serde_json::to_vec(&unsupported).expect("encode version fixture")
-            ))
+            plan_workspace_migration(
+                Some(serde_json::to_vec(&unsupported).expect("encode version fixture")),
+                &BTreeMap::new()
+            )
             .is_err()
         );
     }
     let mut unversioned = current_fixture();
     unversioned.as_object_mut().unwrap().remove("version");
     assert!(
-        plan_workspace_migration(Some(
-            serde_json::to_vec(&unversioned).expect("encode unversioned fixture")
-        ))
+        plan_workspace_migration(
+            Some(serde_json::to_vec(&unversioned).expect("encode unversioned fixture")),
+            &BTreeMap::new()
+        )
         .is_err()
     );
-    assert!(plan_workspace_migration(Some(b"{broken".to_vec())).is_err());
+    assert!(plan_workspace_migration(Some(b"{broken".to_vec()), &BTreeMap::new()).is_err());
     assert_eq!(source, serde_json::to_vec(&unknown_status).unwrap());
+}
+
+/// 主机、pane、tab 与 tmux 的已知引用一起映射，未知扩展和默认本地身份不受影响。
+#[test]
+fn profile_identity_mapping_covers_known_workspace_references_only() {
+    let mut value = current_fixture();
+    value["selectedMachineId"] = json!("profile:legacy");
+    value["sidebarMachines"] = json!([{ "id": "profile:legacy", "future": "profile:legacy" }]);
+    value["terminalPanes"][0]["machineId"] = json!("profile:legacy");
+    value["terminalPanes"][0]["mode"] = json!("local");
+    value["terminalPanes"][0]["target"] = json!({"kind":"local", "profileId":"legacy"});
+    value["terminalPanes"][0]["profileId"] = json!("legacy");
+    value["terminalPanes"][0]["tmuxBinding"] = json!({
+        "targetRef":"local:legacy|L:custom", "sessionId":"$1", "sessionName":"work", "attachedAt":"1"
+    });
+    value["terminalPanes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("remoteHostId");
+    value["terminalTabs"][0]["machineId"] = json!("profile:legacy");
+    value["terminalPanes"][1]["futureReference"] = json!("profile:legacy");
+    let before = serde_json::to_vec(&value).unwrap();
+    let mapping = BTreeMap::from([("legacy".to_owned(), "local-new".to_owned())]);
+    let edit = plan_workspace_migration(Some(before), &mapping)
+        .expect("映射可计划")
+        .expect("目标需要修改");
+    let after: Value = serde_json::from_slice(&edit.after).unwrap();
+    assert_eq!(after["selectedMachineId"], json!("profile:local-new"));
+    assert_eq!(
+        after["sidebarMachines"][0]["id"],
+        json!("profile:local-new")
+    );
+    assert_eq!(
+        after["sidebarMachines"][0]["future"],
+        json!("profile:legacy")
+    );
+    assert_eq!(
+        after["terminalTabs"][0]["machineId"],
+        json!("profile:local-new")
+    );
+    assert_eq!(
+        after["terminalPanes"][0]["machineId"],
+        json!("profile:local-new")
+    );
+    assert_eq!(after["terminalPanes"][0]["profileId"], json!("local-new"));
+    assert_eq!(
+        after["terminalPanes"][0]["target"]["profileId"],
+        json!("local-new")
+    );
+    assert_eq!(
+        after["terminalPanes"][0]["tmuxBinding"]["targetRef"],
+        json!("local:local-new|L:custom")
+    );
+    assert_eq!(
+        after["terminalPanes"][1]["futureReference"],
+        json!("profile:legacy")
+    );
 }

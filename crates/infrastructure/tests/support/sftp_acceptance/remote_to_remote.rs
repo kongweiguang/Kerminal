@@ -13,7 +13,7 @@ use super::{
     AcceptanceResult, SftpAcceptanceFixture, remote_child, request, require, run_transfer,
 };
 
-/// 在不同 HostId 和独立随机目录间执行文件、目录复制，并从两端回读验证数据。
+/// 在不同 HostId 和独立随机目录间双向复制文件与目录，并从两端回读以验证来源未受损。
 ///
 /// @author kongweiguang
 pub(super) async fn exercise_remote_to_remote(fixture: &SftpAcceptanceFixture) -> AcceptanceResult {
@@ -84,6 +84,38 @@ pub(super) async fn exercise_remote_to_remote(fixture: &SftpAcceptanceFixture) -
         require(
             preview.bytes == bytes,
             "remote-to-remote file content differs at one endpoint",
+        )?;
+    }
+
+    let reverse_file = remote_child(
+        &fixture.source_host_id,
+        &fixture.source_workspace,
+        "reverse-文件.bin",
+    )?;
+    let reverse_copied = run_transfer(
+        fixture,
+        "remote_to_remote.copy_file_reverse",
+        request(
+            remote_destination.clone(),
+            reverse_file.clone(),
+            TransferKind::File,
+            ConflictPolicy::Overwrite,
+        ),
+    )
+    .await?;
+    require(
+        reverse_copied.status == TransferStatus::Succeeded
+            && reverse_copied.commit_summary.committed_entries() == 1,
+        "reverse remote file transfer did not confirm its destination",
+    )?;
+    for endpoint in [&remote_destination, &reverse_file] {
+        let preview = fixture
+            .files
+            .preview_file(CancellationToken::new(), endpoint.clone(), bytes.len())
+            .await?;
+        require(
+            preview.bytes == bytes,
+            "reverse remote file content differs at one endpoint",
         )?;
     }
 
@@ -188,6 +220,95 @@ pub(super) async fn exercise_remote_to_remote(fixture: &SftpAcceptanceFixture) -
         .await?
             == "nested from second remote",
         "remote-to-remote directory transfer lost a nested file",
+    )?;
+    require(
+        read_remote_text(
+            fixture,
+            &fixture.source_host_id,
+            &source_tree_path,
+            "replace.txt",
+        )
+        .await?
+            == "from second remote"
+            && read_remote_text(
+                fixture,
+                &fixture.source_host_id,
+                &endpoint_path(&source_nested)?,
+                "nested.txt",
+            )
+            .await?
+                == "nested from second remote",
+        "remote-to-remote directory source changed after transfer",
+    )?;
+
+    let reverse_tree = remote_child(
+        &fixture.source_host_id,
+        &fixture.source_workspace,
+        "reverse-tree",
+    )?;
+    fixture
+        .files
+        .create_directory(CancellationToken::new(), reverse_tree.clone())
+        .await?;
+    let reverse_tree_path = endpoint_path(&reverse_tree)?;
+    write_remote_text(
+        fixture,
+        &fixture.source_host_id,
+        &reverse_tree_path,
+        "source-only.txt",
+        "preserve destination-only content",
+    )
+    .await?;
+    write_remote_text(
+        fixture,
+        &fixture.source_host_id,
+        &reverse_tree_path,
+        "replace.txt",
+        "old reverse target value",
+    )
+    .await?;
+
+    let reverse_merged = run_transfer(
+        fixture,
+        "remote_to_remote.merge_directory_reverse",
+        request(
+            destination_tree.clone(),
+            reverse_tree.clone(),
+            TransferKind::Directory,
+            ConflictPolicy::Overwrite,
+        ),
+    )
+    .await?;
+    require(
+        reverse_merged.status == TransferStatus::Succeeded
+            && reverse_merged.commit_summary.committed_entries() >= 2,
+        "reverse remote directory merge did not confirm copied entries",
+    )?;
+    let reverse_nested = remote_child(&fixture.source_host_id, &reverse_tree_path, "nested")?;
+    for (host_id, tree, nested) in [
+        (&fixture.host_id, &destination_tree_path, &copied_nested),
+        (&fixture.source_host_id, &reverse_tree_path, &reverse_nested),
+    ] {
+        require(
+            read_remote_text(fixture, host_id, tree, "preserve.txt").await? == "target-only"
+                && read_remote_text(fixture, host_id, tree, "replace.txt").await?
+                    == "from second remote"
+                && read_remote_text(fixture, host_id, &endpoint_path(nested)?, "nested.txt")
+                    .await?
+                    == "nested from second remote",
+            "reverse remote directory content differs at one endpoint",
+        )?;
+    }
+    require(
+        read_remote_text(
+            fixture,
+            &fixture.source_host_id,
+            &reverse_tree_path,
+            "source-only.txt",
+        )
+        .await?
+            == "preserve destination-only content",
+        "reverse remote merge removed destination-only content",
     )?;
     Ok(())
 }

@@ -76,9 +76,12 @@ impl FilesPane {
             cx.notify();
             return;
         };
-        if !self.begin_transfer_submission(cx) {
+        let mut related_sides = [false; 2];
+        related_sides[destination_side] = true;
+        let Some((generation, cancellation)) = self.begin_transfer_preparation(related_sides, cx)
+        else {
             return;
-        }
+        };
 
         let files = self.files.clone();
         let executor = self.executor.clone();
@@ -87,7 +90,7 @@ impl FilesPane {
         let total = paths.len();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |cancellation| async move {
+                .run_cancellable(cancellation, move |cancellation| async move {
                     let mut seen = HashSet::with_capacity(total);
                     let mut items = Vec::with_capacity(total);
                     let mut issues = Vec::new();
@@ -204,6 +207,9 @@ impl FilesPane {
                 .await;
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
+                    if !pane.transfer_preparation_is_current(generation) {
+                        return;
+                    }
                     match result {
                         Ok((items, issues)) => pane.enqueue_transfer_batch_started(
                             TransferBatchPlan {

@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use super::{PreferencesEvent, PreferencesPanel};
+use super::{LeaveConfirmation, PreferencesEvent, PreferencesPanel};
 use crate::features::preferences::{CloseRequest, ConfigDraft, DraftStatus};
 use gpui_kit::{Context, Window};
 
@@ -81,10 +81,14 @@ fn quit_deferral(
 }
 
 impl PreferencesPanel {
-    /// 普通关闭只 flush 可提交设置并直接离开；仅 Profile 独立草稿继续使用关闭确认。
+    /// 普通关闭先 flush 可提交设置，再让 Profile 和关键词局部草稿共用丢弃确认。
     ///
     /// @author kongweiguang
     pub fn request_close(&mut self, cx: &mut Context<Self>) {
+        if self.quit_confirmation {
+            return;
+        }
+        self.cancel_shortcut_capture(cx);
         self.screen_color_sampling.cancel();
         let profile_close = self
             .profile_draft
@@ -92,7 +96,11 @@ impl PreferencesPanel {
             .map(ConfigDraft::request_close)
             .unwrap_or(CloseRequest::CloseNow);
         self.flush_settings_before_close(cx);
-        match close_gate_action(CloseRequest::CloseNow, profile_close, false) {
+        match close_gate_action(
+            CloseRequest::CloseNow,
+            profile_close,
+            self.keyword_editor.has_unsaved_drafts(),
+        ) {
             CloseGateAction::Wait => {
                 let outcome_unknown = self
                     .settings
@@ -116,7 +124,12 @@ impl PreferencesPanel {
                     .to_string()
                 });
             }
-            CloseGateAction::ConfirmDiscard => self.close_confirmation = true,
+            CloseGateAction::ConfirmDiscard => {
+                if !self.close_confirmation {
+                    self.close_confirmation = true;
+                    self.schedule_leave_confirmation_focus(LeaveConfirmation::Close, cx);
+                }
+            }
             CloseGateAction::Proceed => self.emit_leave_event(cx),
         }
         cx.notify();
@@ -134,18 +147,20 @@ impl PreferencesPanel {
         }
     }
 
-    /// 离开时丢弃未提交关键词编辑并通知 Root 关闭面板；已提交 CAS 不受影响。
+    /// 离开时释放窗口按键拦截并通知 Root；已提交 CAS 不受影响。
     ///
     /// @author kongweiguang
     fn emit_leave_event(&mut self, cx: &mut Context<Self>) {
+        self.cancel_shortcut_capture(cx);
         self.discard_pending_keyword_rule();
         cx.emit(PreferencesEvent::CloseRequested);
     }
 
-    /// 继续编辑只关闭确认条并重置子草稿的 close marker，不清除用户输入。
+    /// 继续编辑仅解除关闭标记并恢复原焦点，不清除用户输入。
     ///
     /// @author kongweiguang
     pub(in crate::features::preferences) fn cancel_close(&mut self, cx: &mut Context<Self>) {
+        let was_open = self.close_confirmation;
         self.close_confirmation = false;
         if let Some(draft) = self.settings.as_mut()
             && draft.close_confirmation_open()
@@ -157,10 +172,13 @@ impl PreferencesPanel {
         {
             let _ = draft.cancel_close();
         }
+        if was_open {
+            self.restore_leave_confirmation_focus(LeaveConfirmation::Close, cx);
+        }
         cx.notify();
     }
 
-    /// 只有用户确认后才放弃两个页面草稿并通知 Root 恢复打开设置前的页面。
+    /// 用户确认后才放弃页面草稿，并通知 Root 重建焦点陷阱及返回工作区。
     ///
     /// @author kongweiguang
     pub(in crate::features::preferences) fn discard_and_close(
@@ -169,6 +187,7 @@ impl PreferencesPanel {
         cx: &mut Context<Self>,
     ) {
         self.close_confirmation = false;
+        cx.emit(PreferencesEvent::LeaveConfirmationChanged);
         if let Some(draft) = self.settings.as_mut() {
             if draft.close_confirmation_open() {
                 let _ = draft.discard_and_close();
@@ -187,10 +206,12 @@ impl PreferencesPanel {
         self.emit_leave_event(cx);
     }
 
-    /// RootView 调用此守卫后只有无草稿返回 true；需丢稿时先由本面板显示确认。
+    /// 退出前停止录制和取色，再检查未提交草稿及仍需等待的写入回执。
     ///
     /// @author kongweiguang
     pub fn request_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        self.cancel_shortcut_capture(cx);
+        self.screen_color_sampling.cancel();
         let should_flush_settings = self.settings.as_ref().is_some_and(|draft| {
             draft.is_dirty() && matches!(draft.status(), DraftStatus::Ready | DraftStatus::Failed)
         }) && self.settings_input_errors.is_empty();
@@ -268,15 +289,22 @@ impl PreferencesPanel {
         if settings_close == CloseRequest::ConfirmDiscard
             || profile_close == CloseRequest::ConfirmDiscard
             || self.has_unadded_inputs()
+            || self.keyword_editor.has_unsaved_drafts()
         {
-            self.quit_confirmation = true;
+            if !self.quit_confirmation {
+                self.quit_confirmation = true;
+                self.schedule_leave_confirmation_focus(LeaveConfirmation::Quit, cx);
+            }
+            cx.emit(PreferencesEvent::QuitConfirmationRequested);
             cx.notify();
             return false;
         }
         true
     }
 
-    /// 用户确认丢弃偏好草稿后发出串行退出事件，具体进程退出仍由 RootView 负责。
+    /// 用户确认丢弃草稿后撤销内部陷阱，具体进程退出仍由 RootView 串行处理。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn confirm_quit(
         &mut self,
         window: &mut Window,
@@ -286,16 +314,23 @@ impl PreferencesPanel {
             return;
         }
         self.quit_confirmation = false;
+        cx.emit(PreferencesEvent::LeaveConfirmationChanged);
         self.discard_settings_and_profile_drafts();
         self.restore_form_inputs(window, cx);
         cx.emit(PreferencesEvent::QuitConfirmed);
         cx.notify();
     }
 
-    /// 取消退出保留表单和 opaque revision，RootView 不会继续关闭其它工作区。
-    pub(in crate::features::preferences) fn cancel_quit(&mut self, cx: &mut Context<Self>) {
+    /// 取消退出保留草稿和 revision，只有确认拥有焦点时才恢复设置焦点。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn cancel_quit(&mut self, cx: &mut Context<Self>) {
+        let was_open = self.quit_confirmation;
         self.quit_confirmation = false;
         self.cancel_draft_close_markers();
+        if was_open {
+            self.restore_leave_confirmation_focus(LeaveConfirmation::Quit, cx);
+        }
         cx.emit(PreferencesEvent::QuitCancelled);
         cx.notify();
     }

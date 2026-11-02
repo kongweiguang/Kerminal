@@ -48,7 +48,7 @@ fn navigation_exposes_profile_and_existing_pages_in_order() {
     );
 }
 
-/// 字段搜索目录和主页面一一对应；标题、描述及关键词均进入同一匹配流程。
+/// 搜索目录跟随现有设置面板；不再暴露已移除的渲染选项，基础外观设置仍可定位。
 /// @author kongweiguang
 #[test]
 fn main_search_targets_cover_each_settings_page() {
@@ -58,10 +58,14 @@ fn main_search_targets_cover_each_settings_page() {
         .filter(|target| !target.category)
         .collect::<Vec<_>>();
 
-    assert_eq!(entries.len(), 19);
+    assert_eq!(entries.len(), 18);
     for (id, section) in [
         (
             "settings-interface-appearance-panel",
+            PreferencesSection::Appearance,
+        ),
+        (
+            "settings-interface-basics-panel",
             PreferencesSection::Appearance,
         ),
         ("settings-background-panel", PreferencesSection::Appearance),
@@ -70,10 +74,6 @@ fn main_search_targets_cover_each_settings_page() {
             PreferencesSection::Terminal,
         ),
         ("settings-terminal-font-panel", PreferencesSection::Terminal),
-        (
-            "settings-terminal-renderer-panel",
-            PreferencesSection::Terminal,
-        ),
         (
             "settings-terminal-interaction-panel",
             PreferencesSection::Terminal,

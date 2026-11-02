@@ -78,12 +78,38 @@ fn provider_with_shell(
     Arc<AtomicUsize>,
     Arc<FakeRemoteState>,
 ) {
+    provider_with_shell_and_listings(
+        runtime_available,
+        list_calls,
+        shell_kind,
+        shell_dialect,
+        wait_for_exec_cancel,
+        None,
+    )
+}
+
+/// 按需记录请求目录，使路径解析回归能核对 SFTP 目标而不仅是候选数量。
+fn provider_with_shell_and_listings(
+    runtime_available: bool,
+    list_calls: Arc<AtomicUsize>,
+    shell_kind: RemoteShellKind,
+    shell_dialect: RemoteShellDialect,
+    wait_for_exec_cancel: bool,
+    listed_paths: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+) -> (
+    RemoteCommandSuggestionProvider,
+    RemoteSuggestionPolicy,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<FakeRemoteState>,
+) {
     let files = FileService::new(
         vec![Arc::new(FakeRemoteFiles {
             list_calls,
             started: None,
             wait_for_cancel: false,
             cancellation_observed: None,
+            listed_paths,
         })],
         Arc::new(FakeBookmarks),
     )
@@ -144,6 +170,7 @@ struct FakeRemoteFiles {
     started: Option<Arc<tokio::sync::Notify>>,
     wait_for_cancel: bool,
     cancellation_observed: Option<Arc<AtomicUsize>>,
+    listed_paths: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 #[async_trait]
@@ -173,6 +200,9 @@ impl FileAccessProvider for FakeRemoteFiles {
         let FileEndpoint::Remote { host_id, path } = &endpoint else {
             return Err(AppError::unsupported("测试只支持远端路径"));
         };
+        if let Some(listed_paths) = &self.listed_paths {
+            listed_paths.lock().unwrap().push(path.as_str().to_owned());
+        }
         let entries = [
             ("文档", FileEntryKind::Directory, Some(0o755u32)),
             ("README.md", FileEntryKind::File, Some(0o644u32)),
@@ -573,6 +603,238 @@ async fn runtime_gate_is_checked_before_remote_io() {
     assert_eq!(candidate.replacement_range.end, 4);
 }
 
+/// 可信编辑快照提供的 Shell 身份允许只追加转义后的远端空格路径。
+#[tokio::test]
+async fn remote_path_uses_snapshot_shell_to_preserve_quoted_names() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (service, _, _, connect_calls, _) = provider(true, calls);
+    let mut query = request("cat \"uns", vec![SuggestionProviderKind::RemotePath]);
+    query.shell = Some("bash".to_owned());
+    let candidates = service
+        .suggest(query, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.replacement_text == "\"unsafe name\"")
+    );
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+}
+
+/// PowerShell 盘符、相对路径和含空格路径都须访问实际父目录并保留用户已输入的文本。
+#[tokio::test]
+async fn remote_powershell_windows_paths_preserve_typed_prefix() {
+    let listed_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (service, _, command_calls, connect_calls, _) = provider_with_shell_and_listings(
+        true,
+        Arc::new(AtomicUsize::new(0)),
+        RemoteShellKind::PowerShell,
+        RemoteShellDialect::PowerShell,
+        false,
+        Some(listed_paths.clone()),
+    );
+    for (input, expected_directory) in [
+        (
+            "cd C:\\Users\\demo\\projects\\文",
+            "/C:/Users/demo/projects",
+        ),
+        ("cd folder\\文", "/C:/Users/demo/folder"),
+        (
+            "cd \"C:\\Users\\demo\\with space\\文",
+            "/C:/Users/demo/with space",
+        ),
+    ] {
+        let mut query = request(input, vec![SuggestionProviderKind::RemotePath]);
+        query.cwd = Some("C:\\Users\\demo".to_owned());
+        query.shell = Some("powershell".to_owned());
+        let candidates = service
+            .suggest(query, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            listed_paths.lock().unwrap().last().map(String::as_str),
+            Some(expected_directory),
+            "input: {input:?}"
+        );
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.display_text.starts_with("文档"))
+            .expect("directory candidate exists");
+        let typed_token = input.strip_prefix("cd ").unwrap();
+        let suffix = candidate
+            .replacement_text
+            .strip_prefix(typed_token)
+            .expect("candidate preserves the complete typed token");
+        if typed_token.starts_with('"') {
+            assert!(matches!(suffix, "档/\"" | "档\\\""));
+        } else {
+            assert!(matches!(suffix, "档/" | "档\\"));
+        }
+    }
+    assert_eq!(command_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+}
+
+/// POSIX Shell 的反斜杠可能是普通目录名字符，不能被 Windows 路径转换当作分隔符。
+#[tokio::test]
+async fn remote_posix_path_keeps_literal_backslash_in_directory() {
+    let listed_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (service, _, command_calls, connect_calls, _) = provider_with_shell_and_listings(
+        true,
+        Arc::new(AtomicUsize::new(0)),
+        RemoteShellKind::Bash,
+        RemoteShellDialect::Posix,
+        false,
+        Some(listed_paths.clone()),
+    );
+    let mut query = request(
+        "cd 'folder\\literal/文",
+        vec![SuggestionProviderKind::RemotePath],
+    );
+    query.shell = Some("bash".to_owned());
+    let candidates = service
+        .suggest(query, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        listed_paths.lock().unwrap().as_slice(),
+        ["/home/test/folder\\literal"]
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.replacement_text == "'folder\\literal/文档/'")
+    );
+    assert_eq!(command_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+}
+
+/// POSIX 的盘符样目录只是普通相对路径，不能被当成 Windows 的 SFTP 根目录。
+#[tokio::test]
+async fn remote_posix_drive_like_path_is_relative_to_cwd() {
+    let listed_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (service, _, command_calls, connect_calls, _) = provider_with_shell_and_listings(
+        true,
+        Arc::new(AtomicUsize::new(0)),
+        RemoteShellKind::Bash,
+        RemoteShellDialect::Posix,
+        false,
+        Some(listed_paths.clone()),
+    );
+    let mut query = request("cd C:/文", vec![SuggestionProviderKind::RemotePath]);
+    query.shell = Some("bash".to_owned());
+    let candidates = service
+        .suggest(query, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(listed_paths.lock().unwrap().as_slice(), ["/home/test/C:"]);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.replacement_text == "C:/文档/")
+    );
+    assert_eq!(command_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+}
+
+/// 仅有盘符输入不能证明 Windows；未知 cwd 或 Linux PowerShell 的 PSDrive 都不猜测。
+#[tokio::test]
+async fn remote_powershell_unconfirmed_drive_paths_do_not_probe() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let listed_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (service, _, command_calls, connect_calls, _) = provider_with_shell_and_listings(
+        true,
+        calls.clone(),
+        RemoteShellKind::PowerShell,
+        RemoteShellDialect::PowerShell,
+        false,
+        Some(listed_paths.clone()),
+    );
+    for cwd in [Some("/home/test"), None] {
+        for input in [
+            "cd C:\\projects\\文",
+            "cd C:/projects/文",
+            "cd C:folder\\文",
+        ] {
+            let mut query = request(input, vec![SuggestionProviderKind::RemotePath]);
+            query.cwd = cwd.map(str::to_owned);
+            query.shell = Some("powershell".to_owned());
+            assert!(
+                service
+                    .suggest(query, CancellationToken::new())
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "input: {input:?}, cwd: {cwd:?}"
+            );
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(listed_paths.lock().unwrap().is_empty());
+    assert_eq!(command_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+}
+
+/// 未知 cwd 不影响可独立解析的 POSIX 绝对路径，避免因保守处理丢失有效补全。
+#[tokio::test]
+async fn remote_powershell_posix_absolute_path_works_without_cwd() {
+    let listed_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (service, _, command_calls, connect_calls, _) = provider_with_shell_and_listings(
+        true,
+        Arc::new(AtomicUsize::new(0)),
+        RemoteShellKind::PowerShell,
+        RemoteShellDialect::PowerShell,
+        false,
+        Some(listed_paths.clone()),
+    );
+    let mut query = request("cd /var/文", vec![SuggestionProviderKind::RemotePath]);
+    query.cwd = None;
+    query.shell = Some("powershell".to_owned());
+    let candidates = service
+        .suggest(query, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(listed_paths.lock().unwrap().as_slice(), ["/var"]);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.replacement_text == "/var/文档/")
+    );
+    assert_eq!(command_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+}
+
+/// 无法从快照确定的盘符相对路径和网络路径不发起目录查询，避免补全错误位置。
+#[tokio::test]
+async fn remote_powershell_ambiguous_windows_paths_do_not_probe() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (service, _, command_calls, connect_calls, _) = provider(true, calls.clone());
+    for input in [
+        "cd C:folder\\文",
+        "cd \\\\server\\share\\文",
+        "cd \\folder\\文",
+        "cd /folder/文",
+    ] {
+        let mut query = request(input, vec![SuggestionProviderKind::RemotePath]);
+        query.cwd = Some("C:\\Users\\demo".to_owned());
+        query.shell = Some("powershell".to_owned());
+        assert!(
+            service
+                .suggest(query, CancellationToken::new())
+                .await
+                .unwrap()
+                .is_empty(),
+            "input: {input:?}"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(command_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+}
+
 /// 恢复态门禁关闭时路径、PATH 命令和 Git 三类远端来源都不触发 I/O。
 #[tokio::test]
 async fn runtime_gate_blocks_all_remote_sources_before_io() {
@@ -741,7 +1003,7 @@ async fn git_reference_suggestions_use_fixed_read_only_query() {
         .iter()
         .find(|candidate| candidate.display_text == "feature/$expand")
         .expect("shell-sensitive Git ref remains available");
-    assert_eq!(quoted_reference.replacement_text, "'feature/$expand'");
+    assert_eq!(quoted_reference.replacement_text, "feature/\\$expand");
     assert_eq!(candidate.replacement_range.start, 13);
     assert_eq!(candidate.replacement_range.end, 17);
     assert_eq!(command_calls.load(Ordering::SeqCst), 1);
@@ -804,6 +1066,26 @@ async fn static_git_suggestions_do_not_probe_unknown_shell() {
     assert_eq!(command_calls.load(Ordering::SeqCst), 0);
 }
 
+/// Git refs 依赖真实 cwd，缺失或相对目录时不连接并避免查询 SSH 默认目录。
+#[tokio::test]
+async fn git_references_do_not_probe_without_an_absolute_cwd() {
+    let (service, _, command_calls, connect_calls, _) =
+        provider(true, Arc::new(AtomicUsize::new(0)));
+    for cwd in [None, Some("relative/path".to_owned())] {
+        let mut query = request("git checkout feat", vec![SuggestionProviderKind::Git]);
+        query.cwd = cwd;
+        assert!(
+            service
+                .suggest(query, CancellationToken::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(command_calls.load(Ordering::SeqCst), 0);
+}
+
 /// 取消在任何远端 probe 前返回明确错误，不将取消转成空结果。
 #[tokio::test]
 async fn cancellation_is_not_reported_as_successful_empty_result() {
@@ -831,6 +1113,7 @@ async fn cancellation_reaches_in_flight_remote_file_operation() {
             started: Some(started.clone()),
             wait_for_cancel: true,
             cancellation_observed: Some(cancellation_observed.clone()),
+            listed_paths: None,
         })],
         Arc::new(FakeBookmarks),
     )

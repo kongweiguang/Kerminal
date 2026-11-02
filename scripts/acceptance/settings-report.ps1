@@ -13,13 +13,14 @@ $ErrorActionPreference = 'Stop'
 $script:PageDefinitions = @(
     [pscustomobject]@{ Id = 'appearance'; Label = '界面外观' },
     [pscustomobject]@{ Id = 'terminal'; Label = '终端' },
+    [pscustomobject]@{ Id = 'profiles'; Label = 'Profile' },
     [pscustomobject]@{ Id = 'keywords'; Label = '关键词高亮' },
     [pscustomobject]@{ Id = 'suggestions'; Label = '命令提示' },
     [pscustomobject]@{ Id = 'sftp'; Label = 'SFTP' },
     [pscustomobject]@{ Id = 'external-launch'; Label = '外部启动' },
     [pscustomobject]@{ Id = 'mcp'; Label = 'MCP' },
     [pscustomobject]@{ Id = 'sync'; Label = '同步' },
-    [pscustomobject]@{ Id = 'desktop'; Label = '桌面' },
+    [pscustomobject]@{ Id = 'desktop'; Label = '通知' },
     [pscustomobject]@{ Id = 'shortcuts'; Label = '快捷键列表' },
     [pscustomobject]@{ Id = 'about'; Label = '关于' }
 )
@@ -29,7 +30,6 @@ $script:ThemeDefinitions = @(
     [pscustomobject]@{ Id = 'system'; Label = '跟随系统' }
 )
 $script:DisclosureDefinitions = @(
-    [pscustomobject]@{ Id = 'terminal-renderer'; Label = '终端渲染' },
     [pscustomobject]@{ Id = 'sftp-advanced'; Label = 'SFTP 高级选项' },
     [pscustomobject]@{ Id = 'external-launch-compatibility'; Label = '外部启动兼容选项' },
     [pscustomobject]@{ Id = 'mcp-connection-info'; Label = 'MCP 连接信息' },
@@ -301,7 +301,7 @@ function Add-PageGallery {
         [Parameter(Mandatory = $true)][string]$RunRoot
     )
 
-    [void]$Builder.AppendLine('<section class="report-section" id="pages"><h2>设置页面截图 · 11 页 × 3 主题</h2>')
+    [void]$Builder.AppendLine("<section class=`"report-section`" id=`"pages`"><h2>设置页面截图 · $($script:PageDefinitions.Count) 页 × 3 主题</h2>")
     [void]$Builder.AppendLine('<p class="section-note">每页分别展示首屏与底部视口。截图存在只证明文件可查看，不单独代表交互或视觉验收通过。</p>')
     foreach ($pageDefinition in $script:PageDefinitions) {
         $pageId = [string]$pageDefinition.Id
@@ -421,6 +421,25 @@ function Add-InteractionGallery {
             [pscustomobject]@{ File = 'settings-functional-sync-retry-confirms-remote.png'; Label = '恢复后同步回读' }
         )
     }
+    if ([int](Get-JsonProperty $Report 'schemaVersion') -ge 5) {
+        $knownCaptures += @(
+            [pscustomobject]@{ File = 'settings-functional-keyword-list-scroll.png'; Label = '长规则列表滚动' },
+            [pscustomobject]@{ File = 'settings-functional-keyword-filter.png'; Label = '规则搜索过滤' },
+            [pscustomobject]@{ File = 'settings-functional-keyword-limit-footer.png'; Label = '规则上限与保存区' },
+            [pscustomobject]@{ File = 'settings-functional-terminal-theme.png'; Label = '终端主题与实时色盘' },
+            [pscustomobject]@{ File = 'settings-functional-terminal-font.png'; Label = '系统字体搜索' },
+            [pscustomobject]@{ File = 'settings-functional-terminal-font-size.png'; Label = '字号步进与边界' },
+            [pscustomobject]@{ File = 'settings-functional-terminal-line-height.png'; Label = '行高步进与边界' },
+            [pscustomobject]@{ File = 'settings-functional-shortcut-capture.png'; Label = '快捷键录制与取消' },
+            [pscustomobject]@{ File = 'settings-functional-shortcut-live.png'; Label = '新快捷键实际生效' }
+        )
+    }
+    if ([int](Get-JsonProperty $Report 'schemaVersion') -ge 6) {
+        $knownCaptures += @(
+            [pscustomobject]@{ File = 'settings-functional-local-host-created.png'; Label = '模板创建本地主机' },
+            [pscustomobject]@{ File = 'settings-functional-local-host-deleted.png'; Label = '删除本地主机后' }
+        )
+    }
     [void]$Builder.AppendLine('<section class="report-section" id="interactions"><h2>其他交互截图</h2><div class="evidence-grid">')
     foreach ($capture in $knownCaptures) {
         $record = Find-ReportRecord -Records $reportCaptures -PropertyName 'file' -ExpectedValue $capture.File
@@ -432,6 +451,7 @@ function Add-InteractionGallery {
 function Add-ReportChecks {
     # Git 断言从原生回执读取，不能仅按同步按钮或页面存在判为闭环。
     # 保留 JSON 数组的原始形状供逐条核对；结果只取结构化验收证据，不读取 stdout、stderr 或配置文件。
+    # Get-JsonProperty 已保留数组，不能再用 @() 包成嵌套数组，否则检查数量与身份都会失真。
     # @author kongweiguang
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][Collections.Generic.List[object]]$Rows,
@@ -473,7 +493,7 @@ function Add-ReportChecks {
     $captureBackend = [string](Get-JsonProperty $Report 'captureBackend')
     $parsedSchemaVersion = 0
     $validSchemaVersion = [int]::TryParse([string]$schemaVersion, [ref]$parsedSchemaVersion)
-    $reportState = if ($validSchemaVersion -and $parsedSchemaVersion -in @(3, 4) -and $captureMode -ceq 'hidden_native_window' -and $captureBackend -ceq 'gpui_window_render_to_image') { 'pass' } else { 'fail' }
+    $reportState = if ($validSchemaVersion -and $parsedSchemaVersion -in @(3, 4, 5, 6) -and $captureMode -ceq 'hidden_native_window' -and $captureBackend -ceq 'gpui_window_render_to_image') { 'pass' } else { 'fail' }
     Add-CheckRow $Rows '报告 schema 与渲染方式' $reportState "schemaVersion=$schemaVersion; captureMode=$captureMode; captureBackend=$captureBackend"
 
     $windowVisible = Get-JsonProperty $Report 'windowVisible'
@@ -594,6 +614,69 @@ function Add-ReportChecks {
     $keywordObserved = [string](Get-JsonProperty $keywordCheck 'observed')
     $keywordState = if ($keywordPassed -is [bool] -and $keywordPassed -and $keywordExpected -ceq $keywordObserved) { 'pass' } else { 'fail' }
     Add-CheckRow $Rows '关键词规则保存与取消回读' $keywordState "expected=$keywordExpected; observed=$keywordObserved"
+
+    if ($parsedSchemaVersion -ge 5) {
+        $shortcutChecks = Get-JsonProperty $Report 'shortcutChecks'
+        if ($null -eq $shortcutChecks) { $shortcutChecks = @() }
+        $shortcutActions = @('shortcut-capture-and-cancel', 'shortcut-custom-binding-live')
+        foreach ($action in $shortcutActions) {
+            $check = Find-ReportRecord -Records $shortcutChecks -PropertyName 'action' -ExpectedValue $action
+            $passed = Get-JsonProperty $check 'passed'
+            $expected = [string](Get-JsonProperty $check 'expected')
+            $observed = [string](Get-JsonProperty $check 'observed')
+            $state = if ($passed -is [bool] -and $passed -and $expected.Length -gt 0 -and $expected -ceq $observed) { 'pass' } else { 'fail' }
+            Add-CheckRow $Rows "快捷键 $action" $state "expected=$expected; observed=$observed"
+        }
+        if ($shortcutChecks.Count -ne $shortcutActions.Count) {
+            Add-CheckRow $Rows '快捷键新增检查数量' 'fail' "expected=$($shortcutActions.Count); observed=$($shortcutChecks.Count)"
+        }
+
+        $terminalChecks = Get-JsonProperty $Report 'terminalChecks'
+        if ($null -eq $terminalChecks) { $terminalChecks = @() }
+        $terminalActions = @('terminal-theme-and-live-palette', 'terminal-system-font-search', 'terminal-font-size-step-and-bounds', 'terminal-line-height-step-and-bounds')
+        foreach ($action in $terminalActions) {
+            $check = Find-ReportRecord -Records $terminalChecks -PropertyName 'action' -ExpectedValue $action
+            $passed = Get-JsonProperty $check 'passed'
+            $expected = [string](Get-JsonProperty $check 'expected')
+            $observed = [string](Get-JsonProperty $check 'observed')
+            $state = if ($passed -is [bool] -and $passed -and $expected.Length -gt 0 -and $expected -ceq $observed) { 'pass' } else { 'fail' }
+            Add-CheckRow $Rows "终端 $action" $state "expected=$expected; observed=$observed"
+        }
+        if ($terminalChecks.Count -ne $terminalActions.Count) {
+            Add-CheckRow $Rows '终端新增检查数量' 'fail' "expected=$($terminalActions.Count); observed=$($terminalChecks.Count)"
+        }
+
+        $keywordAdjustments = Get-JsonProperty $Report 'keywordAdjustmentChecks'
+        if ($null -eq $keywordAdjustments) { $keywordAdjustments = @() }
+        $expectedActions = @('keyword-scroll-and-preserve-drafts', 'keyword-search-filter', 'keyword-limit-and-footer')
+        foreach ($action in $expectedActions) {
+            $check = Find-ReportRecord -Records $keywordAdjustments -PropertyName 'action' -ExpectedValue $action
+            $passed = Get-JsonProperty $check 'passed'
+            $expected = [string](Get-JsonProperty $check 'expected')
+            $observed = [string](Get-JsonProperty $check 'observed')
+            $state = if ($passed -is [bool] -and $passed -and $expected.Length -gt 0 -and $expected -ceq $observed) { 'pass' } else { 'fail' }
+            Add-CheckRow $Rows "关键词 $action" $state "expected=$expected; observed=$observed"
+        }
+        if ($keywordAdjustments.Count -ne $expectedActions.Count) {
+            Add-CheckRow $Rows '关键词新增检查数量' 'fail' "expected=$($expectedActions.Count); observed=$($keywordAdjustments.Count)"
+        }
+    }
+    if ($parsedSchemaVersion -ge 6) {
+        $profileHostChecks = Get-JsonProperty $Report 'profileHostChecks'
+        if ($null -eq $profileHostChecks) { $profileHostChecks = @() }
+        $profileHostActions = @('profile-template-not-a-host', 'profile-create-local-host', 'profile-edit-keeps-host-snapshot', 'profile-delete-local-host')
+        foreach ($action in $profileHostActions) {
+            $check = Find-ReportRecord -Records $profileHostChecks -PropertyName 'action' -ExpectedValue $action
+            $passed = Get-JsonProperty $check 'passed'
+            $expected = [string](Get-JsonProperty $check 'expected')
+            $observed = [string](Get-JsonProperty $check 'observed')
+            $state = if ($passed -is [bool] -and $passed -and $expected.Length -gt 0 -and $expected -ceq $observed) { 'pass' } else { 'fail' }
+            Add-CheckRow $Rows "本地主机 $action" $state "expected=$expected; observed=$observed"
+        }
+        if ($profileHostChecks.Count -ne $profileHostActions.Count) {
+            Add-CheckRow $Rows '本地主机检查数量' 'fail' "expected=$($profileHostActions.Count); observed=$($profileHostChecks.Count)"
+        }
+    }
 }
 
 function Write-SettingsReport {
@@ -693,6 +776,20 @@ if (Test-Path -LiteralPath $processPath -PathType Leaf) {
         $processReadStatus = if ($processLoaded) { 'JSON 已读取。' } else { 'JSON 内容为空或为 null。' }
     } catch {
         $processReadStatus = '文件存在但无法解析为 JSON。'
+    }
+}
+
+# 旧报告仍使用终端渲染折叠项；Profile 页按其真实记录决定是否存在。
+# @author kongweiguang
+if ($reportLoaded) {
+    $loadedSchemaVersion = 0
+    if ([int]::TryParse([string](Get-JsonProperty $report 'schemaVersion'), [ref]$loadedSchemaVersion) -and $loadedSchemaVersion -lt 5) {
+        $script:DisclosureDefinitions = @([pscustomobject]@{ Id = 'terminal-renderer'; Label = '终端渲染' }) + $script:DisclosureDefinitions
+        $loadedThemes = Get-JsonProperty $report 'themes'
+        $loadedPages = if ($null -ne $loadedThemes -and $loadedThemes.Count -gt 0) { Get-JsonProperty $loadedThemes[0] 'pages' } else { @() }
+        if ($null -eq (Find-ReportRecord -Records $loadedPages -PropertyName 'pageId' -ExpectedValue 'profiles')) {
+            $script:PageDefinitions = @($script:PageDefinitions | Where-Object { $_.Id -cne 'profiles' })
+        }
     }
 }
 

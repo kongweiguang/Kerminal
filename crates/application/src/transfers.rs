@@ -527,6 +527,8 @@ pub enum TransferQueueEvent {
     Changed,
     /// 清理终态后通知观察者重新读取完整快照，包括队列已变为空的情况。
     Cleared,
+    /// 广播丢帧；完整快照可能已不含短暂终态，观察者需保守回读当前目录。
+    Resync,
 }
 
 /// 有界广播订阅只向调用方暴露唤醒信号，避免 UI 依赖 Tokio 广播错误类型。
@@ -540,6 +542,14 @@ impl TransferQueueSubscription {
     /// @author kongweiguang
     pub async fn recv(&mut self, cancellation: CancellationToken) -> Option<()> {
         subscription::receive_transfer_wakeup(&mut self.receiver, &cancellation).await
+    }
+
+    /// 界面需要清理/丢帧事实以补偿目录刷新；事件本身仍不代表任何任务终态。
+    pub async fn recv_event(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Option<TransferQueueEvent> {
+        subscription::receive_transfer_event(&mut self.receiver, &cancellation).await
     }
 }
 

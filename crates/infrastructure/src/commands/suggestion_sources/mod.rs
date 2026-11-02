@@ -7,13 +7,16 @@
 
 mod cache;
 mod git;
+mod local;
 mod projection;
 mod remote_command;
 mod remote_path;
 mod syntax;
 
+pub use local::LocalCommandSuggestionProvider;
+
 use projection::{
-    CandidateContext, candidate, command_cache_key_for_git, parse_remote_path, prefix_score, quote,
+    CandidateContext, candidate, command_cache_key_for_git, parse_remote_path, prefix_score,
     requested,
 };
 
@@ -300,11 +303,12 @@ impl RemoteCommandSuggestionProvider {
                     stream: None,
                     lease: None,
                 }, cleanup_deadline).await;
-                Ok(None)
+                Err(AppError::timeout("远端建议连接超时"))
             }
             result = &mut task => match result {
                 Ok(Ok(lease)) => Ok(Some(lease)),
-                _ => Ok(None),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(AppError::infrastructure("远端建议连接任务异常终止")),
             }
         }
     }
@@ -367,11 +371,12 @@ impl RemoteCommandSuggestionProvider {
                     stream: None,
                     lease: None,
                 }, query.cleanup_deadline).await;
-                return Ok(None);
+                return Err(AppError::timeout("远端建议探测超时"));
             }
             result = &mut task => match result {
                 Ok(Ok(stream)) => stream,
-                _ => return Ok(None),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(AppError::infrastructure("远端建议探测任务异常终止")),
             }
         };
         let output = collect_command_output(
@@ -390,11 +395,10 @@ impl RemoteCommandSuggestionProvider {
                     lease: Some(lease.clone()),
                 });
             }
-            let _ = error;
             if query.cancellation.is_cancelled() {
                 return Err(AppError::cancelled("远端建议查询已取消"));
             }
-            return Ok(None);
+            return Err(error);
         }
         if query.cancellation.is_cancelled() {
             return Err(AppError::cancelled("远端建议查询已取消"));
@@ -422,13 +426,13 @@ impl RemoteCommandSuggestionProvider {
             return Ok(Some(entries));
         }
         if self.directories.is_backing_off(&key).await {
-            return Ok(None);
+            return Err(AppError::infrastructure("远端建议目录暂不可用"));
         }
         let gate = self.directories.gate(&key);
         let guard = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(AppError::cancelled("远端建议查询已取消")),
-            _ = sleep_until(deadline) => return Ok(None),
+            _ = sleep_until(deadline) => return Err(AppError::timeout("远端建议目录读取超时")),
             guard = lock_gate(gate, cancellation) => guard,
         };
         let Some(_guard) = guard else {
@@ -438,7 +442,7 @@ impl RemoteCommandSuggestionProvider {
             return Ok(Some(entries));
         }
         if self.directories.is_backing_off(&key).await {
-            return Ok(None);
+            return Err(AppError::infrastructure("远端建议目录暂不可用"));
         }
 
         let endpoint = FileEndpoint::Remote {
@@ -452,12 +456,23 @@ impl RemoteCommandSuggestionProvider {
             .run_bounded(cancellation, deadline, |cancel| {
                 self.files.list_directory(cancel, endpoint.clone())
             })
-            .await?;
+            .await;
+        let listing = match listing {
+            Ok(listing) => listing,
+            Err(error) => {
+                if !cancellation.is_cancelled() {
+                    self.directories
+                        .mark_failure(key, REMOTE_FAILURE_BACKOFF)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
         let Some(listing) = listing else {
             self.directories
                 .mark_failure(key, REMOTE_FAILURE_BACKOFF)
                 .await;
-            return Ok(None);
+            return Err(AppError::infrastructure("远端建议目录读取失败"));
         };
         if !self.policy.allows(source) {
             return Ok(None);
@@ -466,7 +481,7 @@ impl RemoteCommandSuggestionProvider {
             self.directories
                 .mark_failure(key, REMOTE_FAILURE_BACKOFF)
                 .await;
-            return Ok(None);
+            return Err(AppError::infrastructure("远端建议目录返回不匹配的目标"));
         }
         let entries = listing
             .entries
@@ -506,7 +521,7 @@ impl RemoteCommandSuggestionProvider {
             return Err(AppError::cancelled("远端建议查询已取消"));
         }
         if Instant::now() >= deadline {
-            return Ok(None);
+            return Err(AppError::timeout("远端建议操作超时"));
         }
         let operation_cancel = cancellation.child_token();
         let operation = build(operation_cancel.clone());
@@ -521,11 +536,11 @@ impl RemoteCommandSuggestionProvider {
             _ = sleep_until(deadline) => {
                 operation_cancel.cancel();
                 let _ = timeout(REMOTE_OPERATION_CLEANUP_BUDGET, &mut operation).await;
-                Ok(None)
+                Err(AppError::timeout("远端建议操作超时"))
             }
             result = &mut operation => match result {
                 Ok(value) => Ok(Some(value)),
-                Err(_) => Ok(None),
+                Err(error) => Err(error),
             }
         }
     }
@@ -582,6 +597,24 @@ impl CommandSuggestionProvider for RemoteCommandSuggestionProvider {
         ]
     }
 
+    /// Git 统一入口支持本地与 SSH；路径和 PATH 远端来源只属于 SSH。
+    fn supports_provider_target(
+        &self,
+        provider: SuggestionProviderKind,
+        target: CommandHistoryTarget,
+    ) -> bool {
+        match provider {
+            SuggestionProviderKind::Git => matches!(
+                target,
+                CommandHistoryTarget::Local | CommandHistoryTarget::Ssh
+            ),
+            SuggestionProviderKind::RemotePath | SuggestionProviderKind::RemoteCommand => {
+                target == CommandHistoryTarget::Ssh
+            }
+            _ => false,
+        }
+    }
+
     /// 仅处理明确 SSH session 和用户输入前缀，过期、超时、未知 shell 或恢复态关闭均安全降级。
     async fn suggest(
         &self,
@@ -590,6 +623,9 @@ impl CommandSuggestionProvider for RemoteCommandSuggestionProvider {
     ) -> AppResult<Vec<CommandSuggestionCandidate>> {
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("远端建议查询已取消"));
+        }
+        if request.target == CommandHistoryTarget::Local {
+            return local::git_suggestions(&request, cancellation).await;
         }
         let input_characters = request
             .input
@@ -637,9 +673,17 @@ impl CommandSuggestionProvider for RemoteCommandSuggestionProvider {
         let Some(host_id) = Self::request_host(&request, &cancellation)? else {
             return Ok(Vec::new());
         };
-        // SSH request.shell 来自终端投影且可能缺失或过期；先用未知语法决定是否需认证探测。
+        // 路径仅做本地词法编码；涉及远端命令时仍由认证 lease 确认 Shell 类型。
+        let path_only = requested(&request, SuggestionProviderKind::RemotePath)
+            && !requested(&request, SuggestionProviderKind::RemoteCommand)
+            && !requested(&request, SuggestionProviderKind::Git);
+        let initial_shell = if path_only {
+            syntax::named_shell_family(request.shell.as_deref())
+        } else {
+            syntax::ShellFamily::Unknown
+        };
         let Some(initial_prefix) =
-            syntax::parse_prefix(&request.input, request.cursor, syntax::ShellFamily::Unknown)
+            syntax::parse_prefix(&request.input, request.cursor, initial_shell)
         else {
             return Ok(Vec::new());
         };
@@ -650,21 +694,22 @@ impl CommandSuggestionProvider for RemoteCommandSuggestionProvider {
             && remote_command::requires_remote_query(&initial_prefix);
         let dynamic_git = requested(&request, SuggestionProviderKind::Git)
             && self.policy.allows(SuggestionProviderKind::Git)
+            && request.cwd.as_deref().is_some_and(is_absolute_remote_cwd)
             && git::requires_remote_query(&initial_prefix);
         let needs_ssh = dynamic_command || dynamic_git;
         let _remote_exec_guard = if needs_ssh {
             let guard = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(AppError::cancelled("远端建议查询已取消")),
-                _ = sleep_until(operation_deadline) => return Ok(Vec::new()),
+                _ = sleep_until(operation_deadline) => return Err(AppError::timeout("等待远端建议执行槽超时")),
                 guard = self.remote_exec_gate.lock() => guard,
             };
             Some(guard)
         } else {
             None
         };
-        if needs_ssh && self.flush_pending_cleanup(deadline).await.is_err() {
-            return Ok(Vec::new());
+        if needs_ssh {
+            self.flush_pending_cleanup(deadline).await?;
         }
         let lease = if needs_ssh {
             self.connect_for_suggestions(&host_id, &cancellation, operation_deadline, deadline)
@@ -672,14 +717,12 @@ impl CommandSuggestionProvider for RemoteCommandSuggestionProvider {
         } else {
             None
         };
-        let shell = lease
-            .as_ref()
-            .map_or(syntax::ShellFamily::Unknown, |lease| {
-                syntax::remote_shell_family(lease.shell_kind())
-            });
+        let shell = lease.as_ref().map_or(initial_shell, |lease| {
+            syntax::remote_shell_family(lease.shell_kind())
+        });
         let Some(prefix) = syntax::parse_prefix(&request.input, request.cursor, shell) else {
             if let Some(lease) = lease {
-                let _ = self.close_lease(lease, deadline).await;
+                self.close_lease(lease, deadline).await?;
             }
             return Ok(Vec::new());
         };
@@ -736,6 +779,16 @@ impl CommandSuggestionProvider for RemoteCommandSuggestionProvider {
     }
 }
 
+/// Git 探测必须绑定已确认的远端绝对目录，不能让 SSH 默认目录代替实时 cwd。
+fn is_absolute_remote_cwd(cwd: &str) -> bool {
+    let bytes = cwd.as_bytes();
+    cwd.starts_with('/')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
 /// 以单一期限读取有限 stdout，非零退出、截断输出、错误流或取消均不能伪装成有效候选。
 async fn collect_command_output(
     stream: &mut CommandStreamHandle,
@@ -749,24 +802,22 @@ async fn collect_command_output(
         let event = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(AppError::cancelled("远端建议查询已取消")),
-            _ = sleep_until(deadline) => return Ok(None),
+            _ = sleep_until(deadline) => return Err(AppError::timeout("读取远端建议输出超时")),
             event = stream.next_event() => event,
         };
-        let Ok(Some(event)) = event else {
-            return Ok(None);
-        };
+        let event = event?.ok_or_else(|| AppError::infrastructure("远端建议输出提前结束"))?;
         match event {
             CommandEvent::Stdout(bytes) => {
                 total_bytes = total_bytes.saturating_add(bytes.len());
                 if total_bytes > maximum_bytes {
-                    return Ok(None);
+                    return Err(AppError::infrastructure("远端建议输出超过限制"));
                 }
                 stdout.extend(bytes);
             }
             CommandEvent::Stderr(bytes) => {
                 total_bytes = total_bytes.saturating_add(bytes.len());
                 if total_bytes > maximum_bytes {
-                    return Ok(None);
+                    return Err(AppError::infrastructure("远端建议输出超过限制"));
                 }
             }
             CommandEvent::Exited { code, signal } => {

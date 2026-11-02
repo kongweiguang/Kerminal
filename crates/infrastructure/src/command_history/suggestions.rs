@@ -286,12 +286,16 @@ const fn action_as_str(action: CommandSuggestionFeedbackAction) -> &'static str 
     }
 }
 
-/// 映射 provider 到 v1–v3 SQLite 检查约束使用的历史字符串。
+/// 路径与命令来源沿用 schema 3 的历史标识，由 target 区分本地与 SSH，避免仅为新增来源迁移用户数据库。
+///
+/// @author kongweiguang
 const fn provider_as_str(provider: SuggestionProviderKind) -> &'static str {
     match provider {
         SuggestionProviderKind::History => "history",
-        SuggestionProviderKind::RemotePath => "remotePath",
-        SuggestionProviderKind::RemoteCommand => "remoteCommand",
+        SuggestionProviderKind::LocalPath | SuggestionProviderKind::RemotePath => "remotePath",
+        SuggestionProviderKind::LocalCommand | SuggestionProviderKind::RemoteCommand => {
+            "remoteCommand"
+        }
         SuggestionProviderKind::Git => "git",
         SuggestionProviderKind::Spec => "spec",
         SuggestionProviderKind::Snippet => "snippet",

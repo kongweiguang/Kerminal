@@ -4,8 +4,9 @@
 //!
 //! @author kongweiguang
 
-use gpui_kit::{Context, Window};
+use gpui_kit::{Context, ElementId, Window};
 use kerminal_application::operations::ManagedPortForwardSnapshot;
+use kerminal_application::sessions::UiSessionBinding;
 use kerminal_domain::{
     identity::HostId,
     operations::{
@@ -14,9 +15,107 @@ use kerminal_domain::{
     },
 };
 
-use super::{OperationsSection, OperationsView, forms::ForwardBindScope};
+use super::{
+    OperationsSection, OperationsView, forms::ForwardBindScope, proxy_panel::ProxyCurrentSession,
+};
 
 impl OperationsView {
+    /// 回读刷新期间的同一恢复动作和忙碌门禁，原隧道被删除后仍不更换绑定。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_proxy_action(
+        &self,
+        expected: &PortForwardConfig,
+        forward_id: &str,
+        binding: &UiSessionBinding,
+        cx: &gpui_kit::App,
+    ) -> Result<(bool, bool), String> {
+        validate_acceptance_forward(expected)?;
+        if self.host_target.as_ref() != Some(&expected.host_id) || !self.active {
+            return Err("代理验收目标已变化".to_owned());
+        }
+        let panel = self
+            .proxy_panel
+            .as_ref()
+            .ok_or_else(|| "代理面板不可用".to_owned())?
+            .read(cx);
+        let current = panel
+            .current_session()
+            .ok_or_else(|| "刷新时代理终端投影消失".to_owned())?;
+        if current.binding != *binding || panel.current_recovery_forward_id() != Some(forward_id) {
+            return Err("刷新时代理恢复目标已变化".to_owned());
+        }
+        let action = panel.action_state_for_forward(forward_id);
+        Ok((action.busy, action.restore_current))
+    }
+
+    /// 制造唯一的无效监听端口以执行正式校验，同时保持 fixture 表单及主机身份不变。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_invalid_forward_port(
+        &mut self,
+        host_id: &HostId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<ElementId, String> {
+        if self.busy || self.forward_form_host_id().as_ref() != Some(host_id) {
+            return Err("SSH 隧道表单目标不匹配或正在提交".to_owned());
+        }
+        let inputs = self
+            .inputs
+            .as_ref()
+            .filter(|inputs| inputs.forward_form_open)
+            .ok_or_else(|| "SSH 隧道表单尚未打开".to_owned())?;
+        let port = inputs.forward_bind_port.clone();
+        port.update(cx, |state, cx| state.set_value("0", window, cx));
+        Ok(("input", port.entity_id()).into())
+    }
+
+    /// 验收同时观察真实列表 Loading 阶段和稳定请求序号，避免空白帧被当成刷新效果。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_forward_loading(&self) -> bool {
+        self.forwards.phase() == super::state::SectionPhase::Loading
+    }
+
+    /// 仅读取当前 fixture 的代理投影，停止或删除原转发后仍须保留原恢复记录。
+    /// 只读实体使用 App 上下文，使 Root 核验无需构造 Operations 的可变上下文。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_proxy_session(
+        &self,
+        expected: &PortForwardConfig,
+        forward_id: &str,
+        cx: &gpui_kit::App,
+    ) -> Result<Option<(ProxyCurrentSession, Option<String>, String)>, String> {
+        validate_acceptance_forward(expected)?;
+        if expected.kind != ForwardKind::RemoteDynamic {
+            return Err("代理验收要求远端 SOCKS 隧道".to_owned());
+        }
+        if !self.right_rail_acceptance_ready(OperationsSection::PortForwards, &expected.host_id)? {
+            return Ok(None);
+        }
+        let Some(panel) = &self.proxy_panel else {
+            return Ok(None);
+        };
+        let panel_id = panel.entity_id();
+        let panel = panel.read(cx);
+        let Some(current) = panel.current_session().cloned() else {
+            return Ok(None);
+        };
+        if current.host_id != expected.host_id {
+            return Err("代理投影不属于 fixture 主机".to_owned());
+        }
+        Ok(Some((
+            current,
+            panel.current_recovery_forward_id().map(str::to_owned),
+            format!(
+                "panel={panel_id:?}, action={:?}",
+                panel.action_state_for_forward(forward_id)
+            ),
+        )))
+    }
+
     /// 只通过生产 Add 表单保存唯一 rr-ui 定义，并严格比较全部方向和端点字段。
     ///
     /// @author kongweiguang
@@ -192,7 +291,69 @@ impl OperationsView {
         self.mutation_started("生产隧道停止")
     }
 
-    /// 只删除同一 ID 的停止定义，删除由生产 repository 基线校验并异步回读。
+    /// 冻结同一 fixture 的删除确认，避免验收绕过生产确认入口或改投其他定义。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_open_forward_delete_confirmation(
+        &mut self,
+        expected: &PortForwardConfig,
+        forward_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        self.require_acceptance_forward(expected, forward_id)?;
+        if self.busy || self.root_confirmation_active() {
+            return Err("Operations 有其他确认或写操作在途".to_owned());
+        }
+        self.request_delete_forward_definition(forward_id.to_owned(), cx);
+        if self.right_rail_acceptance_forward_delete_confirmation_ready(expected, forward_id)? {
+            Ok(true)
+        } else {
+            Err("生产隧道删除确认未打开".to_owned())
+        }
+    }
+
+    /// 只接受完整配置、稳定 ID 和目标代次均匹配的删除确认。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_forward_delete_confirmation_ready(
+        &self,
+        expected: &PortForwardConfig,
+        forward_id: &str,
+    ) -> Result<bool, String> {
+        self.require_acceptance_forward(expected, forward_id)?;
+        let Some((definition, generation)) = self.forward_pending_delete.as_ref() else {
+            return Ok(false);
+        };
+        if definition.id != forward_id
+            || definition.config != *expected
+            || *generation != self.target_generation
+        {
+            return Err("隧道删除确认与验收目标不一致".to_owned());
+        }
+        Ok(true)
+    }
+
+    /// 取消仅撤销确认草稿，并重新核对原定义仍在当前目标清单中。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_cancel_forward_delete_confirmation(
+        &mut self,
+        expected: &PortForwardConfig,
+        forward_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        if !self.right_rail_acceptance_forward_delete_confirmation_ready(expected, forward_id)? {
+            return Err("没有待取消的验收隧道删除确认".to_owned());
+        }
+        self.cancel_root_confirmation(cx);
+        if self.forward_pending_delete.is_some() || self.busy {
+            return Err("隧道删除确认未被取消".to_owned());
+        }
+        self.require_acceptance_forward(expected, forward_id)?;
+        Ok(true)
+    }
+
+    /// 确认同一 ID 的停止定义后才删除，结果仍由生产 repository 和清单回读确认。
     ///
     /// @author kongweiguang
     pub(crate) fn right_rail_acceptance_delete_forward(
@@ -205,14 +366,13 @@ impl OperationsView {
         if row.forward.state != ForwardState::Stopped {
             return Err("必须先停止本轮 fixture 隧道才能删除定义".to_owned());
         }
-        if self.busy || self.root_confirmation_active() {
-            return Err("Operations 有其他确认或写操作在途".to_owned());
+        if self.busy
+            || !self
+                .right_rail_acceptance_forward_delete_confirmation_ready(expected, forward_id)?
+        {
+            return Err("本轮 fixture 隧道的删除确认尚未就绪".to_owned());
         }
-        let definition = kerminal_application::operations::PortForwardDefinition {
-            id: row.forward.id.clone(),
-            config: row.forward.config.clone(),
-        };
-        self.delete_forward_definition(definition, cx);
+        self.confirm_root_confirmation(cx);
         self.mutation_started("生产隧道删除")
     }
 

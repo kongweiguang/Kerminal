@@ -587,7 +587,9 @@ fn standalone_configuration_validator_rejects_pending_transaction_without_recove
 }
 
 #[tokio::test]
-/// 直接把唯一配置指南中的六类示例写入隔离根并经真实只读 validator 校验。
+/// 指南示例直接经真实只读 validator 校验，防止本地和远程主机的字段契约漂移。
+///
+/// @author kongweiguang
 async fn configuration_guide_examples_pass_the_configuration_validator() {
     let temp = TemporaryConfigRoot::new();
     for directory in ["profiles", "hosts", "snippets", "workflows"] {
@@ -630,6 +632,11 @@ async fn configuration_guide_examples_pass_the_configuration_validator() {
     );
     fs::write(temp.0.join("hosts/build-host.toml"), host).expect("写入主机示例");
     fs::write(
+        temp.0.join("hosts/local-work.toml"),
+        guide_toml_example("local-host"),
+    )
+    .expect("写入本地主机示例");
+    fs::write(
         temp.0.join("snippets/inspect-host.toml"),
         guide_toml_example("snippet"),
     )
@@ -651,7 +658,7 @@ async fn configuration_guide_examples_pass_the_configuration_validator() {
     assert_eq!(report.warning_count, 0);
 }
 
-/// 先校验指南示例的嵌套与布局默认，再经过 typed settings 端口确认磁盘 DTO 的实际解码结果。
+/// 指南示例经过真实设置仓储读取，防止布局与 MCP 监听字段的文档结构漂移。
 ///
 /// @author kongweiguang
 #[tokio::test]
@@ -697,6 +704,13 @@ async fn settings_guide_example_decodes_appearance_and_workbench_layout_fields()
     assert!(root.contains_key("keybindings"), "keybindings 必须保持顶层");
     assert!(root.contains_key("themeMode"));
     assert!(root.contains_key("interfaceDensity"));
+    let mcp = root
+        .get("mcp")
+        .and_then(toml::Value::as_table)
+        .expect("MCP 监听字段位于 mcp 表");
+    assert_eq!(mcp["bindMode"].as_str(), Some("loopback"));
+    assert_eq!(mcp["port"].as_integer(), Some(37657));
+    assert!(!mcp.contains_key("tokenRef"));
 
     let appearance = example
         .as_table_mut()
@@ -748,6 +762,12 @@ async fn settings_guide_example_decodes_appearance_and_workbench_layout_fields()
     );
     assert_eq!(loaded.settings.background_opacity, 67);
     assert_eq!(loaded.settings.window_opacity, 82);
+    assert_eq!(
+        loaded.settings.mcp.bind_mode,
+        kerminal_application::preferences::settings::McpBindMode::Loopback
+    );
+    assert_eq!(loaded.settings.mcp.port, 37657);
+    assert_eq!(loaded.settings.mcp.token_ref, None);
     assert!(!loaded.settings.workbench_layout.host_sidebar_collapsed);
     assert_eq!(loaded.settings.workbench_layout.host_sidebar_width, 220);
     assert!(
@@ -864,10 +884,10 @@ async fn unknown_app_color_scheme_is_reported_without_rewriting_configuration() 
 }
 
 #[tokio::test]
-/// 跨文件引用错误作为脱敏诊断返回，validation 不会改写源 profile。
+/// 即使分组确实存在，当前 Profile 也不允许分组；校验只返回脱敏诊断并保留源文件。
 ///
 /// @author kongweiguang
-async fn configuration_validator_reports_broken_profile_group_reference_without_writing() {
+async fn configuration_validator_rejects_profile_group_without_writing() {
     let temp = TemporaryConfigRoot::new();
     let profiles = temp.0.join("profiles");
     let hosts = temp.0.join("hosts");
@@ -880,16 +900,16 @@ async fn configuration_validator_reports_broken_profile_group_reference_without_
     .expect("写入隔离密钥忽略规则");
     fs::write(
         hosts.join("groups.toml"),
-        "schema_version = 1\ngroups = []\n",
+        "schema_version = 1\ngroups = [{ id = \"existing-group\", name = \"Existing\", sort_order = 0, created_at = \"1\", updated_at = \"1\" }]\n",
     )
-    .expect("写入合成空分组列表");
+    .expect("写入合成分组列表");
     let profile = concat!(
         "schema_version = 1\n",
         "id = \"launch\"\n",
         "name = \"Launch\"\n",
         "shell = \"fixture-shell\"\n",
         "is_default = true\n",
-        "sidebar_group_id = \"missing-group\"\n",
+        "sidebar_group_id = \"existing-group\"\n",
         "sort_order = 10\n",
         "created_at = \"1\"\n",
         "updated_at = \"1\"\n",
@@ -913,11 +933,9 @@ async fn configuration_validator_reports_broken_profile_group_reference_without_
         ConfigurationValidationSeverity::Error
     );
     assert_eq!(report.diagnostics[0].path, "profiles/launch.toml");
-    assert_eq!(
-        report.diagnostics[0].key.as_deref(),
-        Some("sidebar_group_id")
-    );
-    assert!(!report.diagnostics[0].message.contains("missing-group"));
+    assert_eq!(report.diagnostics[0].key, None);
+    assert_eq!(report.diagnostics[0].message, "Profile 不支持主机分组");
+    assert!(!report.diagnostics[0].message.contains("existing-group"));
     assert_eq!(after, profile.as_bytes());
 }
 
@@ -1202,7 +1220,6 @@ keybindings = [{ action = "terminal.newTab", label = "新建终端", description
         Some("keep-me")
     );
     assert!(row.get("linuxBinding").is_none());
-    assert!(row.get("windowsAlternateBinding").is_none());
 }
 
 /// 可选快捷键字段区分旧配置缺失与用户显式清空，并通过真实 settings codec 往返。
@@ -1225,14 +1242,9 @@ keybindings = [{ action = "terminal.paste", label = "粘贴", description = "", 
     let service = PreferencesService::new(Arc::new(store.clone()));
     let loaded = service.load_settings().await.expect("旧设置可读取");
     assert_eq!(loaded.settings.keybindings[0].linux_binding, None);
-    assert_eq!(
-        loaded.settings.keybindings[0].windows_alternate_binding,
-        None
-    );
 
     let mut changed = loaded.settings.clone();
     changed.keybindings[0].linux_binding = Some(String::new());
-    changed.keybindings[0].windows_alternate_binding = Some(String::new());
     service
         .save_settings(changed, loaded.revision)
         .await
@@ -1253,20 +1265,9 @@ keybindings = [{ action = "terminal.paste", label = "粘贴", description = "", 
         row.get("linuxBinding").and_then(toml::Value::as_str),
         Some("")
     );
-    assert_eq!(
-        row.get("windowsAlternateBinding")
-            .and_then(toml::Value::as_str),
-        Some("")
-    );
     let reloaded = service.load_settings().await.expect("保存后可回读");
     assert_eq!(
         reloaded.settings.keybindings[0].linux_binding.as_deref(),
-        Some("")
-    );
-    assert_eq!(
-        reloaded.settings.keybindings[0]
-            .windows_alternate_binding
-            .as_deref(),
         Some("")
     );
 }

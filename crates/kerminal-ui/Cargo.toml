@@ -36,6 +36,9 @@ uuid.workspace = true
 unicode_segmentation.workspace = true
 unicode_width.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+
 [dev-dependencies]
 # Headless tests exercise the selected GPUI backend without resolving Kit's optional fast backend.
 async-trait.workspace = true

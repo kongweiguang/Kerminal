@@ -7,7 +7,6 @@ use std::{fs, path::Path};
 use crate::storage::CommitMode;
 use kerminal_application::PublicErrorCode;
 use kerminal_application::connections::management::HostDocumentRevision;
-use kerminal_application::preferences::ProfileDraft;
 use kerminal_domain::{
     identity::HostId,
     preferences::{ConfigRevision, ConfigurationMode},
@@ -117,33 +116,27 @@ fn group_delete_rejects_incomplete_host_snapshot() {
     assert!(!temp.path().join(HOST_GROUP_JOURNAL).exists());
 }
 
-/// 锁内检查须包含确认后新出现的本地主机；拒绝不写任何文件，显式移组后仍可继续删除。
+/// 锁内检查必须包含本地主机 revision；完整快照则一次迁移本地与远程主机。
+///
+/// @author kongweiguang
 #[test]
-fn group_delete_rejects_local_references_until_reassigned() {
+fn group_delete_checks_and_reassigns_local_host_revisions() {
     let (temp, store) = initialized_store();
     let groups = read_groups_document(temp.path())
         .expect("读取 groups")
         .expect("groups 存在");
     let hosts = expected_host_revisions(temp.path());
-    let local = store
-        .save_profile_document(
-            ProfileDraft {
-                id: Some("local-a".to_owned()),
-                name: "Local A".to_owned(),
-                shell: "fixture-shell".to_owned(),
-                args: Vec::new(),
-                cwd: None,
-                env: Default::default(),
-                sidebar_group_id: Some("old".to_owned()),
-                sort_order: 0,
-            },
-            None,
-        )
-        .expect("在分组确认快照后添加本地主机");
+    let local = concat!(
+        "schema_version = 3\nprotocol = \"local\"\nid = \"local-a\"\n",
+        "group_id = \"old\"\nname = \"Local A\"\nsort_order = 0\n",
+        "created_at = \"1\"\nupdated_at = \"1\"\n",
+        "[local]\nshell = \"fixture-shell\"\nargs = []\n",
+    );
+    fs::write(temp.path().join("hosts/local-a.toml"), local).expect("在快照后添加本地主机");
     let before = [
         "hosts/groups.toml",
         "hosts/server-a.toml",
-        "profiles/local-a.toml",
+        "hosts/local-a.toml",
     ]
     .map(|path| {
         (
@@ -160,34 +153,19 @@ fn group_delete_rejects_local_references_until_reassigned() {
                 groups.revision.clone(),
                 hosts.clone(),
             )
-            .expect_err("不能删除仍被本地主机引用的组");
+            .expect_err("漏掉本地主机 revision 必须冲突");
         assert_eq!(error.public_code(), PublicErrorCode::Conflict);
-        assert_eq!(
-            error.public_message(),
-            "分组仍有本地主机，请先调整本地主机分组后再删除"
-        );
         for (path, bytes) in &before {
             assert_eq!(&fs::read(temp.path().join(path)).unwrap(), bytes);
         }
         assert!(!temp.path().join(HOST_GROUP_JOURNAL).exists());
     }
 
-    let profile = local.profile;
-    store
-        .save_profile_document(
-            ProfileDraft {
-                id: Some(profile.id),
-                name: profile.name,
-                shell: profile.shell,
-                args: profile.args,
-                cwd: profile.cwd,
-                env: profile.env,
-                sidebar_group_id: None,
-                sort_order: profile.sort_order,
-            },
-            Some(local.revision),
-        )
-        .expect("通过现有 Profile CAS 将本地主机移到未分组");
+    let mut hosts = hosts;
+    hosts.push(HostDocumentRevision {
+        host_id: HostId::parse("local-a").expect("本地主机 ID"),
+        revision: revision_for(local),
+    });
     let receipt = store
         .delete_host_group_and_reassign(
             "old".to_owned(),
@@ -195,22 +173,15 @@ fn group_delete_rejects_local_references_until_reassigned() {
             groups.revision,
             hosts,
         )
-        .expect("本地主机移组后可继续原删除流程");
-    assert_eq!(receipt.reassigned_hosts, 1);
+        .expect("完整快照应迁移所有主机");
+    assert_eq!(receipt.reassigned_hosts, 2);
     assert!(
         !parse_group_ids(&receipt.groups.source)
             .expect("解析最终分组")
             .contains("old")
     );
-    assert!(
-        store
-            .get_profile_document("local-a".to_owned())
-            .expect("读回本地主机")
-            .expect("本地主机仍存在")
-            .profile
-            .sidebar_group_id
-            .is_none()
-    );
+    let local = fs::read_to_string(temp.path().join("hosts/local-a.toml")).expect("读回本地主机");
+    assert!(local.contains("group_id = \"dest\""));
     assert!(!temp.path().join(HOST_GROUP_JOURNAL).exists());
 }
 

@@ -127,8 +127,12 @@ fn apply_new_transaction(
 ) -> AppResult<DataMigrationReport> {
     let mut edits = inspection::collect_plan(root, legacy_window_state.as_deref())
         .map_err(|_| AppError::conflict("用户数据不满足当前迁移规则"))?;
+    if inspection_result.readiness == DataMigrationReadiness::Fresh {
+        edits.extend(super::profile_hosts::plan_initial_profiles()?);
+    }
     edits.retain(|edit| {
         edit.before.as_deref() != Some(edit.after.as_slice())
+            || edit.relative_path.starts_with("profiles")
             || edit.relative_path == Path::new(operational_state::LEGACY_FORWARDS)
             || edit.relative_path == Path::new("data/port-forwards/definitions.json")
     });
@@ -139,6 +143,7 @@ fn apply_new_transaction(
     let operation_id = Uuid::new_v4().to_string();
     let operation_dir = journal::operation_directory(root, &operation_id);
     journal::ensure_directory(root, &operation_dir)?;
+    secure_operation_directory(root, &operation_dir)?;
     let prepared_sqlite = match sqlite::prepare(root, &operation_dir) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -222,6 +227,7 @@ pub(super) fn apply_current_guide_locked(
     let operation_id = Uuid::new_v4().to_string();
     let operation_dir = journal::operation_directory(root, &operation_id);
     journal::ensure_directory(root, &operation_dir)?;
+    secure_operation_directory(root, &operation_dir)?;
     let report = apply_prepared_transaction(
         root,
         &operation_id,
@@ -232,6 +238,71 @@ pub(super) fn apply_current_guide_locked(
         previous_committed.as_ref(),
     )?;
     with_retained_backups(root, report)
+}
+
+/// 显式导入使用当前 marker 的同值哨兵，保留原文和已提交事务的完整备份。
+pub(super) fn apply_current_profile_import_locked(
+    root: &Path,
+    mut edits: Vec<FileEdit>,
+) -> AppResult<DataMigrationReport> {
+    if edits.is_empty()
+        || edits.len() >= 4096
+        || edits
+            .iter()
+            .any(|edit| !is_profile_import_path(&edit.relative_path))
+    {
+        return Err(AppError::conflict("Profile 导入计划包含不支持的目标"));
+    }
+    inspection::validate_edits(root, &edits)
+        .map_err(|_| AppError::conflict("导入目标在预检后发生变化"))?;
+    let before = fs::read(root.join(marker::MARKER_FILE_NAME))
+        .map_err(|source| AppError::infrastructure_with_source("读取当前格式标记失败", source))?;
+    if before != marker::current_marker_bytes() {
+        return Err(AppError::conflict(
+            "当前格式标记含非规范内容，导入未改写该文件",
+        ));
+    }
+    edits.push(FileEdit {
+        relative_path: PathBuf::from(marker::MARKER_FILE_NAME),
+        before: Some(before.clone()),
+        after: before,
+    });
+    let previous_committed = match journal::read_active_journal(root)? {
+        Some(active) if active.state == JournalState::Committed => {
+            journal::archive_committed_journal(root, &active)?;
+            Some(active)
+        }
+        Some(_) => return Err(AppError::conflict("已有迁移事务需要先恢复")),
+        None => None,
+    };
+    let operation_id = Uuid::new_v4().to_string();
+    let operation_dir = journal::operation_directory(root, &operation_id);
+    journal::ensure_directory(root, &operation_dir)?;
+    secure_operation_directory(root, &operation_dir)?;
+    let report = apply_prepared_transaction(
+        root,
+        &operation_id,
+        edits,
+        None,
+        false,
+        DataMigrationOutcome::Migrated,
+        previous_committed.as_ref(),
+    )?;
+    with_retained_backups(root, report)
+}
+
+/// 导入事务只允许独立 Profile、host、分组和对应 Vault 文件，不能借同值 marker 改写其它配置。
+fn is_profile_import_path(path: &Path) -> bool {
+    if path == Path::new("hosts/groups.toml")
+        || path == Path::new("secrets/vault.toml")
+        || path == Path::new("secrets/vault-key.toml")
+    {
+        return true;
+    }
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Normal(name)) if name == "profiles" || name == "hosts")
+        && matches!(components.next(), Some(Component::Normal(name)) if Path::new(name).extension().is_some_and(|extension| extension == "toml"))
+        && components.next().is_none()
 }
 
 /// Commit a caller-supplied, already planned edit set through the single durable journal engine.
@@ -280,11 +351,11 @@ fn changed_file_count(journal: &MigrationJournal) -> usize {
         .count()
 }
 
-/// marker 升级保留源文件精确字节做 CAS；只有已知 (4, 1) 可覆盖，其他标记均拒绝。
+/// marker 升级保留源文件精确字节做 CAS；只有已知同代契约可覆盖，其他标记均拒绝。
 fn marker_before_upgrade(root: &Path) -> AppResult<Option<Vec<u8>>> {
     match marker::read_marker(root)? {
         marker::MarkerRead::Missing => Ok(None),
-        marker::MarkerRead::PreviousSupported => fs::read(root.join(marker::MARKER_FILE_NAME))
+        marker::MarkerRead::PreviousSupported(_) => fs::read(root.join(marker::MARKER_FILE_NAME))
             .map(Some)
             .map_err(|source| AppError::infrastructure_with_source("读取旧格式标记失败", source)),
         marker::MarkerRead::Current | marker::MarkerRead::Blocked(_) => {
@@ -326,6 +397,21 @@ fn prepare_file_journal(
     } else {
         false
     };
+    let current_profile_import = sqlite_entry.is_none()
+        && edits
+            .iter()
+            .any(|edit| is_profile_import_path(&edit.relative_path))
+        && edits.iter().all(|edit| {
+            is_profile_import_path(&edit.relative_path)
+                || edit.relative_path == Path::new(marker::MARKER_FILE_NAME)
+        })
+        && edits
+            .iter()
+            .find(|edit| edit.relative_path == Path::new(marker::MARKER_FILE_NAME))
+            .is_some_and(|edit| {
+                edit.before.as_deref() == Some(current_marker_bytes.as_slice())
+                    && edit.after.as_slice() == current_marker_bytes.as_slice()
+            });
     let operation_dir = journal::operation_directory(root, operation_id);
     let mut entries = Vec::with_capacity(edits.len());
     for edit in edits {
@@ -335,8 +421,8 @@ fn prepare_file_journal(
             Some(bytes) => {
                 matches!(
                     marker::classify_marker_bytes(bytes),
-                    Ok(marker::MarkerRead::PreviousSupported)
-                ) || current_guide_transaction
+                    Ok(marker::MarkerRead::PreviousSupported(_))
+                ) || (current_guide_transaction || current_profile_import)
                     && bytes == current_marker_bytes.as_slice()
                     && edit.before.as_deref() == Some(edit.after.as_slice())
             }
@@ -402,6 +488,7 @@ fn resume_journal_with_hook(
     }
     let operation_dir = journal::operation_directory(root, &journal_value.operation_id);
     journal::require_operation_directory(root, &journal_value.operation_id)?;
+    secure_operation_directory(root, &operation_dir)?;
     verify_marker_before(root, &operation_dir, journal_value)?;
     if journal_value.state == JournalState::Committed {
         return verify_committed_journal(root, &operation_dir, journal_value);
@@ -490,7 +577,7 @@ fn marker_matches_journal(root: &Path, journal_value: &MigrationJournal) -> AppR
     let state = marker::read_marker(root)?;
     if !matches!(
         state,
-        marker::MarkerRead::Current | marker::MarkerRead::PreviousSupported
+        marker::MarkerRead::Current | marker::MarkerRead::PreviousSupported(_)
     ) {
         return Ok(false);
     }
@@ -532,6 +619,18 @@ fn verify_marker_before(
                 && guide.before_sha256.as_deref() != Some(guide.after_sha256.as_str())
                 && guide.after_sha256 == current_guide_hash
         });
+    let same_current_profile_import = matches!(&marker_state, marker::MarkerRead::Current)
+        && journal_value.sqlite.is_none()
+        && entry.before_sha256.as_deref() == Some(current_marker_hash.as_str())
+        && entry.after_sha256 == current_marker_hash
+        && journal_value
+            .files
+            .iter()
+            .any(|candidate| is_profile_import_path(Path::new(&candidate.relative_path)))
+        && journal_value.files.iter().all(|candidate| {
+            candidate.relative_path == marker::MARKER_FILE_NAME
+                || is_profile_import_path(Path::new(&candidate.relative_path))
+        });
     // 冻结正文仍须绑定 journal 的 before 摘要，且沿现有私有路径检查拒绝链接备份。
     let frozen_guide_backup = if let Some(guide) =
         guide_entry.filter(|_| same_current_guide_transaction)
@@ -543,7 +642,10 @@ fn verify_marker_before(
     } else {
         false
     };
-    if !matches!(&marker_state, marker::MarkerRead::PreviousSupported) && !frozen_guide_backup {
+    if !matches!(&marker_state, marker::MarkerRead::PreviousSupported(_))
+        && !frozen_guide_backup
+        && !same_current_profile_import
+    {
         return Err(AppError::conflict("格式标记 before 不是支持的上一契约"));
     }
     Ok(())
@@ -567,9 +669,18 @@ fn apply_file_entry(
             .parent()
             .ok_or_else(|| AppError::invalid("迁移目标没有父目录"))?,
     )?;
+    if entry.relative_path == "secrets/vault-key.toml" {
+        crate::vault::profile_migration::secure_directory(&root.join("secrets"))
+            .map_err(|source| AppError::infrastructure_with_source("保护凭据目录失败", source))?;
+    }
 
     let current = file_hash_or_missing(&target)?;
     if current.as_deref() == Some(entry.after_sha256.as_str()) {
+        if entry.relative_path == "secrets/vault-key.toml" {
+            crate::vault::profile_migration::secure_file(&target).map_err(|source| {
+                AppError::infrastructure_with_source("保护凭据密钥失败", source)
+            })?;
+        }
         if pending_hash(root, &target, &pending)?.is_some() {
             return Err(AppError::conflict("迁移 pending 与已提交目标同时存在"));
         }
@@ -612,6 +723,10 @@ fn apply_file_entry(
     if pending_hash(root, &target, &pending)?.as_deref() != Some(entry.after_sha256.as_str()) {
         return Err(AppError::conflict("迁移 pending 内容与目标摘要不匹配"));
     }
+    if entry.relative_path == "secrets/vault-key.toml" {
+        crate::vault::profile_migration::secure_file(&pending)
+            .map_err(|source| AppError::infrastructure_with_source("保护待提交密钥失败", source))?;
+    }
     fault(FaultPoint::AfterManagedPending(index))?;
     if file_hash_or_missing(&target)? != entry.before_sha256 {
         return Err(AppError::conflict("迁移目标在原子提交前发生变化"));
@@ -640,6 +755,22 @@ fn apply_file_entry(
     }
     if file_hash_or_missing(&target)?.as_deref() != Some(entry.after_sha256.as_str()) {
         return Err(AppError::outcome_unknown("迁移文件提交后回读摘要不匹配"));
+    }
+    if entry.relative_path == "secrets/vault-key.toml" {
+        crate::vault::profile_migration::secure_file(&target)
+            .map_err(|source| AppError::infrastructure_with_source("保护凭据密钥失败", source))?;
+    }
+    Ok(())
+}
+
+/// 迁移操作目录保存原始配置备份；在写入前限定整个目录的访问权限。
+fn secure_operation_directory(root: &Path, operation_dir: &Path) -> AppResult<()> {
+    for directory in [
+        root.join(journal::MIGRATION_DIRECTORY),
+        operation_dir.to_path_buf(),
+    ] {
+        crate::vault::profile_migration::secure_directory(&directory)
+            .map_err(|source| AppError::infrastructure_with_source("保护迁移目录失败", source))?;
     }
     Ok(())
 }

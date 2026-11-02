@@ -6,19 +6,22 @@ use gpui_kit::Context;
 use kerminal_application::{
     AppError, PublicErrorCode,
     operations::{
-        ContainerLogs, PortForwardDefinition, ServerInfoQuery, ServerInfoTier, TmuxCapability,
-        TmuxCreateRequest,
+        ContainerLogs, ManagedPortForwardSnapshot, PortForwardDefinition, ServerInfoQuery,
+        ServerInfoTier, TmuxCapability, TmuxCreateRequest,
     },
 };
 use kerminal_domain::files::{FileEndpoint, RemotePath};
+use kerminal_domain::identity::HostId;
 use kerminal_domain::operations::{
     ComposeAction, ComposeProjectTarget, ContainerListQuery, ContainerRuntime, ContainerTarget,
-    PortForwardConfig, ServerInfoSnapshot, ServerInfoTarget, TmuxMutationReceipt, TmuxTarget,
+    ForwardState, PortForwardConfig, ServerInfoSnapshot, ServerInfoTarget, TmuxMutationReceipt,
+    TmuxTarget,
 };
 use tokio_util::sync::CancellationToken;
 
 use super::{
     ContainerPanelContext, ContainerReadKind, OperationsEvent, OperationsView, TmuxDetailState,
+    container_mutation::{ContainerOperation, ContainerOperationOutcome},
     container_panel::ContainerPanelActionTicket,
     forms::{ForwardFormTransition, container_command, forward_config, next_forward_form_open},
     state::{ContainerMutationRequest, LoadTicket, run_cancellable_request, run_section_request},
@@ -35,13 +38,79 @@ struct ServerMonitorTierRequest {
     executor: kerminal_application::ApplicationTaskExecutor,
 }
 
+/// 写操作冻结表单的主机与编辑基线，目标切换后仍只能向同一表单报告结果。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ForwardFormIdentity {
+    host_id: HostId,
+    edit_expected: Option<PortForwardDefinition>,
+    transient_id: Option<String>,
+}
+
+/// 原表单仍在时优先反馈给它；表单已关闭则仅允许当前目标的结果进入工作区。
+///
+/// @author kongweiguang
+fn forward_save_error_is_relevant(
+    original_form_matches: bool,
+    another_form_open: bool,
+    original_target_active: bool,
+) -> bool {
+    original_form_matches || (!another_form_open && original_target_active)
+}
+
+/// 保存未知时先核对原 ID；只有核对仍失败才提示，避免成功回读后保留过期错误。
+///
+/// @author kongweiguang
+fn report_forward_save_error_immediately(code: PublicErrorCode) -> bool {
+    code != PublicErrorCode::OutcomeUnknown
+}
+
 impl OperationsView {
+    /// 只向仍显示原目标的工作区发送错误，迟到回执不冒充新主机的操作结果。
+    ///
+    /// @author kongweiguang
+    fn notify_forward_error(&self, message: String, generation: u64, cx: &mut Context<Self>) {
+        if self.active && self.target_generation == generation {
+            cx.emit(OperationsEvent::ForwardError { message });
+        }
+    }
+
+    /// 忙碌期间表单不可重新打开，原主机和编辑基线共同标识本次可见草稿。
+    ///
+    /// @author kongweiguang
+    fn forward_form_identity(&self) -> Option<ForwardFormIdentity> {
+        if !self.is_forward_form_open() {
+            return None;
+        }
+        Some(ForwardFormIdentity {
+            host_id: self.forward_form_host_id()?,
+            edit_expected: self.forward_edit_expected.clone(),
+            transient_id: self.forward_edit_transient_id.clone(),
+        })
+    }
+
+    /// 操作目标切换不应隐藏仍打开的原表单错误，也不能把旧回执投到新表单。
+    ///
+    /// @author kongweiguang
+    fn notify_forward_save_error(
+        &self,
+        message: String,
+        generation: u64,
+        original_form_matches: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if forward_save_error_is_relevant(
+            original_form_matches,
+            self.is_forward_form_open(),
+            self.active && self.target_generation == generation,
+        ) {
+            cx.emit(OperationsEvent::ForwardError { message });
+        }
+    }
     /// 新写操作先清旧反馈，再创建视图持有的取消令牌；错误不能被前次成功提示掩盖。
     ///
     /// @author kongweiguang
     fn begin_operation_mutation(&mut self) -> CancellationToken {
         self.status = None;
-        self.forward_success_notice = None;
         let cancellation = CancellationToken::new();
         self.mutation_cancellation = Some(cancellation.clone());
         cancellation
@@ -55,15 +124,11 @@ impl OperationsView {
         self.busy = false;
     }
 
-    /// 隧道在 main 中有独立绿色成功行；宽工作区仍沿用原结果区，错误通道不复用成功样式。
+    /// 紧凑隧道的成功状态由行自身表达；宽工作区继续复用原结果区。
+    ///
+    /// @author kongweiguang
     fn set_forward_success_notice(&mut self, message: String) {
-        self.status = None;
-        self.forward_success_notice = None;
-        if self.compact_layout {
-            self.forward_success_notice = Some(message);
-        } else {
-            self.status = Some(message);
-        }
+        self.status = (!self.compact_layout).then_some(message);
     }
 
     /// 取消仅发出协作请求；命令结果无回执时仍需读取原目标确认实际状态。
@@ -376,6 +441,9 @@ impl OperationsView {
         let generation = self.container_generation;
         let target_host = self.host_target.clone();
         let runtime = self.runtime;
+        let verifies_mutation = self
+            .container_mutations
+            .needs_refresh(&target_host, runtime);
         let panel_context = self.container_panel_context.clone();
         let query_host = target_host.clone();
         let operations = self.operations.clone();
@@ -430,18 +498,44 @@ impl OperationsView {
                                     view.container_output.reset();
                                     view.container_output_target_label = None;
                                 }
-                                view.dirty_targets
-                                    .container_refreshed(&target_host, runtime);
+                                if verifies_mutation
+                                    || !view.container_mutations.blocks_scope(&target_host, runtime)
+                                {
+                                    view.dirty_targets
+                                        .container_refreshed(&target_host, runtime);
+                                }
+                                if verifies_mutation {
+                                    view.finish_container_mutation_refresh(
+                                        &target_host,
+                                        runtime,
+                                        true,
+                                    );
+                                }
                             }
                         }
                         Ok(None) => {
-                            view.containers.cancel(&ticket);
+                            if view.containers.cancel(&ticket) && verifies_mutation {
+                                view.finish_container_mutation_refresh(
+                                    &target_host,
+                                    runtime,
+                                    false,
+                                );
+                            }
                             cx.notify();
                             return;
                         }
                         Err(error) => {
-                            view.containers
-                                .complete(&ticket, Err(error.public_message().to_owned()));
+                            if view
+                                .containers
+                                .complete(&ticket, Err(error.public_message().to_owned()))
+                                && verifies_mutation
+                            {
+                                view.finish_container_mutation_refresh(
+                                    &target_host,
+                                    runtime,
+                                    false,
+                                );
+                            }
                         }
                     }
                     cx.notify();
@@ -450,6 +544,64 @@ impl OperationsView {
         })
         .detach();
         cx.notify();
+    }
+
+    /// 回执属于原宿主；当前仍可读取时立即核对，否则保留待刷新状态直到用户返回。
+    ///
+    /// @author kongweiguang
+    fn refresh_container_after_mutation(
+        &mut self,
+        target_is_current: bool,
+        host_id: Option<kerminal_domain::identity::HostId>,
+        runtime: ContainerRuntime,
+        cx: &mut Context<Self>,
+    ) {
+        if target_is_current
+            && self.active
+            && !matches!(
+                self.container_panel_context,
+                Some(
+                    ContainerPanelContext::Unavailable { .. }
+                        | ContainerPanelContext::ContainerInfo { .. }
+                )
+            )
+        {
+            self.load_containers(cx);
+        } else {
+            self.remember_container_feedback(
+                host_id,
+                runtime,
+                crate::locale::text(
+                    "容器操作结果待核对；返回原宿主后将刷新状态。",
+                    "The container operation needs verification; its original host will be refreshed when you return.",
+                ).to_string(),
+            );
+        }
+    }
+
+    /// 成功回读才解除写入门禁；失败和未知结果保留原始语义及单独刷新入口。
+    ///
+    /// @author kongweiguang
+    fn finish_container_mutation_refresh(
+        &mut self,
+        host_id: &Option<kerminal_domain::identity::HostId>,
+        runtime: ContainerRuntime,
+        success: bool,
+    ) {
+        let Some((outcome, refreshed)) = self
+            .container_mutations
+            .finish_refresh(host_id, runtime, success)
+        else {
+            return;
+        };
+        let (message, is_error) = container_operation_refresh_feedback(outcome, refreshed);
+        if is_error {
+            self.status = Some(message);
+            self.container_success_notice = None;
+        } else {
+            self.status = None;
+            self.container_success_notice = Some(message);
+        }
     }
 
     /// tmux 的探测和 session 查询只影响 tmux 区域；未安装时显示能力原因而非伪装空成功。
@@ -533,7 +685,9 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 端口转发清单来自同一 runtime service，单独刷新不会受 Docker 或 tmux 错误影响。
+    /// 清单按目标代次和票据隔离；运行故障只在进入 Failed 时提示，重复刷新不刷屏。
+    ///
+    /// @author kongweiguang
     pub(super) fn load_forwards(&mut self, cx: &mut Context<Self>) {
         if !self.active || !self.section_selection.watches_forwards() {
             return;
@@ -558,8 +712,20 @@ impl OperationsView {
                     }
                     match result {
                         Ok(Some(rows)) => {
-                            view.forwards.complete(&ticket, Ok(rows));
-                            view.sync_proxy_forward_projection(cx);
+                            if view.forwards.is_current(&ticket) {
+                                let message = new_forward_failure_message(
+                                    view.forwards.data().map(Vec::as_slice),
+                                    &rows,
+                                    view.section_selection.is_fixed(),
+                                    view.host_target.as_ref(),
+                                );
+                                if view.forwards.complete(&ticket, Ok(rows)) {
+                                    view.sync_proxy_forward_projection(cx);
+                                    if let Some(message) = message {
+                                        view.notify_forward_error(message, generation, cx);
+                                    }
+                                }
+                            }
                         }
                         Ok(None) => {
                             view.forwards.cancel(&ticket);
@@ -567,8 +733,10 @@ impl OperationsView {
                             return;
                         }
                         Err(error) => {
-                            view.forwards
-                                .complete(&ticket, Err(error.public_message().to_owned()));
+                            let message = error.public_message().to_owned();
+                            if view.forwards.complete(&ticket, Err(message.clone())) {
+                                view.notify_forward_error(message, generation, cx);
+                            }
                         }
                     }
                     cx.notify();
@@ -579,7 +747,9 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 在应用执行器中订阅合并后的转发 revision，并在实体仍存活时请求当前全局快照。
+    /// 订阅转发 revision；订阅故障只报告仍有效的 watcher，避免隐藏面板留下迟到提示。
+    ///
+    /// @author kongweiguang
     pub(super) fn start_forward_watch(&mut self, cx: &mut Context<Self>) {
         if !self.active || !self.section_selection.watches_forwards() || self.forward_watch_started
         {
@@ -632,7 +802,12 @@ impl OperationsView {
                                         view.forward_watch_cancellation = CancellationToken::new();
                                         view.forward_watch_generation =
                                             view.forward_watch_generation.wrapping_add(1).max(1);
-                                        view.status = Some(message);
+                                        view.status = Some(message.clone());
+                                        view.notify_forward_error(
+                                            message,
+                                            view.target_generation,
+                                            cx,
+                                        );
                                         cx.notify();
                                     }
                                 });
@@ -720,6 +895,42 @@ impl OperationsView {
         }
     }
 
+    /// 项目菜单冻结完整身份；Down 先打开根确认，其余动作交由 Root 复核当前上下文。
+    ///
+    /// @author kongweiguang
+    pub(super) fn request_compose_mutation(
+        &mut self,
+        target: ComposeProjectTarget,
+        action: ComposeAction,
+        ticket: &ContainerPanelActionTicket,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy
+            || self.root_confirmation_active()
+            || !self.container_action_ticket_is_current(ticket, None)
+            || !self.compose_mutation_allowed(&target)
+        {
+            return;
+        }
+        self.container_success_notice = None;
+        self.status = None;
+        if action == ComposeAction::Down {
+            self.compose_pending_down = Some(target);
+            self.compose_pending_context = ticket.context.clone();
+            self.confirmed_compose_down = None;
+            cx.emit(OperationsEvent::RootConfirmationChanged);
+        } else if let Some(context) = ticket.context.clone() {
+            cx.emit(OperationsEvent::ComposeMutationRequested {
+                context,
+                target,
+                action,
+            });
+        } else {
+            self.execute_compose(target, action, cx);
+        }
+        cx.notify();
+    }
+
     /// 固定右栏沿用 Root 校验的 host/profile；完整运维页只使用用户显式选择的 host。
     ///
     /// @author kongweiguang
@@ -774,13 +985,19 @@ impl OperationsView {
             action,
             force,
         } = request;
+        let operation = ContainerOperation::Container {
+            target: target.clone(),
+            action,
+        };
+        if !self.container_mutations.begin(operation.clone()) {
+            return;
+        }
         self.busy = true;
+        self.container_success_notice = None;
         let request_cancellation = self.begin_operation_mutation();
         let cancellation_status = request_cancellation.clone();
         let target_host = target.host_id.clone();
         let target_runtime = target.runtime;
-        let operation_context = self.container_panel_context.clone();
-        let operation_generation = self.container_generation;
         self.container_delete_confirmation = None;
         let operations = self.operations.clone();
         let executor = self.executor.clone();
@@ -803,37 +1020,18 @@ impl OperationsView {
                         &view.host_target,
                         view.runtime,
                     );
-                    let panel_is_current = view.container_panel_context == operation_context
-                        && view.container_generation == operation_generation;
-                    let show_feedback = !view.compact_layout
-                        || !matches!(&result, Ok(receipt) if !receipt.refresh_required);
-                    let message = match result {
-                        Ok(receipt) if receipt.refresh_required => crate::locale::text(
-                            "容器操作完成；运行态刷新可重新读取。",
-                            "Container action completed; refresh the runtime state to verify it.",
-                        )
-                        .to_string(),
-                        Ok(receipt) if receipt.applied => {
-                            crate::locale::text("容器操作已完成。", "Container action completed.")
-                                .to_string()
-                        }
-                        Ok(_) => crate::locale::text(
-                            "容器没有发生变更。",
-                            "No container change was applied.",
-                        )
-                        .to_string(),
-                        Err(error) => mutation_error_message(error, cancellation_requested),
+                    let outcome = match result {
+                        Ok(receipt) if receipt.applied => ContainerOperationOutcome::Applied,
+                        Ok(_) => ContainerOperationOutcome::NoChange,
+                        Err(error) => container_operation_error(error, cancellation_requested),
                     };
-                    if target_is_current && panel_is_current {
-                        view.status = show_feedback.then_some(message);
-                        view.load_containers(cx);
-                    } else if show_feedback {
-                        view.remember_container_feedback(
-                            target_host.clone(),
-                            target_runtime,
-                            message,
-                        );
-                    }
+                    view.container_mutations.complete(&operation, outcome);
+                    view.refresh_container_after_mutation(
+                        target_is_current,
+                        target_host,
+                        target_runtime,
+                        cx,
+                    );
                     cx.notify();
                 });
             });
@@ -1063,25 +1261,22 @@ impl OperationsView {
         action: ComposeAction,
         cx: &mut Context<Self>,
     ) {
-        if self.busy
-            || !self.active
-            || !matches!(
-                self.container_panel_context,
-                None | Some(ContainerPanelContext::Host { .. })
-                    | Some(ContainerPanelContext::WorkspaceHost { .. })
-            )
-            || self.host_target != target.host_id
-            || self.runtime != target.runtime
-        {
+        if self.busy || !self.compose_mutation_allowed(&target) {
+            return;
+        }
+        let operation = ContainerOperation::Compose {
+            target: target.clone(),
+            action,
+        };
+        if !self.container_mutations.begin(operation.clone()) {
             return;
         }
         self.busy = true;
+        self.container_success_notice = None;
         let request_cancellation = self.begin_operation_mutation();
         let cancellation_status = request_cancellation.clone();
         let target_host = target.host_id.clone();
         let target_runtime = target.runtime;
-        let operation_context = self.container_panel_context.clone();
-        let operation_generation = self.container_generation;
         let operations = self.operations.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
@@ -1103,33 +1298,17 @@ impl OperationsView {
                         &view.host_target,
                         view.runtime,
                     );
-                    let panel_is_current = view.container_panel_context == operation_context
-                        && view.container_generation == operation_generation;
-                    let show_feedback = !view.compact_layout
-                        || !matches!(&result, Ok(receipt) if !receipt.refresh_required);
-                    let message = match result {
-                        Ok(receipt) if receipt.refresh_required => crate::locale::text(
-                            "Compose 命令完成；回到此宿主时将重新读取状态。",
-                            "Compose action completed; the host state will be reloaded when you return.",
-                        )
-                        .to_string(),
-                        Ok(_) => crate::locale::text(
-                            "Compose 操作已完成。",
-                            "Compose action completed.",
-                        )
-                        .to_string(),
-                        Err(error) => mutation_error_message(error, cancellation_requested),
+                    let outcome = match result {
+                        Ok(_) => ContainerOperationOutcome::Applied,
+                        Err(error) => container_operation_error(error, cancellation_requested),
                     };
-                    if target_is_current && panel_is_current {
-                        view.status = show_feedback.then_some(message);
-                        view.load_containers(cx);
-                    } else if show_feedback {
-                        view.remember_container_feedback(
-                            target_host.clone(),
-                            target_runtime,
-                            message,
-                        );
-                    }
+                    view.container_mutations.complete(&operation, outcome);
+                    view.refresh_container_after_mutation(
+                        target_is_current,
+                        target_host,
+                        target_runtime,
+                        cx,
+                    );
                     cx.notify();
                 });
             });
@@ -1138,7 +1317,10 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// Compose 配置路径按真实 host 类型构造成文件端点，事件由 Root 交给 FilesPane 校验后预览。
+    /// 仅保留旧文件工作区的身份验收桥；产品入口改走侧栏预览，避免导航改变活动中央 Tab。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "right-rail-acceptance")]
     pub(super) fn request_compose_config(
         &mut self,
         host_id: Option<kerminal_domain::identity::HostId>,
@@ -1178,7 +1360,8 @@ impl OperationsView {
         });
     }
 
-    /// 速查发送同时携带 Root 确认的 pane owner/generation；未绑定时只保留复制能力。
+    /// 速查发送携带 Root 确认的 pane owner/generation；终端本身承载正常回显，正文只保留真实错误。
+    /// 事件排队不等于命令执行成功，因此不生成发送成功或待核对的常驻提示。
     ///
     /// @author kongweiguang
     pub(super) fn send_tmux_quickref(
@@ -1209,13 +1392,7 @@ impl OperationsView {
             text: item.payload.to_owned(),
             kind: item.kind,
         });
-        self.status = Some(
-            crate::locale::text(
-                "已请求发送到当前终端；请核对终端回显。",
-                "Send requested for the current terminal; verify its output.",
-            )
-            .to_string(),
-        );
+        self.status = None;
         cx.notify();
     }
 
@@ -1841,7 +2018,7 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 点击时先选中明确的 session，使折叠卡首次 attach 也能登记后续分离意图；
+    /// 历史行只供浏览；入口再次核对当前就绪快照，避免刷新期间旧点击仍排入连接命令。
     /// Root 仍按原 pane owner 和当前选择复核，异步期间改选不会被迟到回执覆盖。
     ///
     /// @author kongweiguang
@@ -1851,7 +2028,9 @@ impl OperationsView {
         session_name: String,
         cx: &mut Context<Self>,
     ) {
-        if !self.tmux_target_available() || !self.tmux_attach_ready() {
+        if !self.tmux_session_attach_allowed(&self.tmux_target(), &session_id)
+            || !self.tmux_attach_ready()
+        {
             return;
         }
         self.select_tmux_session(session_id.clone(), session_name.clone(), cx);
@@ -1875,9 +2054,15 @@ impl OperationsView {
                 "转发表单没有固定的 SSH 主机；请取消后从明确的 SSH 主机重新打开。",
                 "The forward form has no frozen SSH host. Cancel it and reopen from an explicit SSH host.",
             ).to_string());
+            self.notify_forward_error(
+                self.status.clone().unwrap_or_default(),
+                self.target_generation,
+                cx,
+            );
             cx.notify();
             return;
         }
+        let form_identity = self.forward_form_identity();
         let Some(inputs) = self.inputs.as_ref() else {
             return;
         };
@@ -1901,6 +2086,12 @@ impl OperationsView {
             Ok(config) => config,
             Err(error) => {
                 self.status = Some(error.message().to_owned());
+                self.notify_forward_save_error(
+                    error.message().to_owned(),
+                    self.target_generation,
+                    form_identity.is_some(),
+                    cx,
+                );
                 cx.notify();
                 return;
             }
@@ -1921,6 +2112,7 @@ impl OperationsView {
         };
         self.busy = true;
         let cancellation = self.begin_operation_mutation();
+        let target_generation = self.target_generation;
         let cancellation_status = cancellation.clone();
         let expected = self.forward_edit_expected.clone();
         let new_id = attempted.id.clone();
@@ -1961,6 +2153,9 @@ impl OperationsView {
             cx.update(|app| {
                 let _ = this.update(app, |view, cx| {
                     view.finish_operation_mutation();
+                    let mut failure_message = None;
+                    let original_form_matches = form_identity.is_some()
+                        && view.forward_form_identity() == form_identity;
                     let forward_form_was_open = view
                         .inputs
                         .as_ref()
@@ -2003,13 +2198,17 @@ impl OperationsView {
                             if let Some(inputs) = view.inputs.as_mut() {
                                 inputs.forward_form_open = false;
                             }
-                            view.status = Some(crate::locale::text(
+                            let message = crate::locale::text(
                                 format!("定义已保存，但启动未完成：{}。请核对清单；清理失败时先点停止。", error.public_message()),
                                 format!("Definition saved, but start did not complete: {}. Review the list; stop any entry whose cleanup failed.", error.public_message()),
-                            ).to_string());
+                            ).to_string();
+                            view.status = Some(message.clone());
+                            failure_message = Some(message);
                         }
                         Err(error) => {
-                            if error.public_code() == PublicErrorCode::OutcomeUnknown {
+                            let error_code = error.public_code();
+                            let outcome_unknown = error_code == PublicErrorCode::OutcomeUnknown;
+                            if outcome_unknown {
                                 view.forward_save_pending = Some(attempted);
                             }
                             if let Some(inputs) = view.inputs.as_mut() {
@@ -2018,12 +2217,24 @@ impl OperationsView {
                                     ForwardFormTransition::CreateFailed,
                                 );
                             }
-                            view.status = Some(if cancellation_requested {
+                            let message = if cancellation_requested {
                                 mutation_error_message(error, true)
                             } else {
                                 error.public_message().to_owned()
-                            });
+                            };
+                            view.status = Some(message.clone());
+                            if report_forward_save_error_immediately(error_code) {
+                                failure_message = Some(message);
+                            }
                         }
+                    }
+                    if let Some(message) = failure_message {
+                        view.notify_forward_save_error(
+                            message,
+                            target_generation,
+                            original_form_matches,
+                            cx,
+                        );
                     }
                     if forward_form_was_open
                         && view
@@ -2047,7 +2258,7 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 保存回执未知时只回读原 ID；确认落盘不触发启动，缺失或内容冲突也不自动重放写入。
+    /// 保存未知时只回读原 ID；失败提示限于原目标，任何结果均不自动重放写入。
     /// @author kongweiguang
     pub(super) fn reconcile_forward_save(&mut self, cx: &mut Context<Self>) {
         if self.busy {
@@ -2056,7 +2267,9 @@ impl OperationsView {
         let Some(expected) = self.forward_save_pending.clone() else {
             return;
         };
+        let form_identity = self.forward_form_identity();
         self.busy = true;
+        let target_generation = self.target_generation;
         let operations = self.operations.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
@@ -2065,11 +2278,17 @@ impl OperationsView {
                 operations.port_forwards.get_definition(&id).await
             }).await;
             let _ = this.update(cx, |view, cx| {
+                if view.forward_save_pending.as_ref() != Some(&expected) {
+                    return;
+                }
                 view.busy = false;
+                let original_form_matches = form_identity.is_some()
+                    && view.forward_form_identity() == form_identity;
                 let forward_form_was_open = view
                     .inputs
                     .as_ref()
                     .is_some_and(|inputs| inputs.forward_form_open);
+                let mut failure_message = None;
                 match result {
                     Ok(Some(actual)) if actual == expected => {
                         view.forward_save_pending = None;
@@ -2090,14 +2309,31 @@ impl OperationsView {
                             "已核对：原 ID 未保存。草稿已保留，可明确再次保存；未自动重试。",
                             "Verified: the original ID was not saved. The draft is retained; save again explicitly if needed. No automatic retry was made.",
                         ).to_string());
+                        failure_message = view.status.clone();
                     }
                     Ok(Some(_)) => {
                         view.status = Some(crate::locale::text(
                             "原 ID 的配置与提交内容不同。请返回列表核对并重新编辑，不要重复保存。",
                             "The saved content differs from this submission. Return to the list and review the current definition before editing again.",
                         ).to_string());
+                        failure_message = view.status.clone();
                     }
-                    Err(error) => view.status = Some(error.public_message().to_owned()),
+                    Err(error) => {
+                        let message = crate::locale::text(
+                            format!("保存结果尚未确认，核对失败：{}", error.public_message()),
+                            format!("The save result is still unknown; verification failed: {}", error.public_message()),
+                        ).to_string();
+                        view.status = Some(message.clone());
+                        failure_message = Some(message);
+                    }
+                }
+                if let Some(message) = failure_message {
+                    view.notify_forward_save_error(
+                        message,
+                        target_generation,
+                        original_form_matches,
+                        cx,
+                    );
                 }
                 if forward_form_was_open
                     && view
@@ -2142,13 +2378,16 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 使用已保存定义和原 ID 建立转发，失败结果保留为可再次显式启动的停止定义。
+    /// 使用原 ID 启动并按目标代次报告错误，停止定义仍可显式重试。
+    ///
+    /// @author kongweiguang
     pub(super) fn start_saved_forward(&mut self, id: String, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
         self.busy = true;
         let cancellation = self.begin_operation_mutation();
+        let target_generation = self.target_generation;
         let cancellation_status = cancellation.clone();
         let operations = self.operations.clone();
         let executor = self.executor.clone();
@@ -2171,8 +2410,9 @@ impl OperationsView {
                             .to_string(),
                         ),
                         Err(error) => {
-                            view.status =
-                                Some(mutation_error_message(error, cancellation_requested))
+                            let message = mutation_error_message(error, cancellation_requested);
+                            view.status = Some(message.clone());
+                            view.notify_forward_error(message, target_generation, cx);
                         }
                     }
                     view.load_forwards(cx);
@@ -2183,7 +2423,40 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// main 的删除入口直接提交；冻结配置仍需与当前清单完全匹配，防止旧行回调删除新定义。
+    /// 删除入口先冻结当前可见的持久定义和目标代次，由根模态收集明确确认。
+    ///
+    /// @author kongweiguang
+    pub(super) fn request_delete_forward_definition(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.busy
+            || !self.active
+            || self.root_confirmation_active()
+            || self.forwards.phase() != super::state::SectionPhase::Ready
+        {
+            return;
+        }
+        let Some(row) = self.forwards.data().and_then(|rows| {
+            rows.iter().find(|row| {
+                row.persistent
+                    && row.forward.id == id
+                    && (!self.section_selection.is_fixed()
+                        || self.host_target.as_ref() == Some(&row.forward.config.host_id))
+            })
+        }) else {
+            return;
+        };
+        self.forward_pending_delete = Some((
+            PortForwardDefinition {
+                id: row.forward.id.clone(),
+                config: row.forward.config.clone(),
+            },
+            self.target_generation,
+        ));
+        self.status = None;
+        cx.emit(OperationsEvent::RootConfirmationChanged);
+        cx.notify();
+    }
+
+    /// 确认后再次核对冻结定义、目标代次和当前权威列表，存储层继续使用 CAS 删除。
     /// @author kongweiguang
     pub(super) fn delete_forward_definition(
         &mut self,
@@ -2194,23 +2467,38 @@ impl OperationsView {
             return;
         }
         if !self.active
-            || !self.forwards.data().is_some_and(|rows| {
-                rows.iter().any(|row| {
-                    row.forward.id == expected.id
-                        && row.forward.config == expected.config
-                        && row.persistent
-                })
-            })
+            || !forward_delete_confirmation_current(
+                &expected,
+                self.forward_pending_delete.as_ref(),
+                self.target_generation,
+                self.forwards.phase(),
+                self.forwards.data().map(Vec::as_slice),
+            )
         {
+            self.forward_pending_delete = None;
+            self.status = Some(
+                crate::locale::text(
+                    "隧道目标或定义已变化，请刷新后重新选择。",
+                    "The tunnel target or definition changed. Refresh and select it again.",
+                )
+                .to_string(),
+            );
+            self.notify_forward_error(
+                self.status.clone().unwrap_or_default(),
+                self.target_generation,
+                cx,
+            );
+            cx.emit(OperationsEvent::RootConfirmationChanged);
+            cx.notify();
             return;
         }
         self.busy = true;
         self.forward_pending_delete = None;
         self.status = None;
-        self.forward_success_notice = None;
         cx.emit(OperationsEvent::RootConfirmationChanged);
         let operations = self.operations.clone();
         let executor = self.executor.clone();
+        let target_generation = self.target_generation;
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |_| async move {
@@ -2233,7 +2521,8 @@ impl OperationsView {
                     if succeeded {
                         view.set_forward_success_notice(message);
                     } else {
-                        view.status = Some(message);
+                        view.status = Some(message.clone());
+                        view.notify_forward_error(message, target_generation, cx);
                     }
                     view.load_forwards(cx);
                 });
@@ -2243,16 +2532,18 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// 只停止行中指定转发 ID；成功以 main 的行内反馈呈现，失败保留原对象错误。
+    /// 只停止指定转发，并在原目标仍可见时报告失败；成功由行状态体现。
+    ///
+    /// @author kongweiguang
     pub(super) fn stop_forward(&mut self, id: String, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
         self.busy = true;
         self.status = None;
-        self.forward_success_notice = None;
         let operations = self.operations.clone();
         let executor = self.executor.clone();
+        let target_generation = self.target_generation;
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |_| async move { operations.port_forwards.stop(&id).await })
@@ -2266,7 +2557,8 @@ impl OperationsView {
                     if succeeded {
                         view.set_forward_success_notice(message);
                     } else {
-                        view.status = Some(message);
+                        view.status = Some(message.clone());
+                        view.notify_forward_error(message, target_generation, cx);
                     }
                     view.load_forwards(cx);
                 });
@@ -2274,6 +2566,59 @@ impl OperationsView {
         })
         .detach();
         cx.notify();
+    }
+}
+
+/// 比较同一目标的权威快照，只提示新进入失败的隧道；旧 Failed 反复读取不会重复提示。
+///
+/// @author kongweiguang
+fn new_forward_failure_message(
+    previous: Option<&[ManagedPortForwardSnapshot]>,
+    current: &[ManagedPortForwardSnapshot],
+    fixed_host: bool,
+    host_id: Option<&kerminal_domain::identity::HostId>,
+) -> Option<String> {
+    let previous_states: std::collections::HashMap<_, _> = previous
+        .unwrap_or_default()
+        .iter()
+        .map(|row| (row.forward.id.as_str(), row.forward.state))
+        .collect();
+    let failures = current
+        .iter()
+        .filter(|row| {
+            row.forward.state == ForwardState::Failed
+                && (!fixed_host || host_id == Some(&row.forward.config.host_id))
+                && previous_states.get(row.forward.id.as_str()) != Some(&ForwardState::Failed)
+        })
+        .collect::<Vec<_>>();
+    let first = failures.first()?;
+    if failures.len() > 1 {
+        Some(
+            crate::locale::text(
+                format!(
+                    "{} 等 {} 条隧道异常，请检查连接。",
+                    first.forward.config.name,
+                    failures.len()
+                ),
+                format!(
+                    "{} and {} other tunnels failed. Check the connection.",
+                    first.forward.config.name,
+                    failures.len() - 1
+                ),
+            )
+            .to_string(),
+        )
+    } else {
+        Some(
+            crate::locale::text(
+                format!("隧道 {} 异常，请检查连接。", first.forward.config.name),
+                format!(
+                    "Tunnel {} failed. Check the connection.",
+                    first.forward.config.name
+                ),
+            )
+            .to_string(),
+        )
     }
 }
 
@@ -2426,6 +2771,101 @@ fn mutation_error_message(error: AppError, cancellation_requested: bool) -> Stri
         )
         .to_string(),
         _ => error.public_message().to_owned(),
+    }
+}
+
+/// 确认时只接受同一代次、仍在最新清单中的持久定义，避免异步刷新覆盖用户意图。
+///
+/// @author kongweiguang
+fn forward_delete_confirmation_current(
+    expected: &PortForwardDefinition,
+    pending: Option<&(PortForwardDefinition, u64)>,
+    generation: u64,
+    phase: super::state::SectionPhase,
+    rows: Option<&[kerminal_application::operations::ManagedPortForwardSnapshot]>,
+) -> bool {
+    phase == super::state::SectionPhase::Ready
+        && pending.is_some_and(|(definition, saved_generation)| {
+            definition == expected && *saved_generation == generation
+        })
+        && rows.is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.persistent
+                    && row.forward.id == expected.id
+                    && row.forward.config == expected.config
+            })
+        })
+}
+
+/// 取消和未知回执仍可能已改变远端，只允许在回读后由用户决定下一步。
+///
+/// @author kongweiguang
+fn container_operation_error(
+    error: AppError,
+    cancellation_requested: bool,
+) -> ContainerOperationOutcome {
+    let unknown = error.public_code() == PublicErrorCode::OutcomeUnknown
+        || (error.public_code() == PublicErrorCode::Cancelled && cancellation_requested);
+    let message = mutation_error_message(error, cancellation_requested);
+    if unknown {
+        ContainerOperationOutcome::Unknown(message)
+    } else {
+        ContainerOperationOutcome::Failed(message)
+    }
+}
+
+/// 区分命令回执与刷新结果，避免刷新失败时把远端成功伪装成失败或允许盲重试。
+///
+/// @author kongweiguang
+fn container_operation_refresh_feedback(
+    outcome: ContainerOperationOutcome,
+    refreshed: bool,
+) -> (String, bool) {
+    if !refreshed {
+        let message = match outcome {
+            ContainerOperationOutcome::Applied => crate::locale::text(
+                "操作命令已完成，但状态刷新失败。请刷新并核对后再操作。",
+                "The command completed, but refreshing the state failed. Refresh and verify before acting again.",
+            ).to_string(),
+            ContainerOperationOutcome::NoChange => crate::locale::text(
+                "目标没有变更，但状态刷新失败。请刷新并核对后再操作。",
+                "No change was applied, but refreshing failed. Refresh and verify before acting again.",
+            ).to_string(),
+            ContainerOperationOutcome::Failed(message) | ContainerOperationOutcome::Unknown(message) => format!(
+                "{message}\n{}",
+                crate::locale::text("状态刷新失败，请刷新并核对后再操作。", "Refreshing failed. Refresh and verify before acting again."),
+            ),
+        };
+        return (message, true);
+    }
+    match outcome {
+        ContainerOperationOutcome::Applied => (
+            crate::locale::text(
+                "操作命令已完成，容器列表已刷新。",
+                "The command completed and the container list was refreshed.",
+            )
+            .to_string(),
+            false,
+        ),
+        ContainerOperationOutcome::NoChange => (
+            crate::locale::text(
+                "目标没有变更，容器列表已刷新。",
+                "No change was applied; the container list was refreshed.",
+            )
+            .to_string(),
+            false,
+        ),
+        ContainerOperationOutcome::Failed(message) => (message, true),
+        ContainerOperationOutcome::Unknown(message) => (
+            format!(
+                "{message}\n{}",
+                crate::locale::text(
+                    "已刷新列表，请核对当前状态后再操作。",
+                    "The list was refreshed. Verify the current state before acting again."
+                ),
+            ),
+            true,
+        ),
     }
 }
 

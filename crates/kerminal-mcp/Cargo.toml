@@ -20,6 +20,8 @@ kerminal-domain.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 serde.workspace = true
 serde_json.workspace = true
+subtle = "=2.6.1"
+sysinfo.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

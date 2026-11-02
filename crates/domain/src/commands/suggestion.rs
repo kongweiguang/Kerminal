@@ -11,11 +11,35 @@ use super::history::CommandHistoryTarget;
 #[serde(rename_all = "camelCase")]
 pub enum SuggestionProviderKind {
     History,
+    LocalPath,
+    LocalCommand,
     RemotePath,
     RemoteCommand,
     Git,
     Spec,
     Snippet,
+}
+
+/// 每个已请求来源的独立状态，不携带可能包含路径或输入正文的底层错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuggestionSourceState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+/// 按来源报告查询进度，使无结果与来源故障可以被调用方区分。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestionSourceStatus {
+    pub provider: SuggestionProviderKind,
+    pub state: SuggestionSourceState,
+}
+
+/// 一次查询的当前聚合快照；后续快照可继续补充候选或来源状态。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandSuggestionResult {
+    pub candidates: Vec<CommandSuggestionCandidate>,
+    pub sources: Vec<SuggestionSourceStatus>,
 }
 
 /// 接受建议后需要由界面完成的动作。

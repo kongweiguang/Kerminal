@@ -2,12 +2,17 @@
 //!
 //! @author kongweiguang
 
+use std::{cell::Cell, rc::Rc};
+
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, IntoElement, Render, Window,
+    App, AppContext as _, ClickEvent, Context, IntoElement, Pixels, Render, ScrollHandle,
+    ScrollWheelEvent, Window,
+    base::ElementExt as _,
     component::{
         ActiveTheme, Disableable,
         button::{Button, ButtonVariants},
         input::Textarea,
+        scroll::ScrollableElement,
         switch::Switch,
     },
     div,
@@ -20,7 +25,10 @@ use kerminal_application::preferences::{
 
 use crate::theme::ThemeTokens;
 
-use super::{panel::PreferencesPanel, panel::terminal::parse_hex_color};
+use super::{
+    panel::PreferencesPanel,
+    panel::terminal::{KEYWORD_RULE_LIMIT, parse_hex_color},
+};
 
 /// main 的八个色板值分别提供浅深主题预览，列表顺序与持久规则顺序一致。
 ///
@@ -54,6 +62,30 @@ struct KeywordRuleDragPreview {
     pattern: String,
 }
 
+/// GPUI 先更新子区偏移再派发此监听器，行单位必须采用子区绘制时的行高还原原偏移。
+/// 仅在子区原本还能沿该方向滚动时阻止外层同步滚动。
+/// 分数布局中的 f32 偏移还原存在舍入误差，边界保留千分之一逻辑像素余量。
+/// 已到边界则让滚轮自然传给正文，避免用户必须把指针移出列表或编辑区才能继续浏览。
+///
+/// @author kongweiguang
+fn route_keyword_scroll(
+    event: &ScrollWheelEvent,
+    scroll: &ScrollHandle,
+    line_height: Pixels,
+    cx: &mut App,
+) {
+    let delta = event.delta.pixel_delta(line_height);
+    let vertical = if delta.y != px(0.) { delta.y } else { delta.x };
+    let before = scroll.offset().y - vertical;
+    let max = scroll.max_offset().y;
+    let edge_tolerance = px(0.001);
+    if (vertical < px(0.) && before > -max + edge_tolerance)
+        || (vertical > px(0.) && before < -edge_tolerance)
+    {
+        cx.stop_propagation();
+    }
+}
+
 impl Render for KeywordRuleDragPreview {
     /// 拖动时显示被移动的规则文本，避免只有空占位框而无法辨认来源。
     ///
@@ -72,8 +104,10 @@ impl Render for KeywordRuleDragPreview {
 }
 
 impl PreferencesPanel {
-    /// 按 main 的标题、空态与主从列表呈现确认式规则草稿，不把未保存内容投影进列表。
-    /// 1280px 以下按 main 媒体断点上下排列，保持窄窗可滚动而非挤压编辑字段。
+    /// 使用实际设置内容宽度切换主从布局，两侧独立滚动并保留固定操作区。
+    /// 窄窗口为列表和编辑器保留最小空间，超出正文的部分由外层滚动而非压扁输入框。
+    /// 列表行滚轮使用预绘时的实际行高，子区域未到边界时不带动外层。
+    /// 未保存草稿按规则身份保留，数量达到上限时仍允许恢复但不能新增提交。
     ///
     /// @author kongweiguang
     pub(in crate::features::preferences) fn render_keyword_highlights(
@@ -92,7 +126,20 @@ impl PreferencesPanel {
                 ));
         };
 
-        let wide = window.viewport_size().width >= px(1280.);
+        let wide = self.keyword_editor.wide_layout.unwrap_or(false);
+        let panel = cx.weak_entity();
+        window.on_next_frame(move |_, app| {
+            let _ = panel.update(app, |panel, cx| {
+                let width = panel.content_scroll.bounds().size.width;
+                if width > px(0.) {
+                    let measured_wide = width >= px(680.);
+                    if panel.keyword_editor.wide_layout != Some(measured_wide) {
+                        panel.keyword_editor.wide_layout = Some(measured_wide);
+                        cx.notify();
+                    }
+                }
+            });
+        });
         let keyword_settings = settings.terminal.keyword_highlights;
         let locked = self.settings_controls_locked();
         let query = self.keyword_editor.query.trim().to_lowercase();
@@ -209,8 +256,12 @@ impl PreferencesPanel {
                                 Button::new("keyword-new")
                                     .primary()
                                     .icon(gpui_kit::assets::IconName::Plus)
-                                    .label(crate::locale::text("新建规则", "New rule"))
-                                    .disabled(locked || keyword_settings.rules.len() >= 64)
+                                    .label(if self.keyword_editor.has_parked_new() {
+                                        crate::locale::text("继续新建", "Resume new rule")
+                                    } else {
+                                        crate::locale::text("新建规则", "New rule")
+                                    })
+                                    .disabled(locked || is_new || (keyword_settings.rules.len() >= KEYWORD_RULE_LIMIT && !self.keyword_editor.has_parked_new()))
                                     .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
                                         panel.start_keyword_rule(window, cx);
                                     })),
@@ -302,6 +353,7 @@ impl PreferencesPanel {
         } else {
             let mut list = div()
                 .id("keyword-rule-list")
+                .min_h(px(0.))
                 .flex()
                 .flex_col()
                 .gap_2()
@@ -331,8 +383,14 @@ impl PreferencesPanel {
                                         .text_size(theme.text_xs)
                                         .text_color(theme.muted)
                                         .child(crate::locale::text(
-                                            format!("{} / 64 条", keyword_settings.rules.len()),
-                                            format!("{} / 64 rules", keyword_settings.rules.len()),
+                                            format!(
+                                                "已创建 {} 条，最多 64 条",
+                                                keyword_settings.rules.len()
+                                            ),
+                                            format!(
+                                                "{} created, maximum 64",
+                                                keyword_settings.rules.len()
+                                            ),
                                         )),
                                 ),
                         )
@@ -356,8 +414,28 @@ impl PreferencesPanel {
                         .w_full(),
                     ),
                 );
+            let list_scroll = self.keyword_editor.list_scroll.clone();
+            let list_line_height = Rc::new(Cell::new(px(0.)));
+            let list_prepaint_line_height = list_line_height.clone();
+            let mut list_content = div()
+                .id("keyword-rule-list-scroll")
+                .debug_selector(|| "keyword-rule-list-viewport".into())
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .overflow_y_scroll()
+                .track_scroll(&self.keyword_editor.list_scroll)
+                .on_prepaint(move |_, window, _| {
+                    list_prepaint_line_height.set(window.line_height());
+                })
+                .on_scroll_wheel(move |event, _, cx| {
+                    route_keyword_scroll(event, &list_scroll, list_line_height.get(), cx);
+                })
+                .vertical_scrollbar(&self.keyword_editor.list_scroll);
             for row in visible_rules {
-                list = list.child(row);
+                list_content = list_content.child(row);
             }
             if !query.is_empty()
                 && !keyword_settings.rules.iter().any(|rule| {
@@ -371,7 +449,7 @@ impl PreferencesPanel {
                     .contains(&query)
                 })
             {
-                list = list.child(
+                list_content = list_content.child(
                     div()
                         .id("keyword-no-results")
                         .w_full()
@@ -385,12 +463,15 @@ impl PreferencesPanel {
                         )),
                 );
             }
+            list = list.child(list_content);
 
             root = root.child(
                 div()
                     .w_full()
+                    .flex_1()
+                    .min_h(px(0.))
                     .flex()
-                    .when(!wide, |row| row.flex_col())
+                    .when(!wide, |row| row.flex_col().min_h(px(480.)))
                     .items_stretch()
                     .gap_4()
                     .child(
@@ -398,9 +479,12 @@ impl PreferencesPanel {
                             list.flex_1()
                                 .flex_grow(0.82)
                                 .flex_basis(px(0.))
-                                .min_w(px(280.))
+                                .min_w(px(0.))
+                                .h_full()
                         })
-                        .when(!wide, |list| list.w_full().min_w(px(0.))),
+                        .when(!wide, |list| {
+                            list.w_full().h(px(220.)).flex_shrink_0().min_w(px(0.))
+                        }),
                     )
                     .child(
                         div()
@@ -409,9 +493,12 @@ impl PreferencesPanel {
                                     .flex_1()
                                     .flex_grow(1.18)
                                     .flex_basis(px(0.))
-                                    .min_w(px(360.))
+                                    .min_w(px(0.))
+                                    .h_full()
                             })
-                            .when(!wide, |editor| editor.w_full().min_w(px(0.)))
+                            .when(!wide, |editor| {
+                                editor.w_full().flex_1().min_h(px(240.)).min_w(px(0.))
+                            })
                             .child(self.render_keyword_rule_editor(
                                 draft.as_ref(),
                                 KeywordRuleEditorState {
@@ -430,6 +517,7 @@ impl PreferencesPanel {
     }
 
     /// 列表条目只操作持久规则；编辑器草稿字段仅通过其独立保存按钮提交。
+    /// 两行摘要按内容撑高，列表滚动时不压缩行高，避免单行按钮默认高度裁掉模式和备注。
     ///
     /// @author kongweiguang
     fn render_keyword_rule_row(
@@ -441,6 +529,8 @@ impl PreferencesPanel {
         theme: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let mutation_locked =
+            self.settings_controls_locked() || self.keyword_editor.save_pending.is_some();
         let id = rule.id.clone();
         let selected_id = id.clone();
         let enabled_id = id.clone();
@@ -460,6 +550,7 @@ impl PreferencesPanel {
             .id(format!("keyword-rule-row-{id}"))
             .w_full()
             .min_h(px(64.))
+            .flex_shrink_0()
             .flex()
             .items_center()
             .gap_1()
@@ -482,9 +573,11 @@ impl PreferencesPanel {
                     .flex_none()
                     .px_1()
                     .text_color(theme.muted)
-                    .on_drag(drag_payload, move |dragged, _, _, cx| {
-                        cx.new(|_| KeywordRuleDragPreview {
-                            pattern: dragged.pattern.clone(),
+                    .when(!mutation_locked, |handle| {
+                        handle.on_drag(drag_payload, move |dragged, _, _, cx| {
+                            cx.new(|_| KeywordRuleDragPreview {
+                                pattern: dragged.pattern.clone(),
+                            })
                         })
                     })
                     .child("⋮⋮"),
@@ -494,13 +587,25 @@ impl PreferencesPanel {
                     .custom(super::render_settings::settings_ghost_variant(theme, cx))
                     .flex_1()
                     .min_w(px(0.))
+                    .h_auto()
+                    .py_2()
+                    .tooltip(if rule.note.is_empty() {
+                        rule.pattern.clone()
+                    } else {
+                        format!("{}\n{}", rule.pattern, rule.note)
+                    })
                     .accessibility_label(crate::locale::text(
                         format!("编辑规则 {}", rule.pattern),
                         format!("Edit rule {}", rule.pattern),
                     ))
                     .child(
                         div()
+                            .debug_selector({
+                                let id = id.clone();
+                                move || format!("keyword-rule-summary-{id}")
+                            })
                             .w_full()
+                            .min_w(px(0.))
                             .flex()
                             .flex_col()
                             .items_start()
@@ -565,7 +670,7 @@ impl PreferencesPanel {
                         format!("Move rule {} up", rule.pattern),
                     ))
                     .tooltip(crate::locale::text("上移", "Move up"))
-                    .disabled(index == 0)
+                    .disabled(mutation_locked || index == 0)
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
                         panel.move_keyword_rule(&move_up_id, -1, cx);
                     })),
@@ -580,7 +685,7 @@ impl PreferencesPanel {
                         format!("Move rule {} down", rule.pattern),
                     ))
                     .tooltip(crate::locale::text("下移", "Move down"))
-                    .disabled(index + 1 >= count)
+                    .disabled(mutation_locked || index + 1 >= count)
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
                         panel.move_keyword_rule(&move_down_id, 1, cx);
                     })),
@@ -589,7 +694,7 @@ impl PreferencesPanel {
                 Switch::new(format!("keyword-rule-enabled-{id}"))
                     .track_size(px(40.), px(24.))
                     .checked(rule.enabled)
-                    .disabled(false)
+                    .disabled(mutation_locked)
                     .accessibility_label(crate::locale::text(
                         format!("启用规则 {}", rule.pattern),
                         format!("Enable rule {}", rule.pattern),
@@ -610,9 +715,9 @@ impl PreferencesPanel {
             }))
     }
 
-    /// 编辑器保持 main 的主从比例与原位草稿；说明可收缩换行，色板仅显示当前主题的色块。
-    /// 等待 CAS 时连色盘也锁定，避免提交后再被弹层修改。
-    /// 大小写选项整行可点，子开关截断冒泡以保证每次手势仅改变一次草稿。
+    /// 编辑字段独立滚动，固定底部操作区保证窄窗和自定义色板展开时仍可保存。
+    /// 行滚轮按预绘行高还原真实偏移，避免样式继承导致错误的边界判断。
+    /// 等待 CAS 时锁定编辑字段，避免在回执确认前改变同一提交会话。
     ///
     /// @author kongweiguang
     fn render_keyword_rule_editor(
@@ -632,7 +737,8 @@ impl PreferencesPanel {
             return div()
                 .id("keyword-rule-editor-empty")
                 .w_full()
-                .min_h(px(260.))
+                .h_full()
+                .min_h(px(0.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -658,12 +764,8 @@ impl PreferencesPanel {
             .map(|settings| settings.value().terminal.clone())
             .unwrap_or_default();
         let dark = cx.theme().is_dark();
-        let scheme = if dark {
-            terminal.dark_color_scheme
-        } else {
-            terminal.light_color_scheme
-        };
-        let terminal_colors = super::render_terminal::terminal_preview_colors(scheme, dark);
+        let terminal_colors =
+            super::render_terminal::terminal_preview_colors(terminal.color_scheme, dark);
         let preview_font = crate::terminal_metrics::TerminalMetrics::from_settings(
             &terminal,
             &cx.text_system().all_font_names(),
@@ -672,17 +774,28 @@ impl PreferencesPanel {
         let pattern_count = draft.pattern.chars().count();
         let note_count = draft.note.chars().count();
 
+        let editor_scroll = self.keyword_editor.editor_scroll.clone();
+        let editor_line_height = Rc::new(Cell::new(px(0.)));
+        let editor_prepaint_line_height = editor_line_height.clone();
         let mut editor = div()
-            .id("keyword-rule-editor")
+            .id("keyword-rule-editor-content")
+            .debug_selector(|| "keyword-rule-editor-viewport".into())
             .w_full()
+            .flex_1()
+            .min_h(px(0.))
             .flex()
             .flex_col()
-            .gap_4()
-            .p_4()
-            .bg(theme.panel)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
+            .gap_3()
+            .p_3()
+            .overflow_y_scroll()
+            .track_scroll(&self.keyword_editor.editor_scroll)
+            .on_prepaint(move |_, window, _| {
+                editor_prepaint_line_height.set(window.line_height());
+            })
+            .on_scroll_wheel(move |event, _, cx| {
+                route_keyword_scroll(event, &editor_scroll, editor_line_height.get(), cx);
+            })
+            .vertical_scrollbar(&self.keyword_editor.editor_scroll)
             .child(
                 div()
                     .flex()
@@ -845,7 +958,7 @@ impl PreferencesPanel {
                                     .rounded(theme.control_radius)
                                     .accessibility_id("keyword-note")
                                     .disabled(locked || pending)
-                                    .h(px(80.))
+                                    .h(px(56.))
                                     .w_full(),
                             ),
                     ),
@@ -1026,7 +1139,7 @@ impl PreferencesPanel {
                     });
                 div()
                     .flex_1()
-                    .flex_basis(px(0.))
+                    .flex_basis(px(180.))
                     .min_w(px(0.))
                     .relative()
                     .border_1()
@@ -1055,6 +1168,7 @@ impl PreferencesPanel {
                     .w_full()
                     .min_w(px(0.))
                     .flex()
+                    .flex_wrap()
                     .gap_3()
                     .children(groups),
             );
@@ -1078,10 +1192,10 @@ impl PreferencesPanel {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .p_4()
+                        .p_3()
                         .font_family(preview_font)
                         .text_size(px(13.))
-                        .line_height(px(24.))
+                        .line_height(px(20.))
                         .bg(gpui_kit::rgb(terminal_colors.background))
                         .text_color(gpui_kit::rgb(terminal_colors.foreground))
                         .rounded_md()
@@ -1148,49 +1262,67 @@ impl PreferencesPanel {
                 }))
                 .into_any_element()
         };
-        editor.child(
-            div()
-                .w_full()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .pt_3()
-                .border_t_1()
-                .border_color(theme.border)
-                .child(delete_button)
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            Button::new("keyword-cancel")
-                                .custom(super::render_settings::settings_ghost_variant(theme, cx))
-                                .icon(gpui_kit::assets::IconName::RotateCcw)
-                                .label(crate::locale::text("取消", "Cancel"))
-                                .disabled(locked || pending)
-                                .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
-                                    panel.cancel_keyword_rule(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("keyword-save")
-                                .primary()
-                                .icon(gpui_kit::assets::IconName::Check)
-                                .label(if pending {
-                                    crate::locale::text("保存中…", "Saving…")
-                                } else {
-                                    crate::locale::text("保存规则", "Save rule")
-                                })
-                                .disabled(locked || pending)
-                                .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
-                                    panel.save_keyword_rule(window, cx);
-                                })),
-                        ),
-                ),
-        )
+        div()
+            .id("keyword-rule-editor")
+            .w_full()
+            .h_full()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .child(editor)
+            .child(
+                div()
+                    .id("keyword-rule-editor-footer")
+                    .debug_selector(|| "keyword-rule-editor-footer".into())
+                    .w_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(delete_button)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("keyword-cancel")
+                                    .custom(super::render_settings::settings_ghost_variant(
+                                        theme, cx,
+                                    ))
+                                    .icon(gpui_kit::assets::IconName::RotateCcw)
+                                    .label(crate::locale::text("取消", "Cancel"))
+                                    .disabled(locked || pending)
+                                    .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                                        panel.cancel_keyword_rule(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("keyword-save")
+                                    .primary()
+                                    .icon(gpui_kit::assets::IconName::Check)
+                                    .label(if pending {
+                                        crate::locale::text("保存中…", "Saving…")
+                                    } else {
+                                        crate::locale::text("保存规则", "Save rule")
+                                    })
+                                    .disabled(locked || pending)
+                                    .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                                        panel.save_keyword_rule(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
     }
 }
 

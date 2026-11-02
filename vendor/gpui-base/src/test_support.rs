@@ -26,11 +26,16 @@ pub struct ElementSnapshot {
     bounds: Bounds<Pixels>,
     visible: bool,
     focused: Option<bool>,
+    tracked_focus_id: Option<ElementId>,
     focus_action: bool,
+    click_action: bool,
     disabled: Option<bool>,
     label: Option<SharedString>,
 }
 impl fmt::Debug for ElementSnapshot {
+    /// 显示真实 Click 能力，便于区分未暴露 disabled 标记与未注册点击动作。
+    ///
+    /// @author kongweiguang
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct BindingMissed;
         impl fmt::Debug for BindingMissed {
@@ -54,7 +59,9 @@ impl fmt::Debug for ElementSnapshot {
             .field("bounds", &self.bounds)
             .field("visible", &self.visible)
             .field("focused", focused)
+            .field("tracked_focus_id", &self.tracked_focus_id)
             .field("focus_action", &self.focus_action)
+            .field("click_action", &self.click_action)
             .field("disabled", &self.disabled)
             .field("label", &self.label)
             .finish()
@@ -102,6 +109,18 @@ impl ElementSnapshot {
             self.path
         );
         self.focused
+    }
+    /// 返回绑定的焦点身份供诊断比较，不持有或改变窗口当前焦点。
+    ///
+    /// @author kongweiguang
+    pub fn tracked_focus_id(&self) -> Option<&ElementId> {
+        self.tracked_focus_id.as_ref()
+    }
+    /// 只返回实际 AccessKit 节点的 Click 能力，不将缺失 disabled 标记推断为启用。
+    ///
+    /// @author kongweiguang
+    pub fn supports_click(&self) -> bool {
+        self.click_action
     }
     /// `None` means the native element does not expose a disabled flag.
     /// Absence is not evidence that a control accepts input.
@@ -288,6 +307,9 @@ impl<E: Element<PrepaintState = Option<Hitbox>> + InteractiveElement> Element fo
     ) -> (LayoutId, Self::RequestLayoutState) {
         self.inner.request_layout(id, inspector, window, cx)
     }
+    /// 在已有节点快照中记录原生动作能力，避免依赖后台桌面是否启用无障碍客户端。
+    ///
+    /// @author kongweiguang
     fn prepaint(
         &mut self,
         id: Option<&GlobalElementId>,
@@ -313,7 +335,9 @@ impl<E: Element<PrepaintState = Option<Hitbox>> + InteractiveElement> Element fo
             bounds,
             visible: false,
             focused: None,
+            tracked_focus_id: self.focus.as_ref().map(ElementId::from),
             focus_action: node.supports_action(gpui::accesskit::Action::Focus),
+            click_action: node.supports_action(gpui::accesskit::Action::Click),
             disabled: node.is_disabled().then_some(true),
             label: node.label().map(|label| label.to_owned().into()),
         };

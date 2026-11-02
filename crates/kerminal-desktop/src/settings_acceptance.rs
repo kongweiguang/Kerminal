@@ -30,12 +30,22 @@ use crate::{composition::DesktopComposition, runtime::ApplicationRuntime};
 
 #[path = "settings_acceptance/app_theme.rs"]
 mod app_theme;
+#[path = "settings_acceptance/keywords.rs"]
+mod keywords;
+#[path = "settings_acceptance/local_hosts.rs"]
+mod local_hosts;
 #[path = "settings_acceptance/mcp.rs"]
 mod mcp;
 #[path = "settings_acceptance/profiles.rs"]
 mod profiles;
+#[path = "settings_acceptance/shortcuts.rs"]
+mod shortcuts;
+#[path = "settings_acceptance/suggestions.rs"]
+mod suggestions;
 #[path = "settings_acceptance/sync.rs"]
 mod sync;
+#[path = "settings_acceptance/terminal.rs"]
+mod terminal;
 #[path = "settings_acceptance/workbench.rs"]
 mod workbench;
 
@@ -85,6 +95,7 @@ struct AcceptanceContext {
     width: u32,
     height: u32,
     sync_fixture: sync::SyncFixture,
+    mcp_port_reservation: Arc<Mutex<Option<std::net::TcpListener>>>,
 }
 
 #[derive(Serialize)]
@@ -104,11 +115,15 @@ struct AcceptanceReport {
     themes: Vec<ThemeCapture>,
     disclosure_checks: Vec<SettingCheck>,
     density_checks: Vec<SettingCheck>,
+    terminal_checks: Vec<SettingCheck>,
+    shortcut_checks: Vec<SettingCheck>,
     keyword_rule_check: SettingCheck,
     keyword_lifecycle_checks: Vec<KeywordLifecycleCheck>,
+    keyword_adjustment_checks: Vec<SettingCheck>,
     sync_checks: Vec<SettingCheck>,
     mcp_checks: Vec<SettingCheck>,
     profile_checks: Vec<SettingCheck>,
+    profile_host_checks: Vec<SettingCheck>,
     screenshots: Vec<CaptureRecord>,
 }
 
@@ -187,7 +202,7 @@ pub fn requested() -> bool {
         .is_some_and(|argument| argument == OsStr::new("--settings-acceptance"))
 }
 
-/// 专项入口优先分派到隔离的主题验收；其它情况下继续运行现有完整设置验收及资源收尾。
+/// 专项入口复用真实组合根；建议验收预建子进程重定向的 KnownFolder，隔离 Shell 历史且保留正常关闭。
 ///
 /// @author kongweiguang
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -208,6 +223,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     };
     let config_directory = output_directory.join("config");
     fs::create_dir(&config_directory)?;
+    if std::env::var("KERMINAL_SETTINGS_ACCEPTANCE_SCOPE").is_ok_and(|scope| scope == "suggestions")
+    {
+        for directory in ["AppData/Local", "AppData/Roaming", "Documents"] {
+            fs::create_dir_all(config_directory.join(directory))?;
+        }
+    }
+    let mcp_port_reservation =
+        Arc::new(Mutex::new(Some(seed_isolated_mcp_port(&config_directory)?)));
     let runtime = ApplicationRuntime::new()?;
     let mut composition = match runtime.block_on(DesktopComposition::build(
         runtime.handle(),
@@ -227,6 +250,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 width: options.width.unwrap_or(DEFAULT_WIDTH),
                 height: options.height.unwrap_or(DEFAULT_HEIGHT),
                 sync_fixture,
+                mcp_port_reservation,
             };
             catch_unwind(AssertUnwindSafe(|| run_hidden_window(services, context))).unwrap_or_else(
                 |_| Err(io::Error::other("settings acceptance event loop panicked").into()),
@@ -245,6 +269,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         output_directory.join(REPORT_FILE).display()
     );
     Ok(())
+}
+
+/// 在新建的隔离配置根预留唯一回环端口，直到验收点击启动前才交还给 MCP。
+///
+/// @author kongweiguang
+fn seed_isolated_mcp_port(config_directory: &Path) -> Result<std::net::TcpListener, io::Error> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let port = listener.local_addr()?.port();
+    let settings = format!("schema_version = 1\n\n[mcp]\nbindMode = \"loopback\"\nport = {port}\n");
+    fs::write(config_directory.join("settings.toml"), settings)?;
+    Ok(listener)
 }
 
 /// Rejects duplicate, malformed, and unknown options before creating an isolated output root.
@@ -427,8 +462,10 @@ fn run_hidden_window(
                     width: context.width,
                     height: context.height,
                     sync_fixture: context.sync_fixture.clone(),
+                    mcp_port_reservation: Arc::clone(&context.mcp_port_reservation),
                 };
                 cx.spawn(async move |cx| {
+                    let failure_capture = capture_context.output_directory.join("failure.png");
                     let result = capture_settings(
                         cx,
                         capture_root,
@@ -438,6 +475,7 @@ fn run_hidden_window(
                     )
                     .await;
                     if let Err(error) = result {
+                        let _ = save_frame(cx, window_handle, failure_capture);
                         set_failure(&capture_failure, error.to_string());
                     }
                     cx.update(|cx| cx.quit());
@@ -530,6 +568,7 @@ async fn resize_acceptance_window(
 
 /// 在隔离生产 Root 上使用真实快捷键和滚轮；先保存 Profile，使三主题截图覆盖真实记录。
 /// 紧凑窗口中入口及字段必须先进入可见区域。
+/// 专项只缩小场景，仍使用相同的生产入口、私有桌面和资源收尾边界。
 ///
 /// @author kongweiguang
 async fn capture_settings(
@@ -539,9 +578,13 @@ async fn capture_settings(
     services: kerminal_ui::AppServices,
     context: AcceptanceContext,
 ) -> Result<(), Box<dyn Error>> {
+    let mcp_only =
+        std::env::var("KERMINAL_SETTINGS_ACCEPTANCE_SCOPE").is_ok_and(|scope| scope == "mcp");
+    let suggestions_only = std::env::var("KERMINAL_SETTINGS_ACCEPTANCE_SCOPE")
+        .is_ok_and(|scope| scope == "suggestions");
     let deadline = Instant::now() + READY_TIMEOUT;
     let initial = wait_for_state(cx, &root, window, deadline, |state| {
-        state.settings_ready() && state.draft_ready()
+        state.settings_ready() && state.draft_ready() && state.workspace_ready()
     })
     .await?;
     if initial.modal_open() {
@@ -551,6 +594,17 @@ async fn capture_settings(
         .into());
     }
     resize_acceptance_window(cx, window, context.width, context.height).await?;
+    if !mcp_only && initial.ready_local_session_ids().is_empty() {
+        press_key(cx, window, "ctrl-shift-t")?;
+        wait_for_state(cx, &root, window, Instant::now() + READY_TIMEOUT, |state| {
+            !state.ready_local_session_ids().is_empty()
+                && state.rendered_terminal_palette().is_some()
+        })
+        .await?;
+    }
+    if suggestions_only {
+        return suggestions::capture_only(cx, &root, window, &services, &context).await;
+    }
     let mut themes = Vec::with_capacity(THEMES.len());
     let mut screenshots = Vec::with_capacity(THEMES.len() * SETTINGS_PAGES.len() * 2 + 10);
     press_key(cx, window, "ctrl-alt-s")?;
@@ -572,8 +626,13 @@ async fn capture_settings(
     )
     .await?;
     let modal_generation = opened.modal_generation();
+    if mcp_only {
+        return mcp::capture_only(cx, &root, window, &services, &context, &mut screenshots).await;
+    }
     let profile_checks =
         profiles::verify(cx, &root, window, &services, &context, &mut screenshots).await?;
+    let profile_host_checks =
+        local_hosts::verify(cx, &root, window, &services, &context, &mut screenshots).await?;
     for (theme, name, selector) in THEMES {
         ensure_page(cx, &root, window, "appearance", "appearance").await?;
         reveal_settings_selector(cx, &root, window, "appearance", selector).await?;
@@ -666,7 +725,20 @@ async fn capture_settings(
         verify_language_select_escape(cx, &root, window, &context, &mut screenshots).await?;
     let disclosure_checks =
         capture_expanded_disclosures(cx, &root, window, &context, &mut screenshots).await?;
-    let mcp_checks = mcp::verify(cx, &root, window, &services, &context, &mut screenshots).await?;
+    let mcp_checks = mcp::verify(
+        cx,
+        &root,
+        window,
+        &services,
+        &context,
+        &mut screenshots,
+        false,
+    )
+    .await?;
+    let terminal_checks =
+        terminal::verify(cx, &root, window, &services, &context, &mut screenshots).await?;
+    let shortcut_checks =
+        shortcuts::verify(cx, &root, window, &services, &context, &mut screenshots).await?;
 
     let mut density_checks = Vec::with_capacity(2);
     ensure_page(cx, &root, window, "appearance", "appearance").await?;
@@ -710,8 +782,30 @@ async fn capture_settings(
         });
     }
 
-    let (keyword_rule_check, keyword_lifecycle_checks) =
-        add_keyword_rule(cx, &root, window, &services, &context, &mut screenshots).await?;
+    let fixture_rules = keywords::seed_rules(&services).await?;
+    wait_for_state(
+        cx,
+        &root,
+        window,
+        Instant::now() + ACTION_TIMEOUT,
+        |state| {
+            state.draft_keyword_rule_count() == Some(fixture_rules.len())
+                && state.draft_ready()
+                && !state.draft_dirty()
+        },
+    )
+    .await?;
+    let (keyword_rule_check, keyword_lifecycle_checks, keyword_adjustment_checks) =
+        add_keyword_rule(
+            cx,
+            &root,
+            window,
+            &services,
+            &context,
+            &mut screenshots,
+            &fixture_rules,
+        )
+        .await?;
     let sync_checks =
         sync::verify(cx, &root, window, &services, &context, &mut screenshots).await?;
     let final_state = root_state(cx, &root, window)?;
@@ -721,6 +815,8 @@ async fn capture_settings(
         );
     }
     click_selector(cx, window, "preferences-close")?;
+    keywords::wait_close_confirmation(cx, window, true).await?;
+    click_selector(cx, window, "preferences-close-discard")?;
     wait_for_state(
         cx,
         &root,
@@ -736,6 +832,22 @@ async fn capture_settings(
         )
         .into());
     }
+    let parked_rule_id = fixture_rules
+        .last()
+        .ok_or_else(|| io::Error::other("keyword fixture has no parked draft rule"))?;
+    let persisted_after_discard = load_persisted_settings(&services).await?;
+    if !persisted_after_discard
+        .settings
+        .terminal
+        .keyword_highlights
+        .rules
+        .iter()
+        .any(|rule| rule.id == *parked_rule_id && rule.note == "fixture")
+    {
+        return Err(
+            io::Error::other("discarding the parked keyword draft changed its saved rule").into(),
+        );
+    }
     verify_capture_dimensions(cx, window, context.width, context.height, &screenshots)?;
 
     let (visible, active, bounds, native_isolation) = window.update(cx, |_, window, _| {
@@ -746,7 +858,7 @@ async fn capture_settings(
         Ok::<_, io::Error>((visible, active, window.bounds(), native_isolation))
     })??;
     let report = AcceptanceReport {
-        schema_version: 4,
+        schema_version: 6,
         capture_mode: "hidden_native_window",
         capture_backend: "gpui_window_render_to_image",
         native_isolation,
@@ -764,11 +876,15 @@ async fn capture_settings(
         themes,
         disclosure_checks,
         density_checks,
+        terminal_checks,
+        shortcut_checks,
         keyword_rule_check,
         keyword_lifecycle_checks,
+        keyword_adjustment_checks,
         sync_checks,
         mcp_checks,
         profile_checks,
+        profile_host_checks,
         screenshots,
     };
     let report_path = context.output_directory.join(REPORT_FILE);
@@ -950,7 +1066,9 @@ async fn verify_language_select_escape(
     })
 }
 
-/// Captures one expanded rendering per real disclosure and restores each local toggle after capture.
+/// 只捕获仍存在的生产展开项，并在截图后恢复初始状态，避免后续操作受影响。
+///
+/// @author kongweiguang
 async fn capture_expanded_disclosures(
     cx: &mut AsyncApp,
     root: &Entity<RootView>,
@@ -959,11 +1077,6 @@ async fn capture_expanded_disclosures(
     screenshots: &mut Vec<CaptureRecord>,
 ) -> Result<Vec<SettingCheck>, Box<dyn Error>> {
     let disclosures = [
-        (
-            "terminal",
-            "terminal-renderer-disclosure",
-            "terminal-renderer",
-        ),
         ("sftp", "preferences-sftp-advanced", "sftp-advanced"),
         (
             "external-launch",
@@ -1022,7 +1135,10 @@ async fn capture_expanded_disclosures(
     Ok(checks)
 }
 
-/// 长页面仅用真实滚轮定位；控件完整进入生产正文裁切区域后才允许点击。
+/// 长页面仅用真实滚轮定位；嵌套区域按实际可见高度翻页，对部分露出的目标精确调整。
+/// 目标必须完整进入正文与子滚动区的交集，最后一次滚动也要检查，有限预算覆盖密集规则列表。
+/// 长列表保留较宽时间预算并在失败时报告几何，避免逐页绘制被误报为布局卡死。
+/// 已完整可见的目标保留当前滚动位置，避免连续操作末行时反复从列表顶部遍历。
 ///
 /// @author kongweiguang
 async fn reveal_settings_selector(
@@ -1032,27 +1148,170 @@ async fn reveal_settings_selector(
     page_id: &str,
     selector: &str,
 ) -> Result<(), Box<dyn Error>> {
+    eprintln!("settings reveal start: page={page_id:?}, selector={selector:?}");
+    let nested_region = keyword_scroll_region(page_id, selector);
+    let already_visible = window.update(cx, |_, window, app| {
+        ensure_hidden_window(window)?;
+        draw_acceptance_frame(window, app);
+        let viewport = root.update(app, |root, cx| root.settings_acceptance_content_bounds(cx));
+        let clip = match nested_region {
+            Some(region) => window
+                .debug_selector_bounds(region)
+                .map(|bounds| viewport.intersect(&bounds)),
+            None => Some(viewport),
+        };
+        Ok::<_, io::Error>(clip.is_some_and(|clip| {
+            !clip.is_empty()
+                && selector_bounds(window, selector)
+                    .is_ok_and(|bounds| bounds_inside_viewport(bounds, clip))
+        }))
+    })??;
+    if already_visible {
+        return Ok(());
+    }
+    let deadline =
+        Instant::now() + Duration::from_secs(if nested_region.is_some() { 180 } else { 60 });
     scroll_settings_content(cx, root, window, page_id, 5_000.)?;
-    for _ in 0..16 {
-        let visible = window.update(cx, |_, window, app| {
+    if let Some(region) = nested_region {
+        for _ in 0..16 {
+            if scroll_keyword_region(cx, root, window, region, 5_000.)? {
+                break;
+            }
+            scroll_settings_content(cx, root, window, page_id, -280.)?;
+            cx.background_executor().timer(POLL_INTERVAL).await;
+        }
+    }
+    let max_scrolls = if nested_region.is_some() { 512 } else { 16 };
+    let mut last_geometry = String::new();
+    let mut observed_scrolls = 0;
+    for scrolls in 0..=max_scrolls {
+        observed_scrolls = scrolls;
+        let (visible, nested_delta, geometry) = window.update(cx, |_, window, app| {
             ensure_hidden_window(window)?;
             draw_acceptance_frame(window, app);
             let viewport = root.update(app, |root, cx| root.settings_acceptance_content_bounds(cx));
-            Ok::<_, io::Error>(
-                selector_bounds(window, selector)
-                    .is_ok_and(|bounds| bounds_inside_viewport(bounds, viewport)),
-            )
+            let clipped_viewport = match nested_region {
+                Some(region) => window
+                    .debug_selector_bounds(region)
+                    .map(|bounds| viewport.intersect(&bounds)),
+                None => Some(viewport),
+            };
+            let Some(clipped_viewport) = clipped_viewport.filter(|bounds| !bounds.is_empty())
+            else {
+                return Ok::<_, io::Error>((
+                    false,
+                    None,
+                    format!("viewport={viewport:?}, nested={nested_region:?}:not-visible"),
+                ));
+            };
+            let target = selector_bounds(window, selector).ok();
+            let visible =
+                target.is_some_and(|bounds| bounds_inside_viewport(bounds, clipped_viewport));
+            let nested_delta = nested_region.map(|_| {
+                let limit = clipped_viewport.size.height.as_f32().clamp(1., 280.);
+                target.map_or(-limit, |bounds| {
+                    let top = bounds.origin.y.as_f32();
+                    let bottom = top + bounds.size.height.as_f32();
+                    let visible_top = clipped_viewport.origin.y.as_f32();
+                    let visible_bottom = visible_top + clipped_viewport.size.height.as_f32();
+                    if top < visible_top {
+                        (visible_top - top).clamp(1., limit)
+                    } else if bottom > visible_bottom {
+                        -(bottom - visible_bottom).clamp(1., limit)
+                    } else {
+                        -limit
+                    }
+                })
+            });
+            Ok::<_, io::Error>((
+                visible,
+                nested_delta,
+                format!("viewport={viewport:?}, clipped={clipped_viewport:?}, target={target:?}, delta={nested_delta:?}"),
+            ))
         })??;
+        last_geometry = geometry;
         if visible {
             return Ok(());
         }
-        scroll_settings_content(cx, root, window, page_id, -280.)?;
+        if scrolls == max_scrolls || Instant::now() >= deadline {
+            break;
+        }
+        if let Some(region) = nested_region {
+            let scrolled = match nested_delta {
+                Some(delta) => scroll_keyword_region(cx, root, window, region, delta)?,
+                None => false,
+            };
+            if !scrolled {
+                scroll_settings_content(cx, root, window, page_id, -280.)?;
+            }
+        } else {
+            scroll_settings_content(cx, root, window, page_id, -280.)?;
+        }
         cx.background_executor().timer(POLL_INTERVAL).await;
     }
     Err(io::Error::other(format!(
-        "settings control {selector:?} could not be revealed on page {page_id:?}"
+        "settings control {selector:?} could not be revealed on page {page_id:?}; scrolls={observed_scrolls}, timed_out={}, {last_geometry}",
+        Instant::now() >= deadline,
     ))
     .into())
+}
+
+/// 规则列表和详情各自接收滚轮；固定页脚及页面标题仍由外层页面定位。
+///
+/// @author kongweiguang
+fn keyword_scroll_region(page_id: &str, selector: &str) -> Option<&'static str> {
+    if page_id != "keywords" {
+        return None;
+    }
+    if selector == "keyword-rule-enabled-draft"
+        || selector.starts_with("keyword-pattern-")
+        || selector.starts_with("keyword-note-")
+        || selector.starts_with("keyword-style-")
+        || selector.starts_with("keyword-mode-")
+        || selector.starts_with("keyword-color-")
+    {
+        return Some("keyword-rule-editor-viewport");
+    }
+    if selector.starts_with("keyword-rule-")
+        && !selector.starts_with("keyword-rule-editor-")
+        && selector != "keyword-rule-list-scroll"
+        && selector != "keyword-rule-list-viewport"
+    {
+        return Some("keyword-rule-list-viewport");
+    }
+    None
+}
+
+/// 只在嵌套区域与实际正文裁切区相交的位置发滚轮，防止误滚另一栏或当前桌面。
+///
+/// @author kongweiguang
+fn scroll_keyword_region(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    region: &str,
+    delta: f32,
+) -> Result<bool, Box<dyn Error>> {
+    Ok(window.update(cx, |_, window, app| {
+        ensure_hidden_window(window)?;
+        draw_acceptance_frame(window, app);
+        let viewport = root.update(app, |root, cx| root.settings_acceptance_content_bounds(cx));
+        let Some(region_bounds) = window.debug_selector_bounds(region) else {
+            return Ok::<_, io::Error>(false);
+        };
+        let clipped = viewport.intersect(&region_bounds);
+        if clipped.is_empty() {
+            return Ok(false);
+        }
+        let event = ScrollWheelEvent {
+            position: clipped.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+            touch_phase: TouchPhase::Moved,
+            ..ScrollWheelEvent::default()
+        };
+        let _ = window.dispatch_event(event.to_platform_input(), app);
+        Ok(true)
+    })??)
 }
 
 /// Checks the shared popup registry so the Escape probe proves the Select closed its real overlay.
@@ -1139,7 +1398,8 @@ async fn add_keyword_rule(
     services: &kerminal_ui::AppServices,
     context: &AcceptanceContext,
     screenshots: &mut Vec<CaptureRecord>,
-) -> Result<(SettingCheck, Vec<KeywordLifecycleCheck>), Box<dyn Error>> {
+    fixture_rules: &[String],
+) -> Result<(SettingCheck, Vec<KeywordLifecycleCheck>, Vec<SettingCheck>), Box<dyn Error>> {
     ensure_page(cx, root, window, "keywords", "keywords").await?;
     let before = load_persisted_settings(services).await?;
     let before_count = before.settings.terminal.keyword_highlights.rules.len();
@@ -1185,6 +1445,17 @@ async fn add_keyword_rule(
             && !state.draft_dirty()
             && state.draft_ready()
     })
+    .await?;
+
+    let mut adjustment_checks = keywords::verify_draft_switch(
+        cx,
+        root,
+        window,
+        context,
+        screenshots,
+        &new_rule_id,
+        fixture_rules,
+    )
     .await?;
 
     let before_save = load_persisted_settings(services).await?;
@@ -1289,6 +1560,22 @@ async fn add_keyword_rule(
         ))
         .into());
     }
+    adjustment_checks.push(
+        keywords::verify_rule_limit_and_footer(
+            cx,
+            root,
+            window,
+            services,
+            context,
+            screenshots,
+            &persisted_after_save
+                .settings
+                .terminal
+                .keyword_highlights
+                .rules,
+        )
+        .await?,
+    );
 
     let saved_mode_id = match saved_mode {
         Some(TerminalKeywordHighlightMatchMode::Literal) => "Literal",
@@ -1614,6 +1901,7 @@ async fn add_keyword_rule(
             capture: Some(capture),
         },
         lifecycle_checks,
+        adjustment_checks,
     ))
 }
 
@@ -1830,7 +2118,9 @@ fn verify_capture_dimensions(
     Ok(())
 }
 
-/// Resolves Kit controls from the current observation frame, using debug selectors only for plain wrappers.
+/// 使用真实控件的布局边界发送点击，普通容器仅作为作用域而不假装自己是可交互控件。
+///
+/// @author kongweiguang
 fn click_selector(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
@@ -1842,37 +2132,82 @@ fn click_selector(
         let frame = window.draw(app);
         frame.clear(app);
         let bounds = selector_bounds(window, selector)?;
-        if !bounds_inside_viewport(bounds, window.visual_viewport_bounds()) {
+        click_bounds(window, app, bounds, selector)
+    })??;
+    Ok(())
+}
+
+/// 根据父容器身份区分 Kit 数值控件共用的 increment/decrement 子按钮。
+///
+/// @author kongweiguang
+fn click_scoped_selector(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    parent: &str,
+    child: &str,
+) -> Result<(), Box<dyn Error>> {
+    window.update(cx, |_, window, app| {
+        ensure_hidden_window(window)?;
+        draw_acceptance_frame(window, app);
+        let parent_id: ElementId = parent.to_owned().into();
+        let child_id: ElementId = child.to_owned().into();
+        let matches = gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .filter(|element| {
+                element.visible()
+                    && element.path().contains(&parent_id)
+                    && element.path().last() == Some(&child_id)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
             return Err(io::Error::other(format!(
-                "selector {selector:?} is outside the visible viewport"
+                "expected one visible {parent:?}/{child:?} control, found {}",
+                matches.len()
             )));
         }
-        let position = bounds.center();
-        for event in [
-            MouseMoveEvent {
-                position,
-                ..MouseMoveEvent::default()
-            }
-            .to_platform_input(),
-            MouseDownEvent {
-                button: MouseButton::Left,
-                position,
-                click_count: 1,
-                ..MouseDownEvent::default()
-            }
-            .to_platform_input(),
-            MouseUpEvent {
-                button: MouseButton::Left,
-                position,
-                click_count: 1,
-                ..MouseUpEvent::default()
-            }
-            .to_platform_input(),
-        ] {
-            let _ = window.dispatch_event(event, app);
-        }
-        Ok::<_, io::Error>(())
+        click_bounds(window, app, matches[0].bounds(), child)
     })??;
+    Ok(())
+}
+
+/// 所有原生点击共用同一窗口边界和输入顺序，避免把屏外几何当成有效操作。
+///
+/// @author kongweiguang
+fn click_bounds(
+    window: &mut gpui_pre::Window,
+    app: &mut App,
+    bounds: Bounds<gpui_pre::Pixels>,
+    selector: &str,
+) -> Result<(), io::Error> {
+    if !bounds_inside_viewport(bounds, window.visual_viewport_bounds()) {
+        return Err(io::Error::other(format!(
+            "selector {selector:?} is outside the visible viewport"
+        )));
+    }
+    let position = bounds.center();
+    for event in [
+        MouseMoveEvent {
+            position,
+            ..MouseMoveEvent::default()
+        }
+        .to_platform_input(),
+        MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            click_count: 1,
+            ..MouseDownEvent::default()
+        }
+        .to_platform_input(),
+        MouseUpEvent {
+            button: MouseButton::Left,
+            position,
+            click_count: 1,
+            ..MouseUpEvent::default()
+        }
+        .to_platform_input(),
+    ] {
+        let _ = window.dispatch_event(event, app);
+    }
     Ok(())
 }
 
@@ -1903,15 +2238,21 @@ fn scroll_settings_content(
     Ok(())
 }
 
-/// Resolves Kit observation first; debug selectors are reserved for plain layout wrappers with no native control ID.
+/// 按完整 GPUI 身份路径定位容器内输入，再回退到普通布局的调试选择器。
+/// Kit 的数值输入使用带实体编号的 input ID，必须与普通字符串输入同时支持。
+///
+/// @author kongweiguang
 fn selector_bounds(
     window: &gpui_pre::Window,
     selector: &str,
 ) -> Result<Bounds<gpui_pre::Pixels>, io::Error> {
     let selector_id: ElementId = selector.to_owned().into();
-    let input_id: ElementId = "input".into();
     let element = gpui_kit::base::test_support::find(window, &[], &selector_id).or_else(|| {
-        gpui_kit::base::test_support::find(window, std::slice::from_ref(&selector_id), &input_id)
+        let matches = gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .filter(|element| is_scoped_input_path(element.path(), &selector_id))
+            .collect::<Vec<_>>();
+        (matches.len() == 1).then(|| matches[0].clone())
     });
     if let Some(element) = element {
         if !element.visible() {
@@ -1929,6 +2270,18 @@ fn selector_bounds(
                 "missing observed ElementId or debug selector {selector:?}; registered paths: {registered}"
             ))
         })
+}
+
+/// 只识别指定容器下的 input 叶子，实体编号区分同页多个 Kit 数值输入。
+///
+/// @author kongweiguang
+fn is_scoped_input_path(path: &[ElementId], selector: &ElementId) -> bool {
+    path.contains(selector)
+        && matches!(
+            path.last(),
+            Some(ElementId::Name(name) | ElementId::NamedInteger(name, _))
+                if name.as_ref() == "input"
+        )
 }
 
 /// Maps each settings section to the real scroll container already present in its production page tree.
@@ -1950,7 +2303,9 @@ fn settings_scroll_root(page_id: &str) -> Option<&'static str> {
     }
 }
 
-/// Chooses a child within the body clip, excluding nested JSON scrolling so the page itself consumes the wheel.
+/// 外层滚轮避开 MCP 预览及关键词子滚动区，确保页面本身接收定位事件。
+///
+/// @author kongweiguang
 fn observed_settings_scroll_position(
     window: &gpui_pre::Window,
     page_id: &str,
@@ -1959,9 +2314,10 @@ fn observed_settings_scroll_position(
     let root_name = settings_scroll_root(page_id)
         .ok_or_else(|| io::Error::other(format!("unknown settings scroll page {page_id:?}")))?;
     let root_id: gpui_pre::ElementId = root_name.into();
-    let nested_scroll_root = match page_id {
-        "mcp" => Some(gpui_pre::ElementId::from("mcp-json-preview")),
-        _ => None,
+    let nested_scroll_roots: &[&str] = match page_id {
+        "mcp" => &["mcp-json-preview"],
+        "keywords" => &["keyword-rule-list-scroll", "keyword-rule-editor-content"],
+        _ => &[],
     };
     let viewport_center = viewport.center();
     let mut nearest: Option<(f32, gpui_pre::Point<gpui_pre::Pixels>)> = None;
@@ -1969,9 +2325,11 @@ fn observed_settings_scroll_position(
     for element in gpui_kit::base::test_support::snapshots(window) {
         if !element.visible()
             || !element.path().contains(&root_id)
-            || nested_scroll_root
-                .as_ref()
-                .is_some_and(|nested_id| element.path().contains(nested_id))
+            || nested_scroll_roots.iter().any(|nested_id| {
+                element
+                    .path()
+                    .contains(&gpui_pre::ElementId::from(*nested_id))
+            })
         {
             continue;
         }
@@ -2091,16 +2449,22 @@ fn save_frame(
     })
 }
 
-/// Confirms test clicks target rendered controls within the visible client viewport.
+/// 只容忍分数缩放布局的浮点舍入，仍拒绝实际被裁切的控件和空视口。
+/// 定位滚轮另保留一个逻辑像素的最小步幅，避免无效微量滚动反复占用验收预算。
+///
+/// @author kongweiguang
 fn bounds_inside_viewport(
     bounds: Bounds<gpui_pre::Pixels>,
     viewport: Bounds<gpui_pre::Pixels>,
 ) -> bool {
+    let rounding = px(0.001);
     !bounds.is_empty()
-        && bounds.origin.x >= viewport.origin.x
-        && bounds.origin.y >= viewport.origin.y
-        && bounds.origin.x + bounds.size.width <= viewport.origin.x + viewport.size.width
-        && bounds.origin.y + bounds.size.height <= viewport.origin.y + viewport.size.height
+        && !viewport.is_empty()
+        && bounds.origin.x + rounding >= viewport.origin.x
+        && bounds.origin.y + rounding >= viewport.origin.y
+        && bounds.origin.x + bounds.size.width <= viewport.origin.x + viewport.size.width + rounding
+        && bounds.origin.y + bounds.size.height
+            <= viewport.origin.y + viewport.size.height + rounding
 }
 
 /// Reuses the native isolation proof: visible windows always fail, while active windows pass only on a proven private desktop.
@@ -2149,3 +2513,7 @@ fn set_failure(failure: &Arc<Mutex<Option<String>>>, message: String) {
 #[cfg(test)]
 #[path = "../tests/unit/settings_acceptance_args.rs"]
 mod args_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/settings_acceptance_selectors.rs"]
+mod selector_tests;

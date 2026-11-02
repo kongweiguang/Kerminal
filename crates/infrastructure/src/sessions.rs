@@ -65,6 +65,9 @@ use kerminal_application::{AppError, AppResult};
 #[path = "sessions/auto_reconnect.rs"]
 mod auto_reconnect;
 
+#[path = "sessions/editing_runtime.rs"]
+mod editing_runtime;
+
 use auto_reconnect::{AutoReconnectContext, AutoReconnectDecision, AutoReconnectPolicy};
 
 const SHELL_EVENT_CAPACITY: usize = 64;
@@ -992,6 +995,10 @@ impl SessionManager {
             changes,
             input_gate: Mutex::new(()),
             shell_integration: Mutex::new(ShellIntegrationState::default()),
+            shell_editing: Arc::new(StdMutex::new(editing_runtime::EditingRuntime::new(
+                1,
+                transport.shell_editing_nonce,
+            ))),
             shell_events,
             shell_dialect: RwLock::new(shell_dialect),
             operation_gate: Mutex::new(()),
@@ -1518,6 +1525,8 @@ impl SessionManager {
         let manager = self.clone();
         self.runtime.spawn(async move {
             let mut buffer = vec![0_u8; maximum_chunk];
+            let mut editing_filter =
+                kerminal_terminal::shell_editing::ShellEditingFrameFilter::default();
             loop {
                 let read = tokio::select! {
                     _ = cancellation.cancelled() => break,
@@ -1525,6 +1534,22 @@ impl SessionManager {
                 };
                 match read {
                     Ok(0) => {
+                        let remaining = editing_filter.finish();
+                        if deliver_reader_output(
+                            &session,
+                            &remaining,
+                            output_recorder.as_ref(),
+                            control.as_ref(),
+                            transport_generation,
+                            close_wait,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            cancellation.cancel();
+                            mark_writer_failure(&session, transport_generation).await;
+                            break;
+                        }
                         if let Some(error) = mark_reader_exit(
                             &session,
                             control.as_ref(),
@@ -1548,84 +1573,73 @@ impl SessionManager {
                         break;
                     }
                     Err(error) => {
-                        mark_reader_failure(&session, transport_generation, error).await;
-                        break;
-                    }
-                    Ok(read) => {
-                        let sequence = session
-                            .output_sequence
-                            .fetch_add(1, Ordering::Relaxed)
-                            .wrapping_add(1);
-                        if let Some(recorder) = &output_recorder
-                            && let OutputRecordResult::Failed {
-                                first_missing_sequence,
-                                reason,
-                            } = recorder.try_record_output(
-                                &session.session_id,
-                                sequence,
-                                &buffer[..read],
-                            )
-                        {
-                            tracing::warn!(
-                                session_id = %session.session_id,
-                                first_missing_sequence,
-                                ?reason,
-                                "terminal session log stopped at bounded output queue boundary"
-                            );
-                        }
-                        let (output, reader_diagnostic) = {
-                            let mut state = session.state.lock().await;
-                            let reader_diagnostic = if resize_diagnostics_enabled()
-                                && matches!(&state.info.target, SessionTarget::Ssh(_))
-                                && claim_resize_reader_diagnostic_chunk(
-                                    &session.resize_diagnostic_reader_budget,
-                                ) {
-                                Some(ResizeReaderDiagnosticContext {
-                                    session_sequence: session.resize_diagnostic_session_sequence,
-                                    transport_generation,
-                                    resize_generation: session
-                                        .resize_diagnostic_generation
-                                        .load(Ordering::Acquire),
-                                    reader_sequence: sequence,
-                                    chunk_bytes: read as u64,
-                                })
-                            } else {
-                                None
-                            };
-                            let before = reader_diagnostic
-                                .map(|_| (state.engine.size(), state.engine.revision()));
-                            let output = state.engine.process_output(&buffer[..read]);
-                            let after = reader_diagnostic
-                                .map(|_| (state.engine.size(), state.engine.revision()));
-                            apply_terminal_output_events(&session, &output.events).await;
-                            let revision = state.engine.revision();
-                            session.changes.send_replace(SessionChange {
-                                revision,
-                                kind: if output.title_changed.is_some() {
-                                    SessionChangeKind::Title
-                                } else {
-                                    SessionChangeKind::Output
-                                },
-                            });
-                            (output, reader_diagnostic.zip(before).zip(after))
-                        };
-                        if let Some(((context, before), after)) = reader_diagnostic {
-                            log_resize_reader_diagnostic(context, 20, before.0, before.1);
-                            log_resize_reader_diagnostic(context, 21, after.0, after.1);
-                        }
-                        if write_parser_responses(&session, output.pty_writes)
-                            .await
-                            .is_err()
+                        let remaining = editing_filter.finish();
+                        if deliver_reader_output(
+                            &session,
+                            &remaining,
+                            output_recorder.as_ref(),
+                            control.as_ref(),
+                            transport_generation,
+                            close_wait,
+                        )
+                        .await
+                        .is_err()
                         {
                             cancellation.cancel();
                             mark_writer_failure(&session, transport_generation).await;
                             break;
                         }
-                        if output.close_requested
-                            && let Err(error) =
-                                control.close_until(Instant::now() + close_wait).await
+                        mark_reader_failure(&session, transport_generation, error).await;
+                        break;
+                    }
+                    Ok(read) => {
+                        let filtered = editing_filter.advance(&buffer[..read]);
+                        if filtered.overflowed {
+                            editing_runtime::invalidate(&session, transport_generation);
+                        }
+                        let mut offset = 0;
+                        let mut failed = false;
+                        for frame in filtered.frames {
+                            if deliver_reader_output(
+                                &session,
+                                &filtered.visible[offset..frame.visible_offset],
+                                output_recorder.as_ref(),
+                                control.as_ref(),
+                                transport_generation,
+                                close_wait,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                failed = true;
+                                break;
+                            }
+                            editing_runtime::accept_frame(
+                                &session,
+                                transport_generation,
+                                &frame.payload,
+                            )
+                            .await;
+                            offset = frame.visible_offset;
+                        }
+                        if !failed
+                            && deliver_reader_output(
+                                &session,
+                                &filtered.visible[offset..],
+                                output_recorder.as_ref(),
+                                control.as_ref(),
+                                transport_generation,
+                                close_wait,
+                            )
+                            .await
+                            .is_err()
                         {
-                            tracing::warn!(error = %error, "terminal parser close request failed");
+                            failed = true;
+                        }
+                        if failed {
+                            cancellation.cancel();
+                            mark_writer_failure(&session, transport_generation).await;
+                            break;
                         }
                     }
                 }
@@ -2238,6 +2252,14 @@ impl SessionManager {
             .transport_generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
+        *session
+            .shell_editing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            editing_runtime::EditingRuntime::new(
+                transport_generation,
+                transport.shell_editing_nonce,
+            );
         *session.native_exit_deadline.lock().await = None;
         *session.writer.lock().await = transport.writer;
         session.writer_shutdown.store(false, Ordering::Release);
@@ -2320,6 +2342,76 @@ impl SessionManager {
         drop(_publication);
         Ok(session.state.lock().await.info.clone())
     }
+}
+
+/// 仅把已经剥离私有帧的可见字节送入日志、终端解析器及其响应路径。
+///
+/// @author kongweiguang
+async fn deliver_reader_output(
+    session: &ManagedSession,
+    bytes: &[u8],
+    output_recorder: Option<&Arc<dyn SessionOutputRecorder>>,
+    control: &dyn SessionTransportControl,
+    transport_generation: u64,
+    close_wait: Duration,
+) -> AppResult<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let sequence = session
+        .output_sequence
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    if let Some(recorder) = output_recorder
+        && let OutputRecordResult::Failed {
+            first_missing_sequence,
+            reason,
+        } = recorder.try_record_output(&session.session_id, sequence, bytes)
+    {
+        tracing::warn!(session_id = %session.session_id, first_missing_sequence, ?reason,
+            "terminal session log stopped at bounded output queue boundary");
+    }
+    let (output, diagnostic) = {
+        let mut state = session.state.lock().await;
+        let diagnostic = if resize_diagnostics_enabled()
+            && matches!(&state.info.target, SessionTarget::Ssh(_))
+            && claim_resize_reader_diagnostic_chunk(&session.resize_diagnostic_reader_budget)
+        {
+            Some(ResizeReaderDiagnosticContext {
+                session_sequence: session.resize_diagnostic_session_sequence,
+                transport_generation,
+                resize_generation: session.resize_diagnostic_generation.load(Ordering::Acquire),
+                reader_sequence: sequence,
+                chunk_bytes: bytes.len() as u64,
+            })
+        } else {
+            None
+        };
+        let before = diagnostic.map(|_| (state.engine.size(), state.engine.revision()));
+        let output = state.engine.process_output(bytes);
+        let after = diagnostic.map(|_| (state.engine.size(), state.engine.revision()));
+        apply_terminal_output_events(session, &output.events).await;
+        session.changes.send_replace(SessionChange {
+            revision: state.engine.revision(),
+            kind: if output.title_changed.is_some() {
+                SessionChangeKind::Title
+            } else {
+                SessionChangeKind::Output
+            },
+        });
+        (output, diagnostic.zip(before).zip(after))
+    };
+    if let Some(((context, before), after)) = diagnostic {
+        log_resize_reader_diagnostic(context, 20, before.0, before.1);
+        log_resize_reader_diagnostic(context, 21, after.0, after.1);
+    }
+    write_parser_responses(session, output.pty_writes).await?;
+    if output.close_requested
+        && let Err(error) = control.close_until(Instant::now() + close_wait).await
+    {
+        tracing::warn!(error = %error, "terminal parser close request failed");
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -2424,6 +2516,42 @@ impl SessionService for SessionManager {
     ) -> AppResult<TerminalCommandContext> {
         let session = self.session(&session_id).await?;
         Ok(terminal_command_context_for(&session).await)
+    }
+
+    /// 能力握手与命令生命周期分开校验，允许失效的 UI 投影通过真实 Shell 快照恢复。
+    ///
+    /// @author kongweiguang
+    async fn shell_editing_availability(
+        &self,
+        binding: UiSessionBinding,
+    ) -> AppResult<kerminal_application::sessions::ShellEditingAvailability> {
+        let session = self.session(&binding.session_id).await?;
+        Ok(editing_runtime::availability(&session, &binding).await)
+    }
+
+    /// 只向目标连接发送协商的只读探测，版本变化或取消时不返回旧输入。
+    ///
+    /// @author kongweiguang
+    async fn request_shell_editing_snapshot(
+        &self,
+        binding: UiSessionBinding,
+        cancellation: CancellationToken,
+    ) -> AppResult<kerminal_application::sessions::ShellEditingSnapshot> {
+        let session = self.session(&binding.session_id).await?;
+        editing_runtime::request(session, binding, cancellation).await
+    }
+
+    /// 对原始快照执行一次有界追加并回读，不自动执行或重放命令。
+    ///
+    /// @author kongweiguang
+    async fn append_shell_editing_suffix(
+        &self,
+        snapshot: kerminal_application::sessions::ShellEditingSnapshot,
+        suffix: String,
+        cancellation: CancellationToken,
+    ) -> AppResult<kerminal_application::sessions::ShellEditingSnapshot> {
+        let session = self.session(&snapshot.binding.session_id).await?;
+        editing_runtime::append(session, snapshot, suffix, cancellation).await
     }
 
     /// 原样向单一 writer 队列写协议字节，锁保证同一 session 内调用顺序。
@@ -4339,6 +4467,7 @@ struct ManagedSession {
     changes: watch::Sender<SessionChange>,
     input_gate: Mutex<()>,
     shell_integration: Mutex<ShellIntegrationState>,
+    shell_editing: Arc<StdMutex<editing_runtime::EditingRuntime>>,
     shell_events: broadcast::Sender<ShellRuntimeEvent>,
     child_exit_task: Mutex<Option<JoinHandle<()>>>,
     reader_task: Mutex<Option<JoinHandle<()>>>,
@@ -4367,6 +4496,8 @@ struct AutoReconnectRuntime {
 struct ShellIntegrationState {
     observed: bool,
     prompt_started: bool,
+    // 与可被写入主动关闭的 prompt_ready 分开，标记本 epoch 的首次 B 已被消费。
+    prompt_end_observed: bool,
     prompt_ready: bool,
     prompt_line_dirty: bool,
     external_input_since_prompt: bool,
@@ -4410,6 +4541,16 @@ struct PendingTerminalInputWrite {
     command_finished: bool,
     prompt_started_after_command: bool,
     prompt_ended_after_command: bool,
+}
+
+/// 仅供建议追加的零字节取消使用；不得据此回退输入代数或恢复旧候选。
+///
+/// @author kongweiguang
+struct UnwrittenSuggestionRecovery {
+    binding: UiSessionBinding,
+    transport_generation: u64,
+    prompt_epoch: u64,
+    prompt_line_dirty: bool,
 }
 
 /// 只暂存一条与 UI generation 对齐的正文，等 writer flush 和真实 OSC C 两项证据都到齐。
@@ -4622,6 +4763,7 @@ impl Drop for CancelShellCommandOnDrop {
 }
 
 /// 按引擎提供的有序事件推进 OSC 状态与转录关联；flush ticket 与 capture 仍只归属原命令和 generation。
+/// 同一 A 后重复 B 只是 Readline 重绘，须在取消输入和发布事件前忽略；真实新 A 仍推进 epoch。
 ///
 /// @author kongweiguang
 async fn apply_terminal_output_events(session: &ManagedSession, events: &[TerminalOutputEvent]) {
@@ -4639,6 +4781,12 @@ async fn apply_terminal_output_events(session: &ManagedSession, events: &[Termin
                 continue;
             }
         };
+        if marker == ShellIntegrationMarker::PromptEnd
+            && shell.prompt_started
+            && shell.prompt_end_observed
+        {
+            continue;
+        }
         // 只让完整写入的一字节 Enter 对应的同一命令块 C→D→A→B 保留原 flush ticket。
         let keep_command_write = pending_command_write_accepts_marker(&shell, marker);
         let cancelled_input = shell.pending_input_write.as_ref().is_some_and(|pending| {
@@ -4676,6 +4824,7 @@ async fn apply_terminal_output_events(session: &ManagedSession, events: &[Termin
                 }
                 shell.observed = true;
                 shell.prompt_started = true;
+                shell.prompt_end_observed = false;
                 shell.prompt_ready = false;
                 shell.prompt_line_dirty = false;
                 shell.external_input_since_prompt = false;
@@ -4689,6 +4838,7 @@ async fn apply_terminal_output_events(session: &ManagedSession, events: &[Termin
             }
             ShellIntegrationMarker::PromptEnd => {
                 if shell.prompt_started {
+                    shell.prompt_end_observed = true;
                     shell.prompt_ready = true;
                 }
                 if keep_command_write && let Some(input) = shell.pending_input_write.as_mut() {
@@ -4870,12 +5020,12 @@ fn terminal_command_context_from_state(
             Some(TerminalCommandUnavailableReason::InputWritePending)
         } else if shell.external_input_since_prompt {
             Some(TerminalCommandUnavailableReason::ExternalInputObserved)
-        } else if !shell.ui_input_projection_valid {
-            Some(TerminalCommandUnavailableReason::UiInputProjectionInvalidated)
         } else if shell.prompt_submission_sent {
             Some(TerminalCommandUnavailableReason::PromptNotReady)
         } else if active_command {
             Some(TerminalCommandUnavailableReason::ManagedCommandActive)
+        } else if !shell.ui_input_projection_valid {
+            Some(TerminalCommandUnavailableReason::UiInputProjectionInvalidated)
         } else {
             None
         };
@@ -5329,6 +5479,18 @@ async fn write_input_bytes(
         }
         writer = session.writer.lock() => writer,
     };
+    write_input_bytes_locked(&mut writer, bytes, cancellation, bytes_written).await
+}
+
+/// 允许已在准入门禁持有 writer 的调用复用同一部分写入与取消语义。
+///
+/// @author kongweiguang
+async fn write_input_bytes_locked(
+    writer: &mut std::pin::Pin<Box<dyn AsyncWrite + Send + 'static>>,
+    bytes: &[u8],
+    cancellation: &CancellationToken,
+    bytes_written: &AtomicUsize,
+) -> AppResult<()> {
     let mut offset = 0;
     while offset < bytes.len() {
         if cancellation.is_cancelled() {
@@ -5387,13 +5549,54 @@ fn input_write_cancelled(bytes_written: usize) -> AppError {
     }
 }
 
-/// 清除已完成意图；持有 state→shell 锁时按原 generation 关联 ACK，失败分支才取走候选，迟到 ACK 不回写新 prompt。
+/// 普通输入保留原有保守失败语义；只有建议追加可显式传入零字节恢复凭据。
 ///
 /// @author kongweiguang
 async fn finish_terminal_input_write(session: &ManagedSession, generation: u64, failed: bool) {
+    finish_terminal_input_write_with_recovery(session, generation, failed, None).await;
+}
+
+/// 清除原写入票据并关联 ACK；仅同一上下文中已取消、确实零字节的建议追加能重新请求快照。
+/// 不回退输入代数，也不把旧投影变为可信；部分写入、外部输入和跨 prompt 仍保守失效。
+///
+/// @author kongweiguang
+async fn finish_terminal_input_write_with_recovery(
+    session: &ManagedSession,
+    generation: u64,
+    failed: bool,
+    recovery: Option<&UnwrittenSuggestionRecovery>,
+) {
     let state = session.state.lock().await;
     let mut shell = session.shell_integration.lock().await;
     let mut command_block_changed = false;
+    let recover_unwritten_suggestion = failed
+        && recovery.is_some_and(|recovery| {
+            state.info.lifecycle == SessionLifecycle::Running
+                && state.info.session_id == recovery.binding.session_id
+                && state.info.owner == recovery.binding.owner
+                && session.transport_generation.load(Ordering::Acquire)
+                    == recovery.transport_generation
+                && shell.session_generation == recovery.binding.session_generation
+                && shell.prompt_epoch == recovery.prompt_epoch
+                && shell.input_generation == generation
+                && shell.observed
+                && shell.prompt_started
+                && shell.prompt_ready
+                && !shell.prompt_submission_sent
+                && !shell.external_input_since_prompt
+                && !state.engine.input_modes().alternate_screen
+                && shell
+                    .active_command
+                    .as_ref()
+                    .is_none_or(|active| active.cancellation.is_cancelled())
+                && shell.pending_input_write.as_ref().is_some_and(|pending| {
+                    pending.generation == generation
+                        && pending.session_generation == recovery.binding.session_generation
+                        && pending.prompt_epoch == recovery.prompt_epoch
+                        && pending.cancellation.is_cancelled()
+                        && pending.bytes_written.load(Ordering::Acquire) == 0
+                })
+        });
     let failed_in_current_prompt = shell
         .pending_input_write
         .as_ref()
@@ -5408,7 +5611,12 @@ async fn finish_terminal_input_write(session: &ManagedSession, generation: u64, 
         .is_some_and(|pending| pending.generation == generation)
     {
         shell.pending_input_write = None;
-        if failed && failed_in_current_prompt {
+        if recover_unwritten_suggestion {
+            if let Some(recovery) = recovery {
+                shell.prompt_line_dirty = recovery.prompt_line_dirty;
+            }
+            shell.ui_input_projection_valid = false;
+        } else if failed && failed_in_current_prompt {
             shell.external_input_since_prompt = true;
             shell.ui_input_projection_valid = false;
         }
@@ -5531,22 +5739,32 @@ fn validate_shell_command_request(request: &ShellCommandRequest) -> AppResult<()
     Ok(())
 }
 
-/// 用已确认的 shell dialect 将任意 UTF-8 脚本编码为一行，保留当前 shell 的 cwd 与变量作用域。
+/// 用已确认的 shell dialect 将脚本编码为单行并在当前作用域求值；POSIX 可打印文本保留可读性，控制字符不得作为 PTY 输入。
 ///
 /// @author kongweiguang
 fn encode_managed_shell_command(command: &str, dialect: RemoteShellDialect) -> AppResult<String> {
     match dialect {
         RemoteShellDialect::Posix => {
-            // Octal encodes every input byte, so quotes, substitutions and LF stay data until eval.
-            let mut encoded =
-                String::with_capacity(command.len().saturating_mul(4).saturating_add(40));
-            encoded.push_str("eval \"$(printf '%b' '");
-            for byte in command.as_bytes() {
-                use std::fmt::Write as _;
-                let _ = write!(encoded, "\\{byte:03o}");
+            if !command.chars().any(char::is_control) {
+                return Ok(format!("eval {}", quote_posix_literal(command)));
             }
-            encoded.push_str("')\"");
-            Ok(encoded)
+            use std::fmt::Write as _;
+            let mut encoded = String::with_capacity(command.len());
+            for character in command.chars() {
+                if character == '\\' || character.is_control() {
+                    let mut bytes = [0; 4];
+                    for byte in character.encode_utf8(&mut bytes).bytes() {
+                        write!(encoded, "\\0{byte:03o}")
+                            .expect("writing a POSIX escape into String cannot fail");
+                    }
+                } else {
+                    encoded.push(character);
+                }
+            }
+            Ok(format!(
+                "eval \"$(printf '%b' {})\"",
+                quote_posix_literal(&encoded)
+            ))
         }
         RemoteShellDialect::PowerShell => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(command.as_bytes());
@@ -5559,6 +5777,13 @@ fn encode_managed_shell_command(command: &str, dialect: RemoteShellDialect) -> A
             "受管命令需要已验证的 POSIX、Fish 或 PowerShell shell dialect",
         )),
     }
+}
+
+/// 单引号字面量不提前展开脚本中的变量、命令替换或引号，避免数据在 eval 之前被解释。
+///
+/// @author kongweiguang
+fn quote_posix_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// 将任意 UTF-8 脚本编码为单行 Fish 表达式，并在当前 shell scope 中只 eval 一次。
@@ -6526,3 +6751,7 @@ fn engine_error(error: TerminalEngineError) -> AppError {
 #[cfg(test)]
 #[path = "../tests/unit/session_resize_diagnostics.rs"]
 mod resize_diagnostic_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/managed_shell_encoding.rs"]
+mod managed_shell_encoding_tests;

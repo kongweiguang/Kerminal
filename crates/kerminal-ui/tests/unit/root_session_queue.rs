@@ -456,6 +456,57 @@ fn enqueue_front_preserves_lane_ownership_and_idle_gate() {
     assert!(queues.is_idle(&session));
 }
 
+/// 处理中的 ACK 不冒充后续输入；只有排队的编辑可能让新候选立即过期。
+#[test]
+fn pending_edit_detection_ignores_in_flight_and_non_edit_work() {
+    let mut queues = SessionCommandQueues::with_limits(limits(1));
+    let session = SessionId::new();
+    let binding = ui_binding(session.clone());
+    let size = kerminal_domain::sessions::TerminalSize::new(80, 24, 800, 480).unwrap();
+
+    queues
+        .enqueue(
+            session.clone(),
+            SessionWork::Input {
+                event: TerminalInputEvent::Text("first".to_owned()),
+                origin: InputOrigin::Direct,
+            },
+        )
+        .unwrap();
+    let in_flight = queues.take_ready().unwrap();
+    queues
+        .enqueue(
+            session.clone(),
+            SessionWork::Resize {
+                binding: binding.clone(),
+                size,
+            },
+        )
+        .unwrap();
+    queues
+        .enqueue(
+            session.clone(),
+            SessionWork::Input {
+                event: TerminalInputEvent::Focus(true),
+                origin: InputOrigin::Direct,
+            },
+        )
+        .unwrap();
+    assert!(!queues.has_pending_edit_input(&session));
+
+    queues
+        .enqueue(
+            session.clone(),
+            SessionWork::Input {
+                event: TerminalInputEvent::Text("next".to_owned()),
+                origin: InputOrigin::Direct,
+            },
+        )
+        .unwrap();
+    assert!(queues.has_pending_edit_input(&session));
+    assert!(queues.complete(&in_flight.session_id));
+}
+
 /// 关闭撤销 pending 项但不假装 in-flight 已被取消，并用实际出队状态验证清理。
 ///
 /// @author kongweiguang

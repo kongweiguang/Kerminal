@@ -301,6 +301,7 @@ impl SessionTransportFactory for RecoveryFactory {
                 shell_dialect: RemoteShellDialect::Unknown,
                 process_id: None,
                 shell_integration_enabled: false,
+                shell_editing_nonce: None,
             });
         }
 
