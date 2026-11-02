@@ -15,9 +15,7 @@ use kerminal_application::{
 use tokio_util::sync::CancellationToken;
 
 #[cfg(target_os = "linux")]
-use super::context::unavailable_for_io;
-#[cfg(target_os = "linux")]
-use std::{fs, path::Path};
+use std::{fs, io, path::Path};
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 const GPU_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,6 +27,21 @@ const GPU_PROBE_MAX_OUTPUT_BYTES: usize = 128 * 1024;
 pub(crate) enum LocalGpuProbeFailure {
     Unavailable(DiagnosticUnavailableReason),
     TimedOut,
+}
+
+/// 已移除的通用诊断模块不再拥有此映射；GPU sysfs 仍保留原错误分类供调用方区分恢复方式。
+///
+/// @author kongweiguang
+#[cfg(target_os = "linux")]
+pub(super) fn unavailable_for_io(error: io::Error) -> DiagnosticUnavailableReason {
+    match error.kind() {
+        io::ErrorKind::NotFound => DiagnosticUnavailableReason::NotFound,
+        io::ErrorKind::PermissionDenied => DiagnosticUnavailableReason::PermissionDenied,
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => {
+            DiagnosticUnavailableReason::InvalidData
+        }
+        _ => DiagnosticUnavailableReason::CollectionFailed,
+    }
 }
 
 /// 让各消费者共用同一平台探测与命令执行路径，避免重复启动 GPU 工具或收集无关指标。
