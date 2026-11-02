@@ -1,0 +1,335 @@
+# @author kongweiguang
+name: GPUI beta release
+
+on:
+  push:
+    tags:
+      - "v*.*.*-beta.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing beta tag to rebuild, for example v0.4.0-beta.1"
+        required: true
+        type: string
+
+concurrency:
+  group: gpui-beta-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+# 构建矩阵只读；发布作业单独申请 contents: write。
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: GPUI beta preflight
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      release_version: ${{ steps.release.outputs.release_version }}
+    steps:
+      - name: Checkout release refs and tags
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify beta tag and workspace version
+        id: release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${REQUESTED_TAG}"
+          fi
+
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+            echo "::error title=Invalid beta tag::Expected vX.Y.Z-beta.N, got ${tag}."
+            exit 1
+          fi
+
+          if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::error title=Missing beta tag::Create and push ${tag} before rebuilding it."
+            exit 1
+          fi
+
+          git checkout --force "${tag}"
+          export RELEASE_VERSION="${tag#v}"
+          export RELEASE_TAG_VALUE="${tag}"
+
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import sys
+          import tomllib
+
+          version = os.environ["RELEASE_VERSION"]
+          workspace = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          actual = workspace.get("workspace", {}).get("package", {}).get("version")
+          if actual != version:
+              sys.exit(f"Cargo.toml workspace version {actual!r} does not match tag version {version!r}")
+
+          lock = tomllib.loads(pathlib.Path("Cargo.lock").read_text(encoding="utf-8"))
+          packages = {
+              package["name"]: package["version"]
+              for package in lock["package"]
+              if package["name"].startswith("kerminal-")
+          }
+          mismatches = {name: value for name, value in packages.items() if value != version}
+          if mismatches:
+              sys.exit(f"Cargo.lock workspace package versions do not match {version!r}: {mismatches}")
+          if not packages:
+              sys.exit("Cargo.lock contains no kerminal workspace packages")
+          PY
+
+          echo "release_tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "release_version=${RELEASE_VERSION}" >> "${GITHUB_OUTPUT}"
+
+  package:
+    name: Package ${{ matrix.name }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - name: Windows x64 NSIS
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: Linux x64 AppImage and DEB
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: macOS x64 DMG
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: macOS arm64 DMG
+            runner: macos-15
+            target: aarch64-apple-darwin
+    env:
+      RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.preflight.outputs.release_version }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.preflight.outputs.release_tag }}
+          fetch-depth: 1
+
+      - name: Set up packaging Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Ensure cargo packaging scripts can resolve python
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v python >/dev/null 2>&1; then
+            mkdir -p "${RUNNER_TEMP}/kerminal-python"
+            ln -sf "$(command -v python3)" "${RUNNER_TEMP}/kerminal-python/python"
+            echo "${RUNNER_TEMP}/kerminal-python" >> "${GITHUB_PATH}"
+          fi
+          python --version
+
+      - name: Install Linux GPUI and package dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake pkg-config file patchelf squashfs-tools libfuse2 \
+            desktop-file-utils libfontconfig1-dev libvulkan-dev libwayland-dev \
+            libx11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libxcb-xkb-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libegl1-mesa-dev
+
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis --version=3.11.0 --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $makensis = Get-Command makensis -ErrorAction SilentlyContinue
+          if ($makensis) {
+            $makensisPath = $makensis.Source
+          } else {
+            $candidates = @(
+              (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'),
+              (Join-Path $env:ProgramFiles 'NSIS\makensis.exe')
+            )
+            $makensisPath = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          }
+          if (-not $makensisPath) { throw 'NSIS makensis.exe was not found after installation.' }
+          Split-Path -Parent $makensisPath | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8NoBOM
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpui-beta-${{ matrix.target }}
+
+      - name: Install pinned packaging tools
+        shell: pwsh
+        run: |
+          cargo install cargo-about --version 0.9.2 --locked --root target/tools/cargo-about
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo install cargo-packager --version 0.11.8 --locked --root target/tools/cargo-packager
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Join-Path $env:GITHUB_WORKSPACE 'target/tools/cargo-packager/bin' |
+            Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8NoBOM
+
+      - name: Build and package unsigned beta
+        shell: bash
+        env:
+          PACKAGE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo --locked build --release --package kerminal-desktop --target "$PACKAGE_TARGET"
+          cargo --locked xtask package --target "$PACKAGE_TARGET"
+
+      - name: Upload beta candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpui-beta-candidate-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/package-candidates/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Publish beta prerelease
+    needs:
+      - preflight
+      - package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.preflight.outputs.release_version }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.preflight.outputs.release_tag }}
+          fetch-depth: 1
+
+      - name: Set up packaging Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Download beta candidates
+        uses: actions/download-artifact@v7
+        with:
+          pattern: gpui-beta-candidate-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+          merge-multiple: true
+
+      - name: Validate unsigned candidate set
+        shell: bash
+        run: |
+          set -euo pipefail
+          python packaging/build_candidate_inventory.py --candidate-dir dist --validate-unsigned
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -mindepth 2 -maxdepth 2 -type f \
+            \( -name '*-setup.exe' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.dmg' \) \
+            -exec cp -t release {} +
+
+          expected=(
+            "kerminal_${RELEASE_VERSION}_x64-setup.exe"
+            "kerminal_${RELEASE_VERSION}_x86_64.AppImage"
+            "kerminal_${RELEASE_VERSION}_amd64.deb"
+            "Kerminal_${RELEASE_VERSION}_x64.dmg"
+            "Kerminal_${RELEASE_VERSION}_aarch64.dmg"
+          )
+          for name in "${expected[@]}"; do
+            if [[ ! -f "release/${name}" ]]; then
+              echo "::error title=Missing release asset::Expected release/${name}."
+              find dist -maxdepth 2 -type f -printf '%P\n' | sort
+              exit 1
+            fi
+          done
+
+          (cd release && sha256sum "${expected[@]}" > SHA256SUMS.txt)
+          ls -l release
+
+      - name: Write beta release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          cat > release-notes.md <<EOF
+          **Kerminal GPUI ${RELEASE_VERSION} beta**
+
+          这是 Kerminal 原生 GPUI 重写分支的 beta 测试包。功能迁移和原生验收仍在进行中，请勿用于生产环境。
+
+          ### 下载
+
+          - Windows x64：NSIS 安装包（当前用户安装）
+          - Linux x64：AppImage / DEB
+          - macOS x64 / arm64：DMG
+
+          ### 注意
+
+          - 所有包均为未签名构建。macOS 可能需要在 Finder 中右键“打开”，Windows 可能触发 SmartScreen 提示。
+          - 本 beta 未配置更新器签名和更新 feed，不会自动更新。
+          - GPUI 版数据根为 \`~/.kerminal-gpui\`，与旧版 \`~/.kerminal\` 隔离；旧配置迁移见仓库 README。
+          - 下载后可用 \`SHA256SUMS.txt\` 校验安装包。
+
+          提交：\`${source_commit}\`
+          EOF
+
+      - name: Create or update prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title="Kerminal GPUI ${RELEASE_TAG} (beta)"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --prerelease \
+              --title "${title}" \
+              --notes-file release-notes.md
+            gh release upload "${RELEASE_TAG}" release/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              --verify-tag \
+              --prerelease \
+              --title "${title}" \
+              --notes-file release-notes.md \
+              release/*
+          fi
+
+      - name: Verify published prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "${RELEASE_TAG}" \
+            --json tagName,isDraft,isPrerelease,assets \
+            --jq '{tag: .tagName, draft: .isDraft, prerelease: .isPrerelease, assets: [.assets[].name]}'
+          [[ "$(gh release view "${RELEASE_TAG}" --json isPrerelease --jq '.isPrerelease')" == "true" ]]
+          [[ "$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets | length')" -ge 6 ]]
+          printf '%s\n' "Published ${RELEASE_TAG} as a GitHub prerelease with the beta installers and SHA256SUMS.txt." >> "${GITHUB_STEP_SUMMARY}"

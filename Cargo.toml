@@ -24,7 +24,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.4.0-dev.0"
+version = "0.4.0-beta.1"
 edition = "2024"
 rust-version = "1.98"
 authors = ["kongweiguang"]
@@ -32,13 +32,13 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/kongweiguang/Kerminal.git"
 
 [workspace.dependencies]
-kerminal-domain = { path = "crates/domain", version = "0.4.0-dev.0" }
-kerminal-application = { path = "crates/application", version = "0.4.0-dev.0" }
-kerminal-terminal = { path = "crates/terminal", version = "0.4.0-dev.0" }
-kerminal-infrastructure = { path = "crates/infrastructure", version = "0.4.0-dev.0" }
-kerminal-ui = { path = "crates/kerminal-ui", version = "0.4.0-dev.0" }
-kerminal-mcp = { path = "crates/kerminal-mcp", version = "0.4.0-dev.0" }
-kerminal-desktop = { path = "crates/kerminal-desktop", version = "0.4.0-dev.0" }
+kerminal-domain = { path = "crates/domain", version = "0.4.0-beta.1" }
+kerminal-application = { path = "crates/application", version = "0.4.0-beta.1" }
+kerminal-terminal = { path = "crates/terminal", version = "0.4.0-beta.1" }
+kerminal-infrastructure = { path = "crates/infrastructure", version = "0.4.0-beta.1" }
+kerminal-ui = { path = "crates/kerminal-ui", version = "0.4.0-beta.1" }
+kerminal-mcp = { path = "crates/kerminal-mcp", version = "0.4.0-beta.1" }
+kerminal-desktop = { path = "crates/kerminal-desktop", version = "0.4.0-beta.1" }
 
 async-trait = "0.1"
 anyhow = "1"

@@ -2,7 +2,7 @@
 
 # Kerminal GPUI
 
-Kerminal 正在从 Tauri 前端重建为 Rust 原生 GPUI 桌面应用。当前仓库是新架构的开发工作区，版本为 `0.4.0-dev.0`；旧版 `v0.3.45`（基线提交 `17c5d4b`）只用于核对现有配置与用户数据契约。功能迁移和原生验收仍在进行中。
+Kerminal 正在从 Tauri 前端重建为 Rust 原生 GPUI 桌面应用。当前仓库是新架构的开发工作区，版本为 `0.4.0-beta.1`；旧版 `v0.3.45`（基线提交 `17c5d4b`）只用于核对现有配置与用户数据契约。功能迁移和原生验收仍在进行中。
 
 ## 工作区结构
 
@@ -65,7 +65,7 @@ cargo +1.98.0 xtask package --target $target
 
 三个平台的打包配置仅声明应用自有 `kerminal://` scheme；应用仍可解析 `ssh://` 和 `sftp://` 输入，但安装包不会注册为系统默认处理程序。cargo-packager 为 Windows 当前用户安装、macOS bundle 和 Linux desktop entry 生成相应元数据。AppImage 只携带 desktop entry；主机是否注册该 scheme 取决于用户使用的 AppImage 集成方式。候选安装包的系统关联安装与卸载尚未在隔离桌面环境实测。
 
-当前支持 `x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`x86_64-apple-darwin` 和 `aarch64-apple-darwin`。GitHub Actions 已提供手动触发的 `GPUI unsigned candidate packages` workflow；它按上述 target 构建未签名候选包并上传短期 artifact，不发布 Release 或更新 feed。当前 PR CI 仍只运行质量门禁，不执行打包。
+当前支持 `x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`x86_64-apple-darwin` 和 `aarch64-apple-darwin`。GitHub Actions 提供手动触发的 `GPUI unsigned candidate packages` workflow，按上述 target 构建未签名候选包并上传短期 artifact。推送形如 `vX.Y.Z-beta.N` 且与 workspace 版本一致的 tag 时，`GPUI beta release` workflow 会重新构建四个平台的安装包、校验候选集合并以 prerelease 发布到 GitHub Releases，同时上传 `SHA256SUMS.txt`；它不生成更新 feed，也不发布正式版或签名包。当前 PR CI 仍只运行质量门禁，不执行打包。
 
 需要手动指定隔离配置目录时，在 PowerShell 中设置环境变量后直接运行桌面包：
 
