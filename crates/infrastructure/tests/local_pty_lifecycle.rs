@@ -398,6 +398,8 @@ async fn assert_pwsh_path_matches_expected(environment: BTreeMap<OsString, OsStr
 }
 
 /// 按 PowerShell 官方启动规则计算完整期望 PATH，同时保留原始配置是否已有 PSHOME 前缀这一事实。
+/// Store/MSIX 版会把应用执行别名目录置于 PATH 首段，这里只剥离 PowerShell 自有前导项再比较继承内容；
+/// 两段都保留原始大小写，避免把路径规范化误当成环境传递差异。
 /// 版本字段为 Major、Minor、Patch/Build、Revision/哨兵；不输出任何路径内容。
 /// 三段分别落在独立短行，避免宽度受限的 PTY 把 CSV 断开后无法解析。
 ///
@@ -413,8 +415,31 @@ $processIsPwsh = [string]::Equals($processBasename, 'pwsh.exe', [StringCompariso
 $psHome = [string]$PSHOME
 $psHomePrefix = $psHome + [IO.Path]::PathSeparator
 $configuredPathHasPsHomePrefix = $configuredPath.StartsWith($psHomePrefix, [StringComparison]::Ordinal)
+$trimChars = [char[]]@('\', '/')
 $e = $configuredPath
-if ($processIsPwsh -and -not $configuredPathHasPsHomePrefix) {
+$processPath = [string][Environment]::ProcessPath
+$packagedRoot = [IO.Path]::Combine($env:ProgramFiles, 'WindowsApps') + [IO.Path]::DirectorySeparatorChar
+$isPackagedPwsh = $processIsPwsh -and $processPath.StartsWith($packagedRoot, [StringComparison]::OrdinalIgnoreCase)
+if ($isPackagedPwsh) {
+    $aliasRoot = [IO.Path]::Combine($env:LOCALAPPDATA, 'Microsoft\WindowsApps') + [IO.Path]::DirectorySeparatorChar
+    $aliasBasenamePrefix = 'Microsoft.PowerShell_'
+    function Test-PowerShellOwnedSegment([string]$segment) {
+        $trimmed = $segment.TrimEnd($trimChars)
+        if ([string]::Equals($trimmed, $psHome.TrimEnd($trimChars), [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        return $trimmed.StartsWith($aliasRoot, [StringComparison]::OrdinalIgnoreCase) -and
+            [IO.Path]::GetFileName($trimmed).StartsWith($aliasBasenamePrefix, [StringComparison]::OrdinalIgnoreCase)
+    }
+    function Get-InheritedPath([string]$value) {
+        $segments = $value.Split([char[]]@(';'))
+        $index = 0
+        while (($index -lt $segments.Length) -and (Test-PowerShellOwnedSegment $segments[$index])) { $index++ }
+        if ($index -ge $segments.Length) { return '' }
+        return ($segments[$index..($segments.Length - 1)] -join ';')
+    }
+    $e = Get-InheritedPath $e
+    $r = Get-InheritedPath $r
+    $p = Get-InheritedPath $p
+} elseif ($processIsPwsh -and -not $configuredPathHasPsHomePrefix) {
     $e = $psHomePrefix + $configuredPath
 }
 $ep = $e.Split([char[]]@(';'))
@@ -434,7 +459,6 @@ $er = [string]::Equals($e, $r, [StringComparison]::Ordinal)
 $rpEq = [string]::Equals($r, $p, [StringComparison]::Ordinal)
 $erCi = [string]::Equals($e, $r, [StringComparison]::OrdinalIgnoreCase)
 $firstSegment = if ($rp.Length -gt 0) { [string]$rp[0] } else { '' }
-$trimChars = [char[]]@('\', '/')
 $firstMatchesPsHome = [string]::Equals($firstSegment.TrimEnd($trimChars), $psHome.TrimEnd($trimChars), [StringComparison]::OrdinalIgnoreCase)
 $dotnetStoreSegment = [IO.Path]::DirectorySeparatorChar + '.store' + [IO.Path]::DirectorySeparatorChar + 'powershell' + [IO.Path]::DirectorySeparatorChar
 $psHomeIsDotnetTool = $psHome.IndexOf($dotnetStoreSegment, [StringComparison]::Ordinal) -gt 0
