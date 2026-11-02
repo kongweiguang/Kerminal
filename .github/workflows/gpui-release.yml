@@ -2,6 +2,8 @@
 name: GPUI beta release
 
 on:
+  # Git 推送 tag 和 REST API 创建 tag ref 都会触发 create；push 只作为后续兼容入口。
+  create:
   push:
     tags:
       - "v*.*.*-beta.*"
@@ -13,8 +15,9 @@ on:
         type: string
 
 concurrency:
-  group: gpui-beta-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
-  cancel-in-progress: false
+  group: gpui-beta-${{ inputs.tag || github.ref_name }}
+  # Git tag 推送可能同时产生 create 和 push 事件；保留后启动的运行，避免重复发布。
+  cancel-in-progress: true
 
 # 构建矩阵只读；发布作业单独申请 contents: write。
 permissions:
@@ -23,6 +26,8 @@ permissions:
 jobs:
   preflight:
     name: GPUI beta preflight
+    # create 也会在创建分支时触发，这里只接受 tag 引用。
+    if: github.event_name != 'create' || github.ref_type == 'tag'
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
@@ -43,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "push" || "${GITHUB_EVENT_NAME}" == "create" ]]; then
             tag="${GITHUB_REF_NAME}"
           else
             tag="${REQUESTED_TAG}"
