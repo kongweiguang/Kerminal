@@ -532,6 +532,8 @@ fn run_native_ui(
             }
         });
     }
+    #[cfg(target_os = "macos")]
+    install_open_url_listener(&application, activation_sender, runtime_handle.clone());
     application.run(move |cx| {
         #[cfg(target_os = "linux")]
         if let Err(error) = fonts::register_noto_sans_cjk_sc(cx.text_system()) {
@@ -543,8 +545,6 @@ fn run_native_ui(
             return;
         }
         kerminal_ui::init(cx);
-        #[cfg(target_os = "macos")]
-        install_open_url_listener(cx, activation_sender.clone(), runtime_handle.clone());
 
         #[cfg(feature = "acceptance-metrics")]
         let window_title = acceptance_metrics::diagnostic_window_title()
@@ -965,7 +965,7 @@ fn apply_host_response(
 /// 注册 macOS URL 打开回调；只把原生 URL 封装为参数，业务解析仍由 Root 的同一 service 执行。
 #[cfg(target_os = "macos")]
 fn install_open_url_listener(
-    cx: &App,
+    application: &gpui_pre::Application,
     sender: ActivationQueueSender,
     runtime: tokio::runtime::Handle,
 ) {
@@ -976,7 +976,7 @@ fn install_open_url_listener(
             return;
         }
     };
-    cx.on_open_urls(move |urls| {
+    application.on_open_urls(move |urls| {
         for url in urls {
             let activation =
                 activation_from_os([executable.clone(), std::ffi::OsString::from(url)], None);

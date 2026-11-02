@@ -50,7 +50,7 @@ cargo xtask source-fingerprint
 
 ```powershell
 $target = 'x86_64-pc-windows-msvc'
-cargo install cargo-about --version 0.9.2 --locked --root target/tools/cargo-about
+cargo install cargo-about --version 0.9.2 --locked --features cli --root target/tools/cargo-about
 cargo install cargo-packager --version 0.11.8 --locked --root target/tools/cargo-packager
 $env:PATH = (Resolve-Path 'target/tools/cargo-packager/bin').Path + [IO.Path]::PathSeparator + $env:PATH
 cargo +1.98.0 build --locked --release -p kerminal-desktop --target $target
