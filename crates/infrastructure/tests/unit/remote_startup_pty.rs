@@ -113,12 +113,14 @@ fn run_remote_startup_case(
     let mut pty = PtyRun::spawn(
         executable,
         &startup.exec_command,
-        &home,
-        &user_config,
-        &xdg_config,
-        &trace,
-        &private_tmp,
-        &working_directory,
+        &PtyRunPaths {
+            home: &home,
+            user_config: &user_config,
+            xdg_config: &xdg_config,
+            trace: &trace,
+            private_tmp: &private_tmp,
+            working_directory: &working_directory,
+        },
     )?;
     let deadline = Instant::now() + TEST_DEADLINE;
 
@@ -297,19 +299,27 @@ enum ReaderEvent {
     Error,
 }
 
+/// 单个真实 PTY 启动要固定的隔离目录；字段各自参与环境注入，保持显式命名而不合并路径。
+///
+/// @author kongweiguang
+struct PtyRunPaths<'a> {
+    home: &'a Path,
+    user_config: &'a Path,
+    xdg_config: &'a Path,
+    trace: &'a Path,
+    private_tmp: &'a Path,
+    working_directory: &'a Path,
+}
+
 impl PtyRun {
     /// 以真实 shell `-c` 执行 production exec 字符串，并从 spawn 起持有 PTY 进程组。
+    /// 隔离目录多且语义独立，聚合为一个上下文，避免启动参数继续膨胀。
     ///
     /// @author kongweiguang
     fn spawn(
         executable: PathBuf,
         exec_command: &str,
-        home: &Path,
-        user_config: &Path,
-        xdg_config: &Path,
-        trace: &Path,
-        private_tmp: &Path,
-        working_directory: &Path,
+        paths: &PtyRunPaths<'_>,
     ) -> Result<Self, &'static str> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -329,14 +339,14 @@ impl PtyRun {
             .map_err(|_| "native PTY writer could not be opened")?;
         let mut command = CommandBuilder::new(executable);
         command.args(["-c", exec_command]);
-        command.env("HOME", home.as_os_str());
-        command.env("ZDOTDIR", user_config.as_os_str());
-        command.env("XDG_CONFIG_HOME", xdg_config.as_os_str());
-        command.env("KERMINAL_TRACE_DIR", trace.as_os_str());
-        command.env("KERMINAL_EXPECTED_CWD", working_directory.as_os_str());
+        command.env("HOME", paths.home.as_os_str());
+        command.env("ZDOTDIR", paths.user_config.as_os_str());
+        command.env("XDG_CONFIG_HOME", paths.xdg_config.as_os_str());
+        command.env("KERMINAL_TRACE_DIR", paths.trace.as_os_str());
+        command.env("KERMINAL_EXPECTED_CWD", paths.working_directory.as_os_str());
         command.env("KERMINAL_CWD_OK_TOKEN", CWD_OK_TOKEN);
         command.env("KERMINAL_CWD_WRONG_TOKEN", CWD_WRONG_TOKEN);
-        command.env("TMPDIR", private_tmp.as_os_str());
+        command.env("TMPDIR", paths.private_tmp.as_os_str());
         command.env("TERM", "xterm-256color");
         let mut child = pair
             .slave

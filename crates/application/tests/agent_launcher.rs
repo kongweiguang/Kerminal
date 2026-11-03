@@ -2,28 +2,31 @@
 //!
 //! @author kongweiguang
 
-use std::{
-    ffi::OsString,
-    sync::{Arc, Mutex},
-};
+#[cfg(windows)]
+use std::ffi::OsString;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+// Windows 分支的显式 shell 契约只在 Windows 用例中构造；按平台导入避免其它平台告警。
 use kerminal_application::{
-    AppError, AppResult, PreferencesService, ProfileService,
+    AppError, AppResult, PreferencesService,
     agents::{AgentLaunchResolver, AgentLauncherInstallationProbe, resolve_agent_launcher},
     preferences::{
         AgentLauncherSettings, ConfigurationGuideStatus, ConfigurationRepository,
-        CustomAgentDefinition, DefaultLocalShellProvider, ProfileDraft, ProfileRepository,
-        ProfileRevision, SettingsRepository, SettingsSnapshot, VersionedProfile, VersionedSettings,
+        CustomAgentDefinition, ProfileDraft, ProfileRepository, ProfileRevision,
+        SettingsRepository, SettingsSnapshot, VersionedProfile, VersionedSettings,
     },
 };
+#[cfg(windows)]
+use kerminal_application::{ProfileService, preferences::DefaultLocalShellProvider};
+#[cfg(windows)]
+use kerminal_domain::sessions::LocalSessionTarget;
 use kerminal_domain::{
     agents::{AgentLauncherKey, AgentProvider, AgentSessionLaunch},
     preferences::{
         ConfigDocument, ConfigDocumentPath, ConfigRevision, ConfigurationMode,
         ConfigurationRecoveryState, TerminalProfile,
     },
-    sessions::LocalSessionTarget,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;

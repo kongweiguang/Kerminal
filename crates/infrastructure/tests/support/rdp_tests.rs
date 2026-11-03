@@ -2,18 +2,22 @@
 //!
 //! @author kongweiguang
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{fs, path::PathBuf, sync::Arc};
 
-use kerminal_application::{AppError, connections::RdpLaunchTarget};
+#[cfg(any(windows, target_os = "linux"))]
+use std::path::Path;
+
+use kerminal_application::AppError;
+#[cfg(target_os = "windows")]
+use kerminal_application::connections::RdpLaunchTarget;
 use kerminal_domain::connections::HostEndpoint;
 use tokio::sync::{Semaphore, watch};
 use uuid::Uuid;
 
-use super::{ManagedClient, SystemRdpPlatformLauncher, artifact, platform};
+use super::{ManagedClient, SystemRdpPlatformLauncher, artifact};
+// 客户端探测与启动计划只在 Windows 与 Linux 用例中调用。
+#[cfg(any(windows, target_os = "linux"))]
+use super::platform;
 
 /// 为平台测试创建唯一目录，避免并行运行时覆盖用户文件或其它测试产物。
 fn temporary_directory() -> PathBuf {

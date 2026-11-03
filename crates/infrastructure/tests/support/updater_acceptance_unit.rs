@@ -20,7 +20,7 @@ use serde_json::Value;
 #[cfg(target_os = "linux")]
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     task::JoinHandle,
 };
 #[cfg(target_os = "linux")]

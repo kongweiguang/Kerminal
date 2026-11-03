@@ -15,8 +15,12 @@ use uuid::Uuid;
 
 use super::{
     JOURNAL_SCHEMA_VERSION, MAX_JOURNAL_BYTES, MAX_RECEIPT_BYTES, SnippetImportJournal,
-    SnippetImportJournalEntry, active_journal_path, commit_receipt, ensure_transaction_layout,
-    persist_active_journal, preflight_batch_directories, validate_metadata_budget,
+    SnippetImportJournalEntry, preflight_batch_directories, validate_metadata_budget,
+};
+// journal 清理回执只在 Windows 只读属性用例中写入，其它平台不导入免得成为死代码。
+#[cfg(windows)]
+use super::{
+    active_journal_path, commit_receipt, ensure_transaction_layout, persist_active_journal,
 };
 use crate::commands::FileCommandCatalogRepository;
 use crate::storage::StorageCoordinator;
