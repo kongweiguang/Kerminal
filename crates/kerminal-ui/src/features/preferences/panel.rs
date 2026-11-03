@@ -58,6 +58,8 @@ mod forms;
 #[path = "panel/mcp.rs"]
 mod mcp;
 pub(in crate::features::preferences) use mcp::McpConfigTarget;
+#[path = "panel/profile_scan.rs"]
+mod profile_scan;
 #[path = "panel/profiles.rs"]
 mod profiles;
 #[path = "panel/protocol.rs"]
@@ -485,6 +487,7 @@ pub struct PreferencesPanel {
     pub(super) selected_profile_id: Option<String>,
     pub(super) selected_profile_is_default: bool,
     pub(super) profile_operation_running: bool,
+    pub(super) profile_scan: profile_scan::ProfileScanState,
     pub(super) profile_advanced_open: bool,
     pub(super) profile_default_outcome_unknown: bool,
     pub(super) profile_delete_outcome_unknown: bool,
@@ -708,6 +711,7 @@ impl PreferencesPanel {
             selected_profile_id: None,
             selected_profile_is_default: false,
             profile_operation_running: false,
+            profile_scan: profile_scan::ProfileScanState::default(),
             profile_advanced_open: false,
             profile_default_outcome_unknown: false,
             profile_delete_outcome_unknown: false,
@@ -1091,6 +1095,12 @@ impl PreferencesPanel {
         cx.notify();
     }
 
+    /// 主机表单的编辑入口复用设置导航，保留 Profile 草稿和 revision。
+    /// @author kongweiguang
+    pub(crate) fn show_profiles(&mut self, cx: &mut Context<Self>) {
+        self.select_section(PreferencesSection::Profiles, cx);
+    }
+
     /// 根视图初始加载时读取当前完整快照，避免从另一处拼装第二份运行态设置。
     pub fn settings_snapshot(&self) -> Option<SettingsSnapshot> {
         self.settings.as_ref().map(|draft| draft.value().clone())
@@ -1240,7 +1250,7 @@ impl PreferencesPanel {
     }
 
     /// 列表读回以稳定 ID 核对未知写入；不匹配时保留草稿，不能把任意列表快照当作成功。
-    /// 默认项与删除操作只需确认当前列表事实，且多个默认标记时继续阻止事务。
+    /// 扫描追加、默认项与删除的未知结果必须用完整目录读回，不能根据旧列表解锁。
     ///
     /// @author kongweiguang
     fn finish_profile_load(
@@ -1257,7 +1267,17 @@ impl PreferencesPanel {
         match result {
             Ok(rows) => {
                 self.profile_list_error = None;
-                if self.profile_default_outcome_unknown {
+                if self.profile_scan.requires_readback {
+                    self.profile_scan.requires_readback = false;
+                    cx.emit(PreferencesEvent::ProfilesChanged);
+                    self.status = Some(
+                        crate::locale::text(
+                            "已读取当前 Profile 列表，未重试扫描写入。",
+                            "The current profile list was read. The scan write was not retried.",
+                        )
+                        .to_string(),
+                    );
+                } else if self.profile_default_outcome_unknown {
                     if rows.iter().filter(|row| row.profile.is_default).count() > 1 {
                         self.profile_rows = rows;
                         self.profile_list_error = Some(crate::locale::text(

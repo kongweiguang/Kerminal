@@ -6,13 +6,16 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, Entity, EventEmitter, Focusable as _, IntoElement,
-    KeyDownEvent, Render, StatefulInteractiveElement, Subscription, Window,
+    AppContext as _, Bounds, ClickEvent, Context, Entity, EventEmitter, Focusable as _,
+    IntoElement, KeyDownEvent, MouseButton, MouseUpEvent, Pixels, Point, Render, ScrollHandle,
+    StatefulInteractiveElement, Subscription, Task, Window,
+    base::TestSupportExt as _,
     component::{
-        Disableable, FocusableExt as _, Icon, IconName,
+        Disableable, FocusableExt as _, Icon, IconName, Sizable as _,
         button::{Button, ButtonCustomVariant, ButtonVariants as _},
         input::{Input, InputEvent, InputState},
         menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
+        spinner::Spinner,
     },
     div,
     prelude::*,
@@ -21,9 +24,7 @@ use gpui_kit::{
 use kerminal_application::{
     ApplicationTaskExecutor, ConfigurationChangeService,
     configuration_changes::ConfigurationChangeMessage,
-    connections::management::{
-        HostDraft, HostGroup, HostGroupDraft, HostManagementService, ManagedHost,
-    },
+    connections::management::{HostGroup, HostGroupDraft, HostManagementService, ManagedHost},
     preferences::{InterfaceDensity, ProfileService, VersionedProfile},
     workspace::{WorkspacePinnedContainer, WorkspaceTargetRef},
 };
@@ -38,7 +39,6 @@ use crate::features::workspace_controller::WorkspaceSplitTargetOption;
 use crate::theme::ThemeTokens;
 
 const DUPLICATE_OPEN_GUARD: Duration = Duration::from_millis(650);
-const UNGROUPED_GROUP_ID: &str = "__ungrouped";
 
 /// 导航侧栏只调整自身的可见密度，不改变共享字体令牌或主工作区的几何。
 /// @author kongweiguang
@@ -58,6 +58,8 @@ struct HostNavigationLayoutMetrics {
     row_padding_x: f32,
     row_gap: f32,
     icon_size: f32,
+    /// 分组内行的左缩进，使成员相对根层未分组行形成一级层次；与文件树每层 14px 的约定一致。
+    child_indent: f32,
 }
 
 /// 图标按钮使用独立宽度，保留命中高度并把有限的侧栏空间优先留给搜索输入。
@@ -79,6 +81,7 @@ fn host_navigation_layout_metrics(density: InterfaceDensity) -> HostNavigationLa
             row_padding_x: 9.,
             row_gap: 8.,
             icon_size: 28.,
+            child_indent: 14.,
         },
         InterfaceDensity::Comfortable => HostNavigationLayoutMetrics {
             control_height: 32.,
@@ -95,6 +98,7 @@ fn host_navigation_layout_metrics(density: InterfaceDensity) -> HostNavigationLa
             row_padding_x: 10.,
             row_gap: 10.,
             icon_size: 30.,
+            child_indent: 14.,
         },
         InterfaceDensity::Spacious => HostNavigationLayoutMetrics {
             control_height: 36.,
@@ -111,6 +115,7 @@ fn host_navigation_layout_metrics(density: InterfaceDensity) -> HostNavigationLa
             row_padding_x: 12.,
             row_gap: 12.,
             icon_size: 32.,
+            child_indent: 14.,
         },
     }
 }
@@ -118,30 +123,77 @@ fn host_navigation_layout_metrics(density: InterfaceDensity) -> HostNavigationLa
 /// 左侧导航表达主机目录、主机选择、连接与 SFTP 意图；协议动作仍由 Root 交给现有面板。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostNavigationEvent {
-    CreateLocalProfileRequested { group_id: Option<String> },
-    LocalProfileSelected { profile_id: String },
-    LocalProfileConnectRequested { profile_id: String },
-    EditLocalProfileRequested { profile_id: String },
-    CopyLocalProfileRequested { profile_id: String },
-    DeleteLocalProfileRequested { profile_id: String },
-    HostSelected { host_id: HostId },
-    EditHostRequested { host_id: HostId },
-    CopyHostRequested { host_id: HostId },
-    CopyHostAsSshRequested { host_id: HostId },
-    DeleteHostRequested { host_id: HostId },
-    ConnectRequested { host_id: HostId },
-    OpenSftpRequested { host_id: HostId },
-    CreateSftpTransferTabRequested { host_id: HostId },
-    PinnedContainerSelected { stable_id: String },
-    PinnedContainerOpenRequested { stable_id: String },
-    PinnedContainerRemoveRequested { stable_id: String },
-    PinnedContainerDetailsRequested { stable_id: String },
-    PinnedContainerFilesRequested { stable_id: String },
+    CreateLocalProfileRequested {
+        group_id: Option<String>,
+    },
+    LocalProfileSelected {
+        profile_id: String,
+    },
+    LocalProfileConnectRequested {
+        profile_id: String,
+    },
+    EditLocalProfileRequested {
+        profile_id: String,
+    },
+    CopyLocalProfileRequested {
+        profile_id: String,
+    },
+    DeleteLocalProfileRequested {
+        profile_id: String,
+    },
+    HostSelected {
+        host_id: HostId,
+    },
+    EditHostRequested {
+        host_id: HostId,
+    },
+    CopyHostRequested {
+        host_id: HostId,
+    },
+    CopyHostAsSshRequested {
+        host_id: HostId,
+    },
+    DeleteHostRequested {
+        host_id: HostId,
+    },
+    ConnectRequested {
+        host_id: HostId,
+    },
+    OpenSftpRequested {
+        host_id: HostId,
+    },
+    CreateSftpTransferTabRequested {
+        host_id: HostId,
+    },
+    PinnedContainerSelected {
+        stable_id: String,
+    },
+    PinnedContainerOpenRequested {
+        stable_id: String,
+    },
+    PinnedContainerRemoveRequested {
+        stable_id: String,
+    },
+    PinnedContainerDetailsRequested {
+        stable_id: String,
+    },
+    PinnedContainerFilesRequested {
+        stable_id: String,
+    },
     OpenSftpWorkbenchRequested,
-    CreateHostRequested { group_id: Option<String> },
+    /// 新建连接事件。`group_explicit` 区分背景入口与命中具体行的入口：
+    /// 背景入口沿用表单上次显式选择的分组，具体行/分组入口必须使用点击到的分组（可为未分组）。
+    CreateHostRequested {
+        group_id: Option<String>,
+        group_explicit: bool,
+    },
     CreateGroupRequested,
-    RenameGroupRequested { group_id: String },
-    DeleteGroupRequested { group_id: String },
+    RenameGroupRequested {
+        group_id: String,
+    },
+    DeleteGroupRequested {
+        group_id: String,
+    },
 }
 
 /// 保存确认后切换两个互斥的左栏选择身份，避免远端 Host 与本地 Profile 同时高亮。
@@ -216,6 +268,44 @@ enum GroupAction {
     Delete,
 }
 
+/// 主机拖动绑定导航实体和开始时的 revision，拒绝其它窗口、文件或过期目录载荷。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostNavigationDrag {
+    source_navigation: gpui_kit::EntityId,
+    host_id: HostId,
+    revision: ConfigRevision,
+}
+
+/// 移动菜单与拖动共享同一只读投影，避免每帧复制完整主机配置或读取本地环境。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy)]
+struct HostMoveSnapshot<'a> {
+    group_id: Option<&'a str>,
+    revision: &'a ConfigRevision,
+    local: bool,
+}
+
+/// 同时只允许一次移动，直到对应目录读取成功；写入回执本身不等于读回完成。
+///
+/// @author kongweiguang
+struct PendingHostMove {
+    host_id: HostId,
+    destination: Option<String>,
+    destination_name: String,
+    phase: HostMovePhase,
+}
+
+/// 保存与读回显式分阶段，旧读取和失败读取不能解除提交门禁。
+///
+/// @author kongweiguang
+enum HostMovePhase {
+    Saving,
+    AwaitingReadback(kerminal_application::AppResult<()>),
+}
+
 /// 轻量导航只持有目录快照和筛选状态，不读取文件、不访问网络，也不保存连接秘密。
 pub struct HostNavigation {
     hosts: HostManagementService,
@@ -238,16 +328,22 @@ pub struct HostNavigation {
     selected_machine_id: Option<String>,
     session_projection: HashMap<HostId, HostSessionStatus>,
     collapsed_groups: HashSet<String>,
-    pending_host_moves: HashSet<HostId>,
+    pending_host_move: Option<PendingHostMove>,
     pending_group_pins: HashSet<String>,
     last_open_request: Option<(HostId, Instant)>,
     feedback: Option<NavigationFeedback>,
     loading: bool,
     status: Option<String>,
+    status_dismissed: bool,
     reload_pending: bool,
+    catalog_generation: u64,
     configuration_changes: Option<ConfigurationChangeService>,
     configuration_watch_cancellation: CancellationToken,
     configuration_watch_started: bool,
+    host_tree_scroll_handle: ScrollHandle,
+    active_host_drag: Option<HostNavigationDrag>,
+    host_drag_task: Option<Task<()>>,
+    host_drag_generation: u64,
 }
 
 /// 只呈现最近一次分组移动回执，避免把普通连接列表替换成错误页。
@@ -299,16 +395,22 @@ impl HostNavigation {
             selected_machine_id: None,
             session_projection: HashMap::new(),
             collapsed_groups: HashSet::new(),
-            pending_host_moves: HashSet::new(),
+            pending_host_move: None,
             pending_group_pins: HashSet::new(),
             last_open_request: None,
             feedback: None,
             loading: false,
             status: None,
+            status_dismissed: false,
             reload_pending: false,
+            catalog_generation: 0,
             configuration_changes: None,
             configuration_watch_cancellation: CancellationToken::new(),
             configuration_watch_started: false,
+            host_tree_scroll_handle: ScrollHandle::new(),
+            active_host_drag: None,
+            host_drag_task: None,
+            host_drag_generation: 0,
         };
         navigation.reload(cx);
         navigation
@@ -392,6 +494,27 @@ impl HostNavigation {
         .detach();
     }
 
+    /// 先按稳定 HostId 查远端，再查同 ID 的本地主机；只借用分组和 revision。
+    ///
+    /// @author kongweiguang
+    fn host_move_snapshot(&self, host_id: &HostId) -> Option<HostMoveSnapshot<'_>> {
+        if let Some(host) = self.rows.iter().find(|host| &host.id == host_id) {
+            return Some(HostMoveSnapshot {
+                group_id: host.group_id.as_deref(),
+                revision: &host.revision,
+                local: false,
+            });
+        }
+        self.profile_rows
+            .iter()
+            .find(|row| row.profile.id == host_id.as_str())
+            .map(|row| HostMoveSnapshot {
+                group_id: row.profile.sidebar_group_id.as_deref(),
+                revision: &row.revision,
+                local: true,
+            })
+    }
+
     /// 读取主机与分组作为同一 UI 快照；失败保留旧数据并提供显式重试。
     /// @author kongweiguang
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -400,6 +523,8 @@ impl HostNavigation {
             return;
         }
         self.loading = true;
+        self.status_dismissed = false;
+        let generation = self.catalog_generation;
         let hosts = self.hosts.clone();
         let profiles = self.profiles.clone();
         let executor = self.executor.clone();
@@ -417,55 +542,111 @@ impl HostNavigation {
                 })
                 .await;
             cx.update(|app| {
-                let _ = this.update(app, |navigation, cx| {
-                    navigation.loading = false;
-                    match result {
-                        Ok((rows, local_hosts, groups, profiles)) => {
-                            navigation.rows = rows;
-                            navigation.groups = groups.groups;
-                            navigation.group_revision = groups.revision;
-                            navigation.default_profile_name =
-                                unique_default_profile_name(&profiles);
-                            navigation.profile_rows = local_hosts
-                                .into_iter()
-                                .map(|host| {
-                                    super::local_hosts::local_host_projection(
-                                        host,
-                                        Default::default(),
-                                    )
-                                })
-                                .collect();
-                            if navigation.selected_host.as_ref().is_some_and(|selected| {
-                                !navigation.rows.iter().any(|host| &host.id == selected)
-                            }) {
-                                navigation.selected_host = None;
+                let _ =
+                    this.update(app, |navigation, cx| {
+                        navigation.loading = false;
+                        if generation != navigation.catalog_generation {
+                            navigation.reload_pending = true;
+                        } else {
+                            match result {
+                                Ok((rows, local_hosts, groups, profiles)) => {
+                                    navigation.rows = rows;
+                                    navigation.groups = groups.groups;
+                                    navigation.group_revision = groups.revision;
+                                    navigation.default_profile_name =
+                                        unique_default_profile_name(&profiles);
+                                    navigation.profile_rows = local_hosts
+                                        .into_iter()
+                                        .map(|host| {
+                                            super::local_hosts::local_host_projection(
+                                                host,
+                                                Default::default(),
+                                            )
+                                        })
+                                        .collect();
+                                    if navigation.selected_host.as_ref().is_some_and(|selected| {
+                                        !navigation.rows.iter().any(|host| &host.id == selected)
+                                    }) {
+                                        navigation.selected_host = None;
+                                    }
+                                    if navigation.selected_profile.as_ref().is_some_and(
+                                        |selected| {
+                                            !navigation
+                                                .profile_rows
+                                                .iter()
+                                                .any(|row| &row.profile.id == selected)
+                                        },
+                                    ) {
+                                        navigation.selected_profile = None;
+                                    }
+                                    navigation.status = None;
+                                    navigation.finish_host_move_readback();
+                                }
+                                Err(error) => navigation.status = Some(load_error_message(&error)),
                             }
-                            if navigation
-                                .selected_profile
-                                .as_ref()
-                                .is_some_and(|selected| {
-                                    !navigation
-                                        .profile_rows
-                                        .iter()
-                                        .any(|row| &row.profile.id == selected)
-                                })
-                            {
-                                navigation.selected_profile = None;
-                            }
-                            navigation.status = None;
                         }
-                        Err(error) => navigation.status = Some(load_error_message(&error)),
-                    }
-                    cx.notify();
-                    if navigation.reload_pending {
-                        navigation.reload_pending = false;
-                        navigation.reload(cx);
-                    }
-                });
+                        cx.notify();
+                        if navigation.reload_pending {
+                            navigation.reload_pending = false;
+                            navigation.reload(cx);
+                        }
+                    });
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// 仅当前代次完整读取成功后结算移动；未知写入按实际位置反馈，不能伪装成普通成功。
+    ///
+    /// @author kongweiguang
+    fn finish_host_move_readback(&mut self) {
+        let Some(pending) = self.pending_host_move.take() else {
+            return;
+        };
+        let HostMovePhase::AwaitingReadback(save_result) = pending.phase else {
+            self.pending_host_move = Some(pending);
+            return;
+        };
+        let at_destination = self
+            .host_move_snapshot(&pending.host_id)
+            .is_some_and(|snapshot| snapshot.group_id == pending.destination.as_deref());
+        let confirmed = save_result.is_ok();
+        let message = match save_result {
+            Ok(()) if at_destination => crate::locale::text(
+                format!("主机已移至「{}」。", pending.destination_name),
+                format!("Host moved to ‘{}’.", pending.destination_name),
+            )
+            .to_string(),
+            Ok(()) => crate::locale::text(
+                "主机在移动后已变化，请核对当前位置。",
+                "The host changed after the move. Check its current location.",
+            )
+            .to_string(),
+            Err(error)
+                if error.public_code() == kerminal_application::PublicErrorCode::OutcomeUnknown
+                    && at_destination =>
+            {
+                self.feedback = Some(NavigationFeedback {
+                    message: crate::locale::text(
+                        format!("当前位置已核对：{}", pending.destination_name),
+                        format!("Current location verified: {}", pending.destination_name),
+                    )
+                    .to_string(),
+                    is_error: false,
+                });
+                return;
+            }
+            Err(error) => {
+                self.feedback = Some(NavigationFeedback {
+                    message: error.public_message().to_owned(),
+                    is_error: true,
+                });
+                return;
+            }
+        };
+        let is_error = !confirmed || !at_destination;
+        self.feedback = Some(NavigationFeedback { message, is_error });
     }
 
     /// 只从当前已加载的主机投影返回显示名；缺失时返回 None，避免把内部 HostId 当标题。
@@ -711,9 +892,14 @@ impl HostNavigation {
         }
     }
 
-    /// 新建连接显式携带所属分组；空白区与未分组目标不借用当前选择，也不提前建立会话。
+    /// 新建连接携带命中分组；背景入口标记为非显式，由表单沿用上次分组，不提前建立会话。
     /// @author kongweiguang
-    fn request_create_host(&mut self, group_id: Option<String>, cx: &mut Context<Self>) {
+    fn request_create_host(
+        &mut self,
+        group_id: Option<String>,
+        group_explicit: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.recovery.mode == ConfigurationMode::ReadOnlyRecovery {
             self.feedback = Some(NavigationFeedback {
                 message: crate::locale::text(
@@ -741,7 +927,10 @@ impl HostNavigation {
             cx.notify();
             return;
         }
-        cx.emit(HostNavigationEvent::CreateHostRequested { group_id });
+        cx.emit(HostNavigationEvent::CreateHostRequested {
+            group_id,
+            group_explicit,
+        });
     }
 
     /// 在指定分组新建本地主机；Root 将其路由到统一连接表单而非偏好页。
@@ -1059,6 +1248,7 @@ impl HostNavigation {
         let event = match action {
             GroupAction::CreateHost => HostNavigationEvent::CreateHostRequested {
                 group_id: Some(group_id),
+                group_explicit: true,
             },
             GroupAction::Rename => HostNavigationEvent::RenameGroupRequested { group_id },
             GroupAction::Delete => HostNavigationEvent::DeleteGroupRequested { group_id },
@@ -1259,12 +1449,133 @@ impl HostNavigation {
         cx.notify();
     }
 
-    /// 通过 application 的 HostDraft 与所见 revision 做单文件 CAS；失败后刷新核对，不盲目重放。
+    /// 每个主机拖动只保留一个边缘滚动任务；失活、源变化或代次变化均立即失效。
+    /// 失焦由 Root activation observer 统一取消，避免后台验收窗口被计时器误判。
+    ///
+    /// @author kongweiguang
+    fn begin_host_drag(
+        &mut self,
+        drag: HostNavigationDrag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_host_drag();
+        self.host_drag_generation = self.host_drag_generation.wrapping_add(1).max(1);
+        let generation = self.host_drag_generation;
+        self.active_host_drag = Some(drag.clone());
+        let scroll_handle = self.host_tree_scroll_handle.clone();
+        let mut window_context = window.to_async(cx);
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let pointer = window_context
+                    .update(|window, app| app.has_active_drag().then(|| window.mouse_position()))
+                    .ok()
+                    .flatten();
+                let source_is_current = this
+                    .update(cx, |navigation, _| {
+                        navigation.host_drag_generation == generation
+                            && navigation.active_host_drag.as_ref() == Some(&drag)
+                            && navigation.recovery.mode != ConfigurationMode::ReadOnlyRecovery
+                            && navigation
+                                .host_move_snapshot(&drag.host_id)
+                                .is_some_and(|snapshot| snapshot.revision == &drag.revision)
+                    })
+                    .unwrap_or(false);
+                if !source_is_current {
+                    let _ = window_context.update(|window, app| {
+                        if app.has_active_drag() {
+                            app.stop_active_drag(window);
+                        }
+                    });
+                    break;
+                }
+                let Some(pointer) = pointer else {
+                    break;
+                };
+                if let Some(next_offset) = next_host_drag_scroll_offset(
+                    pointer,
+                    scroll_handle.bounds(),
+                    scroll_handle.offset(),
+                    scroll_handle.max_offset(),
+                ) {
+                    scroll_handle.set_offset(next_offset);
+                    let _ = this.update(cx, |navigation, cx| {
+                        if navigation.host_drag_generation == generation {
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+            let _ = this.update(cx, |navigation, _| {
+                if navigation.host_drag_generation == generation {
+                    navigation.host_drag_task = None;
+                    navigation.active_host_drag = None;
+                }
+            });
+        });
+        self.host_drag_task = Some(task);
+    }
+
+    /// 释放、取消或换源只清理本导航的任务与视觉状态，不提前吞掉后续 drop。
+    ///
+    /// @author kongweiguang
+    fn stop_host_drag(&mut self) {
+        self.host_drag_generation = self.host_drag_generation.wrapping_add(1).max(1);
+        self.host_drag_task = None;
+        self.active_host_drag = None;
+    }
+
+    /// 仅在本导航仍持有主机手势时停止 GPUI drag；文件和其它标签手势不受影响。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn cancel_host_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.active_host_drag.is_none() {
+            return false;
+        }
+        if !cx.has_active_drag() {
+            self.stop_host_drag();
+            return false;
+        }
+        if !cx.stop_active_drag(window) {
+            return false;
+        }
+        self.stop_host_drag();
+        cx.notify();
+        true
+    }
+
+    /// 高亮和投放共用身份、revision、目录和单飞门禁；最终提交仍由 request 再校验。
+    ///
+    /// @author kongweiguang
+    fn host_move_target_is_actionable(
+        &self,
+        drag: &HostNavigationDrag,
+        destination: Option<&str>,
+        navigation_id: gpui_kit::EntityId,
+    ) -> bool {
+        drag.source_navigation == navigation_id
+            && self.recovery.mode != ConfigurationMode::ReadOnlyRecovery
+            && self.pending_host_move.is_none()
+            && !self.loading
+            && self.status.is_none()
+            && destination.is_none_or(|id| self.groups.iter().any(|group| group.id == id))
+            && self
+                .host_move_snapshot(&drag.host_id)
+                .is_some_and(|snapshot| {
+                    snapshot.revision == &drag.revision && snapshot.group_id != destination
+                })
+    }
+
+    /// 远端和本地移动共用冻结 revision；保存回执仅推进到读回阶段，不乐观修改目录。
     /// @author kongweiguang
     fn request_move_host(
         &mut self,
         host_id: HostId,
         destination: Option<String>,
+        expected_revision: ConfigRevision,
         cx: &mut Context<Self>,
     ) {
         if self.recovery.mode == ConfigurationMode::ReadOnlyRecovery {
@@ -1277,6 +1588,33 @@ impl HostNavigation {
                 is_error: true,
             });
             cx.notify();
+            return;
+        }
+        if self.loading {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "主机目录正在刷新，请稍后重试。",
+                    "The host list is refreshing. Try again shortly.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        if self.status.is_some() {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "主机目录读取失败，请刷新后重试。",
+                    "The host list could not be read. Refresh and try again.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        if self.pending_host_move.is_some() {
             return;
         }
         if destination
@@ -1294,7 +1632,7 @@ impl HostNavigation {
             cx.notify();
             return;
         }
-        let Some(host) = self.rows.iter().find(|host| host.id == host_id).cloned() else {
+        let Some(snapshot) = self.host_move_snapshot(&host_id) else {
             self.feedback = Some(NavigationFeedback {
                 message: crate::locale::text(
                     "主机已不存在，请刷新列表。",
@@ -1303,15 +1641,25 @@ impl HostNavigation {
                 .to_string(),
                 is_error: true,
             });
-            self.reload(cx);
             cx.notify();
             return;
         };
-        if host.group_id == destination || !self.pending_host_moves.insert(host_id.clone()) {
+        if snapshot.revision != &expected_revision {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "主机配置已变化，请刷新后重试。",
+                    "The host configuration changed. Refresh and try again.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
             return;
         }
-        self.select_host(host_id.clone(), cx);
-
+        if snapshot.group_id == destination.as_deref() {
+            return;
+        }
+        let local = snapshot.local;
         let destination_name = destination.as_ref().map_or_else(
             || crate::locale::text("未分组", "Ungrouped").to_string(),
             |id| {
@@ -1322,34 +1670,46 @@ impl HostNavigation {
                     .unwrap_or_else(|| id.clone())
             },
         );
-        let draft = host_draft_for_group(&host, destination);
-        let expected_revision = host.revision;
+        if local {
+            self.select_local_profile(host_id.as_str().to_owned(), cx);
+        } else {
+            self.select_host(host_id.clone(), cx);
+        }
+        self.pending_host_move = Some(PendingHostMove {
+            host_id: host_id.clone(),
+            destination: destination.clone(),
+            destination_name,
+            phase: HostMovePhase::Saving,
+        });
+        self.feedback = None;
         let hosts = self.hosts.clone();
         let executor = self.executor.clone();
+        let request_host_id = host_id.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |_| async move { hosts.save_host(draft, Some(expected_revision)).await })
+                .run(move |_| async move {
+                    hosts
+                        .move_host_to_group(request_host_id, destination, expected_revision)
+                        .await
+                })
                 .await;
             let _ = this.update(cx, |navigation, cx| {
-                navigation.pending_host_moves.remove(&host_id);
-                match result {
-                    Ok(_) => {
-                        navigation.feedback = Some(NavigationFeedback {
-                            message: crate::locale::text(
-                                format!("主机已移至「{destination_name}」。"),
-                                format!("Host moved to ‘{destination_name}’."),
-                            )
-                            .to_string(),
-                            is_error: false,
+                let matches_request =
+                    navigation
+                        .pending_host_move
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.host_id == host_id
+                                && matches!(pending.phase, HostMovePhase::Saving)
                         });
-                    }
-                    Err(error) => {
-                        navigation.feedback = Some(NavigationFeedback {
-                            message: error.public_message().to_owned(),
-                            is_error: true,
-                        });
-                    }
+                if !matches_request {
+                    return;
                 }
+                if let Some(pending) = navigation.pending_host_move.as_mut() {
+                    pending.phase = HostMovePhase::AwaitingReadback(result);
+                }
+                navigation.catalog_generation =
+                    navigation.catalog_generation.wrapping_add(1).max(1);
                 navigation.reload(cx);
                 cx.notify();
             });
@@ -1369,7 +1729,7 @@ impl HostNavigation {
     /// 一次性展开或折叠已保存分组；折叠状态只在导航实体内生效，不写入连接配置。
     /// @author kongweiguang
     fn toggle_all_groups(&mut self, cx: &mut Context<Self>) {
-        let group_ids = navigation_group_ids(&self.rows, &self.profile_rows, &self.groups);
+        let group_ids = navigation_group_ids(&self.groups);
         if group_ids.is_empty() {
             return;
         }
@@ -1395,7 +1755,6 @@ impl Render for HostNavigation {
             .focus_handle(cx)
             .is_focused(window);
         let mut content = div()
-            .id("host-navigation")
             .w_full()
             .h_full()
             .flex()
@@ -1462,7 +1821,8 @@ impl Render for HostNavigation {
             .gap(px(metrics.tree_gap))
             .px(px(metrics.list_padding_x))
             .pb(px(metrics.list_padding_bottom))
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .track_scroll(&self.host_tree_scroll_handle);
 
         if self.loading && self.rows.is_empty() && self.profile_rows.is_empty() {
             host_tree = host_tree.child(
@@ -1478,7 +1838,10 @@ impl Render for HostNavigation {
                     .child(IconName::LoaderCircle)
                     .child(crate::locale::text("正在读取主机目录…", "Loading hosts…")),
             );
-        } else if let Some(status) = self.status.clone() {
+        } else if self.rows.is_empty()
+            && self.profile_rows.is_empty()
+            && let Some(status) = self.status.clone()
+        {
             host_tree = host_tree.child(
                 div()
                     .p_3()
@@ -1515,81 +1878,141 @@ impl Render for HostNavigation {
                 host_tree,
             );
         }
-        if let Some(feedback) = self.feedback.as_ref() {
+        content = content.child(host_tree.test_support());
+
+        let has_cached_catalog = !self.rows.is_empty() || !self.profile_rows.is_empty();
+        let floating_feedback = self.feedback.as_ref().map_or_else(
+            || {
+                (has_cached_catalog && !self.status_dismissed)
+                    .then(|| self.status.as_ref().map(|message| (message.clone(), true)))
+                    .flatten()
+            },
+            |feedback| Some((feedback.message.clone(), feedback.is_error)),
+        );
+        if self.active_host_drag.is_none()
+            && let Some((message, is_error)) = floating_feedback
+        {
             content = content.child(
                 div()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(if feedback.is_error {
-                        theme.error.opacity(0.12)
-                    } else {
-                        theme.secondary
+                    .absolute()
+                    .left_2()
+                    .right_2()
+                    .bottom_2()
+                    .p_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if is_error { theme.error } else { theme.border })
+                    .bg(theme.panel)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(theme.text_xs)
+                            .text_color(if is_error { theme.error } else { theme.muted })
+                            .child(message),
+                    )
+                    .when(self.status.is_some() && has_cached_catalog, |overlay| {
+                        overlay.child(
+                            Button::new("host-navigation-retry-read")
+                                .compact()
+                                .label(crate::locale::text("重试读取", "Retry read"))
+                                .on_click(cx.listener(|navigation, _: &ClickEvent, _, cx| {
+                                    navigation.reload(cx)
+                                })),
+                        )
                     })
-                    .text_size(theme.text_xs)
-                    .text_color(if feedback.is_error {
-                        theme.error
-                    } else {
-                        theme.muted
-                    })
-                    .child(feedback.message.clone()),
+                    .child(
+                        Button::new("host-navigation-dismiss-feedback")
+                            .compact()
+                            .ghost()
+                            .icon(IconName::Close)
+                            .accessibility_label(crate::locale::text(
+                                "关闭反馈",
+                                "Dismiss feedback",
+                            ))
+                            .on_click(cx.listener(|navigation, _: &ClickEvent, _, cx| {
+                                navigation.feedback = None;
+                                navigation.status_dismissed = true;
+                                cx.notify();
+                            })),
+                    ),
             );
         }
-        content = content.child(host_tree);
 
         let entity = cx.entity().clone();
         let local_entity = entity.clone();
         let group_entity = entity.clone();
         let create_entity = entity.clone();
         let readonly = self.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
-        content.context_menu(move |menu, _, _| {
-            let refresh_entity = entity.clone();
-            let mut menu = menu.item(
-                PopupMenuItem::new(crate::locale::text("刷新主机列表", "Refresh hosts"))
-                    .icon(gpui_kit::assets::IconName::RefreshCw)
-                    .on_click(move |_, _, app| {
-                        refresh_entity.update(app, |navigation, cx| navigation.reload(cx));
-                    }),
-            );
-            if !readonly {
-                let create_group_entity = group_entity.clone();
-                let create_local_entity = local_entity.clone();
-                menu = menu
-                    .separator()
-                    .item(
-                        PopupMenuItem::new(crate::locale::text("添加连接…", "Add connection…"))
-                            .icon(gpui_kit::assets::IconName::Plus)
-                            .on_click({
-                                let create_entity = create_entity.clone();
-                                move |_, _, app| {
-                                    create_entity.update(app, |navigation, cx| {
-                                        navigation.request_create_host(None, cx);
+        div()
+            .id("host-navigation")
+            .relative()
+            .w_full()
+            .h_full()
+            .capture_any_mouse_up(cx.listener(|navigation, _: &MouseUpEvent, _, cx| {
+                navigation.stop_host_drag();
+                cx.notify();
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|navigation, _: &MouseUpEvent, _, cx| {
+                    navigation.stop_host_drag();
+                    cx.notify();
+                }),
+            )
+            .child(content.context_menu(move |menu, _, _| {
+                let refresh_entity = entity.clone();
+                let mut menu = menu.item(
+                    PopupMenuItem::new(crate::locale::text("刷新主机列表", "Refresh hosts"))
+                        .icon(gpui_kit::assets::IconName::RefreshCw)
+                        .on_click(move |_, _, app| {
+                            refresh_entity.update(app, |navigation, cx| navigation.reload(cx));
+                        }),
+                );
+                if !readonly {
+                    let create_group_entity = group_entity.clone();
+                    let create_local_entity = local_entity.clone();
+                    menu = menu
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(crate::locale::text("添加连接…", "Add connection…"))
+                                .icon(gpui_kit::assets::IconName::Plus)
+                                .on_click({
+                                    let create_entity = create_entity.clone();
+                                    move |_, _, app| {
+                                        create_entity.update(app, |navigation, cx| {
+                                            navigation.request_create_host(None, false, cx);
+                                        });
+                                    }
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(crate::locale::text("新建分组…", "New group…"))
+                                .icon(gpui_kit::assets::IconName::FolderPlus)
+                                .on_click(move |_, _, app| {
+                                    create_group_entity.update(app, |_, cx| {
+                                        cx.emit(HostNavigationEvent::CreateGroupRequested);
                                     });
-                                }
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new(crate::locale::text("新建分组…", "New group…"))
-                            .icon(gpui_kit::assets::IconName::FolderPlus)
-                            .on_click(move |_, _, app| {
-                                create_group_entity.update(app, |_, cx| {
-                                    cx.emit(HostNavigationEvent::CreateGroupRequested);
-                                });
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new(crate::locale::text("新建本地主机…", "New local host…"))
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(crate::locale::text(
+                                "新建本地主机…",
+                                "New local host…",
+                            ))
                             .icon(gpui_kit::assets::IconName::Terminal)
                             .on_click(move |_, _, app| {
                                 create_local_entity.update(app, |navigation, cx| {
                                     navigation.request_create_local_profile(None, cx);
                                 });
                             }),
-                    );
-            }
-            menu
-        })
+                        );
+                }
+                menu
+            }))
     }
 }
 
@@ -1904,28 +2327,11 @@ fn group_sort_order_after_pin(groups: &[HostGroup], group_id: &str, pinned: bool
     }
 }
 
-/// 全量折叠按钮覆盖已保存分组与当前存在的未分组区，未知组引用仍归入同一可见分区。
+/// 全量折叠按钮只覆盖已保存分组；未分组主机直接挂在目录根层，没有可折叠的目录行。
+///
 /// @author kongweiguang
-fn navigation_group_ids(
-    hosts: &[ManagedHost],
-    profiles: &[VersionedProfile],
-    groups: &[HostGroup],
-) -> Vec<String> {
-    let mut ids = groups
-        .iter()
-        .map(|group| group.id.clone())
-        .collect::<Vec<_>>();
-    let has_ungrouped_items = hosts.iter().any(|host| {
-        host.group_id
-            .as_deref()
-            .is_none_or(|id| !groups.iter().any(|group| group.id == id))
-    }) || profiles.iter().any(|profile| {
-        profile_group_is_ungrouped(profile.profile.sidebar_group_id.as_deref(), groups)
-    });
-    if has_ungrouped_items {
-        ids.push(UNGROUPED_GROUP_ID.to_owned());
-    }
-    ids
+fn navigation_group_ids(groups: &[HostGroup]) -> Vec<String> {
+    groups.iter().map(|group| group.id.clone()).collect()
 }
 
 /// 无项目时不把空集合误报为已全部折叠；混合状态采取可预测的“折叠全部”。
@@ -1950,32 +2356,6 @@ fn host_primary_action_label(protocol: RemoteProtocol) -> gpui_kit::SharedString
     }
 }
 
-/// 移动只替换分组并使用原 revision 做 CAS；备注与协议选项必须随草稿保留，避免导航操作清空配置。
-/// @author kongweiguang
-fn host_draft_for_group(host: &ManagedHost, group_id: Option<String>) -> HostDraft {
-    HostDraft {
-        id: Some(host.id.clone()),
-        group_id,
-        name: host.name.clone(),
-        note: host.note.clone(),
-        protocol: host.protocol,
-        endpoint: host.endpoint.clone(),
-        authentication: host.authentication.clone(),
-        authentication_mode: host.authentication_mode,
-        rdp_password: host.rdp_password.clone(),
-        route: host.route.clone(),
-        serial: host.serial.clone(),
-        tags: host.tags.clone(),
-        is_favorite: host.is_favorite,
-        sort_order: host.sort_order,
-        connect_timeout_ms: host.connect_timeout_ms,
-        keepalive_interval_ms: host.keepalive_interval_ms,
-        terminal_options: host.terminal_options.clone(),
-        sftp_options: host.sftp_options.clone(),
-        rdp_display: host.rdp_display.clone(),
-    }
-}
-
 /// 搜索框取得按钮组以外的全部宽度；窄图标槽位保留控件高度，避免搜索被三枚方形按钮挤压。
 /// 刷新沿用同一异步加载门禁，按钮组只在相邻动作间保留小间距。
 /// @author kongweiguang
@@ -1986,11 +2366,7 @@ fn render_navigation_header(
     metrics: HostNavigationLayoutMetrics,
     cx: &mut Context<HostNavigation>,
 ) -> impl IntoElement {
-    let group_ids = navigation_group_ids(
-        &navigation.rows,
-        &navigation.profile_rows,
-        &navigation.groups,
-    );
+    let group_ids = navigation_group_ids(&navigation.groups);
     let all_collapsed = all_groups_are_collapsed(&group_ids, &navigation.collapsed_groups);
     let search = div()
         .id("host-navigation-search-frame")
@@ -2123,6 +2499,7 @@ fn render_navigation_header(
 }
 
 /// 无搜索时保留完整分组树（含空组）；搜索时仅保留命中组名或仍有命中条目的组，并在每组内统一排序两类主机。
+/// 未分组的远端主机与本地主机直接挂在目录根层，不生成额外的“未分组”目录行。
 /// Window 只用于稳定行焦点，不把键盘身份混入业务导航状态。
 /// @author kongweiguang
 fn render_tree_groups(
@@ -2200,20 +2577,51 @@ fn render_tree_groups(
         navigation.search.as_str(),
     );
     if !ungrouped_items.is_empty() {
-        tree = render_host_group(
-            navigation,
-            HostGroupRenderItems {
-                group_id: UNGROUPED_GROUP_ID.to_owned(),
-                label: crate::locale::text("未分组", "Ungrouped"),
-                items: ungrouped_items,
-            },
-            theme,
-            metrics,
-            window,
-            cx,
-            tree,
-        );
+        // 未分组主机直接挂在目录根层，不生成“未分组”目录行：用户未选分组时目标就在最外层，
+        // 不会凭空多出一层目录，也不参与分组折叠和分组右键菜单。
+        let mut section = div()
+            .id("host-navigation-section-ungrouped")
+            .w_full()
+            .rounded_lg()
+            .flex()
+            .flex_col()
+            .gap(px(metrics.section_gap));
+        for item in ungrouped_items {
+            section = section.child(navigation_item_row(
+                navigation, item, theme, metrics, window, cx,
+            ));
+        }
+        let section = host_drop_target(section, cx.entity().clone(), None, theme);
+        tree = tree.child(section);
     }
+
+    let show_root_label = navigation
+        .active_host_drag
+        .as_ref()
+        .is_some_and(|drag| navigation.host_move_target_is_actionable(drag, None, cx.entity_id()));
+    let root_drop = div()
+        .id("host-navigation-root-drop")
+        .w_full()
+        .min_h(gpui_kit::rems(2.0))
+        .flex_1()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_lg()
+        .text_size(theme.text_xs)
+        .text_color(theme.muted)
+        .when(show_root_label, |target| {
+            target
+                .aria_label(crate::locale::text("移到未分组", "Move to Ungrouped"))
+                .child(crate::locale::text("移到未分组", "Move to Ungrouped"))
+        });
+    tree = tree.child(host_drop_target(
+        root_drop,
+        cx.entity().clone(),
+        None,
+        theme,
+    ));
     tree
 }
 
@@ -2259,6 +2667,49 @@ struct HostGroupRenderItems {
     group_id: String,
     label: gpui_kit::SharedString,
     items: Vec<GroupNavigationItem>,
+}
+
+/// 分组 section 和根层留白共用唯一类型化落点；无效目标只结束手势，不向祖先冒泡成未分组。
+///
+/// @author kongweiguang
+fn host_drop_target(
+    target: gpui_kit::Stateful<gpui_kit::Div>,
+    entity: Entity<HostNavigation>,
+    destination: Option<String>,
+    theme: ThemeTokens,
+) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
+    let navigation_id = entity.entity_id();
+    let highlight_entity = entity.clone();
+    let highlight_destination = destination.clone();
+    target
+        .test_support()
+        .border_1()
+        .border_color(theme.sidebar.opacity(0.))
+        .drag_over::<HostNavigationDrag>(move |style, drag, _, app| {
+            if highlight_entity.read(app).host_move_target_is_actionable(
+                drag,
+                highlight_destination.as_deref(),
+                navigation_id,
+            ) {
+                style.border_color(theme.accent).bg(theme.selected)
+            } else {
+                style
+            }
+        })
+        .on_drop(move |drag: &HostNavigationDrag, _, app| {
+            entity.update(app, |navigation, cx| {
+                navigation.stop_host_drag();
+                if drag.source_navigation == navigation_id {
+                    navigation.request_move_host(
+                        drag.host_id.clone(),
+                        destination.clone(),
+                        drag.revision.clone(),
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
 }
 
 /// 分组标题保持紧凑并使用单一全行按钮，让 chevron、名称和计数共享圆角 hover、点击及键盘焦点。
@@ -2406,33 +2857,60 @@ fn render_host_group(
         .child(header);
     if !collapsed {
         for item in items {
-            section = section.child(match item {
-                GroupNavigationItem::LocalHost(profile) => {
-                    let selected =
-                        navigation.selected_profile.as_deref() == Some(profile.profile.id.as_str());
-                    local_profile_row(
-                        *profile,
-                        selected,
-                        navigation.recovery.mode == ConfigurationMode::ReadOnlyRecovery,
-                        theme,
-                        metrics,
-                        window,
-                        cx,
-                    )
-                    .into_any_element()
-                }
-                GroupNavigationItem::RemoteHost(host) => {
-                    host_row(navigation, *host, theme, metrics, window, cx).into_any_element()
-                }
-                GroupNavigationItem::PinnedContainer(container) => {
-                    pinned_container_row(navigation, *container, theme, metrics, window, cx)
-                        .into_any_element()
-                }
-            });
+            // 分组成员缩进一级，根层未分组行保持最左侧，目录层次不依赖分组标题本身。
+            section = section.child(div().w_full().pl(px(metrics.child_indent)).child(
+                navigation_item_row(navigation, item, theme, metrics, window, cx),
+            ));
         }
     }
+    let section = host_drop_target(section, cx.entity().clone(), Some(group_id), theme);
     tree = tree.child(section);
     tree
+}
+
+/// 目录行按条目种类分派；分组内行与未分组根层行共用同一实现，避免两种树的交互规则分叉。
+/// @author kongweiguang
+fn navigation_item_row(
+    navigation: &mut HostNavigation,
+    item: GroupNavigationItem,
+    theme: ThemeTokens,
+    metrics: HostNavigationLayoutMetrics,
+    window: &mut Window,
+    cx: &mut Context<HostNavigation>,
+) -> gpui_kit::AnyElement {
+    match item {
+        GroupNavigationItem::LocalHost(profile) => {
+            let selected =
+                navigation.selected_profile.as_deref() == Some(profile.profile.id.as_str());
+            let pending = navigation
+                .pending_host_move
+                .as_ref()
+                .is_some_and(|pending| pending.host_id.as_str() == profile.profile.id);
+            let move_blocked = navigation.pending_host_move.is_some();
+            local_profile_row(
+                *profile,
+                LocalProfileRowState {
+                    selected,
+                    readonly: navigation.recovery.mode == ConfigurationMode::ReadOnlyRecovery,
+                    pending,
+                    move_blocked,
+                    catalog_available: !navigation.loading && navigation.status.is_none(),
+                },
+                theme,
+                metrics,
+                window,
+                cx,
+            )
+            .into_any_element()
+        }
+        GroupNavigationItem::RemoteHost(host) => {
+            host_row(navigation, *host, theme, metrics, window, cx).into_any_element()
+        }
+        GroupNavigationItem::PinnedContainer(container) => {
+            pinned_container_row(navigation, *container, theme, metrics, window, cx)
+                .into_any_element()
+        }
+    }
 }
 
 /// 主机行用填充表达选择，鼠标焦点不绘制外圈；键盘导航使用内侧边线显示焦点。
@@ -2466,19 +2944,57 @@ fn navigation_row_button(
         .text_color(theme.foreground)
 }
 
+/// 本地主机的副标题只保留 shell 名：终端图标与分组已说明“本地”，
+/// 重复“本地主机”只会挤占名称宽度。显式 shell 路径取文件名，未指定时显示默认，
+/// 让本地行与远端行的地址副标题保持同样的两行节奏。
+///
+/// @author kongweiguang
+fn local_shell_label(shell: &str) -> gpui_kit::SharedString {
+    let shell = shell.trim();
+    let stem = std::path::Path::new(shell)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty());
+    match stem {
+        Some(stem) => {
+            let name = stem.to_owned();
+            crate::locale::text(name.clone(), name)
+        }
+        None => crate::locale::text("默认 shell", "Default shell"),
+    }
+}
+
+/// 本地行的选择、只读、移动和目录门禁合并传递，避免渲染函数因布尔参数过多失焦。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy)]
+struct LocalProfileRowState {
+    selected: bool,
+    readonly: bool,
+    pending: bool,
+    move_blocked: bool,
+    catalog_available: bool,
+}
+
 /// 本地主机鼠标单击选择、双击或键盘确认打开；右键只展示菜单，避免浏览菜单便建立会话。
 /// Kit 按钮默认不在鼠标点击时聚焦，因此显式绑定稳定行焦点，支持先单击再按 Enter。
-/// 同组新建从目录快照解析有效组；已丢失的组引用与树中的未分组呈现一致。
+/// 同组新建从目录快照解析有效组；已丢失的组引用与树根层的无分组呈现一致。
 /// @author kongweiguang
 fn local_profile_row(
     row: VersionedProfile,
-    selected: bool,
-    readonly: bool,
+    state: LocalProfileRowState,
     theme: ThemeTokens,
     metrics: HostNavigationLayoutMetrics,
     window: &mut Window,
     cx: &mut Context<HostNavigation>,
 ) -> impl IntoElement + 'static {
+    let LocalProfileRowState {
+        selected,
+        readonly,
+        pending,
+        move_blocked,
+        catalog_available,
+    } = state;
     let id = row.profile.id.clone();
     let dom_id = id.clone();
     let focus_handle = window
@@ -2495,7 +3011,17 @@ fn local_profile_row(
     let group_id = row.profile.sidebar_group_id.clone();
     let entity = cx.entity().clone();
     let click_id = id.clone();
-    navigation_row_button(
+    let move_host_id = HostId::parse(&id).ok();
+    let move_revision = row.revision.clone();
+    let drag = move_host_id.clone().map(|host_id| HostNavigationDrag {
+        source_navigation: cx.entity_id(),
+        host_id,
+        revision: move_revision.clone(),
+    });
+    let can_drag = !readonly && !move_blocked && catalog_available && drag.is_some();
+    let drag_entity = cx.entity().clone();
+    let preview_title: gpui_kit::SharedString = name.clone().into();
+    let row = navigation_row_button(
         format!("host-navigation-profile-{dom_id}"),
         selected,
         theme,
@@ -2538,13 +3064,30 @@ fn local_profile_row(
                     .truncate()
                     .text_size(theme.text_xs)
                     .text_color(theme.muted)
-                    .child(crate::locale::text(
-                        format!("本地主机 · {shell}"),
-                        format!("Local host · {shell}"),
-                    )),
+                    .child(local_shell_label(&shell)),
             ),
     )
-    .accessibility_label(local_host_accessibility_label(&accessible_name))
+    .child(
+        div()
+            .w_4()
+            .flex_shrink_0()
+            .flex()
+            .justify_center()
+            .when(pending, |slot| {
+                slot.child(Spinner::new().small().color(theme.muted))
+            }),
+    )
+    .accessibility_label({
+        let label = local_host_accessibility_label(&accessible_name);
+        if can_drag {
+            crate::locale::text(
+                format!("{label}，可拖动到分组"),
+                format!("{label}; drag to a group"),
+            )
+        } else {
+            label
+        }
+    })
     .on_click(
         cx.listener(move |navigation, event: &ClickEvent, window, cx| {
             if is_open_gesture(event) {
@@ -2555,7 +3098,7 @@ fn local_profile_row(
             }
         }),
     )
-    .context_menu(move |menu, _, cx| {
+    .context_menu(move |menu, window, cx| {
         let open_entity = entity.clone();
         let open_id = id.clone();
         let mut menu = menu.item(
@@ -2579,7 +3122,7 @@ fn local_profile_row(
                 .icon(gpui_kit::assets::IconName::FolderPlus)
                 .on_click(move |_, _, app| {
                     create_entity.update(app, |navigation, cx| {
-                        navigation.request_create_host(create_group.clone(), cx);
+                        navigation.request_create_host(create_group.clone(), true, cx);
                     });
                 }),
             );
@@ -2615,6 +3158,16 @@ fn local_profile_row(
                     });
                 }),
             );
+            if let Some(host_id) = move_host_id.clone() {
+                menu = append_host_move_menu(
+                    menu,
+                    entity.clone(),
+                    host_id,
+                    move_revision.clone(),
+                    window,
+                    cx,
+                );
+            }
             let delete_entity = entity.clone();
             let delete_id = id.clone();
             menu = menu.item(
@@ -2632,7 +3185,94 @@ fn local_profile_row(
             );
         }
         menu
-    })
+    });
+    if can_drag && let Some(drag) = drag {
+        div()
+            .id(format!("host-navigation-profile-drag-{dom_id}"))
+            .w_full()
+            .on_drag(drag, move |drag, cursor_offset, window, app| {
+                drag_entity.update(app, |navigation, cx| {
+                    navigation.begin_host_drag(drag.clone(), window, cx);
+                });
+                app.new(|_| HostDragPreview {
+                    title: preview_title.clone(),
+                    icon: Icon::new(IconName::SquareTerminal),
+                    cursor_offset,
+                })
+            })
+            .child(row)
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    }
+}
+
+/// 远端和本地主机复用同一移动菜单；条目冻结打开菜单时的 revision，提交时再次校验。
+///
+/// @author kongweiguang
+fn append_host_move_menu(
+    menu: PopupMenu,
+    entity: Entity<HostNavigation>,
+    host_id: HostId,
+    revision: ConfigRevision,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let navigation = entity.read(cx);
+    let current_group = navigation
+        .host_move_snapshot(&host_id)
+        .and_then(|snapshot| snapshot.group_id)
+        .and_then(|group| effective_navigation_group(Some(group), &navigation.groups));
+    if current_group.is_none() && navigation.groups.is_empty() {
+        return menu;
+    }
+    let groups = navigation.groups.clone();
+    let blocked = navigation.pending_host_move.is_some();
+    menu.separator().submenu(
+        crate::locale::text("移动到分组", "Move to group"),
+        window,
+        cx,
+        move |mut submenu, _, _| {
+            if current_group.is_some() {
+                let entity = entity.clone();
+                let id = host_id.clone();
+                let revision = revision.clone();
+                submenu = submenu.item(
+                    PopupMenuItem::new(crate::locale::text("未分组", "Ungrouped"))
+                        .disabled(blocked)
+                        .on_click(move |_, _, app| {
+                            entity.update(app, |navigation, cx| {
+                                navigation.request_move_host(id.clone(), None, revision.clone(), cx)
+                            });
+                        }),
+                );
+            }
+            for group in &groups {
+                if current_group.as_deref() == Some(group.id.as_str()) {
+                    continue;
+                }
+                let entity = entity.clone();
+                let id = host_id.clone();
+                let destination = group.id.clone();
+                let revision = revision.clone();
+                submenu = submenu.item(
+                    PopupMenuItem::new(group.name.clone())
+                        .disabled(blocked)
+                        .on_click(move |_, _, app| {
+                            entity.update(app, |navigation, cx| {
+                                navigation.request_move_host(
+                                    id.clone(),
+                                    Some(destination.clone()),
+                                    revision.clone(),
+                                    cx,
+                                )
+                            });
+                        }),
+                );
+            }
+            submenu
+        },
+    )
 }
 
 /// 分组右键只保留分组 CRUD 动作；目录浏览由左侧导航承载，重命名和删除按稳定 group ID 路由。
@@ -2921,7 +3561,10 @@ fn host_row(
     let endpoint = host_endpoint_label(&host);
     let name = host.name.clone();
     let selected = navigation.selected_host.as_ref() == Some(&host_id);
-    let pending = navigation.pending_host_moves.contains(&host_id);
+    let pending = navigation
+        .pending_host_move
+        .as_ref()
+        .is_some_and(|pending| pending.host_id == host_id);
     let session_status = navigation.session_projection.get(&host_id).copied();
     let readonly = navigation.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
     let groups = navigation.groups.clone();
@@ -2937,6 +3580,17 @@ fn host_row(
     let menu_open_label = open_label.clone();
     let primary_action = primary_host_action(protocol);
     let menu_group_id = current_group.clone();
+    let can_drag = !readonly
+        && navigation.pending_host_move.is_none()
+        && !navigation.loading
+        && navigation.status.is_none();
+    let drag = HostNavigationDrag {
+        source_navigation: cx.entity_id(),
+        host_id: host_id.clone(),
+        revision: host.revision.clone(),
+    };
+    let drag_entity = cx.entity().clone();
+    let preview_title: gpui_kit::SharedString = name.clone().into();
 
     let row = navigation_row_button(
         format!("host-navigation-host-{dom_id}"),
@@ -3002,24 +3656,36 @@ fn host_row(
                     .child(endpoint),
             ),
     )
-    .when(pending, |row| {
-        row.child(
-            div()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(crate::locale::text("移动中", "Moving")),
-        )
-    })
-    .accessibility_label(if menu_actions.show_primary {
-        crate::locale::text(
-            format!("{name}，单击选择，双击或按 Enter {open_label}"),
-            format!("{name}; click to select, double-click or press Enter to {open_label}"),
-        )
-    } else {
-        crate::locale::text(
-            format!("{name}，SFTP 已禁用"),
-            format!("{name}; SFTP is disabled"),
-        )
+    .child(
+        div()
+            .w_4()
+            .flex_shrink_0()
+            .flex()
+            .justify_center()
+            .when(pending, |slot| {
+                slot.child(Spinner::new().small().color(theme.muted))
+            }),
+    )
+    .accessibility_label({
+        let label = if menu_actions.show_primary {
+            crate::locale::text(
+                format!("{name}，单击选择，双击或按 Enter {open_label}"),
+                format!("{name}; click to select, double-click or press Enter to {open_label}"),
+            )
+        } else {
+            crate::locale::text(
+                format!("{name}，SFTP 已禁用"),
+                format!("{name}; SFTP is disabled"),
+            )
+        };
+        if can_drag {
+            crate::locale::text(
+                format!("{label}，可拖动到分组"),
+                format!("{label}; drag to a group"),
+            )
+        } else {
+            label
+        }
     })
     .tooltip(session_status_label(session_status))
     .on_click(
@@ -3094,7 +3760,7 @@ fn host_row(
                 .icon(gpui_kit::assets::IconName::FolderPlus)
                 .on_click(move |_, _, app| {
                     group_entity.update(app, |navigation, cx| {
-                        navigation.request_create_host(group_id.clone(), cx)
+                        navigation.request_create_host(group_id.clone(), true, cx)
                     });
                 }),
             );
@@ -3163,52 +3829,14 @@ fn host_row(
                     }),
                 );
             }
-            if !pending && (current_group.is_some() || !groups.is_empty()) {
-                let move_entity = menu_entity.clone();
-                let move_id = menu_id.clone();
-                let destination_groups = groups.clone();
-                let source_group = current_group.clone();
-                menu = menu.separator().submenu(
-                    crate::locale::text("移动到分组", "Move to group"),
-                    window,
-                    cx,
-                    move |mut submenu, _, _| {
-                        if source_group.is_some() {
-                            let entity = move_entity.clone();
-                            let id = move_id.clone();
-                            submenu = submenu.item(
-                                PopupMenuItem::new(crate::locale::text("未分组", "Ungrouped"))
-                                    .on_click(move |_, _, app| {
-                                        entity.update(app, |navigation, cx| {
-                                            navigation.request_move_host(id.clone(), None, cx)
-                                        });
-                                    }),
-                            );
-                        }
-                        for group in &destination_groups {
-                            if source_group.as_deref() == Some(group.id.as_str()) {
-                                continue;
-                            }
-                            let entity = move_entity.clone();
-                            let id = move_id.clone();
-                            let destination = group.id.clone();
-                            let label = group.name.clone();
-                            submenu = submenu.item(PopupMenuItem::new(label).on_click(
-                                move |_, _, app| {
-                                    entity.update(app, |navigation, cx| {
-                                        navigation.request_move_host(
-                                            id.clone(),
-                                            Some(destination.clone()),
-                                            cx,
-                                        )
-                                    });
-                                },
-                            ));
-                        }
-                        submenu
-                    },
-                );
-            }
+            menu = append_host_move_menu(
+                menu,
+                menu_entity.clone(),
+                menu_id.clone(),
+                host.revision.clone(),
+                window,
+                cx,
+            );
             let delete_entity = menu_entity.clone();
             let delete_id = menu_id.clone();
             menu = menu.separator().item(
@@ -3228,10 +3856,30 @@ fn host_row(
         }
         menu
     });
-    row.into_any_element()
+    if can_drag {
+        div()
+            .id(format!("host-navigation-host-drag-{dom_id}"))
+            .w_full()
+            .on_drag(drag, move |drag, cursor_offset, window, app| {
+                drag_entity.update(app, |navigation, cx| {
+                    navigation.begin_host_drag(drag.clone(), window, cx);
+                });
+                app.new(|_| HostDragPreview {
+                    title: preview_title.clone(),
+                    icon: protocol_icon(protocol),
+                    cursor_offset,
+                })
+            })
+            .child(row)
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    }
 }
 
 /// 统一连接与本地主机的空目录提示，并与搜索无匹配状态区分，避免误报为加载失败。
+/// 空状态只回答“现在能做什么”：标题给出状态，底部一行提示入口位置；
+/// 安全说明属于设置页内容，不在空列表里重复占位。
 /// @author kongweiguang
 fn empty_state(is_first_empty: bool, read_only: bool, theme: ThemeTokens) -> impl IntoElement {
     div()
@@ -3259,9 +3907,9 @@ fn empty_state(is_first_empty: bool, read_only: bool, theme: ThemeTokens) -> imp
                 .text_size(theme.text_sm)
                 .font_weight(gpui_kit::FontWeight::MEDIUM)
                 .child(if is_first_empty {
-                    crate::locale::text("还没有主机", "No hosts yet")
+                    crate::locale::text("还没有连接", "No connections yet")
                 } else {
-                    crate::locale::text("没有匹配的主机", "No matching hosts")
+                    crate::locale::text("没有匹配的连接", "No matching connections")
                 }),
         )
         .when(is_first_empty, |empty| {
@@ -3269,30 +3917,42 @@ fn empty_state(is_first_empty: bool, read_only: bool, theme: ThemeTokens) -> imp
                 div()
                     .text_size(theme.text_xs)
                     .text_color(theme.subtle)
-                    .child(crate::locale::text(
-                        "连接信息会安全保存在此设备。",
-                        "Saved connections stay on this device.",
-                    )),
-            )
-        })
-        .when(is_first_empty, |empty| {
-            empty.child(
-                div()
-                    .text_size(theme.text_xs)
-                    .text_color(theme.subtle)
+                    .text_center()
                     .child(if read_only {
-                        crate::locale::text(
-                            "配置处于只读恢复模式。",
-                            "Configuration is read-only during recovery.",
-                        )
+                        crate::locale::text("配置处于只读恢复模式。", "Configuration is read-only.")
                     } else {
-                        crate::locale::text(
-                            "使用底部 + 添加连接或本地主机。",
-                            "Use + below to add a connection or local host.",
-                        )
+                        crate::locale::text("用底部 + 添加连接。", "Add one with + below.")
                     }),
             )
         })
+}
+
+/// 指针命中主机树上下边缘时按比例推进；这些是实测命中容差与计时步长，不是产品间距。
+///
+/// @author kongweiguang
+fn next_host_drag_scroll_offset(
+    pointer: Point<Pixels>,
+    viewport: Bounds<Pixels>,
+    current_offset: Point<Pixels>,
+    max_offset: Point<Pixels>,
+) -> Option<Point<Pixels>> {
+    const EDGE_ZONE: f32 = 28.;
+    const MAX_STEP: f32 = 8.;
+    if !viewport.contains(&pointer) {
+        return None;
+    }
+    let distance_from_top = (pointer.y - viewport.top()).as_f32();
+    let distance_from_bottom = (viewport.bottom() - pointer.y).as_f32();
+    let mut next = current_offset;
+    if (0.0..EDGE_ZONE).contains(&distance_from_top) {
+        next.y += px(MAX_STEP * (1.0 - distance_from_top / EDGE_ZONE));
+    } else if (0.0..EDGE_ZONE).contains(&distance_from_bottom) {
+        next.y -= px(MAX_STEP * (1.0 - distance_from_bottom / EDGE_ZONE));
+    } else {
+        return None;
+    }
+    next.y = next.y.clamp(-max_offset.y, px(0.));
+    (next != current_offset).then_some(next)
 }
 
 /// SSH 使用 Kit 完整图标集中的服务器图标，Telnet 则保留终端语义。
@@ -3303,6 +3963,52 @@ fn protocol_icon(protocol: RemoteProtocol) -> Icon {
         RemoteProtocol::Sftp => Icon::new(IconName::FolderOpen),
         RemoteProtocol::Serial => Icon::new(IconName::Network),
         RemoteProtocol::Rdp => Icon::new(IconName::WindowMaximize),
+    }
+}
+
+/// 紧凑预览只显示主机身份；主题在每帧读取，抵消抓取偏移避免遮住落点。
+///
+/// @author kongweiguang
+struct HostDragPreview {
+    title: gpui_kit::SharedString,
+    icon: Icon,
+    cursor_offset: Point<Pixels>,
+}
+
+impl Render for HostDragPreview {
+    /// 根布局忽略自身相对定位，因此在子节点抵消整行抓取偏移。
+    ///
+    /// @author kongweiguang
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = ThemeTokens::current(window, cx).for_workbench();
+        div().child(
+            div()
+                .relative()
+                .left(self.cursor_offset.x)
+                .top(self.cursor_offset.y)
+                .debug_selector(|| "host-navigation-drag-preview".into())
+                .ml_3()
+                .mt_3()
+                .px_3()
+                .py_2()
+                .max_w(gpui_kit::rems(16.0))
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.panel)
+                .text_color(theme.foreground)
+                .child(self.icon.clone().size_4())
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .whitespace_nowrap()
+                        .child(self.title.clone()),
+                ),
+        )
     }
 }
 
@@ -3382,6 +4088,7 @@ impl Drop for HostNavigation {
     /// 关闭左栏时停止仅属于此面板的配置事件等待任务。
     fn drop(&mut self) {
         self.configuration_watch_cancellation.cancel();
+        self.host_drag_task = None;
     }
 }
 
@@ -3399,3 +4106,7 @@ fn merge_session_status(left: HostSessionStatus, right: HostSessionStatus) -> Ho
 #[cfg(test)]
 #[path = "../../../tests/unit/host_navigation.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/host_navigation_drag.rs"]
+mod drag_tests;

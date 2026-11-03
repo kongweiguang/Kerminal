@@ -33,6 +33,53 @@ pub(crate) const WM_GPUI_TRACK_SYSTEM_MENU: u32 = WM_USER + 11;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 
+/// 合并一次绘制前的原生尺寸事件，并在最小化或设备恢复期间阻止旧尺寸帧呈现。
+#[derive(Default)]
+pub(crate) struct PendingWindowResize {
+    size: Cell<Option<Size<DevicePixels>>>,
+    minimized: Cell<bool>,
+    recovery_pending: Cell<bool>,
+}
+
+impl PendingWindowResize {
+    /// 用最后一次物理尺寸覆盖中间值，避免同一帧重复重建 DXGI 资源。
+    pub(crate) fn queue(&self, size: Size<DevicePixels>) {
+        self.size.set(Some(size));
+    }
+
+    /// 最小化期间保留待处理尺寸，但不绘制或占用渲染资源。
+    fn set_minimized(&self, minimized: bool) {
+        self.minimized.set(minimized);
+    }
+
+    /// 只在窗口可绘制且设备可用时取走最新尺寸，未消费的请求仍可被新事件覆盖。
+    fn take_ready(&self) -> Option<Size<DevicePixels>> {
+        if self.minimized.get() || self.recovery_pending.get() {
+            None
+        } else {
+            self.size.take()
+        }
+    }
+
+    /// 缩放失败后保留最新请求并等待设备重建，避免对缺失的渲染目标继续绘制。
+    fn failed(&self, attempted: Size<DevicePixels>) {
+        if self.size.get().is_none() {
+            self.size.set(Some(attempted));
+        }
+        self.recovery_pending.set(true);
+    }
+
+    /// 设备重建后允许下一帧提交仍然待处理的尺寸。
+    fn recovered(&self) {
+        self.recovery_pending.set(false);
+    }
+
+    /// 防止尺寸事件在绘制重入时让旧尺寸场景出现在新尺寸窗口中。
+    pub(crate) fn may_present(&self) -> bool {
+        !self.minimized.get() && !self.recovery_pending.get() && self.size.get().is_none()
+    }
+}
+
 /// 只在原生拖拽空白区打开系统菜单，避免禁用的最大化/最小化控件因复用 HTCAPTION 而误触。
 ///
 /// @author kongweiguang
@@ -439,17 +486,16 @@ impl WindowsWindowInner {
         Some(0)
     }
 
+    /// 记录最新客户区尺寸，最小化时暂停绘制，恢复时由下一帧统一更新交换链。
+    ///
+    /// @author kongweiguang
     fn handle_size_msg(self: &Rc<Self>, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         // Minimizing and restoring both arrive as `WM_SIZE`; the deferred report
         // reads `IsIconic` at delivery, so one call covers both directions.
         self.report_visibility();
 
-        // Don't resize the renderer when the window is minimized, but record that it was minimized so
-        // that on restore the swap chain can be recreated via `update_drawable_size_even_if_unchanged`.
         if wparam.0 == SIZE_MINIMIZED as usize {
-            self.state
-                .restore_from_minimized
-                .set(self.state.callbacks.request_frame.take());
+            self.state.pending_resize.set_minimized(true);
             return Some(0);
         }
 
@@ -458,41 +504,19 @@ impl WindowsWindowInner {
         let new_size = size(DevicePixels(width), DevicePixels(height));
 
         let scale_factor = self.state.scale_factor.get();
-        let mut should_resize_renderer = false;
-        if let Some(restore_from_minimized) = self.state.restore_from_minimized.take() {
-            self.state
-                .callbacks
-                .request_frame
-                .set(Some(restore_from_minimized));
-        } else {
-            should_resize_renderer = true;
-        }
-
-        self.handle_size_change(new_size, scale_factor, should_resize_renderer);
+        self.state.pending_resize.set_minimized(false);
+        self.handle_size_change(new_size, scale_factor);
         Some(0)
     }
 
-    fn handle_size_change(
-        &self,
-        device_size: Size<DevicePixels>,
-        scale_factor: f32,
-        should_resize_renderer: bool,
-    ) {
+    /// 即时更新平台几何，延迟昂贵的 GPU 调整与 GPUI 通知以合并同一帧的尺寸变化。
+    ///
+    /// @author kongweiguang
+    fn handle_size_change(&self, device_size: Size<DevicePixels>, scale_factor: f32) {
         let new_logical_size = device_size.to_pixels(scale_factor);
 
         self.state.logical_size.set(new_logical_size);
-        if should_resize_renderer
-            && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
-        {
-            log::error!("Failed to resize renderer, invalidating devices: {}", e);
-            self.state
-                .invalidate_devices
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        if let Some(mut callback) = self.state.callbacks.resize.take() {
-            callback(new_logical_size, scale_factor);
-            self.state.callbacks.resize.set(Some(callback));
-        }
+        self.state.pending_resize.queue(device_size);
     }
 
     fn handle_size_move_loop(&self, handle: HWND) -> Option<isize> {
@@ -1321,7 +1345,7 @@ impl WindowsWindowInner {
                 // SetWindowPos may not send WM_SIZE for maximized windows in some cases,
                 // so we manually update the size to ensure proper rendering
                 let device_size = size(DevicePixels(width), DevicePixels(height));
-                self.handle_size_change(device_size, new_scale_factor, true);
+                self.handle_size_change(device_size, new_scale_factor);
             }
         } else {
             // For non-maximized windows, use the suggested RECT from the system
@@ -1746,6 +1770,9 @@ impl WindowsWindowInner {
             .detach();
     }
 
+    /// 重建设备后恢复尺寸队列，确保失败前最后一次尺寸在强制帧中重新提交。
+    ///
+    /// @author kongweiguang
     fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
         let devices = lparam.0 as *const DirectXDevices;
         let devices = unsafe { &*devices };
@@ -1757,6 +1784,7 @@ impl WindowsWindowInner {
         {
             panic!("Device lost: {err}");
         }
+        self.state.pending_resize.recovered();
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
         // between) is treated as a forced render so it both clears
@@ -1770,6 +1798,9 @@ impl WindowsWindowInner {
         None
     }
 
+    /// 绘制前只提交最新尺寸；设备失败或尺寸重入时跳过旧帧并交由下一次帧唤醒重试。
+    ///
+    /// @author kongweiguang
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
         let Some(_guard) = self.state.draw_coordinator.try_begin_draw() else {
@@ -1800,7 +1831,30 @@ impl WindowsWindowInner {
             }
         }
 
-        let force_render = force_render || self.state.force_render_pending.take();
+        if let Some(device_size) = self.state.pending_resize.take_ready() {
+            let result = self.state.renderer.borrow_mut().resize(device_size);
+            if let Err(error) = result {
+                log::error!("Failed to resize renderer, invalidating devices: {error}");
+                self.state.pending_resize.failed(device_size);
+                self.state.invalidate_devices.store(true, Ordering::Release);
+            } else if self.state.pending_resize.may_present() {
+                if let Some(mut callback) = self.state.callbacks.resize.take() {
+                    callback(self.state.logical_size.get(), self.state.scale_factor.get());
+                    self.state.callbacks.resize.set(Some(callback));
+                }
+            }
+        }
+
+        if !self.state.pending_resize.may_present() {
+            if force_render {
+                self.state.force_render_pending.set(true);
+            }
+            self.state.callbacks.request_frame.set(Some(request_frame));
+            unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+            return Some(0);
+        }
+
+        let force_render = self.state.force_render_pending.take() || force_render;
         if force_render {
             // Re-enable drawing after a device loss recovery. The forced render
             // will rebuild the scene with fresh atlas textures.
@@ -2266,6 +2320,10 @@ fn notify_frame_changed(handle: HWND) {
         .log_err();
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/window_resize.rs"]
+mod window_resize_tests;
 
 #[cfg(test)]
 mod tests {

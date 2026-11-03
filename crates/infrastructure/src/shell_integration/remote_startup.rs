@@ -26,6 +26,10 @@ mod tests;
 #[path = "../../tests/unit/remote_startup_pty.rs"]
 mod pty_tests;
 
+#[cfg(all(test, windows))]
+#[path = "../../tests/unit/remote_startup_wsl.rs"]
+mod wsl_tests;
+
 /// 交互 shell 的 exec 启动脚本；PTY 输入通道不再承载启动脚本或初始 cwd。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RemoteInteractiveStartup {

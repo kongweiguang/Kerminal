@@ -12,7 +12,7 @@ const INITIAL_CWD: &str = "C:\\Windows";
 const INITIAL_ARG: &str = "/Q";
 const INITIAL_ENV: &str = "K_SETTINGS_ACCEPTANCE=template";
 
-/// 所有写入都经过生产控件，仓储与加密环境读回只用于验证结果。
+/// 从主机表单直接进入 Profile 设置并返回草稿，所有写入仍通过生产控件后再读回。
 ///
 /// @author kongweiguang
 pub(super) async fn verify(
@@ -77,6 +77,32 @@ pub(super) async fn verify(
         HOST_NAME,
     )
     .await?;
+    reveal_local_control(
+        cx,
+        root,
+        window,
+        LocalControl::Selector("connections-local-profile-edit"),
+    )
+    .await?;
+    click_selector(cx, window, "connections-local-profile-edit")?;
+    wait_for_state(cx, root, window, Instant::now() + ACTION_TIMEOUT, |state| {
+        state.modal_open() && state.page_id() == "profiles"
+    })
+    .await?;
+    click_selector(cx, window, "preferences-close")?;
+    wait_for_state(cx, root, window, Instant::now() + ACTION_TIMEOUT, |state| {
+        !state.modal_open()
+    })
+    .await?;
+    wait_connections_modal(cx, root, window, true).await?;
+    reveal_local_control(
+        cx,
+        root,
+        window,
+        LocalControl::Label("本地主机名称", "Local host name"),
+    )
+    .await?;
+    wait_input_value(cx, window, "本地主机名称", "Local host name", HOST_NAME).await?;
     // 先输入不同 Shell，再选择模板；若菜单未真正执行，后续 cmd.exe 回读必然失败。
     fill_local_input(
         cx,
@@ -91,10 +117,10 @@ pub(super) async fn verify(
         cx,
         root,
         window,
-        LocalControl::Selector("connections-local-shell-picker"),
+        LocalControl::Selector("connections-local-profile-picker"),
     )
     .await?;
-    select_menu_item(cx, window, "connections-local-shell-picker", PROFILE_NAME).await?;
+    select_menu_item(cx, window, "connections-local-profile-picker", PROFILE_NAME).await?;
     reveal_local_control(
         cx,
         root,

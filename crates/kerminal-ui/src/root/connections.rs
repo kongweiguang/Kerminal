@@ -623,7 +623,7 @@ impl RootView {
     }
 }
 
-/// 将连接动作和原生文件选择器交给唯一 Root owner；选择器回执仍受编辑器代次约束。
+/// Root 统一处理连接动作、配置导航和文件选择；选择器回执仍受编辑器代次约束。
 ///
 /// 返回值供 Root 事件桥维持既有分发契约；迟到共享打开会被拒绝，独立传输成功可在后台落 Tab。
 ///
@@ -635,6 +635,18 @@ pub(super) fn handle_connections_event(
     cx: &mut Context<RootView>,
 ) -> bool {
     match event {
+        ConnectionsEvent::OpenProfileSettings => {
+            if root.connections_modal_open
+                && !root.connection_prompt_modal_open
+                && root.root_confirmation_owner.is_none()
+                && !root.preferences_modal_open
+            {
+                root.open_preferences_surface(window, cx);
+                root.preferences_panel
+                    .update(cx, |panel, cx| panel.show_profiles(cx));
+            }
+            true
+        }
         ConnectionsEvent::PickHostFile { generation, target } => {
             let Some(panel) = root.connections_panel.clone() else {
                 return true;
@@ -2163,9 +2175,12 @@ pub(super) fn handle_host_navigation_event(
         HostNavigationEvent::DeleteHostRequested { host_id } => {
             panel.request_delete_host(host_id, cx)
         }
-        HostNavigationEvent::CreateHostRequested { group_id } => {
-            if let Some(group_id) = group_id {
-                panel.create_host_in_group(group_id, window, cx)
+        HostNavigationEvent::CreateHostRequested {
+            group_id,
+            group_explicit,
+        } => {
+            if *group_explicit {
+                panel.begin_create_host_in_group(group_id.as_deref(), window, cx)
             } else {
                 panel.begin_create_host(window, cx)
             }

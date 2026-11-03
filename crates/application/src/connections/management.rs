@@ -594,6 +594,18 @@ pub trait HostManagementRepository: Send + Sync + 'static {
         expected_revision: Option<ConfigRevision>,
     ) -> AppResult<ManagedHost>;
 
+    /// 仅修改既有主机的分组归属；不经过草稿、凭据或本地环境明文。
+    ///
+    /// @author kongweiguang
+    async fn move_host_to_group(
+        &self,
+        _host_id: HostId,
+        _group_id: Option<String>,
+        _expected_revision: ConfigRevision,
+    ) -> AppResult<()> {
+        Err(AppError::unsupported("主机分组移动不可用"))
+    }
+
     /// 以已确认 revision 删除单份 host 文件；未知提交结果必须作为 OutcomeUnknown 返回。
     async fn delete_host(
         &self,
@@ -777,6 +789,20 @@ impl HostManagementService {
 
         self.repository
             .save_host(host_id, draft, expected_revision)
+            .await
+    }
+
+    /// 只把已存在的远端或本地主机移到指定分组；None 表示未分组，最终 CAS 由仓储保证。
+    ///
+    /// @author kongweiguang
+    pub async fn move_host_to_group(
+        &self,
+        host_id: HostId,
+        group_id: Option<String>,
+        expected_revision: ConfigRevision,
+    ) -> AppResult<()> {
+        self.repository
+            .move_host_to_group(host_id, group_id, expected_revision)
             .await
     }
 

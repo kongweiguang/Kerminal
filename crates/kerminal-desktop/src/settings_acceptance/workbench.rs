@@ -29,6 +29,7 @@ const WORKBENCH_HOST_NAME: &str = "Acceptance Host Details";
 const WORKBENCH_UNGROUPED_HOST_ID: &str = "acceptance-ungrouped-host";
 const WORKBENCH_SFTP_HOST_ID: &str = "acceptance-sftp-host";
 const WORKBENCH_GROUP_ID: &str = "acceptance-pinned-group";
+const WORKBENCH_DROP_GROUP_ID: &str = "acceptance-drop-group";
 
 #[path = "workbench_sidebar_menus.rs"]
 mod sidebar_menus;
@@ -220,7 +221,8 @@ async fn prepare_fixture(
         .clone()
         .ok_or_else(|| io::Error::other("host management service is unavailable"))?;
     let group_service = host_service.clone();
-    services
+    let drop_group_service = host_service.clone();
+    let groups = services
         .executor
         .clone()
         .run(move |_| async move {
@@ -231,6 +233,22 @@ async fn prepare_fixture(
                         id: Some(WORKBENCH_GROUP_ID.to_owned()),
                         name: "默认分组".to_owned(),
                         sort_order: -1,
+                    },
+                    groups.revision,
+                )
+                .await
+        })
+        .await?;
+    services
+        .executor
+        .clone()
+        .run(move |_| async move {
+            drop_group_service
+                .save_group(
+                    HostGroupDraft {
+                        id: Some(WORKBENCH_DROP_GROUP_ID.to_owned()),
+                        name: "目标分组".to_owned(),
+                        sort_order: 10,
                     },
                     groups.revision,
                 )
@@ -1173,7 +1191,9 @@ async fn capture_sidebar_themes(
             output_directory.join(format!("sidebar-{name}.png")),
         )?;
         sidebar_menus::capture(cx, window, output_directory, name).await?;
+        sidebar_menus::capture_drag(cx, window, services, output_directory, name).await?;
     }
+    sidebar_menus::capture_drag_overflow(cx, window, services, output_directory).await?;
     Ok(())
 }
 

@@ -19,11 +19,11 @@ use super::{
     GroupNavigationItem, HostContextMenuActions, HostNavigationEvent, HostPrimaryAction,
     SavedNavigationTarget, all_groups_are_collapsed, apply_saved_navigation_target, filtered_hosts,
     filtered_profiles, group_navigation_items, group_sort_order_after_pin,
-    host_context_menu_actions, host_draft_for_group, host_group_accessibility_label,
-    host_navigation_layout_metrics, is_group_pinned, is_open_gesture,
-    local_host_accessibility_label, merge_session_status, navigation_group_ids,
-    pinned_container_matches_query, primary_host_action, profile_group_is_ungrouped,
-    should_render_saved_group_header, split_target_hosts, unique_default_profile_name,
+    host_context_menu_actions, host_group_accessibility_label, host_navigation_layout_metrics,
+    is_group_pinned, is_open_gesture, local_host_accessibility_label, merge_session_status,
+    navigation_group_ids, pinned_container_matches_query, primary_host_action,
+    profile_group_is_ungrouped, should_render_saved_group_header, split_target_hosts,
+    unique_default_profile_name,
 };
 use crate::features::connections::HostSessionStatus;
 
@@ -285,35 +285,33 @@ fn group_pin_order_uses_legacy_negative_sort_order_without_extra_schema() {
     assert_eq!(group_sort_order_after_pin(&groups, "missing", true), None);
 }
 
-/// 全部折叠入口覆盖保存组及未分组条目，空目录与部分折叠状态按明确规则处理。
+/// 全部折叠入口只覆盖已保存分组；未分组主机直接挂在目录根层，没有可折叠的目录行。
 /// @author kongweiguang
 #[test]
-fn global_group_toggle_projects_saved_and_ungrouped_sections() {
-    let hosts = vec![
-        host("Known", "known.example", Some("group:prod"), false, &[]),
-        host("Loose", "loose.example", None, false, &[]),
-        host(
-            "Orphan",
-            "orphan.example",
-            Some("group:deleted"),
-            false,
-            &[],
-        ),
+fn global_group_toggle_projects_saved_groups_only() {
+    let groups = vec![
+        HostGroup {
+            id: "group:prod".to_owned(),
+            name: "Production".to_owned(),
+            sort_order: 0,
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        },
+        HostGroup {
+            id: "group:dev".to_owned(),
+            name: "Development".to_owned(),
+            sort_order: 10,
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        },
     ];
-    let profiles = vec![profile("local", None)];
-    let groups = vec![HostGroup {
-        id: "group:prod".to_owned(),
-        name: "Production".to_owned(),
-        sort_order: 0,
-        created_at: "1".to_owned(),
-        updated_at: "1".to_owned(),
-    }];
-    let ids = navigation_group_ids(&hosts, &profiles, &groups);
+    let ids = navigation_group_ids(&groups);
 
     assert_eq!(
         ids.iter().map(String::as_str).collect::<Vec<_>>(),
-        vec!["group:prod", "__ungrouped"]
+        vec!["group:prod", "group:dev"]
     );
+    assert!(navigation_group_ids(&[]).is_empty());
     assert!(!all_groups_are_collapsed(&[], &Default::default()));
     assert!(!all_groups_are_collapsed(&ids, &Default::default()));
     assert!(all_groups_are_collapsed(
@@ -680,39 +678,6 @@ fn split_target_filter_excludes_file_and_remote_desktop_hosts() {
         host.protocol,
         RemoteProtocol::Ssh | RemoteProtocol::Telnet | RemoteProtocol::Serial
     )));
-}
-
-/// 分组移动只替换 group ID，所有连接、认证引用和协议默认值都沿用同一份草稿。
-#[test]
-fn moving_host_preserves_the_complete_connection_draft() {
-    let mut original = host(
-        "Build",
-        "ci.internal",
-        Some("group:old"),
-        true,
-        &["staging"],
-    );
-    original.endpoint.username = "deploy".to_owned();
-    original.connect_timeout_ms = 45_000;
-    original.keepalive_interval_ms = Some(15_000);
-
-    let moved = host_draft_for_group(&original, Some("group:new".to_owned()));
-
-    assert_eq!(moved.id.as_ref(), Some(&original.id));
-    assert_eq!(moved.group_id.as_deref(), Some("group:new"));
-    assert_eq!(moved.name, original.name);
-    assert_eq!(moved.protocol, original.protocol);
-    assert_eq!(moved.endpoint, original.endpoint);
-    assert_eq!(moved.authentication, original.authentication);
-    assert_eq!(moved.rdp_password, original.rdp_password);
-    assert_eq!(moved.route, original.route);
-    assert_eq!(moved.tags, original.tags);
-    assert_eq!(moved.is_favorite, original.is_favorite);
-    assert_eq!(moved.connect_timeout_ms, original.connect_timeout_ms);
-    assert_eq!(moved.keepalive_interval_ms, original.keepalive_interval_ms);
-    assert_eq!(moved.terminal_options, original.terminal_options);
-    assert_eq!(moved.sftp_options, original.sftp_options);
-    assert_eq!(moved.rdp_display, original.rdp_display);
 }
 
 /// 汇总多个同主机会话时 Ready 优先，其次保留 Opening，避免失败 pane 遮住可用连接。

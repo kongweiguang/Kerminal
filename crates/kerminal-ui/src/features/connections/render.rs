@@ -703,7 +703,7 @@ fn deletion_confirmation_overlay(
         .into_any_element()
 }
 
-/// 删除分组前显示受影响主机数，并要求用户明确选择目标分组或未分组。
+/// 删除分组只确认一次；组内主机由后端在同一事务中统一归入未分组，界面不再提供迁移目标。
 fn render_group_deletion_confirmation(
     panel: &mut ConnectionsPanel,
     theme: ThemeTokens,
@@ -725,7 +725,16 @@ fn render_group_deletion_confirmation(
         .iter()
         .filter(|host| host.group_id.as_deref() == Some(pending.group_id.as_str()))
         .count();
-    let mut card = div()
+    let consequence = if affected == 0 {
+        crate::locale::text("分组内没有主机。", "This group has no hosts.").to_string()
+    } else {
+        crate::locale::text(
+            format!("组内 {affected} 台主机将归入未分组。"),
+            format!("{affected} hosts in this group will become ungrouped."),
+        )
+        .to_string()
+    };
+    let card = div()
         .id("connections-delete-group-confirmation")
         .w_full()
         .p_5()
@@ -737,72 +746,43 @@ fn render_group_deletion_confirmation(
                 .text_size(theme.text_body)
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .child(crate::locale::text(
-                    format!("删除“{group_name}”并迁移 {affected} 台主机？"),
-                    format!("Delete “{group_name}” and move {affected} hosts?"),
+                    format!("删除分组“{group_name}”？"),
+                    format!("Delete group “{group_name}”?"),
                 )),
         )
         .child(
             div()
                 .text_size(theme.text_xs)
                 .text_color(theme.muted)
-                .child(crate::locale::text(
-                    "主机归属与分组删除在一个配置事务中提交。",
-                    "Host reassignment and group deletion are committed in one configuration transaction.",
-                )),
-        );
-    let mut destinations = div().flex().flex_col().gap_2();
-    for destination in panel
-        .groups
-        .iter()
-        .filter(|candidate| candidate.id != pending.group_id)
-        .cloned()
-        .collect::<Vec<_>>()
-    {
-        let id = destination.id.clone();
-        destinations = destinations.child(
-            Button::new(format!("connections-delete-group-move-{}", id))
-                .compact()
+                .child(consequence),
+        )
+        .child(
+            div()
                 .w_full()
-                .label(crate::locale::text(
-                    format!("迁移到 {} 并删除", destination.name),
-                    format!("Move to {} and delete", destination.name),
-                ))
-                .disabled(panel.configuration_mutation_busy)
-                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                    panel.confirm_group_deletion(Some(id.clone()), cx)
-                })),
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("connections-delete-group-cancel")
+                        .compact()
+                        .ghost()
+                        .label(crate::locale::text("取消", "Cancel"))
+                        .disabled(panel.configuration_mutation_busy)
+                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                            panel.cancel_group_deletion(cx)
+                        })),
+                )
+                .child(
+                    Button::new("connections-delete-group-confirm")
+                        .compact()
+                        .danger()
+                        .label(crate::locale::text("删除", "Delete"))
+                        .disabled(panel.configuration_mutation_busy)
+                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                            panel.confirm_group_deletion(cx)
+                        })),
+                ),
         );
-    }
-    card = card.child(destinations).child(
-        div()
-            .w_full()
-            .flex()
-            .justify_end()
-            .gap_2()
-            .child(
-                Button::new("connections-delete-group-cancel")
-                    .compact()
-                    .ghost()
-                    .label(crate::locale::text("取消", "Cancel"))
-                    .disabled(panel.configuration_mutation_busy)
-                    .on_click(
-                        cx.listener(|panel, _: &ClickEvent, _, cx| panel.cancel_group_deletion(cx)),
-                    ),
-            )
-            .child(
-                Button::new("connections-delete-group-ungroup")
-                    .compact()
-                    .danger()
-                    .label(crate::locale::text(
-                        "迁移到未分组并删除",
-                        "Move to ungrouped and delete",
-                    ))
-                    .disabled(panel.configuration_mutation_busy)
-                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                        panel.confirm_group_deletion(None, cx)
-                    })),
-            ),
-    );
     deletion_confirmation_overlay(
         "connections-delete-group-overlay",
         "rr-connections-delete-group-card",

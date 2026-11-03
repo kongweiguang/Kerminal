@@ -7,6 +7,7 @@ use std::{
     path::Path,
 };
 
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{AppError, AppResult};
@@ -66,6 +67,12 @@ impl LocalShellCandidate {
     /// 以稳定标识匹配 UI 当前选择，避免安装路径变化导致候选项身份漂移。
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// 首次初始化与重新扫描共用持久化 ID；安装路径变化或用户改名都不会另建一份模板。
+    /// @author kongweiguang
+    pub fn standard_profile_id(&self) -> String {
+        format!("standard-{:x}", Sha256::digest(self.id.as_bytes()))
     }
 
     /// 返回适合列表展示的本地化候选名称，不把 executable 路径当作标题。

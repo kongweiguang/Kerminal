@@ -21,7 +21,9 @@ use crate::{
 };
 
 pub mod color_sampler;
+mod profile_scan;
 pub mod settings;
+pub use profile_scan::{ProfileScanConflict, ProfileScanReport};
 pub use settings::{
     AgentLauncherSettings, AppColorScheme, BackgroundFit, CustomAgentDefinition,
     DesktopNotificationSettings, ExternalLaunchSettings, ExternalLaunchToolSetting,

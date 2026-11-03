@@ -6,7 +6,7 @@ use gpui_kit::{
     ClickEvent, Context, IntoElement, StatefulInteractiveElement, Window,
     assets::IconName,
     component::{
-        Disableable,
+        Disableable, Selectable,
         button::{Button, ButtonVariants},
         input::{Input, Textarea},
     },
@@ -14,20 +14,23 @@ use gpui_kit::{
     prelude::*,
     px,
 };
+use kerminal_application::preferences::VersionedProfile;
 
 use crate::theme::ThemeTokens;
 
 use super::{ProfileDraft, panel::PreferencesPanel, render::settings_error_banner};
 
+#[path = "render_profiles/review.rs"]
+mod review;
+
 impl PreferencesPanel {
-    /// Profile 列表选中态采用中性次级表面，避免与保存等主操作争夺视觉层级。
-    /// 悬停由 Kit 按钮内部管理，不能在外层重复安装 GPUI hover 样式。
+    /// 把列表操作、当前项命令和编辑内容分开，保留原表单身份与读写门禁。
     ///
     /// @author kongweiguang
     pub(super) fn render_profiles(
         &mut self,
         theme: ThemeTokens,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let readonly =
@@ -45,38 +48,24 @@ impl PreferencesPanel {
             .profile_draft
             .as_ref()
             .is_some_and(|draft| draft.status() == super::DraftStatus::OutcomeUnknown);
-        let controls_locked =
-            saving || operation_running || outcome_unknown || self.loading_profiles;
+        let controls_locked = saving
+            || operation_running
+            || outcome_unknown
+            || self.loading_profiles
+            || self.profile_scan.requires_readback;
         let form_locked = readonly || controls_locked || draft.is_none();
         let selected_id = self.selected_profile_id.clone();
         let rows = self.profile_rows.iter().map(|row| {
             let id = row.profile.id.clone();
-            let selected = selected_id.as_deref() == Some(id.as_str());
-            let label = if row.profile.is_default {
-                crate::locale::text(
-                    format!("{}  ·  默认", row.profile.name),
-                    format!("{}  ·  Default", row.profile.name),
-                )
-            } else {
-                row.profile.name.clone().into()
-            };
-            let mut button = Button::new(format!("profile-select-{}", row.profile.id))
-                .w_full()
-                .compact()
-                .label(label)
-                .disabled(controls_locked)
-                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
-                    panel.request_profile_selection(Some(id.clone()), window, cx);
-                }));
-            if selected {
-                button = button
-                    .secondary()
-                    .bg(theme.secondary)
-                    .text_color(theme.foreground);
-            } else {
-                button = button.ghost().text_color(theme.foreground);
-            }
-            div().w_full().child(button)
+            profile_list_item(
+                row,
+                selected_id.as_deref() == Some(id.as_str()),
+                controls_locked,
+                theme,
+            )
+            .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                panel.request_profile_selection(Some(id.clone()), window, cx);
+            }))
         });
         let can_delete = self.selected_profile_id.is_some()
             && self
@@ -90,56 +79,41 @@ impl PreferencesPanel {
                 .is_some_and(|draft| !draft.is_dirty())
             && !readonly;
         let actions = div()
-            .w_full()
             .flex()
             .flex_wrap()
             .items_center()
-            .gap_2()
-            .child(
-                Button::new("profile-save")
-                    .compact()
-                    .primary()
-                    .label(if saving {
-                        crate::locale::text("保存中…", "Saving…")
-                    } else {
-                        crate::locale::text("保存", "Save")
+            .gap_1()
+            .when(self.selected_profile_id.is_some(), |actions| {
+                actions
+                    .when(!self.selected_profile_is_default, |actions| {
+                        actions.child(
+                            Button::new("profile-set-default")
+                                .compact()
+                                .ghost()
+                                .label(crate::locale::text("设为默认", "Set as default"))
+                                .disabled(readonly || controls_locked)
+                                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                    panel.set_default_profile(cx)
+                                })),
+                        )
                     })
-                    .disabled(form_locked || !self.profile_input_errors.is_empty())
-                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| panel.save_profile(cx))),
-            )
-            .child(
-                Button::new("profile-set-default")
-                    .compact()
-                    .label(if self.selected_profile_is_default {
-                        crate::locale::text("当前默认", "Current default")
-                    } else {
-                        crate::locale::text("设为默认", "Set as default")
-                    })
-                    .disabled(
-                        readonly
-                            || controls_locked
-                            || self.selected_profile_id.is_none()
-                            || self.selected_profile_is_default,
+                    .child(
+                        Button::new("profile-delete")
+                            .compact()
+                            .ghost()
+                            .label(crate::locale::text("删除…", "Delete…"))
+                            .disabled(!can_delete)
+                            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                panel.request_delete_profile(cx)
+                            })),
                     )
-                    .on_click(
-                        cx.listener(|panel, _: &ClickEvent, _, cx| panel.set_default_profile(cx)),
-                    ),
-            )
-            .child(
-                Button::new("profile-delete")
-                    .compact()
-                    .label(crate::locale::text("删除", "Delete"))
-                    .disabled(!can_delete)
-                    .on_click(
-                        cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.request_delete_profile(cx)
-                        }),
-                    ),
-            )
+            })
             .child(
                 Button::new("profile-reload")
                     .compact()
+                    .ghost()
                     .icon(IconName::RefreshCw)
+                    .loading(self.loading_profiles)
                     .tooltip(crate::locale::text("重新读取 Profile", "Reload profiles"))
                     .accessibility_label(crate::locale::text("重新读取 Profile", "Reload profiles"))
                     .disabled(saving || operation_running || self.loading_profiles)
@@ -147,7 +121,7 @@ impl PreferencesPanel {
                         cx.listener(|panel, _: &ClickEvent, _, cx| panel.reload_profiles(cx)),
                     ),
             );
-        let form = div()
+        div()
             .id("preferences-profiles")
             .flex_1()
             .min_h(px(0.))
@@ -156,31 +130,67 @@ impl PreferencesPanel {
             .bg(theme.background)
             .child(
                 div()
-                    .w(px(180.))
+                    .w(px(208.))
                     .flex_shrink_0()
                     .h_full()
                     .p_3()
+                    .pt_6()
                     .flex()
                     .flex_col()
                     .gap_2()
                     .bg(theme.sidebar)
+                    .border_r_1()
+                    .border_color(theme.border)
                     .child(
                         div()
                             .px_2()
-                            .py_1()
+                            .h_8()
+                            .flex()
+                            .items_center()
                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .child(crate::locale::text("本地 Profile", "Profiles")),
+                            .child(crate::locale::text("本地 Profile", "Local profiles")),
                     )
                     .child(
-                        Button::new("profile-create")
-                            .w_full()
-                            .compact()
-                            .primary()
-                            .label(crate::locale::text("新建 Profile", "New profile"))
-                            .disabled(readonly || controls_locked)
-                            .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
-                                panel.request_profile_selection(None, window, cx);
-                            })),
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1()
+                            .mt_2()
+                            .pb_2()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(
+                                Button::new("profile-create")
+                                    .compact()
+                                    .ghost()
+                                    .icon(IconName::Plus)
+                                    .label(crate::locale::text("新建", "New"))
+                                    .accessibility_label(crate::locale::text(
+                                        "新建 Profile",
+                                        "New profile",
+                                    ))
+                                    .disabled(readonly || controls_locked)
+                                    .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                                        panel.request_profile_selection(None, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("profile-rescan")
+                                    .compact()
+                                    .ghost()
+                                    .icon(IconName::Search)
+                                    .label(crate::locale::text("重新扫描", "Rescan"))
+                                    .tooltip(crate::locale::text(
+                                        "扫描已安装的 Shell",
+                                        "Scan for installed shells",
+                                    ))
+                                    .loading(self.rescan_profiles_running())
+                                    .disabled(!self.can_rescan_profiles())
+                                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                        panel.rescan_profiles(cx);
+                                    })),
+                            ),
                     )
                     .child(
                         div()
@@ -191,31 +201,33 @@ impl PreferencesPanel {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .children(rows),
+                            .children(rows)
+                            .when(
+                                !self.loading_profiles && self.profile_rows.is_empty(),
+                                |list| {
+                                    list.child(issue_hint(
+                                        &crate::locale::text("暂无 Profile", "No profiles yet"),
+                                        theme,
+                                    ))
+                                },
+                            ),
                     )
-                    .when(self.loading_profiles, |list| {
+                    .when(!self.profile_scan.conflicts.is_empty(), |list| {
+                        let count = self.profile_scan.conflicts.len();
                         list.child(
-                            div()
+                            Button::new("profile-scan-review")
                                 .w_full()
-                                .min_w(px(0.))
-                                .px_2()
-                                .text_size(theme.text_xs)
-                                .text_color(theme.muted)
-                                .child(crate::locale::text(
-                                    "正在读取 Profile…",
-                                    "Loading profiles…",
-                                )),
+                                .compact()
+                                .label(crate::locale::text(
+                                    format!("核对覆盖项（{count}）…"),
+                                    format!("Review updates ({count})…"),
+                                ))
+                                .disabled(!self.can_rescan_profiles())
+                                .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                                    panel.review_profile_scan(theme, window, cx);
+                                })),
                         )
-                    })
-                    .when(
-                        !self.loading_profiles && self.profile_rows.is_empty(),
-                        |list| {
-                            list.child(issue_hint(
-                                &crate::locale::text("暂无 Profile", "No profiles yet"),
-                                theme,
-                            ))
-                        },
-                    ),
+                    }),
             )
             .child(
                 div()
@@ -223,40 +235,98 @@ impl PreferencesPanel {
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
-                    .p_5()
+                    .p_6()
                     .flex()
                     .flex_col()
                     .gap_4()
                     .overflow_y_scroll()
                     .track_scroll(&self.content_scroll)
-                    .child(profile_heading(draft.as_ref(), theme))
-                    .when_some(self.status.clone(), |form, status| {
-                        form.child(issue_hint(&status, theme))
-                    })
-                    .child(actions)
-                    .child(profile_fields(ProfileFieldSet {
-                        name: &self.profile_inputs.name,
-                        shell: &self.profile_inputs.shell,
-                        working_directory: &self.profile_inputs.working_directory,
-                        disabled: form_locked,
-                        theme,
-                    }))
                     .child(
-                        Button::new("profile-advanced-toggle")
-                            .compact()
-                            .ghost()
-                            .icon(if self.profile_advanced_open {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .label(crate::locale::text("高级选项", "Advanced options"))
-                            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                panel.profile_advanced_open = !panel.profile_advanced_open;
-                                cx.notify();
-                            })),
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(profile_heading(
+                                draft.as_ref(),
+                                self.selected_profile_is_default,
+                                theme,
+                            ))
+                            .when(draft.is_some(), |header| {
+                                header.child(
+                                    Button::new("profile-save")
+                                        .primary()
+                                        .label(crate::locale::text("保存", "Save"))
+                                        .loading(saving)
+                                        .disabled(
+                                            form_locked
+                                                || !self.profile_input_errors.is_empty()
+                                                || self
+                                                    .profile_draft
+                                                    .as_ref()
+                                                    .is_none_or(|draft| !draft.is_dirty()),
+                                        )
+                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                            panel.save_profile(cx)
+                                        })),
+                                )
+                            }),
                     )
-                    .when(self.profile_advanced_open, |form| {
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .pb_2()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(actions)
+                            .when_some(self.status.as_deref(), |toolbar, status| {
+                                toolbar.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted)
+                                        .child(status.to_owned()),
+                                )
+                            }),
+                    )
+                    .when(draft.is_some(), |form| {
+                        form.child(profile_fields(ProfileFieldSet {
+                            name: &self.profile_inputs.name,
+                            shell: &self.profile_inputs.shell,
+                            working_directory: &self.profile_inputs.working_directory,
+                            disabled: form_locked,
+                            theme,
+                        }))
+                    })
+                    .when(draft.is_some(), |form| {
+                        form.child(
+                            div()
+                                .flex()
+                                .pt_2()
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .child(
+                                    Button::new("profile-advanced-toggle")
+                                        .compact()
+                                        .ghost()
+                                        .icon(if self.profile_advanced_open {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .label(crate::locale::text("高级选项", "Advanced options"))
+                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                            panel.profile_advanced_open =
+                                                !panel.profile_advanced_open;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                    })
+                    .when(draft.is_some() && self.profile_advanced_open, |form| {
                         form.child(profile_advanced_fields(
                             &self.profile_inputs.arguments,
                             &self.profile_inputs.environment,
@@ -321,34 +391,106 @@ impl PreferencesPanel {
                         self.profile_list_error.as_deref(),
                         theme,
                     )),
-            );
-        let _ = window;
-        form
+            )
     }
 }
 
-/// 用紧凑标题标识当前编辑对象；无选择时保持页面可读而不伪装成已创建项目。
-///
+/// 列表继续使用 Kit 按钮的选中和焦点语义，自定义内容只负责对齐和完整名称的回退。
 /// @author kongweiguang
-fn profile_heading(draft: Option<&ProfileDraft>, theme: ThemeTokens) -> impl IntoElement {
-    let title = draft
-        .map(|profile| profile.name.as_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            crate::locale::text("选择或新建 Profile", "Select or create a profile").to_string()
-        });
-    div()
+fn profile_list_item(
+    row: &VersionedProfile,
+    selected: bool,
+    disabled: bool,
+    theme: ThemeTokens,
+) -> Button {
+    let profile = &row.profile;
+    let accessible = if profile.is_default {
+        crate::locale::text(
+            format!("{}，默认", profile.name),
+            format!("{}, default", profile.name),
+        )
+    } else {
+        profile.name.clone().into()
+    };
+    Button::new(format!("profile-select-{}", profile.id))
         .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
+        .ghost()
+        .selected(selected)
+        .disabled(disabled)
+        .tooltip(accessible.clone())
+        .accessibility_label(accessible)
         .child(
             div()
-                .text_size(px(17.))
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .child(title.to_owned()),
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(
+                    gpui_kit::component::Icon::new(IconName::Terminal)
+                        .size_4()
+                        .flex_shrink_0(),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_ellipsis()
+                        .when(selected, |label| {
+                            label.font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        })
+                        .child(profile.name.clone()),
+                )
+                .when(profile.is_default, |row| {
+                    row.child(profile_default_tag(theme))
+                }),
         )
+}
+
+/// 默认状态使用中性文字标记，与选中态或保存主操作区分。
+/// @author kongweiguang
+fn profile_default_tag(theme: ThemeTokens) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .px_1p5()
+        .py_0p5()
+        .rounded(theme.radius_sm)
+        .bg(theme.secondary)
+        .text_color(theme.muted)
+        .text_xs()
+        .child(crate::locale::text("默认", "Default"))
+}
+
+/// 标题区分未选择和未命名的草稿，长名称不挤掉保存按钮。
+///
+/// @author kongweiguang
+fn profile_heading(
+    draft: Option<&ProfileDraft>,
+    is_default: bool,
+    theme: ThemeTokens,
+) -> impl IntoElement {
+    let title = match draft {
+        Some(profile) if !profile.name.trim().is_empty() => profile.name.clone().into(),
+        Some(_) => crate::locale::text("新建 Profile", "New profile"),
+        None => crate::locale::text("选择或新建 Profile", "Select or create a profile"),
+    };
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .min_w_0()
+                .text_ellipsis()
+                .text_size(theme.text_title)
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .child(title),
+        )
+        .when(is_default, |header| {
+            header.child(profile_default_tag(theme))
+        })
         .text_color(theme.foreground)
 }
 
@@ -459,7 +601,7 @@ fn profile_field(
         .flex()
         .flex_col()
         .gap_1()
-        .child(div().text_size(px(13.)).child(label))
+        .child(div().text_sm().text_color(theme.field_label).child(label))
         .when(!hint.is_empty(), |field| {
             field.child(
                 div()

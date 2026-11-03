@@ -126,7 +126,7 @@ struct InitialProfileDocument<'a> {
     updated_at: &'a str,
 }
 
-/// 仅在全新根初始化时扫描系统 Shell，避免用户删除所有模板后被后续启动重新创建。
+/// 自动生成只用于全新配置根；与用户显式重新扫描使用相同 ID，避免重复创建。
 pub(super) fn plan_initial_profiles() -> AppResult<Vec<FileEdit>> {
     let candidates = SystemLocalShellDiscovery::new().discover(&CancellationToken::new())?;
     let candidates = candidates
@@ -156,7 +156,7 @@ pub(super) fn plan_initial_profiles() -> AppResult<Vec<FileEdit>> {
         .to_string();
     let mut edits = Vec::with_capacity(candidates.len());
     for (ix, candidate) in candidates.iter().enumerate() {
-        let id = format!("standard-{}", journal::sha256(candidate.id().as_bytes()));
+        let id = candidate.standard_profile_id();
         let shell = candidate
             .program()
             .to_str()

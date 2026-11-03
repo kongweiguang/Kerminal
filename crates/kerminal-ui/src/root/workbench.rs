@@ -39,7 +39,7 @@ use crate::{features::connections::HostNavigation, theme::ThemeTokens};
 use super::windows_title_bar::windows_workbench_title_bar;
 use super::{
     CenterPanel, RootConfirmationOwner, RootView, logical_input_modal_blocked, workbench_drawers,
-    workbench_layout, workspace_files::WorkspaceFileRestoreState,
+    workbench_layout, workbench_motion::MotionTargets, workspace_files::WorkspaceFileRestoreState,
 };
 #[cfg(not(target_os = "windows"))]
 use gpui_kit::component::TitleBar;
@@ -1171,6 +1171,7 @@ fn panel_slot_mut(
 /// 标签区的唯一前导间距与抽屉按钮到分隔线的距离一致。
 /// 设置离开确认独占焦点陷阱，避免父子陷阱同时包含焦点时 Tab 落回遮罩后的设置控件。
 /// 隧道表单的状态提示位于其遮罩之上，其余模态继续维持原有层级和计时规则。
+/// 面板布局先切换到最终状态，独立动效只改变透明度，退场不再挂载可交互面板。
 ///
 /// @author kongweiguang
 pub(super) fn render_workbench(
@@ -2222,6 +2223,20 @@ pub(super) fn render_workbench(
             RESIZABLE_EDGE_GUTTER + closed_dock_gutter
         };
 
+    // 只读取已确定的挂载结果；动效不能成为终端、Dock 或分隔手柄的尺寸来源。
+    let motion_targets = MotionTargets {
+        sidebar: !effective_host_sidebar_collapsed,
+        dock: dock_is_visible,
+        host_drawer: show_compact_host_drawer,
+        tool_drawer: show_compact_tool_drawer,
+        compact_width: layout_plan.compact_width,
+        compact_panels,
+    };
+    let motion_view = root.workbench_motion.clone();
+    let motion = motion_view.update(cx, |motion, cx| {
+        motion.update_targets(motion_targets, cx.reduce_motion())
+    });
+
     let main_workspace = if compact_panels {
         div()
             .size_full()
@@ -2277,6 +2292,7 @@ pub(super) fn render_workbench(
                         div()
                             .size_full()
                             .pl(px(RESIZABLE_EDGE_GUTTER))
+                            .opacity(motion.dock)
                             .child(dock_content),
                     ),
             )
@@ -2342,6 +2358,7 @@ pub(super) fn render_workbench(
                         div()
                             .size_full()
                             .pr(px(RESIZABLE_EDGE_GUTTER))
+                            .opacity(motion.sidebar)
                             .child(left_sidebar),
                     ),
             )
@@ -2380,19 +2397,91 @@ pub(super) fn render_workbench(
         workbench_body = workbench_body.child(tool_rail);
     }
 
+    // 关闭时只绘制无命中区域的材质表层，不保留旧面板、终端 Canvas 或焦点陷阱。
+    if !motion_targets.sidebar && motion.sidebar > 0.0 {
+        let width = root
+            .workbench_sidebar_restore_width
+            .unwrap_or(px(HOST_NAVIGATION_WIDTH))
+            .as_f32()
+            .clamp(0.0, viewport.width.as_f32());
+        workbench_body = workbench_body.child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(px(width))
+                .bg(sidebar_background)
+                .opacity(motion.sidebar),
+        );
+    }
+    if !motion_targets.dock && motion.dock > 0.0 {
+        let width = root
+            .workbench_dock_restore_width
+            .unwrap_or(initial_dock_width)
+            .as_f32()
+            .clamp(0.0, viewport.width.as_f32());
+        workbench_body = workbench_body.child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right(px(TOOL_RAIL_WIDTH + WORKBENCH_PANEL_GUTTER))
+                .w(px(width))
+                .bg(panel_background)
+                .opacity(motion.dock),
+        );
+    }
+    let host_drawer_width =
+        (viewport.width.as_f32() - TOOL_RAIL_WIDTH - WORKBENCH_PANEL_GUTTER - 16.0)
+            .clamp(0.0, 360.0);
+    if !motion_targets.host_drawer && motion.host_drawer > 0.0 {
+        workbench_body = workbench_body.child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(px(host_drawer_width))
+                .bg(panel_background)
+                .opacity(motion.host_drawer),
+        );
+    }
+    let tool_drawer_width =
+        workbench_drawers::tool_drawer_width(viewport.width.as_f32(), 8.0, 8.0, 440.0);
+    if !motion_targets.tool_drawer && motion.tool_drawer > 0.0 {
+        workbench_body = workbench_body.child(
+            div()
+                .absolute()
+                .top(px(8.0))
+                .bottom(px(8.0))
+                .right(px(8.0))
+                .w(px(tool_drawer_width))
+                .rounded(theme.radius_panel)
+                .bg(theme.floating_surface)
+                .opacity(motion.tool_drawer),
+        );
+    }
+
     if show_compact_host_drawer {
-        let drawer_width =
-            (viewport.width.as_f32() - TOOL_RAIL_WIDTH - WORKBENCH_PANEL_GUTTER - 16.0)
-                .clamp(0.0, 360.0);
-        workbench_body = workbench_body.child(workbench_drawers::render_compact_host_drawer(
-            compact_host_navigation,
-            drawer_width,
-            TOOL_RAIL_WIDTH + WORKBENCH_PANEL_GUTTER,
-            theme,
-            panel_background,
-            &root.compact_drawer_focus_handle,
-            cx,
-        ));
+        workbench_body = workbench_body.child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .opacity(motion.host_drawer)
+                .child(workbench_drawers::render_compact_host_drawer(
+                    compact_host_navigation,
+                    host_drawer_width,
+                    TOOL_RAIL_WIDTH + WORKBENCH_PANEL_GUTTER,
+                    theme,
+                    panel_background,
+                    &root.compact_drawer_focus_handle,
+                    cx,
+                )),
+        );
     }
 
     if show_compact_tool_drawer && let Some(tool) = compact_active_tool {
@@ -2407,25 +2496,30 @@ pub(super) fn render_workbench(
             )
             .into_any_element()
         };
-        workbench_body = workbench_body.child(workbench_drawers::render_compact_tool_drawer(
-            content,
-            tool,
-            workbench_drawers::ToolDrawerLayout {
-                left: 0.0,
-                right: 0.0,
-                width: workbench_drawers::tool_drawer_width(
-                    viewport.width.as_f32(),
-                    8.0,
-                    8.0,
-                    440.0,
-                ),
-            },
-            theme,
-            theme.tool_panel_floating_surface,
-            &root.compact_drawer_focus_handle,
-            cx,
-        ));
+        workbench_body = workbench_body.child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .opacity(motion.tool_drawer)
+                .child(workbench_drawers::render_compact_tool_drawer(
+                    content,
+                    tool,
+                    workbench_drawers::ToolDrawerLayout {
+                        left: 0.0,
+                        right: 0.0,
+                        width: tool_drawer_width,
+                    },
+                    theme,
+                    theme.tool_panel_floating_surface,
+                    &root.compact_drawer_focus_handle,
+                    cx,
+                )),
+        );
     }
+    workbench_body = workbench_body.child(motion_view);
 
     if let Some(tool) = super::tool_panels::expanded_center_tool_panel(panels, compact_panels) {
         let content = renderers.take_for(tool);
@@ -3492,6 +3586,8 @@ fn workspace_has_active_tab(root: &RootView) -> bool {
 }
 
 /// 空工作区只保留终端图标与两个直接入口，避免空白页变成说明卡片。
+/// 标签用最短词汇表达入口结果，靠空状态标题与图标交代上下文，不再重复“新建”。
+/// 两个按钮共用紧凑的最小宽度，短标签视觉对齐，较长译文仍可按内容撑开。
 /// 两个入口都复用 Root 的模态焦点门禁，避免绕过焦点恢复与草稿冲突保护。
 ///
 /// @author kongweiguang
@@ -3502,8 +3598,8 @@ fn empty_terminal_workspace_slot(
     on_create: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_create_host: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let create_label = crate::locale::text("新建本地终端", "Create local terminal");
-    let host_label = crate::locale::text("新建连接", "Create connection");
+    let create_label = crate::locale::text("本地终端", "Local terminal");
+    let host_label = crate::locale::text("新建连接", "New connection");
     let unavailable_label = crate::locale::text(
         "主机连接服务尚未配置，暂时无法新建连接。",
         "Host connection services are unavailable, so a connection cannot be created yet.",
@@ -3544,8 +3640,8 @@ fn empty_terminal_workspace_slot(
                         .primary()
                         .icon(IconName::Plus)
                         .label(create_label.clone())
-                        .accessibility_label(create_label.clone())
-                        .tooltip(create_label)
+                        .accessibility_label(create_label)
+                        .min_w_24()
                         .loading(is_creating)
                         .disabled(is_creating)
                         .tab_stop(true)
@@ -3557,6 +3653,7 @@ fn empty_terminal_workspace_slot(
                         .icon(IconName::Network)
                         .label(host_label.clone())
                         .accessibility_label(host_label.clone())
+                        .min_w_24()
                         .tooltip(if can_create_host {
                             host_label
                         } else {

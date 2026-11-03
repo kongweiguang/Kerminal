@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+sha2.workspace = true
 async-trait.workspace = true
 kerminal-domain.workspace = true
 kerminal-terminal.workspace = true

@@ -52,7 +52,8 @@ pub struct WindowsWindowState {
     pub appearance: Cell<WindowAppearance>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
     pub scale_factor: Cell<f32>,
-    pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
+    /// 原生尺寸先合并，直到将要绘制时才调整交换链。
+    pub(crate) pending_resize: PendingWindowResize,
 
     pub callbacks: Callbacks,
     pub frame_signal: Arc<PlatformFrameSignal>,
@@ -262,7 +263,7 @@ pub(crate) fn system_menu_position_lparam(position: POINT) -> LPARAM {
 }
 
 impl WindowsWindowState {
-    /// 初始化窗口输入状态，并独立保存组合 handler 与 focus id，避免临时空槽改变组合目标。
+    /// 独立保存组合输入与 focus id，并让尺寸合并器从空状态开始以保留首帧初始化流程。
     fn new(
         hwnd: HWND,
         directx_devices: &DirectXDevices,
@@ -293,7 +294,6 @@ impl WindowsWindowState {
             size: logical_size,
         };
         let border_offset = WindowBorderOffset::default();
-        let restore_from_minimized = None;
         let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
             .context("Creating DirectX renderer")?;
         let callbacks = Callbacks::default();
@@ -318,7 +318,7 @@ impl WindowsWindowState {
             appearance: Cell::new(appearance),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
             scale_factor: Cell::new(scale_factor),
-            restore_from_minimized: Cell::new(restore_from_minimized),
+            pending_resize: PendingWindowResize::default(),
             min_size,
             callbacks,
             frame_signal: Arc::new(PlatformFrameSignal::new()),
@@ -1441,7 +1441,13 @@ impl PlatformWindow for WindowsWindow {
             .set(Some(callback));
     }
 
+    /// 绘制过程中若重入了尺寸事件，丢弃旧尺寸场景并等待下一帧刷新。
+    ///
+    /// @author kongweiguang
     fn draw(&self, scene: &Scene) {
+        if !self.state.pending_resize.may_present() {
+            return;
+        }
         self.state
             .renderer
             .borrow_mut()

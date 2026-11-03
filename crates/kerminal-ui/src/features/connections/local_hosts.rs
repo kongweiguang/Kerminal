@@ -18,7 +18,6 @@ use kerminal_application::{
         CredentialCleanupStatus, HostDeletionReceipt, LocalHostDraft, LocalHostSaveRecoveryToken,
         ManagedLocalHost, RecoverableLocalHostSaveOutcome,
     },
-    local_shells::LocalShellCandidate,
     preferences::{ProfileDraft, VersionedProfile},
 };
 use kerminal_domain::{
@@ -26,7 +25,6 @@ use kerminal_domain::{
     preferences::{ConfigRevision, ConfigurationMode, TerminalProfile},
     sessions::LocalSessionTarget,
 };
-use tokio_util::sync::CancellationToken;
 
 use super::{
     form::create_input,
@@ -417,9 +415,6 @@ pub(super) struct LocalHostState {
     pub(super) selected_id: Option<String>,
     pub(super) selected: Option<VersionedProfile>,
     pub(super) editor: Option<LocalHostEditor>,
-    pub(super) shell_candidates: Vec<LocalShellCandidate>,
-    pub(super) shell_loading: bool,
-    pub(super) shell_error: Option<String>,
     pub(super) editor_load_intent: Option<LocalHostEditorLoadIntent>,
     pub(super) editor_load_pending: bool,
     pub(super) editor_load_error: Option<String>,
@@ -441,8 +436,6 @@ pub(super) struct LocalHostState {
     delete_check_generation: u64,
     editor_load_generation: u64,
     editor_generation: u64,
-    shell_discovery_generation: u64,
-    shell_discovery_cancellation: Option<CancellationToken>,
     default_target_generation: u64,
     pub(super) default_target_request: Option<LocalHostDefaultRequest>,
 }
@@ -465,9 +458,6 @@ impl Default for LocalHostState {
             selected_id: None,
             selected: None,
             editor: None,
-            shell_candidates: Vec::new(),
-            shell_loading: false,
-            shell_error: None,
             editor_load_intent: None,
             editor_load_pending: false,
             editor_load_error: None,
@@ -489,8 +479,6 @@ impl Default for LocalHostState {
             delete_check_generation: 0,
             editor_load_generation: 0,
             editor_generation: 0,
-            shell_discovery_generation: 0,
-            shell_discovery_cancellation: None,
             default_target_generation: 0,
             default_target_request: None,
         }
@@ -587,139 +575,6 @@ impl ConnectionsPanel {
         }
     }
 
-    /// 仅对当前本地编辑器发起可取消发现；代次与 profile ID 一起拒绝已关闭表单的迟到回执。
-    /// @author kongweiguang
-    pub(super) fn discover_local_shells(&mut self, cx: &mut Context<Self>) {
-        let Some(service) = self.local_hosts.service.clone() else {
-            self.local_hosts.shell_error = Some(
-                crate::locale::text(
-                    "本地主机服务尚未就绪，可直接填写 Shell 路径。",
-                    "The local host service is not ready. You can enter a Shell path manually.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        };
-        let Some(editor_id) = self
-            .local_hosts
-            .editor
-            .as_ref()
-            .map(|editor| editor.profile_id.clone())
-        else {
-            return;
-        };
-        self.cancel_local_shell_discovery();
-        self.local_hosts.shell_discovery_generation =
-            self.local_hosts.shell_discovery_generation.wrapping_add(1);
-        let discovery_generation = self.local_hosts.shell_discovery_generation;
-        let editor_generation = self.local_hosts.editor_generation;
-        let cancellation = CancellationToken::new();
-        self.local_hosts.shell_discovery_cancellation = Some(cancellation.clone());
-        self.local_hosts.shell_loading = true;
-        self.local_hosts.shell_error = None;
-        let executor = self.executor.clone();
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(move |_| async move { service.discover_local_shells(cancellation).await })
-                .await;
-            let _ = this.update_in(cx, |panel, _window, cx| {
-                if panel.local_hosts.shell_discovery_generation != discovery_generation
-                    || panel.local_hosts.editor_generation != editor_generation
-                    || panel
-                        .local_hosts
-                        .editor
-                        .as_ref()
-                        .map(|editor| editor.profile_id.as_str())
-                        != Some(editor_id.as_str())
-                    || panel.active_editor_kind != Some(ConnectionsEditorKind::Local)
-                {
-                    return;
-                }
-                panel.local_hosts.shell_loading = false;
-                panel.local_hosts.shell_discovery_cancellation = None;
-                match result {
-                    Ok(candidates) => {
-                        panel.local_hosts.shell_candidates = candidates;
-                        panel.local_hosts.shell_error = None;
-                    }
-                    Err(error) => {
-                        panel.local_hosts.shell_candidates.clear();
-                        panel.local_hosts.shell_error = Some(super::panel::localized_error(&error));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// 候选按稳定 ID 解析；无法把系统参数无损转成表单文本时不改动已有手动输入。
-    /// @author kongweiguang
-    pub(super) fn select_local_shell(
-        &mut self,
-        candidate_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(candidate) = self
-            .local_hosts
-            .shell_candidates
-            .iter()
-            .find(|candidate| candidate.id() == candidate_id)
-            .cloned()
-        else {
-            self.local_hosts.shell_error = Some(crate::locale::text(
-                "Shell 候选已失效，请重新扫描或手动填写路径。",
-                "The Shell candidate is no longer available. Scan again or enter a path manually.",
-            ).to_string());
-            cx.notify();
-            return;
-        };
-        let converted = candidate
-            .program()
-            .to_str()
-            .map(str::to_owned)
-            .and_then(|program| {
-                candidate
-                    .args()
-                    .iter()
-                    .map(|arg| arg.to_str().map(str::to_owned))
-                    .collect::<Option<Vec<_>>>()
-                    .map(|args| (program, args))
-            });
-        let Some((program, args)) = converted else {
-            self.local_hosts.shell_error = Some(crate::locale::text(
-                "该 Shell 路径或参数无法用文本表示；原输入已保留，请手动填写。",
-                "This Shell path or its arguments cannot be represented as text. Your input was preserved; enter it manually.",
-            ).to_string());
-            cx.notify();
-            return;
-        };
-        let Some(editor) = self.local_hosts.editor.as_mut() else {
-            return;
-        };
-        editor
-            .shell
-            .update(cx, |state, cx| state.set_value(program, window, cx));
-        editor
-            .args
-            .update(cx, |state, cx| state.set_value(args.join("\n"), window, cx));
-        self.local_hosts.shell_error = None;
-        self.refresh_local_host_dirty(cx);
-    }
-
-    /// 显式恢复默认终端 Profile 会覆盖点击时已有的启动设置，但仍保护点击后新增的输入。
-    /// @author kongweiguang
-    pub(super) fn use_default_local_shell(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.local_hosts.editor.as_ref() else {
-            return;
-        };
-        let expected = read_editor_baseline(editor, cx);
-        self.resolve_local_profile_target(None, Some(expected), cx);
-    }
-
     /// 从同一 ProfileService 按 ID 读取最新启动字段，异步期间的新输入仍由逐字段门禁保护。
     ///
     /// @author kongweiguang
@@ -769,7 +624,7 @@ impl ConnectionsPanel {
         true
     }
 
-    /// 自动填充与显式切换共用同一请求；保留意图供协议返回重试，代次阻止旧回执重放。
+    /// 自动填充与显式选择共用异步回执门禁；成功由表单值反馈，避免状态提示挤动字段。
     /// @author kongweiguang
     fn resolve_local_profile_target(
         &mut self,
@@ -884,19 +739,7 @@ impl ConnectionsPanel {
                                 editor.baseline = projection.baseline;
                                 editor.dirty = editor.is_dirty(cx);
                             }
-                            panel.status = Some(if explicit_override.is_some() {
-                                crate::locale::text(
-                                    "已应用所选 Profile。",
-                                    "Selected profile applied.",
-                                )
-                                .to_string()
-                            } else {
-                                crate::locale::text(
-                                    "已应用默认 Profile。",
-                                    "Default profile applied.",
-                                )
-                                .to_string()
-                            });
+                            panel.status = None;
                         }
                         Err(message) => panel.status = Some(message),
                     },
@@ -907,22 +750,11 @@ impl ConnectionsPanel {
             });
         })
         .detach();
-        self.status = Some(
-            crate::locale::text("正在读取终端 Profile…", "Loading the terminal profile…")
-                .to_string(),
-        );
-        cx.notify();
     }
 
     /// 关闭或替换表单会同时丢弃默认目标意图，避免以后打开另一表单时重放旧请求。
     /// @author kongweiguang
     pub(super) fn cancel_local_host_background_requests(&mut self) {
-        self.local_hosts.shell_discovery_generation =
-            self.local_hosts.shell_discovery_generation.wrapping_add(1);
-        if let Some(cancellation) = self.local_hosts.shell_discovery_cancellation.take() {
-            cancellation.cancel();
-        }
-        self.local_hosts.shell_loading = false;
         self.local_hosts.default_target_generation =
             self.local_hosts.default_target_generation.wrapping_add(1);
         self.local_hosts.default_target_request = None;
@@ -934,17 +766,6 @@ impl ConnectionsPanel {
         if let Some(request) = self.local_hosts.default_target_request.take() {
             self.resolve_local_profile_target(request.profile_id, request.explicit_override, cx);
         }
-    }
-
-    /// 新扫描取代旧扫描并保留跨线程可观察的取消令牌。
-    /// @author kongweiguang
-    fn cancel_local_shell_discovery(&mut self) {
-        self.local_hosts.shell_discovery_generation =
-            self.local_hosts.shell_discovery_generation.wrapping_add(1);
-        if let Some(cancellation) = self.local_hosts.shell_discovery_cancellation.take() {
-            cancellation.cancel();
-        }
-        self.local_hosts.shell_loading = false;
     }
 
     /// 新建分组返回时刷新分组选项并选择刚创建的稳定 ID，保留当前本地主机表单基线。
@@ -1041,7 +862,6 @@ impl ConnectionsPanel {
                 visible_snapshot.profile.env.clear();
                 self.local_hosts.selected = Some(visible_snapshot);
                 self.clear_local_host_unknown();
-                self.discover_local_shells(cx);
                 self.status = Some(crate::locale::text(
                     "已采用当前磁盘版本；未重放上次保存。",
                     "The current stored version is now loaded; the previous save was not replayed.",
@@ -1542,9 +1362,6 @@ impl ConnectionsPanel {
         }
         self.local_hosts.editor = None;
         self.local_hosts.pending_action = None;
-        self.local_hosts.shell_candidates.clear();
-        self.local_hosts.shell_error = None;
-        self.local_hosts.shell_loading = false;
         self.local_hosts.status = None;
     }
 
@@ -2170,9 +1987,8 @@ impl ConnectionsPanel {
                     cx,
                 ));
                 self.active_editor_kind = Some(ConnectionsEditorKind::Local);
-                self.start_default_local_target_resolution(cx);
-                self.discover_local_shells(cx);
                 self.status = None;
+                self.start_default_local_target_resolution(cx);
             }
             LocalHostPendingAction::Edit(profile_id) => {
                 self.load_local_profile_editor(profile_id, LocalHostEditorMode::Edit, window, cx)
@@ -2301,7 +2117,6 @@ impl ConnectionsPanel {
                         visible_snapshot.profile.env.clear();
                         panel.local_hosts.selected = Some(visible_snapshot.clone());
                         upsert_profile(&mut panel.local_hosts.rows, visible_snapshot);
-                        panel.discover_local_shells(cx);
                         panel.status = None;
                     }
                     Ok(None) => {
@@ -2399,8 +2214,6 @@ impl ConnectionsPanel {
         cx: &mut Context<Self>,
     ) -> LocalHostEditor {
         self.cancel_local_host_background_requests();
-        self.local_hosts.shell_candidates.clear();
-        self.local_hosts.shell_error = None;
         self.local_hosts.editor_generation = self.local_hosts.editor_generation.wrapping_add(1);
         let generation = self.local_hosts.editor_generation;
         let profile_id = draft

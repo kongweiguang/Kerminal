@@ -561,7 +561,7 @@ fn untouched_protocol_navigation_and_group_preselection_stay_clean(app: &mut Tes
     };
     let (_runtime, panel, visual) = fixture(app, Vec::new(), vec![group]);
     update_panel(&panel, visual, |panel, window, cx| {
-        panel.create_host_in_group("fixture-group", window, cx);
+        panel.begin_create_host_in_group(Some("fixture-group"), window, cx);
     });
     for protocol in [
         RemoteProtocol::Sftp,
@@ -589,6 +589,79 @@ fn untouched_protocol_navigation_and_group_preselection_stay_clean(app: &mut Tes
                 .selected_group
                 .as_deref(),
             Some("fixture-group")
+        );
+    });
+    close_clean_editor(&panel, visual);
+}
+
+/// 新建主机下拉默认沿用上次显式选定的分组；从具体行（含未分组）新建则以命中目标为准，
+/// 两者都是干净初值，关闭时不应弹出丢弃确认。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn new_host_defaults_to_last_explicitly_selected_group(app: &mut TestAppContext) {
+    let group = HostGroup {
+        id: "fixture-group".into(),
+        name: "测试分组".into(),
+        sort_order: 0,
+        created_at: "1".into(),
+        updated_at: "1".into(),
+    };
+    let (_runtime, panel, visual) = fixture(app, Vec::new(), vec![group]);
+
+    // 首次新建没有任何历史选择，保持未分组；未分组目标本身仍由左栏根层呈现。
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.begin_create_host(window, cx);
+    });
+    visual.update(|_, app| {
+        assert_eq!(
+            panel.read(app).editor.as_ref().unwrap().selected_group,
+            None
+        );
+    });
+    close_clean_editor(&panel, visual);
+
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.begin_create_host_in_group(Some("fixture-group"), window, cx);
+    });
+    close_clean_editor(&panel, visual);
+
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.begin_create_host(window, cx);
+    });
+    visual.update(|_, app| {
+        assert_eq!(
+            panel
+                .read(app)
+                .editor
+                .as_ref()
+                .unwrap()
+                .selected_group
+                .as_deref(),
+            Some("fixture-group")
+        );
+    });
+    close_clean_editor(&panel, visual);
+
+    // 具体行入口以命中目标为准：未分组行不能被上次选择的分组改写。
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.begin_create_host_in_group(None, window, cx);
+    });
+    visual.update(|_, app| {
+        assert_eq!(
+            panel.read(app).editor.as_ref().unwrap().selected_group,
+            None
+        );
+    });
+    close_clean_editor(&panel, visual);
+
+    // 未分组也是显式选择，随后背景入口沿用未分组，而不是回到更早的分组。
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.begin_create_host(window, cx);
+    });
+    visual.update(|_, app| {
+        assert_eq!(
+            panel.read(app).editor.as_ref().unwrap().selected_group,
+            None
         );
     });
     close_clean_editor(&panel, visual);
@@ -1030,7 +1103,7 @@ fn late_local_defaults_preserve_user_inputs_and_dirty_close_guard(app: &mut Test
     });
 }
 
-/// 本地主机菜单读取共享 Profile；确认时重新按 ID 读取，并保留请求期间用户继续修改的字段。
+/// 本地主机菜单只显示已保存的 Profile；点击时读回最新版本，并保护请求期间的输入。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]
@@ -1064,25 +1137,22 @@ fn local_host_picker_applies_latest_shared_profile_without_losing_edits(app: &mu
             .find(|node| {
                 node.path()
                     .iter()
-                    .any(|id| id == &gpui_kit::ElementId::from("connections-local-shell-picker"))
+                    .any(|id| id == &gpui_kit::ElementId::from("connections-local-profile-picker"))
             })
-            .expect("local Shell picker")
+            .expect("local Profile picker")
             .bounds()
             .center()
     });
     visual.simulate_click(picker, Default::default());
     draw(visual);
     let item = visual.update(|window, _| {
-        gpui_kit::base::test_support::snapshots(window)
+        let items = gpui_kit::base::test_support::snapshots(window)
             .into_iter()
-            .find(|node| {
-                node.visible()
-                    && node.role() == Some(gpui_kit::Role::MenuItem)
-                    && node.label() == Some("Stored Profile")
-            })
-            .expect("saved Profile appears in Shell menu")
-            .bounds()
-            .center()
+            .filter(|node| node.visible() && node.role() == Some(gpui_kit::Role::MenuItem))
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 1, "菜单只能包含配置中的 Profile");
+        assert_eq!(items[0].label(), Some("Stored Profile"));
+        items[0].bounds().center()
     });
     visual.simulate_click(item, Default::default());
     draw(visual);

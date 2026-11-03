@@ -577,6 +577,31 @@ impl HostManagementRepository for HostConfigurationRepository {
         Self::decode_host(saved, &host_id)
     }
 
+    /// 只编辑分组与时间戳标量，保留其它字段、扩展和装饰；写锁内复核目标组及最终 CAS。
+    ///
+    /// @author kongweiguang
+    async fn move_host_to_group(
+        &self,
+        host_id: HostId,
+        group_id: Option<String>,
+        expected_revision: ConfigRevision,
+    ) -> AppResult<()> {
+        let (mut document, _) = self
+            .editable_document(&host_id, Some(&expected_revision))
+            .await?;
+        let root = document.as_table_mut();
+        set_optional_string(root, "group_id", group_id.as_deref());
+        set_string(root, "updated_at", &timestamp_now());
+        self.configuration
+            .write(
+                ConfigDocumentPath::Host(host_id.as_str().to_owned()),
+                document.to_string(),
+                Some(expected_revision),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// 在配置存储的同步事务线程中按精确 revision 删除主机，回传删除前已校验的领域快照。
     async fn delete_host(
         &self,

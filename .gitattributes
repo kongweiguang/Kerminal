@@ -1,0 +1,3 @@
+# @author kongweiguang
+# 内嵌脚本原样进入本地/SSH shell，禁止 Windows checkout 注入 CRLF。
+/crates/infrastructure/src/shell_integration/scripts/* text eol=lf

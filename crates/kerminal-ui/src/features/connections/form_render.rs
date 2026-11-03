@@ -337,7 +337,7 @@ fn render_remote_host_editor(
     }
 }
 
-/// 持久本地主机与远程连接使用同一协议栏、双栏内容和固定 footer，避免本地功能再次分裂成独立页面。
+/// 持久本地主机与远程连接使用同一协议栏、双栏内容和固定 footer；模板管理集中在设置页。
 /// @author kongweiguang
 fn render_local_host_editor(
     panel: &mut ConnectionsPanel,
@@ -436,8 +436,8 @@ fn render_local_host_editor(
                 cx,
             ))
             .child(field(
-                crate::locale::text("Profile / Shell", "Profile / Shell"),
-                local_shell_picker(panel, disabled, cx),
+                "Profile",
+                local_profile_picker(panel, disabled, cx),
                 theme,
                 &field_scope,
             ))
@@ -459,9 +459,6 @@ fn render_local_host_editor(
                 &field_scope,
                 cx,
             ));
-        if let Some(error) = panel.local_hosts.shell_error.as_ref() {
-            properties = properties.child(authentication_note(error.clone(), theme));
-        }
     } else {
         properties = properties
             .child(multiline_field(
@@ -1022,44 +1019,33 @@ fn path_field(
     )
 }
 
-/// 已保存 Profile 与系统发现的 Shell 分组显示；Profile 选择按 ID 重新读取，避免使用过期快照。
+/// 菜单仅投影设置中已保存的模板名称和 ID，点击时按 ID 读回当前版本，避免缓存启动参数。
 ///
 /// @author kongweiguang
-fn local_shell_picker(
+fn local_profile_picker(
     panel: &ConnectionsPanel,
     disabled: bool,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
-    let candidates = panel.local_hosts.shell_candidates.clone();
-    let profiles = panel.local_hosts.templates.clone();
-    let selected_profile = panel.selected_local_profile_id(cx);
-    let selected_program = panel
+    let profiles = panel
         .local_hosts
-        .editor
-        .as_ref()
-        .map(|editor| editor.shell.read(cx).value().to_string())
-        .unwrap_or_default();
-    let selected_id = candidates
+        .templates
         .iter()
-        .find(|candidate| candidate.program().to_string_lossy() == selected_program)
-        .map(|candidate| candidate.id().to_owned());
+        .map(|row| (row.profile.id.clone(), row.profile.name.clone()))
+        .collect::<Vec<_>>();
+    let selected_profile = panel.selected_local_profile_id(cx);
     let selected_label = profiles
         .iter()
-        .find(|row| Some(row.profile.id.as_str()) == selected_profile.as_deref())
-        .map(|row| gpui_kit::SharedString::from(row.profile.name.clone()))
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|candidate| Some(candidate.id()) == selected_id.as_deref())
-                .map(|candidate| gpui_kit::SharedString::from(candidate.display_name().to_owned()))
-        })
+        .find(|(id, _)| Some(id.as_str()) == selected_profile.as_deref())
+        .map(|(_, name)| gpui_kit::SharedString::from(name.clone()))
         .unwrap_or_else(|| {
-            if selected_program.is_empty() {
-                crate::locale::text("默认终端 Profile", "Default terminal profile")
+            if profiles.is_empty() {
+                crate::locale::text("没有已保存的 Profile", "No saved profiles")
             } else {
-                crate::locale::text("自定义 Shell", "Custom shell")
+                crate::locale::text("选择 Profile", "Select profile")
             }
         });
+    let has_profiles = !profiles.is_empty();
     let panel_entity = cx.entity().clone();
     div()
         .w_full()
@@ -1067,37 +1053,18 @@ fn local_shell_picker(
         .items_center()
         .gap_2()
         .child(
-            Button::new("connections-local-shell-picker")
+            Button::new("connections-local-profile-picker")
                 .flex_1()
                 .secondary()
                 .dropdown_caret(true)
                 .label(selected_label)
-                .disabled(disabled)
+                .disabled(disabled || !has_profiles)
                 .dropdown_menu(move |mut menu, _, _| {
-                    let default_panel = panel_entity.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(crate::locale::text(
-                            "使用默认终端 Profile",
-                            "Use default terminal profile",
-                        ))
-                        .on_click(move |_, window, app| {
-                            default_panel
-                                .update(app, |panel, cx| panel.use_default_local_shell(window, cx));
-                        }),
-                    );
-                    if !profiles.is_empty() {
-                        menu = menu
-                            .separator()
-                            .item(PopupMenuItem::label(crate::locale::text(
-                                "已保存的 Profile",
-                                "Saved profiles",
-                            )));
-                    }
-                    for row in &profiles {
+                    for (id, name) in &profiles {
                         let panel_entity = panel_entity.clone();
-                        let id = row.profile.id.clone();
+                        let id = id.clone();
                         menu = menu.item(
-                            PopupMenuItem::new(row.profile.name.clone())
+                            PopupMenuItem::new(name.clone())
                                 .checked(Some(id.as_str()) == selected_profile.as_deref())
                                 .on_click(move |_, _, app| {
                                     panel_entity.update(app, |panel, cx| {
@@ -1106,42 +1073,18 @@ fn local_shell_picker(
                                 }),
                         );
                     }
-                    if !candidates.is_empty() {
-                        menu = menu
-                            .separator()
-                            .item(PopupMenuItem::label(crate::locale::text(
-                                "已安装的 Shell",
-                                "Installed shells",
-                            )));
-                    }
-                    for candidate in &candidates {
-                        let panel_entity = panel_entity.clone();
-                        let candidate_id = candidate.id().to_owned();
-                        menu = menu.item(
-                            PopupMenuItem::new(candidate.display_name().to_owned())
-                                .checked(Some(candidate.id()) == selected_id.as_deref())
-                                .on_click(move |_, window, app| {
-                                    panel_entity.update(app, |panel, cx| {
-                                        panel.select_local_shell(&candidate_id, window, cx)
-                                    });
-                                }),
-                        );
-                    }
                     menu
                 }),
         )
         .child(
-            Button::new("connections-local-shell-refresh")
+            Button::new("connections-local-profile-edit")
                 .ghost()
-                .icon(IconName::RefreshCw)
-                .tooltip(crate::locale::text(
-                    "刷新 Profile 和 Shell",
-                    "Refresh profiles and shells",
-                ))
-                .disabled(disabled || panel.local_hosts.shell_loading)
-                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                    panel.reload_local_hosts(cx);
-                    panel.discover_local_shells(cx);
+                .icon(gpui_kit::assets::IconName::Pencil)
+                .accessibility_label(crate::locale::text("编辑 Profile", "Edit profiles"))
+                .tooltip(crate::locale::text("编辑 Profile", "Edit profiles"))
+                .disabled(disabled)
+                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                    cx.emit(super::panel::ConnectionsEvent::OpenProfileSettings);
                 })),
         )
 }

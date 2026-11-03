@@ -81,13 +81,14 @@ fn quit_deferral(
 }
 
 impl PreferencesPanel {
-    /// 普通关闭先 flush 可提交设置，再让 Profile 和关键词局部草稿共用丢弃确认。
+    /// 普通关闭只取消未提交的扫描项；Profile 和关键词草稿继续共用丢弃确认。
     ///
     /// @author kongweiguang
     pub fn request_close(&mut self, cx: &mut Context<Self>) {
         if self.quit_confirmation {
             return;
         }
+        self.cancel_profile_scan();
         self.cancel_shortcut_capture(cx);
         self.screen_color_sampling.cancel();
         let profile_close = self
@@ -206,10 +207,11 @@ impl PreferencesPanel {
         self.emit_leave_event(cx);
     }
 
-    /// 退出前停止录制和取色，再检查未提交草稿及仍需等待的写入回执。
+    /// 退出前请求取消扫描并等待实际回执，结果未知时仍需先核对目录。
     ///
     /// @author kongweiguang
     pub fn request_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        self.cancel_profile_scan();
         self.cancel_shortcut_capture(cx);
         self.screen_color_sampling.cancel();
         let should_flush_settings = self.settings.as_ref().is_some_and(|draft| {
@@ -219,7 +221,11 @@ impl PreferencesPanel {
             self.save_settings(cx);
         }
         let settings_status = self.settings.as_ref().map(ConfigDraft::status);
-        let profile_status = self.profile_draft.as_ref().map(ConfigDraft::status);
+        let profile_status = if self.profile_scan.requires_readback {
+            Some(DraftStatus::OutcomeUnknown)
+        } else {
+            self.profile_draft.as_ref().map(ConfigDraft::status)
+        };
         if let Some(reason) = quit_deferral(
             self.profile_operation_running,
             self.connectivity.sync_running,

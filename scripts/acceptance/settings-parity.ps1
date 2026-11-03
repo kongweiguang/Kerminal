@@ -90,6 +90,7 @@ $script:ExpectedMcpActions = @(
     'mcp-lan-binds-all-interfaces'
 )
 $script:ExpectedProfileActions = @(
+    'rescan-profile-readback',
     'create-profile-readback',
     'edit-profile-readback',
     'set-default-profile-readback'
@@ -938,7 +939,8 @@ function Assert-SettingsParityReport {
         'settings-functional-keyword-summary-light.png',
         'settings-functional-keyword-summary-dark.png',
         'settings-functional-keyword-summary-system.png',
-        'settings-functional-profile.png'
+        'settings-functional-profile.png',
+        'settings-functional-profile-rescan.png'
     )) {
         $null = $expectedCaptureNames.Add($fileName)
     }

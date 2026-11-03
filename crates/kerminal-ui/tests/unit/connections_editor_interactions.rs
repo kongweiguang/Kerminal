@@ -74,17 +74,31 @@ fn interrupted_local_defaults_resume_without_overwriting_edits(app: &mut TestApp
     }
 }
 
-/// 显式应用默认值跨协议中断后仍是显式意图；重试不能退化为仅填初始空字段。
+/// 显式选择已保存 Profile 跨协议中断后仍是显式意图；重试不能退化为仅填初始空字段。
 /// @author kongweiguang
 #[gpui_kit::test]
-fn interrupted_explicit_defaults_retain_request_snapshot(app: &mut TestAppContext) {
-    let (profiles, release) = delayed_profiles();
+fn interrupted_profile_selection_retains_request_snapshot(app: &mut TestAppContext) {
+    let release_default = Arc::new(Semaphore::new(0));
+    let release_selected = Arc::new(Semaphore::new(0));
+    let profile = default_profile();
+    let profile_id = profile.id.clone();
+    let row = Arc::new(Mutex::new(VersionedProfile {
+        profile,
+        revision: ConfigRevision::from_sha256("stored-revision".into()),
+    }));
+    let profiles = ProfileService::new(
+        Arc::new(DelayedProfileDirectory {
+            release_default: release_default.clone(),
+            selected: Some((row, release_selected.clone())),
+        }),
+        Arc::new(NoPlatformShellFallback),
+    );
     let (runtime, panel, visual) =
         fixture_with_profiles(app, Vec::new(), Vec::new(), Some(profiles));
     update_panel(&panel, visual, |panel, window, cx| {
         panel.begin_create_local_host(None, window, cx)
     });
-    release.add_permits(1);
+    release_default.add_permits(1);
     pump_runtime(&runtime, visual);
     update_panel(&panel, visual, |panel, window, cx| {
         panel
@@ -96,13 +110,13 @@ fn interrupted_explicit_defaults_retain_request_snapshot(app: &mut TestAppContex
             .update(cx, |input, cx| {
                 input.replace_all("--before-request", window, cx)
             });
-        panel.use_default_local_shell(window, cx);
+        panel.use_local_profile(profile_id, cx);
     });
     pump_runtime(&runtime, visual);
     update_panel(&panel, visual, |panel, window, cx| {
         panel.activate_remote_protocol(RemoteProtocol::Ssh, window, cx)
     });
-    release.add_permits(1);
+    release_selected.add_permits(1);
     pump_runtime(&runtime, visual);
     update_panel(&panel, visual, |panel, window, cx| {
         panel.activate_local_host_editor(window, cx);
@@ -116,7 +130,7 @@ fn interrupted_explicit_defaults_retain_request_snapshot(app: &mut TestAppContex
                 input.replace_all("KEEP=after-request", window, cx)
             });
     });
-    release.add_permits(1);
+    release_selected.add_permits(1);
     pump_runtime(&runtime, visual);
     visual.update(|_, app| {
         let panel = panel.read(app);

@@ -171,14 +171,21 @@ pub(super) fn paste_bound_terminal(
 }
 
 impl RootView {
-    /// 只在 WorkspaceTabs 确认自己持有 Tab/Group drag 时取消该 GPUI drag 与边缘滚动，不影响其它组件手势。
+    /// 先取消左栏主机拖动，再处理 WorkspaceTabs；组件确认归属后才停止 GPUI drag。
     ///
     /// @author kongweiguang
-    pub(super) fn cancel_workspace_tab_drag(
+    pub(super) fn cancel_workbench_drag(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.host_navigation.as_ref().is_some_and(|navigation| {
+            navigation.update(cx, |navigation, navigation_cx| {
+                navigation.cancel_host_drag(window, navigation_cx)
+            })
+        }) {
+            return true;
+        }
         self.workspace_tabs_view.update(cx, |tabs, tabs_cx| {
             tabs.cancel_workspace_tab_drag(window, tabs_cx)
         })
@@ -199,7 +206,7 @@ impl RootView {
         if !ime_composing
             && !event.is_held
             && event.keystroke.key.eq_ignore_ascii_case("escape")
-            && self.cancel_workspace_tab_drag(window, cx)
+            && self.cancel_workbench_drag(window, cx)
         {
             self.keybinding_runtime.clear_pending();
             window.prevent_default();

@@ -85,6 +85,7 @@ mod windows_title_bar;
 mod workbench;
 mod workbench_drawers;
 mod workbench_layout;
+mod workbench_motion;
 mod workbench_resize;
 mod workspace_broadcast;
 mod workspace_close;
@@ -859,6 +860,8 @@ pub struct RootView {
     _workspace_tabs_create_subscription: gpui_kit::Subscription,
     /// 名称编辑不发业务事件；观察标签实体变更，让工作台按编辑态即时调整标题栏宽度。
     _workspace_tabs_observer_subscription: gpui_kit::Subscription,
+    /// 视觉进度独立于终端与面板布局，短帧不会改变持久化的尺寸意图。
+    workbench_motion: Entity<workbench_motion::WorkbenchMotion>,
     /// 尺寸 Entity 只负责窗口布局；持久意图仍交给 Preferences 的唯一 settings CAS owner。
     workbench_sidebar_resizable_state: Entity<ResizableState>,
     /// 侧栏宽度参与标题栏定位；只在 Kit 确认一次 resize 后通知 Root 重新读取像素宽度。
@@ -3047,7 +3050,7 @@ impl RootView {
     }
 
     /// 组装窗口级实体与布局状态；右栏与中央文件浏览状态独立，但共用同一服务、传输队列和执行器。
-    /// 字体使用 GPUI 已安装清单，临时抽屉和分隔尺寸随 Root 生命周期保存。
+    /// 字体使用 GPUI 已安装清单，临时抽屉和分隔尺寸随 Root 生命周期保存；动效由独立 Entity 计时。
     /// 宿主收尾事实初始为空，避免把可取消准备阶段误当成服务已停止。
     /// SFTP 导航与创建回投从空身份开始，持久工作区不能恢复已经失效的异步用户意图。
     /// 隐藏设置中的退出确认须重新打开其模态入口，不能只保留不可见的脏稿门禁。
@@ -3083,6 +3086,7 @@ impl RootView {
             }
         });
         let configuration_recovery = services.preferences.recovery_state();
+        let workbench_motion = cx.new(|_| workbench_motion::WorkbenchMotion::default());
         let workbench_sidebar_resizable_state = cx.new(|_| ResizableState::default());
         // ResizableState 的 Resized 事件在拖动结束或程序化尺寸变更后发出，避免每帧轮询并让标题栏同步最新分隔线位置。
         let workbench_sidebar_resize_subscription = cx.subscribe(
@@ -3615,7 +3619,7 @@ impl RootView {
             cx.observe_window_activation(window, |root, window, cx| {
                 if !window.is_window_active() {
                     // 应用失活时提前停止组件拥有的拖动与边缘滚动，GPUI 不会替应用清理 active_drag。
-                    root.cancel_workspace_tab_drag(window, cx);
+                    root.cancel_workbench_drag(window, cx);
                 }
                 root.cancel_unfocused_pane_compositions(window, cx);
                 cx.notify();
@@ -3623,6 +3627,7 @@ impl RootView {
         let root_entity = cx.entity();
         window.on_window_should_close(cx, move |window, cx| {
             root_entity.update(cx, |root, cx| {
+                root.cancel_workbench_drag(window, cx);
                 root.handle_window_close_request(window, cx);
             });
             // 有托盘时隐藏窗口；否则沿统一退出门禁处理，绝不绕过脏状态保护。
@@ -3825,6 +3830,7 @@ impl RootView {
             _workspace_tabs_subscription: workspace_tabs_subscription,
             _workspace_tabs_create_subscription: workspace_tabs_create_subscription,
             _workspace_tabs_observer_subscription: workspace_tabs_observer_subscription,
+            workbench_motion,
             workbench_sidebar_resizable_state,
             _workbench_sidebar_resize_subscription: workbench_sidebar_resize_subscription,
             workbench_sidebar_restore_width: None,
@@ -4709,13 +4715,18 @@ impl RootView {
         self.set_center_panel(CenterPanel::Preferences, window, cx);
     }
 
-    /// 打开设置时撤销旧 pane 聚焦回执，再建立独立焦点边界；关闭后回到同一 Root 句柄也不能复活旧意图。
+    /// 普通设置入口不替换正在编辑的主机；表单内的 Profile 跳转使用同一设置表面。
     ///
     /// @author kongweiguang
     fn open_preferences_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.preferences_modal_open || self.connections_modal_open {
-            return;
+        if !self.preferences_modal_open && !self.connections_modal_open {
+            self.open_preferences_surface(window, cx);
         }
+    }
+
+    /// 建立设置的焦点边界，记住发起入口并保留底层主机草稿。
+    /// @author kongweiguang
+    fn open_preferences_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preferences_panel
             .update(cx, |panel, cx| panel.begin_modal_session(window, cx));
         self.clear_pending_pane_focus();
@@ -4745,7 +4756,7 @@ impl RootView {
     }
 
     /// 通过原 dirty-close gate 后可 flush 独立布局队列；撤下弹层不销毁 owner，也不把未落盘布局视作成功。
-    /// 延迟恢复时让其它模态、Quick Open、退出流程和系统提示保有焦点；管理器恢复只接受真实版本化读回。
+    /// 延迟恢复时返回仍打开的主机表单，其它模态和系统提示继续遵循原有焦点顺序。
     ///
     /// @author kongweiguang
     fn close_preferences_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4777,6 +4788,15 @@ impl RootView {
                 }
                 if root.root_confirmation_owner.is_some() {
                     root.focus_root_confirmation(window, cx);
+                    return;
+                }
+                if root.connections_modal_open && !root.preferences_modal_open {
+                    let modal = &root.connections_modal_focus_handle;
+                    let focus = return_focus
+                        .as_ref()
+                        .filter(|focus| modal.contains(focus, window))
+                        .unwrap_or(modal);
+                    window.focus(focus, cx);
                     return;
                 }
                 if terminal_input_modal_blocked(
@@ -6966,7 +6986,7 @@ impl Render for RootView {
                 cx.listener(|root, event: &gpui_kit::KeyDownEvent, window, cx| {
                     if !event.is_held
                         && event.keystroke.key.eq_ignore_ascii_case("escape")
-                        && root.cancel_workspace_tab_drag(window, cx)
+                        && root.cancel_workbench_drag(window, cx)
                     {
                         root.keybinding_runtime.clear_pending();
                         window.prevent_default();

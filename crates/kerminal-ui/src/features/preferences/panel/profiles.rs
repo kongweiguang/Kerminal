@@ -192,11 +192,11 @@ impl PreferencesPanel {
         self.apply_profile_selection(selection.unwrap_or(None), window, cx);
     }
 
-    /// 向 application 提交完整 typed Profile draft，保存結果回傳的 ID/revision 才建立新基線。
+    /// 只提交已确认的版本链；扫描结果未知时不能用旧列表启动新的 Profile 写入。
     ///
     /// @author kongweiguang
     pub(in crate::features::preferences) fn save_profile(&mut self, cx: &mut Context<Self>) {
-        if self.profile_operation_running {
+        if self.profile_operation_running || self.profile_scan.requires_readback {
             return;
         }
         if self.recovery.mode == ConfigurationMode::ReadOnlyRecovery {
@@ -322,9 +322,10 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 外部 profile 变更冲突时显式重新读取列表，不把旧草稿当成已保存值。
+    /// 显式重新读取用于核对冲突或未知写入；不与扫描或其它 Profile 写入交叉。
     pub(in crate::features::preferences) fn reload_profiles(&mut self, cx: &mut Context<Self>) {
         if self.loading_profiles
+            || self.profile_operation_running
             || self
                 .profile_draft
                 .as_ref()
@@ -460,8 +461,8 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 为保存、删除和默认切换共用受任务 tracker 管理的列表刷新过程。
-    fn load_profiles_again(&mut self, cx: &mut Context<Self>) {
+    /// 变更回执共用受任务 tracker 管理的完整列表刷新，以更新后续操作的 revision。
+    pub(super) fn load_profiles_again(&mut self, cx: &mut Context<Self>) {
         self.loading_profiles = true;
         self.profiles_load_started = true;
         self.spawn_profile_load(cx);
@@ -506,9 +507,9 @@ impl PreferencesPanel {
         self.delete_profile(cx);
     }
 
-    /// 删除使用选中 Profile 的原始 revision；用户新增但未保存的草稿没有删除按钮。
+    /// 删除使用原始 revision，并等待扫描未知写入核对后再操作目录。
     fn delete_profile(&mut self, cx: &mut Context<Self>) {
-        if self.profile_operation_running {
+        if self.profile_operation_running || self.profile_scan.requires_readback {
             return;
         }
         let (Some(id), Some(draft), Some(revision)) = (
@@ -590,9 +591,10 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 切换默认项提交整个 profile revision 集合，保证基础设施可原子维护唯一默认状态。
+    /// 切换默认项需要完整的 revision 集合，扫描写入结果未知时必须先核对目录。
     pub(in crate::features::preferences) fn set_default_profile(&mut self, cx: &mut Context<Self>) {
         if self.profile_operation_running
+            || self.profile_scan.requires_readback
             || self.profile_list_error.is_some()
             || self.loading_profiles
             || self.profile_draft.as_ref().is_some_and(|draft| {

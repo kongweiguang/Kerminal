@@ -258,10 +258,59 @@ fn remote_menu_new_connection_uses_clicked_group(app: &mut TestAppContext) {
         assert_eq!(
             &*events.borrow(),
             &[HostNavigationEvent::CreateHostRequested {
-                group_id: expected_group.map(str::to_owned)
+                group_id: expected_group.map(str::to_owned),
+                group_explicit: true,
             }],
         );
     }
+}
+
+/// 背景“添加连接…”不携带目标分组并标记为非显式，表单才能沿用上次选择；
+/// 行与分组入口始终标记显式，未分组目标不会被默认值改写。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn background_menu_marks_group_not_explicit(app: &mut TestAppContext) {
+    init(app);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let row = super::host("fixture", "fixture.invalid", None, false, &[]);
+    let (_runtime, _navigation, _subscription, visual) = fixture(
+        app,
+        vec![row],
+        Vec::new(),
+        ConfigurationMode::ReadWrite,
+        events.clone(),
+    );
+    draw(visual);
+    // 侧栏底部空白属于背景菜单；树本身没有独立 ElementId，不能按目录元素定位。
+    let target = visual.update(|window, _| {
+        let viewport = window.visual_viewport_bounds();
+        gpui_kit::point(
+            viewport.origin.x + gpui_kit::px(80.),
+            viewport.bottom() - gpui_kit::px(80.),
+        )
+    });
+    visual.simulate_mouse_down(target, MouseButton::Right, Default::default());
+    visual.simulate_mouse_up(target, MouseButton::Right, Default::default());
+    draw(visual);
+    let refresh = crate::locale::text("刷新主机列表", "Refresh hosts").to_string();
+    let add = crate::locale::text("添加连接…", "Add connection…").to_string();
+    let labels = visual.update(|window, _| {
+        gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .filter(|node| node.visible() && node.role() == Some(Role::MenuItem))
+            .filter_map(|node| node.label().map(str::to_owned))
+            .collect::<Vec<_>>()
+    });
+    assert!(labels.contains(&refresh), "空白区右键应打开背景菜单");
+    assert!(labels.contains(&add));
+    click_menu_item(visual, &add);
+    assert_eq!(
+        &*events.borrow(),
+        &[HostNavigationEvent::CreateHostRequested {
+            group_id: None,
+            group_explicit: false,
+        }],
+    );
 }
 
 /// 协议菜单不再提供主机容器入口；SFTP 转 SSH 的点击事件保留被右击的准确主机身份。
@@ -433,7 +482,8 @@ fn local_menu_new_connection_uses_its_displayed_group(app: &mut TestAppContext) 
         assert_eq!(
             &*events.borrow(),
             &[HostNavigationEvent::CreateHostRequested {
-                group_id: expected_group.map(str::to_owned)
+                group_id: expected_group.map(str::to_owned),
+                group_explicit: true,
             }],
         );
     }

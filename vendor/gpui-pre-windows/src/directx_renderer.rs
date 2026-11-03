@@ -513,16 +513,15 @@ impl DirectXRenderer {
             .context("Failed to build RgbaImage from staging readback")
     }
 
-    /// Recreate size-dependent resources and release lazy filter images before resizing the swapchain.
+    /// 仅在交换链和尺寸相关资源均重建成功后确认尺寸，失败时保留旧尺寸供设备恢复。
+    ///
+    /// @author kongweiguang
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
         let width = new_size.width.0.max(1) as u32;
         let height = new_size.height.0.max(1) as u32;
         if self.width == width && self.height == height {
             return Ok(());
         }
-        self.width = width;
-        self.height = height;
-
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
         unsafe { devices.device_context.OMSetRenderTargets(None, None) };
@@ -556,6 +555,8 @@ impl DirectXRenderer {
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
         }
 
+        self.width = width;
+        self.height = height;
         Ok(())
     }
 

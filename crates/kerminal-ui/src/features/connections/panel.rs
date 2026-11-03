@@ -153,6 +153,7 @@ fn editor_validation_focus_handle(
 /// 连接面板只发布带明确 host/target 的事件，Root 不得从当前 Tab 猜测连接目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionsEvent {
+    OpenProfileSettings,
     PickHostFile {
         generation: u64,
         target: HostFilePickerTarget,
@@ -1088,6 +1089,8 @@ pub struct ConnectionsPanel {
     pub(super) conflict_reload_in_progress: Option<ConflictReloadTarget>,
     conflict_reload_generation: u64,
     editor_group_revision: Option<kerminal_domain::preferences::ConfigRevision>,
+    /// 最近一次由用户显式选定的主机分组；新建主机表单只把它当默认值，不写配置、不标记脏状态。
+    last_selected_group: Option<String>,
     host_file_picker_generation: u64,
     pending_host_file_picker: Option<(u64, HostFilePickerTarget)>,
 }
@@ -1203,6 +1206,7 @@ impl ConnectionsPanel {
             conflict_reload_in_progress: None,
             conflict_reload_generation: 0,
             editor_group_revision: None,
+            last_selected_group: None,
             host_file_picker_generation: 0,
             pending_host_file_picker: None,
         };
@@ -2507,15 +2511,18 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 在指定真实分组中创建主机，预选值作为干净草稿初值而非持久化副作用。
+    /// 从具体行或分组入口创建主机：命中分组（含未分组）作为干净草稿初值，不是持久化副作用。
+    /// 替换被拒绝时保留原表单，不预选也不改写用户的草稿分组。
     /// @author kongweiguang
-    pub fn create_host_in_group(
+    pub fn begin_create_host_in_group(
         &mut self,
-        group_id: &str,
+        group_id: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.groups.iter().any(|group| group.id == group_id) {
+        if let Some(group_id) = group_id
+            && !self.groups.iter().any(|group| group.id == group_id)
+        {
             self.status = Some(
                 crate::locale::text(
                     "分组已不存在，请刷新后重试。",
@@ -2526,10 +2533,14 @@ impl ConnectionsPanel {
             self.reload(cx);
             return;
         }
-        self.create_host(window, cx);
-        if let Some(editor) = self.editor.as_mut() {
-            editor.preselect_group(Some(group_id.to_owned()), window, cx);
+        if !self.create_host(window, cx) {
+            return;
         }
+        if let Some(editor) = self.editor.as_mut() {
+            editor.preselect_group(group_id.map(str::to_owned), window, cx);
+        }
+        // 从具体行新建等同于用户显式选定该目标，后续“添加主机”沿用同一默认值。
+        self.last_selected_group = group_id.map(str::to_owned);
         cx.notify();
     }
 
@@ -2690,13 +2701,9 @@ impl ConnectionsPanel {
         }
     }
 
-    /// 按用户明选的目标分组执行 host/group 原子事务，None 明确表示迁移到未分组。
+    /// 删除分组只确认一次；组内主机在同一个配置事务中统一归入未分组，不提供迁移目标。
     /// @author kongweiguang
-    pub fn confirm_group_deletion(
-        &mut self,
-        destination_group_id: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn confirm_group_deletion(&mut self, cx: &mut Context<Self>) {
         if self.configuration_mutation_busy
             || self.recovery.mode == ConfigurationMode::ReadOnlyRecovery
         {
@@ -2705,52 +2712,23 @@ impl ConnectionsPanel {
         let Some(pending) = self.pending_group_deletion.clone() else {
             return;
         };
-        if destination_group_id.as_ref().is_some_and(|destination| {
-            destination == &pending.group_id
-                || !self.groups.iter().any(|group| &group.id == destination)
-        }) {
-            self.status = Some(
-                crate::locale::text(
-                    "迁移目标已失效，请重新选择。",
-                    "The destination group changed. Choose again.",
-                )
-                .to_string(),
-            );
-            self.reload(cx);
-            return;
-        }
         let hosts = self.hosts.clone();
         let executor = self.executor.clone();
-        let destination_for_notice = destination_group_id.clone();
-        let groups_for_notice = self.groups.clone();
         self.configuration_mutation_busy = true;
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |_| async move {
                     hosts
-                        .delete_group(pending.group_id, destination_group_id, pending.revision)
+                        .delete_group(pending.group_id, None, pending.revision)
                         .await
                 })
                 .await;
             cx.update(|app| {
-                let _ = this.update(app, |panel, cx| {
-                    panel.finish_group_deletion(
-                        result,
-                        destination_for_notice,
-                        groups_for_notice,
-                        cx,
-                    )
-                });
+                let _ = this.update(app, |panel, cx| panel.finish_group_deletion(result, cx));
             });
         })
         .detach();
-        self.status = Some(
-            crate::locale::text(
-                "正在迁移主机并删除分组…",
-                "Moving hosts and deleting group…",
-            )
-            .to_string(),
-        );
+        self.status = Some(crate::locale::text("正在删除分组…", "Deleting group…").to_string());
         cx.notify();
     }
 
@@ -3100,14 +3078,12 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 事务回执只更新分组快照和迁移提示；结果未知时由上层读取恢复，不补发事务。
+    /// 事务回执只更新分组快照和未分组提示；结果未知时由上层读取恢复，不补发事务。
     ///
     /// @author kongweiguang
     fn finish_group_deletion(
         &mut self,
         result: Result<HostGroupDeletionReceipt, AppError>,
-        destination: Option<String>,
-        groups_before: Vec<HostGroup>,
         cx: &mut Context<Self>,
     ) {
         self.configuration_mutation_busy = false;
@@ -3116,29 +3092,21 @@ impl ConnectionsPanel {
                 self.pending_group_deletion = None;
                 self.groups = receipt.groups.groups;
                 self.group_revision = receipt.groups.revision;
-                let destination_name = destination
-                    .as_ref()
-                    .and_then(|id| groups_before.iter().find(|group| &group.id == id))
-                    .map(|group| group.name.as_str())
-                    .unwrap_or("未分组");
-                self.status_after_reload = Some(
+                self.status_after_reload = Some(if receipt.reassigned_hosts == 0 {
+                    crate::locale::text("分组已删除。", "Group deleted.").to_string()
+                } else {
                     crate::locale::text(
                         format!(
-                            "分组已删除；{} 台主机已迁移到 {}。",
-                            receipt.reassigned_hosts, destination_name
+                            "分组已删除；{} 台主机已归入未分组。",
+                            receipt.reassigned_hosts
                         ),
                         format!(
-                            "Group deleted; {} hosts moved to {}.",
-                            receipt.reassigned_hosts,
-                            if destination.is_some() {
-                                destination_name
-                            } else {
-                                "ungrouped"
-                            }
+                            "Group deleted; {} hosts are now ungrouped.",
+                            receipt.reassigned_hosts
                         ),
                     )
-                    .to_string(),
-                );
+                    .to_string()
+                });
                 self.reload(cx);
             }
             Err(error)
@@ -3393,13 +3361,14 @@ impl ConnectionsPanel {
     }
 
     /// 创建一个纯表单草稿；已有凭据只显示关联状态，不从加密 vault 回填。
+    /// 返回是否真正打开新草稿，供调用方在替换被拒绝时保留原表单状态。
     /// @author kongweiguang
-    pub(super) fn create_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn create_host(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.refuse_host_editor_replacement(cx) {
-            return;
+            return false;
         }
         self.cancel_sftp_host_creation_intent(cx);
-        self.create_host_with_protocol(RemoteProtocol::Ssh, window, cx);
+        self.create_host_with_protocol(RemoteProtocol::Ssh, window, cx)
     }
 
     /// 复用通用表单构造，只允许明确的 picker 入口覆盖新主机协议默认值。
@@ -3410,9 +3379,9 @@ impl ConnectionsPanel {
         protocol: RemoteProtocol,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if self.refuse_host_editor_replacement(cx) {
-            return;
+            return false;
         }
         self.cancel_local_host_background_requests();
         self.invalidate_host_file_picker();
@@ -3426,12 +3395,22 @@ impl ConnectionsPanel {
             window,
             cx,
         ));
+        // 下拉默认回填上次显式选定的分组，让连续添加减少一次选择；未分组仍是最外层呈现，
+        // 预选只写入表单初值并重置基线，不改变配置，也不会让新表单一开始就是脏状态。
+        let remembered_group = self
+            .last_selected_group
+            .clone()
+            .filter(|group_id| self.groups.iter().any(|group| group.id == *group_id));
+        if let Some(editor) = self.editor.as_mut() {
+            editor.preselect_group(remembered_group, window, cx);
+        }
         self.active_editor_kind = Some(ConnectionsEditorKind::Remote);
         self.pending_new_host_id = None;
         self.editor_group_revision = self.group_revision.clone();
         self.external_conflict = false;
         self.status = None;
         cx.notify();
+        true
     }
 
     /// 为 Root 左栏底部的真实新增入口打开同一连接编辑器，避免暴露或复制草稿构造逻辑。
@@ -3452,9 +3431,12 @@ impl ConnectionsPanel {
         if self.refuse_host_editor_replacement(cx) || self.editor.is_some() || self.saving {
             return false;
         }
-        self.create_host_with_protocol(RemoteProtocol::Sftp, window, cx);
-        self.sftp_host_creation_flow_id = Some(request_id);
-        true
+        if self.create_host_with_protocol(RemoteProtocol::Sftp, window, cx) {
+            self.sftp_host_creation_flow_id = Some(request_id);
+            true
+        } else {
+            false
+        }
     }
 
     /// 放弃专用创建草稿时通知 Root 撤销回投资格，迟到成功只能保留已保存主机。
@@ -5011,6 +4993,8 @@ impl ConnectionsPanel {
                                         .map(|group| group.id.clone());
                                     if let Some(group_id) = created_group_id {
                                         panel.presentation.finish_group_editor();
+                                        // 表单内新建分组就是用户显式指定的目标，后续新建主机默认沿用它。
+                                        panel.last_selected_group = Some(group_id.clone());
                                         match inline_return.editor_kind {
                                             ConnectionsEditorKind::Remote => {
                                                 if let Some(editor) = panel.editor.as_mut() {
@@ -5147,7 +5131,7 @@ impl ConnectionsPanel {
         }
     }
 
-    /// 跨编辑器类型时恢复目标草稿的可见焦点与滚动起点，避免隐藏输入截断 Esc 冒泡。
+    /// 跨编辑器类型时恢复草稿焦点和滚动起点；模板列表沿用配置目录的刷新机制。
     ///
     /// @author kongweiguang
     pub(super) fn activate_local_host_editor(
@@ -5169,9 +5153,6 @@ impl ConnectionsPanel {
                 }
                 self.resume_local_host_default_target(cx);
                 self.focus_editor_primary_input(window, cx);
-            }
-            if self.local_hosts.shell_candidates.is_empty() && !self.local_hosts.shell_loading {
-                self.discover_local_shells(cx);
             }
             cx.notify();
         } else {
@@ -5265,8 +5246,12 @@ impl ConnectionsPanel {
     }
 
     /// 用户显式切换分组时只改变草稿归属，不立即写文件或覆盖另一个配置 revision。
+    /// 同时记住这次选择：下次新建主机时用它做下拉默认值，未分组（None）同样被记住。
     /// @author kongweiguang
     pub(super) fn select_editor_group(&mut self, group_id: Option<String>, cx: &mut Context<Self>) {
+        self.last_selected_group = group_id
+            .clone()
+            .filter(|id| self.groups.iter().any(|group| &group.id == id));
         if let Some(editor) = self.editor.as_mut() {
             editor.selected_group = group_id;
             cx.notify();
