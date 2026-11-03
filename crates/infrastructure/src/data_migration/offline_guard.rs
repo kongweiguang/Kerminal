@@ -23,6 +23,8 @@ const LEGACY_INSTANCE_STATUS_UNKNOWN: &str = "无法确认旧版 Kerminal 是否
 enum ProbeStatus {
     Stopped,
     Running,
+    /// Linux 用错误上下文表达不可判定状态，不构造该变体；其它平台由分类函数产生。
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Unknown,
 }
 

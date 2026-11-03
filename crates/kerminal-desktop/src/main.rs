@@ -520,7 +520,9 @@ fn first_run_window_bounds(cx: &App) -> Option<WindowBounds> {
 /// 验收构建在此登记真实窗口线程的 profiler 句柄，后台退出采样不会猜测 Tokio worker 身份。
 /// 验收窗口可使用独立标题，避免并行工作区把同名窗口误认成自己的目标。
 /// 验收配置错误仅输出固定原因码，预热时长错误也不能回显原始环境值。
+/// macOS 额外持有 activation 发送端，平台条件参数导致计数超过默认上限；组合根仍保留显式注入。
 /// @author kongweiguang
+#[cfg_attr(target_os = "macos", allow(clippy::too_many_arguments))]
 fn run_native_ui(
     services: AppServices,
     #[cfg(target_os = "macos")] activation_sender: ActivationQueueSender,

@@ -52,6 +52,7 @@ fn run_powershell(command: &str) -> Option<std::process::Output> {
 }
 
 /// 使用可用的 fish 验证编码结果；原生进程与 WSL 探测在 Windows 均不得创建控制台窗口。
+/// wsl.exe 在未安装 fish 时仍可启动并返回非零码，必须单独探测，不能把缺工具当成编码失败。
 fn run_fish(command: &str) -> Option<std::process::Output> {
     let mut native = Command::new("fish");
     #[cfg(windows)]
@@ -59,6 +60,18 @@ fn run_fish(command: &str) -> Option<std::process::Output> {
     if let Ok(output) = native.args(["-c", command]).output() {
         return Some(output);
     }
+
+    let mut probe = Command::new("wsl.exe");
+    #[cfg(windows)]
+    probe.creation_flags(0x0800_0000);
+    let available = probe
+        .args(["-e", "fish", "--version"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        return None;
+    }
+
     let mut wsl = Command::new("wsl.exe");
     #[cfg(windows)]
     wsl.creation_flags(0x0800_0000);
