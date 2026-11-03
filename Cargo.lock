@@ -4339,7 +4339,7 @@ dependencies = [
 
 [[package]]
 name = "kerminal-application"
-version = "0.4.0-beta.2"
+version = "0.4.0-beta.3"
 dependencies = [
  "async-trait",
  "kerminal-domain",
@@ -4362,7 +4362,7 @@ dependencies = [
 
 [[package]]
 name = "kerminal-desktop"
-version = "0.4.0-beta.2"
+version = "0.4.0-beta.3"
 dependencies = [
  "async-trait",
  "dirs 6.0.0",
@@ -4395,7 +4395,7 @@ dependencies = [
 
 [[package]]
 name = "kerminal-domain"
-version = "0.4.0-beta.2"
+version = "0.4.0-beta.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -4404,7 +4404,7 @@ dependencies = [
 
 [[package]]
 name = "kerminal-infrastructure"
-version = "0.4.0-beta.2"
+version = "0.4.0-beta.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4460,7 +4460,7 @@ dependencies = [
 
 [[package]]
 name = "kerminal-mcp"
-version = "0.4.0-beta.2"
+version = "0.4.0-beta.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -4480,7 +4480,7 @@ dependencies = [
 
 [[package]]
 name = "kerminal-terminal"
-version = "0.4.0-beta.2"
+version = "0.4.0-beta.3"
 dependencies = [
  "alacritty_terminal",
  "kerminal-domain",
@@ -4490,7 +4490,7 @@ dependencies = [
 
 [[package]]
 name = "kerminal-ui"
-version = "0.4.0-beta.2"
+version = "0.4.0-beta.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -11049,7 +11049,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.4.0-beta.2"
+version = "0.4.0-beta.3"
 dependencies = [
  "regex",
  "serde_json",
