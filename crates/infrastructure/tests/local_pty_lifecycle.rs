@@ -10,9 +10,11 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(windows)]
+use kerminal_application::sessions::ShellCommandUnknownReason;
 use kerminal_application::sessions::{
     CreateSessionRequest, PlainTextSnapshotRequest, SessionFilter, SessionService,
-    ShellCommandOutcome, ShellCommandRequest, ShellCommandUnknownReason,
+    ShellCommandOutcome, ShellCommandRequest,
 };
 use kerminal_domain::connections::RemoteShellDialect;
 use kerminal_domain::identity::SessionId;

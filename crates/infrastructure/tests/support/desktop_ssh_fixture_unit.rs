@@ -24,7 +24,7 @@ impl TemporaryDirectory {
             "kerminal-ssh-fixture-boundary-{}-{nonce}",
             std::process::id()
         ));
-        fs::create_dir(&path).expect("create isolated fixture test directory");
+        fs::create_dir_all(&path).expect("create isolated fixture test directory");
         Self(path)
     }
 

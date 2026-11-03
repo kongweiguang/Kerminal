@@ -90,7 +90,7 @@ async fn rejects_import_symlink() {
     symlink(&source, &link).expect("create symlink");
 
     let result = SystemSnippetTransferFileAdapter
-        .read_import_file(PathBuf::from(link), 128, CancellationToken::new())
+        .read_import_file(link, 128, CancellationToken::new())
         .await;
 
     assert!(result.is_err());
