@@ -895,7 +895,7 @@ fn current_runtime_target_path() -> Option<PathBuf> {
         {
             return None;
         }
-        return Some(executable);
+        Some(executable)
     }
     #[cfg(windows)]
     {

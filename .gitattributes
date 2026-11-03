@@ -1,3 +1,6 @@
 # @author kongweiguang
 # 内嵌脚本原样进入本地/SSH shell，禁止 Windows checkout 注入 CRLF。
 /crates/infrastructure/src/shell_integration/scripts/* text eol=lf
+# 冻结的配置指南与历史 fixture 按字节比较摘要，检出必须保持 LF。
+/crates/application/resources/config-guide.md text eol=lf
+/tests/fixtures/configuration/* text eol=lf

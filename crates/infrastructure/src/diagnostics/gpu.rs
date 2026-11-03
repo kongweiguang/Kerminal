@@ -492,10 +492,9 @@ fn value_to_bytes(value: &serde_json::Value) -> Option<u64> {
         (value.trim(), 1024_u64.pow(3))
     } else if let Some(value) = lower.strip_suffix(" mb") {
         (value.trim(), 1024_u64.pow(2))
-    } else if let Some(value) = lower.strip_suffix(" kb") {
-        (value.trim(), 1024_u64)
     } else {
-        return None;
+        let value = lower.strip_suffix(" kb")?;
+        (value.trim(), 1024_u64)
     };
     let number = number.parse::<f64>().ok()?;
     (number.is_finite() && number >= 0.0).then(|| (number * multiplier as f64).round() as u64)

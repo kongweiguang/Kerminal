@@ -58,6 +58,14 @@ fn edit<'a>(edits: &'a [FileEdit], relative_path: &str) -> Option<&'a FileEdit> 
         .find(|edit| edit.relative_path == std::path::Path::new(relative_path))
 }
 
+/// 冻结正文先归一为 LF 再构造 CRLF 变体；Windows 检出把常量写成 CRLF 时不能产生双回车。
+///
+/// @author kongweiguang
+fn guide_newline_variants(text: &str) -> [String; 2] {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    [normalized.clone(), normalized.replace('\n', "\r\n")]
+}
+
 /// 首次使用时无配置仍为空计划，且 dry-run 不创建根目录或生成指南。
 ///
 /// @author kongweiguang
@@ -994,10 +1002,7 @@ fn frozen_revision_five_guides_are_planned_for_current_upgrade() {
     let digest = configuration::config_guide_digest(REVISION_5_GUIDE);
     assert_eq!(digest, super::CONFIG_GUIDE_REVISION_5_SHA256);
 
-    for body in [
-        REVISION_5_GUIDE.to_owned(),
-        REVISION_5_GUIDE.replace('\n', "\r\n"),
-    ] {
+    for body in guide_newline_variants(REVISION_5_GUIDE) {
         for marked in [false, true] {
             let original = if marked {
                 format!(
@@ -1031,10 +1036,7 @@ fn frozen_revision_six_guides_are_planned_for_current_upgrade() {
     let digest = configuration::config_guide_digest(REVISION_6_GUIDE);
     assert_eq!(digest, super::CONFIG_GUIDE_REVISION_6_SHA256);
 
-    for body in [
-        REVISION_6_GUIDE.to_owned(),
-        REVISION_6_GUIDE.replace('\n', "\r\n"),
-    ] {
+    for body in guide_newline_variants(REVISION_6_GUIDE) {
         for marked in [false, true] {
             let original = if marked {
                 format!(
@@ -1068,10 +1070,7 @@ fn frozen_revision_seven_guides_are_planned_for_current_upgrade() {
     let digest = configuration::config_guide_digest(REVISION_7_GUIDE);
     assert_eq!(digest, super::CONFIG_GUIDE_REVISION_7_SHA256);
 
-    for body in [
-        REVISION_7_GUIDE.to_owned(),
-        REVISION_7_GUIDE.replace('\n', "\r\n"),
-    ] {
+    for body in guide_newline_variants(REVISION_7_GUIDE) {
         for marked in [false, true] {
             let original = if marked {
                 format!(
@@ -1105,10 +1104,7 @@ fn frozen_revision_eight_guides_are_planned_for_current_upgrade() {
     let digest = configuration::config_guide_digest(REVISION_8_GUIDE);
     assert_eq!(digest, super::CONFIG_GUIDE_REVISION_8_SHA256);
 
-    for body in [
-        REVISION_8_GUIDE.to_owned(),
-        REVISION_8_GUIDE.replace('\n', "\r\n"),
-    ] {
+    for body in guide_newline_variants(REVISION_8_GUIDE) {
         for marked in [false, true] {
             let original = if marked {
                 format!(
@@ -1142,10 +1138,7 @@ fn frozen_revision_nine_guides_are_planned_for_current_upgrade() {
     let digest = configuration::config_guide_digest(REVISION_9_GUIDE);
     assert_eq!(digest, super::CONFIG_GUIDE_REVISION_9_SHA256);
 
-    for body in [
-        REVISION_9_GUIDE.to_owned(),
-        REVISION_9_GUIDE.replace('\n', "\r\n"),
-    ] {
+    for body in guide_newline_variants(REVISION_9_GUIDE) {
         for marked in [false, true] {
             let original = if marked {
                 format!(
@@ -1179,10 +1172,7 @@ fn frozen_revision_ten_guides_are_planned_for_current_upgrade() {
     let digest = configuration::config_guide_digest(REVISION_10_GUIDE);
     assert_eq!(digest, super::CONFIG_GUIDE_REVISION_10_SHA256);
 
-    for body in [
-        REVISION_10_GUIDE.to_owned(),
-        REVISION_10_GUIDE.replace('\n', "\r\n"),
-    ] {
+    for body in guide_newline_variants(REVISION_10_GUIDE) {
         for marked in [false, true] {
             let original = if marked {
                 format!(

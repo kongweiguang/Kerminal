@@ -54,7 +54,7 @@ jobs:
             libx11-dev libx11-xcb-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev \
             libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libegl1-mesa-dev
+            libegl1-mesa-dev libudev-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

@@ -200,6 +200,7 @@ async fn managed_process_tree_spawn_reaps_successful_child() {
 }
 
 /// 确认 PATH 搜索按候选目录和名称顺序选择真实可执行文件。
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn executable_probe_uses_ordered_directories() {
     let first = temporary_directory();
@@ -219,6 +220,7 @@ fn executable_probe_uses_ordered_directories() {
 }
 
 /// 在 Unix 测试文件上设置执行权限，使探测规则与 FreeRDP 启动要求一致。
+#[cfg(any(windows, target_os = "linux"))]
 fn mark_executable(path: &Path) {
     #[cfg(unix)]
     {

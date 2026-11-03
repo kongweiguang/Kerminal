@@ -262,6 +262,10 @@ fn resolve_freerdp_client() -> AppResult<PathBuf> {
 }
 
 /// 只按 PATH 的文件名与可执行权限探测，不通过 shell 或输出解析执行外部程序。
+/// macOS 使用系统 `open` 启动 RDP，不参与路径探测。
+///
+/// @author kongweiguang
+#[cfg(any(windows, target_os = "linux"))]
 fn find_executable_in_path(names: &[&str]) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let directories = std::env::split_paths(&path).collect::<Vec<_>>();
@@ -269,6 +273,10 @@ fn find_executable_in_path(names: &[&str]) -> Option<PathBuf> {
 }
 
 /// 在给定目录顺序中返回第一个实际可执行文件，隔离测试也复用同一探测规则。
+/// 仅由 Windows / Linux 客户端解析使用，macOS 不编译该探测。
+///
+/// @author kongweiguang
+#[cfg(any(windows, target_os = "linux"))]
 pub(super) fn find_executable_in<'a>(
     directories: impl IntoIterator<Item = &'a Path>,
     names: &[&str],
@@ -282,6 +290,9 @@ pub(super) fn find_executable_in<'a>(
 }
 
 /// Windows 检查文件存在，Unix 还要求至少一个执行位，避免把不可启动文件当作客户端。
+///
+/// @author kongweiguang
+#[cfg(any(windows, target_os = "linux"))]
 pub(super) fn is_runnable_file(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
