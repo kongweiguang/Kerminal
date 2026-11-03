@@ -1,0 +1,37 @@
+# @author kongweiguang
+name: Tauri maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Run legacy quality checks or rebuild an existing Tauri release."
+        required: true
+        type: choice
+        default: quality
+        options:
+          - quality
+          - release
+      version:
+        description: "Existing Tauri release tag, required for release (for example v0.3.48)."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    if: inputs.task == 'quality'
+    uses: kongweiguang/Kerminal/.github/workflows/quality.yml@tauri
+    with:
+      ref: tauri
+
+  release:
+    if: inputs.task == 'release'
+    permissions:
+      contents: write
+    uses: kongweiguang/Kerminal/.github/workflows/release.yml@tauri
+    with:
+      version: ${{ inputs.version }}
+    secrets: inherit

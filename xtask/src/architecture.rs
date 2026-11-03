@@ -250,6 +250,7 @@ fn is_pinned_legacy_workspace_decoder(root: &Path, candidate: &Path) -> bool {
 /// 按文件名和源码扩展名识别前端构建入口，不扫描文件内容中的普通文本。
 fn collect_legacy_web_inputs(directory: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
     const EXCLUDED_DIRECTORIES: &[&str] = &[
+        ".agents",
         ".codegraph",
         ".git",
         ".updeng",
