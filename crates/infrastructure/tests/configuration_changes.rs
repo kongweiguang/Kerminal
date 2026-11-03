@@ -224,5 +224,6 @@ async fn wait_for_changed_configuration_path(
         }
     })
     .await
-    .map_err(|_| "真实片段写入后未收到对应路径的变化通知".to_owned())
+    .map_err(|_| "真实片段写入后未收到对应路径的变化通知".to_owned())?;
+    Ok(())
 }

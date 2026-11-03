@@ -14,14 +14,19 @@ struct TemporaryDirectory(PathBuf);
 
 impl TemporaryDirectory {
     /// 测试使用独立临时目录，避免并行执行时共享 fixture 或触碰验收数据。
+    /// 纳秒时间戳在 Windows 上精度有限，追加进程内序号保证并行测试不会拿到同一路径。
     /// @author kongweiguang
     fn new() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after UNIX epoch")
             .as_nanos();
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "kerminal-ssh-fixture-boundary-{}-{nonce}",
+            "kerminal-ssh-fixture-boundary-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create isolated fixture test directory");

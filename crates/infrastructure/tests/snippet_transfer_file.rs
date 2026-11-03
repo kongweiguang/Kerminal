@@ -4,9 +4,6 @@
 
 use std::fs;
 
-#[cfg(unix)]
-use std::path::PathBuf;
-
 use kerminal_application::commands::{SnippetTransferFileConfirmation, SnippetTransferFilePort};
 use kerminal_infrastructure::commands::SystemSnippetTransferFileAdapter;
 use tempfile::tempdir;
