@@ -201,7 +201,7 @@ async fn wait_for_changed_configuration_path(
     expected_path: &str,
 ) -> Result<(), String> {
     let cancellation = CancellationToken::new();
-    let received = tokio::time::timeout(Duration::from_secs(8), async {
+    tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             match subscription.recv(cancellation.clone()).await {
                 ConfigurationChangeMessage::Changed(event)
@@ -224,6 +224,5 @@ async fn wait_for_changed_configuration_path(
         }
     })
     .await
-    .map_err(|_| "真实片段写入后未收到对应路径的变化通知".to_owned())?;
-    received
+    .map_err(|_| "真实片段写入后未收到对应路径的变化通知".to_owned())
 }

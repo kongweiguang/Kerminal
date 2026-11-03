@@ -161,8 +161,10 @@ impl ProcessExitProbe {
     }
 
     /// 用固定进程对象的非阻塞 wait 查询存活状态，不重新解析 PID。
+    /// 仅 Windows 测试通过该句柄查询；Unix 走独立 blocking PID 探测，不经过此方法。
     ///
     /// @author kongweiguang
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn is_running(&self) -> Result<bool> {
         #[cfg(windows)]
         {
