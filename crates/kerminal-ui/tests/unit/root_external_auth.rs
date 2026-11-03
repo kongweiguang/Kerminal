@@ -37,7 +37,8 @@ use kerminal_application::{
     preferences::{
         ConfigurationRepository, DefaultLocalShellProvider, PreferencesService, ProfileDraft,
         ProfileRepository, ProfileRevision, ProfileService, SettingsRepository, SettingsSnapshot,
-        VersionedProfile, VersionedSettings, settings::ExternalLaunchSettings,
+        ToolRailPanelPlacement, VersionedProfile, VersionedSettings,
+        settings::ExternalLaunchSettings,
     },
     sessions::{
         CreateSessionRequest, PlainTextSnapshot, PlainTextSnapshotRequest, RenderSnapshot,
@@ -2665,4 +2666,81 @@ fn transfer_endpoint_changes_wait_for_cas_and_cannot_revive_closed_tab(app: &mut
         })
     });
     settle(&runtime, visual);
+}
+
+/// 真实挂载紧凑文件栏并断言文件行占满宿主正文；三种非右栏方向共享同一验证。
+///
+/// @author kongweiguang
+fn assert_compact_files_placement_keeps_rows(
+    app: &mut TestAppContext,
+    placement: ToolRailPanelPlacement,
+    minimum_list_height: f32,
+) {
+    use gpui_kit::{px, size};
+    use kerminal_application::preferences::ToolRailToolId;
+
+    let (runtime, _file_runtime, root, _pane, _directory, _entry, visual) =
+        compact_editor_fixture(app);
+    visual.simulate_resize(size(px(1440.), px(900.)));
+    file_support::draw(visual);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            let mut settings = SettingsSnapshot::default();
+            settings
+                .tool_rail
+                .panel_placements
+                .insert(ToolRailToolId::Sftp, placement);
+            root.settings_snapshot = Some(settings);
+            root.remap_tool_rail_settings(cx);
+        });
+        window.draw(app).clear(app);
+    });
+    file_support::draw(visual);
+
+    let list = visual
+        .debug_bounds("files-browser-list-1")
+        .unwrap_or_else(|| panic!("{placement:?} did not mount the file list"));
+    assert!(
+        list.size.height > px(minimum_list_height),
+        "{placement:?} collapsed the file browser: {list:?}"
+    );
+    let row = visual
+        .debug_bounds("files-row-1-next.txt")
+        .unwrap_or_else(|| panic!("{placement:?} did not lay out file rows"));
+    assert!(
+        row.origin.y >= list.origin.y && row.bottom() <= list.bottom(),
+        "file row escaped the list in {placement:?}: row={row:?}, list={list:?}"
+    );
+    let transfer_header = visual
+        .debug_bounds("rr-files-transfer-history")
+        .expect("transfer header stays mounted");
+    assert!(
+        transfer_header.origin.y >= list.bottom(),
+        "transfer header must follow the file list in {placement:?}: header={transfer_header:?}, list={list:?}"
+    );
+    let _runtime = runtime;
+}
+
+/// 左侧停靠必须与右栏使用同一满高宿主，不能把文件正文压成横向工具栏高度。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn left_tool_panel_host_preserves_compact_files_browser_height(app: &mut TestAppContext) {
+    assert_compact_files_placement_keeps_rows(app, ToolRailPanelPlacement::Left, 240.);
+}
+
+/// 底部停靠按可读下限分配高度，保留文件行和传输条，不让工具栏吃掉正文。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn bottom_tool_panel_host_preserves_compact_files_browser_height(app: &mut TestAppContext) {
+    assert_compact_files_placement_keeps_rows(app, ToolRailPanelPlacement::Bottom, 100.);
+}
+
+/// 浮窗宿主由外层几何提供确定高度，文件正文仍要占满除工具栏外的剩余空间。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn floating_tool_panel_host_preserves_compact_files_browser_height(app: &mut TestAppContext) {
+    assert_compact_files_placement_keeps_rows(app, ToolRailPanelPlacement::Center, 240.);
 }

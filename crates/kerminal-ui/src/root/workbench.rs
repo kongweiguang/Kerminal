@@ -53,6 +53,8 @@ const LEFT_TOOL_PANEL_MIN_WIDTH: f32 = 300.0;
 const ATTACHED_DOCK_MAX_WIDTH: f32 = 1_360.0;
 const WORKBENCH_PANEL_GUTTER: f32 = 4.0;
 const WORKBENCH_TITLE_BAR_HEIGHT: f32 = 36.0;
+/// 紧凑文件栏含两行工具栏、列头和传输条；低于该高度时正文只剩一行，底部停靠按可用空间夹紧。
+const FILES_BOTTOM_TOOL_MIN_HEIGHT: f32 = 320.0;
 
 pub(super) use super::workbench_layout::{RESIZABLE_EDGE_GUTTER, TOOL_RAIL_WIDTH};
 
@@ -142,6 +144,45 @@ pub(super) struct ToolRailPanelSlots {
     pub(super) left: Option<ToolRailToolId>,
     pub(super) bottom: Option<ToolRailToolId>,
     pub(super) center: Option<ToolRailToolId>,
+}
+
+/// Agent 终端只跟随唯一实际挂载的 Agent Launcher 宿主，不能因换了停靠方向就消失。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentTerminalHost {
+    Attached,
+    Left,
+    Bottom,
+    Center,
+    Drawer,
+}
+
+/// 一个工具只投影到一个方向；紧凑布局只挂载抽屉，宽布局按实际槽位决定终端归属。
+/// 右栏收起时 attached 不挂载，终端也不能在不可见宿主里继续持有焦点和搜索遮罩。
+///
+/// @author kongweiguang
+fn resolve_agent_terminal_host(
+    compact_panels: bool,
+    compact_drawer_visible: bool,
+    compact_active_tool: Option<ToolRailToolId>,
+    panels: ToolRailPanelSlots,
+    right_dock_collapsed: bool,
+) -> Option<AgentTerminalHost> {
+    if compact_panels {
+        return (compact_drawer_visible
+            && compact_active_tool == Some(ToolRailToolId::AgentLauncher))
+        .then_some(AgentTerminalHost::Drawer);
+    }
+    if panels.attached == Some(ToolRailToolId::AgentLauncher) && !right_dock_collapsed {
+        Some(AgentTerminalHost::Attached)
+    } else if panels.left == Some(ToolRailToolId::AgentLauncher) {
+        Some(AgentTerminalHost::Left)
+    } else if panels.bottom == Some(ToolRailToolId::AgentLauncher) {
+        Some(AgentTerminalHost::Bottom)
+    } else if panels.center == Some(ToolRailToolId::AgentLauncher) {
+        Some(AgentTerminalHost::Center)
+    } else {
+        None
+    }
 }
 
 /// 工作台只消费已归一的入口与面板宿主，不负责创建或销毁业务 Entity。
@@ -1156,7 +1197,7 @@ fn panel_slot_mut(
 /// 持久尺寸只由真实拖动结束回调提交，固定槽程序恢复与响应式夹紧不参与 settings 写入。
 /// 折叠侧栏复用标题栏唯一展开入口，正文不保留窄轨；设置仍可从展开后的侧栏或快捷键进入。
 /// 终端下方不保留常驻状态条，必要状态改用可关闭的浮层提示，不占用终端高度。
-/// Agent 终端可见时 launcher 仅按头部与恢复/错误反馈定高，终端独占 Dock 的剩余高度；无终端时入口继续填满并居中。
+/// Agent 终端可见时 launcher 仅按头部与恢复/错误反馈定高，终端独占所在停靠宿主的剩余高度；无终端时入口继续填满并居中。
 /// 搜索按实际可见宿主挂起或恢复，状态位避免重绘反复重启防抖，恢复查询不获取焦点。
 /// Center 浮窗独立于终端和 Rail，拖动坐标受 Shell 边界约束且不设遮罩或焦点陷阱。
 /// 绘制与首次激活共用只读视口投影；主机栏展开也按展开后的预算打开抽屉，不能只挤走工具却不显示目录。
@@ -1308,6 +1349,16 @@ pub(super) fn render_workbench(
         layout_plan.compact_width && root.compact_host_drawer_open && !compact_drawer_blocked;
     let show_compact_tool_drawer =
         should_show_active_compact_tool && root.compact_tool_drawer_open && !compact_drawer_blocked;
+    let agent_terminal_host = resolve_agent_terminal_host(
+        compact_panels,
+        show_compact_tool_drawer,
+        compact_active_tool,
+        panels,
+        root.right_dock_collapsed,
+    );
+    let agent_terminal_visible = agent_terminal_host.is_some() && agent_terminal_content.is_some();
+    // 终端内容只能交给唯一宿主；其余分支显式跳过，避免重复挂载同一 Canvas。
+    let mut agent_terminal_content = agent_terminal_content;
 
     let title_brand = div()
         .id("workbench-title-brand")
@@ -1511,6 +1562,18 @@ pub(super) fn render_workbench(
         .flatten()
         .map(|tool| {
             let content = renderers.take_for(tool);
+            let content = if tool == ToolRailToolId::AgentLauncher
+                && agent_terminal_host == Some(AgentTerminalHost::Left)
+            {
+                agent_launcher_tool_panel(
+                    content,
+                    agent_terminal_content.take(),
+                    terminal_header_background,
+                )
+            } else {
+                content
+            };
+            // 左栏与右栏共用满高、满宽和面板底色；缺一都会让内部 flex_1 正文失去已分配高度。
             div()
                 .id("workbench-tool-panel-left-host")
                 .on_key_down(cx.listener(move |root, event, window, cx| {
@@ -1522,8 +1585,13 @@ pub(super) fn render_workbench(
                         cx,
                     );
                 }))
+                .w_full()
                 .h_full()
                 .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(theme.tool_panel_surface)
                 .child(workbench_tool_panel_slot(
                     "workbench-tool-panel-left",
                     content,
@@ -1759,6 +1827,17 @@ pub(super) fn render_workbench(
             center_column = center_column.child(center_content_slot);
         } else {
             let content = renderers.take_for(tool);
+            let content = if tool == ToolRailToolId::AgentLauncher
+                && agent_terminal_host == Some(AgentTerminalHost::Bottom)
+            {
+                agent_launcher_tool_panel(
+                    content,
+                    agent_terminal_content.take(),
+                    terminal_header_background,
+                )
+            } else {
+                content
+            };
             let bottom_panel = div()
                 .id("workbench-tool-panel-bottom-host")
                 .on_key_down(cx.listener(move |root, event, window, cx| {
@@ -1774,6 +1853,7 @@ pub(super) fn render_workbench(
                 .flex()
                 .flex_col()
                 .overflow_hidden()
+                .bg(theme.tool_panel_surface)
                 .child(workbench_tool_panel_slot(
                     "workbench-tool-panel-bottom",
                     content,
@@ -1781,6 +1861,8 @@ pub(super) fn render_workbench(
             let max_height = layout_plan
                 .bottom_panel_max_height
                 .max(workbench_layout::BOTTOM_TOOL_MIN_HEIGHT);
+            // 响应式下限只保证当前工具可读，不写回用户持久高度；小窗口仍按真实预算夹紧。
+            let min_height = bottom_tool_min_height(tool).min(max_height);
             let preferred_height = root
                 .workbench_bottom_resizable_state
                 .read(cx)
@@ -1794,7 +1876,7 @@ pub(super) fn render_workbench(
                 })
                 .unwrap_or(px(240.))
                 .as_f32()
-                .clamp(workbench_layout::BOTTOM_TOOL_MIN_HEIGHT, max_height);
+                .clamp(min_height, max_height);
             let stack = v_resizable("workbench-bottom-tool-split")
                 .with_state(&root.workbench_bottom_resizable_state)
                 .preserve_panel_size_on_container_resize(1)
@@ -1822,7 +1904,7 @@ pub(super) fn render_workbench(
                     resizable_panel()
                         .size(px(preferred_height))
                         // 固定范围保留大高度首选；容器策略临时让出中心最小高度，而不截断持久目标。
-                        .size_range(px(workbench_layout::BOTTOM_TOOL_MIN_HEIGHT)..px(4_000.))
+                        .size_range(px(min_height)..px(4_000.))
                         .flex_none()
                         .child(bottom_panel),
                 );
@@ -1974,9 +2056,6 @@ pub(super) fn render_workbench(
             },
         )
         .child(rail_bottom);
-    let has_agent_terminal = agent_terminal_content.is_some();
-    let show_agent_terminal =
-        has_agent_terminal && panels.attached == Some(ToolRailToolId::AgentLauncher);
     let mut agent_dock = div()
         .id("workbench-agent-dock")
         .on_key_down(cx.listener({
@@ -2000,37 +2079,23 @@ pub(super) fn render_workbench(
     if let Some(tool) = panels.attached {
         let content = renderers.take_for(tool);
         let panel_slot = if tool == ToolRailToolId::AgentLauncher {
-            let mut launcher = div()
-                .id("workbench-agent-launcher-panel-host")
-                .w_full()
-                .flex()
-                .flex_col()
-                .overflow_hidden();
-            if show_agent_terminal {
-                // 运行态 chrome 不能与 Canvas 平分 Dock；保留恢复与错误反馈的内容高度，其余交给终端。
-                launcher = launcher.min_h(px(40.)).overflow_y_scroll();
-            } else {
-                launcher = launcher.flex_1().min_h(px(0.));
-            }
-            launcher.child(content).into_any_element()
+            // 紧凑抽屉复用 attached 实体时，终端必须随实体一起进入抽屉，不能在别处提前消费。
+            let include_terminal = agent_terminal_host == Some(AgentTerminalHost::Attached)
+                || (agent_terminal_host == Some(AgentTerminalHost::Drawer)
+                    && panels.attached == Some(ToolRailToolId::AgentLauncher));
+            agent_launcher_tool_panel(
+                content,
+                if include_terminal {
+                    agent_terminal_content.take()
+                } else {
+                    None
+                },
+                terminal_header_background,
+            )
         } else {
             workbench_tool_panel_slot("workbench-tool-panel-attached", content).into_any_element()
         };
         agent_dock = agent_dock.child(panel_slot);
-    }
-    if let Some(agent_terminal) = agent_terminal_content.filter(|_| show_agent_terminal) {
-        agent_dock = agent_dock.child(
-            div()
-                .id("workbench-agent-terminal-slot")
-                .w_full()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .bg(terminal_header_background)
-                .child(agent_terminal),
-        );
     }
     let mut agent_dock_element = Some(agent_dock.into_any_element());
 
@@ -2079,17 +2144,10 @@ pub(super) fn render_workbench(
         center_column.into_any_element()
     };
 
-    let dock_is_visible = !compact_panels
-        && !root.right_dock_collapsed
-        && (panels.attached.is_some() || show_agent_terminal);
+    let dock_is_visible =
+        !compact_panels && !root.right_dock_collapsed && panels.attached.is_some();
     root.reconcile_workspace_search_visibility(cx);
-    root.reconcile_agent_search_visibility(
-        show_agent_terminal
-            && (dock_is_visible
-                || show_compact_tool_drawer
-                    && compact_active_tool == Some(ToolRailToolId::AgentLauncher)),
-        cx,
-    );
+    root.reconcile_agent_search_visibility(agent_terminal_visible, cx);
     let dock_tool = panels.attached.unwrap_or(ToolRailToolId::AgentLauncher);
     let dock_default_width = attached_dock_default_width(viewport.width.as_f32());
     if root
@@ -2496,6 +2554,18 @@ pub(super) fn render_workbench(
             )
             .into_any_element()
         };
+        let content = if tool == ToolRailToolId::AgentLauncher
+            && agent_terminal_host == Some(AgentTerminalHost::Drawer)
+            && panels.attached != Some(tool)
+        {
+            agent_launcher_tool_panel(
+                content,
+                agent_terminal_content.take(),
+                terminal_header_background,
+            )
+        } else {
+            content
+        };
         workbench_body = workbench_body.child(
             div()
                 .absolute()
@@ -2523,6 +2593,17 @@ pub(super) fn render_workbench(
 
     if let Some(tool) = super::tool_panels::expanded_center_tool_panel(panels, compact_panels) {
         let content = renderers.take_for(tool);
+        let content = if tool == ToolRailToolId::AgentLauncher
+            && agent_terminal_host == Some(AgentTerminalHost::Center)
+        {
+            agent_launcher_tool_panel(
+                content,
+                agent_terminal_content.take(),
+                terminal_header_background,
+            )
+        } else {
+            content
+        };
         let close_label = crate::locale::text("关闭工具面板", "Close tool panel");
         let drag_tooltip = crate::locale::text(
             "拖动工具浮窗；方向键可微调位置",
@@ -3392,6 +3473,64 @@ fn render_workbench_feedback(
     }
 
     Some(feedback.into_any_element())
+}
+
+/// 底部宿主最小高度按内容密度区分；文件栏需要完整工具栏和传输条，不能压到单行正文。
+/// 返回值仍由调用方按本次视口的最大可用高度夹紧，不覆盖用户持久高度。
+///
+/// @author kongweiguang
+fn bottom_tool_min_height(tool: ToolRailToolId) -> f32 {
+    if tool == ToolRailToolId::Sftp {
+        FILES_BOTTOM_TOOL_MIN_HEIGHT
+    } else {
+        workbench_layout::BOTTOM_TOOL_MIN_HEIGHT
+    }
+}
+
+/// 四种停靠宿主共用的 Agent 栈：运行态只让入口区按内容定高，终端独占剩余空间。
+/// 无终端时入口填满宿主，避免换了停靠方向后只留下一条标题。
+///
+/// @author kongweiguang
+fn agent_launcher_tool_panel(
+    content: AnyElement,
+    terminal: Option<AnyElement>,
+    terminal_header_background: gpui_kit::Hsla,
+) -> AnyElement {
+    let terminal_attached = terminal.is_some();
+    let mut launcher = div()
+        .id("workbench-agent-launcher-panel-host")
+        .w_full()
+        .flex()
+        .flex_col()
+        .overflow_hidden();
+    if terminal_attached {
+        // 运行态 chrome 不能与 Canvas 平分宿主；恢复与错误反馈保留内容高度并可滚动。
+        launcher = launcher.min_h(px(40.)).overflow_y_scroll();
+    } else {
+        launcher = launcher.flex_1().min_h(px(0.));
+    }
+    let mut slot = div()
+        .w_full()
+        .h_full()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .child(launcher.child(content));
+    if let Some(terminal) = terminal {
+        slot = slot.child(
+            div()
+                .id("workbench-agent-terminal-slot")
+                .w_full()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(terminal_header_background)
+                .child(terminal),
+        );
+    }
+    slot.into_any_element()
 }
 
 /// 让面板直接占满宿主；工具自身标题和被选中的 Rail 入口已提供身份与关闭路径。

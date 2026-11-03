@@ -1111,3 +1111,140 @@ mod windows_title_bar_hitboxes {
         assert_eq!(controls[2].size.width.as_f32(), 34.);
     }
 }
+
+/// Agent 终端必须跟随唯一实际挂载的 Launcher 宿主，换到左/底/浮窗或窄窗抽屉都不能丢失。
+///
+/// @author kongweiguang
+#[test]
+fn agent_terminal_follows_every_launcher_dock_and_compact_drawer() {
+    use crate::root::workbench::{AgentTerminalHost, resolve_agent_terminal_host};
+
+    let launcher = ToolRailToolId::AgentLauncher;
+    for (panels, expected) in [
+        (
+            ToolRailPanelSlots {
+                attached: Some(launcher),
+                ..ToolRailPanelSlots::default()
+            },
+            Some(AgentTerminalHost::Attached),
+        ),
+        (
+            ToolRailPanelSlots {
+                left: Some(launcher),
+                ..ToolRailPanelSlots::default()
+            },
+            Some(AgentTerminalHost::Left),
+        ),
+        (
+            ToolRailPanelSlots {
+                bottom: Some(launcher),
+                ..ToolRailPanelSlots::default()
+            },
+            Some(AgentTerminalHost::Bottom),
+        ),
+        (
+            ToolRailPanelSlots {
+                center: Some(launcher),
+                ..ToolRailPanelSlots::default()
+            },
+            Some(AgentTerminalHost::Center),
+        ),
+    ] {
+        assert_eq!(
+            resolve_agent_terminal_host(false, false, None, panels, false),
+            expected
+        );
+    }
+    assert_eq!(
+        resolve_agent_terminal_host(
+            false,
+            false,
+            None,
+            ToolRailPanelSlots {
+                attached: Some(launcher),
+                ..ToolRailPanelSlots::default()
+            },
+            true,
+        ),
+        None,
+        "a collapsed right dock must not keep the terminal mounted"
+    );
+    assert_eq!(
+        resolve_agent_terminal_host(
+            true,
+            true,
+            Some(launcher),
+            ToolRailPanelSlots::default(),
+            false
+        ),
+        Some(AgentTerminalHost::Drawer)
+    );
+    assert_eq!(
+        resolve_agent_terminal_host(
+            true,
+            true,
+            Some(ToolRailToolId::Sftp),
+            ToolRailPanelSlots::default(),
+            false
+        ),
+        None
+    );
+}
+
+/// Agent 停靠栈在没有右栏时仍让入口区按内容定高，终端占用其余高度，而不是只留下标题。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn agent_launcher_host_reserves_terminal_height(app: &mut gpui_kit::TestAppContext) {
+    use crate::theme::ThemeTokens;
+    use gpui_kit::{
+        AppContext as _, Context, IntoElement as _, Render, Window, div, prelude::*, px, size,
+    };
+
+    struct Probe;
+
+    impl Render for Probe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = ThemeTokens::current(window, cx);
+            crate::root::workbench::agent_launcher_tool_panel(
+                div()
+                    .debug_selector(|| "probe-launcher-content".into())
+                    .h(px(60.))
+                    .into_any_element(),
+                Some(
+                    div()
+                        .debug_selector(|| "probe-terminal-content".into())
+                        .size_full()
+                        .into_any_element(),
+                ),
+                theme.materials.terminal_header,
+            )
+        }
+    }
+
+    app.update(|app| {
+        crate::init(app);
+        app.set_reduce_motion(true);
+    });
+    let (_, visual) = app.add_window_view(|window, cx| {
+        let probe = cx.new(|_| Probe);
+        gpui_kit::base::Root::new(probe, window, cx)
+    });
+    visual.simulate_resize(size(px(400.), px(600.)));
+    visual.update(|window, app| window.draw(app).clear(app));
+
+    let launcher = visual
+        .debug_bounds("probe-launcher-content")
+        .expect("launcher content is mounted");
+    let terminal = visual
+        .debug_bounds("probe-terminal-content")
+        .expect("terminal content follows the launcher");
+    assert!(
+        terminal.origin.y >= launcher.bottom(),
+        "terminal must start below the launcher chrome: launcher={launcher:?}, terminal={terminal:?}"
+    );
+    assert!(
+        terminal.size.height > px(400.),
+        "terminal must own the remaining host height: terminal={terminal:?}"
+    );
+}
