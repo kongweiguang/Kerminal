@@ -16,13 +16,13 @@
   <p><sub>0.4.0-beta.2 · Rust + GPUI · Windows / Linux / macOS</sub></p>
 </div>
 
-![Kerminal GPUI 原生工作台：主机导航、终端与命令片段](docs/assets/kerminal-hero.png)
+![Kerminal GPUI 完整应用窗口：本机终端与已进入会话的 Codex AI 助手](docs/assets/kerminal-hero.png)
 
 Kerminal 是一个本地优先的桌面终端和远程运维工作台。围绕明确的主机、Tab 与 Pane，把本机与远程终端、SFTP、Docker/Podman、Compose、tmux、SSH 隧道、服务器信息和 Agent 会话组织在同一个窗口里。
 
 `main` 是使用 Rust、GPUI 与 GPUI Kit 重建的 **0.4 原生桌面版本**；[tauri 分支](https://github.com/kongweiguang/Kerminal/tree/tauri) 保留 0.3.x Tauri 实现。新版本不再使用旧版的 WebView / xterm.js 界面，开发也不需要先启动 Node.js 前端。
 
-> **当前为 beta 测试版，功能迁移与跨平台原生验收仍在进行，请勿用于生产环境。** GPUI 默认使用 `~/.kerminal-gpui`，与旧版 `~/.kerminal` 隔离。下面的截图来自 GPUI 开发版隔离验收窗口，使用测试夹具，部分画面经过裁剪及本机路径遮盖；不是 Tauri 版截图，也不代表全功能验收通过。
+> **当前为 beta 测试版，功能迁移与跨平台原生验收仍在进行，请勿用于生产环境。** GPUI 默认使用 `~/.kerminal-gpui`，与旧版 `~/.kerminal` 隔离。下面的截图来自 GPUI 开发版隔离窗口，使用演示数据，均保留完整应用窗口，仅遮盖必要的本机信息；首图为真实 Codex CLI 已进入会话的画面。不是 Tauri 版截图，也不代表全功能验收通过。
 
 ## 当前能力
 
@@ -80,9 +80,7 @@ Kerminal 是一个本地优先的桌面终端和远程运维工作台。围绕�
 
 点击右侧 Agent 工具，选择启动器，再点击“进入”。**选择启动器本身不会启动 CLI。**
 
-<p align="center">
-  <img src="docs/assets/kerminal-agent.png" width="435" alt="GPUI Agent 启动器：Codex、Claude、PI Agent 和自定义 Agent" />
-</p>
+![GPUI 完整应用窗口：Agent 启动器与 Codex、Claude、PI Agent 选择](docs/assets/kerminal-agent.png)
 
 | 启动器 | 本机前置条件 |
 | --- | --- |
@@ -115,17 +113,13 @@ Kerminal 管理 CLI 启动、原生终端展示、会话工作目录和上下文
 - 右侧文件栏与中央传输工作台分别保留浏览状态，切换终端不会覆盖另一处的目录。
 - 本机、SFTP 与容器文本通过原生编辑器打开；保存前核对 revision，冲突或提交结果未知时先读回，不盲目覆盖或自动重放。
 
-<p align="center">
-  <img src="docs/assets/kerminal-file-tab.png" width="684" alt="GPUI 原生文件编辑器：多个文件 Tab 与独立正文" />
-</p>
+![GPUI 完整应用窗口：原生文件编辑器与多个文件 Tab](docs/assets/kerminal-file-tab.png)
 
 ## 容器与 Compose
 
 连接 SSH 主机后，从右侧容器工具管理对应宿主的 Docker / Podman。容器 Pane 继续关联创建它的 SSH 宿主，不从终端文字猜测目标。
 
-<p align="center">
-  <img src="docs/assets/kerminal-containers.png" width="360" alt="GPUI 容器详情：镜像、状态、运行时、端口、网络与命令" />
-</p>
+![GPUI 完整应用窗口：SSH 终端与容器详情](docs/assets/kerminal-containers.png)
 
 容器列表可按 Compose 项目组织，查看详情、日志与 stats，执行启动、停止、重启及删除，或进入交互终端。Compose 提供项目操作与 YAML 预览；容器内文件浏览和传输复用统一文件服务与队列。
 
@@ -137,10 +131,9 @@ Kerminal 管理 CLI 启动、原生终端展示、会话工作目录和上下文
 
 tmux 工具面向明确的 Local / SSH 目标，提供会话查看、创建、连接、重命名、分离与结束，并保留常用命令速查。
 
-<p align="center">
-  <img src="docs/assets/kerminal-system.png" width="300" alt="GPUI 服务器资源面板与 CPU 采样" />
-  <img src="docs/assets/kerminal-tmux.png" width="300" alt="GPUI tmux 会话、连接操作与快捷命令" />
-</p>
+![GPUI 完整应用窗口：SSH 终端与服务器资源面板](docs/assets/kerminal-system.png)
+
+![GPUI 完整应用窗口：SSH 终端与 tmux 会话管理](docs/assets/kerminal-tmux.png)
 
 SSH 隧道按访问远端服务、暴露本机服务和 SOCKS 场景组织，支持本地 / 远端端口转发、本地 / 远端动态代理，以及显式启停和代理环境应用。
 
