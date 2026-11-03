@@ -857,6 +857,7 @@ impl OperationsView {
         self.runtime = runtime;
         self.container_host
             .reset_for_target(self.host_target.as_ref(), runtime);
+        self.reset_operations_scroll();
         self.container_generation = self.container_generation.wrapping_add(1).max(1);
         self.containers.reset(self.container_generation);
         self.compose_projects.clear();

@@ -261,9 +261,9 @@ fn container_navigation_keeps_tab_without_an_override() {
     };
     let mut presentation = ContainerHostPresentation::default();
 
-    presentation.select_container(first.clone());
+    presentation.select_container_for_inspection(first.clone(), None);
     presentation.set_container_tab(HostContainerTab::Stats);
-    presentation.select_container(first.clone());
+    presentation.select_container_for_inspection(first.clone(), None);
     assert_eq!(
         presentation.page(),
         &ContainerHostPage::Container { target: first }
@@ -338,11 +338,14 @@ fn target_reset_clears_navigation_but_preserves_list_preferences() {
     presentation.toggle_project_expanded(first.clone());
     presentation.select_project(first.clone());
     presentation.set_project_tab(ComposeProjectTab::Yaml);
-    presentation.select_container(ContainerTarget {
-        host_id: Some(host_id.clone()),
-        runtime: ContainerRuntime::Docker,
-        container_id: "container-a".to_owned(),
-    });
+    presentation.select_container_for_inspection(
+        ContainerTarget {
+            host_id: Some(host_id.clone()),
+            runtime: ContainerRuntime::Docker,
+            container_id: "container-a".to_owned(),
+        },
+        None,
+    );
     presentation.set_container_tab(HostContainerTab::Stats);
 
     assert!(presentation.reset_for_target(Some(&host_id), ContainerRuntime::Podman));
@@ -377,4 +380,108 @@ fn expanded_projects_use_complete_target_identity() {
     assert!(!presentation.is_project_expanded(&second));
     presentation.toggle_project_expanded(first.clone());
     assert!(!presentation.is_project_expanded(&first));
+}
+
+/// 项目容器页签进入容器后，返回必须恢复项目容器页签、项目选择和容器行高亮。
+///
+/// @author kongweiguang
+#[test]
+fn project_container_back_restores_project_tab_and_selection() {
+    let host_id = HostId::new();
+    let project = compose_target(Some(host_id.clone()), "web", "/srv/web");
+    let container = ContainerTarget {
+        host_id: Some(host_id),
+        runtime: ContainerRuntime::Docker,
+        container_id: "container-a".to_owned(),
+    };
+    let mut presentation = ContainerHostPresentation::default();
+
+    presentation.select_project(project.clone());
+    presentation.set_project_tab(ComposeProjectTab::Containers);
+    presentation.select_container_in_project(
+        container.clone(),
+        project.clone(),
+        Some(HostContainerTab::Details),
+    );
+
+    assert_eq!(
+        presentation.page(),
+        &ContainerHostPage::Container {
+            target: container.clone()
+        }
+    );
+    assert_eq!(presentation.container_origin(), Some(&project));
+    assert!(presentation.is_project_selected(&project));
+    assert_eq!(presentation.project_tab(), ComposeProjectTab::Containers);
+
+    presentation.return_to_project(project.clone());
+
+    assert_eq!(
+        presentation.page(),
+        &ContainerHostPage::ComposeProject {
+            target: project.clone()
+        }
+    );
+    assert_eq!(presentation.project_tab(), ComposeProjectTab::Containers);
+    assert!(presentation.is_project_selected(&project));
+    assert!(presentation.is_container_selected(&container));
+    assert_eq!(presentation.container_origin(), None);
+
+    presentation.navigate_to_list();
+    assert_eq!(presentation.page(), &ContainerHostPage::List);
+    assert_eq!(presentation.container_origin(), None);
+}
+
+/// 列表进入容器不继承项目来源，返回列表而不是跳回最后打开的项目。
+///
+/// @author kongweiguang
+#[test]
+fn list_container_entry_clears_project_origin() {
+    let host_id = HostId::new();
+    let project = compose_target(Some(host_id.clone()), "web", "/srv/web");
+    let container = ContainerTarget {
+        host_id: Some(host_id),
+        runtime: ContainerRuntime::Docker,
+        container_id: "container-b".to_owned(),
+    };
+    let mut presentation = ContainerHostPresentation::default();
+
+    presentation.select_project(project.clone());
+    presentation.set_project_tab(ComposeProjectTab::Containers);
+    presentation.select_container_for_inspection(container.clone(), Some(HostContainerTab::Stats));
+
+    assert_eq!(
+        presentation.page(),
+        &ContainerHostPage::Container {
+            target: container.clone()
+        }
+    );
+    assert_eq!(presentation.container_origin(), None);
+    assert!(!presentation.is_project_selected(&project));
+    assert_eq!(presentation.container_tab(), HostContainerTab::Stats);
+}
+
+/// 项目页内行操作保留项目选择，避免日志/终端入口把项目高亮清掉。
+///
+/// @author kongweiguang
+#[test]
+fn project_page_row_action_keeps_project_selection() {
+    let host_id = HostId::new();
+    let project = compose_target(Some(host_id.clone()), "web", "/srv/web");
+    let container = ContainerTarget {
+        host_id: Some(host_id),
+        runtime: ContainerRuntime::Docker,
+        container_id: "container-c".to_owned(),
+    };
+    let mut presentation = ContainerHostPresentation::default();
+
+    presentation.select_project(project.clone());
+    presentation.select_container_row(container.clone());
+
+    assert!(presentation.is_project_selected(&project));
+    assert!(presentation.is_container_selected(&container));
+    assert_eq!(
+        presentation.page(),
+        &ContainerHostPage::ComposeProject { target: project }
+    );
 }

@@ -268,6 +268,21 @@ impl ComposeYamlPreviewState {
         self.pending.is_some()
     }
 
+    /// 页面切换或隐藏后旧回执不能再完成时取消等待，保留已有正文并重新启用刷新。
+    ///
+    /// @author kongweiguang
+    pub(super) fn cancel_pending_preview(&mut self) {
+        if self.pending.take().is_some() && self.preview.is_none() && self.error.is_none() {
+            self.error = Some(
+                crate::locale::text(
+                    "Compose YAML 读取已中断，请刷新。",
+                    "The Compose YAML read was interrupted; refresh to retry.",
+                )
+                .to_string(),
+            );
+        }
+    }
+
     /// 成功和二进制回执都保留文件元数据；失败读取则没有可展示的 preview。
     ///
     /// @author kongweiguang

@@ -43,19 +43,19 @@ enum ContainerRowActivation {
     Enter,
 }
 
-/// 列表遵循 main 首击立即导航；仅运行中容器的双击或 Enter 在收到对应事件时进入终端。
+/// 列表首击立即进入详情；仅运行中容器的键盘 Enter/Space 直接进入终端。
+/// 鼠标双击不再另设终端入口：首击切页后第二击会落到新页面，无法稳定命中同一行。
 ///
 /// @author kongweiguang
 fn container_row_activation(
     project_detail: bool,
     keyboard: bool,
-    double_click: bool,
     status: ContainerStatus,
 ) -> ContainerRowActivation {
     if project_detail {
         return ContainerRowActivation::Inspect;
     }
-    if (keyboard || double_click) && status == ContainerStatus::Running {
+    if keyboard && status == ContainerStatus::Running {
         return ContainerRowActivation::Enter;
     }
     ContainerRowActivation::Inspect
@@ -107,18 +107,29 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// Inspector 入口把显式 tab 与完整目标一起固定，再发起受 Root gate 保护的读取。
+    /// Inspector 入口把显式 tab、完整目标与来源项目一起固定，再发起受 Root gate 保护的读取。
+    /// 项目容器页签进入时保留来源，返回按钮才能回到项目而不是跳到列表。
     ///
     /// @author kongweiguang
     fn open_host_container_inspector(
         &mut self,
         target: ContainerTarget,
         tab: Option<HostContainerTab>,
+        project_origin: Option<ComposeProjectTarget>,
         cx: &mut Context<Self>,
     ) {
         let ticket = self.container_action_ticket(Some(target.clone()));
-        self.container_host
-            .select_container_for_inspection(target.clone(), tab);
+        self.leave_container_page_scroll();
+        match project_origin {
+            Some(project) => {
+                self.container_host
+                    .select_container_in_project(target.clone(), project, tab);
+            }
+            None => {
+                self.container_host
+                    .select_container_for_inspection(target.clone(), tab);
+            }
+        }
         let kind = match self.container_host.container_tab() {
             HostContainerTab::Details => ContainerReadKind::Inspect,
             HostContainerTab::Stats => ContainerReadKind::Stats,
@@ -183,6 +194,8 @@ pub(in crate::features::operations) struct ContainerHostPresentation {
     page: ContainerHostPage,
     project_tab: ComposeProjectTab,
     container_tab: HostContainerTab,
+    /// 容器详情从 Compose 项目容器页签进入时保留来源，返回按钮回到该项目的容器页签。
+    container_origin: Option<ComposeProjectTarget>,
     selected_project: Option<ComposeProjectTarget>,
     selected_container: Option<ContainerTarget>,
     expanded_projects: Vec<ComposeProjectTarget>,
@@ -200,6 +213,7 @@ impl Default for ContainerHostPresentation {
             page: ContainerHostPage::List,
             project_tab: ComposeProjectTab::Overview,
             container_tab: HostContainerTab::Details,
+            container_origin: None,
             selected_project: None,
             selected_container: None,
             expanded_projects: Vec::new(),
@@ -227,6 +241,7 @@ impl ContainerHostPresentation {
         self.expanded_projects.clear();
         self.project_tab = ComposeProjectTab::Overview;
         self.container_tab = HostContainerTab::Details;
+        self.container_origin = None;
         self.selected_project = None;
         self.selected_container = None;
         self.scope = next_scope;
@@ -328,11 +343,12 @@ impl ContainerHostPresentation {
         }
     }
 
-    /// 返回宿主列表时只改变导航页，保留当前 binding 下可复用的筛选和展开状态。
+    /// 返回宿主列表时清空容器来源；列表自身的筛选和展开状态保留。
     ///
     /// @author kongweiguang
     pub(in crate::features::operations) fn navigate_to_list(&mut self) {
         self.page = ContainerHostPage::List;
+        self.container_origin = None;
     }
 
     /// 打开项目详情时回到 Overview，与主版每次从列表选择项目的行为一致。
@@ -341,28 +357,23 @@ impl ContainerHostPresentation {
     pub(in crate::features::operations) fn select_project(&mut self, target: ComposeProjectTarget) {
         self.selected_project = Some(target.clone());
         self.selected_container = None;
+        self.container_origin = None;
         self.project_tab = ComposeProjectTab::Overview;
         self.page = ContainerHostPage::ComposeProject { target };
     }
 
-    /// 行菜单操作只更新选择，保留当前列表或项目页面；详情导航仍由容器主区点击负责。
+    /// 行菜单操作只更新选择，保留当前列表或项目页面；项目页内不丢项目选择。
     ///
     /// @author kongweiguang
     pub(in crate::features::operations) fn select_container_row(
         &mut self,
         target: ContainerTarget,
     ) {
+        let on_project_page = matches!(self.page, ContainerHostPage::ComposeProject { .. });
         self.selected_container = Some(target);
-        self.selected_project = None;
-    }
-
-    /// 打开容器 inspector；容器 tab 按主版独立保留，结果数据仍由 target 隔离。
-    ///
-    /// @author kongweiguang
-    pub(in crate::features::operations) fn select_container(&mut self, target: ContainerTarget) {
-        self.selected_container = Some(target.clone());
-        self.selected_project = None;
-        self.page = ContainerHostPage::Container { target };
+        if !on_project_page {
+            self.selected_project = None;
+        }
     }
 
     /// 普通列表导航沿用当前 tab；Compose 子页和显式入口可传入 tab 覆盖默认状态。
@@ -373,10 +384,62 @@ impl ContainerHostPresentation {
         target: ContainerTarget,
         tab: Option<HostContainerTab>,
     ) {
-        self.select_container(target);
+        self.select_container_with_origin(target, None, tab);
+    }
+
+    /// 从项目容器页签进入时记录来源项目，返回时恢复该项目容器页签与选中对象。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::operations) fn select_container_in_project(
+        &mut self,
+        target: ContainerTarget,
+        project: ComposeProjectTarget,
+        tab: Option<HostContainerTab>,
+    ) {
+        self.select_container_with_origin(target, Some(project), tab);
+    }
+
+    /// 容器页的来源与 tab 一次写入，避免页面、项目选择和返回目标分属不同步更新。
+    ///
+    /// @author kongweiguang
+    fn select_container_with_origin(
+        &mut self,
+        target: ContainerTarget,
+        origin: Option<ComposeProjectTarget>,
+        tab: Option<HostContainerTab>,
+    ) {
+        self.selected_container = Some(target.clone());
+        self.selected_project = origin.clone();
+        self.container_origin = origin;
+        if self.container_origin.is_some() {
+            self.project_tab = ComposeProjectTab::Containers;
+        }
         if let Some(tab) = tab {
             self.container_tab = tab;
         }
+        self.page = ContainerHostPage::Container { target };
+    }
+
+    /// 返回来源项目并保留项目容器页签与容器行选中；来源由调用方确认后才使用。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::operations) fn return_to_project(
+        &mut self,
+        project: ComposeProjectTarget,
+    ) {
+        self.selected_project = Some(project.clone());
+        self.container_origin = None;
+        self.project_tab = ComposeProjectTab::Containers;
+        self.page = ContainerHostPage::ComposeProject { target: project };
+    }
+
+    /// 返回当前容器详情记录的来源项目；列表和其它入口进入的详情为 None。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::operations) fn container_origin(
+        &self,
+    ) -> Option<&ComposeProjectTarget> {
+        self.container_origin.as_ref()
     }
 
     /// 更新项目详情 tab，仅对当前项目页有效。
@@ -843,6 +906,7 @@ fn render_host_list(
                     if !view.container_action_ticket_is_current(&yaml_ticket, None) {
                         return;
                     }
+                    view.leave_container_page_scroll();
                     view.container_host.select_project(yaml_target.clone());
                     view.container_host.set_project_tab(ComposeProjectTab::Yaml);
                     super::compose_yaml::request_preview_for_selected_path(
@@ -914,7 +978,7 @@ fn render_host_list(
                                 project_containers.child(div().w_full().h(px(1.)).bg(theme.border));
                         }
                         project_containers = project_containers.child(render_host_container_row(
-                            view, container, true, false, busy, theme, cx,
+                            view, container, true, None, busy, theme, cx,
                         ));
                     }
                     project_card = project_card.child(project_containers);
@@ -928,7 +992,7 @@ fn render_host_list(
                 ));
                 for container in group.containers {
                     container_list = container_list.child(render_host_container_row(
-                        view, container, true, false, busy, theme, cx,
+                        view, container, true, None, busy, theme, cx,
                     ));
                 }
             }
@@ -951,7 +1015,7 @@ fn render_host_list(
             }
             for container in group.containers {
                 container_list = container_list.child(render_host_container_row(
-                    view, container, false, false, busy, theme, cx,
+                    view, container, false, None, busy, theme, cx,
                 ));
             }
         }
@@ -1238,7 +1302,7 @@ fn render_host_container_row(
     view: &mut OperationsView,
     container: kerminal_domain::operations::ContainerSummary,
     compact: bool,
-    project_detail: bool,
+    project_origin: Option<&ComposeProjectTarget>,
     busy: bool,
     theme: ThemeTokens,
     cx: &mut Context<OperationsView>,
@@ -1247,7 +1311,9 @@ fn render_host_container_row(
     let ticket = view.container_action_ticket(Some(target.clone()));
     let selected = view.container_host.is_container_selected(&target);
     let pending = view.container_mutations.container_loading(&target);
-    let row_id = container.short_id.clone();
+    let row_id = target.container_id.clone();
+    let project_origin = project_origin.cloned();
+    let project_detail = project_origin.is_some();
     let display_name = if project_detail {
         &container.name
     } else if compact {
@@ -1275,43 +1341,116 @@ fn render_host_container_row(
             theme.muted
         }
     };
-    let title_target = target.clone();
-    let title_ticket = ticket.clone();
-    let title_status = container.status;
-    let title_project_detail = project_detail;
+    let status_label = container_status_group_label(container.status);
+    let info_target = target.clone();
+    let info_ticket = ticket.clone();
+    let info_status = container.status;
+    let info_project_detail = project_detail;
+    let info_origin = project_origin.clone();
     let row_selector = format!("rr-container-row-{}", target.container_id);
-    let title = Button::new(format!("container-row-name-{row_id}"))
+    let accessibility_label = if project_detail {
+        crate::locale::text(
+            format!("容器 {}，{}，单击查看详情", container.name, status_label),
+            format!(
+                "Container {}; {}; click for details",
+                container.name, status_label
+            ),
+        )
+    } else if container.status == ContainerStatus::Running {
+        crate::locale::text(
+            format!(
+                "容器 {}，{}，单击查看详情，按 Enter 进入终端",
+                container.name, status_label
+            ),
+            format!(
+                "Container {}; {}; click for details or press Enter to open a terminal",
+                container.name, status_label
+            ),
+        )
+    } else {
+        crate::locale::text(
+            format!("容器 {}，{}，单击查看详情", container.name, status_label),
+            format!(
+                "Container {}; {}; click for details",
+                container.name, status_label
+            ),
+        )
+    };
+    // 名称、状态和副标题同属一个语义按钮；片段点击、键盘 Enter/Space 与应用内其它行一致。
+    // 单击立即进入详情，不再承诺双击进入终端，避免首击已切页后第二击落到新页面。
+    let info = Button::new(format!("container-row-{row_id}"))
         .compact()
         .ghost()
         .debug_selector(move || row_selector)
-        .label(display_name.to_owned())
+        .accessibility_label(accessibility_label)
+        .min_w_0()
+        .flex_1()
+        .h_auto()
+        .min_h(px(40.))
+        .p_0()
+        .justify_start()
         .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
-            if !view.container_action_ticket_is_current(&title_ticket, Some(&title_target)) {
+            if !view.container_action_ticket_is_current(&info_ticket, Some(&info_target)) {
                 return;
             }
-            let keyboard = event.is_keyboard();
-            let double_click = event.click_count() >= 2;
-            match container_row_activation(
-                title_project_detail,
-                keyboard,
-                double_click,
-                title_status,
-            ) {
+            match container_row_activation(info_project_detail, event.is_keyboard(), info_status) {
                 ContainerRowActivation::Inspect => view.open_host_container_inspector(
-                    title_target.clone(),
-                    if title_project_detail {
+                    info_target.clone(),
+                    if info_project_detail {
                         Some(HostContainerTab::Details)
                     } else {
                         None
                     },
+                    info_origin.clone(),
                     cx,
                 ),
                 ContainerRowActivation::Enter => {
-                    view.open_host_container_inspector(title_target.clone(), None, cx);
-                    view.request_container_exec(title_target.clone(), &title_ticket, cx);
+                    view.open_host_container_inspector(info_target.clone(), None, None, cx);
+                    view.request_container_exec(info_target.clone(), &info_ticket, cx);
                 }
             }
-        }));
+        }))
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap_1()
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .size_2()
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(status_color),
+                        )
+                        .child(div().min_w_0().truncate().child(display_name.to_owned()))
+                        .child(status_pill(
+                            status_label.to_string(),
+                            container.status,
+                            theme,
+                        )),
+                )
+                .when_some(secondary_text, |this, secondary| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_size(theme.text_xs)
+                            .text_color(theme.muted)
+                            .truncate()
+                            .child(secondary),
+                    )
+                }),
+        );
     let mut row = div()
         .w_full()
         .min_w_0()
@@ -1332,40 +1471,7 @@ fn render_host_container_row(
             row.bg(theme.tool_panel_surface.opacity(0.72))
         })
         .when(!selected, |row| row.hover(|style| style.bg(theme.hover)))
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().size_2().rounded_full().bg(status_color))
-                        .child(title)
-                        .child(status_pill(
-                            container_status_group_label(container.status).to_string(),
-                            container.status,
-                            theme,
-                        )),
-                )
-                .when_some(secondary_text, |this, secondary| {
-                    this.child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .text_size(theme.text_xs)
-                            .text_color(theme.muted)
-                            .truncate()
-                            .child(secondary),
-                    )
-                }),
-        );
+        .child(info);
     if compact {
         row = row.px_2().py(px(6.)).rounded_xl();
     } else {
@@ -1548,7 +1654,12 @@ fn container_actions_menu(
                         move |_, _, app| {
                             entity.update(app, |view, cx| {
                                 if view.container_action_ticket_is_current(&ticket, Some(&target)) {
-                                    view.open_host_container_inspector(target.clone(), None, cx);
+                                    view.open_host_container_inspector(
+                                        target.clone(),
+                                        Some(HostContainerTab::Details),
+                                        None,
+                                        cx,
+                                    );
                                 }
                             });
                         }
@@ -1705,6 +1816,7 @@ fn compose_actions_menu(
                         move |_, _, app| {
                             entity.update(app, |view, cx| {
                                 if view.container_action_ticket_is_current(&ticket, None) {
+                                    view.leave_container_page_scroll();
                                     view.container_host.select_project(target.clone());
                                     cx.notify();
                                 }
@@ -1844,6 +1956,9 @@ fn render_host_project(
         )
     });
     let selected_tab = view.container_host.project_tab();
+    let row_busy = view.busy
+        || view.container_write_scope_blocked()
+        || view.containers.phase() != super::super::state::SectionPhase::Ready;
     let primary_path = (selected_tab == ComposeProjectTab::Yaml)
         .then(|| view.compose_yaml.selected_path().map(str::to_owned))
         .flatten()
@@ -1877,6 +1992,8 @@ fn render_host_project(
                     return;
                 }
                 view.container_host.set_project_tab(tab);
+                view.scroll_operations_to_top();
+                view.clear_container_project_scroll();
                 cx.notify();
             }));
         tabs = tabs.child(if selected_tab == tab {
@@ -1946,8 +2063,10 @@ fn render_host_project(
                 {
                     if view.container_host.project_tab() == ComposeProjectTab::Yaml {
                         view.container_host.set_project_tab(ComposeProjectTab::Overview);
+                        view.scroll_operations_to_top();
+                        view.clear_container_project_scroll();
                     } else {
-                        view.container_host.navigate_to_list();
+                        view.back_to_container_list();
                     }
                     cx.notify();
                 }
@@ -2040,6 +2159,8 @@ fn render_host_project(
                     view.container_host.set_project_tab(ComposeProjectTab::Yaml);
                     super::compose_yaml::request_preview_for_selected_path(view, &yaml_target, &yaml_ticket, cx);
                 }
+                view.scroll_operations_to_top();
+                view.clear_container_project_scroll();
                 cx.notify();
             })),
         )
@@ -2104,7 +2225,13 @@ fn render_host_project(
             } else {
                 for container in group.containers {
                     body = body.child(render_host_container_row(
-                        view, container, true, true, view.busy, theme, cx,
+                        view,
+                        container,
+                        true,
+                        Some(&target),
+                        row_busy,
+                        theme,
+                        cx,
                     ));
                 }
             }
@@ -2483,6 +2610,12 @@ fn render_host_container(
     };
     let back_ticket = ticket.clone();
     let back_target = target.clone();
+    let back_origin = view.container_host.container_origin().cloned();
+    let back_label = if back_origin.is_some() {
+        crate::locale::text("返回 Compose 详情", "Back to Compose details")
+    } else {
+        crate::locale::text("返回容器列表", "Back to containers")
+    };
     let mut header = div()
         .w_full()
         .flex()
@@ -2492,17 +2625,29 @@ fn render_host_container(
             icon_button(
                 "container-inspector-back",
                 gpui_kit::assets::IconName::ArrowLeft,
-                crate::locale::text("返回容器列表", "Back to containers"),
+                back_label,
             )
+            .debug_selector(|| "rr-container-back".to_owned())
             .with_size(Size::Medium)
             .h_8()
             .w_8()
             .rounded_lg()
             .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                if view.container_action_ticket_is_current(&back_ticket, Some(&back_target)) {
-                    view.container_host.navigate_to_list();
-                    cx.notify();
+                if !view.container_action_ticket_is_current(&back_ticket, Some(&back_target))
+                    || !matches!(
+                        view.container_host.page(),
+                        ContainerHostPage::Container { target } if target == &back_target
+                    )
+                {
+                    return;
                 }
+                if let Some(project) = back_origin.clone() {
+                    view.container_host.return_to_project(project);
+                    view.restore_container_project_scroll();
+                } else {
+                    view.back_to_container_list();
+                }
+                cx.notify();
             })),
         )
         .child(
@@ -2662,6 +2807,7 @@ fn render_host_container(
                     return;
                 }
                 view.container_host.set_container_tab(tab);
+                view.scroll_operations_to_top();
                 view.request_container_read(
                     tab_target.clone(),
                     match tab {

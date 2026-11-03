@@ -28,7 +28,7 @@ use std::{
     time::Duration,
 };
 
-use gpui_kit::{Context, Entity, EventEmitter};
+use gpui_kit::{Context, Entity, EventEmitter, Pixels, Point, ScrollHandle};
 use kerminal_application::{
     ApplicationTaskExecutor,
     operations::{OperationsService, PortForwardDefinition, TmuxCapability},
@@ -763,6 +763,12 @@ pub struct OperationsView {
     containers: SectionState<Vec<ContainerSummary>>,
     /// 列表导航和筛选保留在宿主视图，跨 pane 不重建同宿主的用户选择。
     container_host: render::container_panel::ContainerHostPresentation,
+    /// 离开容器列表前的滚动位置；返回列表时恢复，避免长列表跳回顶部。
+    container_list_scroll: Option<Point<Pixels>>,
+    /// 离开 Compose 项目页前的滚动位置；容器详情或暂时不可用返回项目时恢复。
+    container_project_scroll: Option<Point<Pixels>>,
+    /// 运维正文的唯一滚动句柄；页面或目标切换时显式归零或恢复记录位置。
+    operations_scroll: ScrollHandle,
     /// 页内预览固定请求端点，避免跨项目或宿主的迟到内容覆盖当前 YAML。
     compose_yaml: compose_yaml::ComposeYamlPreviewState,
     /// 保留完整 Compose 执行范围，拆除后仍显示再次启动入口，不依据同名容器补猜路径。
@@ -879,6 +885,9 @@ impl OperationsView {
             server_monitor_wake: CancellationToken::new(),
             containers: SectionState::new(),
             container_host: Default::default(),
+            container_list_scroll: None,
+            container_project_scroll: None,
+            operations_scroll: ScrollHandle::new(),
             compose_yaml: Default::default(),
             compose_projects: Vec::new(),
             compose_pending_down: None,
@@ -1125,6 +1134,28 @@ impl OperationsView {
         if self.container_panel_context.as_ref() == Some(&context) {
             return;
         }
+        if matches!(context, ContainerPanelContext::Unavailable { .. }) {
+            // 连接中、终端结束或协议不支持只是面板暂时不可用；保留同宿主已建立的导航与快照，
+            // 回到可用 pane 时再恢复原页，避免一次聚焦丢失项目/容器层级。
+            let was_unavailable = matches!(
+                self.container_panel_context,
+                Some(ContainerPanelContext::Unavailable { .. })
+            );
+            if !was_unavailable && self.active {
+                self.leave_container_page_scroll();
+            } else {
+                self.scroll_operations_to_top();
+            }
+            self.container_panel_context = Some(context.clone());
+            self.apply_container_panel_context(context);
+            self.container_delete_confirmation = None;
+            self.compose_pending_down = None;
+            self.compose_pending_context = None;
+            self.confirmed_compose_down = None;
+            cx.emit(OperationsEvent::RootConfirmationChanged);
+            cx.notify();
+            return;
+        }
         let same_host = self
             .container_panel_context
             .as_ref()
@@ -1154,18 +1185,39 @@ impl OperationsView {
 
         self.container_panel_context = Some(context.clone());
         self.apply_container_panel_context(context.clone());
-        self.container_host
+        let scope_changed = self
+            .container_host
             .reset_for_target(self.host_target.as_ref(), self.runtime);
-        self.compose_yaml.invalidate();
         self.target_generation = self.target_generation.wrapping_add(1).max(1);
         self.container_generation = self.container_generation.wrapping_add(1).max(1);
-        self.containers.reset(self.container_generation);
         self.container_inspect_request.cancel_pending();
         self.container_output_request.cancel_pending();
-        self.container_inspect.reset();
-        self.container_output.reset();
-        self.container_output_target_label = None;
-        self.compose_projects.clear();
+        if scope_changed {
+            self.compose_yaml.invalidate();
+            self.containers.reset(self.container_generation);
+            self.container_inspect.reset();
+            self.container_output.reset();
+            self.container_output_target_label = None;
+            self.compose_projects.clear();
+            self.reset_operations_scroll();
+        } else if matches!(
+            self.container_host.page(),
+            render::container_panel::ContainerHostPage::List
+        ) {
+            // 从暂时不可用状态回到同一宿主时恢复列表原位置；项目页恢复项目位置。
+            self.container_project_scroll = None;
+            self.restore_container_list_scroll();
+        } else if matches!(
+            self.container_host.page(),
+            render::container_panel::ContainerHostPage::ComposeProject { .. }
+        ) {
+            self.restore_container_project_scroll();
+        } else {
+            self.scroll_operations_to_top();
+        }
+        if !scope_changed {
+            self.cancel_interrupted_container_reads();
+        }
         self.compose_pending_down = None;
         self.compose_pending_context = None;
         self.confirmed_compose_down = None;
@@ -1185,6 +1237,80 @@ impl OperationsView {
     /// @author kongweiguang
     pub fn container_panel_context(&self) -> Option<&ContainerPanelContext> {
         self.container_panel_context.as_ref()
+    }
+
+    /// 离开容器页前按列表/项目分别记录位置；进入项目或容器页时正文从顶部开始。
+    fn leave_container_page_scroll(&mut self) {
+        match self.container_host.page() {
+            render::container_panel::ContainerHostPage::List => {
+                self.container_list_scroll = Some(self.operations_scroll.offset());
+                self.container_project_scroll = None;
+            }
+            render::container_panel::ContainerHostPage::ComposeProject { .. } => {
+                self.container_project_scroll = Some(self.operations_scroll.offset());
+            }
+            render::container_panel::ContainerHostPage::Container { .. } => {}
+        }
+        self.operations_scroll.set_offset(Default::default());
+    }
+
+    /// 返回宿主容器列表时恢复离开前的位置；列表变短时由 GPUI 夹取到有效范围。
+    fn restore_container_list_scroll(&mut self) {
+        let offset = self.container_list_scroll.take().unwrap_or_default();
+        self.operations_scroll.set_offset(offset);
+    }
+
+    /// 容器详情返回来源项目时恢复项目容器页签的滚动位置。
+    fn restore_container_project_scroll(&mut self) {
+        let offset = self.container_project_scroll.take().unwrap_or_default();
+        self.operations_scroll.set_offset(offset);
+    }
+
+    /// 项目页切页或离开项目时丢弃旧位置，避免把另一页/另一项目的偏移带回来。
+    fn clear_container_project_scroll(&mut self) {
+        self.container_project_scroll = None;
+    }
+
+    /// 返回宿主容器列表并恢复离开前的位置。
+    fn back_to_container_list(&mut self) {
+        self.container_host.navigate_to_list();
+        self.container_project_scroll = None;
+        self.restore_container_list_scroll();
+    }
+
+    /// 页内切页或切区块时从顶部开始，避免继承上一页的滚动偏移。
+    fn scroll_operations_to_top(&mut self) {
+        self.operations_scroll.set_offset(Default::default());
+    }
+
+    /// 宿主或 runtime 变化时丢弃旧列表/项目位置，避免把位置带到另一个目标。
+    fn reset_operations_scroll(&mut self) {
+        self.container_list_scroll = None;
+        self.container_project_scroll = None;
+        self.operations_scroll.set_offset(Default::default());
+    }
+
+    /// 回到同一宿主但读取票据已失效时解除 Loading，保留最后快照并重新启用刷新。
+    fn cancel_interrupted_container_reads(&mut self) {
+        if self.container_inspect.phase() == DetailReadPhase::Loading {
+            self.container_inspect.cancel(
+                crate::locale::text(
+                    "容器详情读取已中断，请刷新。",
+                    "The container details read was interrupted; refresh to retry.",
+                )
+                .to_string(),
+            );
+        }
+        if self.container_output.phase() == DetailReadPhase::Loading {
+            self.container_output.cancel(
+                crate::locale::text(
+                    "容器监控读取已中断，请刷新。",
+                    "The container stats read was interrupted; refresh to retry.",
+                )
+                .to_string(),
+            );
+        }
+        self.compose_yaml.cancel_pending_preview();
     }
 
     /// 侧栏固定项只在当前宿主、运行时和最新列表同时匹配后进入详情，复用现有 live-context 读取门禁。
@@ -1228,6 +1354,7 @@ impl OperationsView {
                 {
                     return SidebarContainerReveal::Unavailable;
                 }
+                self.leave_container_page_scroll();
                 self.container_host.select_container_for_inspection(
                     target.clone(),
                     Some(render::container_panel::HostContainerTab::Details),
@@ -1796,6 +1923,7 @@ impl OperationsView {
             return;
         }
         if self.section_selection.select(section) {
+            self.scroll_operations_to_top();
             if section != OperationsSection::Containers {
                 self.container_delete_confirmation = None;
             }

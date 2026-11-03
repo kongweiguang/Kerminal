@@ -188,7 +188,7 @@ impl OperationsView {
             return Err("容器验收面板当前未激活".to_owned());
         }
         self.validate_container_host_context(host_id)?;
-        self.container_host.navigate_to_list();
+        self.back_to_container_list();
         cx.notify();
         Ok(())
     }
@@ -225,7 +225,9 @@ impl OperationsView {
             "stats" => (HostContainerTab::Stats, ContainerReadKind::Stats),
             _ => return Err("验收只支持容器详情或监控页面".to_owned()),
         };
-        self.container_host.select_container(target.clone());
+        self.leave_container_page_scroll();
+        self.container_host
+            .select_container_for_inspection(target.clone(), None);
         self.container_host.set_container_tab(tab);
         self.container_info_tab = kind;
         let ticket = self.container_action_ticket(Some(target.clone()));
@@ -366,6 +368,7 @@ impl OperationsView {
         {
             return Err("Compose 项目不属于当前验收 SSH 主机快照".to_owned());
         }
+        self.leave_container_page_scroll();
         self.container_host.select_project(target.clone());
         self.compose_yaml.select_project(target);
         cx.notify();

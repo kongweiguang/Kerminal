@@ -277,3 +277,26 @@ fn metadata_keeps_preview_boundary_and_readonly_contract_visible() {
     assert!(metadata.contains(&"RO".to_owned()));
     assert!(metadata.contains(&"2026-10-27T00:00:00Z".to_owned()));
 }
+
+/// 上下文暂时不可用后旧 YAML 回执无法完成时，取消等待并给出可刷新的错误。
+///
+/// @author kongweiguang
+#[test]
+fn interrupted_preview_reenables_refresh_with_a_recoverable_error() {
+    let project = project("web", "/srv/web");
+    let path = project.config_files[0].clone();
+    let endpoint = endpoint(project.host_id.as_ref().unwrap(), &path);
+    let mut state = ComposeYamlPreviewState::default();
+    state.select_project(&project);
+    state
+        .begin_request(&project, &path, endpoint, action_ticket(1))
+        .expect("request id");
+
+    assert!(state.is_loading());
+    state.cancel_pending_preview();
+
+    assert!(!state.is_loading());
+    assert!(state.preview().is_none());
+    assert!(state.error().is_some());
+    assert_eq!(state.selected_path(), Some(path.as_str()));
+}

@@ -202,6 +202,7 @@ impl OperationsView {
         {
             return Ok(false);
         }
+        self.leave_container_page_scroll();
         self.container_host.select_project(target.clone());
         self.compose_yaml.select_project(target);
         cx.notify();

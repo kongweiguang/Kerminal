@@ -58,33 +58,26 @@ fn container_detail_soft_breaks_keep_unicode_graphemes_intact() {
     );
 }
 
-/// 宿主列表单击进入详情；仅运行中容器双击或按 Enter 进入终端。
+/// 宿主列表单击进入详情；运行中容器的键盘 Enter/Space 直接进入终端。
+/// 鼠标双击不再作为终端入口，首击切页后不会把第二击投射到新页面。
 ///
 /// @author kongweiguang
 #[test]
 fn host_container_row_activation_matches_main_click_contract() {
     assert_eq!(
-        container_row_activation(false, false, false, ContainerStatus::Running),
+        container_row_activation(false, false, ContainerStatus::Running),
         ContainerRowActivation::Inspect
     );
     assert_eq!(
-        container_row_activation(false, false, true, ContainerStatus::Running),
+        container_row_activation(false, true, ContainerStatus::Running),
         ContainerRowActivation::Enter
     );
     assert_eq!(
-        container_row_activation(false, true, false, ContainerStatus::Running),
-        ContainerRowActivation::Enter
-    );
-    assert_eq!(
-        container_row_activation(false, false, true, ContainerStatus::Exited),
+        container_row_activation(false, false, ContainerStatus::Exited),
         ContainerRowActivation::Inspect
     );
     assert_eq!(
-        container_row_activation(false, false, false, ContainerStatus::Exited),
-        ContainerRowActivation::Inspect
-    );
-    assert_eq!(
-        container_row_activation(false, true, false, ContainerStatus::Exited),
+        container_row_activation(false, true, ContainerStatus::Exited),
         ContainerRowActivation::Inspect
     );
 }
@@ -94,9 +87,9 @@ fn host_container_row_activation_matches_main_click_contract() {
 /// @author kongweiguang
 #[test]
 fn compose_container_row_activation_opens_details() {
-    for (keyboard, double_click) in [(false, false), (true, false), (false, true)] {
+    for keyboard in [false, true] {
         assert_eq!(
-            container_row_activation(true, keyboard, double_click, ContainerStatus::Running),
+            container_row_activation(true, keyboard, ContainerStatus::Running),
             ContainerRowActivation::Inspect
         );
     }

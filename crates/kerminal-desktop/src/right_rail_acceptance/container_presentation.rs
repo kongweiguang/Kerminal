@@ -630,6 +630,57 @@ pub(super) async fn capture_compose(
         )
         .await?,
     );
+    let container_id =
+        wait_for_acceptance_value(cx, root, window, "running container target", |root, cx| {
+            root.right_rail_acceptance_container_target_id(
+                host,
+                &capture.fixture_container_name,
+                cx,
+            )
+        })
+        .await?;
+    menus::click_selector(cx, window, "rr-compose-tab-containers")?;
+    poll_root(cx, root, window, "Compose 容器页签", |_, window, _| {
+        Ok(window
+            .debug_selector_bounds(&format!("rr-container-row-{container_id}"))
+            .map(|_| ()))
+    })
+    .await?;
+    menus::click_selector(cx, window, &format!("rr-container-row-{container_id}"))?;
+    poll_root(
+        cx,
+        root,
+        window,
+        "项目容器进入详情",
+        |root, _, cx| {
+            root.right_rail_acceptance_container_page_ready(host, &container_id, "details", cx)
+                .map(|ready| ready.then_some(()))
+        },
+    )
+    .await?;
+    menus::click_selector(cx, window, "rr-container-back")?;
+    poll_root(
+        cx,
+        root,
+        window,
+        "容器返回项目容器页签",
+        |root, window, cx| {
+            if window
+                .debug_selector_bounds(&format!("rr-container-row-{container_id}"))
+                .is_none()
+            {
+                return Ok(None);
+            }
+            let Some((_, _, detail, yaml, _)) =
+                root.right_rail_acceptance_compose_presentation(host, &target, cx)?
+            else {
+                return Ok(None);
+            };
+            Ok((detail && !yaml).then_some(()))
+        },
+    )
+    .await?;
+
     let tabs_before = poll_root(cx, root, window, "中央标签数", |root, _, _| {
         Ok(root.right_rail_acceptance_workspace_tab_count())
     })

@@ -72,6 +72,7 @@ impl Render for OperationsView {
             .gap_3()
             .when(self.compact_layout, |body| body.gap_2())
             .when(fill_compose_yaml, |body| body.h_full().min_h_0());
+        let scroll_handle = self.operations_scroll.clone();
         match self.section_selection.active() {
             OperationsSection::ServerInfo => {
                 section_content = section_content.child(self.render_server(theme, cx));
@@ -96,6 +97,7 @@ impl Render for OperationsView {
                 body.flex_1()
                     .min_h_0()
                     .gap_2()
+                    .track_scroll(&scroll_handle)
                     .when(fill_compose_yaml, |body| body.overflow_hidden())
                     .when(!fill_compose_yaml, |body| body.overflow_y_scroll())
             })
@@ -174,6 +176,7 @@ impl Render for OperationsView {
             root = root
                 .gap_3()
                 .overflow_y_scroll()
+                .track_scroll(&scroll_handle)
                 .p_4()
                 .when(!dedicated_header, |root| {
                     root.child(self.render_header(theme, cx))
