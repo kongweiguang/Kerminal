@@ -72,11 +72,11 @@ fn overwrite_permissions_preserve_target_and_new_files_inherit_source() -> AppRe
     Ok(())
 }
 
-/// owner-write 缺失时即使 mode 带 group-write 也须补 owner 位，避免依赖未知组成员关系。
+/// owner 读写位缺失时即使 mode 带 group-write 也须补齐，避免依赖未知组成员关系或只读 mtime 打开失败。
 ///
 /// @author kongweiguang
 #[tokio::test]
-async fn checkpoint_write_recovery_does_not_assume_group_membership() -> AppResult<()> {
+async fn checkpoint_access_recovery_does_not_assume_group_membership() -> AppResult<()> {
     let root = tempfile::tempdir().map_err(map_io_error)?;
     let path = root.path().join("group-writable.partial");
     fs::write(&path, b"checkpoint").map_err(map_io_error)?;
@@ -85,15 +85,15 @@ async fn checkpoint_write_recovery_does_not_assume_group_membership() -> AppResu
         .set_permissions(&staging, Some(0o022))
         .await?;
 
-    make_checkpoint_staging_writable(&EndpointSession::Local, &staging, Some(0o022)).await?;
+    make_checkpoint_staging_accessible(&EndpointSession::Local, &staging, Some(0o022)).await?;
     let metadata = EndpointSession::Local
         .metadata(&staging)
         .await?
         .ok_or_else(|| AppError::not_found("测试 checkpoint 暂存文件不存在"))?;
-    assert_ne!(
-        metadata.permissions.unwrap_or_default() & 0o200,
-        0,
-        "owner-write is needed even when group-write is present"
+    assert_eq!(
+        metadata.permissions.unwrap_or_default() & 0o600,
+        0o600,
+        "owner read and write are needed even when group-write is present"
     );
     Ok(())
 }

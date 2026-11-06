@@ -1027,7 +1027,7 @@ impl SftpTransferBackend {
             let Some(hasher) = self.resume_hashes.get(&source_identity, checkpoint) else {
                 return Err(Box::new(expired_checkpoint(destination)));
             };
-            make_checkpoint_staging_writable(
+            make_checkpoint_staging_accessible(
                 destination_session,
                 &checkpoint.staging_destination,
                 metadata.permissions,
@@ -2846,20 +2846,20 @@ async fn validate_staging_checkpoint(
     Ok(metadata)
 }
 
-/// 只在 checkpoint owner、marker 与缓存状态均验证后恢复最小 owner-write，避免放宽未知暂存对象权限。
-/// POSIX owner 类优先于 group/other 类，故只要 owner-write 缺失就补该位；权限未知时不猜。
-/// 续传不再读取暂存内容，因此不为哈希校验额外授予 owner-read；最终提交仍重新应用目标 mode。
+/// 只在 checkpoint owner、marker 与缓存状态均验证后恢复最小 owner 读写位，避免放宽未知暂存对象权限。
+/// 续传写入需要 owner-write；提交前保留源 mtime 会在 Unix 以只读句柄打开同一暂存，因此同时要求 owner-read。
+/// POSIX owner 类优先于 group/other 类，缺失位统一按 0o600 补齐；权限未知时不猜，最终提交仍重新应用目标 mode。
 ///
 /// @author kongweiguang
-async fn make_checkpoint_staging_writable(
+async fn make_checkpoint_staging_accessible(
     session: &EndpointSession,
     staging: &FileEndpoint,
     permissions: Option<u32>,
 ) -> AppResult<()> {
     if let Some(mode) = permissions
-        && mode & 0o200 == 0
+        && mode & 0o600 != 0o600
     {
-        session.set_permissions(staging, Some(mode | 0o200)).await?;
+        session.set_permissions(staging, Some(mode | 0o600)).await?;
     }
     Ok(())
 }
