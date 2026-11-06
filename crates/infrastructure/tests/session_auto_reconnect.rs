@@ -4,7 +4,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -14,9 +14,10 @@ use kerminal_application::sessions::{
     SessionTransportFactory,
 };
 use kerminal_application::{AppError, AppResult};
-use kerminal_domain::identity::{HostId, PaneId, TabId};
+use kerminal_domain::identity::{HostId, PaneId, SessionId, TabId};
 use kerminal_domain::sessions::{
-    SessionExitStatus, SessionOwner, SessionTarget, SshSessionTarget, TerminalSize,
+    SessionExitStatus, SessionLifecycle, SessionOwner, SessionTarget, SshSessionTarget,
+    TerminalSize,
 };
 use kerminal_infrastructure::sessions::{SessionManager, SessionRuntimeConfig};
 use tokio::sync::Mutex;
@@ -26,23 +27,25 @@ use tokio_util::sync::CancellationToken;
 struct ReconnectingFactory {
     open_count: AtomicUsize,
     failures_before_stable: usize,
+    latest_control: Mutex<Option<ReconnectingControl>>,
 }
 
 impl ReconnectingFactory {
-    /// 只跟踪 provider 实际 open 次数，使测试能验证自动重连复用原 registry entry。
+    /// 保留最近的 transport 控制句柄，以便测试独立断线而不改变 manager 的资源所有权。
     ///
     /// @author kongweiguang
     fn new(failures_before_stable: usize) -> Self {
         Self {
             open_count: AtomicUsize::new(0),
             failures_before_stable,
+            latest_control: Mutex::new(None),
         }
     }
 }
 
 #[async_trait]
 impl SessionTransportFactory for ReconnectingFactory {
-    /// 首次交付立即 EOF 且报告 typed disconnect；重连后保留 reader 直到 manager 关闭。
+    /// 按设定次数触发断线，并保留最近控制句柄以模拟稳定连接后的再次断线。
     ///
     /// @author kongweiguang
     async fn open(
@@ -63,20 +66,19 @@ impl SessionTransportFactory for ReconnectingFactory {
         } else {
             Some(peer)
         };
-        Ok(SessionTransport::new(
-            reader,
-            tokio::io::sink(),
-            ReconnectingControl {
-                peer: Mutex::new(keep_peer),
-                retryable_disconnect,
-            },
-        ))
+        let control = ReconnectingControl {
+            peer: Arc::new(Mutex::new(keep_peer)),
+            retryable_disconnect: Arc::new(AtomicBool::new(retryable_disconnect)),
+        };
+        *self.latest_control.lock().await = Some(control.clone());
+        Ok(SessionTransport::new(reader, tokio::io::sink(), control))
     }
 }
 
+#[derive(Clone)]
 struct ReconnectingControl {
-    peer: Mutex<Option<tokio::io::DuplexStream>>,
-    retryable_disconnect: bool,
+    peer: Arc<Mutex<Option<tokio::io::DuplexStream>>>,
+    retryable_disconnect: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -96,11 +98,11 @@ impl SessionTransportControl for ReconnectingControl {
         Ok(())
     }
 
-    /// 首次连接模拟非主动远端断线，后续连接返回实际测试退出状态。
+    /// 仅在测试显式模拟远端断线时返回 typed 错误，避免主动关闭被误认为断线。
     ///
     /// @author kongweiguang
     async fn wait_exit(&self) -> AppResult<SessionExitStatus> {
-        if self.retryable_disconnect {
+        if self.retryable_disconnect.load(Ordering::Acquire) {
             return Err(AppError::retryable_remote_disconnect(
                 std::io::Error::other("test remote channel closed"),
             ));
@@ -143,6 +145,28 @@ async fn wait_for_open_count(factory: &ReconnectingFactory, expected: usize) {
     })
     .await
     .expect("provider reaches expected open count");
+}
+
+/// 确认新 transport 已发布后再推进测试，避免仅凭 factory open 次数触发生命周期竞态。
+///
+/// @author kongweiguang
+async fn wait_for_running_session(manager: &SessionManager, session_id: &SessionId) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let sessions = manager
+                .list(Default::default())
+                .await
+                .expect("session list");
+            if sessions.iter().any(|session| {
+                &session.session_id == session_id && session.lifecycle == SessionLifecycle::Running
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the replacement transport becomes running");
 }
 
 /// settings 开启后只重试 typed disconnect，并保持相同 SessionId 和 UI owner。
@@ -242,4 +266,51 @@ async fn rapid_disconnects_keep_the_same_backoff_incident() {
         .close_all_until(Instant::now() + Duration::from_secs(5))
         .await
         .expect("rapidly reconnecting session closes cleanly");
+}
+
+/// 稳定连接超过真实窗口后，下一次断线必须重新使用首次退避，旧通知不能中止稳定计时。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn stable_reconnect_resets_backoff_before_a_later_disconnect() {
+    let factory = Arc::new(ReconnectingFactory::new(1));
+    let manager = SessionManager::new(
+        factory.clone(),
+        tokio::runtime::Handle::current(),
+        SessionRuntimeConfig::default(),
+    );
+    manager
+        .set_auto_reconnect_enabled(true)
+        .await
+        .expect("manager accepts the settings snapshot");
+    let created = manager
+        .create(create_request())
+        .await
+        .expect("interactive SSH test session opens");
+
+    wait_for_open_count(&factory, 2).await;
+    wait_for_running_session(&manager, &created.session_id).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
+
+    let control = factory
+        .latest_control
+        .lock()
+        .await
+        .clone()
+        .expect("the replacement transport has a control");
+    control.retryable_disconnect.store(true, Ordering::Release);
+    control.peer.lock().await.take();
+    tokio::time::timeout(Duration::from_millis(1800), async {
+        while factory.open_count.load(Ordering::Acquire) < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a separate disconnect starts again with the one-second backoff");
+    wait_for_running_session(&manager, &created.session_id).await;
+
+    manager
+        .close_until(created.session_id, Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("reconnected session closes cleanly");
 }

@@ -2,6 +2,9 @@
 //!
 //! @author kongweiguang
 
+mod close_guard;
+mod resume;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -15,7 +18,7 @@ use std::{
 
 use kerminal_domain::{
     files::{
-        TransferCommitSummary, TransferFailureKind, TransferRequest, TransferStatus,
+        TransferCommitSummary, TransferFailureKind, TransferKind, TransferRequest, TransferStatus,
         TransferSummary, TransferTask,
     },
     identity::{HostId, TransferId},
@@ -31,8 +34,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     InMemoryTransferRecoveryRepository, SftpTransferPolicySnapshot, SftpTransferPolicyStore,
     TransferBackend, TransferCheckpoint, TransferCleanupState, TransferControlRequest,
-    TransferExecutionContext, TransferExecutionError, TransferExecutionFailure, TransferPhase,
-    TransferProgressReporter, TransferProgressUpdate, TransferQueueEvent,
+    TransferExecutionContext, TransferExecutionError, TransferExecutionFailure, TransferOrigin,
+    TransferPhase, TransferProgressReporter, TransferProgressUpdate, TransferQueueEvent,
     TransferQueueSubscription, TransferRecoveryInspection, TransferRecoveryRecord,
     TransferRecoveryRepository, TransferResourceCleanup, TransferStagingOwnership,
 };
@@ -89,6 +92,8 @@ struct TransferServiceInner {
     host_slots: Mutex<HashMap<HostId, Arc<Semaphore>>>,
     global_slots: Arc<Semaphore>,
     events: broadcast::Sender<TransferQueueEvent>,
+    /// 只在活队列实际移除历史时递增，防止进度丢帧被误判成目录变更。
+    history_removal_epoch: Arc<AtomicU64>,
     next_sequence: AtomicU64,
     shutting_down: AtomicBool,
     intake_lock: Mutex<()>,
@@ -99,6 +104,8 @@ struct TransferServiceInner {
 
 struct TransferRecord {
     task: TransferTask,
+    /// 来源在受理前冻结，续传和重试不能跟随当前界面切换。
+    origin: Option<TransferOrigin>,
     /// 重启后仍需要区分暂存准备和最终目标传输。
     drag_staging: bool,
     /// 有效拖动仍持有暂存，不能人工清除对应队列记录。
@@ -126,16 +133,23 @@ struct TransferRecord {
     /// 只有后端 future 已返回才能删除恢复材料；数据屏障成功不等于资源收尾完成。
     attempt_finished: bool,
     worker: Option<JoinHandle<()>>,
+    /// 共享容器接管句柄后仍保留记录，直到该 worker 的 join 被确认。
+    worker_join_pending: bool,
     sequence: u64,
 }
 
 impl TransferRecord {
-    /// 将领域状态与应用层资源所有权合并投影，避免领域模型依赖运行时清理机制。
+    /// 摘要仅承诺当前可用能力；失去暂存归属或已产生后继的原任务不能继续展示续传。
     ///
     /// @author kongweiguang
     fn summary(&self) -> TransferSummary {
         let mut summary = self.task.summary();
         summary.cleanup_pending = self.cleanup_owner.is_some();
+        summary.resumable &= summary.retry_successor.is_none()
+            && self
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint_matches_staging(self, checkpoint));
         summary.phase = match summary.status {
             TransferStatus::Connecting
             | TransferStatus::Transferring
@@ -186,7 +200,7 @@ enum AttemptOutcome {
         checkpoint: Option<TransferCheckpoint>,
         actual_destination: Option<kerminal_domain::files::FileEndpoint>,
     },
-    Idle(TransferProgressUpdate),
+    Idle,
 }
 
 enum IdleAction {
@@ -237,6 +251,8 @@ impl TransferService {
     }
 
     /// 正式装配显式传入恢复仓储与主机目录；构造期不做 IO，恢复列表读取失败可在界面原位重试。
+    ///
+    /// @author kongweiguang
     pub fn new_with_recovery_repository(
         backends: Vec<Arc<dyn TransferBackend>>,
         runtime: Handle,
@@ -277,6 +293,7 @@ impl TransferService {
                 host_slots: Mutex::new(HashMap::new()),
                 global_slots: Arc::new(Semaphore::new(options.max_concurrent)),
                 events,
+                history_removal_epoch: Arc::new(AtomicU64::new(0)),
                 next_sequence: AtomicU64::new(1),
                 shutting_down: AtomicBool::new(false),
                 intake_lock: Mutex::new(()),
@@ -291,7 +308,7 @@ impl TransferService {
     ///
     /// @author kongweiguang
     pub async fn enqueue(&self, request: TransferRequest) -> AppResult<TransferSummary> {
-        self.enqueue_inner(request, None, false).await
+        self.enqueue_inner(request, None, false, None).await
     }
 
     /// 为一次性外部连接显式保留活动传输 scope，普通 MCP/保存主机请求不能冒用该入口。
@@ -308,17 +325,56 @@ impl TransferService {
             return Err(AppError::invalid("临时外部目标与传输端点不匹配"));
         }
         let retained_lease = lease.retain()?;
-        self.enqueue_inner(request, Some(retained_lease), false)
+        self.enqueue_inner(request, Some(retained_lease), false, None)
             .await
     }
 
-    /// 暂存任务在发布首个队列快照前标记用途，避免界面把准备结果当作系统目标复制。
+    /// 在取得独立临时租约后冻结工作区来源，确保首个快照与恢复材料均具备相同归属。
+    ///
+    /// @author kongweiguang
+    pub async fn enqueue_for_origin(
+        &self,
+        request: TransferRequest,
+        origin: TransferOrigin,
+        lease: Option<&ExternalTargetLease>,
+    ) -> AppResult<TransferSummary> {
+        let retained = lease.map(ExternalTargetLease::retain).transpose()?;
+        self.enqueue_inner(request, retained, false, Some(origin))
+            .await
+    }
+
+    /// 保留无来源入口供非工作区调用方使用，不从端点反推工作区身份。
     ///
     /// @author kongweiguang
     pub async fn enqueue_drag_staging(
         &self,
         request: TransferRequest,
         lease: Option<&ExternalTargetLease>,
+    ) -> AppResult<TransferSummary> {
+        self.enqueue_drag_staging_inner(request, lease, None).await
+    }
+
+    /// 在发布首个队列快照前冻结来源，确保拖出暂存及恢复证据属于发起工作区。
+    ///
+    /// @author kongweiguang
+    pub async fn enqueue_drag_staging_for_origin(
+        &self,
+        request: TransferRequest,
+        origin: TransferOrigin,
+        lease: Option<&ExternalTargetLease>,
+    ) -> AppResult<TransferSummary> {
+        self.enqueue_drag_staging_inner(request, lease, Some(origin))
+            .await
+    }
+
+    /// 有无来源共用暂存端点与临时租约校验，避免兼容入口绕开同一保护边界。
+    ///
+    /// @author kongweiguang
+    async fn enqueue_drag_staging_inner(
+        &self,
+        request: TransferRequest,
+        lease: Option<&ExternalTargetLease>,
+        origin: Option<TransferOrigin>,
     ) -> AppResult<TransferSummary> {
         if !matches!(
             &request.destination,
@@ -337,7 +393,7 @@ impl TransferService {
             }
             None => None,
         };
-        self.enqueue_inner(request, retained, true).await
+        self.enqueue_inner(request, retained, true, origin).await
     }
 
     /// 标记仅描述当前内存队列中的任务，不从临时路径名称猜测传输目的。
@@ -373,6 +429,7 @@ impl TransferService {
         request: TransferRequest,
         external_target_lease: Option<ExternalTargetLease>,
         drag_staging: bool,
+        origin: Option<TransferOrigin>,
     ) -> AppResult<TransferSummary> {
         let _intake = self.inner.intake_lock.lock().await;
         self.ensure_open()?;
@@ -433,6 +490,7 @@ impl TransferService {
             }
             let record = TransferRecord {
                 task,
+                origin,
                 drag_staging,
                 drag_evidence_pending: drag_staging,
                 checkpoint: None,
@@ -452,6 +510,7 @@ impl TransferService {
                 no_changes_finalized: false,
                 attempt_finished: false,
                 worker: None,
+                worker_join_pending: false,
                 sequence: self.inner.next_sequence.fetch_add(1, Ordering::Relaxed),
             };
             self.persist_recovery_record(&record).await?;
@@ -487,6 +546,19 @@ impl TransferService {
         ordered.into_iter().map(|record| record.summary()).collect()
     }
 
+    /// 只投影匹配来源的实时任务，排序仍使用同一全局队列分配的序号。
+    ///
+    /// @author kongweiguang
+    pub async fn list_for_origin(&self, origin: &TransferOrigin) -> Vec<TransferSummary> {
+        let records = self.inner.records.lock().await;
+        let mut ordered = records
+            .values()
+            .filter(|record| record.origin.as_ref() == Some(origin))
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|record| std::cmp::Reverse(record.sequence));
+        ordered.into_iter().map(|record| record.summary()).collect()
+    }
+
     /// 恢复项只读加载，不恢复 worker 或 SSH lease；活跃任务仍由普通队列独占展示。
     pub async fn list_recovery(
         &self,
@@ -503,6 +575,49 @@ impl TransferService {
             })
         });
         Ok(recovery)
+    }
+
+    /// 重启后的孤儿材料只属于持久化时明确登记的来源，旧记录不能按端点猜测归属。
+    ///
+    /// @author kongweiguang
+    pub async fn list_recovery_for_origin(
+        &self,
+        origin: &TransferOrigin,
+        cancellation: CancellationToken,
+    ) -> AppResult<Vec<TransferRecoveryRecord>> {
+        let mut records = self.list_recovery(cancellation).await?;
+        records.retain(|record| record.origin.as_ref() == Some(origin));
+        Ok(records)
+    }
+
+    /// 动作在执行前校验冻结来源，活记录缺失时再核验持久孤儿材料。
+    ///
+    /// @author kongweiguang
+    pub async fn ensure_origin(
+        &self,
+        id: &TransferId,
+        origin: &TransferOrigin,
+        cancellation: CancellationToken,
+    ) -> AppResult<()> {
+        if let Some(record) = self.inner.records.lock().await.get(id) {
+            return if record.origin.as_ref() == Some(origin) {
+                Ok(())
+            } else {
+                Err(AppError::not_found("传输任务不属于当前工作区"))
+            };
+        }
+        if self
+            .inner
+            .recovery_repository
+            .list(cancellation)
+            .await?
+            .iter()
+            .any(|record| &record.id == id && record.origin.as_ref() == Some(origin))
+        {
+            Ok(())
+        } else {
+            Err(AppError::not_found("传输任务不属于当前工作区"))
+        }
     }
 
     /// 对原事务做只读证据核对；运行中 owner 不可核对，也不会由此启动第二次传输。
@@ -614,6 +729,9 @@ impl TransferService {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(id);
+            self.inner
+                .history_removal_epoch
+                .fetch_add(1, Ordering::Release);
         }
         publish(&self.inner.events);
         Ok(())
@@ -634,11 +752,15 @@ impl TransferService {
             .await
     }
 
-    /// 原 worker 尚未退出时即使投影为终态，也不允许恢复写入覆盖其迟到回执。
+    /// 必须有完成回执且原 worker 已退出，恢复写入才不会覆盖迟到的传输事实。
+    ///
+    /// @author kongweiguang
     async fn ensure_recovery_idle(&self, id: &TransferId) -> AppResult<()> {
         let records = self.inner.records.lock().await;
         if records.get(id).is_some_and(|record| {
             !is_terminal(record.task.status())
+                || !record.attempt_finished
+                || record.worker_join_pending
                 || record
                     .worker
                     .as_ref()
@@ -712,6 +834,7 @@ impl TransferService {
             .upsert(
                 TransferRecoveryRecord {
                     id: summary.id,
+                    origin: record.origin.clone(),
                     request: summary.request,
                     drag_staging: record.drag_staging,
                     actual_destination: summary.actual_destination,
@@ -857,6 +980,43 @@ impl TransferService {
         &self,
         cancellation: CancellationToken,
     ) -> AppResult<(usize, usize)> {
+        self.clear_completed_inner(None, false, cancellation).await
+    }
+
+    /// 使用原有清理锁和 worker 回收屏障，只移除指定来源的安全终态。
+    ///
+    /// @author kongweiguang
+    pub async fn clear_completed_for_origin(
+        &self,
+        origin: &TransferOrigin,
+        cancellation: CancellationToken,
+    ) -> AppResult<(usize, usize)> {
+        self.clear_completed_inner(Some(origin), false, cancellation)
+            .await
+    }
+
+    /// 面板清理同时收起已结束记录的恢复副本；先耐久归档证据，再释放活记录，旧清理契约保持独立。
+    ///
+    /// @author kongweiguang
+    pub async fn dismiss_completed_for_origin(
+        &self,
+        origin: &TransferOrigin,
+        cancellation: CancellationToken,
+    ) -> AppResult<()> {
+        self.clear_completed_inner(Some(origin), true, cancellation)
+            .await
+            .map(|_| ())
+    }
+
+    /// 来源与归档资格在同一锁内判断；等待 worker 后才归档，失败保留活记录供下次清理接续。
+    ///
+    /// @author kongweiguang
+    async fn clear_completed_inner(
+        &self,
+        origin: Option<&TransferOrigin>,
+        archive_recovery: bool,
+        cancellation: CancellationToken,
+    ) -> AppResult<(usize, usize)> {
         let deadline = Instant::now() + self.inner.options.shutdown_timeout;
         let _shutdown = cancellable_clear(&cancellation, async {
             timeout_at(deadline, self.inner.shutdown_lock.lock())
@@ -888,7 +1048,9 @@ impl TransferService {
             .await?;
             let mut terminal_ids = Vec::new();
             for (id, record) in records.iter_mut() {
-                if is_removable_history_record(record) {
+                if origin.is_none_or(|origin| record.origin.as_ref() == Some(origin))
+                    && is_removable_history_record(record)
+                {
                     terminal_ids.push(id.clone());
                     if let Some(handle) = record.worker.take() {
                         owned_workers.push(ShutdownWorkerOwner::Running {
@@ -910,7 +1072,8 @@ impl TransferService {
             };
             let is_terminal_id = terminal_ids.contains(&id);
             if !is_terminal_id
-                && matches!(&owned_workers[index], ShutdownWorkerOwner::Running { .. })
+                && (origin.is_some()
+                    || matches!(&owned_workers[index], ShutdownWorkerOwner::Running { .. }))
             {
                 index += 1;
                 continue;
@@ -988,7 +1151,7 @@ impl TransferService {
                 .map_err(|_| AppError::timeout("等待传输记录清理"))
         })
         .await?;
-        // 记录锁内的最后一次检查作为删除线性化点；之后的取消不能回滚已移除的历史。
+        // 记录锁内复核候选；逐项归档确认后立即移除，后续取消不回滚已提交的项目。
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("传输历史清理已取消"));
         }
@@ -1000,7 +1163,58 @@ impl TransferService {
                 })
             })
             .collect::<Vec<_>>();
-        {
+        if archive_recovery {
+            let recovery = self
+                .inner
+                .recovery_repository
+                .list(cancellation.clone())
+                .await?;
+            for id in &removed {
+                if cancellation.is_cancelled() {
+                    return Err(AppError::cancelled("传输历史清理已取消"));
+                }
+                if recovery.iter().any(|saved| &saved.id == id) {
+                    // 磁盘原子提交不随 future 丢弃而停止，必须等待归档的权威回执。
+                    if let Err(error) = self
+                        .inner
+                        .recovery_repository
+                        .archive(id, cancellation.clone())
+                        .await
+                    {
+                        // 冷档可能已提交；保留持久证据，仅撤销旧 ID 的续传资格，普通重试仍使用新 ID。
+                        if let Some(record) = records.get_mut(id) {
+                            record.checkpoint = None;
+                        }
+                        publish(&self.inner.events);
+                        return Err(error);
+                    }
+                }
+                // 归档确认后立即移除；下项取消不能留下已封存但仍可重试的活卡片。
+                records.remove(id);
+                self.inner
+                    .drag_staging_ids
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(id);
+                self.inner
+                    .history_removal_epoch
+                    .fetch_add(1, Ordering::Release);
+                let _ = self.inner.events.send(TransferQueueEvent::Cleared);
+            }
+            for saved in recovery {
+                if !removed.contains(&saved.id)
+                    && origin.is_some_and(|origin| saved.origin.as_ref() == Some(origin))
+                    && !records.contains_key(&saved.id)
+                    && saved.can_dismiss_without_live_task()
+                {
+                    self.inner
+                        .recovery_repository
+                        .archive(&saved.id, cancellation.clone())
+                        .await?;
+                    publish(&self.inner.events);
+                }
+            }
+        } else {
             let mut markers = self
                 .inner
                 .drag_staging_ids
@@ -1011,8 +1225,14 @@ impl TransferService {
                 markers.remove(id);
             }
         }
-        let remaining = records.len();
-        if !removed.is_empty() {
+        let remaining = records
+            .values()
+            .filter(|record| origin.is_none_or(|origin| record.origin.as_ref() == Some(origin)))
+            .count();
+        if !archive_recovery && !removed.is_empty() {
+            self.inner
+                .history_removal_epoch
+                .fetch_add(1, Ordering::Release);
             let _ = self.inner.events.send(TransferQueueEvent::Cleared);
         }
         Ok((removed.len(), remaining))
@@ -1171,6 +1391,7 @@ impl TransferService {
                 return Err(AppError::conflict("传输队列已达到容量上限"));
             }
             let request = old.task.request().clone();
+            let origin = old.origin.clone();
             let effective_idle_timeout_seconds = old.effective_idle_timeout_seconds;
             let source_sftp = old.source_sftp.clone();
             let destination_sftp = old.destination_sftp.clone();
@@ -1200,6 +1421,7 @@ impl TransferService {
             }
             let record = TransferRecord {
                 task,
+                origin,
                 drag_staging: false,
                 drag_evidence_pending: false,
                 checkpoint,
@@ -1219,6 +1441,7 @@ impl TransferService {
                 no_changes_finalized: false,
                 attempt_finished: false,
                 worker: None,
+                worker_join_pending: false,
                 sequence: self.inner.next_sequence.fetch_add(1, Ordering::Relaxed),
             };
             self.persist_recovery_record(&record).await?;
@@ -1235,12 +1458,16 @@ impl TransferService {
         self.get(&successor).await
     }
 
-    /// 订阅有界队列唤醒信号；丢帧时接收方仍通过 list 获取权威快照。
+    /// 订阅有界队列唤醒信号；先记录删除代次，再订阅广播，避免建立时漏掉记录移除。
     ///
     /// @author kongweiguang
     pub fn subscribe(&self) -> TransferQueueSubscription {
+        let observed_history_removal_epoch =
+            self.inner.history_removal_epoch.load(Ordering::Acquire);
         TransferQueueSubscription {
             receiver: self.inner.events.subscribe(),
+            history_removal_epoch: self.inner.history_removal_epoch.clone(),
+            observed_history_removal_epoch,
         }
     }
 
@@ -1265,13 +1492,12 @@ impl TransferService {
         let _intake = timeout_at(deadline, self.inner.intake_lock.lock())
             .await
             .map_err(|_| AppError::timeout("等待传输入队锁关闭"))?;
-        let mut records = timeout_at(deadline, self.inner.records.lock())
-            .await
-            .map_err(|_| AppError::timeout("等待传输记录锁关闭"))?;
         let mut workers = timeout_at(deadline, self.inner.shutdown_workers.lock())
             .await
             .map_err(|_| AppError::timeout("等待传输 worker 所有权锁关闭"))?;
-        let mut pending = std::mem::take(&mut *workers);
+        let mut records = timeout_at(deadline, self.inner.records.lock())
+            .await
+            .map_err(|_| AppError::timeout("等待传输记录锁关闭"))?;
         for (id, record) in records.iter_mut() {
             if !is_terminal(record.task.status()) && record.task.request_cancel() {
                 if !record.task.commit_item_in_progress() {
@@ -1280,7 +1506,8 @@ impl TransferService {
                 publish(&self.inner.events);
             }
             if let Some(handle) = record.worker.take() {
-                pending.push(ShutdownWorkerOwner::Running {
+                record.worker_join_pending = true;
+                workers.push(ShutdownWorkerOwner::Running {
                     id: id.clone(),
                     handle,
                 });
@@ -1288,91 +1515,66 @@ impl TransferService {
         }
         drop(records);
 
-        // 暂时保留 shutdown_workers 的唯一所有权，deadline 到时把未完成 JoinHandle 放回。
         let mut join_failed = false;
-        let mut remaining = Vec::new();
-        let mut pending = pending.into_iter();
-        while let Some(owner) = pending.next() {
-            let (id, join_result) = match owner {
-                ShutdownWorkerOwner::Running { id, mut handle } => {
-                    let join_result = if handle.is_finished() {
-                        Some((&mut handle).await)
+        let mut index = 0;
+        while index < workers.len() {
+            let id = match &workers[index] {
+                ShutdownWorkerOwner::Running { id, .. }
+                | ShutdownWorkerOwner::JoinFailed { id, .. } => id.clone(),
+            };
+            let join_result = match &mut workers[index] {
+                ShutdownWorkerOwner::Running { handle, .. } => {
+                    if handle.is_finished() {
+                        Some((&mut *handle).await)
                     } else {
-                        match timeout_at(deadline, &mut handle).await {
+                        match timeout_at(deadline, &mut *handle).await {
                             Ok(result) => Some(result),
-                            Err(_) if handle.is_finished() => Some((&mut handle).await),
+                            Err(_) if handle.is_finished() => Some((&mut *handle).await),
                             Err(_) => None,
                         }
-                    };
-                    match &join_result {
-                        Some(Err(error)) => remaining.push(ShutdownWorkerOwner::JoinFailed {
-                            id: id.clone(),
-                            cancelled: error.is_cancelled(),
-                            panicked: error.is_panic(),
-                        }),
-                        None => remaining.push(ShutdownWorkerOwner::Running {
-                            id: id.clone(),
-                            handle,
-                        }),
-                        _ => {}
                     }
-                    (id, join_result)
                 }
                 ShutdownWorkerOwner::JoinFailed {
-                    id,
                     cancelled,
                     panicked,
+                    ..
                 } => {
-                    remaining.push(ShutdownWorkerOwner::JoinFailed {
-                        id: id.clone(),
-                        cancelled,
-                        panicked,
-                    });
                     join_failed = true;
-                    if let Err(error) = self
-                        .record_worker_join_failure_until(&id, cancelled, panicked, deadline)
-                        .await
-                    {
-                        remaining.extend(pending);
-                        *workers = remaining;
-                        return Err(error);
-                    }
+                    self.record_worker_join_failure_until(&id, *cancelled, *panicked, deadline)
+                        .await?;
+                    index += 1;
                     continue;
                 }
             };
             match join_result {
-                Some(Ok(())) => {}
+                Some(Ok(())) => {
+                    workers.remove(index);
+                }
                 Some(Err(error)) => {
                     let cancelled = error.is_cancelled();
                     let panicked = error.is_panic();
+                    workers[index] = ShutdownWorkerOwner::JoinFailed {
+                        id: id.clone(),
+                        cancelled,
+                        panicked,
+                    };
                     tracing::error!(
                         transfer_id = %id,
                         cancelled,
                         panicked,
                         "传输 worker 异常终止"
                     );
-                    if let Err(record_error) = self
-                        .record_worker_join_failure_until(&id, cancelled, panicked, deadline)
-                        .await
-                    {
-                        remaining.extend(pending);
-                        *workers = remaining;
-                        return Err(record_error);
-                    }
+                    self.record_worker_join_failure_until(&id, cancelled, panicked, deadline)
+                        .await?;
                     join_failed = true;
+                    index += 1;
                 }
-                None => {}
+                None => {
+                    return Err(AppError::timeout(
+                        "传输 worker 清理超过关闭期限；应用尚未完成资源关闭",
+                    ));
+                }
             }
-        }
-
-        let workers_still_running = remaining
-            .iter()
-            .any(|owner| matches!(owner, ShutdownWorkerOwner::Running { .. }));
-        *workers = remaining;
-        if workers_still_running {
-            return Err(AppError::timeout(
-                "传输 worker 清理超过关闭期限；应用尚未完成资源关闭",
-            ));
         }
         drop(workers);
         if join_failed {
@@ -1564,20 +1766,18 @@ impl TransferService {
                         .await;
                     break;
                 }
-                AttemptOutcome::Idle(last_update) => {
-                    match self.handle_idle(&id, last_update).await {
-                        IdleAction::Recover => {
-                            tokio::select! {
-                                _ = cancellation.cancelled() => {
-                                    self.finish_cancelled(&id, None, None).await;
-                                    break;
-                                }
-                                _ = sleep(self.inner.options.recovery_delay) => {}
+                AttemptOutcome::Idle => match self.handle_idle(&id).await {
+                    IdleAction::Recover => {
+                        tokio::select! {
+                            _ = cancellation.cancelled() => {
+                                self.finish_cancelled(&id, None, None).await;
+                                break;
                             }
+                            _ = sleep(self.inner.options.recovery_delay) => {}
                         }
-                        IdleAction::Finished => break,
                     }
-                }
+                    IdleAction::Finished => break,
+                },
             }
         }
     }
@@ -1655,7 +1855,7 @@ impl TransferService {
     }
 
     /// 单次执行固定本轮的空闲超时、取消令牌与策略快照，避免后续队列变化改写运行中尝试的约束；
-    /// 进度快照仅刷新展示，必经的传输与提交状态仍由有界控制消息可靠确认。
+    /// 进度快照仅刷新展示，必经状态由控制消息确认；空闲失败须保留真实回执及最新可信断点。
     ///
     /// @author kongweiguang
     async fn run_attempt(&self, attempt: TransferAttemptInput<'_>) -> AttemptOutcome {
@@ -1874,13 +2074,34 @@ impl TransferService {
                         };
                     }
                     if idle_expired {
-                        if let Err(TransferExecutionError::Failed(failure)) = &result
-                            && (!failure.cleanup_state().is_released()
-                                || failure.kind() == TransferFailureKind::CommitUnknown)
+                        let checkpoint = match result {
+                            Err(TransferExecutionError::Failed(failure))
+                                if !failure.cleanup_state().is_released()
+                                    || failure.kind() == TransferFailureKind::CommitUnknown
+                                    || !failure.resumable() =>
+                            {
+                                return AttemptOutcome::Failed(failure);
+                            }
+                            Err(TransferExecutionError::Failed(failure)) => failure
+                                .checkpoint()
+                                .cloned()
+                                .map(|checkpoint| (checkpoint, failure.actual_destination().cloned())),
+                            Err(TransferExecutionError::Cancelled {
+                                checkpoint: Some(checkpoint),
+                                actual_destination,
+                            }) => Some((checkpoint, actual_destination)),
+                            _ => None,
+                        };
+                        if let Some((checkpoint, actual_destination)) = checkpoint
+                            && self.apply_idle_checkpoint(id, &last_update, checkpoint, actual_destination).await.is_err()
                         {
-                            return AttemptOutcome::Failed(failure.clone());
+                            return AttemptOutcome::Failed(TransferExecutionFailure::new(
+                                TransferFailureKind::Internal, false, false, None,
+                                last_update.actual_destination,
+                                TransferCleanupState::Released,
+                            ));
                         }
-                        return AttemptOutcome::Idle(last_update);
+                        return AttemptOutcome::Idle;
                     }
                     return match result {
                         Ok(result) if result.skipped && !result.unchanged && !commit_started && !no_changes_finalized => AttemptOutcome::Completed(result),
@@ -1934,7 +2155,9 @@ impl TransferService {
         }
     }
 
-    /// 暂存创建前持久登记完整 owner，失败保留“是否创建待核对”事实；释放必须匹配原 token 而不能只凭路径。
+    /// 暂存创建前持久登记完整 owner；确认释放时同步撤销失去归属的断点。
+    ///
+    /// @author kongweiguang
     async fn apply_staging_ownership(
         &self,
         id: &TransferId,
@@ -1992,6 +2215,13 @@ impl TransferService {
                 record
                     .staging_ownership
                     .retain(|current| current != &ownership);
+                if record
+                    .checkpoint
+                    .as_ref()
+                    .is_some_and(|checkpoint| !checkpoint_matches_staging(record, checkpoint))
+                {
+                    record.checkpoint = None;
+                }
             }
         } else if retained {
             if record.staging_ownership.len() >= 512 {
@@ -2007,7 +2237,7 @@ impl TransferService {
     }
 
     /// 进度快照只更新正在传输任务的展示投影；状态迁移由控制消息负责。
-    /// 在同一记录锁内保存更新前的目标与检查点，仅在恢复信息变化时写入持久记录。
+    /// 断点须延续已登记的源与暂存证据，避免合并或延迟的进度覆盖可信记录。
     ///
     /// @author kongweiguang
     async fn apply_progress(
@@ -2050,11 +2280,7 @@ impl TransferService {
             _ => return Err(AppError::conflict("传输进度超出当前状态")),
         }
         if let Some(checkpoint) = update.checkpoint
-            && valid_checkpoint(
-                &checkpoint,
-                update.confirmed_bytes,
-                record.task.actual_destination(),
-            )
+            && checkpoint_can_advance(record, &checkpoint, update.confirmed_bytes)
         {
             record.checkpoint = Some(checkpoint);
         }
@@ -2067,7 +2293,7 @@ impl TransferService {
         Ok(())
     }
 
-    /// 用可靠最终字节计数和单一提交许可确定线性化点，避免 watch 进度被合并后误判。
+    /// 用可靠最终字节计数和单一提交许可确定线性化点；单文件断点必须已有完整摘要。
     ///
     /// @author kongweiguang
     async fn apply_commit_barrier(
@@ -2091,11 +2317,11 @@ impl TransferService {
                     .map_err(|_| AppError::conflict("最终确认字节不符合传输进度"))?;
                 update_progress_telemetry(record, previous_bytes, confirmed_bytes);
                 if let Some(checkpoint) = checkpoint {
-                    if !valid_checkpoint(
-                        &checkpoint,
-                        confirmed_bytes,
-                        record.task.actual_destination(),
-                    ) {
+                    if checkpoint.actual_destination != destination
+                        || checkpoint.confirmed_bytes != checkpoint.source_revision.size
+                        || checkpoint.source_revision.content_digest.is_none()
+                        || !checkpoint_can_advance(record, &checkpoint, confirmed_bytes)
+                    {
                         return Err(AppError::conflict("提交时传入的断点未通过校验"));
                     }
                     record.checkpoint = Some(checkpoint);
@@ -2208,6 +2434,8 @@ impl TransferService {
             &mut records,
             self.inner.options.max_history,
             &self.inner.drag_staging_ids,
+            &self.inner.history_removal_epoch,
+            &self.inner.events,
         );
         Ok(summary)
     }
@@ -2232,6 +2460,8 @@ impl TransferService {
             &mut records,
             self.inner.options.max_history,
             &self.inner.drag_staging_ids,
+            &self.inner.history_removal_epoch,
+            &self.inner.events,
         );
         Ok(summary)
     }
@@ -2285,6 +2515,8 @@ impl TransferService {
             &mut records,
             self.inner.options.max_history,
             &self.inner.drag_staging_ids,
+            &self.inner.history_removal_epoch,
+            &self.inner.events,
         );
         Ok(())
     }
@@ -2356,10 +2588,72 @@ impl TransferService {
         Ok(())
     }
 
-    /// idle timeout 时只用源版本和前缀摘要都可信的检查点恢复，提交阶段统一转为 commitUnknown。
+    /// 空闲取消可同步出比最后进度帧更新的断点；源摘要只允许在完成后单向补全。
     ///
     /// @author kongweiguang
-    async fn handle_idle(&self, id: &TransferId, update: TransferProgressUpdate) -> IdleAction {
+    async fn apply_idle_checkpoint(
+        &self,
+        id: &TransferId,
+        update: &TransferProgressUpdate,
+        checkpoint: TransferCheckpoint,
+        actual_destination: Option<kerminal_domain::files::FileEndpoint>,
+    ) -> AppResult<()> {
+        let mut records = self.inner.records.lock().await;
+        let record = records
+            .get_mut(id)
+            .ok_or_else(|| AppError::not_found("传输任务不存在"))?;
+        let confirmed_bytes = record
+            .task
+            .bytes_transferred()
+            .max(update.confirmed_bytes)
+            .max(checkpoint.confirmed_bytes);
+        if !matches!(
+            record.task.status(),
+            TransferStatus::Transferring | TransferStatus::Cancelling
+        ) || record.task.request().kind != TransferKind::File
+            || record.task.actual_destination() != Some(&checkpoint.actual_destination)
+            || actual_destination
+                .as_ref()
+                .is_some_and(|destination| destination != &checkpoint.actual_destination)
+            || update
+                .actual_destination
+                .as_ref()
+                .is_some_and(|destination| destination != &checkpoint.actual_destination)
+            || confirmed_bytes > checkpoint.source_revision.size
+            || record
+                .task
+                .total_bytes()
+                .is_some_and(|total| total != checkpoint.source_revision.size)
+            || update
+                .total_bytes
+                .is_some_and(|total| total != checkpoint.source_revision.size)
+            || !checkpoint_can_advance(record, &checkpoint, confirmed_bytes)
+        {
+            return Ok(());
+        }
+        let previous_bytes = record.task.bytes_transferred();
+        let progress_result = if record.task.status() == TransferStatus::Cancelling {
+            record.task.record_cancellation_checkpoint_progress(
+                confirmed_bytes,
+                Some(checkpoint.source_revision.size),
+            )
+        } else {
+            record
+                .task
+                .record_progress(confirmed_bytes, Some(checkpoint.source_revision.size))
+        };
+        progress_result.map_err(|_| AppError::conflict("空闲断点的确认字节不符合传输状态"))?;
+        update_progress_telemetry(record, previous_bytes, confirmed_bytes);
+        record.checkpoint = Some(checkpoint);
+        self.persist_recovery_record(record).await?;
+        publish(&self.inner.events);
+        Ok(())
+    }
+
+    /// idle timeout 只恢复已登记暂存所有权的可信检查点，提交阶段统一转为 commitUnknown。
+    ///
+    /// @author kongweiguang
+    async fn handle_idle(&self, id: &TransferId) -> IdleAction {
         let mut records = self.inner.records.lock().await;
         let Some(record) = records.get_mut(id) else {
             return IdleAction::Finished;
@@ -2376,23 +2670,44 @@ impl TransferService {
             publish(&self.inner.events);
             return IdleAction::Finished;
         }
-        let checkpoint = update
-            .checkpoint
-            .filter(|checkpoint| checkpoint.confirmed_bytes <= update.confirmed_bytes)
-            .or_else(|| record.checkpoint.clone());
-        if let Some(checkpoint) =
-            checkpoint.filter(|checkpoint| valid_sha256(&checkpoint.confirmed_prefix_sha256))
-            && record.task.begin_automatic_recovery(true).is_ok()
-        {
-            record.checkpoint = Some(checkpoint.clone());
-            let _ = record
-                .task
-                .select_actual_destination(checkpoint.actual_destination.clone());
+        let checkpoint = record.checkpoint.clone().filter(|checkpoint| {
+            valid_checkpoint(
+                checkpoint,
+                record.task.bytes_transferred(),
+                record.task.actual_destination(),
+            ) && record.task.actual_destination() == Some(&checkpoint.actual_destination)
+                && record
+                    .task
+                    .total_bytes()
+                    .is_none_or(|total| total == checkpoint.source_revision.size)
+                && checkpoint_matches_staging(record, checkpoint)
+        });
+        if record.task.status() == TransferStatus::Cancelling {
+            let _ = record.task.confirm_cancelled(checkpoint.is_some());
+            if record.cleanup_owner.is_none() {
+                record.external_target_lease.take();
+            }
             record.phase = None;
+            publish(&self.inner.events);
+            return IdleAction::Finished;
+        }
+        if let Some(checkpoint) = checkpoint.clone()
+            && record
+                .task
+                .begin_automatic_recovery_from_checkpoint(
+                    checkpoint.confirmed_bytes,
+                    Some(checkpoint.source_revision.size),
+                )
+                .is_ok()
+        {
+            record.checkpoint = Some(checkpoint);
+            record.phase = None;
+            record.progress_sample = None;
+            record.speed_bytes_per_second = 0;
+            record.last_progress_at = None;
             publish(&self.inner.events);
             return IdleAction::Recover;
         }
-        let checkpoint = record.checkpoint.clone();
         let resumable = checkpoint.is_some();
         let _ = record.task.fail(
             TransferFailureKind::IdleTimeout,
@@ -2462,6 +2777,8 @@ impl TransferService {
                 &mut records,
                 self.inner.options.max_history,
                 &self.inner.drag_staging_ids,
+                &self.inner.history_removal_epoch,
+                &self.inner.events,
             );
             return;
         }
@@ -2491,7 +2808,7 @@ impl TransferService {
         record.external_target_lease.take();
     }
 
-    /// 后端失败按稳定类别进入领域状态；CommitUnknown 必须保留临时目标 scope 供人工核对。
+    /// 后端失败按稳定类别进入领域状态；明确撤销断点的回执不能沿用旧续传资格。
     ///
     /// @author kongweiguang
     async fn finish_failure(&self, id: &TransferId, failure: TransferExecutionFailure) {
@@ -2537,19 +2854,31 @@ impl TransferService {
             && failure.kind() != TransferFailureKind::CommitUnknown
             && failure.cleanup_state().is_released()
         {
-            if let Some(checkpoint) = failure.checkpoint().cloned() {
+            if !failure.resumable() {
+                record.checkpoint = None;
+            } else if let Some(checkpoint) = failure.checkpoint().cloned()
+                && failure
+                    .actual_destination()
+                    .is_none_or(|destination| destination == &checkpoint.actual_destination)
+                && checkpoint_can_advance(record, &checkpoint, checkpoint.confirmed_bytes)
+            {
                 record.checkpoint = Some(checkpoint);
             }
             let _ = record.task.confirm_cancelled(record.checkpoint.is_some());
         } else {
-            if let Some(checkpoint) = failure.checkpoint().cloned() {
+            if let Some(checkpoint) = failure.checkpoint().cloned()
+                && failure
+                    .actual_destination()
+                    .is_none_or(|destination| destination == &checkpoint.actual_destination)
+                && checkpoint_can_advance(record, &checkpoint, checkpoint.confirmed_bytes)
+            {
                 record.checkpoint = Some(checkpoint);
             }
             let _ = record.task.fail(
                 failure_kind,
                 safe_message.to_owned(),
                 failure.retryable(),
-                failure.resumable(),
+                failure.resumable() && record.checkpoint.is_some(),
             );
         }
         if record.cleanup_owner.is_none() && failure_kind != TransferFailureKind::CommitUnknown {
@@ -2560,10 +2889,12 @@ impl TransferService {
             &mut records,
             self.inner.options.max_history,
             &self.inner.drag_staging_ids,
+            &self.inner.history_removal_epoch,
+            &self.inner.events,
         );
     }
 
-    /// 后端确认资源释放后才确认取消；提交期间或已有未知结果时保留目标 scope 供回读。
+    /// 后端确认资源释放后才确认取消；取消回执必须延续已登记的断点证据。
     ///
     /// @author kongweiguang
     async fn finish_cancelled(
@@ -2588,7 +2919,7 @@ impl TransferService {
             );
             record.checkpoint = None;
         } else if record.task.status() != TransferStatus::Cancelled {
-            if let Some(destination) = actual_destination
+            if let Some(destination) = actual_destination.as_ref()
                 && matches!(
                     record.task.status(),
                     TransferStatus::Queued
@@ -2596,12 +2927,17 @@ impl TransferService {
                         | TransferStatus::Transferring
                 )
             {
-                let _ = record.task.select_actual_destination(destination);
+                let _ = record.task.select_actual_destination(destination.clone());
             }
             if record.task.status() != TransferStatus::Cancelling {
                 let _ = record.task.request_cancel();
             }
-            if let Some(checkpoint) = checkpoint {
+            if let Some(checkpoint) = checkpoint
+                && actual_destination
+                    .as_ref()
+                    .is_none_or(|destination| destination == &checkpoint.actual_destination)
+                && checkpoint_can_advance(record, &checkpoint, checkpoint.confirmed_bytes)
+            {
                 record.checkpoint = Some(checkpoint);
             }
             if record.task.status() == TransferStatus::Cancelling {
@@ -2616,6 +2952,8 @@ impl TransferService {
             &mut records,
             self.inner.options.max_history,
             &self.inner.drag_staging_ids,
+            &self.inner.history_removal_epoch,
+            &self.inner.events,
         );
     }
 
@@ -2693,11 +3031,12 @@ fn is_drag_record_in_directory(record: &TransferRecord, directory: &Path) -> boo
         && matches!(&record.task.request().destination, kerminal_domain::files::FileEndpoint::Local { path } if path.parent() == Some(directory))
 }
 
-/// 统一判定手动清理与自动裁剪可移除的历史，保留待人工核对或仍持有资源引用的记录。
+/// 统一判定可移除历史；失去暂存归属的旧断点不再阻止清理。
 ///
 /// @author kongweiguang
 fn is_removable_history_record(record: &TransferRecord) -> bool {
     is_terminal(record.task.status())
+        && !(record.task.status() == TransferStatus::Cancelled && record.summary().resumable)
         && !record.drag_evidence_pending
         && record.cleanup_owner.is_none()
         && record.external_target_lease.is_none()
@@ -2783,7 +3122,7 @@ fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// 断点必须绑定强源 revision、确认前缀、唯一暂存 owner 和最终目标的同目录路径。
+/// 未读到 EOF 的断点可以没有完整摘要；一旦存在摘要必须合法且与完整前缀一致。
 ///
 /// @author kongweiguang
 fn valid_checkpoint(
@@ -2791,14 +3130,19 @@ fn valid_checkpoint(
     confirmed_bytes: u64,
     actual_destination: Option<&kerminal_domain::files::FileEndpoint>,
 ) -> bool {
-    let Some(source_digest) = checkpoint.source_revision.content_digest.as_deref() else {
-        return false;
-    };
     let owner = checkpoint.staging_owner.as_str();
     checkpoint.confirmed_bytes <= confirmed_bytes
         && checkpoint.confirmed_bytes <= checkpoint.source_revision.size
         && valid_sha256(&checkpoint.confirmed_prefix_sha256)
-        && valid_sha256(source_digest)
+        && checkpoint
+            .source_revision
+            .content_digest
+            .as_deref()
+            .is_none_or(|source_digest| {
+                valid_sha256(source_digest)
+                    && (checkpoint.confirmed_bytes != checkpoint.source_revision.size
+                        || source_digest.eq_ignore_ascii_case(&checkpoint.confirmed_prefix_sha256))
+            })
         && !owner.is_empty()
         && valid_staging_token(&checkpoint.staging_token)
         && !checkpoint
@@ -2813,6 +3157,66 @@ fn valid_checkpoint(
         )
         && actual_destination
             .is_none_or(|destination| destination == &checkpoint.actual_destination)
+}
+
+/// 所有入口共享单调门禁；元数据和暂存身份不可变化，完整摘要只能在 EOF 后补全一次。
+///
+/// @author kongweiguang
+fn checkpoint_can_advance(
+    record: &TransferRecord,
+    checkpoint: &TransferCheckpoint,
+    confirmed_bytes: u64,
+) -> bool {
+    if record.task.request().kind != TransferKind::File
+        || record
+            .task
+            .total_bytes()
+            .is_some_and(|total| total != checkpoint.source_revision.size)
+        || !valid_checkpoint(
+            checkpoint,
+            confirmed_bytes,
+            record.task.actual_destination(),
+        )
+        || !checkpoint_matches_staging(record, checkpoint)
+    {
+        return false;
+    }
+    let Some(previous) = &record.checkpoint else {
+        return true;
+    };
+    let previous_revision = &previous.source_revision;
+    let current_revision = &checkpoint.source_revision;
+    previous_revision.size == current_revision.size
+        && previous_revision.modified == current_revision.modified
+        && previous_revision.permissions == current_revision.permissions
+        && previous.staging_owner == checkpoint.staging_owner
+        && previous.staging_token == checkpoint.staging_token
+        && previous.staging_destination == checkpoint.staging_destination
+        && previous.actual_destination == checkpoint.actual_destination
+        && previous.confirmed_bytes <= checkpoint.confirmed_bytes
+        && (previous.confirmed_bytes != checkpoint.confirmed_bytes
+            || previous.confirmed_prefix_sha256 == checkpoint.confirmed_prefix_sha256)
+        && match (
+            previous_revision.content_digest.as_deref(),
+            current_revision.content_digest.as_deref(),
+        ) {
+            (None, None) => true,
+            (None, Some(_)) => checkpoint.confirmed_bytes == current_revision.size,
+            (Some(previous), Some(current)) => previous == current,
+            (Some(_), None) => false,
+        }
+}
+
+/// 自动续传只接受本任务已持久登记的暂存身份，不能凭结构合法的路径取得所有权。
+///
+/// @author kongweiguang
+fn checkpoint_matches_staging(record: &TransferRecord, checkpoint: &TransferCheckpoint) -> bool {
+    record.staging_ownership.iter().any(|ownership| {
+        ownership.staging_owner == checkpoint.staging_owner
+            && ownership.staging_token == checkpoint.staging_token
+            && ownership.staging_destination == checkpoint.staging_destination
+            && ownership.actual_destination == checkpoint.actual_destination
+    })
 }
 
 /// 暂存 marker token 必须是固定长度的小写十六进制 nonce，避免检查点携带路径或任意文本。
@@ -2869,18 +3273,22 @@ fn same_parent_directory(
 }
 
 /// 仅裁剪普通终态历史；未知提交、待清理 owner 和临时目标租约必须留在队列供恢复或核对。
-/// 删除记录时同步释放拖出标记，不依赖视图下一次读取；调用方始终先持 records 锁再取标记锁。
+/// 删除记录时同步释放拖出标记并推进代次；额外唤醒保证已有变更通知先于裁剪时仍可观察。
+/// 调用方始终先持 records 锁再取标记锁。
 ///
 /// @author kongweiguang
 fn prune_history(
     records: &mut BTreeMap<TransferId, TransferRecord>,
     max_history: usize,
     drag_staging_ids: &StdMutex<HashMap<TransferId, bool>>,
+    history_removal_epoch: &AtomicU64,
+    events: &broadcast::Sender<TransferQueueEvent>,
 ) {
     let mut terminal = records
         .iter()
         .filter(|(_, record)| {
             is_removable_history_record(record)
+                && !record.worker_join_pending
                 && record
                     .worker
                     .as_ref()
@@ -2900,8 +3308,14 @@ fn prune_history(
         records.remove(&id);
         markers.remove(&id);
     }
+    history_removal_epoch.fetch_add(1, Ordering::Release);
+    publish(events);
 }
 
 #[cfg(test)]
 #[path = "../../tests/unit/private_queue.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/transfer_idle_checkpoint.rs"]
+mod idle_checkpoint_tests;

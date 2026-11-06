@@ -82,7 +82,10 @@ fn retries_only_ui_owned_interactive_ssh_with_bounded_backoff() {
         Duration::from_secs(2),
         Duration::from_secs(4),
         Duration::from_secs(8),
-        Duration::from_secs(10),
+        Duration::from_secs(16),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
     ];
 
     for (attempts_started, expected_delay) in expected_delays.into_iter().enumerate() {
@@ -101,8 +104,42 @@ fn retries_only_ui_owned_interactive_ssh_with_bounded_backoff() {
     }
 
     assert_eq!(
-        policy.decide(true, context(&owner, &target, &failure, 5)),
+        policy.decide(true, context(&owner, &target, &failure, 8)),
         AutoReconnectDecision::Suppressed(AutoReconnectSuppression::AttemptsExhausted)
+    );
+
+    // 已进入重试循环后的收尾超时与建连失败仍属于同一次断线，不能因此永久停止重试。
+    let cleanup_timeout = AppError::timeout("SSH PTY close state lock");
+    assert!(matches!(
+        policy.decide(true, context(&owner, &target, &cleanup_timeout, 1)),
+        AutoReconnectDecision::Retry(_)
+    ));
+    assert_eq!(
+        policy.decide(true, context(&owner, &target, &cleanup_timeout, 0)),
+        AutoReconnectDecision::Suppressed(AutoReconnectSuppression::NotRetryableDisconnect)
+    );
+    let connect_refused = AppError::infrastructure("SSH TCP connection failed");
+    assert!(matches!(
+        policy.decide(true, context(&owner, &target, &connect_refused, 1)),
+        AutoReconnectDecision::Retry(_)
+    ));
+    assert_eq!(
+        policy.decide(true, context(&owner, &target, &connect_refused, 0)),
+        AutoReconnectDecision::Suppressed(AutoReconnectSuppression::NotRetryableDisconnect)
+    );
+    assert_eq!(
+        policy.decide(
+            true,
+            context(&owner, &target, &AppError::AuthenticationFailed, 1)
+        ),
+        AutoReconnectDecision::Suppressed(AutoReconnectSuppression::NotRetryableDisconnect)
+    );
+    assert_eq!(
+        policy.decide(
+            true,
+            context(&owner, &target, &AppError::cancelled("closed"), 1)
+        ),
+        AutoReconnectDecision::Suppressed(AutoReconnectSuppression::NotRetryableDisconnect)
     );
 }
 

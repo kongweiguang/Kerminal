@@ -2,21 +2,25 @@
 //!
 //! @author kongweiguang
 
+#[path = "transfer_history_dismissal.rs"]
+mod history_dismissal;
+
 use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use super::{TransferRecord, prune_history};
 use crate::transfers::{
-    TransferBackend, TransferCleanupState, TransferExecutionContext, TransferExecutionError,
-    TransferExecutionFailure, TransferExecutionResult, TransferPhase, TransferProgressUpdate,
-    TransferQueueOptions, TransferResourceCleanup, TransferService,
+    TransferBackend, TransferCheckpoint, TransferCleanupState, TransferExecutionContext,
+    TransferExecutionError, TransferExecutionFailure, TransferExecutionResult, TransferOrigin,
+    TransferPhase, TransferProgressUpdate, TransferQueueEvent, TransferQueueOptions,
+    TransferResourceCleanup, TransferService, TransferStagingOwnership,
 };
 use crate::{
     AppError, AppResult, PublicErrorCode,
@@ -26,14 +30,14 @@ use crate::{
 use async_trait::async_trait;
 use kerminal_domain::{
     files::{
-        ConflictPolicy, FileEndpoint, TransferFailureKind, TransferKind, TransferRequest,
-        TransferStatus, TransferTask,
+        ConflictPolicy, FileEndpoint, FileRevision, TransferFailureKind, TransferKind,
+        TransferRequest, TransferStatus, TransferTask,
     },
-    identity::{HostId, TransferId},
+    identity::{HostId, PaneId, TabId, TransferId},
 };
 use tokio::{
     runtime::Handle,
-    sync::{Notify, oneshot},
+    sync::{Notify, broadcast, oneshot},
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
@@ -578,6 +582,7 @@ fn terminal_record(kind: TransferFailureKind, sequence: u64) -> (TransferId, Tra
         id,
         TransferRecord {
             task,
+            origin: None,
             drag_staging: false,
             drag_evidence_pending: false,
             checkpoint: None,
@@ -597,9 +602,129 @@ fn terminal_record(kind: TransferFailureKind, sequence: u64) -> (TransferId, Tra
             no_changes_finalized: false,
             attempt_finished: true,
             worker: None,
+            worker_join_pending: false,
             sequence,
         },
     )
+}
+
+/// 构造已确认前缀的取消中任务，隔离失败与暂存释放回执的时序。
+///
+/// @author kongweiguang
+fn cancelling_checkpoint_record() -> (
+    TransferId,
+    TransferRecord,
+    TransferCheckpoint,
+    TransferStagingOwnership,
+) {
+    let (id, mut record) = terminal_record(TransferFailureKind::Connection, 1);
+    let mut task = TransferTask::queued(id.clone(), record.task.request().clone()).unwrap();
+    let destination = task.request().destination.clone();
+    task.begin_connecting().unwrap();
+    task.begin_transferring(Some(10)).unwrap();
+    task.select_actual_destination(destination.clone()).unwrap();
+    task.record_progress(5, Some(10)).unwrap();
+    assert!(task.request_cancel());
+    let ownership = TransferStagingOwnership {
+        staging_destination: FileEndpoint::Local {
+            path: PathBuf::from(".fixture.partial"),
+        },
+        actual_destination: destination.clone(),
+        staging_owner: id.clone(),
+        staging_token: "a".repeat(32),
+    };
+    let checkpoint = TransferCheckpoint {
+        source_revision: FileRevision {
+            size: 10,
+            modified: None,
+            permissions: None,
+            content_digest: None,
+        },
+        confirmed_bytes: 5,
+        confirmed_prefix_sha256: "c".repeat(64),
+        staging_owner: ownership.staging_owner.clone(),
+        staging_destination: ownership.staging_destination.clone(),
+        staging_token: ownership.staging_token.clone(),
+        actual_destination: destination,
+    };
+    record.task = task;
+    record.checkpoint = Some(checkpoint.clone());
+    record.staging_ownership = vec![ownership.clone()];
+    (id, record, checkpoint, ownership)
+}
+
+/// 取消与失败竞态以失败回执决定断点可信性，临时故障携带有效断点时仍可继续。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn cancelled_failure_respects_checkpoint_revocation() {
+    for (kind, resumable) in [
+        (TransferFailureKind::Conflict, false),
+        (TransferFailureKind::InvalidSource, false),
+        (TransferFailureKind::Connection, false),
+        (TransferFailureKind::Connection, true),
+    ] {
+        let (service, _, _, _) = service_for(BackendMode::NoChanges);
+        let (id, record, checkpoint, _) = cancelling_checkpoint_record();
+        service
+            .inner
+            .records
+            .lock()
+            .await
+            .insert(id.clone(), record);
+        let failure = TransferExecutionFailure::new(
+            kind,
+            true,
+            resumable,
+            resumable.then_some(checkpoint.clone()),
+            Some(checkpoint.actual_destination.clone()),
+            TransferCleanupState::Released,
+        );
+        service.finish_failure(&id, failure).await;
+        let summary = service.get(&id).await.unwrap();
+        assert_eq!(summary.status, TransferStatus::Cancelled);
+        assert_eq!(summary.resumable, resumable, "{kind:?}");
+        let records = service.inner.records.lock().await;
+        assert_eq!(records[&id].checkpoint.is_some(), resumable, "{kind:?}");
+    }
+}
+
+/// 已确认清理的暂存不能再支撑断点，即使释放回执晚于取消终态也不能展示继续。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn released_staging_revokes_checkpoint_before_and_after_cancellation() {
+    for release_before_cancellation in [true, false] {
+        let (service, _, _, _) = service_for(BackendMode::NoChanges);
+        let (id, record, checkpoint, ownership) = cancelling_checkpoint_record();
+        service
+            .inner
+            .records
+            .lock()
+            .await
+            .insert(id.clone(), record);
+        if !release_before_cancellation {
+            service
+                .finish_cancelled(
+                    &id,
+                    Some(checkpoint.clone()),
+                    Some(checkpoint.actual_destination.clone()),
+                )
+                .await;
+            assert!(service.get(&id).await.unwrap().resumable);
+        }
+        service
+            .apply_staging_ownership(&id, ownership, false)
+            .await
+            .unwrap();
+        if release_before_cancellation {
+            service.finish_cancelled(&id, None, None).await;
+        }
+        assert!(!service.get(&id).await.unwrap().resumable);
+        let records = service.inner.records.lock().await;
+        assert!(records[&id].checkpoint.is_none());
+        assert!(super::is_removable_history_record(&records[&id]));
+    }
 }
 
 /// 完整遍历零变更进入独立终态，提交回执摘要必须保持为空。
@@ -937,6 +1062,228 @@ async fn external_retry_requires_and_retains_current_workspace_lease() {
     wait_for_external_scopes(&owner, 1).await;
     drop(lease);
     assert_eq!(owner.scopes.load(Ordering::Acquire), 0);
+}
+
+/// 同一主机和路径的任务仍按 pane 或工作台分开，重试继承来源且定向清理不影响其他来源。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn origin_isolates_same_host_history_retry_and_clear() {
+    let (service, _, request, _) = service_for(BackendMode::FailBeforeCommit);
+    let origins = [
+        TransferOrigin::TerminalPane(PaneId::new()),
+        TransferOrigin::TerminalPane(PaneId::new()),
+        TransferOrigin::SftpWorkspace(TabId::new()),
+        TransferOrigin::SftpWorkspace(TabId::new()),
+    ];
+    let mut ids = Vec::new();
+    for origin in &origins {
+        let task = service
+            .enqueue_for_origin(request.clone(), origin.clone(), None)
+            .await
+            .expect("scoped request accepted");
+        wait_for_status(&service, &task.id, TransferStatus::Failed).await;
+        ids.push(task.id);
+    }
+    let unassigned = service.enqueue(request).await.expect("unassigned request");
+    wait_for_status(&service, &unassigned.id, TransferStatus::Failed).await;
+
+    for (index, origin) in origins.iter().enumerate() {
+        let visible = service.list_for_origin(origin).await;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, ids[index]);
+        assert!(
+            service
+                .ensure_origin(&unassigned.id, origin, CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .ensure_origin(
+                    &ids[(index + 1) % ids.len()],
+                    origin,
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+    }
+    let successor = service.retry(&ids[0]).await.expect("retry original task");
+    assert_ne!(successor.id, ids[0]);
+    wait_for_status(&service, &successor.id, TransferStatus::Failed).await;
+    assert_eq!(service.list_for_origin(&origins[0]).await.len(), 2);
+    assert_eq!(
+        service
+            .clear_completed_for_origin(&origins[0], CancellationToken::new())
+            .await
+            .expect("clear selected source"),
+        (2, 0)
+    );
+    assert_eq!(service.list().await.len(), 4);
+    assert!(service.get(&unassigned.id).await.is_ok());
+    for (index, origin) in origins.iter().enumerate().skip(1) {
+        let visible = service.list_for_origin(origin).await;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, ids[index]);
+    }
+}
+
+/// 保留真实断点与暂存归属的暂停终态，即使历史上限达到零也不能被清理。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn paused_history_survives_pruning_and_scoped_clear() {
+    let (service, _, _, _) = service_for(BackendMode::FailBeforeCommit);
+    let origin = TransferOrigin::TerminalPane(PaneId::new());
+    let (id, mut record, _, _) = cancelling_checkpoint_record();
+    record.task.confirm_cancelled(true).unwrap();
+    record.origin = Some(origin.clone());
+    let mut records = BTreeMap::from([(id.clone(), record)]);
+    let markers = Mutex::new(std::collections::HashMap::new());
+    let epoch = AtomicU64::new(0);
+    let (events, _) = broadcast::channel(1);
+    prune_history(&mut records, 0, &markers, &epoch, &events);
+    assert!(records.contains_key(&id));
+    *service.inner.records.lock().await = records;
+    assert_eq!(
+        service
+            .clear_completed_for_origin(&origin, CancellationToken::new())
+            .await
+            .unwrap(),
+        (0, 1)
+    );
+    assert!(service.get(&id).await.unwrap().resumable);
+}
+
+/// 暂停任务只有旧 worker 退出后才能归档，归档必须保留检查点及暂存所有权。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn paused_archive_waits_for_worker_and_preserves_recovery_evidence() {
+    use crate::transfers::{TransferCheckpoint, TransferStagingOwnership};
+    use kerminal_domain::files::FileRevision;
+
+    let (service, _, _, _) = service_for(BackendMode::FailBeforeCommit);
+    let origin = TransferOrigin::TerminalPane(PaneId::new());
+    let other = TransferOrigin::TerminalPane(PaneId::new());
+    let (id, mut record) = terminal_record(TransferFailureKind::Connection, 1);
+    let mut task = TransferTask::queued(id.clone(), record.task.request().clone()).unwrap();
+    task.begin_connecting().unwrap();
+    task.begin_transferring(Some(10)).unwrap();
+    task.record_progress(5, Some(10)).unwrap();
+    assert!(task.request_cancel());
+    task.confirm_cancelled(true).unwrap();
+    let destination = task.request().destination.clone();
+    let staging = FileEndpoint::Local {
+        path: PathBuf::from(".fixture.partial"),
+    };
+    let checkpoint = TransferCheckpoint {
+        source_revision: FileRevision {
+            size: 10,
+            modified: None,
+            permissions: None,
+            content_digest: Some("b".repeat(64)),
+        },
+        confirmed_bytes: 5,
+        confirmed_prefix_sha256: "c".repeat(64),
+        staging_owner: id.clone(),
+        staging_destination: staging.clone(),
+        staging_token: "a".repeat(32),
+        actual_destination: destination.clone(),
+    };
+    let ownership = TransferStagingOwnership {
+        staging_destination: staging,
+        actual_destination: destination,
+        staging_owner: id.clone(),
+        staging_token: checkpoint.staging_token.clone(),
+    };
+    let release = Arc::new(Notify::new());
+    let worker_release = release.clone();
+    record.task = task;
+    record.origin = Some(origin.clone());
+    record.checkpoint = Some(checkpoint.clone());
+    record.staging_ownership = vec![ownership.clone()];
+    record.worker = Some(tokio::spawn(async move { worker_release.notified().await }));
+    service.persist_recovery_record(&record).await.unwrap();
+    service
+        .inner
+        .records
+        .lock()
+        .await
+        .insert(id.clone(), record);
+
+    assert!(
+        service
+            .ensure_origin(&id, &other, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        service
+            .clear_completed_for_origin(&origin, CancellationToken::new())
+            .await
+            .unwrap(),
+        (0, 1)
+    );
+    assert!(
+        service
+            .archive_recovery(&id, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .list_archived_recovery(None, 10, CancellationToken::new())
+            .await
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert!(service.get(&id).await.unwrap().resumable);
+
+    release.notify_one();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if service
+                .inner
+                .records
+                .lock()
+                .await
+                .get(&id)
+                .unwrap()
+                .worker
+                .as_ref()
+                .unwrap()
+                .is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("old worker exits");
+    service
+        .ensure_origin(&id, &origin, CancellationToken::new())
+        .await
+        .unwrap();
+    service
+        .archive_recovery(&id, CancellationToken::new())
+        .await
+        .expect("archive after worker exits");
+    assert!(service.get(&id).await.is_err());
+    let archived = service
+        .list_archived_recovery(None, 10, CancellationToken::new())
+        .await
+        .unwrap()
+        .records;
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].origin, Some(origin));
+    assert_eq!(archived[0].checkpoint, Some(checkpoint));
+    assert_eq!(archived[0].staging_ownership, vec![ownership]);
+    assert!(archived[0].archived);
+    service.shutdown().await.expect("queue shutdown");
 }
 
 /// 普通历史清理保留 CommitUnknown 与外部目标 scope，供用户核对真实提交结果。
@@ -1396,7 +1743,9 @@ fn history_pruning_retains_unknown_commit_beyond_ordinary_limit() {
         (old_id.clone(), false),
         (recent_id.clone(), false),
     ]));
-    prune_history(&mut records, 1, &markers);
+    let removal_epoch = AtomicU64::new(0);
+    let (events, mut receiver) = broadcast::channel(1);
+    prune_history(&mut records, 1, &markers, &removal_epoch, &events);
 
     assert!(records.contains_key(&unknown_id));
     assert!(!records.contains_key(&old_id));
@@ -1405,6 +1754,8 @@ fn history_pruning_retains_unknown_commit_beyond_ordinary_limit() {
     let markers = markers.lock().expect("fixture marker lock is healthy");
     assert_eq!(markers.len(), 2);
     assert!(!markers.contains_key(&old_id));
+    assert_eq!(removal_epoch.load(Ordering::Acquire), 1);
+    assert_eq!(receiver.try_recv(), Ok(TransferQueueEvent::Changed));
 }
 
 /// 清理已结束任务直接释放其拖出标记，不要求打开文件面板或调用列表查询。
@@ -1709,4 +2060,166 @@ async fn transfer_change_wakeup_is_followed_by_authoritative_list_state() {
         .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
         .await
         .expect("test queue worker is joined before the test ends");
+}
+
+/// 大量源摘要进度必须经过真实队列广播；丢帧仍只要求重读任务，不能要求读取文件目录。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn transfer_verification_lag_only_requests_queue_snapshot() {
+    let (service, backend, request, _) =
+        service_for_kind(BackendMode::CancelDuringTraversal, TransferKind::Directory);
+    let accepted = service.enqueue(request).await.expect("request is accepted");
+    backend.started.notified().await;
+    wait_for_phase(&service, &accepted.id, TransferPhase::Transferring).await;
+    let mut subscription = service.subscribe();
+
+    for activity_sequence in 1..=4_387 {
+        service
+            .apply_progress(
+                &accepted.id,
+                TransferProgressUpdate {
+                    confirmed_bytes: 0,
+                    total_bytes: Some(0),
+                    phase: TransferPhase::Verifying,
+                    actual_destination: Some(accepted.request.destination.clone()),
+                    checkpoint: None,
+                    activity_sequence,
+                },
+            )
+            .await
+            .expect("verification progress is accepted");
+    }
+    assert_eq!(
+        subscription.recv_event(CancellationToken::new()).await,
+        Some(TransferQueueEvent::Changed),
+    );
+    assert_eq!(
+        subscription.recv_event(CancellationToken::new()).await,
+        Some(TransferQueueEvent::Changed),
+    );
+    let rows = service.list().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].phase, Some(TransferPhase::Verifying));
+    assert_eq!(rows[0].bytes_transferred, 0);
+
+    service
+        .cancel(&accepted.id)
+        .await
+        .expect("cancel test worker");
+    wait_for_status(&service, &accepted.id, TransferStatus::Cancelled).await;
+    service.shutdown().await.expect("test worker is joined");
+}
+
+/// 完成、清理及其广播都落在丢帧窗口时，空快照不能掩盖已确认提交；订阅各自只补偿一次。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn transfer_completed_and_cleared_during_lag_requires_one_resync_per_subscription() {
+    let (service, _, request, _) = service_for(BackendMode::ProgressTelemetry);
+    let mut first = service.subscribe();
+    let mut second = service.subscribe();
+    assert!(service.list().await.is_empty());
+    let accepted = service.enqueue(request).await.expect("request is accepted");
+    wait_for_status(&service, &accepted.id, TransferStatus::Succeeded).await;
+    assert_eq!(
+        service
+            .get(&accepted.id)
+            .await
+            .expect("completed")
+            .commit_summary
+            .committed_entries(),
+        1,
+    );
+    assert_eq!(
+        service
+            .clear_completed(CancellationToken::new())
+            .await
+            .expect("clear settled task")
+            .0,
+        1,
+    );
+    for _ in 0..1_000 {
+        let _ = service.inner.events.send(TransferQueueEvent::Changed);
+    }
+    assert!(service.list().await.is_empty());
+    for subscription in [&mut first, &mut second] {
+        assert_eq!(
+            subscription.recv_event(CancellationToken::new()).await,
+            Some(TransferQueueEvent::Resync),
+        );
+        assert_eq!(
+            subscription.recv_event(CancellationToken::new()).await,
+            Some(TransferQueueEvent::Changed),
+        );
+    }
+    service.shutdown().await.expect("test worker is joined");
+}
+
+/// 裁剪通知若晚于已有的 Changed，删除后的第二个唤醒必须携带可观察的代次变化。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn transfer_history_pruning_wakes_subscription_after_existing_change() {
+    let (service, _, _, _) = service_for(BackendMode::NoChanges);
+    let mut subscription = service.subscribe();
+    let (old_id, old) = terminal_record(TransferFailureKind::Connection, 1);
+    let (new_id, new) = terminal_record(TransferFailureKind::Connection, 2);
+    {
+        let mut records = service.inner.records.lock().await;
+        records.insert(old_id.clone(), old);
+        records.insert(new_id.clone(), new);
+        let _ = service.inner.events.send(TransferQueueEvent::Changed);
+        prune_history(
+            &mut records,
+            1,
+            &service.inner.drag_staging_ids,
+            &service.inner.history_removal_epoch,
+            &service.inner.events,
+        );
+    }
+    assert_eq!(
+        subscription.recv_event(CancellationToken::new()).await,
+        Some(TransferQueueEvent::Resync),
+    );
+    assert_eq!(
+        subscription.recv_event(CancellationToken::new()).await,
+        Some(TransferQueueEvent::Changed),
+    );
+    let rows = service.list().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, new_id);
+}
+
+/// 人工归档移除活终态时也可能抹去提交事实，必须与清理和容量裁剪使用相同的补偿代次。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn transfer_recovery_archive_removal_requires_resync() {
+    let (service, _, _, _) = service_for(BackendMode::NoChanges);
+    let (id, record) = terminal_record(TransferFailureKind::CommitUnknown, 1);
+    service
+        .persist_recovery_record(&record)
+        .await
+        .expect("persist recovery fixture");
+    service
+        .inner
+        .records
+        .lock()
+        .await
+        .insert(id.clone(), record);
+    let mut subscription = service.subscribe();
+    service
+        .archive_recovery(&id, CancellationToken::new())
+        .await
+        .expect("archive recovery");
+    assert!(service.list().await.is_empty());
+    assert_eq!(
+        subscription.recv_event(CancellationToken::new()).await,
+        Some(TransferQueueEvent::Resync),
+    );
+    assert_eq!(
+        subscription.recv_event(CancellationToken::new()).await,
+        Some(TransferQueueEvent::Changed),
+    );
 }

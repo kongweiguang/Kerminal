@@ -1103,6 +1103,7 @@ fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 /// Unix 同目录 rename 原子替换；Windows ReplaceFileW 保留目标 DACL 和安全属性。
+/// Windows 替换失败时先保存系统错误，只记录不含路径与数据的诊断并维持既有提交分类。
 ///
 /// @author kongweiguang
 fn replace_existing_file(source: &Path, destination: &Path) -> io::Result<()> {
@@ -1124,7 +1125,16 @@ fn replace_existing_file(source: &Path, destination: &Path) -> io::Result<()> {
             )
         };
         if result == 0 {
-            Err(io::Error::last_os_error())
+            let error = io::Error::last_os_error();
+            tracing::warn!(
+                target: "kerminal_atomic_commit_diagnostic",
+                event = "atomic_commit_failed",
+                stage = "replace_file_w",
+                mode = "replace_existing",
+                error_kind = ?error.kind(),
+                raw_os_error = error.raw_os_error(),
+            );
+            Err(error)
         } else {
             Ok(())
         }

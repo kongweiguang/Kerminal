@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use kerminal_application::{
     AppError, AppResult,
-    connections::{ChannelLane, RemoteConnectionLease},
+    connections::{ChannelLane, OpenSftpRequest, RemoteConnectionLease},
 };
 use kerminal_domain::{
     files::{FileEndpoint, FileEntryKind, FileRevision, RemotePath},
@@ -30,7 +30,7 @@ use super::super::sftp::{RemoteCommitError, RemoteCommitMode, SftpFileProvider};
 use super::{
     BoxReader, BoxWriter, STAGING_MARKER_MAX_BYTES, StagingArtifact, StagingDisposition,
     StagingKind, absolute_path, local_kind, local_permissions, map_atomic_commit,
-    map_directory_rename_error, map_io_error, remote_kind,
+    map_directory_rename_error, map_io_error, map_remote_stream_error, remote_kind,
 };
 use crate::storage::{CommitMode, commit_staged_file};
 /// 单端点文件访问通道；Local 不占网络资源，Remote 只持有本次 SFTP subsystem。
@@ -105,8 +105,18 @@ impl EndpointSession {
         }
     }
 
-    /// 仅允许由当前端点在独占创建语义下写入 marker，避免覆盖同名外部对象。
-    pub(super) async fn create_staging_marker(&self, artifact: &StagingArtifact) -> AppResult<()> {
+    /// 独占创建 marker；准备阶段同样响应取消，断流不能卡在没有请求超时的 WRITE ACK 上。
+    /// 取消后的不完整 marker 仍由原 staging owner 核对，不把未知写入当作已清理。
+    ///
+    /// @author kongweiguang
+    pub(super) async fn create_staging_marker(
+        &self,
+        artifact: &StagingArtifact,
+        cancellation: &CancellationToken,
+    ) -> AppResult<()> {
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("传输暂存准备已取消"));
+        }
         let bytes = artifact.marker_bytes()?;
         match (self, &artifact.marker) {
             (Self::Local, FileEndpoint::Local { path }) => {
@@ -128,18 +138,7 @@ impl EndpointSession {
                     path,
                 },
             ) if host_id == marker_host => {
-                let mut file = session
-                    .open_with_flags(
-                        path.as_str(),
-                        OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
-                    )
-                    .await
-                    .map_err(super::super::sftp::map_sftp_error)?;
-                file.write_all(&bytes).await.map_err(map_io_error)?;
-                file.sync_all()
-                    .await
-                    .map_err(super::super::sftp::map_sftp_error)?;
-                file.shutdown().await.map_err(map_io_error)
+                write_remote_staging_marker(session, path, &bytes, cancellation).await
             }
             _ => Err(AppError::unsupported("暂存 marker 与访问通道端点不匹配")),
         }
@@ -156,7 +155,9 @@ impl EndpointSession {
         }
     }
 
-    /// 读取有上限的 marker；外部替换成超大文件时不会无界占用内存。
+    /// 限制 marker 读取长度，并由远端读取入口确认关闭句柄以归还客户端配额。
+    ///
+    /// @author kongweiguang
     async fn read_staging_marker(&self, marker: &FileEndpoint) -> AppResult<Option<Vec<u8>>> {
         match (self, marker) {
             (Self::Local, FileEndpoint::Local { path }) => {
@@ -183,26 +184,7 @@ impl EndpointSession {
                     host_id: marker_host,
                     path,
                 },
-            ) if host_id == marker_host => {
-                let file = match session.open(path.as_str()).await {
-                    Ok(file) => file,
-                    Err(SftpError::Status(status))
-                        if status.status_code == StatusCode::NoSuchFile =>
-                    {
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(super::super::sftp::map_sftp_error(error)),
-                };
-                let mut bytes = Vec::new();
-                file.take(STAGING_MARKER_MAX_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .await
-                    .map_err(map_io_error)?;
-                if bytes.len() as u64 > STAGING_MARKER_MAX_BYTES {
-                    return Err(AppError::conflict("传输暂存 marker 大小无效"));
-                }
-                Ok(Some(bytes))
-            }
+            ) if host_id == marker_host => read_remote_staging_marker(session, path).await,
             _ => Err(AppError::unsupported("暂存 marker 与访问通道端点不匹配")),
         }
     }
@@ -285,7 +267,9 @@ impl EndpointSession {
         }
     }
 
-    /// 不跟随符号链接递归删除已验证的目录树，任何不完整清理都返回给持久 owner。
+    /// 不跟随符号链接递归删除已验证的目录树，目录读取使用隔离通道以限制中断后的句柄寿命。
+    ///
+    /// @author kongweiguang
     async fn remove_staging_tree(&self, root: &FileEndpoint) -> AppResult<()> {
         let mut pending = vec![(root.clone(), false)];
         while let Some((current, visited)) = pending.pop() {
@@ -315,7 +299,7 @@ impl EndpointSession {
                 }
             } else {
                 pending.push((current.clone(), true));
-                for (child, _, _, _) in self.list_children(&current).await? {
+                for (child, _, _, _) in self.list_children_for_cleanup(&current).await? {
                     pending.push((child, false));
                 }
             }
@@ -404,7 +388,9 @@ impl EndpointSession {
         }
     }
 
-    /// 列出当前目录的一层普通项，不跟随链接并拒绝无法安全表示的远端名称。
+    /// 普通传输复用原端点通道列目录，保留 POSIX 名称并避免逐目录重新握手。
+    ///
+    /// @author kongweiguang
     pub(super) async fn list_children(
         &self,
         endpoint: &FileEndpoint,
@@ -432,34 +418,48 @@ impl EndpointSession {
                 Ok(output)
             }
             (Self::Remote { session, .. }, FileEndpoint::Remote { host_id, path }) => {
-                let entries = session
-                    .read_dir(path.as_str())
-                    .await
-                    .map_err(super::super::sftp::map_sftp_error)?;
-                let mut output = Vec::new();
-                for entry in entries {
-                    let name = entry.file_name();
-                    let child_path = path
-                        .join_name(&name)
-                        .map_err(|_| AppError::invalid("SFTP 目录项名称无效"))?;
-                    let metadata = entry.metadata();
-                    output.push((
-                        FileEndpoint::Remote {
-                            host_id: host_id.clone(),
-                            path: child_path,
-                        },
-                        name,
-                        remote_kind(metadata.file_type()),
-                        metadata.size.unwrap_or_default(),
-                    ));
-                }
-                Ok(output)
+                read_remote_directory(session, host_id, path).await
             }
             _ => Err(AppError::unsupported("文件端点与已打开的访问通道不匹配")),
         }
     }
 
-    /// 创建普通文件读取流；动态 dispatch 让本机和 SFTP 共用同一块有界复制循环。
+    /// 清理读取复用原 lease 但独占子通道，超时丢弃会话只关闭该次目录读取的通道。
+    ///
+    /// @author kongweiguang
+    pub(super) async fn list_children_for_cleanup(
+        &self,
+        endpoint: &FileEndpoint,
+    ) -> AppResult<Vec<(FileEndpoint, String, FileEntryKind, u64)>> {
+        match (self, endpoint) {
+            (Self::Local, FileEndpoint::Local { .. }) => self.list_children(endpoint).await,
+            (
+                Self::Remote { host_id, lease, .. },
+                FileEndpoint::Remote {
+                    host_id: endpoint_host,
+                    path,
+                },
+            ) if host_id == endpoint_host => {
+                let channel = lease
+                    .open_sftp(
+                        OpenSftpRequest {
+                            lane: ChannelLane::Bulk,
+                        },
+                        CancellationToken::new(),
+                    )
+                    .await?;
+                let session = SftpSession::new(channel)
+                    .await
+                    .map_err(super::super::sftp::map_sftp_error)?;
+                read_remote_directory_for_cleanup(session, host_id, path).await
+            }
+            _ => Err(AppError::unsupported("清理目录端点与原访问通道不匹配")),
+        }
+    }
+
+    /// 统一本机和 SFTP 的读取流；成功结束时调用方必须 shutdown 以归还 SFTP 句柄配额。
+    ///
+    /// @author kongweiguang
     pub(super) async fn open_reader(&self, endpoint: &FileEndpoint) -> AppResult<BoxReader> {
         match (self, endpoint) {
             (Self::Local, FileEndpoint::Local { path }) => {
@@ -591,7 +591,9 @@ impl EndpointSession {
         }
     }
 
-    /// 同步 partial 文件数据；续传检查点只在 flush/sync 返回后发布。
+    /// 同步 partial 文件数据；续传检查点只在 flush/sync 返回后发布，关闭失败归属对应端点。
+    ///
+    /// @author kongweiguang
     pub(super) async fn sync_file(&self, endpoint: &FileEndpoint) -> AppResult<()> {
         match (self, endpoint) {
             (Self::Local, FileEndpoint::Local { path }) => fs::OpenOptions::new()
@@ -610,7 +612,7 @@ impl EndpointSession {
                 file.sync_all()
                     .await
                     .map_err(super::super::sftp::map_sftp_error)?;
-                file.shutdown().await.map_err(map_io_error)
+                file.shutdown().await.map_err(map_remote_stream_error)
             }
             _ => Err(AppError::unsupported("文件端点与同步通道不匹配")),
         }
@@ -852,6 +854,131 @@ impl EndpointSession {
         }
     }
 }
+
+/// 将远端目录投影为端点时保留服务端原始名称，清理与普通传输共用同一校验规则。
+///
+/// @author kongweiguang
+async fn read_remote_directory(
+    session: &SftpSession,
+    host_id: &HostId,
+    path: &RemotePath,
+) -> AppResult<Vec<(FileEndpoint, String, FileEntryKind, u64)>> {
+    let entries = session
+        .read_dir(path.as_str())
+        .await
+        .map_err(super::super::sftp::map_sftp_error)?;
+    let mut output = Vec::new();
+    for entry in entries {
+        let name = entry.file_name();
+        let child_path = super::super::sftp::directory_child_path(path, &name)?;
+        let metadata = entry.metadata();
+        output.push((
+            FileEndpoint::Remote {
+                host_id: host_id.clone(),
+                path: child_path,
+            },
+            name,
+            remote_kind(metadata.file_type()),
+            metadata.size.unwrap_or_default(),
+        ));
+    }
+    Ok(output)
+}
+
+/// 清理独占会话在成功和失败时都请求关闭；future 被中断时会话释放同样触发通道关闭。
+///
+/// @author kongweiguang
+async fn read_remote_directory_for_cleanup(
+    session: SftpSession,
+    host_id: &HostId,
+    path: &RemotePath,
+) -> AppResult<Vec<(FileEndpoint, String, FileEntryKind, u64)>> {
+    let result = read_remote_directory(&session, host_id, path).await;
+    if let Err(error) = session.close().await {
+        let close_error = AppError::infrastructure_with_source("清理目录 SFTP 通道关闭失败", error);
+        if result.is_ok() {
+            return Err(close_error);
+        }
+        tracing::warn!(
+            error_code = close_error.public_code().as_str(),
+            "读取清理目录失败后关闭子通道也失败"
+        );
+    }
+    result
+}
+
+/// 保留读取或大小校验的原始错误，同时确认 CLOSE；取消时由外层 endpoint owner 回收连接。
+///
+/// @author kongweiguang
+async fn read_remote_staging_marker(
+    session: &SftpSession,
+    path: &RemotePath,
+) -> AppResult<Option<Vec<u8>>> {
+    let mut file = match session.open(path.as_str()).await {
+        Ok(file) => file,
+        Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+            return Ok(None);
+        }
+        Err(error) => return Err(super::super::sftp::map_sftp_error(error)),
+    };
+    let mut bytes = Vec::new();
+    let read_result = async {
+        (&mut file)
+            .take(STAGING_MARKER_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(map_remote_stream_error)?;
+        if bytes.len() as u64 > STAGING_MARKER_MAX_BYTES {
+            return Err(AppError::conflict("传输暂存 marker 大小无效"));
+        }
+        Ok(Some(bytes))
+    }
+    .await;
+    let close_result = file.shutdown().await.map_err(map_remote_stream_error);
+    match (read_result, close_result) {
+        (Err(error), Err(close_error)) => {
+            tracing::warn!(
+                error_code = close_error.public_code().as_str(),
+                "读取暂存 marker 失败后关闭句柄也失败，由 endpoint owner 回收"
+            );
+            Err(error)
+        }
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(bytes), Ok(())) => Ok(bytes),
+    }
+}
+
+/// 锁定版 SFTP 的 WRITE 使用无等待请求，ACK 等待没有 request_timeout；由队列取消负责中断。
+/// flush 先收齐写入 ACK，并在服务器支持时执行 fsync，再确认 CLOSE，保持原耐久边界。
+///
+/// @author kongweiguang
+async fn write_remote_staging_marker(
+    session: &SftpSession,
+    path: &RemotePath,
+    bytes: &[u8],
+    cancellation: &CancellationToken,
+) -> AppResult<()> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(AppError::cancelled("传输暂存准备已取消")),
+        result = async {
+            let mut file = session
+                .open_with_flags(
+                    path.as_str(),
+                    OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                )
+                .await
+                .map_err(super::super::sftp::map_sftp_error)?;
+            file.write_all(bytes).await.map_err(map_remote_stream_error)?;
+            file.flush().await.map_err(map_remote_stream_error)?;
+            file.shutdown().await.map_err(map_remote_stream_error)
+        } => result,
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/unit/sftp_staging_marker.rs"]
+mod marker_tests;
 
 #[derive(Clone)]
 pub(super) struct ObjectMetadata {

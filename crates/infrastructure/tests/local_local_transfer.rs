@@ -248,7 +248,7 @@ async fn remove_directory_alias(alias: &Path) -> std::io::Result<()> {
 }
 
 /// 确认本机文件与空文件复制、目录复制、冲突选择及取消都走统一队列且不触碰 SSH。
-/// 失败回执由格式化参数直接借用；payload 长度按 UTF-8 字节计量。
+/// 首次复制直接推进字节，取消仍保留可信前缀；稀疏大文件为取消观察保留足够执行窗口。
 ///
 /// @author kongweiguang
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -470,14 +470,19 @@ async fn local_local_file_directory_conflict_and_cancel_use_one_queue() {
     timeout(Duration::from_secs(5), async {
         loop {
             let summary = service.get(&queued.id).await.unwrap();
-            if summary.phase == Some(TransferPhase::Verifying) {
+            assert_ne!(
+                summary.phase,
+                Some(TransferPhase::Verifying),
+                "fresh copies must not pre-scan source contents"
+            );
+            if summary.bytes_transferred >= 4 * 1024 * 1024 {
                 break;
             }
             sleep(Duration::from_millis(2)).await;
         }
     })
     .await
-    .expect("source verification begins before cancellation");
+    .expect("copy confirms a resumable prefix before cancellation");
     service
         .cancel(&queued.id)
         .await
@@ -485,6 +490,10 @@ async fn local_local_file_directory_conflict_and_cancel_use_one_queue() {
     let cancelled = await_terminal(&service, &queued.id).await;
     assert_eq!(cancelled.status, TransferStatus::Cancelled);
     assert!(!cancel_target.exists());
+    assert!(
+        cancelled.resumable,
+        "streaming checkpoints retain resume support"
+    );
     assert_eq!(ssh_calls.load(Ordering::Acquire), 0);
 
     service

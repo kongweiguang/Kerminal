@@ -4,6 +4,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -38,13 +39,16 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, SeekFrom},
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::sftp::SftpFileProvider;
 use crate::storage::AtomicCommitError;
 
 mod endpoint_session;
+mod resume_hash;
 use self::endpoint_session::{CommitFailure, EndpointSession, FileCommitMode, ObjectMetadata};
+use self::resume_hash::ResumeHashCache;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const CHECKPOINT_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
@@ -103,8 +107,8 @@ fn sftp_client_config(
     }
 }
 
-trait AsyncReadSeek: AsyncRead + AsyncSeek + Send + Unpin {}
-impl<T> AsyncReadSeek for T where T: AsyncRead + AsyncSeek + Send + Unpin {}
+trait AsyncReadSeek: AsyncRead + AsyncWrite + AsyncSeek + Send + Unpin {}
+impl<T> AsyncReadSeek for T where T: AsyncRead + AsyncWrite + AsyncSeek + Send + Unpin {}
 
 trait AsyncWriteSeek: AsyncWrite + AsyncSeek + Send + Unpin {}
 impl<T> AsyncWriteSeek for T where T: AsyncWrite + AsyncSeek + Send + Unpin {}
@@ -121,6 +125,7 @@ struct StreamTransferPlan<'a> {
     source_session: &'a EndpointSession,
     destination_session: &'a EndpointSession,
     source: &'a FileEndpoint,
+    checkpoint_source: Option<&'a FileEndpoint>,
     destination_stage: &'a FileEndpoint,
     staging_token: String,
     staging_tracker: &'a StagingCleanupTracker,
@@ -171,6 +176,7 @@ struct MergeStagedDirectoryPlan<'a> {
 #[derive(Clone)]
 pub struct SftpTransferBackend {
     files: SftpFileProvider,
+    resume_hashes: Arc<ResumeHashCache>,
 }
 
 /// 暂存对象和协议资源共用一个清理 owner，避免错误路径只关闭 SSH 却遗失 partial。
@@ -458,12 +464,14 @@ impl StagingCleanupTracker {
     }
 
     /// 在原子发布目录树前退役已提交子文件 marker；root marker 持续证明整棵 staging 的所有权。
+    /// 取消可中断挂起的端点操作，未确认清理的记录继续由原 owner 持有。
     ///
     /// @author kongweiguang
     async fn retire_committed_file_markers_before_tree_publish(
         &self,
         session: &EndpointSession,
         tree_root: &FileEndpoint,
+        cancellation: &CancellationToken,
     ) -> AppResult<()> {
         let (root_artifact, children) = {
             let entries = self
@@ -504,8 +512,13 @@ impl StagingCleanupTracker {
         };
 
         // 先验证唯一覆盖整树的 owner，随后才可移除会随目录 rename 的子文件 marker。
-        session.verify_staging_marker(&root_artifact).await?;
-        let Some(root_metadata) = session.metadata(tree_root).await? else {
+        await_unless_cancelled(cancellation, session.verify_staging_marker(&root_artifact))
+            .await
+            .ok_or_else(|| AppError::cancelled("目录暂存清理已取消"))??;
+        let Some(root_metadata) = await_unless_cancelled(cancellation, session.metadata(tree_root))
+            .await
+            .ok_or_else(|| AppError::cancelled("目录暂存清理已取消"))??
+        else {
             return Err(AppError::conflict("目录 staging 在发布前消失"));
         };
         if root_metadata.kind != FileEntryKind::Directory {
@@ -514,7 +527,9 @@ impl StagingCleanupTracker {
 
         for artifact in children {
             // cleanup_owned_artifact 会校验 token/endpoint 摘要，并确认已提交的 temporary 不存在。
-            session.cleanup_owned_artifact(&artifact).await?;
+            await_unless_cancelled(cancellation, session.cleanup_owned_artifact(&artifact))
+                .await
+                .ok_or_else(|| AppError::cancelled("目录暂存清理已取消"))??;
             self.remove_entry(&artifact.marker);
         }
         Ok(())
@@ -698,7 +713,7 @@ async fn make_owned_staging_tree_writable(
             continue;
         }
         session.set_permissions(&directory, Some(0o700)).await?;
-        for (child, _, kind, _) in session.list_children(&directory).await? {
+        for (child, _, kind, _) in session.list_children_for_cleanup(&directory).await? {
             if kind == FileEntryKind::Directory {
                 pending.push(child);
             }
@@ -708,15 +723,19 @@ async fn make_owned_staging_tree_writable(
 }
 
 impl SftpTransferBackend {
-    /// 复用文件浏览器的连接服务，保证 host profile、凭据、known_hosts 与 SFTP-only 能力门禁一致。
+    /// 复用连接服务和进程内断点状态，使同一后端的克隆能够继续已同步的复制流。
+    ///
+    /// @author kongweiguang
     pub fn new(connections: Arc<dyn RemoteConnectionService>) -> Self {
         Self {
             files: SftpFileProvider::new(connections),
+            resume_hashes: Arc::new(ResumeHashCache::default()),
         }
     }
 
     /// 执行前端点校验、稳定目标选择和可靠传输/提交边界；源链接预检遵循入队冻结的源端策略。
     /// 每轮结束只关闭本轮 SFTP channel；链接仍须经后续规范化、范围与目标类型校验。
+    /// 端点读取的临时失败不证明断点失效，仍由后续完整校验决定能否复用。
     /// 盒装内部错误以缩小 future 的失败分支体积，不改变失败类别或携带的恢复与清理状态。
     ///
     /// @author kongweiguang
@@ -730,7 +749,7 @@ impl SftpTransferBackend {
         let request = &context.request;
         if context.cancellation.is_cancelled() {
             return Err(Box::new(cancelled(
-                None,
+                context.resume_from.clone(),
                 context.actual_destination.clone(),
             )));
         }
@@ -743,7 +762,16 @@ impl SftpTransferBackend {
         let source_metadata = source_session
             .metadata(&request.source)
             .await
-            .map_err(|error| transfer_error(error, None, context.actual_destination.clone()))?
+            .map_err(|error| {
+                verification_error(
+                    error,
+                    context.resume_from.clone(),
+                    context
+                        .actual_destination
+                        .as_ref()
+                        .unwrap_or(&request.destination),
+                )
+            })?
             .ok_or_else(|| transfer_error(AppError::not_found("传输源不存在"), None, None))?;
         validate_transfer_source(
             request.kind,
@@ -762,10 +790,13 @@ impl SftpTransferBackend {
             .await
             .map_err(|error| transfer_error(error, None, None))?,
         };
-        let destination_metadata = destination_session
-            .metadata(&destination)
-            .await
-            .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
+        let destination_metadata =
+            destination_session
+                .metadata(&destination)
+                .await
+                .map_err(|error| {
+                    verification_error(error, context.resume_from.clone(), &destination)
+                })?;
         validate_destination(
             request.kind,
             destination_metadata.as_ref(),
@@ -871,8 +902,11 @@ impl SftpTransferBackend {
         }
     }
 
-    /// 先验证完整源 revision，再流式写入受 owner 绑定的同目录 partial；每个检查点均可安全截断后续尾部。
+    /// 初次传输只读取源属性，完整摘要随复制生成，避免远端文件在首字节写入前被完整下载一次。
+    /// 续传复用进程内已同步哈希状态，并校验源属性、暂存 owner、marker 与长度。
+    /// 缓存失效时允许从头重试，不读取前缀重建哈希状态。
     /// 单文件暂存先可靠登记再写入；仅失败时盒装完整状态，保留 checkpoint 而缩小 future 结果体积。
+    /// 规范路径与提交前属性读取的临时故障保留可信断点；源内容或属性冲突必须撤销续传资格。
     ///
     /// @author kongweiguang
     async fn transfer_file(
@@ -896,7 +930,7 @@ impl SftpTransferBackend {
             options.follow_source_symlinks,
         )
         .await
-        .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
+        .map_err(|error| verification_error(error, context.resume_from.clone(), &destination))?;
         let (source, source_before) = resolve_source_object(
             source_session,
             &request.source,
@@ -904,7 +938,7 @@ impl SftpTransferBackend {
             source_scope.as_ref(),
         )
         .await
-        .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
+        .map_err(|error| verification_error(error, context.resume_from.clone(), &destination))?;
         if source_before.kind != FileEntryKind::File {
             return Err(Box::new(transfer_error(
                 AppError::conflict("文件传输源不是普通文件"),
@@ -913,6 +947,21 @@ impl SftpTransferBackend {
             )));
         }
 
+        let Some(source_identity) = await_unless_cancelled(
+            &context.cancellation,
+            source_session.canonicalize_source(&source),
+        )
+        .await
+        else {
+            return Err(Box::new(cancelled(
+                context.resume_from.clone(),
+                Some(destination),
+            )));
+        };
+        let source_identity = source_identity.map_err(|error| {
+            verification_error(error, context.resume_from.clone(), &destination)
+        })?;
+
         let resume = context.resume_from.as_ref();
         let staging_token = resume
             .map(|checkpoint| checkpoint.staging_token.clone())
@@ -920,16 +969,26 @@ impl SftpTransferBackend {
         let resume_offset = resume
             .map(|checkpoint| checkpoint.confirmed_bytes)
             .unwrap_or(0);
-        let (source_revision, source_hash, source_prefix_digest) = hash_source(
-            source_session,
-            &source,
-            &source_before,
-            resume_offset,
-            resume_offset,
-            context,
-            &destination,
-        )
-        .await?;
+        let source_revision = if let Some(checkpoint) = resume {
+            let mut revision = source_before.revision();
+            revision.content_digest = checkpoint.source_revision.content_digest.clone();
+            let valid_digest = revision.content_digest.as_ref().is_none_or(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+            if !valid_digest
+                || revision != checkpoint.source_revision
+                || resume_offset > revision.size
+            {
+                return Err(Box::new(transfer_error(
+                    AppError::conflict("传输源或可信断点已变化，不能继续续传"),
+                    None,
+                    Some(destination),
+                )));
+            }
+            revision
+        } else {
+            source_before.revision()
+        };
         if let Some(checkpoint) = resume
             && (checkpoint.source_revision != source_revision
                 || checkpoint.actual_destination != destination
@@ -937,7 +996,6 @@ impl SftpTransferBackend {
                     &checkpoint.staging_destination,
                     &checkpoint.staging_owner,
                 )
-                || checkpoint.confirmed_prefix_sha256 != source_prefix_digest
                 || checkpoint.confirmed_bytes > source_revision.size)
         {
             return Err(Box::new(transfer_error(
@@ -947,18 +1005,46 @@ impl SftpTransferBackend {
             )));
         }
 
-        let staging = if let Some(checkpoint) = resume {
-            validate_staging_checkpoint(
-                destination_session,
-                checkpoint,
-                &destination,
-                context,
-                &source_prefix_digest,
+        let (staging, source_hash) = if let Some(checkpoint) = resume {
+            let metadata =
+                validate_staging_checkpoint(destination_session, checkpoint, &destination, context)
+                    .await?;
+            let mut artifact = StagingArtifact::new(
+                checkpoint.staging_destination.clone(),
+                checkpoint.staging_owner.clone(),
+                checkpoint.staging_token.clone(),
+                StagingKind::File,
             )
-            .await?
+            .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
+            artifact.stage_owned = true;
+            artifact
+                .register_recovery(context, &destination)
+                .await
+                .map_err(|error| {
+                    verification_error(error, context.resume_from.clone(), &destination)
+                })?;
+            staging_tracker.register(artifact);
+            let Some(hasher) = self.resume_hashes.get(&source_identity, checkpoint) else {
+                return Err(Box::new(expired_checkpoint(destination)));
+            };
+            make_checkpoint_staging_writable(
+                destination_session,
+                &checkpoint.staging_destination,
+                metadata.permissions,
+            )
+            .await
+            .map_err(|error| verification_error(error, resume.cloned(), &destination))?;
+            destination_session
+                .truncate_file(&checkpoint.staging_destination, checkpoint.confirmed_bytes)
+                .await
+                .map_err(|error| verification_error(error, resume.cloned(), &destination))?;
+            (checkpoint.staging_destination.clone(), hasher)
         } else {
-            create_staging_sibling(&destination, &context.transfer_id)
-                .map_err(|error| transfer_error(error, None, Some(destination.clone())))?
+            (
+                create_staging_sibling(&destination, &context.transfer_id)
+                    .map_err(|error| transfer_error(error, None, Some(destination.clone())))?,
+                Sha256::new(),
+            )
         };
 
         let (copied_bytes, final_checkpoint) = match self
@@ -967,6 +1053,7 @@ impl SftpTransferBackend {
                 source_session,
                 destination_session,
                 source: &source,
+                checkpoint_source: Some(&source_identity),
                 destination_stage: &staging,
                 staging_token,
                 staging_tracker,
@@ -988,11 +1075,20 @@ impl SftpTransferBackend {
         if copied_bytes.saturating_add(resume_offset) != source_revision.size
             || final_checkpoint.as_ref().is_none_or(|checkpoint| {
                 checkpoint.confirmed_bytes != source_revision.size
-                    || checkpoint.source_revision.content_digest != source_revision.content_digest
+                    || checkpoint
+                        .source_revision
+                        .content_digest
+                        .as_ref()
+                        .is_none_or(|digest| {
+                            source_revision
+                                .content_digest
+                                .as_ref()
+                                .is_some_and(|expected| expected != digest)
+                        })
             })
         {
             return Err(Box::new(transfer_error(
-                AppError::conflict("传输字节与预检源 revision 不一致"),
+                AppError::conflict("传输字节或完整摘要与源文件不一致"),
                 None,
                 Some(destination),
             )));
@@ -1018,8 +1114,57 @@ impl SftpTransferBackend {
                 Some(destination),
             )));
         }
+        if let Err(error) = confirm_source_revision(source_session, &source, &source_before).await {
+            return Err(Box::new(verification_error(
+                error,
+                Some(final_checkpoint),
+                &destination,
+            )));
+        }
+        if context.cancellation.is_cancelled() {
+            return Err(Box::new(cancelled(
+                Some(final_checkpoint),
+                Some(destination),
+            )));
+        }
+        let existing_destination =
+            match request.conflict_policy {
+                ConflictPolicy::Overwrite => destination_session
+                    .metadata(&destination)
+                    .await
+                    .map_err(|error| {
+                        transfer_error(
+                            error,
+                            Some(final_checkpoint.clone()),
+                            Some(destination.clone()),
+                        )
+                    })?,
+                ConflictPolicy::Rename | ConflictPolicy::Skip => None,
+            };
+        let mode = match existing_destination.as_ref() {
+            Some(metadata) if metadata.kind == FileEntryKind::File => {
+                FileCommitMode::ReplaceExisting
+            }
+            Some(_) => {
+                return Err(Box::new(transfer_error(
+                    AppError::conflict("覆盖目标不再是普通文件"),
+                    None,
+                    Some(destination),
+                )));
+            }
+            None => FileCommitMode::CreateNew,
+        };
+        let permissions =
+            file_staging_permissions(source_before.permissions, existing_destination.as_ref())
+                .map_err(|error| {
+                    transfer_error(
+                        error,
+                        Some(final_checkpoint.clone()),
+                        Some(destination.clone()),
+                    )
+                })?;
         if let Err(error) = destination_session
-            .set_permissions(&staging, source_before.permissions)
+            .set_permissions(&staging, permissions)
             .await
         {
             return Err(Box::new(transfer_error(
@@ -1028,42 +1173,6 @@ impl SftpTransferBackend {
                 Some(destination),
             )));
         }
-        if let Err(error) =
-            confirm_source_revision(source_session, &source, &source_before, &source_revision).await
-        {
-            return Err(Box::new(transfer_error(error, None, Some(destination))));
-        }
-        if context.cancellation.is_cancelled() {
-            return Err(Box::new(cancelled(
-                Some(final_checkpoint),
-                Some(destination),
-            )));
-        }
-        let mode = match request.conflict_policy {
-            ConflictPolicy::Overwrite => match destination_session
-                .metadata(&destination)
-                .await
-                .map_err(|error| {
-                    transfer_error(
-                        error,
-                        Some(final_checkpoint.clone()),
-                        Some(destination.clone()),
-                    )
-                })? {
-                Some(metadata) if metadata.kind == FileEntryKind::File => {
-                    FileCommitMode::ReplaceExisting
-                }
-                Some(_) => {
-                    return Err(Box::new(transfer_error(
-                        AppError::conflict("覆盖目标不再是普通文件"),
-                        None,
-                        Some(destination),
-                    )));
-                }
-                None => FileCommitMode::CreateNew,
-            },
-            ConflictPolicy::Rename | ConflictPolicy::Skip => FileCommitMode::CreateNew,
-        };
         context
             .progress
             .begin_commit(
@@ -1137,6 +1246,7 @@ impl SftpTransferBackend {
     /// 规范源根与目标真实父目录先做 containment 校验；目标叶不规范化，且该门禁早于 stage 所有权登记。
     /// 根暂存创建前先持久登记所有权，目录内子项沿用该根记录，树外 merge 暂存仍独立登记。
     /// 根目录 rename 会连同 staging 中的文件 sidecar 一起发布，因此发布前必须先校验并退役已提交的子文件 marker；root marker 保留至最终提交结果明确。
+    /// 子项复制完成后的整理仍属于准备提交，不使用源校验阶段误导用户以为正在整树预扫描。
     /// 内部失败以盒装形式传播，不跳过目录项、回执、权限应用或原子发布步骤。
     ///
     /// @author kongweiguang
@@ -1210,7 +1320,7 @@ impl SftpTransferBackend {
         let mut staging_directories_postorder = Vec::new();
         let stage_result = async {
             destination_session
-                .create_staging_marker(&root_artifact)
+                .create_staging_marker(&root_artifact, &context.cancellation)
                 .await
                 .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
             destination_session
@@ -1352,7 +1462,7 @@ impl SftpTransferBackend {
         context.progress.report(TransferProgressUpdate {
             confirmed_bytes: total_bytes,
             total_bytes: Some(total_bytes),
-            phase: TransferPhase::Verifying,
+            phase: TransferPhase::Preparing,
             actual_destination: Some(destination.clone()),
             ..TransferProgressUpdate::default()
         });
@@ -1395,7 +1505,11 @@ impl SftpTransferBackend {
             })
         } else {
             staging_tracker
-                .retire_committed_file_markers_before_tree_publish(destination_session, &staging)
+                .retire_committed_file_markers_before_tree_publish(
+                    destination_session,
+                    &staging,
+                    &context.cancellation,
+                )
                 .await
                 .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
             if context.cancellation.is_cancelled() {
@@ -1486,7 +1600,7 @@ impl SftpTransferBackend {
         }
     }
 
-    /// 把目录中的单个普通文件写入私有 staging 子项，摘要阶段沿用整树已确认字节作为进度基数。
+    /// 目录内文件直接流式写入私有 staging，复制前后只核对属性，避免逐文件重复读取完整内容。
     /// 使用同一份树级操作计划避免进度引用与 cleanup owner 在多参数调用中错位。
     ///
     /// @author kongweiguang
@@ -1523,16 +1637,7 @@ impl SftpTransferBackend {
                 Some(public_destination.clone()),
             )));
         }
-        let (source_revision, source_hash, _) = hash_source(
-            source_session,
-            source,
-            &metadata,
-            0,
-            *total_bytes,
-            context,
-            public_destination,
-        )
-        .await?;
+        let source_revision = metadata.revision();
         let temporary = temporary_sibling(destination_in_tree)
             .map_err(|error| transfer_error(error, None, Some(public_destination.clone())))?;
         let copied = self
@@ -1541,13 +1646,14 @@ impl SftpTransferBackend {
                 source_session,
                 destination_session,
                 source,
+                checkpoint_source: None,
                 destination_stage: &temporary,
                 staging_token: Uuid::new_v4().simple().to_string(),
                 staging_tracker,
                 public_destination,
                 recovery_destination: None,
                 offset: 0,
-                hasher: source_hash,
+                hasher: Sha256::new(),
                 base_confirmed: *total_bytes,
                 source_revision: Some(&source_revision),
                 resume_existing: false,
@@ -1557,6 +1663,11 @@ impl SftpTransferBackend {
             .await;
         match copied {
             Ok((bytes, _)) => {
+                confirm_source_revision(source_session, source, &metadata)
+                    .await
+                    .map_err(|error| {
+                        transfer_error(error, None, Some(public_destination.clone()))
+                    })?;
                 *total_bytes = total_bytes.saturating_add(bytes);
                 if let Err(error) = apply_source_modified_time(
                     destination_session,
@@ -1808,6 +1919,7 @@ impl SftpTransferBackend {
                                 source_session: destination_session,
                                 destination_session,
                                 source: &source_child,
+                                checkpoint_source: None,
                                 destination_stage: &temporary,
                                 staging_token: Uuid::new_v4().simple().to_string(),
                                 staging_tracker,
@@ -1937,6 +2049,11 @@ impl SftpTransferBackend {
     /// 按 64 KiB 有界块复制；SFTP 写确认和本机 flush 后才推进字节及可信前缀摘要。
     /// 独立暂存先取得持久化 owner 回执；树内子项沿用已登记根，不按展示用目录推断提交目标。
     /// 错误只在内部结果中盒装，取消携带的 checkpoint 与 staging 身份原样交还外层清理状态机。
+    /// 新任务边复制边计算摘要；续传复用已同步状态，完整摘要只在读到 EOF 后补齐。
+    /// 取消后在有界时间内尝试同步已确认前缀，失败时保留上一个可靠检查点。
+    /// 最终长度或摘要冲突会撤销续传资格，避免把已变化的源内容保存成看似可信的新断点。
+    /// 源和暂存句柄的打开、定位与读取均响应取消；恢复流尚未写入时的临时错误仍携带原可信 checkpoint。
+    /// 成功读取和写入后确认关闭各自句柄，异常及取消路径仍由 endpoint owner 负责回收。
     ///
     /// @author kongweiguang
     async fn stream_file(
@@ -1948,6 +2065,7 @@ impl SftpTransferBackend {
             source_session,
             destination_session,
             source,
+            checkpoint_source,
             destination_stage,
             staging_token,
             staging_tracker,
@@ -1961,6 +2079,18 @@ impl SftpTransferBackend {
             report_progress,
             allow_checkpoint,
         } = plan;
+        if report_progress {
+            context.progress.report(TransferProgressUpdate {
+                confirmed_bytes: base_confirmed,
+                total_bytes: (context.request.kind == TransferKind::File)
+                    .then(|| source_revision.map(|revision| revision.size))
+                    .flatten(),
+                phase: TransferPhase::Preparing,
+                actual_destination: Some(public_destination.clone()),
+                checkpoint: context.resume_from.clone(),
+                ..TransferProgressUpdate::default()
+            });
+        }
         let staging_owner = context
             .resume_from
             .as_ref()
@@ -1998,11 +2128,11 @@ impl SftpTransferBackend {
                     return Err(Box::new(cancelled(context.resume_from.clone(), Some(public_destination.clone()))));
                 }
                 result = destination_session.verify_staging_marker(&staging_artifact) => {
-                    result.map_err(|error| transfer_error(
+                    result.map_err(|error| Box::new(verification_error(
                         error,
                         context.resume_from.clone(),
-                        Some(public_destination.clone()),
-                    ))?;
+                        public_destination,
+                    )))?;
                 }
             }
             if !staging_tracker.contains(destination_stage) {
@@ -2020,7 +2150,7 @@ impl SftpTransferBackend {
                     )));
                 }
                 destination_session
-                    .create_staging_marker(&staging_artifact)
+                    .create_staging_marker(&staging_artifact, &context.cancellation)
                     .await
                     .map_err(|error| {
                         transfer_error(error, None, Some(public_destination.clone()))
@@ -2033,10 +2163,21 @@ impl SftpTransferBackend {
                 Some(public_destination.clone()),
             )));
         }
-        let mut reader = source_session
-            .open_reader(source)
-            .await
-            .map_err(|error| transfer_error(error, None, Some(public_destination.clone())))?;
+        let Some(opened_reader) =
+            await_unless_cancelled(&context.cancellation, source_session.open_reader(source)).await
+        else {
+            return Err(Box::new(cancelled(
+                context.resume_from.clone(),
+                Some(public_destination.clone()),
+            )));
+        };
+        let mut reader = opened_reader.map_err(|error| {
+            Box::new(verification_error(
+                error,
+                context.resume_from.clone(),
+                public_destination,
+            ))
+        })?;
         if offset > 0 {
             tokio::select! {
                 biased;
@@ -2047,8 +2188,8 @@ impl SftpTransferBackend {
                     )));
                 }
                 result = reader.seek(SeekFrom::Start(offset)) => {
-                    result.map_err(|error| transfer_error(
-                        map_io_error(error), None, Some(public_destination.clone()),
+                    result.map_err(|error| verification_error(
+                        map_endpoint_io_error(source, error), context.resume_from.clone(), public_destination,
                     ))?;
                 }
             }
@@ -2062,7 +2203,9 @@ impl SftpTransferBackend {
                 )));
             }
             result = destination_session.open_writer(destination_stage, !resume_existing) => {
-                result.map_err(|error| transfer_error(error, None, Some(public_destination.clone())))?
+                result.map_err(|error| verification_error(
+                    error, context.resume_from.clone(), public_destination,
+                ))?
             }
         };
         if !resume_existing {
@@ -2090,8 +2233,8 @@ impl SftpTransferBackend {
                     )));
                 }
                 result = writer.seek(SeekFrom::Start(offset)) => {
-                    result.map_err(|error| transfer_error(
-                        map_io_error(error), None, Some(public_destination.clone()),
+                    result.map_err(|error| verification_error(
+                        map_endpoint_io_error(destination_stage, error), context.resume_from.clone(), public_destination,
                     ))?;
                 }
             }
@@ -2106,22 +2249,21 @@ impl SftpTransferBackend {
         let mut confirmed = offset;
         let mut last_checkpoint_at = offset;
         let mut checkpoint = context.resume_from.clone();
+        let mut interrupted = false;
         loop {
             if context.cancellation.is_cancelled() {
-                drop(writer);
-                return Err(Box::new(cancelled(
-                    checkpoint,
-                    Some(public_destination.clone()),
-                )));
+                interrupted = true;
+                break;
             }
             let read = tokio::select! {
                 biased;
                 _ = context.cancellation.cancelled() => {
-                    return Err(Box::new(cancelled(checkpoint.clone(), Some(public_destination.clone()))));
+                    interrupted = true;
+                    break;
                 }
                 result = reader.read(&mut buffer) => result.map_err(|error| {
                     transfer_error(
-                        map_io_error(error),
+                        map_endpoint_io_error(source, error),
                         checkpoint.clone(),
                         Some(public_destination.clone()),
                     )
@@ -2133,11 +2275,12 @@ impl SftpTransferBackend {
             tokio::select! {
                 biased;
                 _ = context.cancellation.cancelled() => {
-                    return Err(Box::new(cancelled(checkpoint.clone(), Some(public_destination.clone()))));
+                    interrupted = true;
+                    break;
                 }
                 result = writer.write_all(&buffer[..read]) => result.map_err(|error| {
                     transfer_error(
-                        map_io_error(error),
+                        map_endpoint_io_error(destination_stage, error),
                         checkpoint.clone(),
                         Some(public_destination.clone()),
                     )
@@ -2146,11 +2289,12 @@ impl SftpTransferBackend {
             tokio::select! {
                 biased;
                 _ = context.cancellation.cancelled() => {
-                    return Err(Box::new(cancelled(checkpoint.clone(), Some(public_destination.clone()))));
+                    interrupted = true;
+                    break;
                 }
                 result = writer.flush() => result.map_err(|error| {
                     transfer_error(
-                        map_io_error(error),
+                        map_endpoint_io_error(destination_stage, error),
                         checkpoint.clone(),
                         Some(public_destination.clone()),
                     )
@@ -2169,7 +2313,8 @@ impl SftpTransferBackend {
                 tokio::select! {
                     biased;
                     _ = context.cancellation.cancelled() => {
-                        return Err(Box::new(cancelled(checkpoint.clone(), Some(public_destination.clone()))));
+                        interrupted = true;
+                        break;
                     }
                     result = destination_session.sync_file(destination_stage) => result.map_err(|error| {
                         transfer_error(
@@ -2188,6 +2333,9 @@ impl SftpTransferBackend {
                     staging_token: staging_token.clone(),
                     actual_destination: public_destination.clone(),
                 });
+                if let (Some(source), Some(checkpoint)) = (checkpoint_source, checkpoint.as_ref()) {
+                    self.resume_hashes.insert(source, checkpoint, &hasher);
+                }
                 last_checkpoint_at = confirmed;
             }
             if report_progress {
@@ -2205,34 +2353,109 @@ impl SftpTransferBackend {
                 });
             }
         }
-        tokio::select! {
-            biased;
-            _ = context.cancellation.cancelled() => {
-                return Err(Box::new(cancelled(checkpoint.clone(), Some(public_destination.clone()))));
+        if !interrupted {
+            tokio::select! {
+                biased;
+                _ = context.cancellation.cancelled() => interrupted = true,
+                result = reader.shutdown() => result.map_err(|error| {
+                    transfer_error(
+                        map_endpoint_io_error(source, error),
+                        checkpoint.clone(),
+                        Some(public_destination.clone()),
+                    )
+                })?,
             }
-            result = writer.flush() => result.map_err(|error| {
-                transfer_error(
-                    map_io_error(error),
-                    checkpoint.clone(),
-                    Some(public_destination.clone()),
-                )
-            })?,
+        }
+        drop(reader);
+        if !interrupted {
+            tokio::select! {
+                biased;
+                _ = context.cancellation.cancelled() => interrupted = true,
+                result = writer.flush() => result.map_err(|error| {
+                    transfer_error(
+                        map_endpoint_io_error(destination_stage, error),
+                        checkpoint.clone(),
+                        Some(public_destination.clone()),
+                    )
+                })?,
+            }
+        }
+        if !interrupted {
+            tokio::select! {
+                biased;
+                _ = context.cancellation.cancelled() => interrupted = true,
+                result = writer.shutdown() => result.map_err(|error| {
+                    transfer_error(
+                        map_endpoint_io_error(destination_stage, error),
+                        checkpoint.clone(),
+                        Some(public_destination.clone()),
+                    )
+                })?,
+            }
         }
         drop(writer);
-        tokio::select! {
-            biased;
-            _ = context.cancellation.cancelled() => {
-                return Err(Box::new(cancelled(checkpoint.clone(), Some(public_destination.clone()))));
+        if !interrupted {
+            tokio::select! {
+                biased;
+                _ = context.cancellation.cancelled() => interrupted = true,
+                result = destination_session.sync_file(destination_stage) => result.map_err(|error| {
+                    transfer_error(error, checkpoint.clone(), Some(public_destination.clone()))
+                })?,
             }
-            result = destination_session.sync_file(destination_stage) => result.map_err(|error| {
-                transfer_error(error, checkpoint.clone(), Some(public_destination.clone()))
-            })?,
+        }
+        if interrupted {
+            if allow_checkpoint
+                && confirmed > last_checkpoint_at
+                && let Some(revision) = source_revision
+            {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let deadline = context
+                    .shutdown_deadline()
+                    .map_or(deadline, |limit| limit.min(deadline));
+                match tokio::time::timeout_at(
+                    deadline,
+                    destination_session.sync_file(destination_stage),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        checkpoint = Some(TransferCheckpoint {
+                            source_revision: revision.clone(),
+                            confirmed_bytes: confirmed,
+                            confirmed_prefix_sha256: sha256_hex(
+                                hasher.clone().finalize().as_slice(),
+                            ),
+                            staging_owner,
+                            staging_destination: destination_stage.clone(),
+                            staging_token,
+                            actual_destination: public_destination.clone(),
+                        });
+                        if let (Some(source), Some(checkpoint)) =
+                            (checkpoint_source, checkpoint.as_ref())
+                        {
+                            self.resume_hashes.insert(source, checkpoint, &hasher);
+                        }
+                    }
+                    Ok(Err(error)) => tracing::warn!(
+                        error_code = error.public_code().as_str(),
+                        "暂停时无法同步最新确认前缀，保留上一个检查点"
+                    ),
+                    Err(_) => tracing::warn!("暂停时同步最新确认前缀超时，保留上一个检查点"),
+                }
+            }
+            return Err(Box::new(cancelled(
+                checkpoint,
+                Some(public_destination.clone()),
+            )));
         }
         if let Some(revision) = source_revision.filter(|_| allow_checkpoint)
             && confirmed == revision.size
         {
+            let mut completed_revision = revision.clone();
+            completed_revision.content_digest =
+                Some(sha256_hex(hasher.clone().finalize().as_slice()));
             checkpoint = Some(TransferCheckpoint {
-                source_revision: revision.clone(),
+                source_revision: completed_revision,
                 confirmed_bytes: confirmed,
                 confirmed_prefix_sha256: sha256_hex(hasher.clone().finalize().as_slice()),
                 staging_owner,
@@ -2240,6 +2463,9 @@ impl SftpTransferBackend {
                 staging_token,
                 actual_destination: public_destination.clone(),
             });
+            if let (Some(source), Some(checkpoint)) = (checkpoint_source, checkpoint.as_ref()) {
+                self.resume_hashes.insert(source, checkpoint, &hasher);
+            }
         }
         if let Some(revision) = source_revision
             && (confirmed != revision.size
@@ -2248,8 +2474,8 @@ impl SftpTransferBackend {
                 }))
         {
             return Err(Box::new(transfer_error(
-                AppError::conflict("传输流内容与预检源摘要不一致"),
-                checkpoint,
+                AppError::conflict("传输流长度或内容与源文件版本不一致"),
+                None,
                 Some(public_destination.clone()),
             )));
         }
@@ -2337,7 +2563,7 @@ impl TransferBackend for SftpTransferBackend {
     /// 每个队列尝试独立建立端点连接，返回前释放本次 SFTP channel 与其专属 SSH lease。
     /// 纯本机复制使用默认 client 参数，绝不为占位配置打开 SSH route。
     /// 内部传输 helper 的盒装错误在此解箱，保证 application trait 与清理/未知提交分类契约不变。
-    /// 暂存物理清理与 journal 释放回执分离；仅本轮 receiver 存活时补释放，不能让后续 owner 卡死在旧通道。
+    /// 暂存物理清理与 journal 释放回执分离；结束时仅为可续传结果保留哈希状态。
     ///
     /// @author kongweiguang
     async fn execute(
@@ -2413,6 +2639,11 @@ impl TransferBackend for SftpTransferBackend {
             .await
             .map_err(|error| *error);
         preserve_staging_for_outcome(&staging, &outcome);
+        let artifacts = staging
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let deadline = context
             .shutdown_deadline()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
@@ -2425,30 +2656,41 @@ impl TransferBackend for SftpTransferBackend {
         staging
             .release_cleaned_recovery_ownerships(&context.progress, &recovery_ownerships, deadline)
             .await;
-        if cleanup_result.is_ok() {
-            return outcome;
-        }
-        let cleanup = TransferCleanupState::pending(cleanup_owner.clone());
-        match outcome {
-            Ok(result) => match context
-                .progress
-                .retain_cleanup_owner(cleanup_owner.clone())
-                .await
-            {
-                Ok(()) => Ok(result),
-                Err(_) => Err(TransferExecutionError::Failed(
-                    TransferExecutionFailure::new(
-                        TransferFailureKind::Internal,
-                        false,
-                        false,
-                        None,
-                        Some(result.actual_destination),
-                        cleanup,
-                    ),
-                )),
-            },
-            Err(outcome) => Err(with_pending_cleanup(outcome, cleanup)),
-        }
+        let outcome = if cleanup_result.is_ok() {
+            outcome
+        } else {
+            let cleanup = TransferCleanupState::pending(cleanup_owner.clone());
+            match outcome {
+                Ok(result) => match context
+                    .progress
+                    .retain_cleanup_owner(cleanup_owner.clone())
+                    .await
+                {
+                    Ok(()) => Ok(result),
+                    Err(_) => Err(TransferExecutionError::Failed(
+                        TransferExecutionFailure::new(
+                            TransferFailureKind::Internal,
+                            false,
+                            false,
+                            None,
+                            Some(result.actual_destination),
+                            cleanup,
+                        ),
+                    )),
+                },
+                Err(outcome) => Err(with_pending_cleanup(outcome, cleanup)),
+            }
+        };
+        let retained = match &outcome {
+            Err(TransferExecutionError::Cancelled { checkpoint, .. }) => checkpoint.as_ref(),
+            Err(TransferExecutionError::Failed(failure)) if failure.resumable() => {
+                failure.checkpoint()
+            }
+            _ => None,
+        };
+        self.resume_hashes
+            .finish_attempt(&artifacts, context.resume_from.as_ref(), retained);
+        outcome
     }
 }
 
@@ -2530,89 +2772,8 @@ async fn choose_destination(
     }
 }
 
-/// 逐块计算完整源摘要，并在续传偏移处保留 SHA 状态；目录项使用累计字节且不把单文件大小当整树总量。
-///
-/// @author kongweiguang
-async fn hash_source(
-    session: &EndpointSession,
-    endpoint: &FileEndpoint,
-    metadata: &ObjectMetadata,
-    prefix_len: u64,
-    progress_base: u64,
-    context: &TransferExecutionContext,
-    destination: &FileEndpoint,
-) -> CompactTransferResult<(FileRevision, Sha256, String)> {
-    if prefix_len > metadata.size {
-        return Err(Box::new(transfer_error(
-            AppError::conflict("续传断点超过源文件大小"),
-            None,
-            Some(destination.clone()),
-        )));
-    }
-    let mut reader = session
-        .open_reader(endpoint)
-        .await
-        .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
-    let mut full = Sha256::new();
-    let mut prefix = Sha256::new();
-    let mut prefix_state = Sha256::new();
-    let mut prefix_saved = prefix_len == 0;
-    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
-    let mut bytes = 0_u64;
-    loop {
-        if context.cancellation.is_cancelled() {
-            return Err(Box::new(cancelled(
-                context.resume_from.clone(),
-                Some(destination.clone()),
-            )));
-        }
-        let read = reader.read(&mut buffer).await.map_err(|error| {
-            transfer_error(
-                map_io_error(error),
-                context.resume_from.clone(),
-                Some(destination.clone()),
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        let remaining_prefix = prefix_len.saturating_sub(bytes).min(read as u64) as usize;
-        if remaining_prefix > 0 {
-            prefix.update(&buffer[..remaining_prefix]);
-        }
-        full.update(&buffer[..read]);
-        bytes = bytes.saturating_add(read as u64);
-        if !prefix_saved && bytes >= prefix_len {
-            prefix_state = prefix.clone();
-            prefix_saved = true;
-        }
-        context.progress.report(TransferProgressUpdate {
-            confirmed_bytes: progress_base,
-            total_bytes: (context.request.kind == TransferKind::File).then_some(metadata.size),
-            phase: TransferPhase::Verifying,
-            actual_destination: Some(destination.clone()),
-            checkpoint: context.resume_from.clone(),
-            ..TransferProgressUpdate::default()
-        });
-    }
-    if bytes != metadata.size || !prefix_saved {
-        return Err(Box::new(transfer_error(
-            AppError::conflict("传输源在读取 revision 时发生变化"),
-            None,
-            Some(destination.clone()),
-        )));
-    }
-    let mut revision = metadata.revision();
-    revision.content_digest = Some(sha256_hex(full.finalize().as_slice()));
-    Ok((
-        revision,
-        prefix_state,
-        sha256_hex(prefix.finalize().as_slice()),
-    ))
-}
-
-/// 校验 checkpoint 的 owner、同目录目标、源摘要和 partial 前缀；只修剪摘要已确认后的尾部。
-/// 仅在全部信任条件成立后才访问 partial，盒装错误仍完整携带恢复上下文供外层分类。
+/// 只检查断点目标、owner、marker、类型与长度，不重读已传内容；写入前仍须命中进程内哈希状态。
+/// 校验不修改暂存文件，缓存失效时由调用方登记原 owner 后安全回收。
 ///
 /// @author kongweiguang
 async fn validate_staging_checkpoint(
@@ -2620,8 +2781,7 @@ async fn validate_staging_checkpoint(
     checkpoint: &TransferCheckpoint,
     destination: &FileEndpoint,
     context: &TransferExecutionContext,
-    source_prefix_digest: &str,
-) -> CompactTransferResult<FileEndpoint> {
+) -> CompactTransferResult<ObjectMetadata> {
     let staging = &checkpoint.staging_destination;
     if !staging.same_filesystem(destination)
         || !same_parent_directory(staging, destination)
@@ -2635,7 +2795,6 @@ async fn validate_staging_checkpoint(
                 .unwrap_or("")
         || !checkpoint_owner_matches(staging, &checkpoint.staging_owner)
         || !valid_staging_token(&checkpoint.staging_token)
-        || checkpoint.confirmed_prefix_sha256 != source_prefix_digest
     {
         return Err(Box::new(transfer_error(
             AppError::conflict("传输断点未绑定当前目标"),
@@ -2653,11 +2812,23 @@ async fn validate_staging_checkpoint(
     session
         .verify_staging_marker(&artifact)
         .await
-        .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
+        .map_err(|error| {
+            Box::new(verification_error(
+                error,
+                context.resume_from.clone(),
+                destination,
+            ))
+        })?;
     let metadata = session
         .metadata(staging)
         .await
-        .map_err(|error| transfer_error(error, None, Some(destination.clone())))?
+        .map_err(|error| {
+            Box::new(verification_error(
+                error,
+                context.resume_from.clone(),
+                destination,
+            ))
+        })?
         .ok_or_else(|| {
             transfer_error(
                 AppError::conflict("可信传输暂存文件已不存在"),
@@ -2672,96 +2843,109 @@ async fn validate_staging_checkpoint(
             Some(destination.clone()),
         )));
     }
-    let digest = hash_prefix(
-        session,
-        staging,
-        checkpoint.confirmed_bytes,
-        context,
-        destination,
-    )
-    .await?;
-    if digest != checkpoint.confirmed_prefix_sha256 {
-        return Err(Box::new(transfer_error(
-            AppError::conflict("传输暂存文件前缀校验失败"),
-            None,
-            Some(destination.clone()),
-        )));
-    }
-    session
-        .truncate_file(staging, checkpoint.confirmed_bytes)
-        .await
-        .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
-    Ok(staging.clone())
+    Ok(metadata)
 }
 
-/// 分块读取指定前缀并校验短读；不把服务端 partial 长度直接当作可信断点。
-/// 校验与源 revision 共用紧凑错误通道，短读仍失败关闭，不接受服务端长度作为可信前缀。
+/// 只在 checkpoint owner、marker 与缓存状态均验证后恢复最小 owner-write，避免放宽未知暂存对象权限。
+/// POSIX owner 类优先于 group/other 类，故只要 owner-write 缺失就补该位；权限未知时不猜。
+/// 续传不再读取暂存内容，因此不为哈希校验额外授予 owner-read；最终提交仍重新应用目标 mode。
 ///
 /// @author kongweiguang
-async fn hash_prefix(
+async fn make_checkpoint_staging_writable(
     session: &EndpointSession,
-    endpoint: &FileEndpoint,
-    length: u64,
-    context: &TransferExecutionContext,
-    destination: &FileEndpoint,
-) -> CompactTransferResult<String> {
-    let mut reader = session
-        .open_reader(endpoint)
-        .await
-        .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
-    let mut hasher = Sha256::new();
-    let mut remaining = length;
-    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
-    while remaining > 0 {
-        if context.cancellation.is_cancelled() {
-            return Err(Box::new(cancelled(
-                context.resume_from.clone(),
-                Some(destination.clone()),
-            )));
-        }
-        let limit = buffer.len().min(remaining as usize);
-        let read = reader.read(&mut buffer[..limit]).await.map_err(|error| {
-            transfer_error(map_io_error(error), None, Some(destination.clone()))
-        })?;
-        if read == 0 {
-            return Err(Box::new(transfer_error(
-                AppError::conflict("传输暂存文件前缀读取不完整"),
-                None,
-                Some(destination.clone()),
-            )));
-        }
-        hasher.update(&buffer[..read]);
-        remaining -= read as u64;
-        context.progress.report(TransferProgressUpdate {
-            confirmed_bytes: context
-                .resume_from
-                .as_ref()
-                .map(|item| item.confirmed_bytes)
-                .unwrap_or(0),
-            phase: TransferPhase::Verifying,
-            actual_destination: Some(destination.clone()),
-            checkpoint: context.resume_from.clone(),
-            ..TransferProgressUpdate::default()
-        });
+    staging: &FileEndpoint,
+    permissions: Option<u32>,
+) -> AppResult<()> {
+    if let Some(mode) = permissions
+        && mode & 0o200 == 0
+    {
+        session.set_permissions(staging, Some(mode | 0o200)).await?;
     }
-    Ok(sha256_hex(hasher.finalize().as_slice()))
+    Ok(())
 }
 
-/// 读取源的基础属性并检查完整哈希在传输读取中未变化。
+/// 目标存在时使用它明确提供的 mode；缺失权限不能用源权限猜测，否则原子替换会改变目标访问语义。
+/// 新建目标没有既有 mode，才沿用源文件权限；源权限未知时继续保留暂存的默认权限。
+///
+/// @author kongweiguang
+fn file_staging_permissions(
+    source_permissions: Option<u32>,
+    existing_destination: Option<&ObjectMetadata>,
+) -> AppResult<Option<u32>> {
+    match existing_destination {
+        Some(metadata) if metadata.kind != FileEntryKind::File => {
+            Err(AppError::conflict("覆盖目标不再是普通文件"))
+        }
+        Some(metadata) => metadata
+            .permissions
+            .map(Some)
+            .ok_or_else(|| AppError::unsupported("现有目标未提供权限，无法安全保留后覆盖")),
+        None => Ok(source_permissions),
+    }
+}
+
+/// 与阻塞 I/O 竞速并优先观察取消；返回 None 表示底层操作 future 已被立即丢弃。
+///
+/// @author kongweiguang
+async fn await_unless_cancelled<T>(
+    cancellation: &CancellationToken,
+    operation: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = operation => Some(result),
+    }
+}
+
+/// 临时链路错误不证明原断点失效；源属性、暂存身份或长度冲突必须禁止沿用。
+/// 保留断点只允许重试轻量检查与缓存匹配，不触发前缀扫描。
+///
+/// @author kongweiguang
+fn verification_error(
+    error: AppError,
+    checkpoint: Option<TransferCheckpoint>,
+    destination: &FileEndpoint,
+) -> TransferExecutionError {
+    let checkpoint = match error.public_code() {
+        PublicErrorCode::Cancelled | PublicErrorCode::Timeout | PublicErrorCode::Infrastructure => {
+            checkpoint
+        }
+        _ => None,
+    };
+    transfer_error(error, checkpoint, Some(destination.clone()))
+}
+
+/// 缓存丢失后立即结束本轮并提供既有“重试”，不扫描前缀，也不把失效断点交回继续按钮。
+///
+/// @author kongweiguang
+fn expired_checkpoint(destination: FileEndpoint) -> TransferExecutionError {
+    TransferExecutionError::Failed(
+        TransferExecutionFailure::new(
+            TransferFailureKind::Internal,
+            true,
+            false,
+            None,
+            Some(destination),
+            TransferCleanupState::Released,
+        )
+        .with_safe_message("续传状态已失效，请重试传输"),
+    )
+}
+
+/// 提交前以有界属性读取检查源版本；内容摘要由同一复制流形成，不额外重读整个远端文件。
+///
+/// @author kongweiguang
 async fn confirm_source_revision(
     session: &EndpointSession,
     source: &FileEndpoint,
     initial: &ObjectMetadata,
-    expected: &FileRevision,
 ) -> AppResult<()> {
     let current = session
         .metadata(source)
         .await?
         .ok_or_else(|| AppError::not_found("传输源在提交前消失"))?;
-    let digest_is_valid = expected.content_digest.as_ref().is_some_and(|digest| {
-        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-    });
-    if current.revision() != initial.revision() || !digest_is_valid {
+    if current.kind != FileEntryKind::File || current.revision() != initial.revision() {
         return Err(AppError::conflict("传输源属性在提交前发生变化"));
     }
     Ok(())
@@ -2825,6 +3009,7 @@ fn recovery_file_evidence(record: &TransferRecoveryRecord) -> Option<(&FileEndpo
 
 /// 仅以 lstat、真实目标字节哈希和读后 revision 组成只读恢复证据，不把匹配改写为成功状态。
 /// 链接目标和变动中的对象均不能证明原提交结果；哈希按固定缓冲区流式读取以限制内存。
+/// 读取完成后确认关闭远端句柄，取消及读取失败时仍交由 endpoint owner 回收。
 ///
 /// @author kongweiguang
 async fn inspect_recovery_destination(
@@ -2870,12 +3055,19 @@ async fn inspect_recovery_destination(
             _ = cancellation.cancelled() => {
                 return Err(AppError::cancelled("传输恢复核对已取消"));
             }
-            read = reader.read(&mut buffer) => read.map_err(map_io_error)?,
+            read = reader.read(&mut buffer) => read.map_err(|error| map_endpoint_io_error(destination, error))?,
         };
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+    }
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            return Err(AppError::cancelled("传输恢复核对已取消"));
+        }
+        result = reader.shutdown() => result.map_err(|error| map_endpoint_io_error(destination, error))?,
     }
     if cancellation.is_cancelled() {
         return Err(AppError::cancelled("传输恢复核对已取消"));
@@ -2950,20 +3142,16 @@ async fn restore_staging_directory_modes(
     }
 }
 
-/// 冲突目录合并时逐项写成私有 sibling，再按无覆盖/替换策略原子发布。
+/// 合并目录时按目标平台校验单层名称，远端合法名称不能变成本机路径穿越或数据流。
+///
+/// @author kongweiguang
 fn sibling_child(parent: &FileEndpoint, name: &str) -> AppResult<FileEndpoint> {
-    match parent {
-        FileEndpoint::Local { path } => Ok(FileEndpoint::Local {
-            path: path.join(name),
-        }),
-        FileEndpoint::Remote { host_id, path } => Ok(FileEndpoint::Remote {
-            host_id: host_id.clone(),
-            path: path
-                .join_name(name)
-                .map_err(|_| AppError::invalid("远端文件名无效"))?,
-        }),
-        FileEndpoint::Container { .. } => Err(AppError::unsupported("SFTP 传输不接受容器端点")),
+    if matches!(parent, FileEndpoint::Container { .. }) {
+        return Err(AppError::unsupported("SFTP 传输不接受容器端点"));
     }
+    parent
+        .join_name(name)
+        .map_err(|_| AppError::invalid("文件名无法安全保存到目标文件系统，请重命名后重试"))
 }
 
 /// 暂存名不复用用户文件名，避免长 UTF-8 basename 再次突破远端组件长度限制；owner 与随机 nonce 固定恢复身份。
@@ -3470,7 +3658,9 @@ fn preserve_staging_for_outcome(
     }
 }
 
-/// 资源关闭失败后，取消不再代表已清理；将其转为带 owner 的失败以保留重试入口。
+/// 保留原失败的脱敏原因和恢复策略；取消未完成清理时保留 owner 与原可信断点。
+///
+/// @author kongweiguang
 fn with_pending_cleanup(
     error: TransferExecutionError,
     cleanup: TransferCleanupState,
@@ -3483,18 +3673,23 @@ fn with_pending_cleanup(
             failure.checkpoint().cloned(),
             failure.actual_destination().cloned(),
             cleanup,
-        ),
+        )
+        .with_safe_message(failure.safe_message()),
         TransferExecutionError::Cancelled {
             checkpoint,
             actual_destination,
-        } => TransferExecutionFailure::new(
-            TransferFailureKind::Internal,
-            false,
-            false,
-            checkpoint,
-            actual_destination,
-            cleanup,
-        ),
+        } => {
+            let resumable = checkpoint.is_some();
+            TransferExecutionFailure::new(
+                TransferFailureKind::Internal,
+                true,
+                resumable,
+                checkpoint,
+                actual_destination,
+                cleanup,
+            )
+            .with_safe_message("传输已取消")
+        }
     };
     TransferExecutionError::Failed(failure)
 }
@@ -3650,6 +3845,26 @@ fn map_io_error(error: io::Error) -> AppError {
     }
 }
 
+/// 流的错误归属由实际端点决定，避免上传和下载将远端故障误报为本机故障。
+///
+/// @author kongweiguang
+fn map_endpoint_io_error(endpoint: &FileEndpoint, error: io::Error) -> AppError {
+    match endpoint {
+        FileEndpoint::Local { .. } => map_io_error(error),
+        FileEndpoint::Remote { .. } => map_remote_stream_error(error),
+        FileEndpoint::Container { .. } => {
+            AppError::infrastructure_with_source("容器文件数据流失败", error)
+        }
+    }
+}
+
+/// SFTP 流接口可能已丢失协议状态码；保留错误链并只公开不含远端内容的固定文案。
+///
+/// @author kongweiguang
+fn map_remote_stream_error(error: io::Error) -> AppError {
+    AppError::infrastructure_with_source("远端 SFTP 数据流失败", error)
+}
+
 /// SHA-256 仅保存十六进制摘要到可信 checkpoint，不暴露文件内容。
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -3661,3 +3876,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[path = "../../tests/unit/private_transfer.rs"]
 mod private_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/transfer_verification.rs"]
+mod verification_tests;

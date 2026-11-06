@@ -37,6 +37,8 @@ pub struct TransferStagingOwnership {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferRecoveryRecord {
     pub id: TransferId,
+    /// 旧记录和非工作区调用保留未分配状态，不推断主机或目录归属。
+    pub origin: Option<super::TransferOrigin>,
     pub request: TransferRequest,
     /// 此记录只描述拖出前的本机暂存，不能解释为系统目标已完成复制。
     pub drag_staging: bool,
@@ -48,6 +50,20 @@ pub struct TransferRecoveryRecord {
     pub inspection: TransferRecoveryInspection,
     /// 人工归档不修改证据结论；未知结果与清理所有权仍可在归档历史查看。
     pub archived: bool,
+}
+
+impl TransferRecoveryRecord {
+    /// 缺少活任务时仅允许收起无待办证据的记录；断点、暂存和未知提交不能凭界面清理推定已释放。
+    ///
+    /// @author kongweiguang
+    pub fn can_dismiss_without_live_task(&self) -> bool {
+        !self.archived
+            && !self.drag_staging
+            && !self.cleanup_pending
+            && !self.commit_unknown
+            && self.checkpoint.is_none()
+            && self.staging_ownership.is_empty()
+    }
 }
 
 /// 冷归档按仓储稳定顺序分页，不把无限历史一次载入内存，也不声称 ID 是时间顺序。

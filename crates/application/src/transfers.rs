@@ -5,7 +5,7 @@
 use kerminal_domain::files::{
     FileEndpoint, FileRevision, TransferCommitSummary, TransferFailureKind, TransferRequest,
 };
-use kerminal_domain::identity::TransferId;
+use kerminal_domain::identity::{PaneId, TabId, TransferId};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -29,6 +29,15 @@ pub use recovery::{
     TransferRecoveryPage, TransferRecoveryRecord, TransferRecoveryRepository,
     TransferStagingOwnership,
 };
+
+/// 来源使用稳定工作区身份，避免同主机的多个面板共享传输历史。
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum TransferOrigin {
+    TerminalPane(PaneId),
+    SftpWorkspace(TabId),
+    WorkspaceFile(TabId),
+    SharedWorkbench,
+}
 
 /// 进度只报告已经确认的字节；更新走 watch 通道，繁忙时合并旧帧而不积压内存。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,19 +530,21 @@ impl TransferProgressReporter {
     }
 }
 
-/// 队列事件仅用于唤醒界面刷新；接收方遇到 lag 应调用 list 重建完整快照。
+/// 队列事件仅用于唤醒界面刷新；接收方仍须调用 list 重建权威快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferQueueEvent {
     Changed,
     /// 清理终态后通知观察者重新读取完整快照，包括队列已变为空的情况。
     Cleared,
-    /// 广播丢帧；完整快照可能已不含短暂终态，观察者需保守回读当前目录。
+    /// 队列记录被移除，完整快照可能已不含短暂终态，观察者需保守回读当前目录。
     Resync,
 }
 
 /// 有界广播订阅只向调用方暴露唤醒信号，避免 UI 依赖 Tokio 广播错误类型。
 pub struct TransferQueueSubscription {
     receiver: broadcast::Receiver<TransferQueueEvent>,
+    history_removal_epoch: Arc<AtomicU64>,
+    observed_history_removal_epoch: u64,
 }
 
 impl TransferQueueSubscription {
@@ -541,15 +552,43 @@ impl TransferQueueSubscription {
     ///
     /// @author kongweiguang
     pub async fn recv(&mut self, cancellation: CancellationToken) -> Option<()> {
-        subscription::receive_transfer_wakeup(&mut self.receiver, &cancellation).await
+        self.recv_event(cancellation).await.map(|_| ())
     }
 
-    /// 界面需要清理/丢帧事实以补偿目录刷新；事件本身仍不代表任何任务终态。
+    /// 纯进度丢帧只需回读队列；记录移除单独以代次跟踪，防止完成及清理同时丢帧。
+    /// 先检查代次覆盖订阅建立时的竞态，旧清理广播不得重复造成目录回读。
+    ///
+    /// @author kongweiguang
     pub async fn recv_event(
         &mut self,
         cancellation: CancellationToken,
     ) -> Option<TransferQueueEvent> {
-        subscription::receive_transfer_event(&mut self.receiver, &cancellation).await
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        if self.take_history_removal() {
+            return Some(TransferQueueEvent::Resync);
+        }
+        let event = subscription::receive_transfer_event(&mut self.receiver, &cancellation).await?;
+        if self.take_history_removal() {
+            return Some(match event {
+                TransferQueueEvent::Cleared => TransferQueueEvent::Cleared,
+                _ => TransferQueueEvent::Resync,
+            });
+        }
+        Some(TransferQueueEvent::Changed)
+    }
+
+    /// 每个订阅独立确认已观察的删除代次，合并积压事件而不依赖队列仍保留已删除项。
+    ///
+    /// @author kongweiguang
+    fn take_history_removal(&mut self) -> bool {
+        let current = self.history_removal_epoch.load(Ordering::Acquire);
+        if current == self.observed_history_removal_epoch {
+            return false;
+        }
+        self.observed_history_removal_epoch = current;
+        true
     }
 }
 

@@ -171,13 +171,13 @@ fn conflicting_or_future_forward_documents_remain_untouched() {
     );
 }
 
-/// 预检兼容普通恢复与拖出准备两种当前格式；未来版本仍须阻断且保留原文件，不能当作空记录迁移。
+/// 覆盖普通、拖出和工作区来源三种已支持格式；用版本上界固定未来文档的只读拒绝边界。
 #[test]
 fn recovery_preflight_validates_current_format_without_inventing_old_tasks() {
     let root = tempfile::tempdir().expect("创建隔离根");
     validate_current_operational_state(root.path()).expect("缺失当前文件视为空");
     fs::create_dir(root.path().join("data")).expect("创建恢复目录");
-    for schema_version in [1, 2] {
+    for schema_version in [1, 2, 3] {
         fs::write(
             root.path().join(TRANSFER_RECOVERY),
             serde_json::to_vec(&json!({ "schemaVersion": schema_version, "records": [] }))
@@ -186,8 +186,9 @@ fn recovery_preflight_validates_current_format_without_inventing_old_tasks() {
         .expect("写入当前恢复文件");
         validate_current_operational_state(root.path()).expect("支持的恢复格式应通过预检");
     }
-    let original = b"{\"schemaVersion\":3,\"records\":[]}";
-    fs::write(root.path().join(TRANSFER_RECOVERY), original).expect("写入未来恢复文件");
+    let original = serde_json::to_vec(&json!({ "schemaVersion": u32::MAX, "records": [] }))
+        .expect("未来恢复格式可编码");
+    fs::write(root.path().join(TRANSFER_RECOVERY), &original).expect("写入未来恢复文件");
     assert_eq!(
         validate_current_operational_state(root.path()).expect_err("未来记录必须阻断"),
         DataMigrationBlocker::ManagedDataInvalid {

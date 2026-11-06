@@ -14,7 +14,7 @@ use kerminal_application::{
     AppError, AppResult,
     connections::{
         ChannelLane, ConnectionIntent, OpenSftpRequest, RemoteConnectionLease,
-        RemoteConnectionService, management::HostManagementService,
+        RemoteConnectionService, SftpChannelHandle, management::HostManagementService,
     },
     files::FileAccessProvider,
 };
@@ -80,7 +80,7 @@ impl SftpFileProvider {
     }
 
     /// 在连接之前检查已保存主机的 SFTP 开关，配置读取失败不能降级绕过限制。
-    /// 批量请求仍使用入队时冻结的 packet、流水线和请求超时预算。
+    /// 初始化握手响应协作取消；初始化 future 退出后必须确认 lease 已关闭，不能把未知清理状态伪装成取消成功。
     ///
     /// @author kongweiguang
     pub(super) async fn open_session_with_config(
@@ -110,23 +110,7 @@ impl SftpFileProvider {
                 cancellation.clone(),
             )
             .await?;
-        let channel = match lease
-            .open_sftp(OpenSftpRequest { lane }, cancellation)
-            .await
-        {
-            Ok(channel) => channel,
-            Err(error) => {
-                let _ = lease.close("SFTP channel open failed").await;
-                return Err(error);
-            }
-        };
-        match SftpSession::new_with_config(channel, config).await {
-            Ok(session) => Ok((session, lease)),
-            Err(error) => {
-                let _ = lease.close("SFTP session initialization failed").await;
-                Err(map_sftp_error(error))
-            }
-        }
+        initialize_sftp_session_on_lease(lease, lane, cancellation, config).await
     }
 
     /// 同一进程内对同一远端路径串行保存，避免两个编辑器互相覆盖；弱引用表不会常驻历史路径。
@@ -169,13 +153,9 @@ impl SftpFileProvider {
             .await
             .map_err(RemoteCommitError::Application)?;
         let session = RawSftpSession::new(channel);
-        let version = match session.init().await {
-            Ok(version) => version,
-            Err(error) => {
-                let _ = session.close_session();
-                return Err(RemoteCommitError::NotCommitted(error));
-            }
-        };
+        let version = initialize_raw_sftp_session(&session, &cancellation)
+            .await
+            .map_err(map_raw_sftp_initialization_error)?;
         if !version.extensions.contains_key(POSIX_RENAME_EXTENSION) {
             let _ = session.close_session();
             return Err(RemoteCommitError::Unsupported);
@@ -216,7 +196,7 @@ impl SftpFileProvider {
         }
     }
 
-    /// 用 SFTP hardlink 做 no-clobber 新建，用 OpenSSH 扩展原子替换；已提交后通道清理失败只告警。
+    /// 用 SFTP hardlink 做 no-clobber 新建，用 OpenSSH 扩展原子替换；INIT 可取消，提交请求发出后等待真实回执。
     ///
     /// @author kongweiguang
     pub(super) async fn commit_staged_file(
@@ -238,9 +218,23 @@ impl SftpFileProvider {
                     )
                     .await
                     .map_err(RemoteCommitError::Application)?;
-                let session = SftpSession::new(channel)
-                    .await
-                    .map_err(RemoteCommitError::NotCommitted)?;
+                let session = match initialize_sftp_client(
+                    channel,
+                    &cancellation,
+                    SftpClientConfig::default(),
+                )
+                .await
+                {
+                    Ok(session) => session,
+                    Err(SftpClientInitializationError::Cancelled) => {
+                        return Err(RemoteCommitError::Application(AppError::cancelled(
+                            "SFTP 文件提交初始化已取消",
+                        )));
+                    }
+                    Err(SftpClientInitializationError::Protocol(error)) => {
+                        return Err(RemoteCommitError::NotCommitted(error));
+                    }
+                };
                 if cancellation.is_cancelled() {
                     let _ = session.close().await;
                     return Err(RemoteCommitError::Application(AppError::cancelled(
@@ -273,6 +267,149 @@ impl SftpFileProvider {
                 self.replace_remote_file(lease, temporary, destination, cancellation)
                     .await
             }
+        }
+    }
+}
+
+/// 在已认证 lease 上建立 SFTP channel 与协议 session；握手取消后先释放 reader，再有界关闭 lease。
+/// 测试通过真实 SFTP client 和挂起 duplex stream 验证 reader 是否随原连接关闭而退出。
+///
+/// @author kongweiguang
+async fn initialize_sftp_session_on_lease(
+    lease: RemoteConnectionLease,
+    lane: ChannelLane,
+    cancellation: CancellationToken,
+    config: SftpClientConfig,
+) -> AppResult<(SftpSession, RemoteConnectionLease)> {
+    let channel = match lease
+        .open_sftp(OpenSftpRequest { lane }, cancellation.clone())
+        .await
+    {
+        Ok(channel) => channel,
+        Err(error) => {
+            if let Err(close_error) =
+                close_sftp_initialization_lease(&lease, "SFTP channel open failed").await
+            {
+                tracing::warn!(
+                    operation_error = ?error.public_code(),
+                    close_error = ?close_error.public_code(),
+                    "SFTP channel open failed and its lease could not be confirmed closed"
+                );
+                return Err(close_error);
+            }
+            return Err(error);
+        }
+    };
+
+    match initialize_sftp_client(channel, &cancellation, config).await {
+        Err(SftpClientInitializationError::Cancelled) => {
+            close_sftp_initialization_lease(&lease, "SFTP session initialization cancelled")
+                .await?;
+            Err(AppError::cancelled("SFTP 文件会话初始化已取消"))
+        }
+        Ok(session) => Ok((session, lease)),
+        Err(SftpClientInitializationError::Protocol(error)) => {
+            if let Err(close_error) =
+                close_sftp_initialization_lease(&lease, "SFTP session initialization failed").await
+            {
+                tracing::warn!(
+                    operation_error = ?sftp_error_kind(&error),
+                    close_error = ?close_error.public_code(),
+                    "SFTP session initialization failed and its lease could not be confirmed closed"
+                );
+                return Err(close_error);
+            }
+            Err(map_sftp_error(error))
+        }
+    }
+}
+
+enum SftpClientInitializationError {
+    Cancelled,
+    Protocol(SftpError),
+}
+
+/// 取消 SFTP client INIT 时丢弃握手 future；其内部 RawSftpSession Drop 会通知 reader 关闭 channel。
+/// 借用中的 lease 可能还服务其它操作，因此该 helper 只拥有本次 channel，不关闭整个连接。
+///
+/// @author kongweiguang
+async fn initialize_sftp_client(
+    channel: SftpChannelHandle,
+    cancellation: &CancellationToken,
+    config: SftpClientConfig,
+) -> Result<SftpSession, SftpClientInitializationError> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(SftpClientInitializationError::Cancelled),
+        result = SftpSession::new_with_config(channel, config) => {
+            result.map_err(SftpClientInitializationError::Protocol)
+        }
+    }
+}
+
+enum RawSftpInitializationError {
+    Cancelled,
+    Protocol(SftpError),
+    ChannelClose {
+        initialization: Option<SftpError>,
+        error: SftpError,
+    },
+}
+
+/// raw INIT 只发生在提交前；取消时显式关闭本次 channel，提交扩展一旦发送则不使用此 helper。
+/// 初始化失败也核对 channel close 回执，避免把失效资源留在共享 lease 上而不报告。
+///
+/// @author kongweiguang
+async fn initialize_raw_sftp_session(
+    session: &RawSftpSession,
+    cancellation: &CancellationToken,
+) -> Result<russh_sftp::protocol::Version, RawSftpInitializationError> {
+    let initialization = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = session.init() => Some(result),
+    };
+    match initialization {
+        None => match session.close_session() {
+            Ok(()) => Err(RawSftpInitializationError::Cancelled),
+            Err(error) => Err(RawSftpInitializationError::ChannelClose {
+                initialization: None,
+                error,
+            }),
+        },
+        Some(Ok(version)) => Ok(version),
+        Some(Err(initialization)) => match session.close_session() {
+            Ok(()) => Err(RawSftpInitializationError::Protocol(initialization)),
+            Err(error) => Err(RawSftpInitializationError::ChannelClose {
+                initialization: Some(initialization),
+                error,
+            }),
+        },
+    }
+}
+
+/// 保留预提交 INIT 失败类别；通道关闭未确认时报告资源问题，且不把它伪装成已提交结果未知。
+///
+/// @author kongweiguang
+fn map_raw_sftp_initialization_error(error: RawSftpInitializationError) -> RemoteCommitError {
+    match error {
+        RawSftpInitializationError::Cancelled => {
+            RemoteCommitError::Application(AppError::cancelled("SFTP 文件提交初始化已取消"))
+        }
+        RawSftpInitializationError::Protocol(error) => RemoteCommitError::NotCommitted(error),
+        RawSftpInitializationError::ChannelClose {
+            initialization,
+            error,
+        } => {
+            tracing::warn!(
+                initialization_error = ?initialization.as_ref().map(sftp_error_kind),
+                close_error = ?sftp_error_kind(&error),
+                "SFTP 初始化后子通道关闭未确认"
+            );
+            RemoteCommitError::Application(AppError::infrastructure_with_source(
+                "SFTP 初始化后子通道关闭未确认",
+                error,
+            ))
         }
     }
 }
@@ -314,43 +451,10 @@ impl FileAccessProvider for SftpFileProvider {
                 .read_dir(path.as_str())
                 .await
                 .map_err(map_sftp_error)?;
-            let mut output = Vec::new();
-            for entry in entries {
-                let name = entry.file_name();
-                let child = path
-                    .join_name(&name)
-                    .map_err(|_| AppError::infrastructure("SFTP 目录项名称无效"))?;
-                let metadata = entry.metadata();
-                let kind = sftp_entry_kind(metadata.file_type());
-                let raw = sftp_attribute_line(&name, kind, &metadata);
-                let is_hidden = name.starts_with('.');
-                output.push(FileEntry {
-                    endpoint: FileEndpoint::Remote {
-                        host_id: host_id.clone(),
-                        path: child,
-                    },
-                    name,
-                    kind,
-                    size: metadata.size,
-                    modified: metadata
-                        .mtime
-                        .map(|seconds| (u64::from(seconds) * 1_000_000_000).to_string()),
-                    permissions: metadata.permissions.map(|mode| mode & 0o7777),
-                    is_hidden,
-                    raw: Some(raw),
-                });
-            }
-            output.sort_by(|left, right| {
-                let left_directory = left.kind == FileEntryKind::Directory;
-                let right_directory = right.kind == FileEntryKind::Directory;
-                right_directory
-                    .cmp(&left_directory)
-                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            });
-            Ok(DirectoryListing {
-                directory: endpoint.clone(),
-                entries: output,
-            })
+            project_sftp_directory(
+                endpoint.clone(),
+                entries.map(|entry| (entry.file_name(), entry.metadata())),
+            )
         })
         .await;
         finish_session(session, lease, result).await
@@ -740,6 +844,61 @@ fn remote_endpoint(
     }
 }
 
+/// SFTP 只将斜杠当分隔符；不支持的控制字符明确报错，不输出控制原文或静默漏掉目录项。
+///
+/// @author kongweiguang
+pub(super) fn directory_child_path(path: &RemotePath, name: &str) -> AppResult<RemotePath> {
+    path.join_posix_name(name).map_err(|error| match error {
+        kerminal_domain::files::FilePathError::ControlCharacter => {
+            AppError::unsupported("目录含当前不支持的控制字符名称，请通过其他工具重命名后刷新")
+        }
+        _ => AppError::infrastructure("SFTP 目录项名称无效"),
+    })
+}
+
+/// 完整投影服务端清单后才发布，名称身份与属性一并保留，冲突预检不会收到静默缺项的成功结果。
+///
+/// @author kongweiguang
+fn project_sftp_directory(
+    endpoint: FileEndpoint,
+    entries: impl Iterator<Item = (String, FileAttributes)>,
+) -> AppResult<DirectoryListing> {
+    let (host_id, path) = remote_endpoint(&endpoint)?;
+    let mut output = Vec::new();
+    for (name, metadata) in entries {
+        let child = directory_child_path(path, &name)?;
+        let kind = sftp_entry_kind(metadata.file_type());
+        let raw = sftp_attribute_line(&name, kind, &metadata);
+        let is_hidden = name.starts_with('.');
+        output.push(FileEntry {
+            endpoint: FileEndpoint::Remote {
+                host_id: host_id.clone(),
+                path: child,
+            },
+            name,
+            kind,
+            size: metadata.size,
+            modified: metadata
+                .mtime
+                .map(|seconds| (u64::from(seconds) * 1_000_000_000).to_string()),
+            permissions: metadata.permissions.map(|mode| mode & 0o7777),
+            is_hidden,
+            raw: Some(raw),
+        });
+    }
+    output.sort_by(|left, right| {
+        let left_directory = left.kind == FileEntryKind::Directory;
+        let right_directory = right.kind == FileEntryKind::Directory;
+        right_directory
+            .cmp(&left_directory)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(DirectoryListing {
+        directory: endpoint,
+        entries: output,
+    })
+}
+
 /// 映射 SFTP 文件类型并保留 symlink 标记，避免递归文件操作无意跟随链接。
 fn sftp_entry_kind(file_type: FileType) -> FileEntryKind {
     match file_type {
@@ -862,12 +1021,13 @@ async fn read_file_bounded(
     .await
 }
 
-/// 为新远端版本生成同目录唯一暂存路径，根路径或无父目录语义时显式拒绝写入。
+/// 暂存使用固定长度随机名称，保留同目录原子提交且不让合法长 basename 撑破组件上限。
+/// 根路径或无父目录语义时显式拒绝写入。
 ///
 /// @author kongweiguang
 fn temporary_remote_sibling(path: &RemotePath) -> AppResult<RemotePath> {
-    let basename = path.as_str().rsplit('/').next().unwrap_or("file");
-    let suffix = format!(".{basename}.kerminal-edit-{}.partial", Uuid::new_v4());
+    // 暂存身份只需随机唯一；不追加用户 basename，避免合法长名称超过服务端组件长度。
+    let suffix = format!(".kerminal-edit-{}.partial", Uuid::new_v4());
     path.parent()
         .and_then(|parent| parent.join_name(&suffix).ok())
         .ok_or_else(|| AppError::invalid("远端文件路径无法创建同目录暂存文件"))
@@ -908,7 +1068,31 @@ async fn cleanup_remote_temporary(session: &SftpSession, path: &str) {
     }
 }
 
-/// 把已实现的 SFTP 状态码映射为安全错误类型，其余 transport 错误保留 source 供诊断。
+/// 初始化阶段没有文件写入结果；关闭失败或超时必须作为资源故障返回，不能只记录后伪报取消。
+/// 同一绝对 deadline 同时限制 lease owner 的清理和本地等待，避免取消路径无限悬挂。
+///
+/// @author kongweiguang
+async fn close_sftp_initialization_lease(
+    lease: &RemoteConnectionLease,
+    reason: &str,
+) -> AppResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    match timeout_at(deadline, lease.close_until(deadline, reason)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(AppError::infrastructure_with_source(
+            "SFTP 初始化后连接关闭未确认",
+            error,
+        )),
+        Err(error) => Err(AppError::infrastructure_with_source(
+            "SFTP 初始化后连接关闭未确认",
+            error,
+        )),
+    }
+}
+
+/// 区分服务端拒绝、超时与配额限制，避免把句柄耗尽只呈现为连接失败；原始协议消息仅保留在 source。
+///
+/// @author kongweiguang
 pub(super) fn map_sftp_error(error: SftpError) -> AppError {
     match &error {
         SftpError::Status(status) if status.status_code == StatusCode::NoSuchFile => {
@@ -918,6 +1102,9 @@ pub(super) fn map_sftp_error(error: SftpError) -> AppError {
             AppError::conflict("远端文件权限不足")
         }
         SftpError::Timeout => AppError::timeout("SFTP 请求"),
+        SftpError::Limited(_) => {
+            AppError::infrastructure_with_source("SFTP 资源配额不足或请求超过限制", error)
+        }
         _ => AppError::infrastructure_with_source("SFTP 文件操作失败", error),
     }
 }
@@ -1028,3 +1215,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[path = "../../tests/files/sftp_preview.rs"]
 mod preview_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/sftp_directory_names.rs"]
+mod directory_name_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/sftp_initialization_cancellation.rs"]
+mod initialization_cancellation_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/sftp_error_mapping.rs"]
+mod error_mapping_tests;

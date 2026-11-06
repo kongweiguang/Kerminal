@@ -6,13 +6,16 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use kerminal_application::files::{
     FileService,
-    drag_out::{DragOutSource, prepare_drag_out},
+    drag_out::{DragOutSource, prepare_drag_out, prepare_drag_out_observed_for_origin},
 };
 use kerminal_application::transfers::{
     TransferBackend, TransferExecutionContext, TransferExecutionError, TransferExecutionResult,
-    TransferQueueOptions, TransferService,
+    TransferOrigin, TransferQueueOptions, TransferService,
 };
-use kerminal_domain::files::{FileEndpoint, TransferKind, TransferStatus};
+use kerminal_domain::{
+    files::{FileEndpoint, TransferKind, TransferStatus},
+    identity::PaneId,
+};
 use kerminal_infrastructure::files::{JsonFileBookmarkRepository, LocalFileProvider};
 use tokio_util::sync::CancellationToken;
 
@@ -125,6 +128,98 @@ async fn staging_multiple_entries_keeps_empty_directories_until_owner_is_dropped
     })
     .await
     .expect("temporary staging is removed after its last owner");
+    transfers.shutdown().await.expect("queue shutdown");
+}
+
+/// 整次多选拖出及未知结果证据都绑定发起面板；旧入口仍不归入任意面板。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn staging_keeps_original_origin_for_multiple_entries_and_recovery() {
+    let fixture = tempfile::tempdir().expect("isolated sources");
+    let first = fixture.path().join("first.txt");
+    let second = fixture.path().join("second.txt");
+    tokio::fs::write(&first, b"first")
+        .await
+        .expect("first source");
+    tokio::fs::write(&second, b"second")
+        .await
+        .expect("second source");
+    let source = |path: PathBuf, name: &str| DragOutSource {
+        endpoint: FileEndpoint::Local { path },
+        name: name.into(),
+        kind: TransferKind::File,
+        external_target_lease: None,
+    };
+    let (transfers, _, _) = local_transfer_service();
+    let original = TransferOrigin::TerminalPane(PaneId::new());
+    let other = TransferOrigin::TerminalPane(PaneId::new());
+    let prepared = prepare_drag_out_observed_for_origin(
+        file_service(fixture.path().to_path_buf()),
+        transfers.clone(),
+        CancellationToken::new(),
+        vec![
+            source(first.clone(), "first.txt"),
+            source(second, "second.txt"),
+        ],
+        original.clone(),
+        |_| {},
+    )
+    .await
+    .expect("scoped staging succeeds");
+    let legacy = prepare_drag_out(
+        file_service(fixture.path().to_path_buf()),
+        transfers.clone(),
+        CancellationToken::new(),
+        vec![source(first, "first.txt")],
+    )
+    .await
+    .expect("legacy staging succeeds");
+
+    let scoped = transfers.list_for_origin(&original).await;
+    assert_eq!(scoped.len(), 2);
+    assert!(transfers.list_for_origin(&other).await.is_empty());
+    assert_eq!(transfers.list().await.len(), 3);
+    assert_eq!(
+        transfers
+            .clear_completed_for_origin(&original, CancellationToken::new())
+            .await
+            .expect("active drag retains its evidence"),
+        (0, 2)
+    );
+
+    prepared.session.retain_unknown().await;
+    let recovery = transfers
+        .list_recovery_for_origin(&original, CancellationToken::new())
+        .await
+        .expect("scoped recovery");
+    assert_eq!(recovery.len(), 2);
+    assert!(recovery.iter().all(|record| {
+        record.origin.as_ref() == Some(&original)
+            && record.drag_staging
+            && scoped.iter().any(|summary| summary.id == record.id)
+    }));
+    assert!(
+        transfers
+            .list_recovery_for_origin(&other, CancellationToken::new())
+            .await
+            .expect("other recovery")
+            .is_empty()
+    );
+    let retained = prepared.session.directory();
+    assert!(prepared.session.cleanup().await.is_err());
+    assert!(retained.join("first.txt").exists());
+    assert!(retained.join("second.txt").exists());
+    legacy
+        .session
+        .cleanup()
+        .await
+        .expect("release legacy staging");
+    drop(legacy);
+    drop(prepared);
+    tokio::fs::remove_dir_all(retained)
+        .await
+        .expect("remove this test's retained staging");
     transfers.shutdown().await.expect("queue shutdown");
 }
 

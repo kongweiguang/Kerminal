@@ -21,7 +21,9 @@ async fn event_wakes_subscription() {
         sender.send(event).expect("receiver exists");
 
         assert_eq!(
-            subscription::receive_transfer_wakeup(&mut receiver, &CancellationToken::new()).await,
+            subscription::receive_transfer_event(&mut receiver, &CancellationToken::new())
+                .await
+                .map(|_| ()),
             Some(()),
         );
     }
@@ -39,7 +41,9 @@ async fn lagged_receiver_is_prompted_to_reload_snapshot() {
         .expect("receiver exists");
 
     assert_eq!(
-        subscription::receive_transfer_wakeup(&mut receiver, &CancellationToken::new()).await,
+        subscription::receive_transfer_event(&mut receiver, &CancellationToken::new())
+            .await
+            .map(|_| ()),
         Some(()),
     );
 }
@@ -78,7 +82,9 @@ async fn closed_sender_ends_subscription() {
     drop(sender);
 
     assert_eq!(
-        subscription::receive_transfer_wakeup(&mut receiver, &CancellationToken::new()).await,
+        subscription::receive_transfer_event(&mut receiver, &CancellationToken::new())
+            .await
+            .map(|_| ()),
         None,
     );
 }
@@ -94,7 +100,9 @@ async fn cancellation_wins_over_queued_event() {
     cancellation.cancel();
 
     assert_eq!(
-        subscription::receive_transfer_wakeup(&mut receiver, &cancellation).await,
+        subscription::receive_transfer_event(&mut receiver, &cancellation)
+            .await
+            .map(|_| ()),
         None,
     );
 }
@@ -106,7 +114,9 @@ async fn cancellation_interrupts_idle_subscription() {
     let cancellation = CancellationToken::new();
     let waiter_cancellation = cancellation.clone();
     let waiter = tokio::spawn(async move {
-        subscription::receive_transfer_wakeup(&mut receiver, &waiter_cancellation).await
+        subscription::receive_transfer_event(&mut receiver, &waiter_cancellation)
+            .await
+            .map(|_| ())
     });
     tokio::task::yield_now().await;
     cancellation.cancel();

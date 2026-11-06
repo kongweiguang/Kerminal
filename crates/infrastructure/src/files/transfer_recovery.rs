@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult,
     transfers::{
-        MAX_TRANSFER_ARCHIVE_PAGE_SIZE, TransferCheckpoint, TransferRecoveryInspection,
-        TransferRecoveryPage, TransferRecoveryRecord, TransferRecoveryRepository,
-        TransferStagingOwnership,
+        MAX_TRANSFER_ARCHIVE_PAGE_SIZE, TransferCheckpoint, TransferOrigin,
+        TransferRecoveryInspection, TransferRecoveryPage, TransferRecoveryRecord,
+        TransferRecoveryRepository, TransferStagingOwnership,
     },
 };
 use kerminal_domain::{
@@ -24,7 +24,7 @@ use kerminal_domain::{
         ConflictPolicy, ContainerRuntime, FileEndpoint, FileRevision, RemotePath, TransferKind,
         TransferRequest,
     },
-    identity::{HostId, TransferId},
+    identity::{HostId, PaneId, TabId, TransferId},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,6 +55,8 @@ struct RecoveryDocument {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredRecord {
     id: TransferId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<StoredOrigin>,
     #[serde(default, skip_serializing_if = "is_false")]
     drag_staging: bool,
     source: StoredEndpoint,
@@ -69,6 +71,21 @@ struct StoredRecord {
     commit_unknown: bool,
     inspection: String,
     archived: bool,
+}
+
+/// 持久化来源独立于应用模型，旧文档缺少该字段时保持未分配。
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum StoredOrigin {
+    TerminalPane { pane_id: PaneId },
+    SftpWorkspace { tab_id: TabId },
+    WorkspaceFile { tab_id: TabId },
+    SharedWorkbench,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -510,7 +527,7 @@ fn decode_records(source: &str) -> AppResult<Vec<TransferRecoveryRecord>> {
         return Err(corrupt());
     }
     let document: RecoveryDocument = serde_json::from_str(source).map_err(|_| corrupt())?;
-    if !matches!(document.schema_version, 1 | 2) || document.records.len() > MAX_RECORDS {
+    if !matches!(document.schema_version, 1..=3) || document.records.len() > MAX_RECORDS {
         return Err(corrupt());
     }
     let version = document.schema_version;
@@ -519,7 +536,7 @@ fn decode_records(source: &str) -> AppResult<Vec<TransferRecoveryRecord>> {
         .records
         .into_iter()
         .map(|stored| {
-            if version == 1 && stored.drag_staging {
+            if (version == 1 && stored.drag_staging) || (version < 3 && stored.origin.is_some()) {
                 return Err(corrupt());
             }
             if !identities.insert(stored.id.clone()) {
@@ -557,6 +574,7 @@ fn write_records(
 }
 
 /// active 可原子替换，冷档只能排他新建；两者复用同一耐久提交及未知回执分类。
+/// 未知结果保留原始系统原因，同时保持公开文案和暂存证据不变。
 /// @author kongweiguang
 fn write_document(
     path: &Path,
@@ -571,7 +589,9 @@ fn write_document(
         validate_record(record)?;
     }
     let document = RecoveryDocument {
-        schema_version: if records.iter().any(|record| record.drag_staging) {
+        schema_version: if records.iter().any(|record| record.origin.is_some()) {
+            3
+        } else if records.iter().any(|record| record.drag_staging) {
             2
         } else {
             1
@@ -629,8 +649,9 @@ fn write_document(
     };
     match commit_staged_file(&temporary, path, mode) {
         Ok(()) => Ok(()),
-        Err(AtomicCommitError::CommitUnknown(_)) => Err(AppError::outcome_unknown(
+        Err(AtomicCommitError::CommitUnknown(error)) => Err(AppError::outcome_unknown_with_source(
             "恢复材料提交结果未知，请重新读取确认",
+            error,
         )),
         Err(error) => {
             let _ = fs::remove_file(&temporary);
@@ -643,6 +664,7 @@ fn write_document(
 }
 
 /// 恢复事实只允许原请求范围内的实际目标；继任任务可保留旧 owner，但必须匹配原暂存命名和 token。
+/// 流式传输的部分断点可尚无完整摘要，已确认前缀仍须有效；已有完整摘要不能接受畸形值。
 /// @author kongweiguang
 fn validate_record(record: &TransferRecoveryRecord) -> AppResult<()> {
     if record.drag_staging && !matches!(&record.request.destination, FileEndpoint::Local { .. }) {
@@ -695,7 +717,7 @@ fn validate_record(record: &TransferRecoveryRecord) -> AppResult<()> {
                 .source_revision
                 .content_digest
                 .as_deref()
-                .is_none_or(|digest| {
+                .is_some_and(|digest| {
                     digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
                 })
             || !valid_staging_token(&checkpoint.staging_token)
@@ -824,6 +846,7 @@ impl StoredRecord {
     fn from_record(record: &TransferRecoveryRecord) -> Self {
         Self {
             id: record.id.clone(),
+            origin: record.origin.as_ref().map(StoredOrigin::from_origin),
             drag_staging: record.drag_staging,
             source: StoredEndpoint::from_endpoint(&record.request.source),
             destination: StoredEndpoint::from_endpoint(&record.request.destination),
@@ -869,6 +892,7 @@ impl StoredRecord {
     fn into_record(self) -> AppResult<TransferRecoveryRecord> {
         Ok(TransferRecoveryRecord {
             id: self.id,
+            origin: self.origin.map(StoredOrigin::into_origin),
             drag_staging: self.drag_staging,
             request: TransferRequest {
                 source: self.source.into_endpoint()?,
@@ -910,6 +934,38 @@ impl StoredRecord {
             },
             archived: self.archived,
         })
+    }
+}
+
+impl StoredOrigin {
+    /// 显式映射来源，避免让应用枚举的内部表示隐式成为持久化契约。
+    ///
+    /// @author kongweiguang
+    fn from_origin(origin: &TransferOrigin) -> Self {
+        match origin {
+            TransferOrigin::TerminalPane(pane_id) => Self::TerminalPane {
+                pane_id: pane_id.clone(),
+            },
+            TransferOrigin::SftpWorkspace(tab_id) => Self::SftpWorkspace {
+                tab_id: tab_id.clone(),
+            },
+            TransferOrigin::WorkspaceFile(tab_id) => Self::WorkspaceFile {
+                tab_id: tab_id.clone(),
+            },
+            TransferOrigin::SharedWorkbench => Self::SharedWorkbench,
+        }
+    }
+
+    /// 严格反序列化稳定身份，禁止按端点或主机猜测来源。
+    ///
+    /// @author kongweiguang
+    fn into_origin(self) -> TransferOrigin {
+        match self {
+            Self::TerminalPane { pane_id } => TransferOrigin::TerminalPane(pane_id),
+            Self::SftpWorkspace { tab_id } => TransferOrigin::SftpWorkspace(tab_id),
+            Self::WorkspaceFile { tab_id } => TransferOrigin::WorkspaceFile(tab_id),
+            Self::SharedWorkbench => TransferOrigin::SharedWorkbench,
+        }
     }
 }
 

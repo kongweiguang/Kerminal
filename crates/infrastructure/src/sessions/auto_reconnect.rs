@@ -7,9 +7,10 @@ use std::time::Duration;
 use kerminal_application::AppError;
 use kerminal_domain::sessions::{SessionExitStatus, SessionOwner, SessionTarget};
 
-const MAX_ATTEMPTS: u8 = 5;
+// 网络闪断常来自坞站/显示器切换或 VPN 抖动；退避预算覆盖约两分钟，仍在有限次数内收敛。
+const MAX_ATTEMPTS: u8 = 8;
 const INITIAL_DELAY: Duration = Duration::from_secs(1);
-const MAX_DELAY: Duration = Duration::from_secs(10);
+const MAX_DELAY: Duration = Duration::from_secs(30);
 
 /// 供 Manager 在每次断线时重新评估的纯策略；尝试计数与任务生命周期仍由唯一会话 owner 持有。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,7 +115,18 @@ impl AutoReconnectPolicy {
         if context.exit_status.is_some() {
             return AutoReconnectDecision::Suppressed(AutoReconnectSuppression::HasExitStatus);
         }
-        if !context.failure.is_retryable_remote_disconnect() {
+        // 已进入重试循环后，旧 transport 的收尾超时或重连时的建连失败（如 sshd 重启后的
+        // connection refused）仍指向同一次断线，允许继续按退避重试；首次失败的普通超时
+        // 与连接错误仍不触发自动重连。认证、host key 和冲突错误不会进入此分支。
+        let transport_failure_inside_retry_cycle = context.attempts_started > 0
+            && matches!(
+                context.failure.public_code(),
+                kerminal_application::PublicErrorCode::Timeout
+                    | kerminal_application::PublicErrorCode::Infrastructure
+            );
+        if !context.failure.is_retryable_remote_disconnect()
+            && !transport_failure_inside_retry_cycle
+        {
             return AutoReconnectDecision::Suppressed(
                 AutoReconnectSuppression::NotRetryableDisconnect,
             );

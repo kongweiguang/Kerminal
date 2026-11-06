@@ -22,8 +22,10 @@ use kerminal_domain::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AppError, AppResult, files::FileService, platform::external_launch::ExternalTargetLease,
-    transfers::TransferService,
+    AppError, AppResult,
+    files::FileService,
+    platform::external_launch::ExternalTargetLease,
+    transfers::{TransferOrigin, TransferService},
 };
 
 /// 暂存 owner 负责限制路径和清理；不能确认传输停止时必须保留整个目录。
@@ -174,7 +176,7 @@ pub async fn prepare_drag_out(
     result
 }
 
-/// 在创建任务前发布暂存 owner，使未知提交也能回报原目录。
+/// 保留无来源观察入口，已有调用方仍能取得同样的暂存生命周期。
 ///
 /// @author kongweiguang
 pub async fn prepare_drag_out_observed(
@@ -182,6 +184,42 @@ pub async fn prepare_drag_out_observed(
     transfers: TransferService,
     cancellation: CancellationToken,
     sources: Vec<DragOutSource>,
+    on_staging: impl FnOnce(Arc<DragOutSession>) + Send,
+) -> AppResult<PreparedDragOut> {
+    prepare_drag_out_observed_inner(files, transfers, cancellation, sources, None, on_staging).await
+}
+
+/// 工作区来源在系统稍后请求数据之前确定，整批暂存和恢复记录沿用同一身份。
+///
+/// @author kongweiguang
+pub async fn prepare_drag_out_observed_for_origin(
+    files: FileService,
+    transfers: TransferService,
+    cancellation: CancellationToken,
+    sources: Vec<DragOutSource>,
+    origin: TransferOrigin,
+    on_staging: impl FnOnce(Arc<DragOutSession>) + Send,
+) -> AppResult<PreparedDragOut> {
+    prepare_drag_out_observed_inner(
+        files,
+        transfers,
+        cancellation,
+        sources,
+        Some(origin),
+        on_staging,
+    )
+    .await
+}
+
+/// 创建任务前发布暂存 owner；兼容入口和工作区入口共用失败、取消与清理语义。
+///
+/// @author kongweiguang
+async fn prepare_drag_out_observed_inner(
+    files: FileService,
+    transfers: TransferService,
+    cancellation: CancellationToken,
+    sources: Vec<DragOutSource>,
+    origin: Option<TransferOrigin>,
     on_staging: impl FnOnce(Arc<DragOutSession>) + Send,
 ) -> AppResult<PreparedDragOut> {
     if sources.is_empty() {
@@ -220,9 +258,22 @@ pub async fn prepare_drag_out_observed(
             idle_timeout_seconds: None,
         };
         let mut subscription = transfers.subscribe();
-        let summary = transfers
-            .enqueue_drag_staging(request, source.external_target_lease.as_ref())
-            .await?;
+        let summary = match &origin {
+            Some(origin) => {
+                transfers
+                    .enqueue_drag_staging_for_origin(
+                        request,
+                        origin.clone(),
+                        source.external_target_lease.as_ref(),
+                    )
+                    .await?
+            }
+            None => {
+                transfers
+                    .enqueue_drag_staging(request, source.external_target_lease.as_ref())
+                    .await?
+            }
+        };
         let result = loop {
             if cancellation.is_cancelled() {
                 break None;

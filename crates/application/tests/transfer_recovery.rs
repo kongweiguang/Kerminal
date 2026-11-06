@@ -8,7 +8,7 @@ use kerminal_application::{
     preferences::SftpPerformanceSettings,
     transfers::{
         InMemoryTransferRecoveryRepository, SftpTransferPolicyStore, TransferBackend,
-        TransferExecutionContext, TransferExecutionError, TransferExecutionResult,
+        TransferExecutionContext, TransferExecutionError, TransferExecutionResult, TransferOrigin,
         TransferQueueOptions, TransferRecoveryInspection, TransferRecoveryPage,
         TransferRecoveryRecord, TransferRecoveryRepository, TransferService,
         TransferStagingOwnership,
@@ -16,7 +16,7 @@ use kerminal_application::{
 };
 use kerminal_domain::{
     files::{ConflictPolicy, FileEndpoint, TransferKind, TransferRequest, TransferStatus},
-    identity::TransferId,
+    identity::{PaneId, TabId, TransferId},
 };
 use std::sync::{
     Arc,
@@ -178,6 +178,7 @@ impl TransferRecoveryRepository for FailingRepository {
 fn recovery_record() -> TransferRecoveryRecord {
     TransferRecoveryRecord {
         id: TransferId::new(),
+        origin: None,
         drag_staging: false,
         request: TransferRequest {
             source: FileEndpoint::Local {
@@ -216,6 +217,65 @@ fn service(
         None,
     )
     .expect("fixture queue")
+}
+
+/// 重启后的来源只认持久化身份；相同端点及旧的无来源记录不能泄露到其他面板。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn orphan_recovery_records_are_visible_only_to_their_exact_origin() {
+    let repository = Arc::new(InMemoryTransferRecoveryRepository::default());
+    let origins = [
+        TransferOrigin::TerminalPane(PaneId::new()),
+        TransferOrigin::TerminalPane(PaneId::new()),
+        TransferOrigin::SftpWorkspace(TabId::new()),
+        TransferOrigin::SftpWorkspace(TabId::new()),
+    ];
+    let mut records = Vec::new();
+    for origin in &origins {
+        let mut item = recovery_record();
+        item.origin = Some(origin.clone());
+        repository
+            .upsert(item.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        records.push(item);
+    }
+    let unassigned = recovery_record();
+    repository
+        .upsert(unassigned.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+    let queue = service(repository, Arc::new(AtomicUsize::new(0)));
+    assert_eq!(
+        queue
+            .list_recovery(CancellationToken::new())
+            .await
+            .unwrap()
+            .len(),
+        5
+    );
+    for (index, origin) in origins.iter().enumerate() {
+        assert_eq!(
+            queue
+                .list_recovery_for_origin(origin, CancellationToken::new())
+                .await
+                .unwrap(),
+            vec![records[index].clone()]
+        );
+        assert!(
+            queue
+                .ensure_origin(&unassigned.id, origin, CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            queue
+                .ensure_origin(&records[index].id, origin, CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
 }
 
 /// 重启和冷归档历史均不创建 worker；归档后核对入口必须拒绝，且保留此前的证据结论。

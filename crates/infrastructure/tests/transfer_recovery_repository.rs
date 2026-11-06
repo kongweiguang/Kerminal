@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use kerminal_application::connections::{HostKeyIdentity, HostKeyStatus, KnownHostsRepository};
 use kerminal_application::transfers::{
-    TransferCheckpoint, TransferRecoveryInspection, TransferRecoveryRecord,
+    TransferCheckpoint, TransferOrigin, TransferRecoveryInspection, TransferRecoveryRecord,
     TransferRecoveryRepository, TransferStagingOwnership,
 };
 use kerminal_domain::{
     connections::HostEndpoint,
     files::{ConflictPolicy, FileEndpoint, FileRevision, TransferKind, TransferRequest},
-    identity::TransferId,
+    identity::{PaneId, TabId, TransferId},
 };
 use kerminal_infrastructure::connections::KnownHostsStore;
 use kerminal_infrastructure::files::{
@@ -41,6 +41,7 @@ fn record(root: &std::path::Path) -> TransferRecoveryRecord {
     };
     TransferRecoveryRecord {
         id: TransferId::new(),
+        origin: None,
         drag_staging: false,
         request: TransferRequest {
             source: FileEndpoint::Local {
@@ -124,6 +125,53 @@ async fn recovery_round_trip_preserves_exact_target_and_ownership() {
     }
 }
 
+/// 复制中的断点无需预读完整源；重开仓储仍保留前缀证据，畸形的可选完整摘要继续拒绝。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn streaming_checkpoint_without_full_digest_round_trips() {
+    let temporary = tempfile::tempdir().expect("isolated fixture");
+    let mut expected = record(temporary.path());
+    expected.commit_unknown = false;
+    let checkpoint = expected.checkpoint.as_mut().expect("checkpoint");
+    checkpoint.confirmed_bytes = 4;
+    checkpoint.source_revision.content_digest = None;
+    let repository = JsonTransferRecoveryRepository::new(temporary.path());
+    repository
+        .upsert(expected.clone(), CancellationToken::new())
+        .await
+        .expect("save streaming checkpoint");
+    let reopened = JsonTransferRecoveryRepository::new(temporary.path());
+    assert_eq!(
+        reopened
+            .list(CancellationToken::new())
+            .await
+            .expect("read streaming checkpoint"),
+        vec![expected.clone()]
+    );
+
+    let mut malformed = expected.clone();
+    malformed
+        .checkpoint
+        .as_mut()
+        .expect("checkpoint")
+        .source_revision
+        .content_digest = Some("invalid".to_owned());
+    assert!(
+        reopened
+            .upsert(malformed, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        reopened
+            .list(CancellationToken::new())
+            .await
+            .expect("preserve valid checkpoint"),
+        vec![expected]
+    );
+}
+
 /// 拖出暂存的恢复用途必须跨重启保留，普通记录仍写旧版本供旧版本读取。
 ///
 /// @author kongweiguang
@@ -164,6 +212,51 @@ async fn drag_staging_purpose_is_durable_and_uses_versioned_format() {
         .expect("remaining document");
     let after: serde_json::Value = serde_json::from_str(&after).expect("remaining JSON");
     assert_eq!(after["schemaVersion"], 1);
+}
+
+/// 来源与拖出标记共享版本 3，重开后身份精确一致，旧版本不能伪装携带新字段。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn scoped_origins_round_trip_and_reject_downgraded_documents() {
+    let temporary = tempfile::tempdir().expect("isolated fixture");
+    let repository = JsonTransferRecoveryRepository::new(temporary.path());
+    let origins = [
+        TransferOrigin::TerminalPane(PaneId::new()),
+        TransferOrigin::SftpWorkspace(TabId::new()),
+        TransferOrigin::WorkspaceFile(TabId::new()),
+        TransferOrigin::SharedWorkbench,
+    ];
+    let mut expected = Vec::new();
+    for origin in origins {
+        let mut item = record(temporary.path());
+        item.origin = Some(origin);
+        item.drag_staging = true;
+        repository
+            .upsert(item.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        expected.push(item);
+    }
+    let path = temporary.path().join("data/transfer-recovery.json");
+    let source = tokio::fs::read_to_string(path).await.unwrap();
+    let document: serde_json::Value = serde_json::from_str(&source).unwrap();
+    assert_eq!(document["schemaVersion"], 3);
+    validate_transfer_recovery_document(&source).unwrap();
+    let reopened = JsonTransferRecoveryRepository::new(temporary.path());
+    let actual = reopened.list(CancellationToken::new()).await.unwrap();
+    assert_eq!(actual.len(), expected.len());
+    for item in expected {
+        assert!(actual.contains(&item));
+    }
+    for version in [1, 2] {
+        let mut downgraded = document.clone();
+        downgraded["schemaVersion"] = version.into();
+        for item in downgraded["records"].as_array_mut().unwrap() {
+            item["dragStaging"] = false.into();
+        }
+        assert!(validate_transfer_recovery_document(&downgraded.to_string()).is_err());
+    }
 }
 
 /// 损坏或未来文档不能用空默认值覆盖，保存失败后逐字保留旧材料。

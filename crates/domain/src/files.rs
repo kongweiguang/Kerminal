@@ -118,12 +118,22 @@ impl RemotePath {
         Self::parse(&path[..separator]).ok()
     }
 
-    /// 将单个目录项名称追加到路径，拒绝带路径分隔符的名称以防跨目录写入。
+    /// 跨平台名称入口保持拒绝两种分隔符；SFTP 原始目录项使用明确的 POSIX 入口。
     pub fn join_name(&self, name: &str) -> Result<Self, FilePathError> {
+        if name.contains('\\') {
+            return Err(FilePathError::InvalidName);
+        }
+        self.join_posix_name(name)
+    }
+
+    /// POSIX 仅将斜杠视作分隔符，保留合法反斜杠；该结果不能直接作为本机文件名。
+    ///
+    /// @author kongweiguang
+    pub fn join_posix_name(&self, name: &str) -> Result<Self, FilePathError> {
         if name.is_empty() {
             return Err(FilePathError::Empty);
         }
-        if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        if name == "." || name == ".." || name.contains('/') {
             return Err(FilePathError::InvalidName);
         }
         if name.chars().any(char::is_control) {
@@ -176,6 +186,49 @@ impl FileEndpoint {
         })
     }
 
+    /// 按目标文件系统校验单层名称，避免把远端反斜杠或 Windows 数据流解释为本机路径。
+    /// 容器仍沿用严格名称契约，不改变其用户输入路径的规范化规则。
+    ///
+    /// @author kongweiguang
+    pub fn join_name(&self, name: &str) -> Result<Self, FilePathError> {
+        match self {
+            Self::Local { path } => {
+                if name.is_empty() {
+                    return Err(FilePathError::Empty);
+                }
+                if name.chars().any(char::is_control) {
+                    return Err(FilePathError::ControlCharacter);
+                }
+                let mut components = std::path::Path::new(name).components();
+                if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+                    || components.next().is_some()
+                    || name.contains('/')
+                    || (cfg!(windows) && !windows_file_name_is_safe(name))
+                {
+                    return Err(FilePathError::InvalidName);
+                }
+                Ok(Self::Local {
+                    path: path.join(name),
+                })
+            }
+            Self::Remote { host_id, path } => Ok(Self::Remote {
+                host_id: host_id.clone(),
+                path: path.join_posix_name(name)?,
+            }),
+            Self::Container {
+                host_id,
+                runtime,
+                container_id,
+                path,
+            } => Ok(Self::Container {
+                host_id: host_id.clone(),
+                runtime: *runtime,
+                container_id: container_id.clone(),
+                path: path.join_name(name)?,
+            }),
+        }
+    }
+
     /// 返回远端路径文本，本机端点由 PathBuf 单独处理。
     pub fn remote_path(&self) -> Option<&RemotePath> {
         match self {
@@ -222,6 +275,37 @@ impl FileEndpoint {
             _ => false,
         }
     }
+}
+
+/// Windows 会规范化尾点、尾空格并解释设备名和数据流，必须在 join 前拒绝这些别名。
+///
+/// @author kongweiguang
+fn windows_file_name_is_safe(name: &str) -> bool {
+    if name.ends_with([' ', '.'])
+        || name
+            .chars()
+            .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_uppercase();
+    !matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) && !stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
 }
 
 /// 目录条目类型保留符号链接身份，递归删除和传输不得默默跟随链接。
@@ -403,6 +487,8 @@ pub struct TransferTask {
     total_bytes: Option<u64>,
     retryable: bool,
     resumable: bool,
+    /// 仅续传重新排队持有可信断点；首次入队不能凭零进度获得续传资格。
+    queued_from_checkpoint: bool,
     failure_kind: Option<TransferFailureKind>,
     safe_error: Option<String>,
     actual_destination: Option<FileEndpoint>,
@@ -468,6 +554,7 @@ impl TransferTask {
             total_bytes: None,
             retryable: false,
             resumable: false,
+            queued_from_checkpoint: false,
             failure_kind: None,
             safe_error: None,
             actual_destination: None,
@@ -477,11 +564,14 @@ impl TransferTask {
         })
     }
 
-    /// Connecting 只允许从队列或一次安全恢复等待进入，保持任务阶段可审计。
+    /// Connecting 只允许从队列或一次安全恢复等待进入，连接后由 worker 确认取消结果。
+    ///
+    /// @author kongweiguang
     pub fn begin_connecting(&mut self) -> Result<(), TransferTransitionError> {
         match self.status {
             TransferStatus::Queued | TransferStatus::WaitingForRecovery => {
                 self.status = TransferStatus::Connecting;
+                self.queued_from_checkpoint = false;
                 self.failure_kind = None;
                 self.safe_error = None;
                 Ok(())
@@ -556,6 +646,40 @@ impl TransferTask {
         }
         self.bytes_transferred = bytes;
         self.total_bytes = total;
+        Ok(())
+    }
+
+    /// 原任务仅能从可信断点重新排队；保留排队阶段的断点身份以支持再次取消。
+    ///
+    /// @author kongweiguang
+    pub fn resume_from_checkpoint(
+        &mut self,
+        bytes: u64,
+        total: Option<u64>,
+    ) -> Result<(), TransferTransitionError> {
+        if !matches!(
+            self.status,
+            TransferStatus::Cancelled | TransferStatus::Failed
+        ) || !self.resumable
+            || self.retry_successor.is_some()
+            || self.commit_protocol.item_in_progress()
+            || self.commit_protocol.is_outcome_unknown()
+            || self.commit_protocol.is_finalized()
+            || !self.commit_protocol.summary().is_empty()
+            || total.is_some_and(|limit| bytes > limit)
+        {
+            return Err(TransferTransitionError::RecoveryNotAllowed);
+        }
+        self.status = TransferStatus::Queued;
+        self.bytes_transferred = bytes;
+        self.total_bytes = total;
+        self.retryable = false;
+        self.resumable = false;
+        self.queued_from_checkpoint = true;
+        self.failure_kind = None;
+        self.safe_error = None;
+        self.automatic_recovery_used = false;
+        self.commit_protocol = TransferCommitProtocol::default();
         Ok(())
     }
 
@@ -776,12 +900,16 @@ impl TransferTask {
         Ok(())
     }
 
-    /// 当前项目提交时只登记取消意图，项间立即取消，避免打断已获许可的原子替换。
+    /// 排队续传保留可信断点资格；提交时只登记取消意图，避免打断原子替换。
+    ///
+    /// @author kongweiguang
     pub fn request_cancel(&mut self) -> bool {
         match self.status {
             TransferStatus::Queued => {
                 self.status = TransferStatus::Cancelled;
-                self.retryable = false;
+                self.retryable = self.queued_from_checkpoint;
+                self.resumable = self.queued_from_checkpoint;
+                self.queued_from_checkpoint = false;
                 true
             }
             TransferStatus::Connecting
@@ -824,6 +952,39 @@ impl TransferTask {
         Ok(())
     }
 
+    /// 取消期间只接纳 worker 最终确认的检查点进度，避免把未完成提交当作可恢复数据。
+    ///
+    /// @author kongweiguang
+    pub fn record_cancellation_checkpoint_progress(
+        &mut self,
+        bytes: u64,
+        total: Option<u64>,
+    ) -> Result<(), TransferTransitionError> {
+        if self.status != TransferStatus::Cancelling
+            || self.commit_protocol.item_in_progress()
+            || self.commit_protocol.is_outcome_unknown()
+        {
+            return Err(TransferTransitionError::InvalidTransition);
+        }
+        if bytes < self.bytes_transferred {
+            return Err(TransferTransitionError::ProgressRegressed);
+        }
+        if self
+            .total_bytes
+            .zip(total)
+            .is_some_and(|(existing, requested)| existing != requested)
+        {
+            return Err(TransferTransitionError::InvalidTransition);
+        }
+        let effective_total = total.or(self.total_bytes);
+        if effective_total.is_some_and(|limit| bytes > limit) {
+            return Err(TransferTransitionError::ProgressExceededTotal);
+        }
+        self.bytes_transferred = bytes;
+        self.total_bytes = effective_total;
+        Ok(())
+    }
+
     /// 仅允许一次带可信断点的 idle 自动恢复，避免循环重连和无休止占用连接槽。
     pub fn begin_automatic_recovery(
         &mut self,
@@ -840,6 +1001,30 @@ impl TransferTask {
         self.status = TransferStatus::WaitingForRecovery;
         self.resumable = true;
         self.automatic_recovery_used = true;
+        Ok(())
+    }
+
+    /// 自动重连只能回退到调用方已校验的断点，保持新一轮进度从实际续传偏移开始。
+    ///
+    /// @author kongweiguang
+    pub fn begin_automatic_recovery_from_checkpoint(
+        &mut self,
+        bytes: u64,
+        total: Option<u64>,
+    ) -> Result<(), TransferTransitionError> {
+        let effective_total = total.or(self.total_bytes);
+        if bytes > self.bytes_transferred
+            || effective_total.is_some_and(|limit| bytes > limit)
+            || self
+                .total_bytes
+                .zip(total)
+                .is_some_and(|(existing, requested)| existing != requested)
+        {
+            return Err(TransferTransitionError::RecoveryNotAllowed);
+        }
+        self.begin_automatic_recovery(true)?;
+        self.bytes_transferred = bytes;
+        self.total_bytes = effective_total;
         Ok(())
     }
 

@@ -30,6 +30,11 @@ pub(super) async fn exercise_empty_binary_and_atomic_overwrite(
     fixture: &SftpAcceptanceFixture,
 ) -> AcceptanceResult {
     write_remote_text(fixture, &fixture.workspace, ".kerminal-hidden", "hidden").await?;
+    run_stage(
+        "files.posix_backslash_names",
+        exercise_posix_backslash_names(fixture),
+    )
+    .await?;
 
     let empty_source = fixture.local_root.path().join("empty.bin");
     fs::write(&empty_source, b"")?;
@@ -176,6 +181,59 @@ pub(super) async fn exercise_empty_binary_and_atomic_overwrite(
     require(
         replacement_preview.bytes.as_slice() == replacement,
         "atomic overwrite exposed stale or partial content",
+    )?;
+    Ok(())
+}
+
+/// 真实服务器上的反斜杠名称须能写入、浏览及递归复制，普通兄弟项不能被它阻断。
+///
+/// @author kongweiguang
+async fn exercise_posix_backslash_names(fixture: &SftpAcceptanceFixture) -> AcceptanceResult {
+    let directory = remote_child(&fixture.host_id, &fixture.workspace, "posix-names")?;
+    fixture
+        .files
+        .create_directory(CancellationToken::new(), directory.clone())
+        .await?;
+    let path = destination_path(&directory)?;
+    let name = r"backup\2026.txt";
+    let expected = remote_child(&fixture.host_id, &path, name)?;
+    write_remote_text(fixture, &path, name, "posix-name-payload").await?;
+    write_remote_text(fixture, &path, "ordinary.txt", "ordinary-payload").await?;
+    let listing = fixture
+        .files
+        .list_directory(CancellationToken::new(), directory.clone())
+        .await?;
+    require(
+        listing.entries.len() == 2,
+        "special POSIX name blocked its sibling listing",
+    )?;
+    require(
+        listing
+            .entries
+            .iter()
+            .any(|entry| entry.name == name && entry.endpoint == expected),
+        "POSIX filename changed during listing",
+    )?;
+    let destination = remote_child(&fixture.host_id, &fixture.workspace, "posix-names-copy")?;
+    run_transfer(
+        fixture,
+        "files.posix_name_directory_copy",
+        request(
+            directory,
+            destination.clone(),
+            TransferKind::Directory,
+            ConflictPolicy::Overwrite,
+        ),
+    )
+    .await?;
+    let copied = remote_child(&fixture.host_id, &destination_path(&destination)?, name)?;
+    let preview = fixture
+        .files
+        .preview_file(CancellationToken::new(), copied, 128)
+        .await?;
+    require(
+        preview.bytes == b"posix-name-payload",
+        "POSIX filename directory copy changed content",
     )?;
     Ok(())
 }

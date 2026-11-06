@@ -1274,6 +1274,7 @@ impl SessionManager {
     }
 
     /// 在固定退避预算内重连同一 UI 交互式 SSH session，并保留跨快速断线的尝试计数。
+    /// 通知可能来自已处理的失败，稳定窗口只在新的待处理失败或取消时提前结束。
     ///
     /// @author kongweiguang
     async fn run_auto_reconnect_supervisor(
@@ -1391,37 +1392,71 @@ impl SessionManager {
                             let shell = session.shell_integration.lock().await;
                             shell.session_generation
                         };
-                        tokio::select! {
-                            _ = cancellation.cancelled() => break,
-                            _ = session.auto_reconnect_changed.notified() => continue,
-                            _ = tokio::time::sleep(AUTO_RECONNECT_STABILITY_WINDOW) => {
-                                let (lifecycle, generation) = {
-                                    let state = session.state.lock().await;
-                                    let shell = session.shell_integration.lock().await;
-                                    (state.info.lifecycle, shell.session_generation)
-                                };
-                                if lifecycle == SessionLifecycle::Running
-                                    && generation == connected_generation
-                                {
-                                    let mut runtime = session.auto_reconnect.lock().await;
-                                    if runtime.pending_failure.is_none() {
-                                        runtime.attempts_started = 0;
+                        let stability_deadline = Instant::now() + AUTO_RECONNECT_STABILITY_WINDOW;
+                        loop {
+                            tokio::select! {
+                                _ = cancellation.cancelled() => break,
+                                _ = session.auto_reconnect_changed.notified() => {
+                                    if session
+                                        .auto_reconnect
+                                        .lock()
+                                        .await
+                                        .pending_failure
+                                        .is_some()
+                                    {
                                         break;
                                     }
-                                } else if lifecycle != SessionLifecycle::Failed {
-                                    break;
                                 }
+                                _ = tokio::time::sleep_until(stability_deadline) => break,
                             }
                         }
+                        if cancellation.is_cancelled() {
+                            break;
+                        }
+                        let (lifecycle, generation) = {
+                            let state = session.state.lock().await;
+                            let shell = session.shell_integration.lock().await;
+                            (state.info.lifecycle, shell.session_generation)
+                        };
+                        if lifecycle == SessionLifecycle::Running
+                            && generation == connected_generation
+                        {
+                            let mut runtime = session.auto_reconnect.lock().await;
+                            if runtime.pending_failure.is_none() {
+                                runtime.attempts_started = 0;
+                                break;
+                            }
+                        } else if lifecycle != SessionLifecycle::Failed {
+                            break;
+                        }
                     }
-                    Err(error) if error.is_retryable_remote_disconnect() => {
+                    // 断线后的重连仍可能赶上 sshd 重启、坞站切换等建连失败（connection refused、
+                    // 握手超时）或旧 transport 收尾超时；它们都只说明本次恢复未完成，仍属可重试状态，
+                    // 不能把一次网络闪断永久降级成只读终端。认证、host key、冲突和取消仍立即停止。
+                    Err(error)
+                        if error.is_retryable_remote_disconnect()
+                            || matches!(
+                                error.public_code(),
+                                kerminal_application::PublicErrorCode::Timeout
+                                    | kerminal_application::PublicErrorCode::Infrastructure
+                            ) =>
+                    {
+                        tracing::debug!(
+                            event = "TERMINAL_AUTO_RECONNECT_ATTEMPT_FAILED",
+                            session_id = %session.session_id,
+                            attempt = plan.attempt,
+                            code = error.public_code().as_str(),
+                            "automatic reconnect attempt failed; retry remains eligible"
+                        );
                         session.auto_reconnect.lock().await.pending_failure = Some(error);
                         session.auto_reconnect_changed.notify_one();
                     }
                     Err(error) => {
                         tracing::debug!(
+                            event = "TERMINAL_AUTO_RECONNECT_ATTEMPT_STOPPED",
                             session_id = %session.session_id,
-                            error = %error,
+                            attempt = plan.attempt,
+                            code = error.public_code().as_str(),
                             "automatic reconnect stopped after a non-retryable failure"
                         );
                         break;

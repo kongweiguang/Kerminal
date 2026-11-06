@@ -1041,10 +1041,10 @@ fn remote_endpoint(host_id: &HostId, path: &RemotePath) -> FileEndpoint {
     }
 }
 
-/// 只通过 RemotePath::join_name 添加单个名称，避免字符串拼接逃出随机测试目录。
+/// 保留真实 POSIX 名称并拒绝斜杠穿越，使特殊名称测试也留在随机工作区。
 fn remote_child(host_id: &HostId, parent: &RemotePath, name: &str) -> AppResult<FileEndpoint> {
     let child = parent
-        .join_name(name)
+        .join_posix_name(name)
         .map_err(|_| AppError::invalid("invalid isolated SFTP child name"))?;
     Ok(remote_endpoint(host_id, &child))
 }

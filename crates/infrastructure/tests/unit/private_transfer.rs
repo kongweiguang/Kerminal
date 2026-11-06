@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::{fs, path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use kerminal_domain::{
     files::{FileEndpoint, RemotePath},
@@ -12,6 +12,176 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::*;
+
+#[path = "transfer_overwrite_permissions.rs"]
+mod transfer_overwrite_permissions;
+
+#[path = "transfer_hash_cancellation.rs"]
+mod transfer_hash_cancellation;
+
+/// 包装清理 owner 不得丢失原错误和可信恢复状态，未知提交仍必须保持不可重试。
+///
+/// @author kongweiguang
+#[test]
+fn pending_cleanup_preserves_failure_context_and_commit_unknown_policy() {
+    let destination = FileEndpoint::Local {
+        path: PathBuf::from("destination"),
+    };
+    let checkpoint = TransferCheckpoint {
+        source_revision: FileRevision {
+            size: 42,
+            modified: None,
+            permissions: None,
+            content_digest: None,
+        },
+        confirmed_bytes: 7,
+        confirmed_prefix_sha256: "ab".repeat(32),
+        staging_owner: TransferId::new(),
+        staging_destination: FileEndpoint::Local {
+            path: PathBuf::from("stage"),
+        },
+        staging_token: "0123456789abcdef0123456789abcdef".to_owned(),
+        actual_destination: destination.clone(),
+    };
+    let owner: Arc<dyn TransferResourceCleanup> = Arc::new(SftpTransferCleanup {
+        sessions: Vec::new(),
+        staging: StagingCleanupTracker::default(),
+    });
+    let original = TransferExecutionFailure::new(
+        TransferFailureKind::Connection,
+        true,
+        true,
+        Some(checkpoint.clone()),
+        Some(destination.clone()),
+        TransferCleanupState::Released,
+    )
+    .with_safe_message("远端 SFTP 权限不足");
+    let TransferExecutionError::Failed(failure) = with_pending_cleanup(
+        TransferExecutionError::Failed(original),
+        TransferCleanupState::pending(Arc::clone(&owner)),
+    ) else {
+        panic!("pending cleanup must remain a failure");
+    };
+    assert_eq!(failure.safe_message(), "远端 SFTP 权限不足");
+    assert_eq!(failure.kind(), TransferFailureKind::Connection);
+    assert!(failure.retryable());
+    assert!(failure.resumable());
+    assert_eq!(failure.checkpoint(), Some(&checkpoint));
+    assert_eq!(failure.actual_destination(), Some(&destination));
+    assert!(Arc::ptr_eq(
+        &owner,
+        &failure
+            .cleanup_state()
+            .cleanup_owner()
+            .expect("cleanup owner")
+    ));
+
+    let unknown = TransferExecutionFailure::new(
+        TransferFailureKind::CommitUnknown,
+        true,
+        true,
+        Some(checkpoint),
+        Some(destination),
+        TransferCleanupState::Released,
+    )
+    .with_safe_message("提交结果未知");
+    let TransferExecutionError::Failed(failure) = with_pending_cleanup(
+        TransferExecutionError::Failed(unknown),
+        TransferCleanupState::pending(owner),
+    ) else {
+        panic!("unknown commit must remain a failure");
+    };
+    assert_eq!(failure.kind(), TransferFailureKind::CommitUnknown);
+    assert_eq!(failure.safe_message(), "提交结果未知");
+    assert!(!failure.retryable());
+    assert!(!failure.resumable());
+    assert!(failure.checkpoint().is_none());
+    assert!(failure.cleanup_state().cleanup_owner().is_some());
+}
+
+/// 取消后的未确认清理仍需原 owner；只有存在可信检查点时才保留续传资格。
+///
+/// @author kongweiguang
+#[test]
+fn cancelled_pending_cleanup_remains_retryable_and_retains_checkpoint() {
+    let destination = FileEndpoint::Local {
+        path: PathBuf::from("destination"),
+    };
+    let checkpoint = TransferCheckpoint {
+        source_revision: FileRevision {
+            size: 42,
+            modified: None,
+            permissions: None,
+            content_digest: None,
+        },
+        confirmed_bytes: 7,
+        confirmed_prefix_sha256: "ab".repeat(32),
+        staging_owner: TransferId::new(),
+        staging_destination: FileEndpoint::Local {
+            path: PathBuf::from("stage"),
+        },
+        staging_token: "0123456789abcdef0123456789abcdef".to_owned(),
+        actual_destination: destination.clone(),
+    };
+    let owner: Arc<dyn TransferResourceCleanup> = Arc::new(SftpTransferCleanup {
+        sessions: Vec::new(),
+        staging: StagingCleanupTracker::default(),
+    });
+
+    for checkpoint in [None, Some(checkpoint)] {
+        let expected_resume = checkpoint.is_some();
+        let TransferExecutionError::Failed(failure) = with_pending_cleanup(
+            TransferExecutionError::Cancelled {
+                checkpoint: checkpoint.clone(),
+                actual_destination: Some(destination.clone()),
+            },
+            TransferCleanupState::pending(Arc::clone(&owner)),
+        ) else {
+            panic!("unconfirmed cleanup must retain its owner");
+        };
+        assert_eq!(failure.safe_message(), "传输已取消");
+        assert!(failure.retryable());
+        assert_eq!(failure.resumable(), expected_resume);
+        assert_eq!(failure.checkpoint(), checkpoint.as_ref());
+        assert_eq!(failure.actual_destination(), Some(&destination));
+        assert!(Arc::ptr_eq(
+            &owner,
+            &failure
+                .cleanup_state()
+                .cleanup_owner()
+                .expect("cleanup owner")
+        ));
+    }
+}
+
+/// 远端流错误保留内部诊断链且不暴露远端原文，本机错误仍沿用原有分类。
+///
+/// @author kongweiguang
+#[test]
+fn stream_errors_identify_the_actual_endpoint_without_exposing_remote_details() -> AppResult<()> {
+    let local = FileEndpoint::Local {
+        path: PathBuf::from("local"),
+    };
+    let remote = FileEndpoint::remote(HostId::new(), "/remote")
+        .map_err(|_| AppError::invalid("test remote endpoint"))?;
+    let local_error = map_endpoint_io_error(&local, io::ErrorKind::PermissionDenied.into());
+    assert_eq!(local_error.public_message(), "本机文件权限不足");
+    assert_eq!(local_error.public_code(), PublicErrorCode::Conflict);
+
+    let remote_error = map_endpoint_io_error(
+        &remote,
+        io::Error::new(io::ErrorKind::PermissionDenied, "sensitive remote detail"),
+    );
+    assert_eq!(remote_error.public_message(), "远端 SFTP 数据流失败");
+    assert_eq!(remote_error.public_code(), PublicErrorCode::Infrastructure);
+    assert_eq!(
+        std::error::Error::source(&remote_error)
+            .expect("remote cause")
+            .to_string(),
+        "sensitive remote detail"
+    );
+    Ok(())
+}
 
 /// 远端目录 containment 按 host 身份及 POSIX 组件边界比较，避免前缀相似路径或另一主机误判。
 ///
@@ -175,6 +345,7 @@ fn recovery_evidence_accepts_original_stage_owner_for_a_retry_successor() -> App
     };
     let record = TransferRecoveryRecord {
         id: successor_id.clone(),
+        origin: None,
         drag_staging: false,
         request: TransferRequest {
             source: FileEndpoint::Local {
@@ -275,7 +446,7 @@ async fn cleaned_staging_keeps_durable_facts_separate_from_physical_owner() -> A
     )?;
     artifact.recovery_ownership = Some(artifact.recovery_record(&actual_destination));
     EndpointSession::Local
-        .create_staging_marker(&artifact)
+        .create_staging_marker(&artifact, &tokio_util::sync::CancellationToken::new())
         .await?;
     let FileEndpoint::Local { path: stage_path } = &artifact.endpoint else {
         unreachable!("local stage uses a local data path")
@@ -319,7 +490,7 @@ async fn unknown_stage_creation_keeps_data_marker_and_cleanup_owner() -> AppResu
         StagingKind::File,
     )?;
     EndpointSession::Local
-        .create_staging_marker(&artifact)
+        .create_staging_marker(&artifact, &tokio_util::sync::CancellationToken::new())
         .await?;
     fs::write(&stage_path, b"possibly-created-by-uncertain-request").map_err(map_io_error)?;
 
@@ -369,7 +540,9 @@ async fn cleanup_continues_after_an_independent_owner_conflict() -> AppResult<()
         "0123456789abcdef0123456789abcdef".to_owned(),
         StagingKind::File,
     )?;
-    EndpointSession::Local.create_staging_marker(&owned).await?;
+    EndpointSession::Local
+        .create_staging_marker(&owned, &tokio_util::sync::CancellationToken::new())
+        .await?;
     fs::write(&owned_path, b"ours").map_err(map_io_error)?;
 
     let uncertain_path = root.path().join("uncertain.partial");
@@ -382,7 +555,7 @@ async fn cleanup_continues_after_an_independent_owner_conflict() -> AppResult<()
         StagingKind::File,
     )?;
     EndpointSession::Local
-        .create_staging_marker(&uncertain)
+        .create_staging_marker(&uncertain, &tokio_util::sync::CancellationToken::new())
         .await?;
     fs::write(&uncertain_path, b"not-confirmed-ours").map_err(map_io_error)?;
 
@@ -1046,7 +1219,7 @@ async fn marker_name_conflict_preserves_the_existing_marker() -> AppResult<()> {
     fs::write(marker_path, b"foreign-owner").map_err(map_io_error)?;
 
     let result = EndpointSession::Local
-        .create_staging_marker(&artifact)
+        .create_staging_marker(&artifact, &tokio_util::sync::CancellationToken::new())
         .await;
 
     assert!(
@@ -1093,6 +1266,103 @@ fn marker_fingerprint_changes_when_native_path_changes() -> AppResult<()> {
     Ok(())
 }
 
+/// 子项清理进行中取消时保留尚未确认的记录，后续仍能回收未发布的整棵暂存树。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn cancelled_child_marker_retirement_retains_cleanup_ownership() -> AppResult<()> {
+    let root = tempfile::tempdir().map_err(map_io_error)?;
+    let staging_path = root.path().join("tree.partial");
+    fs::create_dir(&staging_path).map_err(map_io_error)?;
+    let session = EndpointSession::Local;
+    let owner = TransferId::new();
+    let root_endpoint = FileEndpoint::Local {
+        path: staging_path.clone(),
+    };
+    let root_artifact = StagingArtifact::new(
+        root_endpoint.clone(),
+        owner.clone(),
+        "0123456789abcdef0123456789abcdef".to_owned(),
+        StagingKind::Tree,
+    )?;
+    session
+        .create_staging_marker(&root_artifact, &CancellationToken::new())
+        .await?;
+    let tracker = StagingCleanupTracker::default();
+    tracker.register(root_artifact.clone());
+    tracker.mark_stage_created(&root_endpoint);
+    let mut children = Vec::new();
+    for index in 1..=16 {
+        let child = StagingArtifact::new(
+            FileEndpoint::Local {
+                path: staging_path.join(format!(".payload-{index}.partial")),
+            },
+            owner.clone(),
+            format!("{index:032x}"),
+            StagingKind::File,
+        )?;
+        session
+            .create_staging_marker(&child, &CancellationToken::new())
+            .await?;
+        tracker.register(child.clone());
+        tracker.mark_stage_created(&child.endpoint);
+        tracker.mark_committed(&child.endpoint);
+        children.push(child);
+    }
+
+    let cancellation = CancellationToken::new();
+    let worker = tokio::spawn({
+        let tracker = tracker.clone();
+        let session = session.clone();
+        let root_endpoint = root_endpoint.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            tracker
+                .retire_committed_file_markers_before_tree_publish(
+                    &session,
+                    &root_endpoint,
+                    &cancellation,
+                )
+                .await
+        }
+    });
+    let FileEndpoint::Local { path: first_marker } = &children[0].marker else {
+        unreachable!("local child artifacts use local markers")
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while first_marker.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| AppError::infrastructure("子项 marker 清理未开始"))?;
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .map_err(|_| AppError::infrastructure("子项 marker 清理未及时响应取消"))?
+        .map_err(|_| AppError::infrastructure("子项 marker 清理任务异常"))?
+        .expect_err("retirement must stop on cancellation");
+    assert_eq!(error.public_code(), PublicErrorCode::Cancelled);
+    assert!(tracker.contains(&root_artifact.endpoint));
+    assert!(
+        children
+            .iter()
+            .any(|child| tracker.contains(&child.endpoint))
+    );
+
+    tracker
+        .cleanup_until(&[session], Instant::now() + Duration::from_secs(2))
+        .await?;
+    assert!(!staging_path.exists());
+    assert!(!tracker.contains(&root_artifact.endpoint));
+    assert!(
+        children
+            .iter()
+            .all(|child| !tracker.contains(&child.endpoint))
+    );
+    Ok(())
+}
+
 /// 子文件 owner 校验失败必须阻止 root rename，不能把未清理的 marker 发布到正式树。
 ///
 /// @author kongweiguang
@@ -1113,7 +1383,9 @@ async fn child_marker_conflict_blocks_directory_root_publication() -> AppResult<
         "0123456789abcdef0123456789abcdef".to_owned(),
         StagingKind::Tree,
     )?;
-    session.create_staging_marker(&root_artifact).await?;
+    session
+        .create_staging_marker(&root_artifact, &tokio_util::sync::CancellationToken::new())
+        .await?;
 
     let child_stage = staging_path.join(".payload.partial");
     let child_artifact = StagingArtifact::new(
@@ -1122,7 +1394,9 @@ async fn child_marker_conflict_blocks_directory_root_publication() -> AppResult<
         "fedcba9876543210fedcba9876543210".to_owned(),
         StagingKind::File,
     )?;
-    session.create_staging_marker(&child_artifact).await?;
+    session
+        .create_staging_marker(&child_artifact, &tokio_util::sync::CancellationToken::new())
+        .await?;
     fs::write(staging_path.join("payload.txt"), b"payload").map_err(map_io_error)?;
 
     let tracker = StagingCleanupTracker::default();
@@ -1137,7 +1411,11 @@ async fn child_marker_conflict_blocks_directory_root_publication() -> AppResult<
     fs::write(child_marker, b"replaced-owner-marker").map_err(map_io_error)?;
 
     let result = tracker
-        .retire_committed_file_markers_before_tree_publish(&session, &root_endpoint)
+        .retire_committed_file_markers_before_tree_publish(
+            &session,
+            &root_endpoint,
+            &CancellationToken::new(),
+        )
         .await;
     assert!(result.is_err(), "a replaced marker must fail closed");
     assert!(
@@ -1189,7 +1467,9 @@ async fn unknown_directory_root_commit_preserves_recovery_marker_and_target() ->
         "0123456789abcdef0123456789abcdef".to_owned(),
         StagingKind::Tree,
     )?;
-    session.create_staging_marker(&root_artifact).await?;
+    session
+        .create_staging_marker(&root_artifact, &tokio_util::sync::CancellationToken::new())
+        .await?;
 
     let child_artifact = StagingArtifact::new(
         FileEndpoint::Local {
@@ -1199,7 +1479,9 @@ async fn unknown_directory_root_commit_preserves_recovery_marker_and_target() ->
         "fedcba9876543210fedcba9876543210".to_owned(),
         StagingKind::File,
     )?;
-    session.create_staging_marker(&child_artifact).await?;
+    session
+        .create_staging_marker(&child_artifact, &tokio_util::sync::CancellationToken::new())
+        .await?;
     let tracker = StagingCleanupTracker::default();
     tracker.register(root_artifact.clone());
     tracker.mark_stage_created(&root_endpoint);
@@ -1207,7 +1489,11 @@ async fn unknown_directory_root_commit_preserves_recovery_marker_and_target() ->
     tracker.mark_stage_created(&child_artifact.endpoint);
     tracker.mark_committed(&child_artifact.endpoint);
     tracker
-        .retire_committed_file_markers_before_tree_publish(&session, &root_endpoint)
+        .retire_committed_file_markers_before_tree_publish(
+            &session,
+            &root_endpoint,
+            &CancellationToken::new(),
+        )
         .await?;
     let FileEndpoint::Local { path: child_marker } = &child_artifact.marker else {
         unreachable!("local child artifacts use local markers")
