@@ -197,3 +197,50 @@ fn oversized_directory_is_discarded_and_following_events_recover() {
         Some("/next")
     );
 }
+
+/// 取消控制符终止未完成的目录通知，后续新 OSC 仍须按原始块边界单独解析。
+///
+/// @author kongweiguang
+#[test]
+fn cancelled_directory_notification_does_not_consume_the_next_osc() {
+    for cancel in [0x18, 0x1a] {
+        let mut scanner = Osc133Scanner::default();
+        markers(
+            &mut scanner,
+            b"\x1b]7;file:///valid\x07\x1b]7;file:///unfinished",
+        );
+        assert!(markers(&mut scanner, &[cancel]).is_empty());
+        assert_eq!(
+            scanner.take_current_working_directory().as_deref(),
+            Some("/valid"),
+        );
+        assert_eq!(
+            markers(&mut scanner, b"\x1b]7;file:///next\x07\x1b]133;A\x07"),
+            vec![ShellIntegrationMarker::PromptStart],
+        );
+        assert_eq!(
+            scanner.take_current_working_directory().as_deref(),
+            Some("/next"),
+        );
+    }
+}
+
+/// 未以 ST 结束的 OSC 被新 ESC 打断时不得吞掉紧随其后的合法目录和命令标记。
+///
+/// @author kongweiguang
+#[test]
+fn interrupted_osc_recovers_when_the_next_start_crosses_chunks() {
+    let mut scanner = Osc133Scanner::default();
+    assert!(markers(&mut scanner, b"\x1b]7;file:///unfinished\x1b").is_empty());
+    assert_eq!(
+        markers(
+            &mut scanner,
+            b"]7;file:///%E4%B8%AD%20%25\x07\x1b]133;B\x07"
+        ),
+        vec![ShellIntegrationMarker::PromptEnd],
+    );
+    assert_eq!(
+        scanner.take_current_working_directory().as_deref(),
+        Some("/中 %"),
+    );
+}

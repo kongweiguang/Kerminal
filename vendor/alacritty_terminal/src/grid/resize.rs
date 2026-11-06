@@ -125,8 +125,18 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         self.lines = target;
     }
 
-    /// Grow number of columns in each row, reflowing if necessary.
+    /// 合并折行时不把默认历史空行拉到活动正文之前；将等量空位补在底部，历史仍完整保留。
+    /// 历史阅读、跨历史软换行和非默认样式沿用上游行为，避免把真实内容当作布局留白。
+    ///
+    /// @author kongweiguang
     fn grow_columns(&mut self, reflow: bool, columns: usize) {
+        let preserve_blank_history = reflow
+            && self.display_offset == 0
+            && self.history_size() > 0
+            && !self[Line(-1)]
+                .last()
+                .is_some_and(|cell| cell.flags().contains(Flags::WRAPLINE));
+
         // Check if a row needs to be wrapped.
         let should_reflow = |row: &Row<T>| -> bool {
             let len = Column(row.len());
@@ -137,6 +147,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         let mut reversed: Vec<Row<T>> = Vec::with_capacity(self.raw.len());
         let mut cursor_line_delta = 0;
+        let mut original_viewport_start = None;
 
         // Remove the linewrap special case, by moving the cursor outside of the grid.
         if self.cursor.input_needs_wrap && reflow {
@@ -147,6 +158,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         let mut rows = self.raw.take_all();
 
         for (i, mut row) in rows.drain(..).enumerate().rev() {
+            if i == self.lines - 1 {
+                original_viewport_start = Some(reversed.len());
+            }
             // Check if reflowing should be performed.
             let last_row = match reversed.last_mut() {
                 Some(last_row) if should_reflow(last_row) => last_row,
@@ -254,6 +268,25 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             let overflow = cursor_line_delta.saturating_sub(available);
             reversed.truncate(reversed.len() + overflow - cursor_line_delta);
             self.cursor.point.line = max(self.cursor.point.line - overflow, Line(0));
+        }
+
+        if preserve_blank_history
+            && let Some(original_start) = original_viewport_start
+            && original_start <= reversed.len()
+        {
+            let current_start = reversed.len() - self.lines;
+            if current_start < original_start {
+                let empty = T::default();
+                // 只归还来自旧历史的连续默认空行；原正文空行、背景色、链接及其它属性均不裁掉。
+                let returned = reversed[current_start..original_start]
+                    .iter()
+                    .take_while(|row| row[..].iter().all(|cell| *cell == empty))
+                    .count()
+                    .min(self.cursor.point.line.0.max(0) as usize);
+                reversed.resize_with(reversed.len() + returned, || Row::new(columns));
+                self.cursor.point.line -= returned;
+                // saved_cursor 仍是 DEC 保存的屏幕坐标，不随活动光标的内容投影作统一平移。
+            }
         }
 
         // Reverse iterator and fill all rows that are still too short.

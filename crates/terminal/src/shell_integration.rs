@@ -42,7 +42,7 @@ pub(crate) struct Osc133Scanner {
 }
 
 impl Osc133Scanner {
-    /// 共用一次跨块扫描处理 OSC133 和 OSC7，保留命令捕获原有的精确 marker offset。
+    /// 共用一次跨块扫描处理 OSC133 和 OSC7；取消或新转义会隔离未完成序列，保留 marker offset。
     ///
     /// @author kongweiguang
     pub(crate) fn advance_with_offsets(&mut self, bytes: &[u8]) -> Vec<ScannedShellMarker> {
@@ -67,11 +67,17 @@ impl Osc133Scanner {
                     self.finish_osc(&mut markers, index + 1);
                     continue;
                 }
-                self.push_payload(0x1b);
-                self.pending_escape = false;
+                self.discard_osc();
+                match *byte {
+                    b']' => self.start_osc(),
+                    0x1b => self.pending_start_escape = true,
+                    _ => {}
+                }
+                continue;
             }
             match *byte {
                 0x07 => self.finish_osc(&mut markers, index + 1),
+                0x18 | 0x1a => self.discard_osc(),
                 0x1b => self.pending_escape = true,
                 value => self.push_payload(value),
             }
@@ -121,7 +127,15 @@ impl Osc133Scanner {
                 self.current_working_directory = Some(directory);
             }
         }
+        self.discard_osc();
+    }
+
+    /// 无效或已消费的 OSC 不得残留到下一个序列；已接受的目录事件独立保留。
+    ///
+    /// @author kongweiguang
+    fn discard_osc(&mut self) {
         self.in_osc = false;
+        self.pending_start_escape = false;
         self.pending_escape = false;
         self.overflowed = false;
         self.payload.clear();
