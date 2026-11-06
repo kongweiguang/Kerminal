@@ -289,7 +289,7 @@ cargo +1.98.0 xtask package --target $target
 
 平台配置位于 [`packaging/`](packaging/)，资源路径相对配置目录解析。原始产物先进入 `target/package-output/`，整理后位于 `target/package-candidates/<target>/`：Windows 为 NSIS，Linux 为 AppImage / DEB，macOS 为应用包 / DMG；必要的 updater archive 单独生成，不以改扩展名替代真实打包。
 
-支持的 target 为 `x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`x86_64-apple-darwin`、`aarch64-apple-darwin`。[候选打包工作流](.github/workflows/gpui-package.yml) 可手动触发；[beta 发布工作流](.github/workflows/gpui-release.yml) 核对 `vX.Y.Z-beta.N` tag 与 workspace 版本，构建四个平台并发布 prerelease 及摘要，不等于正式版签名或安装验收。
+支持的 target 为 `x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`x86_64-apple-darwin`、`aarch64-apple-darwin`。[候选打包工作流](.github/workflows/gpui-package.yml) 可手动触发；[beta 发布工作流](.github/workflows/gpui-release.yml) 核对 `vX.Y.Z-beta.N` tag 与 workspace 版本，构建四个平台并发布 prerelease 及摘要，不等于正式版签名或安装验收。发布说明由 `packaging/release_notes.py` 按上一个发布 tag 到当前 tag 的提交生成“新功能 / 改进 / 修复”分节，`chore` 提交不对外展示。
 
 稳定候选应同时记录构建前后源码指纹与实际二进制摘要。源码指纹覆盖锁文件和非忽略的新源码，但单独的 Git revision 或指纹不能证明二进制与源码的对应关系。
 

@@ -237,7 +237,9 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.preflight.outputs.release_tag }}
-          fetch-depth: 1
+          # 发布说明要按上一个发布 tag 计算提交区间，因此需要完整历史和 tags。
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Set up packaging Python
         uses: actions/setup-python@v6
@@ -288,27 +290,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          source_commit="$(git rev-parse HEAD)"
-          cat > release-notes.md <<EOF
-          **Kerminal GPUI ${RELEASE_VERSION} beta**
-
-          这是 Kerminal 原生 GPUI 重写分支的 beta 测试包。功能迁移和原生验收仍在进行中，请勿用于生产环境。
-
-          ### 下载
-
-          - Windows x64：NSIS 安装包（当前用户安装）
-          - Linux x64：AppImage / DEB
-          - macOS x64 / arm64：DMG
-
-          ### 注意
-
-          - 所有包均为未签名构建。macOS 可能需要在 Finder 中右键“打开”，Windows 可能触发 SmartScreen 提示。
-          - 本 beta 未配置更新器签名和更新 feed，不会自动更新。
-          - GPUI 版数据根为 \`~/.kerminal-gpui\`，与旧版 \`~/.kerminal\` 隔离；旧配置迁移见仓库 README。
-          - 下载后可用 \`SHA256SUMS.txt\` 校验安装包。
-
-          提交：\`${source_commit}\`
-          EOF
+          # 发布说明按上一个发布 tag 到当前 tag 的真实提交生成新功能/改进/修复分节。
+          python packaging/release_notes.py \
+            --tag "${RELEASE_TAG}" \
+            --version "${RELEASE_VERSION}" \
+            --out release-notes.md
+          cat release-notes.md
 
       - name: Create or update prerelease
         shell: bash
