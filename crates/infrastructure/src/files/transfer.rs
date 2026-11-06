@@ -463,6 +463,39 @@ impl StagingCleanupTracker {
         }
     }
 
+    /// 目录合并写入目标目录的文件在提交回执后立即退役 sidecar，避免随后收紧目录权限后无法删除。
+    /// 清理失败不改写已提交的数据结果，保留原 owner 供关闭清理重试。
+    ///
+    /// @author kongweiguang
+    async fn retire_committed_file_marker(
+        &self,
+        session: &EndpointSession,
+        endpoint: &FileEndpoint,
+        cancellation: &CancellationToken,
+    ) -> AppResult<()> {
+        let artifact = {
+            let entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries
+                .iter()
+                .find(|artifact| {
+                    artifact.endpoint == *endpoint
+                        && matches!(artifact.kind, StagingKind::File)
+                        && artifact.stage_owned
+                        && artifact.disposition == StagingDisposition::Committed
+                })
+                .cloned()
+                .ok_or_else(|| AppError::conflict("合并文件暂存尚未确认提交"))
+        }?;
+        await_unless_cancelled(cancellation, session.cleanup_owned_artifact(&artifact))
+            .await
+            .ok_or_else(|| AppError::cancelled("合并文件暂存清理已取消"))??;
+        self.remove_entry(&artifact.marker);
+        Ok(())
+    }
+
     /// 在原子发布目录树前退役已提交子文件 marker；root marker 持续证明整棵 staging 的所有权。
     /// 取消可中断挂起的端点操作，未确认清理的记录继续由原 owner 持有。
     ///
@@ -2020,6 +2053,19 @@ impl SftpTransferBackend {
                                             ),
                                         )
                                     })?;
+                                if let Err(error) = staging_tracker
+                                    .retire_committed_file_marker(
+                                        destination_session,
+                                        &temporary,
+                                        &context.cancellation,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        error_code = error.public_code().as_str(),
+                                        "已提交目录文件 marker 清理失败，保留 owner 供关闭重试"
+                                    );
+                                }
                                 changed = true;
                             }
                             Err(CommitFailure::Known(error)) => {
