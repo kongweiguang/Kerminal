@@ -297,7 +297,491 @@ fn compact_file_rows_and_toolbar_follow_reference_geometry(app: &mut TestAppCont
     let _runtime = runtime;
 }
 
-/// 单行导航让路径可编辑且次要控件不换行；传输元数据不越过窄栏边界。
+/// 同一帧的虚拟行、绘制和翻页必须使用放大后的行高，才能保留目录位置和键盘上下文。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn scaled_file_rows_keep_virtual_geometry_and_page_navigation_aligned(app: &mut TestAppContext) {
+    use gpui_kit::{component::Theme, px, size};
+
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv/app");
+    let entries = (0..40)
+        .map(|index| {
+            support::remote_entry(&directory, &format!("file-{index:02}"), FileEntryKind::File)
+        })
+        .collect();
+    let seeded_directory = directory.clone();
+    let (runtime, pane, _, visual) = support::window_fixture(app, directory, move |pane| {
+        pane.compact_layout = true;
+        pane.queue_watch_started = true;
+        support::seed_compact_listing(pane, seeded_directory, entries);
+    });
+    visual.simulate_resize(size(px(360.), px(600.)));
+    support::draw(visual);
+
+    let row = visual
+        .debug_bounds("files-row-1-file-00")
+        .expect("first row");
+    assert_eq!(row.size.height, px(36.));
+    visual.update(|window, cx| {
+        Theme::update(cx, |theme| theme.font_size = px(24.));
+        window.set_rem_size(px(24.));
+        pane.update(cx, |_, cx| cx.notify());
+    });
+    support::draw(visual);
+    let first = visual
+        .debug_bounds("files-row-1-file-00")
+        .expect("first row");
+    let second = visual
+        .debug_bounds("files-row-1-file-01")
+        .expect("second row");
+    assert_eq!(first.size.height, px(54.));
+    assert_eq!(second.origin.y - first.origin.y, px(54.));
+
+    visual.update(|window, cx| {
+        let focus = pane.read(cx).panels[1]
+            .list_focus_handle
+            .clone()
+            .expect("list focus handle");
+        window.focus(&focus, cx);
+    });
+    send_key(visual, "home");
+    let visible_rows = visual.update(|_, cx| {
+        (pane.read(cx).panels[1]
+            .list_scroll
+            .bounds()
+            .size
+            .height
+            .as_f32()
+            / 54.)
+            .floor() as usize
+    });
+    send_key(visual, "pagedown");
+    let expected_index = visible_rows.saturating_sub(1).clamp(1, 39);
+    visual.update(|_, cx| {
+        assert_eq!(
+            pane.read(cx).panels[1]
+                .keyboard_focus
+                .active_name
+                .as_deref(),
+            Some(format!("file-{expected_index:02}").as_str())
+        );
+    });
+    visual.update(|window, cx| {
+        Theme::update(cx, |theme| theme.font_size = px(16.));
+        window.set_rem_size(px(16.));
+    });
+    let _runtime = runtime;
+}
+
+/// 文件动作在窄栏和大字号下可以换行，但每个主要入口都必须留在容器内。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn scaled_file_actions_remain_reachable_in_a_narrow_panel(app: &mut TestAppContext) {
+    use gpui_kit::{component::Theme, px, size};
+
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv/app");
+    let seeded_directory = directory.clone();
+    let (runtime, pane, _, visual) = support::window_fixture(app, directory, move |pane| {
+        pane.compact_layout = true;
+        pane.queue_watch_started = true;
+        support::seed_compact_listing(pane, seeded_directory, Vec::new());
+    });
+    visual.simulate_resize(size(px(296.), px(600.)));
+    visual.update(|window, cx| {
+        Theme::update(cx, |theme| theme.font_size = px(24.));
+        window.set_rem_size(px(24.));
+        pane.update(cx, |_, cx| cx.notify());
+    });
+    support::draw(visual);
+    let bar = visual
+        .debug_bounds("rr-files-actions-1")
+        .expect("actions bar");
+    for selector in [
+        "rr-files-upload-menu",
+        "files-new-folder-1",
+        "files-download-1",
+        "rr-files-view-menu",
+    ] {
+        let bounds = visual.debug_bounds(selector).expect("file action");
+        assert!(
+            bounds.origin.x >= bar.origin.x
+                && bounds.right() <= bar.right()
+                && bounds.origin.y >= bar.origin.y
+                && bounds.bottom() <= bar.bottom(),
+            "{selector} outside toolbar: action={bounds:?}, toolbar={bar:?}"
+        );
+    }
+    visual.update(|window, cx| {
+        Theme::update(cx, |theme| theme.font_size = px(16.));
+        window.set_rem_size(px(16.));
+    });
+    let _runtime = runtime;
+}
+
+/// 树的普通行、空目录和失败重试共享缩放高度，Kit 虚拟树才不会产生行内裁切。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn scaled_tree_rows_keep_placeholder_and_retry_heights_aligned(app: &mut TestAppContext) {
+    use gpui_kit::{component::Theme, px, size};
+    use kerminal_domain::files::DirectoryListing;
+
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv");
+    let empty = support::remote_entry(&directory, "a-empty", FileEntryKind::Directory);
+    let failed = support::remote_entry(&directory, "b-failed", FileEntryKind::Directory);
+    let final_entry = support::remote_entry(&directory, "z-file", FileEntryKind::File);
+    let root = directory.clone();
+    let (runtime, pane, _, visual) = support::window_fixture(app, directory, move |pane| {
+        let entries = vec![empty.clone(), failed.clone(), final_entry];
+        pane.view_mode = super::view_mode::FilesViewMode::Tree;
+        support::seed_listing(pane, 1, 3, entries.clone());
+        let tree = &mut pane.panels[1].tree;
+        tree.begin_root_request(&root, 3);
+        tree.set_root_listing(root, 3, entries, true);
+        tree.expand(&empty.endpoint);
+        let (request, _) = tree
+            .begin_directory_request(&empty.endpoint, 3)
+            .expect("empty request");
+        assert!(tree.complete_directory_request(
+            &empty.endpoint,
+            3,
+            request,
+            true,
+            Ok(DirectoryListing {
+                directory: empty.endpoint.clone(),
+                entries: Vec::new()
+            }),
+        ));
+        tree.expand(&failed.endpoint);
+        let (request, _) = tree
+            .begin_directory_request(&failed.endpoint, 3)
+            .expect("failed request");
+        assert!(tree.complete_directory_request(
+            &failed.endpoint,
+            3,
+            request,
+            true,
+            Err("unavailable".into()),
+        ));
+    });
+    visual.simulate_resize(size(px(1180.), px(700.)));
+    visual.update(|window, cx| {
+        Theme::update(cx, |theme| theme.font_size = px(24.));
+        window.set_rem_size(px(24.));
+        pane.update(cx, |_, cx| cx.notify());
+    });
+    support::draw(visual);
+    for selector in [
+        "files-tree-entry-1-/srv/a-empty",
+        "files-tree-placeholder",
+        "files-tree-entry-1-/srv/b-failed",
+        "files-tree-retry",
+        "files-tree-entry-1-/srv/z-file",
+    ] {
+        let row = visual.debug_bounds(selector).expect("tree row");
+        assert_eq!(row.size.height, px(48.), "{selector}: {row:?}");
+    }
+    visual.update(|window, cx| {
+        Theme::update(cx, |theme| theme.font_size = px(16.));
+        window.set_rem_size(px(16.));
+    });
+    let _runtime = runtime;
+}
+
+/// 短面板展开多条任务时仍需保留可操作的目录区域，避免固定队列高度挤走文件内容。
+/// 两种窗口高度共用实际布局约束，任务数量与展开状态不随高度调整而丢失。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn short_file_panel_keeps_browser_space_with_expanded_transfer_history(app: &mut TestAppContext) {
+    use gpui_kit::{px, size};
+    use kerminal_domain::{
+        files::{ConflictPolicy, TransferKind, TransferRequest, TransferStatus, TransferTask},
+        identity::TransferId,
+    };
+
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv/transfer-history-layout");
+    let summaries = (0..6)
+        .map(|index| {
+            let request = TransferRequest {
+                source: FileEndpoint::Local {
+                    path: std::path::PathBuf::from(format!("source-{index}.txt")),
+                },
+                destination: support::remote_endpoint(
+                    &host,
+                    &format!("/srv/transfer-history-layout/target-{index}.txt"),
+                ),
+                kind: TransferKind::File,
+                conflict_policy: ConflictPolicy::Rename,
+                idle_timeout_seconds: None,
+            };
+            let mut summary = TransferTask::queued(TransferId::new(), request)
+                .expect("fixture endpoints are distinct")
+                .summary();
+            summary.status = TransferStatus::Succeeded;
+            summary
+        })
+        .collect();
+    let (runtime, pane, _, visual) = support::window_fixture(app, directory, move |pane| {
+        pane.compact_layout = true;
+        pane.current_terminal_endpoint = Some(pane.panels[1].endpoint.clone());
+        pane.queue_watch_started = true;
+        pane.queue.history_expanded = true;
+        pane.transfer_rows = summaries;
+    });
+    for height in [600., 900.] {
+        visual.simulate_resize(size(px(800.), px(height)));
+        support::draw(visual);
+        let browser = visual
+            .debug_bounds("files-browser-list-1")
+            .expect("browser list remains visible");
+        let queue = visual
+            .debug_bounds("rr-files-transfer-list")
+            .expect("expanded transfer list remains visible");
+        assert!(
+            browser.size.height >= px(108.),
+            "file browser must retain at least three default rows: {browser:?}"
+        );
+        assert!(
+            queue.size.height < px(height * 0.45),
+            "auxiliary transfer list must leave most height for browsing: {queue:?}"
+        );
+        visual.update(|_, cx| {
+            assert_eq!(pane.read(cx).transfer_rows.len(), 6);
+            assert!(pane.read(cx).queue.history_expanded);
+        });
+    }
+    let _runtime = runtime;
+}
+
+/// 紧凑栏失去当前目标时不挂载传输区，重新绑定后可以恢复展示。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn compact_file_panel_hides_transfers_without_a_current_target(app: &mut TestAppContext) {
+    let directory = support::remote_endpoint(&HostId::new(), "/srv/target");
+    let (_runtime, pane, _, visual) = support::window_fixture(app, directory, |pane| {
+        pane.compact_layout = true;
+        pane.current_terminal_endpoint = None;
+        pane.queue_watch_started = true;
+    });
+    assert!(visual.debug_bounds("files-transfer-queue").is_none());
+    visual.update(|_, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.current_terminal_endpoint = Some(pane.panels[1].endpoint.clone());
+            cx.notify();
+        });
+    });
+    support::draw(visual);
+    assert!(visual.debug_bounds("files-transfer-queue").is_some());
+    visual.update(|_, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.current_terminal_endpoint = None;
+            cx.notify();
+        });
+    });
+    support::draw(visual);
+    assert!(visual.debug_bounds("files-transfer-queue").is_none());
+}
+
+/// 通过真实队列制造已确认检查点，避免把普通取消误当作可继续的暂停。
+///
+/// @author kongweiguang
+struct PausableUiBackend;
+
+#[async_trait::async_trait]
+impl kerminal_application::transfers::TransferBackend for PausableUiBackend {
+    /// 此测试后端只由隔离队列使用，不访问文件系统或远程端点。
+    ///
+    /// @author kongweiguang
+    fn supports(&self, _: &kerminal_domain::files::TransferRequest) -> bool {
+        true
+    }
+
+    /// 发布可信检查点后等待取消，让测试覆盖真实的活暂停记录。
+    ///
+    /// @author kongweiguang
+    async fn execute(
+        &self,
+        context: kerminal_application::transfers::TransferExecutionContext,
+    ) -> Result<
+        kerminal_application::transfers::TransferExecutionResult,
+        kerminal_application::transfers::TransferExecutionError,
+    > {
+        use kerminal_application::transfers::{
+            TransferCheckpoint, TransferExecutionError, TransferPhase, TransferProgressUpdate,
+            TransferStagingOwnership,
+        };
+        use kerminal_domain::files::FileRevision;
+
+        let destination = context.request.destination.clone();
+        let staging = FileEndpoint::Local {
+            path: ".ui-fixture.partial".into(),
+        };
+        let checkpoint = TransferCheckpoint {
+            source_revision: FileRevision {
+                size: 10,
+                modified: None,
+                permissions: None,
+                content_digest: Some("b".repeat(64)),
+            },
+            confirmed_bytes: 5,
+            confirmed_prefix_sha256: "c".repeat(64),
+            staging_owner: context.transfer_id.clone(),
+            staging_destination: staging.clone(),
+            staging_token: "a".repeat(32),
+            actual_destination: destination.clone(),
+        };
+        context.progress.begin_transfer(Some(10)).await.unwrap();
+        context
+            .progress
+            .register_staging(TransferStagingOwnership {
+                staging_destination: staging,
+                actual_destination: destination.clone(),
+                staging_owner: context.transfer_id.clone(),
+                staging_token: checkpoint.staging_token.clone(),
+            })
+            .await
+            .unwrap();
+        context.progress.report(TransferProgressUpdate {
+            confirmed_bytes: 5,
+            total_bytes: Some(10),
+            phase: TransferPhase::Transferring,
+            actual_destination: Some(destination.clone()),
+            checkpoint: Some(checkpoint.clone()),
+            activity_sequence: 1,
+        });
+        context.cancellation.cancelled().await;
+        Err(TransferExecutionError::Cancelled {
+            checkpoint: Some(checkpoint),
+            actual_destination: Some(destination),
+        })
+    }
+}
+
+/// 暂停任务保留继续入口和可信断点，普通清理不能移除该任务或暴露单项维护入口。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn paused_transfer_keeps_resume_button_and_survives_history_clear(app: &mut TestAppContext) {
+    use std::time::Duration;
+
+    use gpui_kit::{px, size};
+    use kerminal_application::transfers::{TransferOrigin, TransferQueueOptions, TransferService};
+    use kerminal_domain::files::{ConflictPolicy, TransferKind, TransferRequest, TransferStatus};
+    use tokio_util::sync::CancellationToken;
+
+    let directory = support::remote_endpoint(&HostId::new(), "/srv/target");
+    let (runtime, pane, _, visual) = support::window_fixture(app, directory, |pane| {
+        pane.compact_layout = true;
+        pane.current_terminal_endpoint = Some(pane.panels[1].endpoint.clone());
+        pane.queue_watch_started = true;
+        pane.queue.history_expanded = true;
+    });
+    let transfers = TransferService::new(
+        vec![Arc::new(PausableUiBackend)],
+        runtime.handle().clone(),
+        TransferQueueOptions::default(),
+    )
+    .expect("isolated transfer queue");
+    let origin = TransferOrigin::SharedWorkbench;
+    let paused = runtime.block_on(async {
+        let queued = transfers
+            .enqueue_for_origin(
+                TransferRequest {
+                    source: FileEndpoint::Local {
+                        path: "source.bin".into(),
+                    },
+                    destination: FileEndpoint::Local {
+                        path: "destination.bin".into(),
+                    },
+                    kind: TransferKind::File,
+                    conflict_policy: ConflictPolicy::Rename,
+                    idle_timeout_seconds: None,
+                },
+                origin.clone(),
+                None,
+            )
+            .await
+            .expect("enqueue fixture");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while transfers.get(&queued.id).await.unwrap().bytes_transferred != 5 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            transfers.cancel(&queued.id).await.unwrap();
+            loop {
+                if let Some(summary) = transfers.get_settled(&queued.id).await.unwrap() {
+                    break summary;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("pause settles")
+    });
+    assert_eq!(paused.status, TransferStatus::Cancelled);
+    assert!(paused.resumable);
+    let paused_id = paused.id.clone();
+    assert_eq!(
+        runtime
+            .block_on(transfers.clear_completed_for_origin(&origin, CancellationToken::new()))
+            .unwrap(),
+        (0, 1)
+    );
+    assert!(
+        runtime
+            .block_on(transfers.get_settled(&paused_id))
+            .expect("paused transfer remains in the queue")
+            .expect("paused transfer remains settled")
+            .resumable
+    );
+    visual.update(|_, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.transfers = transfers.clone();
+            pane.transfer_rows = vec![paused];
+            cx.notify();
+        });
+    });
+    visual.simulate_resize(size(px(800.), px(600.)));
+    support::draw(visual);
+    visual.update(|window, _| {
+        assert!(
+            window
+                .debug_selector_bounds(&format!("rr-files-transfer-{paused_id}"))
+                .is_some(),
+            "the paused transfer card is rendered"
+        );
+        let find = |id: String| gpui_kit::base::test_support::find(window, &[], &id.into());
+        assert!(
+            find(format!("files-retry-{paused_id}")).is_some_and(|button| button.visible()),
+            "the paused transfer retains its resume button"
+        );
+        for prefix in [
+            "files-archive-paused",
+            "recovery-inspect",
+            "recovery-locate",
+            "recovery-archive",
+            "recovery-staging",
+        ] {
+            let id = format!("{prefix}-{paused_id}");
+            assert!(
+                find(id.clone()).is_none(),
+                "unexpected maintenance button: {id}"
+            );
+        }
+    });
+    runtime
+        .block_on(transfers.shutdown())
+        .expect("queue shutdown");
+}
+
+/// 单行导航和活动速率适配窄栏；终态撤下过期速率，避免让用户误以为传输仍在进行。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]
@@ -322,14 +806,14 @@ fn compact_sftp_path_and_transfer_rate_fit_narrow_panel(app: &mut TestAppContext
     let mut summary = TransferTask::queued(TransferId::new(), request)
         .expect("fixture endpoints are distinct")
         .summary();
-    summary.status = TransferStatus::Succeeded;
+    summary.status = TransferStatus::Transferring;
     summary.bytes_transferred = 65;
     summary.total_bytes = Some(65);
     summary.speed_bytes_per_second = 2048;
     let transfer_selector = format!("rr-files-transfer-{}", summary.id);
     let speed_selector = format!("rr-files-transfer-speed-{}", summary.id);
     let percent_selector = format!("rr-files-transfer-percent-{}", summary.id);
-    let (runtime, _, _, visual) = support::window_fixture(app, directory, move |pane| {
+    let (runtime, pane, _, visual) = support::window_fixture(app, directory, move |pane| {
         pane.compact_layout = true;
         pane.current_terminal_endpoint = Some(pane.panels[1].endpoint.clone());
         pane.queue_watch_started = true;
@@ -370,10 +854,96 @@ fn compact_sftp_path_and_transfer_rate_fit_narrow_panel(app: &mut TestAppContext
         "transfer rate exceeds the padded row: rate={speed:?}, row={transfer:?}"
     );
     assert!(
-        percent.size.width >= px(24.) && percent.right() <= transfer.right() - px(12.),
+        !percent.is_empty() && percent.right() <= transfer.right() - px(12.),
         "transfer percentage is clipped: percent={percent:?}, row={transfer:?}"
     );
 
+    for status in [TransferStatus::Succeeded, TransferStatus::Failed] {
+        visual.update(|_, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.transfer_rows[0].status = status;
+                cx.notify();
+            });
+        });
+        support::draw(visual);
+        assert!(
+            visual
+                .update(|window, _| window.debug_selector_bounds(&speed_selector))
+                .is_none(),
+            "terminal transfers must not retain a stale rate"
+        );
+        if status == TransferStatus::Succeeded {
+            let completed_percent = visual
+                .update(|window, _| window.debug_selector_bounds(&percent_selector))
+                .expect("completed percentage remains visible");
+            assert!(completed_percent.size.width >= px(24.));
+            assert!(completed_percent.right() <= transfer.right() - px(12.));
+        }
+    }
+
+    let _runtime = runtime;
+}
+
+/// 路径组合期间的 Enter 和跳转不提交，Escape 先结束组合，再允许用户放弃路径草稿。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn path_edit_respects_ime_before_navigation_or_cancel(app: &mut TestAppContext) {
+    use gpui_kit::{EntityInputHandler as _, Focusable as _, px, size};
+
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv");
+    let seeded_directory = directory.clone();
+    let (runtime, pane, _, visual) = support::window_fixture(app, directory, move |pane| {
+        pane.compact_layout = true;
+        pane.queue_watch_started = true;
+        support::seed_compact_listing(pane, seeded_directory, Vec::new());
+    });
+    visual.simulate_resize(size(px(360.), px(600.)));
+    support::draw(visual);
+    let input = visual.update(|_, app| {
+        pane.read(app).panels[1]
+            .path_input
+            .as_ref()
+            .expect("rendered path input")
+            .clone()
+    });
+    visual.update(|window, app| {
+        let focus = input.read(app).focus_handle(app);
+        window.focus(&focus, app);
+        input.update(app, |input, cx| {
+            input.set_value("/srv/", window, cx);
+            input.replace_and_mark_text_in_range(None, "组合目录", None, window, cx);
+            assert!(input.marked_text_range(window, cx).is_some());
+        });
+    });
+    support::draw(visual);
+    let before_generation = visual.update(|_, app| pane.read(app).panels[1].generation);
+    visual.simulate_event(KeyDownEvent {
+        keystroke: Keystroke::parse("enter").expect("valid enter key"),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    support::draw(visual);
+    visual.update(|_, app| {
+        pane.update(app, |pane, cx| pane.commit_path_edit(1, cx));
+        assert_eq!(pane.read(app).panels[1].generation, before_generation);
+        assert!(input.read(app).is_composing());
+    });
+
+    visual.simulate_keystrokes("escape");
+    support::draw(visual);
+    visual.update(|_, app| {
+        assert!(!input.read(app).is_composing());
+        assert_ne!(input.read(app).value().as_ref(), "/srv");
+        assert_eq!(pane.read(app).panels[1].generation, before_generation);
+    });
+    visual.simulate_keystrokes("escape");
+    support::draw(visual);
+    visual.update(|_, app| {
+        assert_eq!(input.read(app).value().as_ref(), "/srv");
+        assert_eq!(pane.read(app).panels[1].generation, before_generation);
+    });
     let _runtime = runtime;
 }
 

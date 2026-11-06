@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 use gpui_kit::{AppContext as _, Context, SharedString};
 use kerminal_application::{
-    AppError, AppResult,
+    AppError, AppResult, PublicErrorCode,
     connections::management::HostManagementService,
     preferences::ProfileService,
     workspace::{
@@ -51,6 +51,9 @@ pub(super) struct WorkspaceTerminalReservation {
 
 impl RootView {
     /// 先登记稳定 pane 身份并返回唯一代次，避免并行功能各自维护临时 session registry。
+    /// 工作台验收仅在准入被拒时记录状态标签与操作身份，不输出工作区内容或改变返回路径。
+    ///
+    /// @author kongweiguang
     pub(super) fn reserve_new_workspace_terminal_tab(
         &mut self,
         mut pane: WorkspaceSessionPane,
@@ -79,6 +82,19 @@ impl RootView {
                     | WorkspacePersistenceState::ReadbackConfirmedUncommitted { .. }
             )
         {
+            #[cfg(feature = "right-rail-acceptance")]
+            if std::env::var_os("KERMINAL_WORKBENCH_ACCEPTANCE").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            {
+                use std::io::Write as _;
+
+                let (persistence, pending_resource) =
+                    self.workbench_acceptance_workspace_admission_state();
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "workbench terminal creation admission rejected: persistence={persistence}, pending_resource={pending_resource:?}"
+                );
+            }
             return Err(crate::locale::text(
                 "工作区有未完成的资源或保存冲突；请先处理后再创建终端。",
                 "The workspace has a pending resource change or save conflict. Resolve it before creating a terminal.",
@@ -635,6 +651,12 @@ impl RootView {
                     }
                 }
                 Err(error) => {
+                    let recoverable_conflict = should_recover_snapshot_conflict(
+                        error.public_code(),
+                        root.workspace_runtime
+                            .pane(&pane_id)
+                            .is_some_and(|pane| pane.last_snapshot_error),
+                    );
                     if !root
                         .workspace_runtime
                         .mark_snapshot_failed(&pane_id, &session_id, token)
@@ -662,6 +684,15 @@ impl RootView {
                         .unwrap_or(false);
                     if follow_up && root.workspace_tab_is_visible(&tab_id) {
                         root.request_workspace_pane_snapshot(tab_id.clone(), pane_id.clone(), cx);
+                    } else if recoverable_conflict && root.workspace_tab_is_visible(&tab_id) {
+                        // 首个 generation 冲突来自生命周期切换；静默重绑一次，不把内部 CAS 竞态弹给用户。
+                        root.request_snapshot_binding_reconcile(
+                            tab_id.clone(),
+                            pane_id.clone(),
+                            session_id.clone(),
+                            cx,
+                        );
+                        root.refresh_workspace_views(cx);
                     } else if root.workspace_tab_is_visible(&tab_id) {
                         root.status = Some(error.public_message().into());
                         root.refresh_workspace_views(cx);
@@ -1444,6 +1475,18 @@ pub(super) fn startup_workspace_terminal_focus_target(
         .filter(|pane_id| layout.contains_pane(pane_id))
         .or_else(|| layout.pane_ids().into_iter().next())?;
     Some((tab_id.clone(), pane_id))
+}
+
+/// 首个快照 Conflict 视为生命周期换代的内部竞态，静默重绑一次；已有失败锁存时仍上报真实错误。
+///
+/// 这样既不让自动重连的瞬时旧 generation 变成用户提示，也避免把持续失败永久吞掉。
+///
+/// @author kongweiguang
+fn should_recover_snapshot_conflict(
+    error_code: PublicErrorCode,
+    last_snapshot_error: bool,
+) -> bool {
+    error_code == PublicErrorCode::Conflict && !last_snapshot_error
 }
 
 #[cfg(test)]

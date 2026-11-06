@@ -5,7 +5,6 @@
 use super::{
     BackgroundFit, InterfaceDensity, ThemeMode,
     panel::{PreferencesPanel, keyboard_platform},
-    render::settings_error_banner,
     render_app_palette::app_color_scheme_choices,
     validate_settings,
 };
@@ -171,7 +170,7 @@ impl PreferencesPanel {
     }
 
     /// 外观面板沿用 main 的列分布，色板选项按其实际容器宽度换行并使用当前明暗预览。
-    /// 背景和应用色板分别进入同一 typed 草稿，继续服从已有保存与恢复门禁。
+    /// 背景和应用色板分别进入同一 typed 草稿；事务错误与恢复由外层固定区域呈现。
     ///
     /// @author kongweiguang
     pub(super) fn render_appearance(
@@ -225,7 +224,7 @@ impl PreferencesPanel {
             })
             .collect();
 
-        let mut body = div()
+        let body = div()
             .id("preferences-appearance")
             .flex_1()
             .w_full()
@@ -526,9 +525,6 @@ impl PreferencesPanel {
                     ),
                     ),
             );
-        if let Some(error) = settings_error_banner(self.settings_error.as_deref(), theme) {
-            body = body.child(error);
-        }
         body.children(issue_rows)
             .children(input_errors)
             .child(self.render_save_notice(theme))

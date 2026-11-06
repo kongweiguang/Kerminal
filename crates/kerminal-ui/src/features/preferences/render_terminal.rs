@@ -184,7 +184,7 @@ impl PreferencesPanel {
         configure_number(&inputs.sftp_idle_timeout, 30., 3_600., 1., window, cx);
     }
 
-    /// 围绕同一终端预览组织外观、光标和操作；单列分组避免无关区域互相撑高，所有控件仍写入唯一自动保存草稿。
+    /// 围绕同一终端预览组织外观、光标和操作；事务错误只留在固定底栏，所有控件写入唯一草稿。
     ///
     /// @author kongweiguang
     pub(super) fn render_terminal(
@@ -517,11 +517,7 @@ impl PreferencesPanel {
                                 )
                             })
                             .map(|(_, message)| super::render_settings::issue_row(message, theme)),
-                    )
-                    .children(super::render::settings_error_banner(
-                        self.settings_error.as_deref(),
-                        theme,
-                    )),
+                    ),
             );
 
         div()
@@ -565,7 +561,7 @@ impl PreferencesPanel {
         )
     }
 
-    /// 固定状态区只投影真实草稿状态，输入错误与待保存不显示成功；确定失败才允许调用原保存用例重试。
+    /// 固定状态区只投影真实草稿状态，输入错误与待保存不显示成功；恢复按钮与其它页面共用同一门禁。
     /// @author kongweiguang
     fn render_terminal_save_status(
         &self,
@@ -635,23 +631,9 @@ impl PreferencesPanel {
                 row.child(gpui_kit::component::Icon::new(IconName::Check).size_3())
             })
             .child(div().flex_1().min_w_0().child(message))
-            .when(
-                state == Some(DraftStatus::Failed)
-                    && dirty
-                    && !invalid
-                    && !self.settings_controls_locked(),
-                |row| {
-                    row.child(
-                        Button::new("terminal-retry-save")
-                            .small()
-                            .outline()
-                            .label(crate::locale::text("重试保存", "Retry save"))
-                            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                panel.save_settings(cx);
-                            })),
-                    )
-                },
-            )
+            .when_some(self.render_save_recovery_action(cx), |row, action| {
+                row.child(action)
+            })
     }
 }
 

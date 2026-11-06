@@ -759,10 +759,61 @@ fn split_commits_only_after_resource_success_and_failure_can_be_discarded() {
     );
 }
 
-/// 指定主机分屏只生成独立 target pane，失败仍复用 CreatePane 的重试/放弃边界。
+/// 未报告实时目录的 shell 仍使用原参数；公开分屏入口不能绕过已有资源操作门禁。
+///
+/// @author kongweiguang
+#[test]
+fn split_without_live_directory_preserves_saved_directory_and_pending_guard() {
+    for current_cwd in [None, Some("")] {
+        let mut snapshot = one_terminal_snapshot();
+        snapshot.terminal_panes[0].cwd = Some("C:/startup".to_owned());
+        snapshot.terminal_panes[0].current_cwd = Some("C:/last-known".to_owned());
+        let mut controller = WorkspaceController::from_loaded(
+            document_for(&snapshot),
+            WorkspaceSessionRevision::new("revision-a"),
+        )
+        .unwrap();
+        let WorkspaceControllerEffect::ResourceOperation(operation) = controller
+            .begin_split(
+                &tab_id("tab-a"),
+                &pane_id("pane-a"),
+                SplitDirection::Horizontal,
+                true,
+                current_cwd,
+            )
+            .unwrap()
+        else {
+            panic!("split must create a resource candidate");
+        };
+        let WorkspaceResourceOperation::CreatePane { pane, .. } = &operation else {
+            panic!("split must create a pane");
+        };
+        assert_eq!(pane.cwd.as_deref(), Some("C:/startup"));
+        assert_eq!(pane.current_cwd.as_deref(), Some("C:/last-known"));
+        assert!(
+            controller
+                .begin_split(
+                    &tab_id("tab-a"),
+                    &pane_id("pane-a"),
+                    SplitDirection::Vertical,
+                    false,
+                    Some("C:/another"),
+                )
+                .is_err()
+        );
+        assert_eq!(controller.pending_resource_operation(), Some(&operation));
+        assert_eq!(controller.snapshot(), &snapshot);
+    }
+}
+
+/// 指定主机分屏清除来源目录并生成独立 target pane，失败仍复用 CreatePane 的重试/放弃边界。
+///
+/// @author kongweiguang
 #[test]
 fn explicit_host_split_uses_target_parameters_and_keeps_failure_recoverable() {
-    let snapshot = one_terminal_snapshot();
+    let mut snapshot = one_terminal_snapshot();
+    snapshot.terminal_panes[0].cwd = Some("C:/source-startup".to_owned());
+    snapshot.terminal_panes[0].current_cwd = Some("C:/source-current".to_owned());
     let mut controller = WorkspaceController::from_loaded(
         document_for(&snapshot),
         WorkspaceSessionRevision::new("revision-a"),
@@ -806,6 +857,7 @@ fn explicit_host_split_uses_target_parameters_and_keeps_failure_recoverable() {
     assert_eq!(pane.machine_id, host_id.as_str());
     assert_eq!(pane.shell, None);
     assert_eq!(pane.cwd, None);
+    assert_eq!(pane.current_cwd, None);
     assert_eq!(pane.output_history, None);
     assert_eq!(controller.snapshot().terminal_panes.len(), 1);
     assert_eq!(

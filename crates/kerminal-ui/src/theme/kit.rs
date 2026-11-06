@@ -2,13 +2,14 @@
 //!
 //! @author kongweiguang
 
-use gpui_kit::{component::Theme as KitTheme, px};
+use gpui_kit::component::Theme as KitTheme;
 
-use super::ThemeTokens;
+use super::{ThemeTokens, UI_TRANSITION_DURATION};
 
 /// Kit 控件含派生按钮状态均从产品语义色板投影，避免已解析的默认按钮色残留在新主题中。
 /// Windows 普通界面延续旧 CSS 的 Segoe UI 优先级，终端字体仍独立控制。
-/// 保持 Kit 的 16px rem 基准，使 text_sm/text_xs 解析为 14px/12px，避免 14px 基准将常用控件缩到 12.25px/10.5px；应用正文与终端字号仍由各自令牌和配置控制。
+/// Kit 默认 16px rem，应用仅同步几何角色，不在切换配色时覆盖用户文字缩放；终端字号仍由独立配置控制。
+/// 标准浮层采用与工作台相同的短过渡，减少动态效果仍由 Kit 和系统能力决定。
 /// 统一关闭外扩聚焦光晕，覆盖普通、密码、多行、数字与组合输入；沿用 Kit 的聚焦细边框，兼顾紧凑布局和键盘焦点辨识。
 ///
 /// @author kongweiguang
@@ -139,9 +140,9 @@ pub(super) fn apply_kit_palette(theme: &mut KitTheme, tokens: ThemeTokens) {
     colors.link = tokens.accent;
     colors.link_hover = tokens.accent;
     colors.link_active = tokens.accent;
-    theme.radius = px(7.);
-    theme.radius_lg = px(8.);
-    theme.font_size = px(16.);
+    theme.radius = tokens.control_radius;
+    theme.radius_lg = tokens.radius_dialog;
+    theme.motion.duration_normal = UI_TRANSITION_DURATION;
     #[cfg(target_os = "windows")]
     if theme.font_family != "Segoe UI" {
         // Windows 延续旧 CSS 的 Latin 字体优先级，并让 DirectWrite 为中文选择匹配字形；只在 Kit 重置为系统默认时覆盖。

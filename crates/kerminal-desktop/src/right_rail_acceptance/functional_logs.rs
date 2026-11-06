@@ -397,6 +397,7 @@ pub(super) async fn run(
 
 /// 通过真实按钮点击验证复制及未提交填入，始终限定本轮 fixture 的记录、终端和光标。
 /// 成功提示会挤占列表空间，须在布局稳定后核对反馈与完整行，防止被动重排误作废操作。
+/// 本轮隔离输入核验后用 Ctrl+C 建立新提示符；仅清除 readline 文字不足以结束旧输入代次。
 ///
 /// @author kongweiguang
 async fn verify_copy_and_fill(
@@ -500,8 +501,8 @@ async fn verify_copy_and_fill(
         if !focused {
             return Err(io::Error::other("原 fixture 终端焦点已变化，拒绝清除输入"));
         }
-        let keystroke = Keystroke::parse("ctrl-u")
-            .map_err(|error| io::Error::other(format!("无法构造 Ctrl+U: {error}")))?;
+        let keystroke = Keystroke::parse("ctrl-c")
+            .map_err(|error| io::Error::other(format!("无法构造 Ctrl+C: {error}")))?;
         let _ = window.dispatch_event(
             KeyDownEvent {
                 keystroke: keystroke.clone(),

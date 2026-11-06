@@ -2,11 +2,11 @@
 //!
 //! @author kongweiguang
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gpui_kit::{Context, IntoElement, Render, Window, div, prelude::*, px};
 
-const TRANSITION_DURATION: Duration = Duration::from_millis(140);
+use crate::theme::UI_TRANSITION_DURATION as TRANSITION_DURATION;
 
 /// 仅保存布局已决定的可见性，动画进度不能反向影响空间预算或面板归属。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -64,6 +64,7 @@ fn navigation_rows_leave_hover_style_to_kit_render() {
         for selected in [false, true] {
             let metrics = super::host_navigation_layout_metrics(
                 kerminal_application::preferences::InterfaceDensity::Compact,
+                gpui_kit::px(16.),
             );
             let _ =
                 super::navigation_row_button("navigation-style-probe", selected, theme, metrics)
@@ -78,7 +79,7 @@ fn navigation_rows_leave_hover_style_to_kit_render() {
 fn sidebar_density_matches_main_navigation_geometry() {
     use kerminal_application::preferences::InterfaceDensity;
 
-    let compact = host_navigation_layout_metrics(InterfaceDensity::Compact);
+    let compact = host_navigation_layout_metrics(InterfaceDensity::Compact, gpui_kit::px(16.));
     assert_eq!(
         (
             compact.control_height,
@@ -88,10 +89,11 @@ fn sidebar_density_matches_main_navigation_geometry() {
             compact.row_gap,
             compact.icon_size,
         ),
-        (28., 40., 32., 7., 8., 28.)
+        (32., 40., 32., 7., 8., 28.)
     );
 
-    let comfortable = host_navigation_layout_metrics(InterfaceDensity::Comfortable);
+    let comfortable =
+        host_navigation_layout_metrics(InterfaceDensity::Comfortable, gpui_kit::px(16.));
     assert_eq!(
         (
             comfortable.control_height,
@@ -101,10 +103,10 @@ fn sidebar_density_matches_main_navigation_geometry() {
             comfortable.row_gap,
             comfortable.icon_size,
         ),
-        (32., 48., 32., 10., 10., 30.)
+        (36., 48., 32., 10., 10., 30.)
     );
 
-    let spacious = host_navigation_layout_metrics(InterfaceDensity::Spacious);
+    let spacious = host_navigation_layout_metrics(InterfaceDensity::Spacious, gpui_kit::px(16.));
     assert_eq!(
         (
             spacious.control_height,
@@ -114,8 +116,27 @@ fn sidebar_density_matches_main_navigation_geometry() {
             spacious.row_gap,
             spacious.icon_size,
         ),
-        (36., 54., 32., 12., 12., 32.)
+        (40., 54., 32., 12., 12., 32.)
     );
+}
+
+/// 放大界面字体时，主机双行、分组行与工具栏必须按相同尺度增长，避免文字挤出命中区域。
+///
+/// @author kongweiguang
+#[test]
+fn sidebar_density_scales_geometry_with_interface_text() {
+    use kerminal_application::preferences::InterfaceDensity;
+
+    let normal = host_navigation_layout_metrics(InterfaceDensity::Compact, gpui_kit::px(16.));
+    let enlarged = host_navigation_layout_metrics(InterfaceDensity::Compact, gpui_kit::px(24.));
+    assert_eq!(enlarged.control_height, normal.control_height * 1.5);
+    assert_eq!(enlarged.row_height, normal.row_height * 1.5);
+    assert_eq!(
+        enlarged.group_header_height,
+        normal.group_header_height * 1.5
+    );
+    assert_eq!(enlarged.icon_size, normal.icon_size * 1.5);
+    assert_eq!(enlarged.list_padding_x, normal.list_padding_x * 1.5);
 }
 
 /// 只构造导航筛选所需的完整 managed host 快照，备注为空以保持筛选样例不含额外语义。
@@ -338,7 +359,7 @@ fn group_row_hit_area_does_not_increase_navigation_density() {
             32.0,
         ),
     ] {
-        let metrics = super::host_navigation_layout_metrics(density);
+        let metrics = super::host_navigation_layout_metrics(density, gpui_kit::px(16.));
         assert_eq!(metrics.group_header_height, expected_group_height);
         assert!(metrics.group_header_height < metrics.row_height);
     }

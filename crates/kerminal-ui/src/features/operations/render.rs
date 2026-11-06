@@ -34,6 +34,7 @@ impl Render for OperationsView {
     /// 完整工作台保留公共导航与材质；紧凑工具使用 main 的独立面板表面，不能覆盖宿主为工作台底色。
     /// 两种宿主共享数据与请求生命周期；中性右栏配色只使用局部令牌副本，不修改全局主题。
     /// 紧凑容器详情已消费结构化回执，不再追加完整工作台的同一份原始输出卡。
+    /// 固定运维工具由共享密度提供边距，避免各面板缩放时出现不同的内容起点。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -164,7 +165,7 @@ impl Render for OperationsView {
             root = root
                 .gap_2()
                 .overflow_hidden()
-                .p_3()
+                .p(theme.metrics.panel_padding)
                 .when(!dedicated_header, |root| {
                     root.child(self.render_header(theme, cx))
                 })
@@ -556,6 +557,7 @@ fn container_detail_row(
 }
 
 /// 完整 ID 单独使用等宽字族；其它值不因技术内容而改变 main 的正文排版。
+/// 已读快照中的空字符串与缺省值统一显示短横线，不把空白误作加载中，也不猜测容器用户。
 ///
 /// @author kongweiguang
 fn container_detail_value(
@@ -566,7 +568,11 @@ fn container_detail_value(
 ) -> impl IntoElement + 'static {
     let label = label.into();
     let value: String = value.into();
-    let display_value = add_container_detail_soft_breaks(&value);
+    let display_value = if value.trim().is_empty() {
+        "-".to_owned()
+    } else {
+        add_container_detail_soft_breaks(&value)
+    };
     div()
         .w_full()
         .min_w_0()

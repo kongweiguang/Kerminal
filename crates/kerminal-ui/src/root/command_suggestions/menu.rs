@@ -19,7 +19,8 @@ use kerminal_domain::commands::{CommandSuggestionCandidate, SuggestionProviderKi
 use super::TerminalSuggestionQueryState;
 use crate::theme::ThemeTokens;
 
-const MAX_MENU_HEIGHT: f32 = 240.0;
+const MAX_MENU_ROWS_REM: f32 = 15.0;
+const MAX_MENU_REM: f32 = 18.0;
 
 /// Root 提供短期只读候选快照；候选业务状态与接受权限不会复制到菜单。
 #[derive(Clone, Debug, PartialEq)]
@@ -295,6 +296,7 @@ impl TerminalCommandSuggestionMenu {
     }
 
     /// 菜单仅展示投影文本；截断和有界悬浮说明避免长候选挤占来源与其他操作。
+    /// 列表上限跟随界面字体缩放，高亮使用共享的选中表面并保持行几何稳定。
     ///
     /// @author kongweiguang
     fn render_content(&mut self, theme: ThemeTokens, cx: &mut Context<Self>) -> AnyElement {
@@ -370,7 +372,7 @@ impl TerminalCommandSuggestionMenu {
                 let generation = self.projection.request_generation;
                 let mut rows = div()
                     .id("suggestion-menu-candidates")
-                    .max_h(px(MAX_MENU_HEIGHT))
+                    .max_h(gpui_kit::rems(MAX_MENU_ROWS_REM))
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
@@ -388,7 +390,11 @@ impl TerminalCommandSuggestionMenu {
                     let provider = provider_label(candidate.provider);
                     let activation = candidate.activation;
                     let sensitivity = candidate.sensitivity;
-                    let row_background = if selected { theme.sidebar } else { theme.panel };
+                    let row_background = if selected {
+                        theme.surface_selected()
+                    } else {
+                        theme.panel
+                    };
                     let row_id = format!(
                         "suggestion-menu-candidate-{generation}-{}:{}:{selection_key:?}",
                         candidate.id.len(),
@@ -407,16 +413,10 @@ impl TerminalCommandSuggestionMenu {
                         .w_full()
                         .px_3()
                         .py_2()
-                        .rounded_md()
+                        .rounded(theme.control_radius)
                         .bg(row_background)
-                        .border_1()
-                        .border_color(if selected {
-                            theme.accent
-                        } else {
-                            row_background
-                        })
                         .when(!selected, |row| {
-                            row.hover(|style| style.bg(theme.hover).border_color(theme.hover))
+                            row.hover(|style| style.bg(theme.surface_hover()))
                         })
                         .on_click(cx.listener(move |menu, _: &ClickEvent, _, cx| {
                             if menu.selection.candidate_ids.get(index) == Some(&candidate_id)
@@ -447,13 +447,13 @@ impl TerminalCommandSuggestionMenu {
                                         .tooltip({
                                             let text = bounded_tooltip_text(&display_text);
                                             move |window, cx| {
-                                                let width = (window.viewport_size().width
-                                                    - px(32.))
-                                                .max(px(0.))
-                                                .min(px(360.));
+                                                let size = suggestion_tooltip_max_size(
+                                                    window.viewport_size(),
+                                                    window.rem_size(),
+                                                );
                                                 Tooltip::new(text.clone())
-                                                    .max_w(width)
-                                                    .max_h(px(160.))
+                                                    .max_w(size.width)
+                                                    .max_h(size.height)
                                                     .overflow_hidden()
                                                     .build(window, cx)
                                             }
@@ -487,12 +487,13 @@ impl TerminalCommandSuggestionMenu {
                                 .text_size(theme.text_xs)
                                 .text_color(theme.muted)
                                 .tooltip(move |window, cx| {
-                                    let width = (window.viewport_size().width - px(32.))
-                                        .max(px(0.))
-                                        .min(px(360.));
+                                    let size = suggestion_tooltip_max_size(
+                                        window.viewport_size(),
+                                        window.rem_size(),
+                                    );
                                     Tooltip::new(tooltip_text.clone())
-                                        .max_w(width)
-                                        .max_h(px(160.))
+                                        .max_w(size.width)
+                                        .max_h(size.height)
                                         .overflow_hidden()
                                         .build(window, cx)
                                 })
@@ -524,7 +525,9 @@ impl TerminalCommandSuggestionMenu {
 }
 
 impl Render for TerminalCommandSuggestionMenu {
-    /// 明暗主题共用 Kit 令牌；菜单仅在 Root 持有的活动投影范围内可见。
+    /// 明暗主题共用浮层与面板头令牌；视口和字号共同约束尺寸，不改变终端焦点及目标。
+    ///
+    /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.projection.state == TerminalSuggestionQueryState::Closed {
             return div().id("suggestion-menu-closed");
@@ -535,25 +538,18 @@ impl Render for TerminalCommandSuggestionMenu {
             .id("terminal-command-suggestion-menu")
             .debug_selector(|| "terminal-command-suggestion-menu".to_owned())
             .w_full()
-            .max_h(px(MAX_MENU_HEIGHT + 48.))
+            .max_h((window.rem_size() * MAX_MENU_REM).min(window.viewport_size().height))
             .flex()
             .flex_col()
             .overflow_hidden()
-            .rounded_lg()
+            .rounded(theme.radius_panel)
             .border_1()
-            .border_color(theme.muted)
+            .border_color(theme.border)
             .bg(theme.panel)
             .text_color(theme.foreground)
             .child(
-                div()
+                crate::ui_surface::panel_header(theme)
                     .w_full()
-                    .flex_shrink_0()
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .bg(theme.sidebar)
                     .child(
                         div()
                             .min_w_0()
@@ -619,6 +615,19 @@ impl Render for TerminalCommandSuggestionMenu {
                 },
             )
     }
+}
+
+/// 说明层按当前窗口与 rem 缩放并留出边距，避免长命令或说明在小窗口越界。
+///
+/// @author kongweiguang
+fn suggestion_tooltip_max_size(
+    viewport: gpui_kit::Size<gpui_kit::Pixels>,
+    rem: gpui_kit::Pixels,
+) -> gpui_kit::Size<gpui_kit::Pixels> {
+    gpui_kit::size(
+        (viewport.width - rem * 2.).max(px(0.)).min(rem * 22.5),
+        (viewport.height - rem * 2.).max(px(0.)).min(rem * 10.),
+    )
 }
 
 /// 历史提供方的固定说明与来源标签重复；其他说明保留，以免隐藏实际上下文。

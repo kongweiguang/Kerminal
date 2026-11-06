@@ -681,6 +681,23 @@ impl RootView {
             return true;
         }
 
+        // 已退出或断开的终端没有可写 PTY；字符与回车不再静默丢弃，直接把唯一恢复入口告诉用户。
+        if matches!(
+            terminal_event.map(|key| key.key),
+            Some(TerminalKey::Character(_) | TerminalKey::Enter)
+        ) && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.super_key
+        {
+            self.status = Some(crate::locale::text(
+                "终端未连接，历史内容只读；点击标题栏的重新连接可恢复输入。",
+                "The terminal is not connected and its history is read-only; click Reconnect in the title bar to resume typing.",
+            ));
+            cx.notify();
+            self.keybinding_runtime.clear_pending();
+            return true;
+        }
+
         match resolve_terminal_shortcut(&mut self.keybinding_runtime, event, false) {
             keybindings::KeybindingDispatch::Unhandled => false,
             keybindings::KeybindingDispatch::Pending => true,

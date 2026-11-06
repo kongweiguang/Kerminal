@@ -14,8 +14,9 @@ use kerminal_domain::{
 };
 
 use super::{
-    hidden_attention_count, is_clearable_history, needs_attention_or_is_active,
-    project_transfer_queue, recovery_actions_row, transfer_percent,
+    can_pause_transfer, can_resume_transfer, hidden_attention_count, is_clearable_history,
+    is_paused, needs_attention_or_is_active, orphan_recovery_records, project_transfer_queue,
+    transfer_percent,
 };
 
 /// 通过真实领域摘要保留 UI 投影依赖的字段形状，避免手工构造不一致 DTO。
@@ -72,6 +73,36 @@ fn collapsed_history_hides_rows_without_changing_counts() {
     }
 }
 
+/// 可恢复取消显示待处理并继续原任务；普通取消、失败和提交阶段保留各自语义。
+///
+/// @author kongweiguang
+#[test]
+fn pause_and_resume_require_the_relevant_transfer_state() {
+    let mut task = summary(TransferStatus::Cancelled, None, false);
+    assert!(!is_paused(&task));
+    assert!(!can_resume_transfer(&task));
+    assert!(is_clearable_history(&task));
+    task.resumable = true;
+    assert!(is_paused(&task));
+    assert!(can_resume_transfer(&task));
+    assert!(!is_clearable_history(&task));
+    assert!(needs_attention_or_is_active(&task));
+    task.status = TransferStatus::Failed;
+    assert!(!is_paused(&task));
+    assert!(can_resume_transfer(&task));
+    task.resumable = false;
+    assert!(!can_resume_transfer(&task));
+    task.status = TransferStatus::Transferring;
+    assert!(!can_pause_transfer(&task));
+    task.bytes_transferred = 1;
+    assert!(can_pause_transfer(&task));
+    task.request.kind = TransferKind::Directory;
+    assert!(!can_pause_transfer(&task));
+    task.request.kind = TransferKind::File;
+    task.status = TransferStatus::Committing;
+    assert!(!can_pause_transfer(&task));
+}
+
 /// 隐藏的未知提交与恢复材料按任务去重提示，仍不得计入可清理历史。
 ///
 /// @author kongweiguang
@@ -84,6 +115,7 @@ fn collapsed_history_reports_hidden_attention_without_clearing_it() {
     );
     let recovery = TransferRecoveryRecord {
         id: pending.id.clone(),
+        origin: None,
         drag_staging: false,
         request: pending.request.clone(),
         actual_destination: None,
@@ -186,23 +218,46 @@ fn expanded_history_preserves_all_queue_rows_in_order() {
     assert_eq!(projection.active_or_attention_count, 2);
 }
 
-/// 操作区独立占满内容行并允许换行，新增按钮不能再次挤占恢复目标的标题行。
-/// 这里只断言实际绘制容器的样式投影；窄栏文字和未知状态仍须当前候选实窗确认。
+/// 同一任务在实时摘要与恢复记录中各出现一次时只渲染一张卡片；
+/// 只有没有实时摘要的孤儿记录才单独成行。
 ///
 /// @author kongweiguang
 #[test]
-fn recovery_actions_keep_an_independent_wrappable_row() {
-    use gpui_kit::{AlignItems, FlexDirection, FlexWrap, Styled, px};
-
-    let mut actions = recovery_actions_row();
-    let style = actions.style();
-
-    assert_eq!(style.flex_direction, Some(FlexDirection::Row));
-    assert_eq!(style.flex_wrap, Some(FlexWrap::Wrap));
-    assert_eq!(style.align_items, Some(AlignItems::Center));
-    assert_eq!(style.min_size.width, Some(px(0.).into()));
-    assert!(
-        style.size.width.is_some(),
-        "actions reserve their own full row"
+fn recovery_records_only_render_when_their_summary_is_absent() {
+    let pending = summary(
+        TransferStatus::Failed,
+        Some(TransferFailureKind::CommitUnknown),
+        true,
     );
+    let linked = TransferRecoveryRecord {
+        id: pending.id.clone(),
+        origin: None,
+        drag_staging: false,
+        request: pending.request.clone(),
+        actual_destination: None,
+        checkpoint: None,
+        staging_ownership: Vec::new(),
+        cleanup_pending: true,
+        commit_unknown: true,
+        inspection: TransferRecoveryInspection::Insufficient,
+        archived: false,
+    };
+    let orphan = TransferRecoveryRecord {
+        id: TransferId::new(),
+        ..linked.clone()
+    };
+
+    let merged = orphan_recovery_records(
+        std::slice::from_ref(&linked),
+        std::slice::from_ref(&pending),
+    );
+    assert!(
+        merged.is_empty(),
+        "the summary card already represents this recovery record"
+    );
+
+    let records = [linked, orphan.clone()];
+    let standalone = orphan_recovery_records(&records, &[pending]);
+    assert_eq!(standalone.len(), 1);
+    assert_eq!(standalone[0].id, orphan.id);
 }

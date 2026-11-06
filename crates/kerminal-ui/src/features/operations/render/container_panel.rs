@@ -3,7 +3,7 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    AnyElement, ClickEvent, Context, InteractiveElement as _, IntoElement,
+    AnyElement, ClickEvent, Context, InteractiveElement as _, IntoElement, SharedString,
     StatefulInteractiveElement as _,
     base::Selectable as _,
     component::{
@@ -16,7 +16,7 @@ use gpui_kit::{
     },
     div,
     prelude::*,
-    px,
+    px, relative,
 };
 use kerminal_domain::{
     identity::HostId,
@@ -43,19 +43,21 @@ enum ContainerRowActivation {
     Enter,
 }
 
-/// 列表首击立即进入详情；仅运行中容器的键盘 Enter/Space 直接进入终端。
-/// 鼠标双击不再另设终端入口：首击切页后第二击会落到新页面，无法稳定命中同一行。
+/// 列表首击和空格进入详情；仅运行中容器的 Enter 沿用直接进入终端的快捷入口。
+/// 鼠标双击不另设终端入口：首击切页后第二击会落到新页面，无法稳定命中同一行。
 ///
 /// @author kongweiguang
 fn container_row_activation(
     project_detail: bool,
-    keyboard: bool,
+    event: &ClickEvent,
     status: ContainerStatus,
 ) -> ContainerRowActivation {
     if project_detail {
         return ContainerRowActivation::Inspect;
     }
-    if keyboard && status == ContainerStatus::Running {
+    if matches!(event, ClickEvent::Keyboard(click) if click.button == gpui_kit::KeyboardButton::Enter)
+        && status == ContainerStatus::Running
+    {
         return ContainerRowActivation::Enter;
     }
     ContainerRowActivation::Inspect
@@ -538,8 +540,8 @@ fn render_host(
     }
 }
 
-/// 宿主列表只展示当前 binding/runtime 的数据；Compose 标题与展开子行共用卡片边界，避免视觉上失去项目归属。
-/// 搜索框通过 Styled 设置单行高度；无实际反馈时不插入空节点，以免刷新改变列表的 flex 间距。
+/// 宿主列表只展示当前 binding/runtime 的数据；页头和筛选共用工具面板密度与对齐边界。
+/// 同目标刷新不插入临时占位，长主机名与摘要可通过提示查看完整内容。
 ///
 /// @author kongweiguang
 fn render_host_list(
@@ -597,8 +599,9 @@ fn render_host_list(
         .compact()
         .dropdown_caret(true)
         .w_full()
+        .h(theme.metrics.control_height)
         .accessibility_label(runtime_label)
-        .child(container_selector_label(runtime_label))
+        .child(container_selector_label(runtime_label, theme))
         .dropdown_menu(move |mut menu, _, _| {
             menu = crate::ui_popup::dropdown_menu(menu, runtime_menu_theme);
             for (option, label) in [
@@ -629,8 +632,9 @@ fn render_host_list(
         .compact()
         .dropdown_caret(true)
         .w_full()
-        .accessibility_label(group_label)
-        .child(container_selector_label(group_label))
+        .h(theme.metrics.control_height)
+        .accessibility_label(group_label.clone())
+        .child(container_selector_label(group_label, theme))
         .dropdown_menu(move |mut menu, _, _| {
             menu = crate::ui_popup::dropdown_menu(menu, group_menu_theme);
             for mode in [
@@ -667,12 +671,16 @@ fn render_host_list(
                 .unwrap_or_else(|| host_id.as_str().into())
         },
     );
+    let host_tooltip = host_name.clone();
+    let summary_tooltip = summary.clone();
     let refresh_ticket = ticket.clone();
     let refresh_button = icon_button(
         "container-panel-refresh",
         gpui_kit::assets::IconName::RefreshCw,
         crate::locale::text("刷新容器列表", "Refresh containers"),
     )
+    .w(theme.metrics.control_height)
+    .h(theme.metrics.control_height)
     .debug_selector(|| "rr-containers-refresh".to_owned())
     .loading(loading)
     .loading_icon(gpui_kit::assets::IconName::RefreshCw)
@@ -686,10 +694,14 @@ fn render_host_list(
         .flex_col()
         .gap_2()
         .child(
-            div()
+            crate::ui_surface::panel_header(theme)
+                .id("container-panel-header")
                 .w_full()
                 .flex_col()
-                .gap_3()
+                .items_stretch()
+                .gap_2()
+                .px_0()
+                .pt_0()
                 .child(
                     div()
                         .w_full()
@@ -700,9 +712,17 @@ fn render_host_list(
                         .child(
                             div().min_w_0().flex_1().flex().flex_col().gap_1().child(
                                 div()
+                                    .id(format!(
+                                        "container-panel-host-name-{}",
+                                        cx.entity_id().as_u64()
+                                    ))
                                     .truncate()
                                     .text_size(theme.text_sm)
                                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .aria_label(host_name.clone())
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(host_tooltip.clone()).build(window, cx)
+                                    })
                                     .child(host_name),
                             ),
                         )
@@ -710,17 +730,23 @@ fn render_host_list(
                 )
                 .child(
                     div()
+                        .id(format!(
+                            "container-panel-summary-{}",
+                            cx.entity_id().as_u64()
+                        ))
                         .w_full()
                         .min_w_0()
-                        .h(px(18.))
+                        .min_h_4()
                         .text_size(theme.text_xs)
                         .text_color(theme.muted)
+                        .truncate()
+                        .when(!summary_tooltip.is_empty(), |row| {
+                            row.tooltip(move |window, cx| {
+                                Tooltip::new(summary_tooltip.clone()).build(window, cx)
+                            })
+                        })
                         .child(summary),
-                )
-                .border_1()
-                .border_color(theme.border)
-                .rounded_xl()
-                .p_3(),
+                ),
         )
         .child(
             div()
@@ -732,10 +758,10 @@ fn render_host_list(
                         Input::new(&inputs.container_search)
                             .prefix(gpui_kit::assets::IconName::Search)
                             .w_full(),
-                        px(36.),
+                        theme.metrics.control_height,
                     )
-                    .text_size(px(16.))
-                    .line_height(px(24.)),
+                    .text_size(theme.text_sm)
+                    .line_height(relative(1.5)),
                 )
                 .child(
                     div()
@@ -752,7 +778,7 @@ fn render_host_list(
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .h(px(36.))
+                        .h(theme.metrics.control_height)
                         .px_3()
                         .rounded_xl()
                         .border_1()
@@ -776,12 +802,35 @@ fn render_host_list(
         .children(view.compact_operation_feedback(theme))
         .children(container_success_notice(view, theme))
         .when(show_list_feedback, |body| {
-            body.child(super::section_feedback(
-                &view.containers,
-                empty_result,
-                crate::locale::text("尚未读取容器列表。", "Container list has not been loaded."),
-                theme,
-            ))
+            if view.containers.phase() == super::super::state::SectionPhase::Ready
+                && view.containers.error().is_none()
+                && empty_result
+            {
+                let message = if view.container_search.trim().is_empty() && include_stopped {
+                    crate::locale::text("暂无容器", "No containers")
+                } else {
+                    crate::locale::text(
+                        "没有符合当前筛选的容器",
+                        "No containers match the current filters",
+                    )
+                };
+                body.child(
+                    div()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(message),
+                )
+            } else {
+                body.child(super::section_feedback(
+                    &view.containers,
+                    empty_result,
+                    crate::locale::text(
+                        "尚未读取容器列表。",
+                        "Container list has not been loaded.",
+                    ),
+                    theme,
+                ))
+            }
         });
 
     let mut container_list = div().w_full().min_w_0().flex().flex_col().gap_1p5();
@@ -1138,27 +1187,28 @@ fn container_status_group_label(status: ContainerStatus) -> gpui_kit::SharedStri
     }
 }
 
-/// 控件文案保持与宿主工具分组选项一致。
+/// 分组菜单与当前界面语言同步，避免切换语言后只改变部分选项。
 ///
 /// @author kongweiguang
-fn container_group_mode_label(mode: ContainerHostGroupMode) -> &'static str {
+fn container_group_mode_label(mode: ContainerHostGroupMode) -> SharedString {
     match mode {
-        ContainerHostGroupMode::Compose => "Compose",
-        ContainerHostGroupMode::Status => "状态",
-        ContainerHostGroupMode::Flat => "平铺",
+        ContainerHostGroupMode::Compose => "Compose".into(),
+        ContainerHostGroupMode::Status => crate::locale::text("状态", "Status"),
+        ContainerHostGroupMode::Flat => crate::locale::text("平铺", "Flat"),
     }
 }
 
-/// Compact Button 会重设内部 label 字号；把 main 的 16/24/400 规格落在可见文字节点上。
+/// 选择器显式继承工具栏文字尺度，避免 Kit 紧凑按钮覆盖共享密度和界面缩放。
 ///
 /// @author kongweiguang
-fn container_selector_label(label: &'static str) -> AnyElement {
+fn container_selector_label(label: impl Into<SharedString>, theme: ThemeTokens) -> AnyElement {
+    let label: SharedString = label.into();
     div()
         .min_w_0()
         .whitespace_nowrap()
         .text_ellipsis()
-        .text_size(px(16.))
-        .line_height(px(24.))
+        .text_size(theme.text_sm)
+        .line_height(relative(1.5))
         .font_weight(gpui_kit::FontWeight::NORMAL)
         .child(label)
         .into_any_element()
@@ -1359,11 +1409,11 @@ fn render_host_container_row(
     } else if container.status == ContainerStatus::Running {
         crate::locale::text(
             format!(
-                "容器 {}，{}，单击查看详情，按 Enter 进入终端",
+                "容器 {}，{}，单击或按空格查看详情，按 Enter 进入终端",
                 container.name, status_label
             ),
             format!(
-                "Container {}; {}; click for details or press Enter to open a terminal",
+                "Container {}; {}; click or press Space for details; press Enter to open a terminal",
                 container.name, status_label
             ),
         )
@@ -1376,7 +1426,7 @@ fn render_host_container_row(
             ),
         )
     };
-    // 名称、状态和副标题同属一个语义按钮；片段点击、键盘 Enter/Space 与应用内其它行一致。
+    // 名称、状态和副标题同属一个语义按钮；空格执行详情，Enter 保留既有终端快捷入口。
     // 单击立即进入详情，不再承诺双击进入终端，避免首击已切页后第二击落到新页面。
     let info = Button::new(format!("container-row-{row_id}"))
         .compact()
@@ -1393,7 +1443,7 @@ fn render_host_container_row(
             if !view.container_action_ticket_is_current(&info_ticket, Some(&info_target)) {
                 return;
             }
-            match container_row_activation(info_project_detail, event.is_keyboard(), info_status) {
+            match container_row_activation(info_project_detail, event, info_status) {
                 ContainerRowActivation::Inspect => view.open_host_container_inspector(
                     info_target.clone(),
                     if info_project_detail {

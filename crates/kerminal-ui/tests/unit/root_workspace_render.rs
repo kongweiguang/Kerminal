@@ -3,17 +3,21 @@
 //! @author kongweiguang
 
 use crate::features::workspace_controller::WorkspaceResourceOperation;
-use kerminal_application::workspace::WorkspaceSessionTab;
+use kerminal_application::{sessions::UiSessionBinding, workspace::WorkspaceSessionTab};
 use kerminal_domain::{
     identity::{PaneId, SessionId, TabId},
+    sessions::SessionOwner,
     workspace::{SplitDirection, TerminalLayoutNode},
 };
 
+use super::super::session_reconnect::SessionActionProjection;
 use super::{
-    PaneSurfaceState, ProjectionIndex, ProjectionLookupError, RuntimePanePhase,
-    WorkspacePaneProjection, candidate_retry_pane, classify_surface_state,
-    close_operation_blocks_retry_or_measurement, close_operation_targets_pane, pane_surface_state,
-    workspace_pane_is_closing, workspace_pane_projection_status, workspace_pane_status_banner,
+    PaneSessionActionKind, PaneSurfaceState, ProjectionIndex, ProjectionLookupError,
+    RuntimePanePhase, WorkspacePaneProjection, WorkspacePaneSessionActionEvent,
+    candidate_retry_pane, classify_surface_state, close_operation_blocks_retry_or_measurement,
+    close_operation_targets_pane, pane_session_action_projection, pane_surface_state,
+    validated_pane_session_action, workspace_pane_is_closing, workspace_pane_projection_status,
+    workspace_pane_status_banner,
 };
 
 /// 测试 ID 使用领域构造器，避免测试 fixture 引入第二套身份格式。
@@ -52,7 +56,7 @@ fn two_pane_layout(first: PaneId, second: PaneId) -> TerminalLayoutNode {
     }
 }
 
-/// 创建携带会话身份但尚无快照的投影；群发默认为隐藏，避免身份测试依赖额外运行态。
+/// 身份测试显式允许分屏但默认隐藏群发，避免映射校验依赖目录或广播运行态。
 ///
 /// @author kongweiguang
 fn projection(pane_id: PaneId, session_id: SessionId) -> WorkspacePaneProjection {
@@ -66,8 +70,9 @@ fn projection(pane_id: PaneId, session_id: SessionId) -> WorkspacePaneProjection
         is_closing: false,
         split_candidate_cancelable: false,
         close_operation_pending: false,
-        reconnect: None,
-        restart: None,
+        split_enabled: true,
+        session_action: None,
+        session_disconnected: false,
         broadcast: Default::default(),
     }
 }
@@ -321,5 +326,123 @@ fn surface_state_requires_matching_session_snapshot() {
     assert_eq!(
         classify_surface_state(Some(&session), Some(&session), false, true),
         PaneSurfaceState::Closing
+    );
+}
+
+/// 运行和断开态都只占据标题栏同一个重新连接槽位，连接中点击用于取消。
+///
+/// @author kongweiguang
+#[test]
+fn session_actions_share_one_header_slot() {
+    let pane_id = pane_id();
+    let binding = UiSessionBinding {
+        session_id: SessionId::new(),
+        owner: SessionOwner::Ui {
+            tab_id: TabId::new(),
+            pane_id: pane_id.clone(),
+        },
+        session_generation: 3,
+    };
+    let mut pane = projection(pane_id, binding.session_id.clone());
+    pane.session_action = Some(SessionActionProjection {
+        binding: binding.clone(),
+        busy: false,
+        attempt_id: None,
+        cancelling: false,
+    });
+
+    let reconnect = pane_session_action_projection(&pane).expect("stable pane action");
+    assert_eq!(reconnect.kind, PaneSessionActionKind::Reconnect);
+    assert!(reconnect.enabled);
+    assert!(!reconnect.busy);
+    assert_eq!(reconnect.attempt_id, None);
+
+    pane.session_action = Some(SessionActionProjection {
+        binding: binding.clone(),
+        busy: true,
+        attempt_id: Some(7),
+        cancelling: false,
+    });
+    let cancel = pane_session_action_projection(&pane).expect("connecting pane action");
+    assert_eq!(cancel.kind, PaneSessionActionKind::CancelReconnect);
+    assert!(cancel.enabled);
+    assert!(cancel.busy);
+    assert_eq!(cancel.attempt_id, Some(7));
+
+    pane.session_action = Some(SessionActionProjection {
+        binding,
+        busy: true,
+        attempt_id: Some(7),
+        cancelling: true,
+    });
+    let cancelling = pane_session_action_projection(&pane).expect("cancelling pane action");
+    assert_eq!(cancelling.kind, PaneSessionActionKind::CancelReconnect);
+    assert!(!cancelling.enabled);
+}
+
+/// 顶栏回执必须匹配当前动作与 attempt，旧连接或旧取消不能穿透到新会话状态。
+///
+/// @author kongweiguang
+#[test]
+fn stale_header_session_actions_are_rejected() {
+    let pane_id = pane_id();
+    let binding = UiSessionBinding {
+        session_id: SessionId::new(),
+        owner: SessionOwner::Ui {
+            tab_id: TabId::new(),
+            pane_id: pane_id.clone(),
+        },
+        session_generation: 4,
+    };
+    let mut pane = projection(pane_id.clone(), binding.session_id.clone());
+    pane.session_action = Some(SessionActionProjection {
+        binding: binding.clone(),
+        busy: false,
+        attempt_id: None,
+        cancelling: false,
+    });
+    let stable_reconnect = WorkspacePaneSessionActionEvent {
+        pane_id: pane_id.clone(),
+        binding: binding.clone(),
+        kind: PaneSessionActionKind::Reconnect,
+        attempt_id: None,
+    };
+    assert_eq!(
+        validated_pane_session_action(&pane, &stable_reconnect),
+        Some(PaneSessionActionKind::Reconnect)
+    );
+
+    pane.session_action = Some(SessionActionProjection {
+        binding: binding.clone(),
+        busy: true,
+        attempt_id: Some(9),
+        cancelling: false,
+    });
+
+    let late_reconnect = WorkspacePaneSessionActionEvent {
+        pane_id: pane_id.clone(),
+        binding: binding.clone(),
+        kind: PaneSessionActionKind::Reconnect,
+        attempt_id: None,
+    };
+    assert_eq!(validated_pane_session_action(&pane, &late_reconnect), None);
+
+    let stale_cancel = WorkspacePaneSessionActionEvent {
+        pane_id: pane_id.clone(),
+        binding: binding.clone(),
+        kind: PaneSessionActionKind::CancelReconnect,
+        attempt_id: Some(8),
+    };
+    assert_eq!(validated_pane_session_action(&pane, &stale_cancel), None);
+
+    let current_cancel = WorkspacePaneSessionActionEvent {
+        pane_id,
+        binding,
+        kind: PaneSessionActionKind::CancelReconnect,
+        attempt_id: Some(9),
+    };
+    assert_eq!(
+        validated_pane_session_action(&pane, &current_cancel),
+        Some(PaneSessionActionKind::CancelReconnect)
     );
 }

@@ -49,27 +49,47 @@ pub(crate) type PaneRenderer = dyn for<'a> Fn(
     ) -> gpui_kit::AnyElement
     + 'static;
 
-/// Pane 标题与重启目标由 Root 统一投影，不在组件中猜测终端来源。
+/// Pane 标题与会话操作目标由 Root 统一投影，不在组件中猜测终端来源。
 pub(crate) type PaneTitleRenderer = dyn Fn(&PaneId) -> PaneHeaderProjection + 'static;
 
-/// 标题栏仅展示稳定标题和来自 Root 的精确重启状态，不自行推导会话身份。
+/// 标题栏仅展示稳定标题和来自 Root 的精确会话操作，不自行推导会话身份。
 ///
 /// @author kongweiguang
 #[derive(Clone)]
 pub(crate) struct PaneHeaderProjection {
     pub(crate) title: SharedString,
-    pub(crate) refresh: Option<PaneRefreshProjection>,
+    pub(crate) split_enabled: bool,
+    pub(crate) session_action: Option<PaneSessionActionProjection>,
     pub(crate) host_picker: Option<HostPickerPopoverProjection>,
     pub(crate) broadcast: PaneBroadcastProjection,
+    /// 会话已断开时标题栏显示固定状态标记；正文不插入状态条，连接后自动消失。
+    pub(crate) session_disconnected: bool,
 }
 
-/// 重启绑定来自当前服务观察；busy 时仍保留相同按钮槽位以固定工具栏布局。
+/// 标题栏会话操作来自当前服务观察；同一槽位切换重新连接或取消重新连接。
+///
+/// 断开状态不再占用一整行，避免终端正文被状态条挤压；无可用操作时仍保留
+/// 按钮槽位，使工具栏在会话生命周期切换时不发生横向跳动。
 ///
 /// @author kongweiguang
 #[derive(Clone)]
-pub(crate) struct PaneRefreshProjection {
+pub(crate) struct PaneSessionActionProjection {
     pub(crate) binding: UiSessionBinding,
+    pub(crate) kind: PaneSessionActionKind,
+    pub(crate) enabled: bool,
+    /// 仅用于区分“忙碌中”与“稳定可用”，不承载会话身份。
     pub(crate) busy: bool,
+    /// 取消重连必须回传发起时的 attempt，避免迟到点击取消新尝试。
+    pub(crate) attempt_id: Option<u64>,
+}
+
+/// 标题栏唯一会话操作槽位的动作种类；运行和断开状态都表达“重新连接”。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PaneSessionActionKind {
+    Reconnect,
+    CancelReconnect,
 }
 
 /// Root 对未提交 CreatePane 的只读身份投影；candidate 只改变画面，不取得 session owner。
@@ -160,13 +180,15 @@ pub enum WorkspacePaneEvent {
     },
 }
 
-/// 顶栏重启动作冻结渲染时的 session 身份，避免迟到点击作用于同一 PaneId 的新会话。
+/// 顶栏会话动作冻结渲染时的 session 身份与 attempt，避免迟到点击作用于同 PaneId 的新会话。
 ///
 /// @author kongweiguang
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WorkspacePaneRefreshEvent {
+pub(crate) struct WorkspacePaneSessionActionEvent {
     pub(crate) pane_id: PaneId,
     pub(crate) binding: UiSessionBinding,
+    pub(crate) kind: PaneSessionActionKind,
+    pub(crate) attempt_id: Option<u64>,
 }
 
 /// 多级布局组件只保留 Root 发布的结构、焦点投影与 terminal canvas renderer。
@@ -185,7 +207,7 @@ pub struct WorkspacePanes {
 }
 
 impl EventEmitter<WorkspacePaneEvent> for WorkspacePanes {}
-impl EventEmitter<WorkspacePaneRefreshEvent> for WorkspacePanes {}
+impl EventEmitter<WorkspacePaneSessionActionEvent> for WorkspacePanes {}
 
 impl WorkspacePanes {
     /// 注入已校验布局、真实标题和画布 renderer；持久结构仍由 WorkspaceService 管理。
@@ -451,6 +473,7 @@ impl WorkspacePanes {
     /// 每个叶子提供圆角终端卡片；标题只占剩余宽度并截断，避免窄分屏把控制区和正文挤变形。
     /// 关闭与目标勾选不冒泡激活 pane；群发勾选与重新打开入口共用固定槽位，保持窄分屏控制区可达。
     /// 键盘关闭只从按钮原生回调带回真实焦点来源，供 Root 在 ACK 后做受限交接。
+    /// 重连和目录换代只禁用固定分屏槽位，不插入占位文字或改变终端几何。
     ///
     /// @author kongweiguang
     fn render_pane(
@@ -516,6 +539,10 @@ impl WorkspacePanes {
                         .child(title.clone()),
                 );
 
+        if header_projection.session_disconnected {
+            header = header.child(pane_disconnected_badge(theme));
+        }
+
         if candidate_pane {
             header = header.child(crate::locale::text(
                 "正在准备新分屏…",
@@ -523,9 +550,10 @@ impl WorkspacePanes {
             ));
         } else if !preview_locked {
             header = header
-                .child(pane_refresh_button(
+                .child(pane_session_action_button(
                     pane_id.clone(),
-                    header_projection.refresh,
+                    header_projection.session_action,
+                    header_projection.session_disconnected,
                     cx,
                 ))
                 .child(split_button(
@@ -538,6 +566,7 @@ impl WorkspacePanes {
                             "Split right with a host selected by right-click",
                         ),
                         pane_id: pane_id.clone(),
+                        enabled: header_projection.split_enabled,
                         primary: SplitDirectionIntent {
                             direction: SplitDirection::Horizontal,
                             before: false,
@@ -556,6 +585,7 @@ impl WorkspacePanes {
                             "Split below with a host selected by right-click",
                         ),
                         pane_id: pane_id.clone(),
+                        enabled: header_projection.split_enabled,
                         primary: SplitDirectionIntent {
                             direction: SplitDirection::Vertical,
                             before: false,
@@ -951,10 +981,12 @@ struct SplitButtonSpec {
     label: SharedString,
     tooltip: SharedString,
     pane_id: PaneId,
+    enabled: bool,
     primary: SplitDirectionIntent,
 }
 
 /// 两个固定按钮各自确定分屏方向；右键只锚定主机列表，并冻结原 pane 与请求代次。
+/// 禁用状态同时阻止左键和弹层请求，避免外层 Popover 绕过 Button 的不可用状态。
 ///
 /// @author kongweiguang
 fn split_button(
@@ -968,6 +1000,7 @@ fn split_button(
         label,
         tooltip,
         pane_id,
+        enabled,
         primary,
     } = spec;
     let view = cx.entity();
@@ -976,7 +1009,7 @@ fn split_button(
             && picker.request.direction == primary.direction
             && picker.request.before == primary.before
     });
-    let open = picker_matches;
+    let open = picker_matches && enabled;
     let request_generation = picker
         .as_ref()
         .map_or(0, |picker| picker.request.generation);
@@ -992,11 +1025,21 @@ fn split_button(
             .w(px(22.))
             .h(px(22.))
             .accessibility_label(label.clone())
-            .tooltip(tooltip)
+            .tooltip(if enabled {
+                tooltip
+            } else {
+                crate::locale::text(
+                    "终端目录同步中，请稍后分屏",
+                    "Terminal directory syncing; split shortly",
+                )
+            })
             .tab_stop(true)
+            .disabled(!enabled)
             .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                 cx.stop_propagation();
-                cx.emit(split_event(pane_id.clone(), primary));
+                if enabled {
+                    cx.emit(split_event(pane_id.clone(), primary));
+                }
             })),
         mouse_button: Some(MouseButton::Right),
         open,
@@ -1006,7 +1049,7 @@ fn split_button(
             let pane_id = choose_pane_id.clone();
             let generation = request_generation;
             view.update(app, |_, cx| {
-                if *open {
+                if *open && enabled {
                     cx.emit(split_target_request_event(pane_id, primary));
                 } else if picker_matches {
                     cx.emit(WorkspacePaneEvent::CancelSplitTarget {
@@ -1030,41 +1073,97 @@ fn split_button(
     })
 }
 
-/// 重启与分屏按钮共用图标槽位，以提示和无障碍名称说明作用范围；忙碌时保留槽位并禁止重复操作。
-/// 点击继续使用渲染时冻结的 binding，避免图标化改变会话身份校验。
+/// 重新连接与取消重连共用固定图标槽位，避免断开状态增加整行控件。
+/// 点击继续使用渲染时冻结的 binding/attempt，避免图标化改变会话身份校验；
+/// 重连进行中保留可点击状态以便取消，取消收尾阶段则禁用重复提交。
+/// 运行中与断开后使用同一入口；断开时按钮改用警示样式并配套标题栏标记，用户不必猜测图标含义。
 ///
 /// @author kongweiguang
-fn pane_refresh_button(
+fn pane_session_action_button(
     pane_id: PaneId,
-    refresh: Option<PaneRefreshProjection>,
+    action: Option<PaneSessionActionProjection>,
+    disconnected: bool,
     cx: &mut Context<WorkspacePanes>,
 ) -> impl IntoElement {
-    let enabled = refresh.as_ref().is_some_and(|refresh| !refresh.busy);
-    let busy = refresh.as_ref().is_some_and(|refresh| refresh.busy);
-    let binding = refresh.map(|refresh| refresh.binding);
-    let label = crate::locale::text("重启当前终端", "Restart terminal");
-    let mut button = Button::new(format!("pane-refresh-{}", pane_id.as_str()))
-        .compact()
-        .ghost()
-        .icon(IconName::RefreshCw)
+    let kind = action.as_ref().map(|action| action.kind);
+    let enabled = action.as_ref().is_some_and(|action| action.enabled);
+    let busy = action.as_ref().is_some_and(|action| action.busy);
+    let binding = action.as_ref().map(|action| action.binding.clone());
+    let attempt_id = action.as_ref().and_then(|action| action.attempt_id);
+    let (icon, label) = match kind {
+        Some(PaneSessionActionKind::Reconnect) if disconnected => (
+            IconName::RefreshCw,
+            crate::locale::text(
+                "终端未连接，点击重新连接",
+                "Terminal is not connected; click to reconnect",
+            ),
+        ),
+        Some(PaneSessionActionKind::Reconnect) => (
+            IconName::RefreshCw,
+            crate::locale::text("重新连接当前终端", "Reconnect terminal"),
+        ),
+        Some(PaneSessionActionKind::CancelReconnect) => (
+            IconName::LoaderCircle,
+            crate::locale::text("取消重新连接", "Cancel reconnect"),
+        ),
+        None if disconnected => (
+            IconName::RefreshCw,
+            crate::locale::text(
+                "终端未连接，当前没有可执行的重连操作",
+                "Terminal is not connected; no reconnect action is available yet",
+            ),
+        ),
+        None => (
+            IconName::RefreshCw,
+            crate::locale::text("当前没有可执行的会话操作", "No session action available"),
+        ),
+    };
+    // 只强调可执行的重新连接；取消重连沿用普通图标，避免把中断操作渲染成告警。
+    let emphasize =
+        disconnected && enabled && matches!(kind, Some(PaneSessionActionKind::Reconnect));
+    let mut button = Button::new(format!("pane-session-action-{}", pane_id.as_str())).compact();
+    button = if emphasize {
+        button.warning()
+    } else {
+        button.ghost()
+    };
+    let mut button = button
+        .icon(icon)
         .w(px(22.))
         .h(px(22.))
-        .loading(busy)
+        .loading(busy && !enabled)
         .flex_shrink_0()
         .accessibility_label(label.clone())
         .tooltip(label)
         .tab_stop(true)
         .disabled(!enabled);
-    if enabled && let Some(binding) = binding {
+    if enabled && let (Some(binding), Some(kind)) = (binding, kind) {
         button = button.on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
             cx.stop_propagation();
-            cx.emit(WorkspacePaneRefreshEvent {
+            cx.emit(WorkspacePaneSessionActionEvent {
                 pane_id: pane_id.clone(),
                 binding: binding.clone(),
+                kind,
+                attempt_id,
             });
         }));
     }
     button
+}
+
+/// 断开标记固定占用标题栏的一小段槽位：不插入正文状态条，重连成功后自动消失。
+///
+/// @author kongweiguang
+fn pane_disconnected_badge(theme: ThemeTokens) -> impl IntoElement {
+    div()
+        .id("workspace-pane-disconnected")
+        .flex_shrink_0()
+        .px_1()
+        .rounded(px(4.))
+        .bg(theme.warning.opacity(0.16))
+        .text_color(theme.warning)
+        .text_size(px(11.))
+        .child(crate::locale::text("未连接", "Not connected"))
 }
 
 /// 分屏方向映射到不会暗示抽屉开合的固定图标，避免重绘后图形视觉反转。

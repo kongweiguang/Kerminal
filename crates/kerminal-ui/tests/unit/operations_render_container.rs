@@ -8,6 +8,7 @@ use super::{
     compose_project_display_metadata, compose_project_element_key, container_row_activation,
     container_stats_display, format_container_stats_raw,
 };
+use gpui_kit::{ClickEvent, KeyboardButton, KeyboardClickEvent, MouseClickEvent};
 use kerminal_domain::{
     identity::HostId,
     operations::{
@@ -58,38 +59,52 @@ fn container_detail_soft_breaks_keep_unicode_graphemes_intact() {
     );
 }
 
-/// 宿主列表单击进入详情；运行中容器的键盘 Enter/Space 直接进入终端。
-/// 鼠标双击不再作为终端入口，首击切页后不会把第二击投射到新页面。
+/// 使用实际 ClickEvent 区分 Enter 和空格，避免键盘快捷入口覆盖普通详情动作。
 ///
 /// @author kongweiguang
 #[test]
-fn host_container_row_activation_matches_main_click_contract() {
+fn host_container_row_distinguishes_enter_from_space() {
+    let mouse = ClickEvent::Mouse(MouseClickEvent::default());
+    let enter = ClickEvent::Keyboard(KeyboardClickEvent {
+        button: KeyboardButton::Enter,
+        ..Default::default()
+    });
+    let space = ClickEvent::Keyboard(KeyboardClickEvent {
+        button: KeyboardButton::Space,
+        ..Default::default()
+    });
     assert_eq!(
-        container_row_activation(false, false, ContainerStatus::Running),
+        container_row_activation(false, &mouse, ContainerStatus::Running),
         ContainerRowActivation::Inspect
     );
     assert_eq!(
-        container_row_activation(false, true, ContainerStatus::Running),
+        container_row_activation(false, &enter, ContainerStatus::Running),
         ContainerRowActivation::Enter
     );
     assert_eq!(
-        container_row_activation(false, false, ContainerStatus::Exited),
+        container_row_activation(false, &space, ContainerStatus::Running),
         ContainerRowActivation::Inspect
     );
-    assert_eq!(
-        container_row_activation(false, true, ContainerStatus::Exited),
-        ContainerRowActivation::Inspect
-    );
+    for event in [&mouse, &enter, &space] {
+        assert_eq!(
+            container_row_activation(false, event, ContainerStatus::Exited),
+            ContainerRowActivation::Inspect
+        );
+    }
 }
 
-/// Compose 项目内的容器名称单击进入 Details，终端动作仍由其独立按钮执行。
+/// Compose 项目内的容器名称无论使用哪种激活键都进入详情，终端由独立按钮执行。
 ///
 /// @author kongweiguang
 #[test]
 fn compose_container_row_activation_opens_details() {
-    for keyboard in [false, true] {
+    for button in [KeyboardButton::Enter, KeyboardButton::Space] {
+        let event = ClickEvent::Keyboard(KeyboardClickEvent {
+            button,
+            ..Default::default()
+        });
         assert_eq!(
-            container_row_activation(true, keyboard, ContainerStatus::Running),
+            container_row_activation(true, &event, ContainerStatus::Running),
             ContainerRowActivation::Inspect
         );
     }

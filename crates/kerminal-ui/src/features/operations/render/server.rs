@@ -34,70 +34,6 @@ use std::collections::HashMap;
 const SERVER_METRIC_PLOT_HEIGHT_PX: f32 = 28.0;
 const SERVER_PROCESS_DISPLAY_LIMIT: usize = 5;
 
-#[derive(Clone, Copy)]
-struct ServerControlTypography {
-    font_size: Pixels,
-    line_height: Pixels,
-    font_weight: gpui_kit::FontWeight,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ServerControlLabelMode {
-    NativeButtonLabel,
-    StyledChild,
-}
-
-/// 固定右栏给 Kit Button 使用显式标签子节点；完整工作台保留 Kit 原生标签排版。
-///
-/// @author kongweiguang
-fn server_control_label_mode(compact: bool) -> ServerControlLabelMode {
-    if compact {
-        ServerControlLabelMode::StyledChild
-    } else {
-        ServerControlLabelMode::NativeButtonLabel
-    }
-}
-
-/// 仅紧凑右栏覆盖 Kit 的紧凑按钮字号，以匹配 main WebView 的计算样式；完整工作台沿用原控件默认值。
-///
-/// @author kongweiguang
-fn server_control_typography() -> ServerControlTypography {
-    ServerControlTypography {
-        font_size: px(16.),
-        line_height: px(24.),
-        font_weight: gpui_kit::FontWeight::NORMAL,
-    }
-}
-
-/// 显式子节点抵消 Button 内容容器的紧凑字号覆盖，并保留读屏器可见名称。
-///
-/// @author kongweiguang
-fn apply_server_control_label(button: Button, label: SharedString, compact: bool) -> Button {
-    match server_control_label_mode(compact) {
-        ServerControlLabelMode::NativeButtonLabel => button.label(label),
-        ServerControlLabelMode::StyledChild => {
-            let typography = server_control_typography();
-            button.accessibility_label(label.clone()).child(
-                div()
-                    .min_w_0()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_size(typography.font_size)
-                    .line_height(typography.line_height)
-                    .font_weight(typography.font_weight)
-                    .child(label),
-            )
-        }
-    }
-}
-
-/// 右栏标签高度复刻 main，完整工作区保留现有紧凑按钮尺寸。
-///
-/// @author kongweiguang
-fn server_tab_height(compact: bool) -> Pixels {
-    px(if compact { 36. } else { 28. })
-}
-
 /// 进程排序只影响当前投影；CPU 是传统默认顺序，内存列可随时恢复原排序。
 ///
 /// @author kongweiguang
@@ -162,7 +98,7 @@ impl OperationsView {
         )
     }
 
-    /// 标题、目标与采样态共用页头；状态行的两端都可省略，窄栏和英文长状态也不会挤动下方内容。
+    /// 页签独占导航行，避免英文被采样周期挤成省略号；状态与周期并列，刷新不改变布局。
     ///
     /// @author kongweiguang
     fn render_server_header(
@@ -234,47 +170,49 @@ impl OperationsView {
         let target_host_id = presentation_target
             .and_then(server_target_host_id)
             .map(HostId::as_str);
-        let full_target_label = target_subtitle.clone();
-        let mut target_row = div()
+        let target_tooltip = target_host_id.map_or_else(
+            || target_subtitle.clone().into(),
+            |host_id| {
+                crate::locale::text(
+                    format!("目标：{target_subtitle} · 主机 ID：{host_id}"),
+                    format!("Target: {target_subtitle}; host ID: {host_id}"),
+                )
+            },
+        );
+        let target_accessible_label = target_tooltip.clone();
+        let target_row = div()
             .id("operations-server-target-label")
             .min_w_0()
             .flex_1()
             .text_size(theme.text_xs)
-            .line_height(px(16.))
+            .line_height(relative(1.5))
             .text_color(theme.muted)
             .truncate()
+            .tooltip(move |window, cx| Tooltip::new(target_tooltip.clone()).build(window, cx))
+            .aria_label(target_accessible_label)
             .child(target_subtitle);
-        if let Some(host_id) = target_host_id {
-            let target_tooltip = crate::locale::text(
-                format!("目标：{full_target_label} · 主机 ID：{host_id}"),
-                format!("Target: {full_target_label}; host ID: {host_id}"),
-            );
-            let target_accessible_label = target_tooltip.clone();
-            target_row = target_row
-                .tooltip(move |window, cx| Tooltip::new(target_tooltip.clone()).build(window, cx))
-                .aria_label(target_accessible_label);
-        }
 
         let refresh = Button::new("operations-server-refresh")
             .compact()
             .ghost()
+            .w(theme.metrics.control_height)
+            .h(theme.metrics.control_height)
             .icon(IconName::RefreshCw)
+            .loading_icon(IconName::RefreshCw)
+            .loading(phase == SectionPhase::Loading)
             .accessibility_label(crate::locale::text("刷新服务器信息", "Refresh server info"))
             .tooltip(crate::locale::text("刷新服务器信息", "Refresh server info"))
             .disabled(server_refresh_disabled(phase, target_available))
             .on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.load_server(cx)));
 
-        div()
+        crate::ui_surface::panel_header(theme)
             .id("operations-server-header")
             .w_full()
-            .flex()
             .flex_col()
+            .items_stretch()
             .gap_0()
-            .px_3()
-            .pt_2()
-            .pb_3()
-            .border_b_1()
-            .border_color(theme.tool_panel_border)
+            .px_0()
+            .pt_0()
             .child(
                 div()
                     .w_full()
@@ -298,13 +236,13 @@ impl OperationsView {
                                     .child(
                                         gpui_kit::component::Icon::new(IconName::Server)
                                             .text_color(theme.accent)
-                                            .size(px(16.)),
+                                            .size(theme.metrics.icon_size),
                                     )
                                     .child(
                                         div()
                                             .min_w_0()
                                             .text_size(theme.text_sm)
-                                            .line_height(px(20.))
+                                            .line_height(relative(1.4))
                                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                             .text_color(theme.foreground)
                                             .truncate()
@@ -328,9 +266,7 @@ impl OperationsView {
                     .mt_3()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(self.render_server_tabs(theme, cx))
-                    .child(self.render_server_refresh_intervals(theme, cx)),
+                    .child(self.render_server_tabs(theme, cx)),
             )
             .child(
                 div()
@@ -340,25 +276,35 @@ impl OperationsView {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .text_size(px(11.))
-                    .line_height(px(16.5))
+                    .text_size(theme.text_xs)
+                    .line_height(relative(1.5))
                     .child(
                         div()
                             .min_w_0()
                             .flex_1()
-                            .truncate()
+                            .flex()
+                            .flex_col()
                             .text_color(theme.muted)
-                            .child(sampling_status),
+                            .child(
+                                div()
+                                    .id("operations-server-sampling-status")
+                                    .truncate()
+                                    .child(sampling_status.clone())
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(sampling_status.clone()).build(window, cx)
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("operations-server-last-updated")
+                                    .truncate()
+                                    .child(last_updated.clone())
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(last_updated.clone()).build(window, cx)
+                                    }),
+                            ),
                     )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .text_color(theme.muted)
-                            .text_right()
-                            .truncate()
-                            .child(last_updated),
-                    ),
+                    .child(self.render_server_refresh_intervals(theme, cx)),
             )
     }
 
@@ -1121,7 +1067,7 @@ impl OperationsView {
         div().w_full().child(metrics)
     }
 
-    /// 页签沿用 main 的单行 muted surface；切页时清理临时筛选/排序，避免继承意外视图。
+    /// 页签使用统一控件密度与 Kit 标签；切页时清理临时筛选/排序，避免继承意外视图。
     ///
     /// @author kongweiguang
     fn render_server_tabs(&self, theme: ThemeTokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1146,39 +1092,36 @@ impl OperationsView {
                 .compact()
                 .ghost()
                 .flex_1()
-                .h(server_tab_height(self.compact_layout))
+                .h(theme.metrics.control_height)
                 .text_size(theme.text_xs)
-                .line_height(px(16.))
+                .line_height(relative(1.5))
                 .selected(selected)
                 .when(selected, |button| {
                     button.bg(theme.panel).text_color(theme.foreground)
                 })
                 .when(!selected, |button| button.text_color(theme.muted));
-            let button = apply_server_control_label(
-                button,
-                crate::locale::text(zh, en),
-                self.compact_layout,
-            )
-            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                if view.server_info_panel != panel {
-                    let (network_filter, process_sort) = server_panel_control_state(
-                        view.server_info_panel,
-                        panel,
-                        view.server_network_filter,
-                        view.server_process_sort,
-                    );
-                    view.server_info_panel = panel;
-                    view.server_network_filter = network_filter;
-                    view.server_process_sort = process_sort;
-                    cx.notify();
-                }
-            }));
+            let button = button
+                .label(crate::locale::text(zh, en))
+                .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+                    if view.server_info_panel != panel {
+                        let (network_filter, process_sort) = server_panel_control_state(
+                            view.server_info_panel,
+                            panel,
+                            view.server_network_filter,
+                            view.server_process_sort,
+                        );
+                        view.server_info_panel = panel;
+                        view.server_network_filter = network_filter;
+                        view.server_process_sort = process_sort;
+                        cx.notify();
+                    }
+                }));
             row = row.child(button);
         }
         row
     }
 
-    /// 固定宽度的间隔触发器保留 main 选择器的描边识别度，周期变更仍由同一监控 driver 接管。
+    /// 间隔触发器随界面缩放并与页签共用控件高度；周期仍由原监控 driver 接管。
     ///
     /// @author kongweiguang
     fn render_server_refresh_intervals(
@@ -1189,38 +1132,35 @@ impl OperationsView {
         let selected = self.server_refresh_interval;
         let (zh, en) = selected.label();
         let entity = cx.entity().clone();
-        apply_server_control_label(
-            Button::new("operations-server-refresh-interval-picker")
-                .debug_selector(|| "rr-system-interval".into())
-                .compact()
-                .ghost()
-                .outline()
-                .w(px(76.))
-                .flex_shrink_0()
-                .h(px(32.))
-                .dropdown_caret(true),
-            crate::locale::text(zh, en),
-            self.compact_layout,
-        )
-        .dropdown_menu(move |mut menu, _, _| {
-            menu = crate::ui_popup::dropdown_menu(menu, theme);
-            for interval in ServerInfoRefreshInterval::OPTIONS {
-                let (zh, en) = interval.label();
-                let entity = entity.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(crate::locale::text(zh, en))
-                        .checked(interval == selected)
-                        .on_click(move |_, _, app| {
-                            entity.update(app, |view, cx| {
-                                view.set_server_refresh_interval(interval, cx);
-                            });
-                        }),
-                );
-            }
-            menu
-        })
-        .offset(px(6.))
-        .into_any_element()
+        Button::new("operations-server-refresh-interval-picker")
+            .debug_selector(|| "rr-system-interval".into())
+            .compact()
+            .ghost()
+            .outline()
+            .w(theme.metrics.control_height * 2.35)
+            .flex_shrink_0()
+            .h(theme.metrics.control_height)
+            .dropdown_caret(true)
+            .label(crate::locale::text(zh, en))
+            .dropdown_menu(move |mut menu, _, _| {
+                menu = crate::ui_popup::dropdown_menu(menu, theme);
+                for interval in ServerInfoRefreshInterval::OPTIONS {
+                    let (zh, en) = interval.label();
+                    let entity = entity.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(crate::locale::text(zh, en))
+                            .checked(interval == selected)
+                            .on_click(move |_, _, app| {
+                                entity.update(app, |view, cx| {
+                                    view.set_server_refresh_interval(interval, cx);
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
+            .offset(px(6.))
+            .into_any_element()
     }
 }
 
@@ -1943,7 +1883,7 @@ struct ServerMetricRowData {
     maximum: f64,
 }
 
-/// 指标格使用 main 的图标标题、16px 读数和 28px 轻趋势，保持六项网格紧凑。
+/// 指标格使用共享图标与文字尺度，趋势绘制区域保留稳定的采样几何。
 ///
 /// @author kongweiguang
 fn server_metric_row(data: ServerMetricRowData, theme: ThemeTokens) -> impl IntoElement {
@@ -1967,16 +1907,16 @@ fn server_metric_row(data: ServerMetricRowData, theme: ThemeTokens) -> impl Into
                 .items_center()
                 .gap_2()
                 .text_size(theme.text_xs)
-                .line_height(px(16.))
+                .line_height(relative(1.5))
                 .text_color(theme.muted)
-                .child(gpui_kit::component::Icon::new(icon).size(px(16.)))
+                .child(gpui_kit::component::Icon::new(icon).size(theme.metrics.icon_size))
                 .child(div().min_w_0().truncate().child(title)),
         )
         .child(
             div()
                 .w_full()
                 .text_size(theme.text_heading)
-                .line_height(px(24.))
+                .line_height(relative(1.5))
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .text_color(theme.foreground)
                 .truncate()

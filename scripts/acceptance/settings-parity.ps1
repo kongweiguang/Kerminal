@@ -8,7 +8,14 @@ param(
 
     [switch]$SuggestionsOnly,
 
+    [switch]$WorkbenchOnly,
+
+    [switch]$WorkbenchMotion,
+
     [switch]$SshSuggestions,
+
+    [ValidateSet('debug', 'release')]
+    [string]$BuildProfile = 'debug',
 
     [ValidateRange(800, 3840)]
     [int]$Width = 1440,
@@ -23,11 +30,22 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if ($McpOnly -and $SuggestionsOnly) {
-    throw '-McpOnly and -SuggestionsOnly are mutually exclusive.'
+if (($McpOnly -and $SuggestionsOnly) -or
+    ($WorkbenchOnly -and ($McpOnly -or $SuggestionsOnly))) {
+    throw '-McpOnly, -SuggestionsOnly and -WorkbenchOnly are mutually exclusive.'
 }
 if ($SshSuggestions -and -not $SuggestionsOnly) {
     throw '-SshSuggestions requires -SuggestionsOnly and an isolated fixture.'
+}
+if ($WorkbenchMotion -and (-not $WorkbenchOnly -or $BuildProfile -cne 'release')) {
+    throw '-WorkbenchMotion requires -WorkbenchOnly and -BuildProfile release.'
+}
+if ($WorkbenchOnly) {
+    foreach ($name in @('KERMINAL_APP_THEME_ACCEPTANCE', 'KERMINAL_SPLIT_DIRECTORY_ACCEPTANCE', 'KERMINAL_COLUMN_REFLOW_ACCEPTANCE')) {
+        if ([Environment]::GetEnvironmentVariable($name, 'Process') -ceq '1') {
+            throw "-WorkbenchOnly cannot run with the independent $name scope enabled."
+        }
+    }
 }
 
 $script:RepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
@@ -505,10 +523,13 @@ function Assert-PathWithinRoot {
 }
 
 function Assert-CaptureRecord {
-    # Checks PNG file identity and IHDR dimensions against the native renderer's pixel metadata.
+    # 截图必须与本轮 native 元数据一致；调用方可额外固定物理视口，防止 1×1 帧通过。
+    # @author kongweiguang
     param(
         [Parameter(Mandatory = $true)]$Capture,
-        [Parameter(Mandatory = $true)][string]$RunRoot
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [uint32]$ExpectedWidth = 0,
+        [uint32]$ExpectedHeight = 0
     )
 
     $fileName = [string]$Capture.file
@@ -543,6 +564,199 @@ function Assert-CaptureRecord {
     $pngHeight = [uint64]$bytes[20] * 16777216 + [uint64]$bytes[21] * 65536 + [uint64]$bytes[22] * 256 + [uint64]$bytes[23]
     if ($pngWidth -ne [uint64]$Capture.width -or $pngHeight -ne [uint64]$Capture.height) {
         throw "Screenshot dimensions differ from the report: $fileName"
+    }
+    if (($ExpectedWidth -gt 0 -and $pngWidth -ne $ExpectedWidth) -or
+        ($ExpectedHeight -gt 0 -and $pngHeight -ne $ExpectedHeight)) {
+        throw "Screenshot dimensions differ from the native viewport: $fileName"
+    }
+}
+
+function Assert-WorkbenchNativeEvidence {
+    # 工作台专项共用隔离桌面、窗口尺寸和配置根的验收边界，不依赖报告自称处于后台。
+    # @author kongweiguang
+    param(
+        [Parameter(Mandatory = $true)]$Report,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string]$DesktopName,
+        [Parameter(Mandatory = $true)][int]$ExpectedWidth,
+        [Parameter(Mandatory = $true)][int]$ExpectedHeight,
+        [switch]$VisibleMotion
+    )
+
+    $isolation = $Report.nativeIsolation
+    $threadDesktop = [string]$isolation.uiThreadDesktopName
+    $inputDesktop = [string]$isolation.inputDesktopName
+    $expectedCaptureMode = if ($VisibleMotion) { 'private-visible-native-window' } else { 'hidden-native-window' }
+    if ($Report.captureMode -cne $expectedCaptureMode -or
+        [bool]$Report.windowVisible -ne [bool]$VisibleMotion -or -not $isolation.platformSupported -or
+        -not $isolation.isolationProven -or $threadDesktop -cne $DesktopName -or
+        -not $threadDesktop.StartsWith('KerminalRail-settings-', [StringComparison]::Ordinal) -or
+        [string]::IsNullOrWhiteSpace($inputDesktop) -or
+        $threadDesktop.Equals($inputDesktop, [StringComparison]::OrdinalIgnoreCase) -or
+        [uint64]$isolation.processId -ne [uint64]$ProcessId) {
+        throw 'The workbench report did not prove its owned native desktop and expected visibility.'
+    }
+    if ([double]$Report.windowWidth -ne $ExpectedWidth -or
+        [double]$Report.windowHeight -ne $ExpectedHeight) {
+        throw "The workbench viewport dimensions are invalid; expected ${ExpectedWidth}x${ExpectedHeight}."
+    }
+    $expectedConfig = [IO.Path]::GetFullPath((Join-Path $RunRoot 'config'))
+    if (-not [IO.Path]::GetFullPath([string]$Report.configDirectory).Equals(
+        $expectedConfig, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The workbench report used a different configuration root.'
+    }
+}
+
+function Assert-WorkbenchMotionReport {
+    # 只接受有真实平台 present 差分和足够动画样本的报告；屏幕扫描与硬件呈现仍不在此测量口径。
+    # @author kongweiguang
+    param(
+        [Parameter(Mandatory = $true)]$Report,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string]$DesktopName,
+        [Parameter(Mandatory = $true)][int]$ExpectedWidth,
+        [Parameter(Mandatory = $true)][int]$ExpectedHeight
+    )
+    Assert-WorkbenchNativeEvidence -Report $Report -RunRoot $RunRoot -ProcessId $ProcessId `
+        -DesktopName $DesktopName -ExpectedWidth $ExpectedWidth -ExpectedHeight $ExpectedHeight -VisibleMotion
+    if ($Report.schemaVersion -ne 1 -or
+        $Report.measurementBoundary -cne 'gpui-platform-present-submission-not-screen-scanout' -or
+        $Report.status -cne 'passed' -or -not $Report.windowActive -or
+        -not $Report.nativeWindowVisible -or
+        [uint64]$Report.motionWindowHandle -eq 0 -or
+        [uint64]$Report.motionWindowHandle -ne [uint64]$Report.nativeIsolation.getActiveWindowHandle -or
+        [uint64]$Report.motionWindowHandle -ne [uint64]$Report.nativeFocusWindowHandle -or
+        $Report.warmupToggles -ne 4 -or $Report.toggleCycles -ne 20 -or
+        $Report.completedTransitions -ne 40 -or $Report.minimumAnimationSamples -ne 100 -or
+        $Report.initialSidebarVisible -ne $Report.finalSidebarVisible -or
+        -not $Report.sessionAndPanePreserved -or $Report.frame.interval -cne 'since_baseline') {
+        throw 'The workbench motion report is incomplete or did not preserve the workspace.'
+    }
+    $scale = [double]$Report.scaleFactor
+    $refresh = [uint64]$Report.refreshIntervalNs
+    $target = [uint64]$Report.targetP95Ns
+    $animation = $Report.frame.gpuiAnimatedPresentInterval
+    $bucketCount = ($animation.buckets | Measure-Object -Property sampleCount -Sum).Sum
+    if (-not [double]::IsFinite($scale) -or $scale -le 0 -or $refresh -eq 0 -or
+        $target -ne ($refresh + [uint64][Math]::Floor($refresh / 2)) -or
+        $animation.unit -cne 'nanoseconds' -or [uint64]$animation.sampleCount -lt 100 -or
+        [uint64]$bucketCount -ne [uint64]$animation.sampleCount -or
+        [uint64]$animation.p95 -eq 0 -or [uint64]$animation.p95 -gt $target -or
+        [string]::IsNullOrWhiteSpace([string]$Report.uiFontFamily) -or
+        [string]::IsNullOrWhiteSpace([string]$Report.terminalFontPreference)) {
+        throw 'The workbench motion samples, timing budget, or environment are invalid.'
+    }
+}
+
+function Assert-WorkbenchAcceptanceReport {
+    # 工作台和设置报告是不同范围；逐项回读真实菜单、焦点、拖拽与会话证据，不能仅凭进程退出判通过。
+    # @author kongweiguang
+    param(
+        [Parameter(Mandatory = $true)]$Report,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string]$DesktopName,
+        [Parameter(Mandatory = $true)][int]$ExpectedWidth,
+        [Parameter(Mandatory = $true)][int]$ExpectedHeight
+    )
+    Assert-WorkbenchNativeEvidence -Report $Report -RunRoot $RunRoot -ProcessId $ProcessId `
+        -DesktopName $DesktopName -ExpectedWidth $ExpectedWidth -ExpectedHeight $ExpectedHeight
+    if ($Report.schemaVersion -ne 4 -or
+        $Report.captureBackend -cne 'gpui-root-click-and-state-readback') {
+        throw 'The workbench report schema or backend is unsupported.'
+    }
+
+    $expectedChecks = [ordered]@{
+        hostSelection = 'select-remote-host-without-details'
+        localProfileSelection = 'select-local-profile-without-details'
+        hostSelectionPreservedAgentTarget = 'host-selection-preserves-agent-target'
+        profileSelectionPreservedAgentTarget = 'profile-selection-preserves-agent-target'
+        defaultProfileRetry = 'default-profile-failure-retry'
+        profileResolutionFailureRecovery = 'default-profile-resolution-failure-recovery'
+        profileEnterOpensOneSession = 'enter-opens-local-profile'
+        repeatedProfileTabs = 'ten-repeated-profile-independent-tabs'
+        splitThenPlus = 'plus-after-split'
+        closingNewTabPreservesOtherSessions = 'close-new-tab-preserves-other-sessions'
+    }
+    foreach ($name in $expectedChecks.Keys) {
+        $check = $Report.$name
+        if ($null -eq $check -or -not $check.passed -or
+            $check.action -cne $expectedChecks[$name] -or
+            [string]::IsNullOrWhiteSpace([string]$check.observed)) {
+            throw "The workbench check is missing or failed: $name"
+        }
+    }
+
+    $expectedMoves = @(
+        @{ source = 'acceptance-host'; destination = $null },
+        @{ source = 'acceptance-ungrouped-host'; destination = 'acceptance-drop-group' },
+        @{ source = 'acceptance-default'; destination = 'acceptance-drop-group' },
+        @{ source = 'acceptance-ungrouped-host'; destination = $null }
+    )
+    $expectedTargets = @('group', 'host', 'profile', 'ungrouped-host', 'sftp-copy-ssh', 'background')
+    foreach ($theme in $script:ExpectedThemes) {
+        $dragPath = Join-Path $RunRoot "sidebar-drag-$theme.json"
+        $menuPath = Join-Path $RunRoot "sidebar-menus-$theme.json"
+        if (-not (Test-Path -LiteralPath $dragPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $menuPath -PathType Leaf)) {
+            throw "The workbench report is missing sidebar evidence for theme $theme."
+        }
+        $drag = Get-Content -LiteralPath $dragPath -Raw | ConvertFrom-Json
+        $scale = [double]$drag.scaleFactor
+        if ($drag.theme -cne $theme -or -not [double]::IsFinite($scale) -or $scale -le 0 -or
+            @($drag.steps).Count -ne $expectedMoves.Count -or
+            $drag.escape.activeAfterEscape -or $drag.escape.previewVisibleAfterEscape -or
+            $drag.escape.committed -or -not $drag.escape.groupUnchanged -or
+            -not $drag.escape.revisionUnchanged -or
+            $drag.terminalCountBefore -ne 1 -or $drag.terminalCountAfter -ne 1) {
+            throw "The workbench drag evidence is incomplete for theme $theme."
+        }
+        for ($index = 0; $index -lt $expectedMoves.Count; $index++) {
+            $step = $drag.steps[$index]
+            $expected = $expectedMoves[$index]
+            if ($step.source -cne $expected.source -or $step.destination -cne $expected.destination -or
+                [string]$step.beforeRevision -notmatch '^[0-9a-f]{64}$' -or
+                [string]$step.afterRevision -notmatch '^[0-9a-f]{64}$' -or
+                $step.beforeRevision -ceq $step.afterRevision) {
+                throw "The workbench drag move is invalid for theme $theme at index $index."
+            }
+        }
+
+        $physicalWidth = [uint32][Math]::Round($ExpectedWidth * $scale, [MidpointRounding]::AwayFromZero)
+        $physicalHeight = [uint32][Math]::Round($ExpectedHeight * $scale, [MidpointRounding]::AwayFromZero)
+        $menus = @(Get-Content -LiteralPath $menuPath -Raw | ConvertFrom-Json)
+        $remainingTargets = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($target in $expectedTargets) { [void]$remainingTargets.Add($target) }
+        if ($menus.Count -ne $expectedTargets.Count) {
+            throw "The workbench menu evidence is incomplete for theme $theme."
+        }
+        foreach ($menu in $menus) {
+            if (-not $remainingTargets.Remove([string]$menu.target) -or $menu.menuCount -ne 1 -or
+                -not $menu.escapeRestoredFocus -or -not $menu.actionOpenedEditor -or
+                -not $menu.editorCancelled -or @($menu.labels).Count -eq 0) {
+                throw "The workbench menu or focus check failed for theme $theme."
+            }
+            if ($menu.menuCapture.file -cne "sidebar-menu-$theme-$($menu.target).png" -or
+                $menu.actionCapture.file -cne "sidebar-action-$theme-$($menu.target).png") {
+                throw "The workbench menu capture name is invalid for theme $theme."
+            }
+            Assert-CaptureRecord -Capture $menu.menuCapture -RunRoot $RunRoot -ExpectedWidth $physicalWidth -ExpectedHeight $physicalHeight
+            Assert-CaptureRecord -Capture $menu.actionCapture -RunRoot $RunRoot -ExpectedWidth $physicalWidth -ExpectedHeight $physicalHeight
+        }
+    }
+
+    $overflowPath = Join-Path $RunRoot 'sidebar-drag-overflow.json'
+    if (-not (Test-Path -LiteralPath $overflowPath -PathType Leaf)) {
+        throw 'The workbench overflow drag evidence is missing.'
+    }
+    $overflow = Get-Content -LiteralPath $overflowPath -Raw | ConvertFrom-Json
+    if (-not $overflow.edgeScrollReachedTarget -or $overflow.overflowGroupCount -ne 24 -or
+        $overflow.destination -cne 'acceptance-overflow-23' -or
+        $overflow.restoredGroup -cne 'acceptance-pinned-group' -or
+        $overflow.terminalCountBefore -ne 1 -or $overflow.terminalCountAfter -ne 1) {
+        throw 'The workbench overflow drag did not reach and restore its target.'
     }
 }
 
@@ -1134,13 +1348,16 @@ function Move-AcceptanceLogs {
 }
 
 if ([string]::IsNullOrWhiteSpace($ExecutablePath)) {
-    $ExecutablePath = Join-Path $script:RepositoryRoot 'target\debug\kerminal.exe'
+    $ExecutablePath = Join-Path $script:RepositoryRoot "target\$BuildProfile\kerminal.exe"
 } else {
     $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
 }
 
 if (-not $SkipBuild) {
-    & cargo build --manifest-path (Join-Path $script:RepositoryRoot 'Cargo.toml') -p kerminal-desktop --features right-rail-acceptance
+    $features = if ($WorkbenchMotion) { 'right-rail-acceptance,acceptance-metrics' } else { 'right-rail-acceptance' }
+    $buildArguments = @('build', '--locked', '--manifest-path', (Join-Path $script:RepositoryRoot 'Cargo.toml'), '-p', 'kerminal-desktop', '--features', $features)
+    if ($BuildProfile -ceq 'release') { $buildArguments += '--release' }
+    & cargo @buildArguments
     if ($LASTEXITCODE -ne 0) {
         throw "Cargo build failed with exit code $LASTEXITCODE."
     }
@@ -1149,6 +1366,21 @@ if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
     throw "Settings acceptance executable was not found: $ExecutablePath"
 }
 $ExecutablePath = [IO.Path]::GetFullPath($ExecutablePath)
+$motionEnvironment = $null
+if ($WorkbenchMotion) {
+    $motionEnvironment = [ordered]@{
+        executableSha256 = (Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        buildProfile = $BuildProfile
+        buildProfileSource = $(if ($SkipBuild) { 'operator-declared' } else { 'cargo-invocation' })
+        operatingSystem = Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber
+        processors = @(Get-CimInstance Win32_Processor | Select-Object Name)
+        graphicsAdapters = @(Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion)
+        renderer = 'unknown; graphicsAdapters lists available adapters only'
+    }
+    if ($motionEnvironment.processors.Count -eq 0 -or $motionEnvironment.graphicsAdapters.Count -eq 0) {
+        throw 'Motion acceptance requires a recorded CPU and graphics-adapter inventory.'
+    }
+}
 
 [void][IO.Directory]::CreateDirectory($script:DiagnosticsRoot)
 $runName = 'run-{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmssfff'), [Guid]::NewGuid().ToString('N')
@@ -1175,9 +1407,15 @@ $logMoveFailure = $null
 $configDirectoryRemoved = $false
 $previousAcceptanceScope = [Environment]::GetEnvironmentVariable('KERMINAL_SETTINGS_ACCEPTANCE_SCOPE', 'Process')
 $previousSshSuggestions = [Environment]::GetEnvironmentVariable('KERMINAL_SUGGESTIONS_ACCEPTANCE_SSH', 'Process')
+$previousWorkbenchAcceptance = [Environment]::GetEnvironmentVariable('KERMINAL_WORKBENCH_ACCEPTANCE', 'Process')
+$previousWorkbenchMotion = [Environment]::GetEnvironmentVariable('KERMINAL_WORKBENCH_MOTION_ACCEPTANCE', 'Process')
 try {
     [Environment]::SetEnvironmentVariable('KERMINAL_SETTINGS_ACCEPTANCE_SCOPE', $(if ($McpOnly) { 'mcp' } elseif ($SuggestionsOnly) { 'suggestions' } else { $null }), 'Process')
     [Environment]::SetEnvironmentVariable('KERMINAL_SUGGESTIONS_ACCEPTANCE_SSH', $(if ($SshSuggestions) { '1' } else { $null }), 'Process')
+    if ($WorkbenchOnly) {
+        [Environment]::SetEnvironmentVariable('KERMINAL_WORKBENCH_ACCEPTANCE', '1', 'Process')
+        [Environment]::SetEnvironmentVariable('KERMINAL_WORKBENCH_MOTION_ACCEPTANCE', $(if ($WorkbenchMotion) { '1' } else { $null }), 'Process')
+    }
     [void][IO.Directory]::CreateDirectory($runnerLogDirectory)
     $result = Invoke-HiddenAcceptanceProcess `
         -Executable $ExecutablePath `
@@ -1212,6 +1450,18 @@ try {
         $processEvidenceJson + [Environment]::NewLine,
         [Text.UTF8Encoding]::new($false)
     )
+    if ($WorkbenchMotion) {
+        $afterHash = (Get-FileHash -LiteralPath $ExecutablePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $motionEnvironment['executableUnchanged'] = $afterHash -ceq $motionEnvironment.executableSha256
+        [IO.File]::WriteAllText(
+            (Join-Path $runRoot 'workbench-motion-environment.json'),
+            ((ConvertTo-Json -InputObject $motionEnvironment -Depth 5) + [Environment]::NewLine),
+            [Text.UTF8Encoding]::new($false)
+        )
+        if (-not $motionEnvironment.executableUnchanged) {
+            throw 'The motion acceptance executable changed during sampling.'
+        }
+    }
 
     if (-not $result.DesktopClosed) {
         throw "The settings acceptance private desktop was not closed after native exit status $($result.ExitCodeHex) ($($result.ExitCode)). See process-result.json and stderr.log in $runRoot."
@@ -1223,27 +1473,47 @@ try {
         throw "Settings parity process failed with native exit status $($result.ExitCodeHex) ($($result.ExitCode)). See process-result.json and stderr.log in $runRoot."
     }
 
-    $reportPath = Join-Path $runRoot 'report.json'
+    $reportPath = Join-Path $runRoot $(if ($WorkbenchMotion) { 'workbench-motion-report.json' } elseif ($WorkbenchOnly) { 'workbench-report.json' } else { 'report.json' })
     if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
         throw "Settings parity process exited without a report: $runRoot"
     }
     $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
-    Assert-SettingsParityReport `
-        -Report $report `
-        -RunRoot $runRoot `
-        -ProcessId $result.ProcessId `
-        -DesktopName $result.DesktopName `
-        -ExpectedWidth $Width `
-        -ExpectedHeight $Height `
-        -McpOnly:$McpOnly `
-        -SuggestionsOnly:$SuggestionsOnly `
-        -SshSuggestions:$SshSuggestions
+    if ($WorkbenchMotion) {
+        Assert-WorkbenchMotionReport `
+            -Report $report `
+            -RunRoot $runRoot `
+            -ProcessId $result.ProcessId `
+            -DesktopName $result.DesktopName `
+            -ExpectedWidth $Width `
+            -ExpectedHeight $Height
+    } elseif ($WorkbenchOnly) {
+        Assert-WorkbenchAcceptanceReport `
+            -Report $report `
+            -RunRoot $runRoot `
+            -ProcessId $result.ProcessId `
+            -DesktopName $result.DesktopName `
+            -ExpectedWidth $Width `
+            -ExpectedHeight $Height
+    } else {
+        Assert-SettingsParityReport `
+            -Report $report `
+            -RunRoot $runRoot `
+            -ProcessId $result.ProcessId `
+            -DesktopName $result.DesktopName `
+            -ExpectedWidth $Width `
+            -ExpectedHeight $Height `
+            -McpOnly:$McpOnly `
+            -SuggestionsOnly:$SuggestionsOnly `
+            -SshSuggestions:$SshSuggestions
+    }
     $acceptancePassed = $true
 } catch {
     $acceptanceFailure = $_
 } finally {
     [Environment]::SetEnvironmentVariable('KERMINAL_SETTINGS_ACCEPTANCE_SCOPE', $previousAcceptanceScope, 'Process')
     [Environment]::SetEnvironmentVariable('KERMINAL_SUGGESTIONS_ACCEPTANCE_SSH', $previousSshSuggestions, 'Process')
+    [Environment]::SetEnvironmentVariable('KERMINAL_WORKBENCH_ACCEPTANCE', $previousWorkbenchAcceptance, 'Process')
+    [Environment]::SetEnvironmentVariable('KERMINAL_WORKBENCH_MOTION_ACCEPTANCE', $previousWorkbenchMotion, 'Process')
     try {
         if (Test-Path -LiteralPath $runRoot) {
             Remove-IsolatedConfigDirectory -RunRoot $runRoot -ConfigDirectory $configDirectory
@@ -1311,5 +1581,5 @@ if (-not $acceptancePassed -or
     -not $processEvidence['configDirectoryRemoved']) {
     throw 'Settings parity acceptance did not produce a verified cleanup receipt.'
 }
-Write-Output "Settings parity acceptance passed."
+Write-Output "$(if ($WorkbenchMotion) { 'Workbench motion' } elseif ($WorkbenchOnly) { 'Workbench' } else { 'Settings parity' }) acceptance passed."
 Write-Output "Evidence: $runRoot"

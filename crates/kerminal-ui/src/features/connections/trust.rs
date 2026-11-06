@@ -3,14 +3,15 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    ClickEvent, Context, IntoElement,
+    ClickEvent, Context, IntoElement, ScrollHandle, Window,
     component::{
         Disableable,
         button::{Button, ButtonVariants},
+        scroll::ScrollableElement as _,
     },
     div,
     prelude::*,
-    px,
+    px, rems,
 };
 use kerminal_application::connections::HostKeyStatus;
 
@@ -19,15 +20,20 @@ use crate::theme::ThemeTokens;
 use super::panel::{ConnectionsPanel, PendingTrust, host_key_trust_allowed};
 use kerminal_domain::preferences::ConfigurationMode;
 
-/// 展示完整指纹并沿用应用的决策遮罩；变化密钥或只读恢复状态不提供继续连接的信任动作。
+/// 保留完整指纹及信任门禁；长说明独立滚动，使窄矮窗口仍能访问固定操作栏。
 /// @author kongweiguang
 pub(super) fn render_trust_confirmation(
     pending: Option<&PendingTrust>,
     configuration_mode: ConfigurationMode,
     theme: ThemeTokens,
+    window: &mut Window,
     cx: &mut Context<ConnectionsPanel>,
 ) -> Option<impl IntoElement> {
     let pending = pending?;
+    let scroll = window
+        .use_keyed_state("connections-hostkey-scroll", cx, |_, _| ScrollHandle::new())
+        .read(cx)
+        .clone();
     let challenge = &pending.challenge;
     let changed = matches!(challenge.status, HostKeyStatus::Changed { .. });
     let trust_allowed = host_key_trust_allowed(&challenge.status, configuration_mode);
@@ -106,11 +112,123 @@ pub(super) fn render_trust_confirmation(
                 panel.confirm_host_key_rotation(cx);
             }))
     });
+    let identity = format!(
+        "{} · {} · {} · {} · {}",
+        pending
+            .display_host
+            .as_deref()
+            .unwrap_or(challenge.host_id.as_str()),
+        endpoint_label(&challenge.endpoint),
+        peer_label(&challenge.peer),
+        challenge.algorithm,
+        challenge.host_id.as_str(),
+    );
+    let busy_feedback = pending.operation_busy.then(|| {
+        div()
+            .w_full()
+            .p(theme.metrics.panel_padding)
+            .rounded_sm()
+            .bg(theme.sidebar)
+            .text_size(theme.text_xs)
+            .text_color(theme.warning)
+            .child(if cancel_requested {
+                crate::locale::text(
+                    "已请求取消；操作可能已经提交。正在等待真实回执并回读原端点。",
+                    "Cancellation requested. The write may already have committed; waiting for its receipt and reading back the original endpoint.",
+                )
+            } else {
+                crate::locale::text(
+                    "正在重新握手和写入主机信任。取消后仍会等待真实回执并回读原端点。",
+                    "Rechecking and writing host trust. A cancellation request still waits for the real receipt and reads back the original endpoint.",
+                )
+            })
+    });
+    let classification = pending.external_classification.as_ref().map(|value| {
+        div()
+            .text_size(theme.text_xs)
+            .text_color(theme.muted)
+            .child(super::external::external_classification_text(value))
+    });
+    let previous_fingerprint = previous.map(|fingerprint| {
+        div()
+            .w_full()
+            .p(theme.metrics.panel_padding)
+            .rounded_sm()
+            .bg(theme.sidebar)
+            .text_size(theme.text_xs)
+            .text_color(theme.error)
+            .child(crate::locale::text(
+                format!("已保存指纹：{fingerprint}"),
+                format!("Saved fingerprint: {fingerprint}"),
+            ))
+    });
+    let blocked_feedback = blocked_reason.map(|message| {
+        div()
+            .w_full()
+            .p(theme.metrics.panel_padding)
+            .rounded_sm()
+            .bg(theme.sidebar)
+            .text_size(theme.text_xs)
+            .text_color(theme.error)
+            .child(message)
+    });
+    let description = if changed {
+        crate::locale::text(
+            "变化可能表示服务器重装、密钥轮换或连接被拦截。请通过独立可信渠道核对，不要只凭本提示确认。",
+            "A changed key may indicate a server reinstall, key rotation, or interception. Verify it through an independent trusted channel before continuing.",
+        )
+    } else {
+        crate::locale::text(
+            "确认前应用不会保存此指纹，也不会继续建立终端或文件连接。请通过独立可信渠道核对。",
+            "The app will not save this key or continue to a terminal or file connection until you confirm. Verify it through an independent trusted channel.",
+        )
+    };
+    let body = crate::ui_surface::panel_content(theme)
+        .id("connections-hostkey-body")
+        .debug_selector(|| "connections-hostkey-body".to_owned())
+        .w_full()
+        .min_h(px(0.))
+        .flex_auto()
+        .overflow_y_scroll()
+        .track_scroll(&scroll)
+        .vertical_scrollbar(&scroll)
+        .p(theme.metrics.dialog_padding)
+        .child(
+            div()
+                .id("connections-hostkey-identity")
+                .debug_selector(|| "connections-hostkey-identity".to_owned())
+                .text_size(theme.text_xs)
+                .text_color(theme.muted)
+                .child(identity),
+        )
+        .children(busy_feedback)
+        .children(classification)
+        .child(
+            div()
+                .w_full()
+                .p(theme.metrics.panel_padding)
+                .rounded_sm()
+                .bg(theme.sidebar)
+                .text_size(theme.text_sm)
+                .child(crate::locale::text(
+                    format!("当前指纹：{}", challenge.fingerprint_sha256),
+                    format!("Current fingerprint: {}", challenge.fingerprint_sha256),
+                )),
+        )
+        .children(previous_fingerprint)
+        .child(
+            div()
+                .text_size(theme.text_xs)
+                .text_color(theme.muted)
+                .child(description),
+        )
+        .children(blocked_feedback);
     Some(
         div()
             .id("connections-hostkey-confirmation")
             .absolute()
             .inset_0()
+            .p(theme.metrics.gap)
             .flex()
             .items_center()
             .justify_center()
@@ -118,110 +236,39 @@ pub(super) fn render_trust_confirmation(
             .child(
                 div()
                     .w_full()
-                    .max_w(px(510.))
-                    .p_5()
+                    .max_w(rems(32.0))
+                    .min_h(px(0.))
+                    .max_h_full()
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .overflow_hidden()
                     .bg(theme.panel)
                     .border_1()
                     .border_color(if changed { theme.error } else { theme.accent })
                     .rounded_md()
                     .text_color(theme.foreground)
-                    .child(div().text_size(px(18.)).font_weight(gpui_kit::FontWeight::BOLD).child(headline))
-                    .child(div().text_size(px(12.)).text_color(theme.muted).child(format!(
-                        "{} · {} · {} · {} · {}",
-                        pending
-                            .display_host
-                            .as_deref()
-                            .unwrap_or(challenge.host_id.as_str()),
-                        endpoint_label(&challenge.endpoint),
-                        peer_label(&challenge.peer),
-                        challenge.algorithm,
-                        challenge.host_id.as_str(),
-                    )))
-                    .children(pending.operation_busy.then(|| {
-                        div()
-                            .w_full()
-                            .p_3()
-                            .rounded_sm()
-                            .bg(theme.sidebar)
-                            .text_size(px(12.))
-                            .text_color(theme.warning)
-                            .child(if cancel_requested {
-                                crate::locale::text(
-                                    "已请求取消；操作可能已经提交。正在等待真实回执并回读原端点。",
-                                    "Cancellation requested. The write may already have committed; waiting for its receipt and reading back the original endpoint.",
-                                )
-                            } else {
-                                crate::locale::text(
-                                    "正在重新握手和写入主机信任。取消后仍会等待真实回执并回读原端点。",
-                                    "Rechecking and writing host trust. A cancellation request still waits for the real receipt and reads back the original endpoint.",
-                                )
-                            })
-                    }))
-                    .children(pending.external_classification.as_ref().map(|classification| {
-                        div()
-                            .text_size(theme.text_xs)
-                            .text_color(theme.muted)
-                            .child(super::external::external_classification_text(classification))
-                    }))
                     .child(
-                        div()
+                        crate::ui_surface::panel_header(theme)
                             .w_full()
-                            .p_3()
-                            .rounded_sm()
-                            .bg(theme.sidebar)
-                            .text_size(px(13.))
-                            .child(crate::locale::text(
-                                format!("当前指纹：{}", challenge.fingerprint_sha256),
-                                format!("Current fingerprint: {}", challenge.fingerprint_sha256),
-                            )),
+                            .px(theme.metrics.dialog_padding)
+                            .py(theme.metrics.gap)
+                            .text_size(theme.text_body)
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child(headline),
                     )
-                    .children(previous.map(|fingerprint| {
-                        div()
-                            .w_full()
-                            .p_3()
-                            .rounded_sm()
-                            .bg(theme.sidebar)
-                            .text_size(px(12.))
-                            .text_color(theme.error)
-                            .child(crate::locale::text(
-                                format!("已保存指纹：{fingerprint}"),
-                                format!("Saved fingerprint: {fingerprint}"),
-                            ))
-                    }))
-                    .child(div().text_size(px(12.)).text_color(theme.muted).child(
-                        if changed {
-                            crate::locale::text(
-                                "变化可能表示服务器重装、密钥轮换或连接被拦截。请通过独立可信渠道核对，不要只凭本提示确认。",
-                                "A changed key may indicate a server reinstall, key rotation, or interception. Verify it through an independent trusted channel before continuing.",
-                            )
-                        } else {
-                            crate::locale::text(
-                                "确认前应用不会保存此指纹，也不会继续建立终端或文件连接。请通过独立可信渠道核对。",
-                                "The app will not save this key or continue to a terminal or file connection until you confirm. Verify it through an independent trusted channel.",
-                            )
-                        },
-                    ))
-                    .children(blocked_reason.map(|message| {
-                        div()
-                            .w_full()
-                            .p_3()
-                            .rounded_sm()
-                            .bg(theme.sidebar)
-                            .text_size(px(12.))
-                            .text_color(theme.error)
-                            .child(message)
-                    }))
+                    .child(body)
                     .child(
-                        div()
+                        crate::ui_surface::dialog_actions(theme)
+                            .id("connections-hostkey-actions")
+                            .debug_selector(|| "connections-hostkey-actions".to_owned())
                             .w_full()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
+                            .px(theme.metrics.dialog_padding)
+                            .py(theme.metrics.gap)
+                            .border_t_1()
+                            .border_color(theme.border)
                             .child(
                                 Button::new("connections-hostkey-cancel")
+                                    .debug_selector(|| "connections-hostkey-cancel".to_owned())
                                     .compact()
                                     .disabled(cancel_requested)
                                     .label(if cancel_requested {
@@ -231,7 +278,9 @@ pub(super) fn render_trust_confirmation(
                                     } else {
                                         crate::locale::text("取消连接", "Cancel connection")
                                     })
-                                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| panel.cancel_pending_trust(cx))),
+                                    .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                        panel.cancel_pending_trust(cx)
+                                    })),
                             )
                             .children(trust_button)
                             .children(rotation_button),

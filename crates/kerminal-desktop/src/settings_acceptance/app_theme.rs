@@ -276,7 +276,7 @@ fn run_hidden_window(
     Ok(())
 }
 
-/// 验证每种应用色板的生产单选、Kit 投影、磁盘回读及终端身份，截图保留可审阅证据。
+/// 验证每种应用色板的生产单选、Kit 投影、磁盘回读及终端身份；先等待隐藏窗口原生目标就绪。
 ///
 /// @author kongweiguang
 async fn capture_theme(
@@ -290,7 +290,14 @@ async fn capture_theme(
         state.settings_ready() && state.workspace_ready()
     })
     .await?;
-    resize_acceptance_window(cx, window, context.width, context.height).await?;
+    workbench::prepare_capture_surface_for_title(
+        cx,
+        window,
+        context.width,
+        context.height,
+        "Kerminal App Theme Acceptance",
+    )
+    .await?;
     let before_session = root_state(cx, &root, window)?;
     if before_session.ready_local_session_ids().is_empty() {
         click_selector(cx, window, "workspace-tabs-create-terminal")?;
@@ -797,7 +804,7 @@ async fn verify_keyboard(
     })
 }
 
-/// 在真实窄窗口中检查每项相对于正文裁切区域的边界与相邻单选项几何。
+/// 在原生目标完成重设的窄窗口中检查正文裁切与相邻单选项几何。
 ///
 /// @author kongweiguang
 async fn verify_narrow_window(
@@ -809,7 +816,14 @@ async fn verify_narrow_window(
 ) -> Result<NarrowCheck, Box<dyn Error>> {
     const WIDTH: u32 = 800;
     const HEIGHT: u32 = 600;
-    resize_acceptance_window(cx, window, WIDTH, HEIGHT).await?;
+    workbench::prepare_capture_surface_for_title(
+        cx,
+        window,
+        WIDTH,
+        HEIGHT,
+        "Kerminal App Theme Acceptance",
+    )
+    .await?;
     ensure_page(cx, root, window, "appearance", "appearance").await?;
     for scheme in AppColorScheme::ALL {
         let selector = format!("app-color-{}", scheme.as_str());

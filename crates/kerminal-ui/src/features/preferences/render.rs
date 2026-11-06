@@ -17,6 +17,7 @@ use gpui_kit::{
 use kerminal_domain::preferences::{ConfigurationMode, ConfigurationRecoveryState};
 
 use crate::theme::ThemeTokens;
+use crate::ui_surface::dialog_actions;
 
 use super::panel::{PreferencesPanel, PreferencesSection, recovery_issue_label};
 
@@ -436,7 +437,7 @@ fn navigation_target(spec: NavigationTargetSpec<'_>) -> NavigationTarget {
 }
 
 impl Render for PreferencesPanel {
-    /// 设置页跟踪独立焦点边界供确认层恢复，搜索仍保留当前正文页。
+    /// 设置页跟踪独立焦点边界供确认层恢复；事务异常与恢复固定在正文外，搜索仍保留当前正文页。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -513,7 +514,11 @@ impl Render for PreferencesPanel {
                                 .flex_col()
                                 .overflow_hidden()
                                 .child(self.render_recovery(theme, cx))
-                                .child(content),
+                                .child(content)
+                                .when_some(
+                                    self.render_save_recovery(theme, cx),
+                                    |column, feedback| column.child(feedback),
+                                ),
                         ),
                 )
                 .when_some(
@@ -965,9 +970,21 @@ impl PreferencesPanel {
         })
     }
 
-    /// 保存反馈放在正文末尾；只有确认成功才显示 main 的勾，失败和在途状态不冒充保存完成。
+    /// 普通状态留在正文末尾；设置事务异常交给固定反馈区，避免滚动后出现重复错误。
     /// @author kongweiguang
     pub(super) fn render_save_notice(&self, theme: ThemeTokens) -> impl IntoElement {
+        if self.settings_error.is_some()
+            || self.settings.as_ref().is_some_and(|draft| {
+                matches!(
+                    draft.status(),
+                    super::DraftStatus::Failed
+                        | super::DraftStatus::ExternalConflict
+                        | super::DraftStatus::OutcomeUnknown
+                )
+            })
+        {
+            return div();
+        }
         let message = self
             .settings_error
             .as_deref()
@@ -1016,7 +1033,7 @@ impl PreferencesPanel {
         })
     }
 
-    /// 关闭确认独占内部焦点范围，Escape 保留当前草稿并回到原面板控件。
+    /// 只为最上层确认注册焦点范围；Escape 保留当前草稿并回到原面板控件。
     ///
     /// @author kongweiguang
     fn render_close_confirmation(
@@ -1024,252 +1041,344 @@ impl PreferencesPanel {
         theme: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        self.close_confirmation.then(|| {
+        (self.close_confirmation
+            && !self.profile_switch_confirmation
+            && !self.profile_reload_confirmation
+            && !self.profile_delete_confirmation
+            && !self.quit_confirmation)
+            .then(|| {
+                div()
+                    .id("preferences-close-confirmation-overlay")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(theme.metrics.panel_padding)
+                    .bg(theme.dialog_scrim)
+                    .on_key_down(cx.listener(|panel, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key.eq_ignore_ascii_case("escape")
+                            && !event.keystroke.modifiers.modified()
+                            && !event.is_held
+                        {
+                            panel.cancel_close(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(420.))
+                            .p(theme.metrics.dialog_padding)
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .bg(theme.panel)
+                            .border_1()
+                            .border_color(theme.border)
+                            .rounded(theme.radius_dialog)
+                            .child(crate::locale::text(
+                                crate::locale::text(
+                                    "设置尚有未保存修改",
+                                    "Settings contain unsaved changes",
+                                ),
+                                "Preferences contain unsaved changes",
+                            ))
+                            .child(
+                                dialog_actions(theme)
+                                    .child(
+                                        Button::new("preferences-close-cancel")
+                                            .focus_handle(
+                                                &self.close_confirmation_focus.keep_editing,
+                                            )
+                                            .compact()
+                                            .label(crate::locale::text("继续编辑", "Keep editing"))
+                                            .on_click(cx.listener(
+                                                |panel, _: &ClickEvent, _, cx| {
+                                                    panel.cancel_close(cx)
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("preferences-close-discard")
+                                            .focus_handle(&self.close_confirmation_focus.discard)
+                                            .compact()
+                                            .label(crate::locale::text(
+                                                crate::locale::text(
+                                                    "丢弃并返回",
+                                                    "Discard and return",
+                                                ),
+                                                "Discard and return",
+                                            ))
+                                            .on_click(cx.listener(
+                                                |panel, _: &ClickEvent, window, cx| {
+                                                    panel.discard_and_close(window, cx)
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .focus_trap(
+                                "preferences-close-confirmation-focus",
+                                &self.close_confirmation_focus.container,
+                            ),
+                    )
+            })
+    }
+
+    /// 切换确认只在顶层注册焦点范围；取消保留草稿并恢复本次弹层之前的焦点。
+    ///
+    /// @author kongweiguang
+    fn render_profile_switch_confirmation(
+        &mut self,
+        theme: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        (self.profile_switch_confirmation
+            && !self.profile_reload_confirmation
+            && !self.profile_delete_confirmation
+            && !self.quit_confirmation)
+            .then(|| {
+                div()
+                    .id("profile-switch-confirmation-overlay")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(theme.metrics.panel_padding)
+                    .bg(theme.dialog_scrim)
+                    .on_key_down(cx.listener(|panel, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key.eq_ignore_ascii_case("escape")
+                            && !event.keystroke.modifiers.modified()
+                            && !event.is_held
+                        {
+                            panel.cancel_profile_switch(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(420.))
+                            .p(theme.metrics.dialog_padding)
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .bg(theme.panel)
+                            .border_1()
+                            .border_color(theme.border)
+                            .rounded(theme.radius_dialog)
+                            .child(crate::locale::text(
+                                crate::locale::text(
+                                    "当前 Profile 有未保存修改",
+                                    "This profile has unsaved changes",
+                                ),
+                                "This profile has unsaved changes",
+                            ))
+                            .child(
+                                dialog_actions(theme)
+                                    .child(
+                                        Button::new("profile-switch-cancel")
+                                            .focus_handle(
+                                                &self
+                                                    .profile_switch_confirmation_focus
+                                                    .keep_editing,
+                                            )
+                                            .compact()
+                                            .label(crate::locale::text("继续编辑", "Keep editing"))
+                                            .on_click(cx.listener(
+                                                |panel, _: &ClickEvent, _, cx| {
+                                                    panel.cancel_profile_switch(cx);
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("profile-switch-discard")
+                                            .focus_handle(
+                                                &self.profile_switch_confirmation_focus.discard,
+                                            )
+                                            .compact()
+                                            .label(crate::locale::text(
+                                                crate::locale::text(
+                                                    "丢弃并切换",
+                                                    "Discard and switch",
+                                                ),
+                                                "Discard and switch",
+                                            ))
+                                            .on_click(cx.listener(
+                                                |panel, _: &ClickEvent, window, cx| {
+                                                    panel.confirm_profile_discard(window, cx)
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .focus_trap(
+                                "profile-switch-confirmation-focus",
+                                &self.profile_switch_confirmation_focus.container,
+                            ),
+                    )
+            })
+    }
+
+    /// 重读确认只在顶层注册焦点范围；窄窗口允许动作换行而不裁掉结果。
+    ///
+    /// @author kongweiguang
+    fn render_profile_reload_confirmation(
+        &mut self,
+        theme: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        (self.profile_reload_confirmation
+            && !self.profile_delete_confirmation
+            && !self.quit_confirmation)
+            .then(|| {
+                div()
+                    .id("profile-reload-confirmation-overlay")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(theme.metrics.panel_padding)
+                    .bg(theme.dialog_scrim)
+                    .on_key_down(cx.listener(|panel, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key.eq_ignore_ascii_case("escape")
+                            && !event.keystroke.modifiers.modified()
+                            && !event.is_held
+                        {
+                            panel.cancel_profile_reload(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(420.))
+                            .p(theme.metrics.dialog_padding)
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .bg(theme.panel)
+                            .border_1()
+                            .border_color(theme.border)
+                            .rounded(theme.radius_dialog)
+                            .child(crate::locale::text(
+                                crate::locale::text(
+                                    "重新读取会放弃当前 Profile 草稿",
+                                    "Reloading will discard this profile draft",
+                                ),
+                                "Reloading will discard this profile draft",
+                            ))
+                            .child(
+                                dialog_actions(theme)
+                                    .child(
+                                        Button::new("profile-reload-cancel")
+                                            .focus_handle(
+                                                &self
+                                                    .profile_reload_confirmation_focus
+                                                    .keep_editing,
+                                            )
+                                            .compact()
+                                            .label(crate::locale::text("继续编辑", "Keep editing"))
+                                            .on_click(cx.listener(
+                                                |panel, _: &ClickEvent, _, cx| {
+                                                    panel.cancel_profile_reload(cx)
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("profile-reload-confirm")
+                                            .focus_handle(
+                                                &self.profile_reload_confirmation_focus.discard,
+                                            )
+                                            .compact()
+                                            .label(crate::locale::text(
+                                                crate::locale::text(
+                                                    "丢弃并重新读取",
+                                                    "Discard and reload",
+                                                ),
+                                                "Discard and reload",
+                                            ))
+                                            .on_click(cx.listener(
+                                                |panel, _: &ClickEvent, _, cx| {
+                                                    panel.confirm_profile_reload(cx)
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .focus_trap(
+                                "profile-reload-confirmation-focus",
+                                &self.profile_reload_confirmation_focus.container,
+                            ),
+                    )
+            })
+    }
+
+    /// 删除确认在顶层显示具体模板并先聚焦取消，避免隐藏陷阱与退出确认争夺焦点。
+    ///
+    /// @author kongweiguang
+    fn render_profile_delete_confirmation(
+        &mut self,
+        theme: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        (self.profile_delete_confirmation && !self.quit_confirmation).then(|| {
+            let name = self
+                .pending_profile_delete
+                .as_ref()
+                .map(|pending| pending.name.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("Profile");
+            let title = crate::locale::text(
+                format!("删除 Profile“{name}”？"),
+                format!("Delete profile ‘{name}’?"),
+            );
             div()
-                .id("preferences-close-confirmation-overlay")
+                .id("profile-delete-confirmation-overlay")
                 .absolute()
                 .inset_0()
                 .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
+                .p(theme.metrics.panel_padding)
                 .bg(theme.dialog_scrim)
                 .on_key_down(cx.listener(|panel, event: &KeyDownEvent, _, cx| {
                     if event.keystroke.key.eq_ignore_ascii_case("escape")
                         && !event.keystroke.modifiers.modified()
                         && !event.is_held
                     {
-                        panel.cancel_close(cx);
+                        panel.cancel_delete_profile(cx);
                         cx.stop_propagation();
                     }
                 }))
                 .child(
                     div()
-                        .w(px(420.))
-                        .p_4()
+                        .w_full()
+                        .max_w(px(420.))
+                        .p(theme.metrics.dialog_padding)
                         .flex()
                         .flex_col()
                         .gap_3()
                         .bg(theme.panel)
                         .border_1()
-                        .border_color(theme.muted)
-                        .rounded_md()
-                        .child(crate::locale::text(
-                            crate::locale::text(
-                                "设置尚有未保存修改",
-                                "Settings contain unsaved changes",
-                            ),
-                            "Preferences contain unsaved changes",
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    Button::new("preferences-close-cancel")
-                                        .focus_handle(&self.close_confirmation_focus.keep_editing)
-                                        .compact()
-                                        .label(crate::locale::text("继续编辑", "Keep editing"))
-                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                            panel.cancel_close(cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("preferences-close-discard")
-                                        .focus_handle(&self.close_confirmation_focus.discard)
-                                        .compact()
-                                        .primary()
-                                        .label(crate::locale::text(
-                                            crate::locale::text("丢弃并返回", "Discard and return"),
-                                            "Discard and return",
-                                        ))
-                                        .on_click(cx.listener(
-                                            |panel, _: &ClickEvent, window, cx| {
-                                                panel.discard_and_close(window, cx)
-                                            },
-                                        )),
-                                ),
-                        )
-                        .focus_trap(
-                            "preferences-close-confirmation-focus",
-                            &self.close_confirmation_focus.container,
-                        ),
-                )
-        })
-    }
-
-    /// 切换 profile 前的丢弃提示局限于该表单，遮罩由当前应用主题决定。
-    fn render_profile_switch_confirmation(
-        &mut self,
-        theme: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        self.profile_switch_confirmation.then(|| {
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.dialog_scrim)
-                .child(
-                    div()
-                        .w(px(420.))
-                        .p_4()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .bg(theme.panel)
-                        .border_1()
-                        .border_color(theme.muted)
-                        .rounded_md()
-                        .child(crate::locale::text(
-                            crate::locale::text(
-                                "当前 Profile 有未保存修改",
-                                "This profile has unsaved changes",
-                            ),
-                            "This profile has unsaved changes",
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    Button::new("profile-switch-cancel")
-                                        .compact()
-                                        .label(crate::locale::text("继续编辑", "Keep editing"))
-                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                            panel.profile_switch_confirmation = false;
-                                            panel.pending_profile_selection = None;
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("profile-switch-discard")
-                                        .compact()
-                                        .primary()
-                                        .label(crate::locale::text(
-                                            crate::locale::text("丢弃并切换", "Discard and switch"),
-                                            "Discard and switch",
-                                        ))
-                                        .on_click(cx.listener(
-                                            |panel, _: &ClickEvent, window, cx| {
-                                                panel.confirm_profile_discard(window, cx)
-                                            },
-                                        )),
-                                ),
-                        ),
-                )
-        })
-    }
-
-    /// 外部 Profile 冲突时明确提示重读的草稿后果，并复用当前主题遮罩。
-    fn render_profile_reload_confirmation(
-        &mut self,
-        theme: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        self.profile_reload_confirmation.then(|| {
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.dialog_scrim)
-                .child(
-                    div()
-                        .w(px(420.))
-                        .p_4()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .bg(theme.panel)
-                        .border_1()
-                        .border_color(theme.muted)
-                        .rounded_md()
-                        .child(crate::locale::text(
-                            crate::locale::text(
-                                "重新读取会放弃当前 Profile 草稿",
-                                "Reloading will discard this profile draft",
-                            ),
-                            "Reloading will discard this profile draft",
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    Button::new("profile-reload-cancel")
-                                        .compact()
-                                        .label(crate::locale::text("继续编辑", "Keep editing"))
-                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                            panel.cancel_profile_reload(cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("profile-reload-confirm")
-                                        .compact()
-                                        .primary()
-                                        .label(crate::locale::text(
-                                            crate::locale::text(
-                                                "丢弃并重新读取",
-                                                "Discard and reload",
-                                            ),
-                                            "Discard and reload",
-                                        ))
-                                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                            panel.confirm_profile_reload(cx)
-                                        })),
-                                ),
-                        ),
-                )
-        })
-    }
-
-    /// 删除保持独立确认以避免误触发，并复用当前主题的决策层遮罩。
-    fn render_profile_delete_confirmation(
-        &mut self,
-        theme: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        self.profile_delete_confirmation.then(|| {
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.dialog_scrim)
-                .child(
-                    div()
-                        .w(px(420.))
-                        .p_4()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .bg(theme.panel)
-                        .border_1()
-                        .border_color(theme.muted)
-                        .rounded_md()
-                        .child(crate::locale::text(
-                            "确认删除此 Profile？",
-                            "Delete this profile?",
-                        ))
+                        .border_color(theme.border)
+                        .rounded(theme.radius_dialog)
+                        .child(title)
                         .child(crate::locale::text(
                             "删除后无法从设置面板撤销。",
                             "This cannot be undone from Preferences.",
                         ))
                         .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap_2()
+                            dialog_actions(theme)
                                 .child(
                                     Button::new("profile-delete-cancel")
+                                        .focus_handle(
+                                            &self.profile_delete_confirmation_focus.keep_editing,
+                                        )
                                         .compact()
                                         .label(crate::locale::text("取消", "Cancel"))
                                         .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
@@ -1278,8 +1387,11 @@ impl PreferencesPanel {
                                 )
                                 .child(
                                     Button::new("profile-delete-confirm")
+                                        .focus_handle(
+                                            &self.profile_delete_confirmation_focus.discard,
+                                        )
                                         .compact()
-                                        .primary()
+                                        .danger()
                                         .label(crate::locale::text(
                                             "删除 Profile",
                                             "Delete profile",
@@ -1288,6 +1400,10 @@ impl PreferencesPanel {
                                             panel.confirm_delete_profile(cx)
                                         })),
                                 ),
+                        )
+                        .focus_trap(
+                            "profile-delete-confirmation-focus",
+                            &self.profile_delete_confirmation_focus.container,
                         ),
                 )
         })
@@ -1310,6 +1426,7 @@ impl PreferencesPanel {
                 .flex()
                 .items_center()
                 .justify_center()
+                .p(theme.metrics.panel_padding)
                 .bg(theme.dialog_scrim)
                 .on_key_down(cx.listener(|panel, event: &KeyDownEvent, _, cx| {
                     if event.keystroke.key.eq_ignore_ascii_case("escape")
@@ -1322,15 +1439,16 @@ impl PreferencesPanel {
                 }))
                 .child(
                     div()
-                        .w(px(440.))
-                        .p_4()
+                        .w_full()
+                        .max_w(px(440.))
+                        .p(theme.metrics.dialog_padding)
                         .flex()
                         .flex_col()
                         .gap_3()
                         .bg(theme.panel)
                         .border_1()
-                        .border_color(theme.muted)
-                        .rounded_md()
+                        .border_color(theme.border)
+                        .rounded(theme.radius_dialog)
                         .child(crate::locale::text(
                             crate::locale::text("偏好设置有未保存修改", "Preferences contain unsaved changes"),
                             "Preferences contain unsaved changes",
@@ -1340,10 +1458,7 @@ impl PreferencesPanel {
                             "Quitting will discard unsaved settings, profiles, keyword rules, and pending inputs.",
                         ))
                         .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap_2()
+                            dialog_actions(theme)
                                 .child(
                                     Button::new("preferences-quit-cancel")
                                         .focus_handle(&self.quit_confirmation_focus.keep_editing)
@@ -1357,7 +1472,6 @@ impl PreferencesPanel {
                                     Button::new("preferences-quit-confirm")
                                         .focus_handle(&self.quit_confirmation_focus.discard)
                                         .compact()
-                                        .primary()
                                         .label(crate::locale::text(
                                             crate::locale::text("丢弃并退出", "Discard and quit"),
                                             "Discard and quit",

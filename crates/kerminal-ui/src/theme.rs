@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::borrow::BorrowMut;
+use std::{borrow::BorrowMut, time::Duration};
 
 use gpui_kit::component::{Theme as KitTheme, ThemeMode as KitThemeMode};
 use gpui_kit::{App, Context, Global, Hsla, Pixels, Window, WindowAppearance, px};
@@ -10,11 +10,16 @@ use kerminal_application::preferences::{AppColorScheme, ThemeMode};
 
 mod kit;
 mod materials;
+mod metrics;
 mod palette;
 mod terminal;
 
 pub(crate) use materials::{BackgroundMaterialSettings, BackgroundMaterials};
+pub(crate) use metrics::{ActiveInterfaceDensity, UiMetrics};
 pub(crate) use terminal::{terminal_background_color, terminal_palette_for_mode};
+
+/// 共享短过渡仅表达表面关系，不参与终端测量或阻塞业务完成。
+pub(crate) const UI_TRANSITION_DURATION: Duration = Duration::from_millis(140);
 
 /// 仅缓存当前选择的色板身份；明暗和材质仍从各自的既有状态解析。
 #[derive(Clone, Copy, Default)]
@@ -75,6 +80,7 @@ pub(crate) struct ThemeTokens {
     pub text_body: Pixels,
     pub text_heading: Pixels,
     pub text_title: Pixels,
+    pub(crate) metrics: UiMetrics,
     pub(crate) materials: BackgroundMaterials,
     dark_foreground: Hsla,
     dark: bool,
@@ -168,11 +174,11 @@ impl ThemeTokens {
             .opacity(if self.dark { 0.06 } else { 0.035 })
     }
 
-    /// 字段使用当前主题的背景角色，透明度允许壁纸与浮层共同显示。
+    /// 字段使用稳定实色，避免复杂表单的字形和边框随底层终端或壁纸变化。
     ///
     /// @author kongweiguang
     pub(crate) fn field_surface(self) -> Hsla {
-        self.background.opacity(if self.dark { 0.55 } else { 0.78 })
+        self.background
     }
 
     /// 字段悬停使用中性次级表面，避免与持久选中态混淆。
@@ -212,11 +218,11 @@ impl ThemeTokens {
             .opacity(if self.dark { 0.09 } else { 0.055 })
     }
 
-    /// 右键菜单复用应用面板色并保留独立透明度，避免遮挡底层背景。
+    /// 右键与下拉菜单共享同一表面，避免相邻浮层出现不同透明度和文字对比度。
     ///
     /// @author kongweiguang
     pub(crate) fn context_menu_surface(self) -> Hsla {
-        self.panel.opacity(0.86)
+        self.floating_surface
     }
 
     /// 上传动作遵循当前色板的强调色，避免菜单在非默认主题中残留蓝色。
@@ -253,10 +259,10 @@ impl ThemeTokens {
         )
     }
 
-    /// 从当前色板、Kit 明暗模式和原始材质设置一次性投影，避免局部控件回落默认色。
+    /// 从当前色板、密度和窗口 rem 一次性投影，保证自绘区域与 Kit 缩放一致且不重建输入实体。
     ///
     /// @author kongweiguang
-    pub(crate) fn current(_window: &Window, cx: &App) -> Self {
+    pub(crate) fn current(window: &Window, cx: &App) -> Self {
         let dark = cx.global::<KitTheme>().mode == KitThemeMode::Dark;
         let settings = cx
             .try_global::<BackgroundMaterialSettings>()
@@ -268,7 +274,15 @@ impl ThemeTokens {
             .copied()
             .unwrap_or_default()
             .0;
-        Self::for_palette_with_materials(dark, scheme, settings)
+        let mut theme = Self::for_palette_with_materials(dark, scheme, settings);
+        let scale = window.rem_size().as_f32() / 16.;
+        theme.text_xs = px(12. * scale);
+        theme.text_sm = px(14. * scale);
+        theme.text_body = px(14. * scale);
+        theme.text_heading = px(16. * scale);
+        theme.text_title = px(20. * scale);
+        theme.metrics = UiMetrics::current(window.rem_size(), cx);
+        theme
     }
 
     /// 预览与运行态复用同一色板解析；系统模式仅决定明暗，不替换用户选中的方案。
@@ -310,6 +324,7 @@ impl ThemeTokens {
 
     /// 两侧辅助区共享侧栏角色，浮层使用面板角色；中央与终端正文分别保留自己的底色。
     /// 再一次性投影透明材质，避免区域覆盖和重复应用累乘。
+    /// 目前只有 Windows 实现背景滤镜，其他平台使用实色，不能把无模糊的正文透进菜单。
     ///
     /// @author kongweiguang
     fn for_palette_with_materials(
@@ -318,12 +333,17 @@ impl ThemeTokens {
         settings: BackgroundMaterialSettings,
     ) -> Self {
         let colors = palette::palette(scheme, dark);
+        let floating_surface = colors.panel.opacity(if cfg!(target_os = "windows") {
+            0.96
+        } else {
+            1.0
+        });
         let mut theme = Self {
             background: colors.background,
             sidebar: colors.sidebar,
             panel: colors.panel,
             tool_panel_surface: colors.sidebar,
-            tool_panel_floating_surface: colors.panel.opacity(0.92),
+            tool_panel_floating_surface: floating_surface,
             tool_panel_border: colors.border,
             secondary: colors.secondary,
             foreground: colors.foreground,
@@ -349,10 +369,10 @@ impl ThemeTokens {
             warning: colors.warning,
             scrim: colors.scrim.opacity(if dark { 0.40 } else { 0.18 }),
             dialog_scrim: colors.scrim.opacity(if dark { 0.48 } else { 0.30 }),
-            floating_surface: colors.panel.opacity(0.92),
+            floating_surface,
             modal_blur_radius: px(12.),
-            floating_blur_radius: px(28.),
-            floating_saturation: 1.8,
+            floating_blur_radius: px(12.),
+            floating_saturation: 1.0,
             tool_drawer_scrim: colors.scrim.opacity(if dark { 0.40 } else { 0.18 }),
             tool_drawer_blur_radius: px(2.),
             radius_sm: px(4.),
@@ -365,6 +385,10 @@ impl ThemeTokens {
             text_body: px(14.),
             text_heading: px(16.),
             text_title: px(20.),
+            metrics: UiMetrics::resolve(
+                kerminal_application::preferences::InterfaceDensity::Compact,
+                px(16.),
+            ),
             materials: BackgroundMaterials {
                 root_base: colors.background,
                 shell: colors.background,
@@ -399,7 +423,7 @@ pub(crate) fn apply_app_theme<T: 'static>(
     apply_theme_mode(mode, appearance, cx);
 }
 
-/// 系统外观变化仅重新解析明暗版本，继续使用上一次选中的应用色板。
+/// 系统外观变化仅解析同一配色的明暗版本，并保留现有界面字号，避免主题重载重置文字缩放。
 ///
 /// @author kongweiguang
 pub(crate) fn apply_theme_mode<T: 'static>(
@@ -407,6 +431,10 @@ pub(crate) fn apply_theme_mode<T: 'static>(
     appearance: WindowAppearance,
     cx: &mut Context<T>,
 ) {
+    let font_size = cx
+        .try_global::<KitTheme>()
+        .map(|theme| theme.font_size)
+        .unwrap_or(px(16.));
     let kit_mode = match mode {
         ThemeMode::Light => KitThemeMode::Light,
         ThemeMode::Dark => KitThemeMode::Dark,
@@ -427,6 +455,7 @@ pub(crate) fn apply_theme_mode<T: 'static>(
     let tokens = ThemeTokens::for_scheme(appearance, mode, scheme);
     KitTheme::update(cx.borrow_mut(), |theme| {
         kit::apply_kit_palette(theme, tokens);
+        theme.font_size = font_size;
     });
 }
 

@@ -73,7 +73,7 @@ pub(crate) fn build_terminal_context_menu(
                 TerminalContextMenuAction::CopySelection,
             ))
             .item(context_menu_item(
-                crate::locale::text("清除选择", "Clear Selection"),
+                crate::locale::text("清除选择", "Clear selection"),
                 root.clone(),
                 input_handler.clone(),
                 tools.clone(),
@@ -84,7 +84,7 @@ pub(crate) fn build_terminal_context_menu(
     }
 
     menu = menu.item(context_menu_item(
-        crate::locale::text("全选", "Select All"),
+        crate::locale::text("全选", "Select all"),
         root.clone(),
         input_handler.clone(),
         tools.clone(),
@@ -103,7 +103,7 @@ pub(crate) fn build_terminal_context_menu(
         ));
     }
     menu = menu.item(context_menu_item(
-        crate::locale::text("搜索终端", "Search Terminal"),
+        crate::locale::text("搜索终端", "Search terminal"),
         root.clone(),
         input_handler.clone(),
         tools.clone(),

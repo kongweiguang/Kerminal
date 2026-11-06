@@ -9,14 +9,13 @@ use super::super::super::state::{
 use super::super::is_fixed_compact_operations_panel;
 use super::SERVER_METRIC_PLOT_HEIGHT_PX;
 use super::{
-    ServerControlLabelMode, ServerNetworkFilter, ServerNetworkRole, ServerProcessSort,
-    compare_server_processes, dynamic_rate_max, filtered_network_rates, network_interface_role,
-    operations_target_label, percentage_label, preferred_host_display_name, server_bytes_label,
-    server_control_label_mode, server_control_typography, server_device_count_label,
+    ServerNetworkFilter, ServerNetworkRole, ServerProcessSort, compare_server_processes,
+    dynamic_rate_max, filtered_network_rates, network_interface_role, operations_target_label,
+    percentage_label, preferred_host_display_name, server_bytes_label, server_device_count_label,
     server_disk_percent, server_gpu_utilization, server_page_title, server_panel_control_state,
     server_process_summary_label, server_processes_for_display, server_rate_label,
     server_refresh_disabled, server_root_disk, server_sampling_status,
-    server_ssh_endpoint_subtitle, server_tab_height, server_target_label, server_target_subtitle,
+    server_ssh_endpoint_subtitle, server_target_label, server_target_subtitle,
     server_timestamp_label, server_uptime_label, should_render_server_feedback,
 };
 use crate::locale::UiLanguage;
@@ -45,27 +44,6 @@ fn server_refresh_control_is_available_and_disabled_for_unsafe_states() {
     assert!(!server_refresh_disabled(SectionPhase::Ready, true));
     assert!(server_refresh_disabled(SectionPhase::Ready, false));
     assert!(server_refresh_disabled(SectionPhase::Loading, true));
-}
-
-/// 紧凑右栏的 Button 标签改用显式子节点，完整工作区继续使用 Kit 原生标签。
-///
-/// @author kongweiguang
-#[test]
-fn server_compact_controls_select_explicit_labels_only_in_compact_layout() {
-    assert_eq!(
-        server_control_label_mode(true),
-        ServerControlLabelMode::StyledChild
-    );
-    assert_eq!(
-        server_control_label_mode(false),
-        ServerControlLabelMode::NativeButtonLabel
-    );
-    let typography = server_control_typography();
-    assert_eq!(typography.font_size, gpui_kit::px(16.));
-    assert_eq!(typography.line_height, gpui_kit::px(24.));
-    assert_eq!(typography.font_weight, gpui_kit::FontWeight::NORMAL);
-    assert_eq!(server_tab_height(true), gpui_kit::px(36.));
-    assert_eq!(server_tab_height(false), gpui_kit::px(28.));
 }
 
 /// 页标题随精确目标类型变化，避免本机、SSH 与容器被混为同一泛化页面。

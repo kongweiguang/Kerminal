@@ -17,7 +17,7 @@ use kerminal_application::preferences::ProfileScanConflict;
 use crate::{features::preferences::panel::PreferencesPanel, theme::ThemeTokens};
 
 impl PreferencesPanel {
-    /// 对照只展示会被覆盖的字段；关闭和 Esc 都由 Kit 恢复焦点，不改变待核对项。
+    /// 对照只展示会被覆盖的字段；淡入服从减少动态效果设置，关闭和 Esc 由 Kit 恢复焦点。
     /// @author kongweiguang
     pub(super) fn review_profile_scan(
         &self,
@@ -36,6 +36,7 @@ impl PreferencesPanel {
                 _ => None,
             };
             dialog
+                .entrance(gpui_kit::component::dialog::DialogEntrance::Fade)
                 .title(crate::locale::text(
                     "核对启动设置",
                     "Review startup settings",

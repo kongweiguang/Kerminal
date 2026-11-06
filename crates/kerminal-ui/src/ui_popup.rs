@@ -17,22 +17,17 @@ use crate::{theme::ThemeTokens, ui_backdrop};
 #[path = "../tests/unit/context_menu_dispatch.rs"]
 mod context_menu_dispatch;
 
-/// 下拉菜单使用右侧勾选，并让已选项和当前键盘/鼠标项共享 main 的强调态。
+/// 下拉菜单通过勾选和选中底色表达持久选择，悬停保持中性，键盘行为仍由 Kit 管理。
 ///
 /// @author kongweiguang
 pub(crate) fn dropdown_menu(menu: PopupMenu, theme: ThemeTokens) -> PopupMenu {
     let active = active_item_style(theme);
     menu.check_side(Side::Right)
-        .surface_style(surface_style(
-            theme,
-            theme.floating_surface,
-            px(13.),
-            px(20.),
-        ))
-        .items_style(items_style(px(4.)))
+        .surface_style(surface_style(theme, theme.floating_surface))
+        .items_style(items_style(theme.metrics.gap / 2.))
         .item_style(dropdown_item_style(theme))
         .item_checked_style(active.clone())
-        .item_hover_style(active)
+        .item_hover_style(file_hover_style(theme))
         .separator_style(separator_style(theme))
         .max_h(px(256.))
         .scrollable(true)
@@ -50,7 +45,7 @@ pub(crate) fn agent_launcher_menu(menu: PopupMenu, theme: ThemeTokens) -> PopupM
         .max_w(px(360.))
         .max_h(px(320.))
         .scrollable(true)
-        .items_style(agent_items_style())
+        .items_style(agent_items_style(theme))
         .item_style(
             div()
                 .refine_style(&dropdown_item_style(theme))
@@ -60,7 +55,7 @@ pub(crate) fn agent_launcher_menu(menu: PopupMenu, theme: ThemeTokens) -> PopupM
         )
 }
 
-/// 右键菜单维持 main 的中性 hover；只有给定固定宽度的容器操作菜单才收窄到 176px。
+/// 右键命令复用共享字号、行高和中性悬停，保留调用方的对象范围与宽度约束。
 ///
 /// @author kongweiguang
 pub(crate) fn context_menu(
@@ -70,13 +65,8 @@ pub(crate) fn context_menu(
 ) -> PopupMenu {
     let menu = menu
         .check_side(Side::Right)
-        .surface_style(surface_style(
-            theme,
-            theme.context_menu_surface(),
-            px(13.),
-            px(20.),
-        ))
-        .items_style(items_style(px(6.)))
+        .surface_style(surface_style(theme, theme.context_menu_surface()))
+        .items_style(items_style(theme.metrics.gap / 2.))
         .item_style(context_item_style(theme))
         .item_hover_style(context_hover_style(theme))
         .separator_style(separator_style(theme))
@@ -88,7 +78,7 @@ pub(crate) fn context_menu(
     }
 }
 
-/// 文件书签是含标题和嵌套删除按钮的自定义菜单，保持 main 的320px宽度及视口内边距。
+/// 书签保留标题和嵌套删除动作，文字放大时宽度同步增长，但不越过当前视口。
 ///
 /// @author kongweiguang
 pub(crate) fn file_bookmark_menu(
@@ -96,36 +86,28 @@ pub(crate) fn file_bookmark_menu(
     theme: ThemeTokens,
     viewport_width: Pixels,
 ) -> PopupMenu {
-    let width = px((viewport_width.as_f32() - 16.).clamp(0., 320.));
+    let scale = theme.text_body.as_f32() / 14.;
+    let width = px((viewport_width.as_f32() - 16.).clamp(0., 320. * scale));
     menu.min_w(width)
         .max_w(width)
-        .surface_style(surface_style(
-            theme,
-            theme.floating_surface,
-            px(13.),
-            px(19.5),
-        ))
-        .items_style(items_style(px(6.)))
+        .surface_style(surface_style(theme, theme.floating_surface))
+        .items_style(items_style(theme.metrics.gap / 2.))
         .item_hover_style(file_hover_style(theme))
         .render_surface(move |surface, _, _| {
             ui_backdrop::floating_surface(surface, theme, theme.radius)
         })
 }
 
-/// 文件视图菜单按 main 的160px宽度、32px行高和右侧勾选显示当前模式。
+/// 文件视图使用普通菜单几何和右侧勾选，避免同一区域的选项突然放大字号。
 ///
 /// @author kongweiguang
 pub(crate) fn file_view_menu(menu: PopupMenu, theme: ThemeTokens) -> PopupMenu {
+    let width = px(160. * theme.text_body.as_f32() / 14.);
     menu.check_side(Side::Right)
-        .min_w(px(160.))
-        .max_w(px(160.))
-        .surface_style(surface_style(
-            theme,
-            theme.floating_surface,
-            px(16.),
-            px(24.),
-        ))
-        .items_style(items_style(px(4.)))
+        .min_w(width)
+        .max_w(width)
+        .surface_style(surface_style(theme, theme.floating_surface))
+        .items_style(items_style(theme.metrics.gap / 2.))
         .item_style(file_view_item_style(theme))
         .item_checked_style(file_view_selected_style(theme))
         .item_hover_style(file_hover_style(theme))
@@ -134,19 +116,16 @@ pub(crate) fn file_view_menu(menu: PopupMenu, theme: ThemeTokens) -> PopupMenu {
         })
 }
 
-/// 上传菜单用独立176px菜单规格，避免通用文件选择菜单扩大行高或增加勾选列。
+/// 上传动作共享普通菜单的文字与命中区，不增加无意义的持久勾选列。
 ///
 /// @author kongweiguang
 pub(crate) fn file_upload_menu(menu: PopupMenu, theme: ThemeTokens) -> PopupMenu {
-    menu.min_w(px(176.))
-        .max_w(px(176.))
-        .surface_style(surface_style(
-            theme,
-            theme.floating_surface,
-            px(16.),
-            px(24.),
-        ))
-        .items_style(items_style(px(6.)))
+    let width = px(176. * theme.text_body.as_f32() / 14.);
+    menu.min_w(width)
+        .max_w(width)
+        .surface_style(surface_style(theme, theme.floating_surface))
+        .items_style(items_style(theme.metrics.gap / 2.))
+        .item_style(context_item_style(theme))
         .item_hover_style(file_hover_style(theme))
         .render_surface(move |surface, _, _| {
             ui_backdrop::floating_surface(surface, theme, theme.radius)
@@ -156,12 +135,7 @@ pub(crate) fn file_upload_menu(menu: PopupMenu, theme: ThemeTokens) -> PopupMenu
 /// 菜单的玻璃背景、边界和文字层级集中在一个 refinement 中以避免覆盖焦点布局。
 ///
 /// @author kongweiguang
-fn surface_style(
-    theme: ThemeTokens,
-    background: Hsla,
-    text_size: Pixels,
-    line_height: Pixels,
-) -> StyleRefinement {
+fn surface_style(theme: ThemeTokens, background: Hsla) -> StyleRefinement {
     div()
         .overflow_hidden()
         .rounded(theme.radius)
@@ -169,8 +143,8 @@ fn surface_style(
         .border_color(theme.border)
         .bg(background)
         .text_color(theme.foreground)
-        .text_size(text_size)
-        .line_height(line_height)
+        .text_size(theme.text_body)
+        .line_height(theme.text_body * 1.5)
         .shadow_lg()
         .style()
         .clone()
@@ -183,70 +157,61 @@ fn items_style(padding: Pixels) -> StyleRefinement {
     div().p(padding).gap_y(px(0.)).style().clone()
 }
 
-/// 普通选择菜单匹配 main 的最小行高、可读留白和右侧勾选空间。
+/// 选择和命令菜单共享密度行高，允许多行内容自然增长，不挤压右侧勾选空间。
 ///
 /// @author kongweiguang
 fn dropdown_item_style(theme: ThemeTokens) -> StyleRefinement {
     div()
         .h_auto()
-        .min_h(px(36.))
-        .px(px(10.))
-        .py(px(8.))
+        .min_h(theme.metrics.row_height)
+        .px(theme.metrics.gap)
+        .py(theme.metrics.gap / 2.)
         .rounded(theme.control_radius)
-        .gap_x(px(12.))
-        .text_size(px(13.))
-        .line_height(px(20.))
+        .gap_x(theme.metrics.gap)
+        .text_size(theme.text_body)
+        .line_height(theme.text_body * 1.5)
         .style()
         .clone()
 }
 
-/// Agent launcher 的菜单主体按图标 32px 与上下各 8px 组成 48px 稳定行。
+/// Agent 菜单仅保留图标复合内容需要的空间，外围留白跟随其它菜单的密度。
 ///
 /// @author kongweiguang
-fn agent_items_style() -> StyleRefinement {
-    div().p(px(6.)).gap_y(px(0.)).style().clone()
+fn agent_items_style(theme: ThemeTokens) -> StyleRefinement {
+    items_style(theme.metrics.gap / 2.)
 }
 
-/// 右键命令采用 32px 行高与 8px 图标间距，避免工具菜单挤压长标签。
+/// 命令项采用共享密度和自适应行高，文字放大后保留完整命中区。
 ///
 /// @author kongweiguang
 fn context_item_style(theme: ThemeTokens) -> StyleRefinement {
     div()
         .h_auto()
-        .min_h(px(32.))
-        .px(px(8.))
-        .py_0()
+        .min_h(theme.metrics.row_height)
+        .px(theme.metrics.gap)
+        .py(theme.metrics.gap / 2.)
         .rounded(theme.control_radius)
-        .gap_x(px(8.))
-        .text_size(px(13.))
-        .line_height(px(20.))
+        .gap_x(theme.metrics.gap)
+        .text_size(theme.text_body)
+        .line_height(theme.text_body * 1.5)
         .style()
         .clone()
 }
 
-/// 视图选项固定32px行高并采用8px水平留白，匹配 main 的紧凑单选菜单。
+/// 文件视图项复用普通命令行几何，避免固定行高裁掉放大的文字。
 ///
 /// @author kongweiguang
 fn file_view_item_style(theme: ThemeTokens) -> StyleRefinement {
-    div()
-        .h(px(32.))
-        .px(px(8.))
-        .py_0()
-        .rounded(theme.control_radius)
-        .gap_x(px(8.))
-        .text_size(px(16.))
-        .line_height(px(24.))
-        .style()
-        .clone()
+    context_item_style(theme)
 }
 
-/// 下拉菜单使用选中蓝底，保持选中值和键盘焦点在切换后仍可见。
+/// 选中项复用当前主题语义，不以品牌色文字替代菜单的勾选与键盘焦点。
 ///
 /// @author kongweiguang
 fn active_item_style(theme: ThemeTokens) -> StyleRefinement {
     div()
         .bg(theme.surface_selected())
-        .text_color(theme.accent)
+        .text_color(theme.selected_foreground)
         .style()
         .clone()
 }

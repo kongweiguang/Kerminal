@@ -1,44 +1,47 @@
-//! 文件工作区的传输表单策略与清理重试交互。
+//! 文件工作区的传输策略、刷新与历史清理状态。
 //!
 //! @author kongweiguang
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::collections::BTreeSet;
 
 use gpui_kit::Context;
-use kerminal_application::transfers::{TransferRecoveryPage, TransferRecoveryRecord};
-use kerminal_application::{AppError, AppResult};
-use kerminal_domain::{files::ConflictPolicy, identity::TransferId};
+use kerminal_application::AppResult;
+use kerminal_application::transfers::TransferOrigin;
+use kerminal_domain::{
+    files::{ConflictPolicy, TransferFailureKind, TransferStatus, TransferSummary},
+    identity::TransferId,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::FilesPane;
 use crate::locale;
 
-/// 同一视图一次仅运行一个清理重试，token 只取消当前等待，资源 owner 仍由队列持有。
-struct CleanupRetry {
-    id: TransferId,
-    cancellation: CancellationToken,
-    active_cancellation: Arc<Mutex<Option<CancellationToken>>>,
+/// 清理入口同时承接终态资源重试；未知提交和可信暂停继续保留，不能因简化卡片而丢失证据。
+///
+/// @author kongweiguang
+pub(super) fn is_clearable_history(summary: &TransferSummary) -> bool {
+    matches!(
+        summary.status,
+        TransferStatus::Succeeded
+            | TransferStatus::Skipped
+            | TransferStatus::Unchanged
+            | TransferStatus::Failed
+            | TransferStatus::Cancelled
+    ) && summary.failure_kind != Some(TransferFailureKind::CommitUnknown)
+        && !(summary.status == TransferStatus::Cancelled && summary.resumable)
 }
 
-/// UI 队列状态与应用传输记录分离；冲突策略只用于之后提交的请求。
+/// 只持有界面实际展示的队列状态；恢复证据与资源所有权仍由应用服务维护。
 pub(super) struct TransferQueueUi {
     pub(super) conflict_policy: ConflictPolicy,
     pub(super) history_expanded: bool,
-    cleanup_retry: Option<CleanupRetry>,
     clear_completed_cancellation: Option<CancellationToken>,
-    recovery_cancellation: Option<CancellationToken>,
-    recovery_id: Option<TransferId>,
+    clear_completed_origin: Option<TransferOrigin>,
+    pending_retries: BTreeSet<TransferId>,
     pub(super) recovery_list_loading: bool,
     pub(super) recovery_list_error: Option<String>,
-    expanded_recovery: Option<TransferId>,
-    pub(super) archive_records: Vec<TransferRecoveryRecord>,
-    pub(super) archive_next_cursor: Option<TransferId>,
-    pub(super) archive_loading: bool,
-    pub(super) archive_loaded: bool,
-    pub(super) archive_error: Option<String>,
-    archive_generation: u64,
     refresh_generation: u64,
+    uncertain_refresh_pending: bool,
 }
 
 impl Default for TransferQueueUi {
@@ -48,26 +51,33 @@ impl Default for TransferQueueUi {
         Self {
             conflict_policy: ConflictPolicy::Rename,
             history_expanded: true,
-            cleanup_retry: None,
             clear_completed_cancellation: None,
-            recovery_cancellation: None,
-            recovery_id: None,
+            clear_completed_origin: None,
+            pending_retries: BTreeSet::new(),
             recovery_list_loading: false,
             recovery_list_error: None,
-            expanded_recovery: None,
-            archive_records: Vec::new(),
-            archive_next_cursor: None,
-            archive_loading: false,
-            archive_loaded: false,
-            archive_error: None,
-            archive_generation: 0,
             refresh_generation: 0,
+            uncertain_refresh_pending: false,
         }
     }
 }
 
 impl TransferQueueUi {
-    /// 手动刷新和队列事件共用代次，归档后的新读取使旧活任务与恢复材料回执同时失效。
+    /// 删除事实跨快照代次保留，由最终接受的读取统一回读目录，避免迟到结果丢失补偿。
+    ///
+    /// @author kongweiguang
+    pub(super) fn mark_uncertain_transfer_change(&mut self) {
+        self.uncertain_refresh_pending = true;
+    }
+
+    /// 消费一次合并后的删除事实；失败路径也可取走并执行保守回读。
+    ///
+    /// @author kongweiguang
+    pub(super) fn take_uncertain_transfer_change(&mut self) -> bool {
+        std::mem::take(&mut self.uncertain_refresh_pending)
+    }
+
+    /// 手动刷新和队列事件共用代次，新读取使旧活任务与恢复材料回执同时失效。
     /// @author kongweiguang
     pub(super) fn begin_transfer_refresh(&mut self) -> u64 {
         self.refresh_generation = self.refresh_generation.wrapping_add(1);
@@ -99,86 +109,46 @@ impl TransferQueueUi {
         true
     }
 
-    /// 每次读取使此前代次失效，取消或迟到回执不能把新页的加载状态提前解除。
-    /// @author kongweiguang
-    fn begin_archive_page(&mut self) -> u64 {
-        self.archive_generation = self.archive_generation.wrapping_add(1);
-        self.archive_loading = true;
-        self.archive_error = None;
-        self.archive_generation
-    }
-
-    /// 仅接受当前代次；失败保留上一确认页供定位，成功则替换而非累加无限历史。
-    /// @author kongweiguang
-    fn finish_archive_page(
-        &mut self,
-        generation: u64,
-        result: AppResult<TransferRecoveryPage>,
-    ) -> bool {
-        if self.archive_generation != generation {
-            return false;
-        }
-        self.archive_loading = false;
-        self.archive_loaded = true;
-        match result {
-            Ok(page) => {
-                self.archive_records = page.records;
-                self.archive_next_cursor = page.next_cursor;
-            }
-            Err(error) => self.archive_error = Some(super::localized_error(&error)),
-        }
-        true
-    }
-
-    /// 同一面板只核对一个原事务，避免迟到回执覆盖另一项恢复反馈。
-    pub(super) fn recovery_busy(&self) -> bool {
-        self.recovery_cancellation.is_some()
-    }
-
-    /// 恢复按钮按精确 owner 显示进度，而不是根据当前文件面板推断目标。
-    pub(super) fn recovery_id(&self) -> Option<&TransferId> {
-        self.recovery_id.as_ref()
-    }
-
-    /// 暂存证据按需展开，一次只展示一个 owner，避免大量中断材料挤占终端工作区。
-    pub(super) fn is_recovery_expanded(&self, id: &TransferId) -> bool {
-        self.expanded_recovery.as_ref() == Some(id)
-    }
-    /// 返回正在运行的清理任务 ID，让渲染层为单个 owner 显示 busy 状态。
+    /// 续传与历史清理互斥；资源清理与再次入队共用忙态，真实回执前不解除门禁。
     ///
     /// @author kongweiguang
-    pub(super) fn cleanup_retry_id(&self) -> Option<&TransferId> {
-        self.cleanup_retry.as_ref().map(|retry| &retry.id)
+    pub(super) fn begin_transfer_retry(&mut self, id: TransferId) -> bool {
+        self.clear_completed_cancellation.is_none() && self.pending_retries.insert(id)
     }
 
-    /// 判断是否已有清理请求，防止同一 UI 对串行清理锁重复排队。
+    /// 即使用户已切换来源也必须释放原任务门禁，避免返回原页面后按钮永久禁用。
     ///
     /// @author kongweiguang
-    pub(super) fn is_retrying_cleanup(&self) -> bool {
-        self.cleanup_retry.is_some()
+    pub(super) fn finish_transfer_retry(&mut self, id: &TransferId) {
+        self.pending_retries.remove(id);
     }
 
-    /// 取消只终止当前清理尝试的等待；待清理 owner 不从队列移除，可再次重试。
+    /// 请求启动与真实队列进度分开管理，等待锁或原 worker 收尾时也能立即反馈。
     ///
     /// @author kongweiguang
-    pub(super) fn cancel_cleanup_retry(&self, id: &TransferId) -> bool {
-        let Some(retry) = self.cleanup_retry.as_ref().filter(|retry| &retry.id == id) else {
-            return false;
-        };
-        retry.cancellation.cancel();
-        if let Ok(active) = retry.active_cancellation.lock()
-            && let Some(cancellation) = active.as_ref()
-        {
-            cancellation.cancel();
-        }
-        true
+    pub(super) fn is_retrying_transfer(&self, id: &TransferId) -> bool {
+        self.pending_retries.contains(id)
     }
 
-    /// 同一面板只允许一个历史清理用例，避免重复提交竞争同一组 worker 句柄。
+    /// 清理会移除原任务，因此任一续传等待回执时都禁用清理入口。
+    ///
+    /// @author kongweiguang
+    pub(super) fn has_pending_retry(&self) -> bool {
+        !self.pending_retries.is_empty()
+    }
+
+    /// 清理跨来源固定目标；按钮资格也遵守面板级互斥，避免切页后发起竞争操作。
+    ///
+    /// @author kongweiguang
+    pub(super) fn is_clearing_history(&self) -> bool {
+        self.clear_completed_cancellation.is_some()
+    }
+
+    /// 同一面板只允许一个清理且不与续传并行，避免原任务先被移除后才尝试创建后继。
     ///
     /// @author kongweiguang
     pub(super) fn begin_clear_completed_history(&mut self) -> Option<CancellationToken> {
-        if self.clear_completed_cancellation.is_some() {
+        if self.is_clearing_history() || self.has_pending_retry() {
             return None;
         }
         let cancellation = CancellationToken::new();
@@ -190,6 +160,7 @@ impl TransferQueueUi {
     ///
     /// @author kongweiguang
     pub(super) fn finish_clear_completed_history(&mut self) -> bool {
+        self.clear_completed_origin = None;
         self.clear_completed_cancellation.take().is_some()
     }
 
@@ -204,11 +175,12 @@ impl TransferQueueUi {
         true
     }
 
-    /// 将面板卸载映射为协作取消，避免关闭文件面板后后台继续清理历史。
+    /// 其他来源的清理不得在当前面板显示为可取消的动作。
     ///
     /// @author kongweiguang
-    pub(super) fn is_clearing_completed_history(&self) -> bool {
+    pub(super) fn is_clearing_for_origin(&self, origin: Option<&TransferOrigin>) -> bool {
         self.clear_completed_cancellation.is_some()
+            && self.clear_completed_origin.as_ref() == origin
     }
 }
 
@@ -220,123 +192,10 @@ impl Drop for TransferQueueUi {
         if let Some(cancellation) = self.clear_completed_cancellation.as_ref() {
             cancellation.cancel();
         }
-        if let Some(cancellation) = self.recovery_cancellation.as_ref() {
-            cancellation.cancel();
-        }
     }
 }
 
 impl FilesPane {
-    /// 每次只替换一页冷档，不累加历史；代次阻止迟到页面覆盖刷新或另一页的权威回执。
-    /// @author kongweiguang
-    pub(super) fn load_transfer_archive_page(
-        &mut self,
-        cursor: Option<TransferId>,
-        cx: &mut Context<Self>,
-    ) {
-        let generation = self.queue.begin_archive_page();
-        let transfers = self.transfers.clone();
-        let executor = self.executor.clone();
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(move |cancellation| async move {
-                    transfers
-                        .list_archived_recovery(cursor, 50, cancellation)
-                        .await
-                })
-                .await;
-            let _ = this.update(cx, |pane, cx| {
-                if pane.queue.finish_archive_page(generation, result) {
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// 展开只改变证据视图，不连接目标或推断暂存对象存在性。
-    pub(super) fn toggle_recovery_staging(&mut self, id: TransferId, cx: &mut Context<Self>) {
-        self.queue.expanded_recovery = if self.queue.is_recovery_expanded(&id) {
-            None
-        } else {
-            Some(id)
-        };
-        cx.notify();
-    }
-    /// 恢复核对只读取持久目标证据；结果未知时仍保留记录，并明确给出下一步。
-    pub(super) fn inspect_transfer_recovery(&mut self, id: TransferId, cx: &mut Context<Self>) {
-        self.run_transfer_recovery(id, false, cx);
-    }
-
-    /// 归档是人工确认后的记录动作，不冒充目标提交成功，也不会释放未知 cleanup owner。
-    pub(super) fn archive_transfer_recovery(&mut self, id: TransferId, cx: &mut Context<Self>) {
-        self.run_transfer_recovery(id, true, cx);
-    }
-
-    /// 取消只通知当前核对等待，不提前清除 busy 状态或恢复材料。
-    pub(super) fn cancel_transfer_recovery(&mut self, cx: &mut Context<Self>) {
-        if let Some(cancellation) = self.queue.recovery_cancellation.as_ref() {
-            cancellation.cancel();
-            self.status = Some(locale::text("正在取消核对…", "Cancelling inspection…").to_string());
-            cx.notify();
-        }
-    }
-
-    /// 核对与归档不能创建传输 worker；归档回执后重新读取有界首页，不把旧核对结论改写为成功。
-    /// @author kongweiguang
-    fn run_transfer_recovery(&mut self, id: TransferId, archive: bool, cx: &mut Context<Self>) {
-        if self.queue.recovery_busy() {
-            return;
-        }
-        let cancellation = CancellationToken::new();
-        self.queue.recovery_cancellation = Some(cancellation.clone());
-        self.queue.recovery_id = Some(id.clone());
-        self.status = Some(
-            if archive {
-                locale::text(
-                    "正在归档原传输证据…",
-                    "Archiving the original transfer evidence…",
-                )
-            } else {
-                locale::text("正在核对原传输…", "Inspecting the original transfer…")
-            }
-            .to_string(),
-        );
-        let transfers = self.transfers.clone();
-        let executor = self.executor.clone();
-        cx.spawn(async move |this, cx| {
-            let result = executor.run_cancellable(cancellation, move |token| async move {
-                if archive {
-                    transfers.archive_recovery(&id, token).await?;
-                    Ok(None)
-                } else {
-                    transfers.inspect_recovery(&id, token).await.map(Some)
-                }
-            }).await;
-            let _ = this.update(cx, |pane, cx| {
-                pane.queue.recovery_cancellation = None;
-                pane.queue.recovery_id = None;
-                pane.status = Some(match result {
-                    Ok(None) => locale::text("已人工归档；未知结果和清理材料保持原样，可在历史中查看，不代表传输成功。", "Manually archived. Unknown results and cleanup evidence are retained in history; this is not a successful transfer.").to_string(),
-                    Ok(Some(record)) => match record.inspection {
-                        kerminal_application::transfers::TransferRecoveryInspection::DestinationMatches => locale::text("目标内容与保存的完整证据一致；请检查后归档，不会自动重放。", "Destination matches the saved complete evidence. Review and archive; nothing is replayed.").to_string(),
-                        kerminal_application::transfers::TransferRecoveryInspection::DestinationMissing => locale::text("原目标不存在；恢复记录已保留，请检查原路径后决定是否重新创建任务。", "The original destination is missing. Evidence is retained; review the path before creating a new task.").to_string(),
-                        kerminal_application::transfers::TransferRecoveryInspection::DestinationDiffers => locale::text("原目标内容不同；不要覆盖或盲目重试，请先人工核对。", "Destination differs. Review it manually before overwriting or retrying.").to_string(),
-                        kerminal_application::transfers::TransferRecoveryInspection::Insufficient => locale::text("现有证据不足以确定提交结果；记录继续保留，请在原目标人工核对。", "Evidence is insufficient. The record remains pending; inspect the original destination manually.").to_string(),
-                    },
-                    Err(error) => crate::features::files::localized_error(&error),
-                });
-                pane.reload_transfers(cx);
-                if archive {
-                    pane.load_transfer_archive_page(None, cx);
-                }
-                cx.notify();
-            });
-        }).detach();
-        cx.notify();
-    }
-
     /// 后续传输按钮读取该值并写进 TransferRequest，入队后不会被 UI 更改影响。
     ///
     /// @author kongweiguang
@@ -345,7 +204,7 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 展开完整任务列表；冷档按需独立打开，避免每次展开都触发磁盘读取。
+    /// 仅切换当前任务列表的展开状态，不为已经移除的维护界面读取冷档。
     ///
     /// @author kongweiguang
     pub(super) fn toggle_transfer_history(&mut self, cx: &mut Context<Self>) {
@@ -353,10 +212,25 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 通过统一队列用例清理安全终态；未知提交和待清理资源由应用服务保留。
+    /// 阻止来源页关闭后遗失待办入口；展开后回读服务快照，使定位展示不依赖面板缓存。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn reveal_transfer_queue(&mut self, cx: &mut Context<Self>) {
+        self.queue.history_expanded = true;
+        self.reload_transfers(cx);
+        cx.notify();
+    }
+
+    /// 清理只针对点击时的来源，先释放终态资源并归档恢复副本；失败保留原 owner 供同一入口重试。
+    /// 所有资源关闭共用绝对期限，未知提交、可信暂停和系统仍持有的暂存不参与清理。
+    /// 成功由队列回读直接表达，不额外留下结果提示；取消和失败仍保留可查看的反馈。
     ///
     /// @author kongweiguang
     pub(super) fn clear_completed_transfer_history(&mut self, cx: &mut Context<Self>) {
+        let Some(origin) = self.transfer_origin.clone() else {
+            return;
+        };
+        let result_origin = origin.clone();
         let Some(cancellation) = self.queue.begin_clear_completed_history() else {
             self.status = Some(
                 locale::text(
@@ -368,39 +242,53 @@ impl FilesPane {
             cx.notify();
             return;
         };
+        self.queue.clear_completed_origin = Some(origin.clone());
         let transfers = self.transfers.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run_cancellable(cancellation, move |task_cancellation| async move {
-                    transfers.clear_completed(task_cancellation).await
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    let cleanup = async {
+                        for summary in transfers.list_for_origin(&origin).await {
+                            if summary.cleanup_pending
+                                && is_clearable_history(&summary)
+                                && !transfers.is_drag_staging_pending_delivery(&summary.id)
+                            {
+                                transfers.retry_cleanup_until(&summary.id, deadline.into()).await?;
+                            }
+                        }
+                        Ok::<(), kerminal_application::AppError>(())
+                    };
+                    task_cancellation.run_until_cancelled(cleanup).await
+                        .ok_or_else(|| kerminal_application::AppError::cancelled("传输历史清理已取消"))??;
+                    transfers.dismiss_completed_for_origin(&origin, task_cancellation).await
                 })
                 .await;
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
                     pane.queue.finish_clear_completed_history();
-                    pane.status = Some(match result {
-                        Ok((removed, remaining)) => locale::text(
-                            format!(
-                                "已清理 {removed} 条可清理历史，仍保留 {remaining} 个任务。"
-                            ),
-                            format!(
-                                "Removed {removed} clearable history entries; {remaining} tasks remain."
-                            ),
-                        )
-                        .to_string(),
+                    if pane.transfer_origin.as_ref() != Some(&result_origin) {
+                        pane.reload_transfers(cx);
+                        return;
+                    }
+                    pane.status = match result {
+                        Ok(_) => {
+                            pane.status_details_expanded = false;
+                            None
+                        }
                         Err(error)
                             if error.public_code()
                                 == kerminal_application::PublicErrorCode::Cancelled =>
                         {
-                            locale::text(
+                            Some(locale::text(
                                 "已取消历史清理；需要核对或仍待清理的任务继续保留。",
                                 "History cleanup was cancelled; tasks needing review or resource cleanup remain.",
                             )
-                            .to_string()
+                            .to_string())
                         }
-                        Err(error) => crate::features::files::localized_error(&error),
-                    });
+                        Err(error) => Some(crate::features::files::localized_error(&error)),
+                    };
                     pane.reload_transfers(cx);
                     cx.notify();
                 });
@@ -414,7 +302,11 @@ impl FilesPane {
     ///
     /// @author kongweiguang
     pub(super) fn cancel_completed_transfer_history(&mut self, cx: &mut Context<Self>) {
-        if self.queue.cancel_clear_completed_history() {
+        if self
+            .queue
+            .is_clearing_for_origin(self.transfer_origin.as_ref())
+            && self.queue.cancel_clear_completed_history()
+        {
             self.status = Some(
                 locale::text(
                     "已请求取消历史清理；正在确认任务状态。",
@@ -425,117 +317,6 @@ impl FilesPane {
             cx.notify();
         }
     }
-
-    /// 用同一个队列 owner 重试资源关闭；取消或失败后刷新权威快照以保留待办入口。
-    ///
-    /// @author kongweiguang
-    pub(super) fn retry_cleanup(&mut self, id: TransferId, cx: &mut Context<Self>) {
-        if self.queue.is_retrying_cleanup() {
-            self.status = Some(
-                locale::text(
-                    "已有清理重试正在执行。",
-                    "A cleanup retry is already running.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-
-        let cancellation = CancellationToken::new();
-        let active_cancellation = Arc::new(Mutex::new(None));
-        self.queue.cleanup_retry = Some(CleanupRetry {
-            id: id.clone(),
-            cancellation: cancellation.clone(),
-            active_cancellation: Arc::clone(&active_cancellation),
-        });
-        let transfers = self.transfers.clone();
-        let executor = self.executor.clone();
-        let task_id = id.clone();
-        let inspect_id = id.clone();
-        let task_active_cancellation = active_cancellation;
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(move |task_cancellation| async move {
-                    if let Ok(mut active) = task_active_cancellation.lock() {
-                        *active = Some(task_cancellation.clone());
-                    }
-                    if cancellation.is_cancelled() {
-                        task_cancellation.cancel();
-                    }
-                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                    match task_cancellation
-                        .run_until_cancelled(
-                            transfers.retry_cleanup_until(&task_id, deadline.into()),
-                        )
-                        .await
-                    {
-                        Some(result) => result,
-                        None => match transfers.get(&inspect_id).await {
-                            Ok(summary) if !summary.cleanup_pending => Ok(()),
-                            _ => Err(AppError::cancelled("清理重试已取消；资源 owner 仍保留")),
-                        },
-                    }
-                })
-                .await;
-            cx.update(|app| {
-                let _ = this.update(app, |pane, cx| {
-                    if pane.queue.cleanup_retry_id() == Some(&id) {
-                        pane.queue.cleanup_retry = None;
-                    }
-                    pane.status = Some(match result {
-                        Ok(()) => locale::text(
-                            "资源已确认清理。",
-                            "The resources were confirmed released.",
-                        )
-                        .to_string(),
-                        Err(error) => localized_cleanup_error(&error),
-                    });
-                    pane.reload_transfers(cx);
-                    cx.notify();
-                });
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// 取消当前 owner 的清理重试等待，不修改目标数据、不删除待清理记录。
-    ///
-    /// @author kongweiguang
-    pub(super) fn cancel_cleanup_retry(&mut self, id: &TransferId, cx: &mut Context<Self>) {
-        if self.queue.cancel_cleanup_retry(id) {
-            self.status = Some(
-                locale::text(
-                    "已请求停止清理尝试；待清理资源仍保留，可再次重试。",
-                    "Cleanup retry cancellation requested; the owner remains available to retry.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-        }
-    }
-}
-
-/// 让未知提交和资源清理错误使用明确提示，不把 owner 保留误报为数据写入失败。
-///
-/// @author kongweiguang
-fn localized_cleanup_error(error: &AppError) -> String {
-    if error.public_code() == kerminal_application::PublicErrorCode::Cancelled {
-        return locale::text(
-            "清理尝试已停止；待清理资源仍保留。",
-            "Cleanup attempt stopped; the resource owner is still retained.",
-        )
-        .to_string();
-    }
-    if error.public_code() == kerminal_application::PublicErrorCode::Timeout {
-        return locale::text(
-            "清理超过本次等待期限；资源仍待处理。",
-            "Cleanup exceeded this attempt's deadline; resources remain pending.",
-        )
-        .to_string();
-    }
-    crate::features::files::localized_error(error)
 }
 
 #[cfg(test)]

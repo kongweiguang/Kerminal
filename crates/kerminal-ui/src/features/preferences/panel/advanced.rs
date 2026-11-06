@@ -21,7 +21,6 @@ use kerminal_application::preferences::{
 
 use crate::theme::ThemeTokens;
 
-use super::super::render::settings_error_banner;
 use super::forms::set_input;
 use super::{PreferencesPanel, PreferencesSection};
 
@@ -162,7 +161,7 @@ fn tool_rail_edit_readiness_error(panel: &PreferencesPanel) -> Option<String> {
 }
 
 impl PreferencesPanel {
-    /// 集中展示已经有 typed settings 与应用端持久化用例的扩展选项，避免伪造未接线操作。
+    /// 扩展选项只展示已有 typed 用例；设置事务错误交给共用固定区域，不随正文滚出视口。
     ///
     /// @author kongweiguang
     pub(in crate::features::preferences) fn render_integrations(
@@ -822,10 +821,6 @@ impl PreferencesPanel {
                 self.settings_input_errors
                     .values()
                     .map(|message| issue_row(message, theme)),
-            )
-            .when_some(
-                settings_error_banner(self.settings_error.as_deref(), theme),
-                |root, banner| root.child(banner),
             )
     }
 

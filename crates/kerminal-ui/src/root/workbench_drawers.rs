@@ -93,23 +93,27 @@ pub(super) fn render_compact_host_drawer(
                 .bg(panel_background)
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
-                    div()
+                    crate::ui_surface::panel_header(theme)
                         .id("workbench-compact-host-drawer-header")
                         .w_full()
-                        .h(px(40.))
-                        .flex_shrink_0()
-                        .px_3()
-                        .flex()
-                        .items_center()
+                        .min_h(theme.metrics.toolbar_height)
                         .justify_between()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .text_color(theme.foreground)
-                        .child(crate::locale::text("主机", "Hosts"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(crate::locale::text("主机", "Hosts")),
+                        )
                         .child(
                             Button::new("workbench-close-compact-host-drawer")
                                 .compact()
                                 .ghost()
+                                .w(theme.metrics.control_height)
+                                .h(theme.metrics.control_height)
+                                .flex_shrink_0()
                                 .icon(IconName::PanelLeft)
                                 .accessibility_label(close_label.clone())
                                 .tooltip(close_label)
@@ -126,7 +130,7 @@ pub(super) fn render_compact_host_drawer(
 }
 
 /// 抽屉以原 ToolId 约束 X、遮罩和 Escape 的关闭 owner；只接冒泡按键，Agent PTY 和子输入优先消费。
-/// 遮罩覆盖标题栏下方整个 body；仅面板留 8px 间距，避免把 Rail 或边缘露成可操作区域。
+/// 遮罩覆盖标题栏下方整个 body；仅面板按密度令牌留间距，避免把 Rail 或边缘露成可操作区域。
 /// 验收 feature 单独记录实际表面边界，普通元素 id 不承担原生绘制可观测性的契约。
 ///
 /// @author kongweiguang
@@ -151,8 +155,8 @@ pub(super) fn render_compact_tool_drawer(
             .occlude()
             .flex()
             .justify_end()
-            .pr(px(8.))
-            .py(px(8.))
+            .pr(theme.metrics.gap)
+            .py(theme.metrics.gap)
             .bg(theme.tool_drawer_scrim)
             .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
                 root.dismiss_compact_drawer(Some(tool), window, cx);
@@ -181,34 +185,28 @@ pub(super) fn render_compact_tool_drawer(
                     .bg(theme.floating_surface)
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .child(
-                        div()
+                        crate::ui_surface::panel_header(theme)
                             .id("workbench-compact-tool-drawer-header")
                             .w_full()
-                            .h(px(40.))
-                            .flex_shrink_0()
-                            .px(px(8.))
-                            .flex()
-                            .items_center()
+                            .min_h(theme.metrics.toolbar_height)
                             .justify_between()
-                            .border_b_1()
                             .border_color(theme.tool_panel_border)
-                            .text_color(theme.muted)
                             .child(
                                 div()
                                     .flex_1()
-                                    .min_w(px(0.))
-                                    .px(px(8.))
-                                    .text_size(px(12.))
-                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .min_w_0()
                                     .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
                                     .child(tool_rail_label(tool)),
                             )
                             .child(
                                 Button::new("workbench-close-compact-tool-drawer")
                                     .compact()
                                     .ghost()
-                                    .w(px(32.))
-                                    .h(px(32.))
+                                    .w(theme.metrics.control_height)
+                                    .h(theme.metrics.control_height)
+                                    .flex_shrink_0()
                                     .icon(IconName::X)
                                     .accessibility_label(close_label.clone())
                                     .tooltip(crate::locale::text("关闭", "Close"))

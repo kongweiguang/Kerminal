@@ -10,15 +10,15 @@ use gpui_kit::{
     component::WindowExt as _,
     component::{
         Disableable, Theme as KitTheme,
-        button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants},
-        dialog::{DialogDescription, DialogFooter, DialogTitle},
+        button::{Button, ButtonRounded, ButtonVariants},
+        dialog::{DialogDescription, DialogEntrance, DialogFooter, DialogTitle},
         input::Input,
         menu::{DropdownMenu as _, PopupMenuItem},
         tooltip::Tooltip,
     },
     div,
     prelude::*,
-    px,
+    px, relative,
 };
 use kerminal_application::{
     PublicErrorCode,
@@ -54,7 +54,7 @@ struct HistoryFilterOption {
 }
 
 impl AgentsPanel {
-    /// 冻结历史行上下文并复用 Kit 的焦点与关闭语义；应用组合按 main 自绘三段表面，避免估高定位。
+    /// 冻结历史行上下文并复用 Kit 的焦点与关闭语义；短淡入不改变已确认的操作目标。
     ///
     /// @author kongweiguang
     pub(super) fn open_archive_confirmation(
@@ -110,6 +110,7 @@ impl AgentsPanel {
             let dialog_content = content_entity.clone();
             dialog
                 .centered()
+                .entrance(DialogEntrance::Fade)
                 .p_0()
                 .gap_0()
                 .min_h(px(0.))
@@ -172,7 +173,7 @@ impl AgentArchiveConfirmationContent {
 }
 
 impl Render for AgentArchiveConfirmationContent {
-    /// 保留固定头尾与有界正文滚动；文字来自活动应用色板，已打开弹框也可随主题同步刷新。
+    /// 保留固定头尾与有界正文滚动；状态说明只出现一次，已打开弹框随活动主题同步刷新。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -182,13 +183,12 @@ impl Render for AgentArchiveConfirmationContent {
             .archive_confirmation_feedback(&self.owner);
         let theme = ThemeTokens::current(window, cx).for_tool_panel();
         let foreground = theme.foreground;
-        let description_color = theme.muted;
         let title = self.owner.expected_title.clone();
         let runtime_description = self.runtime_description.clone();
         let cancel_parent = self.panel.clone();
         let cancel_owner = self.owner.clone();
-        // 表面外框另占 2px；正文组合与它共同遵守 main 的 288px/视口减 48px 上限。
-        let max_height = px(286.).min((window.viewport_size().height - px(50.)).max(px(0.)));
+        let max_height = (theme.metrics.control_height * 9.)
+            .min((window.viewport_size().height - theme.metrics.dialog_padding * 2.).max(px(0.)));
 
         let mut body = div()
             .id("agent-archive-confirmation-content")
@@ -197,9 +197,9 @@ impl Render for AgentArchiveConfirmationContent {
             .flex_1()
             .flex()
             .flex_col()
-            .gap_3()
-            .px_5()
-            .py_4()
+            .gap(theme.metrics.panel_padding)
+            .px(theme.metrics.dialog_padding)
+            .py(theme.metrics.section_gap)
             .overflow_y_scroll()
             .child(
                 div()
@@ -207,17 +207,17 @@ impl Render for AgentArchiveConfirmationContent {
                     .min_w(px(0.))
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .p_3()
-                    .rounded(px(8.))
+                    .gap(theme.metrics.panel_padding)
+                    .p(theme.metrics.panel_padding)
+                    .rounded(theme.radius)
                     .border_1()
                     .border_color(theme.tool_panel_border)
                     .bg(theme.muted_surface())
                     .child(
                         div()
-                            .size(px(32.))
+                            .size(theme.metrics.control_height)
                             .flex_none()
-                            .rounded(px(8.))
+                            .rounded(theme.control_radius)
                             .bg(theme.tool_panel_surface)
                             .text_color(theme.muted)
                             .flex()
@@ -231,7 +231,7 @@ impl Render for AgentArchiveConfirmationContent {
                             .min_w(px(0.))
                             .text_size(theme.text_sm)
                             .text_color(foreground)
-                            .line_height(px(20.))
+                            .line_height(relative(1.5))
                             .whitespace_nowrap()
                             .text_ellipsis()
                             .child(title),
@@ -240,14 +240,7 @@ impl Render for AgentArchiveConfirmationContent {
             .child(
                 div()
                     .text_size(theme.text_xs)
-                    .line_height(px(20.))
-                    .text_color(description_color)
-                    .child(runtime_description),
-            )
-            .child(
-                div()
-                    .text_size(theme.text_xs)
-                    .line_height(px(20.))
+                    .line_height(relative(1.5))
                     .text_color(theme.muted)
                     .child(crate::locale::text(
                         "Codex、Claude 或其他 Agent 服务商自身保存的历史不会被删除。",
@@ -278,9 +271,9 @@ impl Render for AgentArchiveConfirmationContent {
                     .flex()
                     .items_start()
                     .justify_between()
-                    .gap_4()
-                    .px_5()
-                    .py_4()
+                    .gap(theme.metrics.section_gap)
+                    .px(theme.metrics.dialog_padding)
+                    .py(theme.metrics.section_gap)
                     .border_b_1()
                     .border_color(theme.tool_panel_border)
                     .child(
@@ -292,8 +285,8 @@ impl Render for AgentArchiveConfirmationContent {
                             .gap_1()
                             .child(
                                 DialogTitle::new()
-                                    .text_size(px(17.))
-                                    .line_height(px(24.))
+                                    .text_size(theme.text_heading)
+                                    .line_height(relative(1.25))
                                     .child(crate::locale::text(
                                         "删除会话记录？",
                                         "Delete chat record?",
@@ -301,21 +294,17 @@ impl Render for AgentArchiveConfirmationContent {
                             )
                             .child(
                                 DialogDescription::new()
-                                    .text_size(px(13.))
-                                    .line_height(px(20.))
+                                    .text_size(theme.text_xs)
+                                    .line_height(relative(1.5))
                                     .text_color(theme.muted)
-                                    .child(crate::locale::text(
-                                        "会从 Kerminal 的对话列表中移除这条记录。",
-                                        "This removes the record from Kerminal's chat list.",
-                                    )),
+                                    .child(runtime_description),
                             ),
                     )
                     .child(
                         Button::new("agent-archive-close")
                             .ghost()
                             .icon(IconName::Close)
-                            .w(px(36.))
-                            .h(px(36.))
+                            .size(theme.metrics.control_height)
                             .accessibility_label(crate::locale::text("关闭弹窗", "Close dialog"))
                             .disabled(busy)
                             .on_click(move |_, window, app| {
@@ -360,7 +349,7 @@ impl AgentArchiveConfirmationFooter {
 }
 
 impl Render for AgentArchiveConfirmationFooter {
-    /// 失败保持原 owner 以供重试；透明危险态取自语义主题，避免不同应用色板下出现固定文字色。
+    /// 失败保持原 owner 以供重试；危险提交与取消共用主题字号，并明确区分不可撤销结果。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -373,26 +362,23 @@ impl Render for AgentArchiveConfirmationFooter {
         let cancel_parent = parent.clone();
         let cancel_owner = owner.clone();
         let theme = ThemeTokens::current(window, cx).for_tool_panel();
-        let cancel_color = theme.muted;
-        let danger_color = theme.error;
-        let danger_surface = theme.error.opacity(0.1);
         DialogFooter::new()
             .w_full()
             .flex_shrink_0()
             .justify_end()
-            .gap_2()
-            .px_5()
-            .py_4()
+            .flex_wrap()
+            .gap(theme.metrics.gap)
+            .px(theme.metrics.dialog_padding)
+            .py(theme.metrics.section_gap)
             .border_t_1()
             .border_color(theme.tool_panel_border)
             .child(
                 Button::new("agent-archive-cancel")
                     .ghost()
-                    .h(px(32.))
+                    .h(theme.metrics.control_height)
                     .px_3()
-                    .text_size(px(16.))
-                    .line_height(px(24.))
-                    .text_color(cancel_color)
+                    .text_size(theme.text_sm)
+                    .line_height(relative(1.25))
                     .font_weight(gpui_kit::FontWeight::NORMAL)
                     .label(crate::locale::text("取消", "Cancel"))
                     .disabled(busy)
@@ -406,17 +392,11 @@ impl Render for AgentArchiveConfirmationFooter {
             )
             .child(
                 Button::new("agent-archive-confirm")
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .foreground(danger_color)
-                            .hover_foreground(danger_color)
-                            .hover(danger_surface)
-                            .active(danger_surface),
-                    )
-                    .h(px(32.))
+                    .danger()
+                    .h(theme.metrics.control_height)
                     .px_3()
-                    .text_size(px(16.))
-                    .line_height(px(24.))
+                    .text_size(theme.text_sm)
+                    .line_height(relative(1.25))
                     .font_weight(gpui_kit::FontWeight::NORMAL)
                     .icon(IconName::Trash)
                     .label(if busy {
@@ -665,22 +645,19 @@ impl AgentsPanel {
         cx.notify();
     }
 
-    /// 外层滚动区负责 12px 留白，列前 8px 外边距在双 flex spacer 中将内容整体下移 4px，对齐 main。
-    /// 列本身只限宽不二次缩进，保持 main 的 320px 内容宽度。
+    /// 入口和历史共用面板内容留白；列只限制最大宽度，避免停靠方向和密度变化时重复缩进。
     /// @author kongweiguang
     fn render_landing_content(
         &self,
         theme: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
+        crate::ui_surface::panel_content(theme)
             .id("agents-landing-scroll")
             .w_full()
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
-            .px_3()
-            .py_3()
             .child(
                 div()
                     .id("agents-landing-scroll-content")
@@ -696,11 +673,11 @@ impl AgentsPanel {
                             .w_full()
                             .max_w(px(320.))
                             .flex_shrink_0()
-                            .mt(px(8.))
-                            .py_2()
+                            .mt(theme.metrics.gap)
+                            .py(theme.metrics.gap)
                             .flex()
                             .flex_col()
-                            .gap_3()
+                            .gap(theme.metrics.panel_padding)
                             .child(self.render_launcher(theme, cx))
                             .child(self.render_session_history(theme, cx)),
                     )
@@ -708,7 +685,7 @@ impl AgentsPanel {
             )
     }
 
-    /// 已进入的 Agent 只展示返回、身份和真实状态；返回仅切换视图，不终止原 CLI。
+    /// 已进入的 Agent 只展示返回、身份和真实状态；页头随共享密度缩放，返回不终止原 CLI。
     ///
     /// @author kongweiguang
     fn render_header(
@@ -745,12 +722,13 @@ impl AgentsPanel {
                 div()
                     .id("agents-header-toolbar")
                     .w_full()
-                    .h(px(40.))
+                    .min_h(theme.metrics.toolbar_height)
                     .flex_shrink_0()
-                    .px_2()
+                    .px(theme.metrics.panel_padding)
+                    .py(theme.metrics.gap / 2.)
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(theme.metrics.gap)
                     .child(
                         Button::new("agents-back")
                             .compact()
@@ -1024,7 +1002,7 @@ impl AgentsPanel {
         cx.notify();
     }
 
-    /// 选择器与主启动动作相接并保留 main 的 58px 命中宽；compact Button 的字号由显式子文本覆盖。
+    /// 选择器与启动动作从同一密度投影计算双行高度，双语和无障碍名称保留真实启动范围。
     /// 空目录仍通过选择菜单进入自定义定义管理。
     ///
     /// @author kongweiguang
@@ -1041,7 +1019,7 @@ impl AgentsPanel {
                     .w_full()
                     .flex()
                     .items_center()
-                    .px(px(2.))
+                    .px(theme.metrics.gap / 4.)
                     .child(
                         div()
                             .flex_1()
@@ -1052,16 +1030,16 @@ impl AgentsPanel {
                         Button::new("agents-launcher-start")
                             .compact()
                             .flex_none()
-                            .min_w(px(58.))
-                            .h(px(44.))
+                            .min_w(theme.metrics.control_height * 1.75)
+                            .h(theme.metrics.control_height + theme.metrics.gap * 1.5)
                             .primary()
-                            .accessibility_label("进入")
+                            .accessibility_label(crate::locale::text("启动 Agent", "Start Agent"))
                             .child(
                                 div()
-                                    .text_size(px(16.))
-                                    .line_height(px(24.))
+                                    .text_size(theme.text_sm)
+                                    .line_height(relative(1.25))
                                     .font_weight(gpui_kit::FontWeight::NORMAL)
-                                    .child("进入"),
+                                    .child(crate::locale::text("进入", "Start")),
                             )
                             .disabled(!self.can_create_with_selected_launcher())
                             .on_click(
@@ -1170,7 +1148,8 @@ impl AgentsPanel {
             }))
     }
 
-    /// 沿用目录顺序与安装快照；外层裁切补足 Kit Button 不公开的单侧圆角，同时保留其焦点与键盘行为。
+    /// 沿用目录顺序与安装快照；选择器和菜单共用主题字号，避免双语及放大时出现独立的小字层级。
+    /// 外层裁切补足 Kit Button 不公开的单侧圆角，同时保留其焦点与键盘行为。
     /// 菜单继续由 Kit 管理状态；所有图标由内容绘制，避免尾项的 Plus 让 Kit 为整列额外预留图标槽。
     /// @author kongweiguang
     fn render_launcher_selector(
@@ -1255,26 +1234,25 @@ impl AgentsPanel {
             .px_3()
             .w_full()
             .min_w(px(0.))
-            .h(px(44.))
+            .h(theme.metrics.control_height + theme.metrics.gap * 1.5)
             .dropdown_caret(true)
             .debug_selector(|| "rr-agent-picker".into())
-            .accessibility_label(accessibility_label)
-            .tooltip(label.clone())
+            .accessibility_label(accessibility_label.clone())
+            .tooltip(accessibility_label)
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.))
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(theme.metrics.gap)
                     .child(
                         div()
                             .debug_selector(|| "rr-agent-launcher-icon".into())
-                            .size(px(28.))
-                            .rounded_lg()
+                            .size(theme.metrics.control_height - theme.metrics.gap / 2.)
+                            .rounded(theme.control_radius)
                             .bg(theme.panel)
                             .text_color(accent)
-                            .shadow_sm()
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1290,8 +1268,8 @@ impl AgentsPanel {
                             .gap_0()
                             .child(
                                 div()
-                                    .text_size(px(13.))
-                                    .line_height(px(16.))
+                                    .text_size(theme.text_sm)
+                                    .line_height(relative(1.25))
                                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                     .text_color(theme.foreground)
                                     .whitespace_nowrap()
@@ -1304,8 +1282,10 @@ impl AgentsPanel {
                                         .flex()
                                         .items_center()
                                         .gap_1()
-                                        .text_size(px(10.))
-                                        .line_height(px(14.))
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .text_size(theme.text_xs)
+                                        .line_height(relative(1.25))
                                         .text_color(theme.subtle)
                                         .child(launcher_installation_dot(
                                             theme,
@@ -1338,19 +1318,18 @@ impl AgentsPanel {
                                 .aria_label(option_accessibility_label.clone())
                                 .flex_1()
                                 .min_w(px(0.))
-                                .min_h(px(32.))
-                                .py_2()
+                                .min_h(theme.metrics.control_height)
+                                .py(theme.metrics.gap)
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
                                 .child(
                                     div()
-                                        .size(px(32.))
+                                        .size(theme.metrics.control_height)
                                         .flex_none()
-                                        .rounded_md()
+                                        .rounded(theme.control_radius)
                                         .bg(theme.panel)
                                         .text_color(accent)
-                                        .shadow_sm()
                                         .flex()
                                         .items_center()
                                         .justify_center()
@@ -1366,7 +1345,7 @@ impl AgentsPanel {
                                         .child(
                                             div()
                                                 .w_full()
-                                                .text_size(px(13.))
+                                                .text_size(theme.text_sm)
                                                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                                 .text_color(theme.foreground)
                                                 .whitespace_nowrap()
@@ -1379,8 +1358,10 @@ impl AgentsPanel {
                                                 .flex()
                                                 .items_center()
                                                 .gap_1()
-                                                .text_size(px(10.))
-                                                .line_height(px(14.))
+                                                .min_w(px(0.))
+                                                .overflow_hidden()
+                                                .text_size(theme.text_xs)
+                                                .line_height(relative(1.25))
                                                 .text_color(theme.subtle)
                                                 .child(launcher_installation_dot(
                                                     theme,
@@ -1421,13 +1402,13 @@ impl AgentsPanel {
 
         div()
             .w_full()
-            .rounded_tl(px(10.))
-            .rounded_bl(px(10.))
+            .rounded_tl(theme.control_radius)
+            .rounded_bl(theme.control_radius)
             .overflow_hidden()
             .child(picker)
     }
 
-    /// 目标与 Info 保持 main 的 muted 辅助层级，避免目标说明抢过 Agent 启动入口。
+    /// 目标与 Info 保持辅助层级；字号继承主题，长目标保留省略和信息入口。
     ///
     /// @author kongweiguang
     fn render_new_chat_target(&self, theme: ThemeTokens) -> impl IntoElement {
@@ -1439,6 +1420,7 @@ impl AgentsPanel {
         let target_label = summary
             .map(str::to_owned)
             .unwrap_or_else(|| crate::locale::text("未绑定终端", "Unbound").to_string());
+        let target_tooltip = target_label.clone();
         div()
             .w_full()
             .px_1()
@@ -1451,22 +1433,26 @@ impl AgentsPanel {
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .h(px(16.))
+                    .min_h(theme.metrics.icon_size)
                     .flex()
                     .items_center()
                     .gap(px(2.))
                     .overflow_hidden()
-                    .text_size(px(11.))
+                    .text_size(theme.text_xs)
                     .text_color(theme.muted)
                     .child(crate::locale::text("当前目标 ·", "Current target · "))
                     .child(
                         div()
+                            .id("agents-new-chat-target")
                             .flex_1()
                             .min_w(px(0.))
                             .whitespace_nowrap()
                             .text_ellipsis()
                             .font_weight(gpui_kit::FontWeight::NORMAL)
                             .text_color(theme.muted)
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(target_tooltip.clone()).build(window, cx)
+                            })
                             .child(target_label),
                     ),
             )
@@ -1476,8 +1462,7 @@ impl AgentsPanel {
                     .ghost()
                     .text_color(theme.muted)
                     .flex_none()
-                    .w(px(24.))
-                    .h(px(24.))
+                    .size(theme.metrics.icon_size + theme.metrics.gap)
                     .icon(IconName::Info)
                     .accessibility_label(crate::locale::text(
                         "启动器与目标详情",
@@ -1533,7 +1518,7 @@ impl AgentsPanel {
             })
     }
 
-    /// 两段筛选匹配 main 的 190px 等宽组；背景覆盖完整按钮，避免 Kit 内边距缩短选中面。
+    /// 两段筛选共享紧凑文字和等宽槽位；长文案可截断并提供完整提示，窄栏不挤压相邻标题。
     /// @author kongweiguang
     fn render_history_filter(
         &self,
@@ -1566,26 +1551,29 @@ impl AgentsPanel {
             .ghost()
             .flex_1()
             .min_w(px(0.))
-            .h(px(28.))
+            .h(theme.metrics.control_height - theme.metrics.gap / 2.)
             .p_0()
             .accessibility_label(accessibility_label)
+            .tooltip(description)
             .child(
                 div()
                     .w_full()
                     .h_full()
                     .min_w(px(0.))
-                    .rounded_md()
+                    .rounded(theme.control_radius)
                     .flex()
                     .items_center()
                     .justify_center()
-                    .px_2()
+                    .px(theme.metrics.gap)
                     .when(selected, |element| element.bg(theme.panel).shadow_sm())
                     .child(
                         div()
                             .min_w(px(0.))
                             .whitespace_nowrap()
-                            .text_size(px(16.))
-                            .line_height(px(24.))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(theme.text_xs)
+                            .line_height(relative(1.25))
                             .font_weight(gpui_kit::FontWeight::NORMAL)
                             .text_color(foreground)
                             .child(label),
@@ -1596,7 +1584,7 @@ impl AgentsPanel {
             )
     }
 
-    /// 历史区沿用 main 的标题、190px 双段筛选和整宽记录卡；组内 2px 留白形成 32px 总高。
+    /// 历史区将标题、刷新和筛选保持在同一对齐行；窄栏允许筛选收缩并保留完整可访问名称。
     /// 刷新进度留在标题按钮中，保留原列表几何；错误栏以稳定 ID 持有滚动状态，成功重试后收起。
     /// @author kongweiguang
     fn render_session_history(
@@ -1628,7 +1616,11 @@ impl AgentsPanel {
                 .child(
                     div()
                         .flex_1()
-                        .h(px(16.))
+                        .min_w(px(0.))
+                        .min_h(theme.metrics.icon_size)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .flex()
                         .items_center()
                         .text_size(theme.text_xs)
@@ -1640,6 +1632,8 @@ impl AgentsPanel {
                     Button::new("agents-history-refresh")
                         .compact()
                         .ghost()
+                        .w(theme.metrics.control_height)
+                        .h(theme.metrics.control_height)
                         .icon(IconName::RefreshCw)
                         .loading(self.loading)
                         .accessibility_label(crate::locale::text("刷新会话", "Refresh chats"))
@@ -1652,9 +1646,11 @@ impl AgentsPanel {
                         .id("agents-history-filter")
                         .flex()
                         .items_center()
-                        .w(px(190.))
-                        .p(px(2.))
-                        .rounded_lg()
+                        .w(theme.metrics.control_height * 6.)
+                        .min_w(px(0.))
+                        .flex_shrink_1()
+                        .p(theme.metrics.gap / 4.)
+                        .rounded(theme.radius)
                         .bg(theme.secondary)
                         .child(self.render_history_filter(
                             HistoryFilterOption {
@@ -1884,16 +1880,17 @@ impl AgentsPanel {
         let continue_title = title.clone();
         let continue_scope = scope.clone();
         let continue_candidate = candidate.clone();
+        let continue_label = crate::locale::text(
+            format!("继续对话 {title}"),
+            format!("Continue chat {title}"),
+        );
         let primary = Button::new(format!("agent-session-continue-{}", id.as_str()))
             .compact()
             .ghost()
             .flex_1()
             .min_w(px(0.))
-            .accessibility_label(crate::locale::text(
-                format!("继续对话 {title}"),
-                format!("Continue chat {title}"),
-            ))
-            .tooltip(crate::locale::text("继续这段对话", "Continue this chat"))
+            .accessibility_label(continue_label.clone())
+            .tooltip(continue_label)
             .disabled(!selectable || self.busy)
             .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
                 panel.continue_agent_from_history(

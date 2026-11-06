@@ -120,6 +120,16 @@ impl PreferencesPanel {
                 .is_some_and(|draft| draft.status() == DraftStatus::Ready)
     }
 
+    /// 超时诊断只返回事务阶段与已公开的设置错误，不输出草稿字段或凭据，避免误把同步状态当保存结果。
+    /// @author kongweiguang
+    pub(crate) fn settings_acceptance_draft_diagnostic(&self) -> String {
+        format!(
+            "status={:?}, error={:?}",
+            self.settings.as_ref().map(|draft| draft.status()),
+            self.settings_error,
+        )
+    }
+
     /// Keeps initial or explicit settings reload work distinct from an in-flight autosave.
     pub(crate) fn settings_acceptance_loading(&self) -> bool {
         self.loading_settings || self.settings.is_none()

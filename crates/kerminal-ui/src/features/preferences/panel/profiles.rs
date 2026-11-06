@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    PreferencesEvent, PreferencesPanel, PreferencesSection, ProfileTextField, parse_environment,
-    profile_to_draft,
+    LeaveConfirmation, PendingProfileDelete, PreferencesEvent, PreferencesPanel,
+    PreferencesSection, ProfileTextField, parse_environment, profile_to_draft,
 };
 use crate::features::preferences::{
     ConfigDraft, DraftSnapshot, DraftStatus, DraftTransitionError, validate_profile,
@@ -118,13 +118,18 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 切换或新建 Profile 前先检查当前草稿，丢弃动作需由用户在确认条中明确选择。
+    /// 切换前固定待选目标；焦点陷阱与草稿确认同代开启，避免键盘落到被遮住的表单。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn request_profile_selection(
         &mut self,
         selection: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_leave_confirmation() {
+            return;
+        }
         if self
             .profile_draft
             .as_ref()
@@ -147,6 +152,7 @@ impl PreferencesPanel {
         {
             self.pending_profile_selection = Some(selection);
             self.profile_switch_confirmation = true;
+            self.schedule_leave_confirmation_focus(LeaveConfirmation::ProfileSwitch, cx);
             cx.notify();
             return;
         }
@@ -178,18 +184,81 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 用户确认丢弃后才切换 Profile，取消则原样保留草稿和 revision。
+    /// 先核实固定目标仍存在且草稿允许放弃，避免监听回执使用户输入被无效切换丢弃。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn confirm_profile_discard(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.profile_switch_confirmation {
+            return;
+        }
         let selection = self.pending_profile_selection.take();
         self.profile_switch_confirmation = false;
-        if let Some(draft) = self.profile_draft.as_mut() {
-            let _ = draft.discard_changes();
+        self.restore_leave_confirmation_focus(LeaveConfirmation::ProfileSwitch, cx);
+        let Some(selection) = selection else {
+            self.status = Some(
+                crate::locale::text(
+                    "切换目标已失效，Profile 草稿已保留。",
+                    "The target is no longer available. The profile draft was preserved.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        if selection
+            .as_ref()
+            .is_some_and(|id| !self.profile_rows.iter().any(|row| row.profile.id == *id))
+        {
+            self.status = Some(
+                crate::locale::text(
+                    "切换目标已不存在，Profile 草稿已保留。",
+                    "The target profile no longer exists. The profile draft was preserved.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
         }
-        self.apply_profile_selection(selection.unwrap_or(None), window, cx);
+        if let Some(draft) = self.profile_draft.as_mut()
+            && let Err(error) = draft.discard_changes()
+        {
+            self.status = Some(
+                match error {
+                    DraftTransitionError::ReadBackRequired => crate::locale::text(
+                        "Profile 写入结果未知，请先重新读取并核对。",
+                        "The profile write result is unknown. Read it back and verify it first.",
+                    ),
+                    _ => crate::locale::text(
+                        "Profile 正在保存，请等待结果后再切换。",
+                        "The profile is being saved. Wait for the result before switching.",
+                    ),
+                }
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        self.apply_profile_selection(selection, window, cx);
+    }
+
+    /// 取消切换只撤销原待选目标并归还焦点，保留 Profile 草稿和 revision。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn cancel_profile_switch(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.profile_switch_confirmation {
+            return;
+        }
+        self.profile_switch_confirmation = false;
+        self.pending_profile_selection = None;
+        self.restore_leave_confirmation_focus(LeaveConfirmation::ProfileSwitch, cx);
+        cx.notify();
     }
 
     /// 只提交已确认的版本链；扫描结果未知时不能用旧列表启动新的 Profile 写入。
@@ -322,9 +391,12 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 显式重新读取用于核对冲突或未知写入；不与扫描或其它 Profile 写入交叉。
+    /// 显式重新读取用于核对冲突或未知写入；有草稿时建立独立确认焦点。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn reload_profiles(&mut self, cx: &mut Context<Self>) {
-        if self.loading_profiles
+        if self.has_leave_confirmation()
+            || self.loading_profiles
             || self.profile_operation_running
             || self
                 .profile_draft
@@ -345,13 +417,16 @@ impl PreferencesPanel {
             draft.is_dirty() || draft.status() == DraftStatus::ExternalConflict
         }) {
             self.profile_reload_confirmation = true;
+            self.schedule_leave_confirmation_focus(LeaveConfirmation::ProfileReload, cx);
             cx.notify();
             return;
         }
         self.load_profiles_again(cx);
     }
 
-    /// 放弃本地 Profile 草稿后才刷新外部版本，防止列表查询静默覆盖输入。
+    /// 放弃本地草稿后才刷新外部版本，并释放本次确认的焦点所有权。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn confirm_profile_reload(
         &mut self,
         cx: &mut Context<Self>,
@@ -360,6 +435,7 @@ impl PreferencesPanel {
             return;
         }
         self.profile_reload_confirmation = false;
+        self.restore_leave_confirmation_focus(LeaveConfirmation::ProfileReload, cx);
         if let Some(draft) = self.profile_draft.as_mut() {
             let _ = draft.discard_changes();
         }
@@ -452,12 +528,18 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 关闭 Profile 重载确认时保留当前草稿和外部冲突状态。
+    /// 取消重载保留草稿与外部冲突状态，并仅恢复仍属于本次确认的焦点。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn cancel_profile_reload(
         &mut self,
         cx: &mut Context<Self>,
     ) {
+        if !self.profile_reload_confirmation {
+            return;
+        }
         self.profile_reload_confirmation = false;
+        self.restore_leave_confirmation_focus(LeaveConfirmation::ProfileReload, cx);
         cx.notify();
     }
 
@@ -469,33 +551,67 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 删除前要求用户确认；默认项、脏草稿和恢复模式都由真实服务/写入门禁约束。
+    /// 删除前冻结目标及 revision，防止配置监听期间选中项变化后误删其他 Profile。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn request_delete_profile(
         &mut self,
         cx: &mut Context<Self>,
     ) {
-        let can_delete = self.selected_profile_id.is_some()
-            && self
-                .profile_draft
-                .as_ref()
-                .is_some_and(|draft| draft.revision().is_some() && !draft.is_dirty());
-        if !can_delete || self.recovery.mode == ConfigurationMode::ReadOnlyRecovery {
+        if self.has_leave_confirmation()
+            || self.loading_profiles
+            || self.profile_operation_running
+            || self.profile_scan.requires_readback
+            || self.recovery.mode == ConfigurationMode::ReadOnlyRecovery
+        {
             return;
         }
+        let (Some(id), Some(draft)) = (
+            self.selected_profile_id.clone(),
+            self.profile_draft.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(revision) = draft.revision().clone() else {
+            return;
+        };
+        if draft.is_dirty()
+            || matches!(
+                draft.status(),
+                DraftStatus::Saving | DraftStatus::OutcomeUnknown
+            )
+        {
+            return;
+        }
+        self.pending_profile_delete = Some(PendingProfileDelete {
+            id,
+            revision,
+            name: draft.value().name.clone(),
+        });
         self.profile_delete_confirmation = true;
+        self.schedule_leave_confirmation_focus(LeaveConfirmation::ProfileDelete, cx);
         cx.notify();
     }
 
-    /// 取消删除时不触及服务端状态或当前 Profile 草稿。
+    /// 取消删除保留原草稿，并仅在当前确认持有焦点时恢复原控件。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn cancel_delete_profile(
         &mut self,
         cx: &mut Context<Self>,
     ) {
+        if !self.profile_delete_confirmation {
+            return;
+        }
         self.profile_delete_confirmation = false;
+        self.pending_profile_delete = None;
+        self.restore_leave_confirmation_focus(LeaveConfirmation::ProfileDelete, cx);
         cx.notify();
     }
 
-    /// 用户确认后按当前 revision 执行 CAS 删除，过期结果要求重新加载列表。
+    /// 仅在目标及 revision 仍与用户确认的一致时删除；变化后保留数据并要求重新确认。
+    ///
+    /// @author kongweiguang
     pub(in crate::features::preferences) fn confirm_delete_profile(
         &mut self,
         cx: &mut Context<Self>,
@@ -504,6 +620,25 @@ impl PreferencesPanel {
             return;
         }
         self.profile_delete_confirmation = false;
+        let pending = self.pending_profile_delete.take();
+        self.restore_leave_confirmation_focus(LeaveConfirmation::ProfileDelete, cx);
+        let still_matches = pending.as_ref().is_some_and(|pending| {
+            self.selected_profile_id.as_deref() == Some(pending.id.as_str())
+                && self.profile_draft.as_ref().is_some_and(|draft| {
+                    draft.revision().as_ref() == Some(&pending.revision) && !draft.is_dirty()
+                })
+        });
+        if !still_matches {
+            self.status = Some(
+                crate::locale::text(
+                    "Profile 已变化，请核对后重新删除。",
+                    "The profile changed. Review it before deleting again.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         self.delete_profile(cx);
     }
 

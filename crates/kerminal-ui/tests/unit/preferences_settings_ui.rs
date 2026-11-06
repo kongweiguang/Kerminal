@@ -11,6 +11,12 @@ mod mcp;
 #[path = "preferences_keyword_regressions.rs"]
 mod keyword_regressions;
 
+#[path = "preferences_initial_scroll.rs"]
+mod initial_scroll;
+
+#[path = "preferences_save_recovery.rs"]
+mod save_recovery;
+
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -68,6 +74,9 @@ struct MemorySettingsState {
     save_count: usize,
     save_attempt_count: usize,
     fail_next_settings_save: bool,
+    unknown_after_settings_save: bool,
+    fail_next_settings_read: bool,
+    settings_read_count: usize,
     profiles: Vec<VersionedProfile>,
     profile_saves: usize,
     unknown_after_profile_save: bool,
@@ -85,6 +94,9 @@ impl MemorySettingsRepository {
                 save_count: 0,
                 save_attempt_count: 0,
                 fail_next_settings_save: false,
+                unknown_after_settings_save: false,
+                fail_next_settings_read: false,
+                settings_read_count: 0,
                 profiles: Vec::new(),
                 profile_saves: 0,
                 unknown_after_profile_save: false,
@@ -116,16 +128,20 @@ impl MemorySettingsRepository {
 
 #[async_trait]
 impl SettingsRepository for MemorySettingsRepository {
-    /// 返回唯一的测试快照和 CAS revision，不让测试自行复刻配置文件解码。
+    /// 返回唯一的测试快照和 CAS revision；读回可独立失败并计数，证明恢复没有重放写入。
     async fn load_settings(&self) -> AppResult<VersionedSettings> {
-        let state = self.state.lock().expect("settings state is not poisoned");
+        let mut state = self.state.lock().expect("settings state is not poisoned");
+        state.settings_read_count += 1;
+        if std::mem::take(&mut state.fail_next_settings_read) {
+            return Err(AppError::infrastructure("模拟设置读回失败"));
+        }
         Ok(VersionedSettings {
             settings: state.settings.clone(),
             revision: state.revision.clone(),
         })
     }
 
-    /// 每次请求先记录真实尝试，再按可控故障和 revision 决定提交，避免失败伪装成写入成功。
+    /// 每次请求先记录真实尝试，再按可控故障和 revision 决定提交；未知结果可伴随首次读回失败。
     ///
     /// @author kongweiguang
     async fn save_settings(
@@ -146,6 +162,10 @@ impl SettingsRepository for MemorySettingsRepository {
         state.save_count += 1;
         state.settings = settings.clone();
         state.revision = Some(revision.clone());
+        if std::mem::take(&mut state.unknown_after_settings_save) {
+            state.fail_next_settings_read = true;
+            return Err(AppError::outcome_unknown("模拟设置提交结果未知"));
+        }
         Ok(VersionedSettings {
             settings,
             revision: Some(revision),
@@ -263,13 +283,19 @@ impl ProfileRepository for MemorySettingsRepository {
         Ok(row)
     }
 
-    /// 设置 UI fixture 不允许删除主机配置。
-    async fn delete_profile(
-        &self,
-        _id: &str,
-        _expected_revision: ConfigRevision,
-    ) -> AppResult<bool> {
-        Err(AppError::unsupported("设置 UI fixture 不删除 Profile"))
+    /// 按原 revision 删除隔离 Profile，令确认、取消与实际结果可走完整 UI 路径。
+    ///
+    /// @author kongweiguang
+    async fn delete_profile(&self, id: &str, expected_revision: ConfigRevision) -> AppResult<bool> {
+        let mut state = self.state.lock().expect("settings state is not poisoned");
+        let Some(index) = state.profiles.iter().position(|row| row.profile.id == id) else {
+            return Ok(false);
+        };
+        if state.profiles[index].revision != expected_revision {
+            return Err(AppError::conflict("Profile revision changed"));
+        }
+        state.profiles.remove(index);
+        Ok(true)
     }
 
     /// 对完整列表 revision 做 CAS，模拟成功后回执未知的可恢复事务。
@@ -723,6 +749,295 @@ fn profile_page_creates_edits_and_selects_the_shared_default(app: &mut TestAppCo
         visual.update(|_, cx| panel.read(cx).selected_profile_id.clone()),
         Some(id)
     );
+}
+
+/// 交付确认弹层的下一帧焦点回调，使断言覆盖生产焦点交接而不是测试直接赋值。
+///
+/// @author kongweiguang
+fn deliver_profile_confirmation_frame(visual: &mut VisualTestContext) {
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        assert!(window.simulate_next_frame(cx) > 0);
+        window.draw(cx).clear(cx);
+    });
+    visual.run_until_parked();
+}
+
+/// 两个真实按钮构成闭合的键盘路径，保证焦点不能穿过确认层触及设置正文。
+///
+/// @author kongweiguang
+fn assert_profile_confirmation_tab_cycle(
+    visual: &mut VisualTestContext,
+    cancel: &gpui_kit::FocusHandle,
+    confirm: &gpui_kit::FocusHandle,
+) {
+    assert!(visual.update(|window, _| cancel.is_focused(window)));
+    for (key, expected) in [
+        ("tab", confirm),
+        ("tab", cancel),
+        ("shift-tab", confirm),
+        ("shift-tab", cancel),
+    ] {
+        visual.simulate_keystrokes(key);
+        draw(visual);
+        assert!(
+            visual.update(|window, _| expected.is_focused(window)),
+            "{key}"
+        );
+    }
+}
+
+/// 切换确认通过真实按钮打开，Escape 恢复触发前焦点并保留输入中的 Profile。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn profile_switch_confirmation_traps_focus_and_preserves_draft(app: &mut TestAppContext) {
+    let (_runtime, panel, _repository, visual) = fixture(app);
+    click(visual, "preferences-nav-profiles");
+    click(visual, "profile-create");
+    click(visual, "profile-name-field");
+    visual.simulate_input("Unfinished profile");
+    draw(visual);
+    click(visual, "profile-create");
+    assert!(visual.update(|_, cx| panel.read(cx).profile_switch_confirmation));
+    let previous = visual.update(|window, cx| window.focused(cx));
+    deliver_profile_confirmation_frame(visual);
+    let (cancel, confirm) = visual.update(|_, cx| {
+        let focus = &panel.read(cx).profile_switch_confirmation_focus;
+        (focus.keep_editing.clone(), focus.discard.clone())
+    });
+    assert_profile_confirmation_tab_cycle(visual, &cancel, &confirm);
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+    assert!(!visual.update(|_, cx| panel.read(cx).profile_switch_confirmation));
+    assert_eq!(visual.update(|window, cx| window.focused(cx)), previous);
+    assert_eq!(
+        visual.update(|_, cx| panel
+            .read(cx)
+            .profile_draft
+            .as_ref()
+            .unwrap()
+            .value()
+            .name
+            .clone()),
+        "Unfinished profile"
+    );
+}
+
+/// 监听回执移除目标时保留当前草稿，不能先丢弃输入再静默停留在原页面。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn profile_switch_preserves_draft_when_target_disappears(app: &mut TestAppContext) {
+    let (runtime, panel, _repository, visual) = fixture(app);
+    click(visual, "preferences-nav-profiles");
+    click(visual, "profile-create");
+    click(visual, "profile-name-field");
+    visual.simulate_input("Target profile");
+    click(visual, "profile-shell-field");
+    visual.simulate_input("pwsh.exe");
+    scroll_until_visible(
+        visual,
+        "profile-save",
+        "preferences-profile-form-scroll",
+        -8.,
+    );
+    click(visual, "profile-save");
+    pump_runtime(&runtime, visual);
+    let target_id = visual.update(|_, cx| panel.read(cx).selected_profile_id.clone().unwrap());
+
+    click(visual, "profile-create");
+    click(visual, "profile-name-field");
+    visual.simulate_input("Preserved draft");
+    click(visual, &format!("profile-select-{target_id}"));
+    deliver_profile_confirmation_frame(visual);
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.profile_rows.retain(|row| row.profile.id != target_id);
+            cx.notify();
+        })
+    });
+    click(visual, "profile-switch-discard");
+    assert!(!visual.update(|_, cx| panel.read(cx).profile_switch_confirmation));
+    assert_eq!(
+        visual.update(|_, cx| panel
+            .read(cx)
+            .profile_draft
+            .as_ref()
+            .unwrap()
+            .value()
+            .name
+            .clone()),
+        "Preserved draft"
+    );
+    assert!(visual.update(|_, cx| panel.read(cx).profile_draft.as_ref().unwrap().is_dirty()));
+}
+
+/// 退出确认取消后回到原草稿；确认退出时清除已失效的 Profile 切换意图。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn quitting_over_profile_confirmation_restores_the_original_confirmation(app: &mut TestAppContext) {
+    let (_runtime, panel, _repository, visual) = fixture(app);
+    click(visual, "preferences-nav-profiles");
+    click(visual, "profile-create");
+    click(visual, "profile-name-field");
+    visual.simulate_input("Unfinished profile");
+    draw(visual);
+    click(visual, "profile-create");
+    deliver_profile_confirmation_frame(visual);
+
+    visual.update(|_, cx| panel.update(cx, |panel, cx| panel.request_close(cx)));
+    assert!(!visual.update(|_, cx| panel.read(cx).close_confirmation));
+    assert!(!visual.update(|_, cx| panel.update(cx, |panel, cx| panel.request_quit(cx))));
+    deliver_profile_confirmation_frame(visual);
+    assert_not_rendered(visual, "profile-switch-cancel");
+    let (cancel, confirm) = visual.update(|_, cx| {
+        let focus = &panel.read(cx).quit_confirmation_focus;
+        (focus.keep_editing.clone(), focus.discard.clone())
+    });
+    assert_profile_confirmation_tab_cycle(visual, &cancel, &confirm);
+
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+    assert!(!visual.update(|_, cx| panel.read(cx).quit_confirmation));
+    assert!(visual.update(|_, cx| panel.read(cx).profile_switch_confirmation));
+    assert_rendered(visual, "profile-switch-cancel");
+    let original_cancel = visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .profile_switch_confirmation_focus
+            .keep_editing
+            .clone()
+    });
+    assert!(visual.update(|window, _| original_cancel.is_focused(window)));
+    assert_eq!(
+        visual.update(|_, cx| panel
+            .read(cx)
+            .profile_draft
+            .as_ref()
+            .unwrap()
+            .value()
+            .name
+            .clone()),
+        "Unfinished profile"
+    );
+
+    assert!(!visual.update(|_, cx| panel.update(cx, |panel, cx| panel.request_quit(cx))));
+    deliver_profile_confirmation_frame(visual);
+    click(visual, "preferences-quit-confirm");
+    assert!(!visual.update(|_, cx| panel.read(cx).profile_switch_confirmation));
+    assert!(visual.update(|_, cx| panel.read(cx).pending_profile_selection.is_none()));
+    assert_not_rendered(visual, "profile-switch-cancel");
+}
+
+/// 重读确认关闭后不丢弃草稿，并能从原触发器再次打开和取消。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn profile_reload_confirmation_preserves_draft_and_can_reopen(app: &mut TestAppContext) {
+    let (_runtime, panel, _repository, visual) = fixture(app);
+    click(visual, "preferences-nav-profiles");
+    click(visual, "profile-create");
+    click(visual, "profile-name-field");
+    visual.simulate_input("Reload draft");
+    draw(visual);
+    for _ in 0..2 {
+        click(visual, "profile-reload");
+        assert!(visual.update(|_, cx| panel.read(cx).profile_reload_confirmation));
+        deliver_profile_confirmation_frame(visual);
+        let (cancel, confirm) = visual.update(|_, cx| {
+            let focus = &panel.read(cx).profile_reload_confirmation_focus;
+            (focus.keep_editing.clone(), focus.discard.clone())
+        });
+        assert_profile_confirmation_tab_cycle(visual, &cancel, &confirm);
+        visual.simulate_keystrokes("escape");
+        draw(visual);
+        assert!(!visual.update(|_, cx| panel.read(cx).profile_reload_confirmation));
+        assert_eq!(
+            visual.update(|_, cx| panel
+                .read(cx)
+                .profile_draft
+                .as_ref()
+                .unwrap()
+                .value()
+                .name
+                .clone()),
+            "Reload draft"
+        );
+    }
+}
+
+/// 删除确认先给取消焦点，目标变化时不提交；重新确认后才删除原 Profile。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn profile_delete_confirmation_traps_focus_and_requires_explicit_confirmation(
+    app: &mut TestAppContext,
+) {
+    let (runtime, panel, repository, visual) = fixture(app);
+    click(visual, "preferences-nav-profiles");
+    click(visual, "profile-create");
+    click(visual, "profile-name-field");
+    visual.simulate_input("Profile to delete");
+    click(visual, "profile-shell-field");
+    visual.simulate_input("pwsh.exe");
+    scroll_until_visible(
+        visual,
+        "profile-save",
+        "preferences-profile-form-scroll",
+        -8.,
+    );
+    click(visual, "profile-save");
+    pump_runtime(&runtime, visual);
+    assert_eq!(repository.state.lock().unwrap().profiles.len(), 1);
+
+    click(visual, "profile-delete");
+    deliver_profile_confirmation_frame(visual);
+    let (cancel, confirm) = visual.update(|_, cx| {
+        let focus = &panel.read(cx).profile_delete_confirmation_focus;
+        (focus.keep_editing.clone(), focus.discard.clone())
+    });
+    assert_profile_confirmation_tab_cycle(visual, &cancel, &confirm);
+    visual.simulate_keystrokes("escape");
+    draw(visual);
+    assert_eq!(repository.state.lock().unwrap().profiles.len(), 1);
+
+    let original_id = visual.update(|_, cx| panel.read(cx).selected_profile_id.clone());
+    click(visual, "profile-delete");
+    deliver_profile_confirmation_frame(visual);
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.selected_profile_id = Some("changed-profile".to_owned());
+            cx.notify();
+        });
+    });
+    click(visual, "profile-delete-confirm");
+    assert!(!visual.update(|_, cx| panel.read(cx).profile_operation_running));
+    assert_eq!(repository.state.lock().unwrap().profiles.len(), 1);
+    assert_eq!(
+        visual.update(|_, cx| panel.read(cx).status.clone()),
+        Some(
+            crate::locale::text(
+                "Profile 已变化，请核对后重新删除。",
+                "The profile changed. Review it before deleting again.",
+            )
+            .to_string()
+        )
+    );
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.selected_profile_id = original_id;
+            cx.notify();
+        });
+    });
+
+    click(visual, "profile-delete");
+    deliver_profile_confirmation_frame(visual);
+    click(visual, "profile-delete-confirm");
+    pump_runtime(&runtime, visual);
+    assert!(repository.state.lock().unwrap().profiles.is_empty());
+    assert!(!visual.update(|_, cx| panel.read(cx).profile_delete_confirmation));
 }
 
 /// 未知保存回执须由用户触发读回；匹配时确认，不重放写入。
@@ -1372,7 +1687,7 @@ fn app_color_scheme_keyboard_navigation_changes_selection(app: &mut TestAppConte
     );
 }
 
-/// 缩略卡随设置正文的实际宽度换行，窄窗口和宽窗口都不能越过内容区两侧。
+/// 缩略卡随设置正文宽度均分为三列两行：不越过内容区两侧，且末列贴住整行控件右边界。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]
@@ -1382,6 +1697,12 @@ fn app_color_scheme_choices_fit_the_settings_content_width(app: &mut TestAppCont
         visual.simulate_resize(window_size);
         draw(visual);
         let clip = visual.update(|_, cx| panel.read(cx).content_scroll.bounds());
+        // 同一表单里整行控件（语言选择框）的右边界即该列应有边界。
+        let column = target_geometry(visual, "settings-interface-language-select").0;
+        let mut widest_right = f64::MIN;
+        let mut leftmost = f64::MAX;
+        let mut widths = Vec::new();
+        let mut rows = Vec::new();
         for selector in [
             "app-color-kerminal",
             "app-color-jetbrains",
@@ -1396,7 +1717,28 @@ fn app_color_scheme_choices_fit_the_settings_content_width(app: &mut TestAppCont
                     && bounds.right().to_f64() <= clip.right().to_f64() + 0.75,
                 "{selector} exceeds the content width at {window_size:?}: {bounds:?}, {clip:?}"
             );
+            widest_right = widest_right.max(bounds.right().to_f64());
+            leftmost = leftmost.min(bounds.left().to_f64());
+            widths.push(bounds.size.width.to_f64());
+            let top = bounds.top().to_f64();
+            if !rows.iter().any(|row: &f64| (row - top).abs() <= 0.75) {
+                rows.push(top);
+            }
         }
+        // 三列按行均分剩余宽度：最右列必须贴住整行容器的右边界，否则会出现俗称的
+        // “配色卡片右侧留白”，与上方整行控件错位。
+        assert!(
+            (leftmost - column.left().to_f64()).abs() <= 0.75
+                && (widest_right - column.right().to_f64()).abs() <= 0.75,
+            "palette columns do not fill the row at {window_size:?}: left {leftmost}, right {widest_right}, column {column:?}"
+        );
+        // 六个色板固定排成三列两行；列宽一致才不会再出现末列被挤窄的观感。
+        let narrowest = widths.iter().copied().fold(f64::MAX, f64::min);
+        let widest = widths.iter().copied().fold(f64::MIN, f64::max);
+        assert!(
+            rows.len() == 2 && widest - narrowest <= 0.75,
+            "palette columns are uneven at {window_size:?}: widths {widths:?}, rows {rows:?}"
+        );
     }
 }
 

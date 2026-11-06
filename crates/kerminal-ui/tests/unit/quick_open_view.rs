@@ -12,7 +12,9 @@ use kerminal_domain::{
     sessions::SessionOwner,
 };
 
-use super::{action_category, local_search_entries, remote_protocol_label, snippet_risk_label};
+use super::{
+    action_category, action_label, local_search_entries, remote_protocol_label, snippet_risk_label,
+};
 
 /// 构造被 Root 捕获的可见 UI 目标，测试不依赖运行中的 SessionManager。
 ///
@@ -170,6 +172,28 @@ fn command_palette_uses_human_details_while_preserving_action_search_ids() {
         assert!(!entry.detail.starts_with("Action ·"));
         assert!(entry.keywords.iter().any(|keyword| keyword == action_id));
     }
+}
+
+/// 命令面板与工具栏必须指向同一命令历史入口，内部 action ID 仍可用于快捷键检索。
+///
+/// @author kongweiguang
+#[test]
+fn command_history_action_matches_tool_rail_name_and_id() {
+    let label = action_label(KeybindingAction::ToolLogs);
+    assert!(label == "打开命令历史" || label == "Open command history");
+    let context = QuickOpenOpenContext {
+        workspace: None,
+        terminal: None,
+        terminal_binding: None,
+    };
+    let entries = local_search_entries(&context, QuickOpenMode::CommandPalette, &label);
+    assert!(entries.iter().any(|entry| {
+        entry.selection == Some(QuickOpenSelection::Action(KeybindingAction::ToolLogs))
+            && entry
+                .keywords
+                .iter()
+                .any(|keyword| keyword == KeybindingAction::ToolLogs.id())
+    }));
 }
 
 /// 协议和风险元数据使用人类词汇展示，不把 Rust enum 的 Debug 输出当产品文案。

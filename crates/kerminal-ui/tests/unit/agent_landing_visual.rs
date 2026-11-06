@@ -380,3 +380,45 @@ fn launcher_menu_content_aligns_with_picker(app: &mut TestAppContext) {
         draw(visual);
     }
 }
+
+/// 窄工具栏保留启动与筛选的独立命中区；三个主题均检查真实按钮而非内部布局常量。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn launcher_and_history_controls_fit_narrow_tool_panels(app: &mut TestAppContext) {
+    let (_, _, panel, _, visual) = fixture(app);
+    for (mode, appearance) in [
+        (ThemeMode::Light, WindowAppearance::Light),
+        (ThemeMode::Dark, WindowAppearance::Dark),
+        (ThemeMode::System, WindowAppearance::Dark),
+    ] {
+        apply_theme(&panel, visual, mode, appearance);
+        for width in [240., 320., 360.] {
+            visual.simulate_resize(size(px(width), px(700.)));
+            draw(visual);
+            let picker = visual
+                .debug_bounds("rr-agent-picker")
+                .expect("launcher selector rendered");
+            let start = button_bounds(visual, "agents-launcher-start");
+            let refresh = button_bounds(visual, "agents-history-refresh");
+            let current = button_bounds(visual, "agents-history-current");
+            let all = button_bounds(visual, "agents-history-all");
+            assert!(
+                picker.right() <= start.left() + px(0.5) && start.right() <= px(width) + px(0.5),
+                "launcher controls overlap or escape {width}: {picker:?} {start:?}"
+            );
+            assert!(
+                refresh.right() <= current.left() + px(0.5)
+                    && current.right() <= all.left() + px(0.5)
+                    && all.right() <= px(width) + px(0.5),
+                "history controls overlap or escape {width}: {refresh:?} {current:?} {all:?}"
+            );
+            visual.update(|window, _| {
+                let id: ElementId = "agents-launcher-start".into();
+                let start = gpui_kit::base::test_support::find(window, &[], &id)
+                    .expect("launcher start accessible node");
+                assert!(matches!(start.label(), Some("启动 Agent" | "Start Agent")));
+            });
+        }
+    }
+}

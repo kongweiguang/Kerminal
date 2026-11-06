@@ -349,24 +349,40 @@ fn pagination_is_hidden_until_more_than_one_page_exists() {
     assert!(super::pagination_visible(PAGE_SIZE + 1, PAGE_SIZE));
 }
 
-/// 高度增长必须增加可见命令；临界高度需包含边框、标题和分页栏，避免末行裁切。
+/// 分页容量始终与实际绘制的密度及 rem 保持一致，临界高度必须容纳完整末行。
 ///
 /// @author kongweiguang
 #[test]
 fn logs_capacity_uses_card_height_and_reserves_pagination_only_when_needed() {
-    use super::{HISTORY_HEADER_HEIGHT, HISTORY_PAGINATION_HEIGHT, HISTORY_ROW_HEIGHT};
-    let eight_rows = 2. + HISTORY_HEADER_HEIGHT + HISTORY_ROW_HEIGHT * 8.;
-    assert_eq!(super::history_page_size(eight_rows, 8), 8);
-    assert_eq!(super::history_page_size(eight_rows, 24), 7);
-    let paged_eight_rows = eight_rows + HISTORY_PAGINATION_HEIGHT;
-    assert_eq!(super::history_page_size(paged_eight_rows, 24), 8);
-    assert_eq!(super::history_page_size(paged_eight_rows - 0.5, 24), 7);
-    assert_eq!(
-        super::history_page_size(paged_eight_rows + HISTORY_ROW_HEIGHT * 8., 24),
-        16
-    );
-    assert_eq!(super::history_page_size(0., 24), 1);
-    assert_eq!(super::history_page_size(100_000., 100), 100);
+    use crate::theme::UiMetrics;
+    use gpui_kit::px;
+    use kerminal_application::preferences::InterfaceDensity;
+
+    for (density, rem) in [
+        (InterfaceDensity::Compact, 16.),
+        (InterfaceDensity::Compact, 24.),
+        (InterfaceDensity::Comfortable, 16.),
+        (InterfaceDensity::Spacious, 20.),
+    ] {
+        let geometry = super::HistoryGeometry::from_metrics(UiMetrics::resolve(density, px(rem)));
+        let row = geometry.row_height.as_f32();
+        let header = geometry.header_height.as_f32();
+        let pagination = geometry.pagination_height.as_f32();
+        let eight_rows = 2. + header + row * 8.;
+        assert_eq!(super::history_page_size(eight_rows, 8, geometry), 8);
+        let paged_eight_rows = eight_rows + pagination;
+        assert_eq!(super::history_page_size(paged_eight_rows, 24, geometry), 8);
+        assert_eq!(
+            super::history_page_size(paged_eight_rows - 0.5, 24, geometry),
+            7
+        );
+        assert_eq!(
+            super::history_page_size(paged_eight_rows + row * 8., 24, geometry),
+            16
+        );
+        assert_eq!(super::history_page_size(0., 24, geometry), 1);
+        assert_eq!(super::history_page_size(100_000., 100, geometry), 100);
+    }
 }
 
 /// 动态分页在窗口缩放、删除和空结果时仍覆盖真实末页，不遗失或重复划分记录。

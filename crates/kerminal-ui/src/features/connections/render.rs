@@ -161,6 +161,7 @@ impl Render for ConnectionsPanel {
                 self.pending_trust.as_ref(),
                 self.recovery.mode,
                 theme,
+                window,
                 cx,
             ))
             .children(render_external_password_prompt(self, theme, cx))
@@ -678,17 +679,17 @@ fn deletion_confirmation_overlay(
         .absolute()
         .inset_0()
         .occlude()
-        .p_4()
+        .p(theme.metrics.panel_padding)
         .flex()
         .items_center()
         .justify_center()
-        .bg(theme.background.opacity(0.8))
+        .bg(theme.dialog_scrim)
         .when_some(dismiss, |overlay, dismiss| overlay.on_click(dismiss))
         .child(
             div()
                 .id(card_debug_id)
                 .debug_selector(move || card_debug_id.to_owned())
-                .w(px(480.))
+                .w(rems(30.0))
                 .max_w_full()
                 .max_h_full()
                 .overflow_y_scroll()
@@ -704,6 +705,7 @@ fn deletion_confirmation_overlay(
 }
 
 /// 删除分组只确认一次；组内主机由后端在同一事务中统一归入未分组，界面不再提供迁移目标。
+/// @author kongweiguang
 fn render_group_deletion_confirmation(
     panel: &mut ConnectionsPanel,
     theme: ThemeTokens,
@@ -737,7 +739,7 @@ fn render_group_deletion_confirmation(
     let card = div()
         .id("connections-delete-group-confirmation")
         .w_full()
-        .p_5()
+        .p(theme.metrics.dialog_padding)
         .flex()
         .flex_col()
         .gap_3()
@@ -757,11 +759,8 @@ fn render_group_deletion_confirmation(
                 .child(consequence),
         )
         .child(
-            div()
+            crate::ui_surface::dialog_actions(theme)
                 .w_full()
-                .flex()
-                .justify_end()
-                .gap_2()
                 .child(
                     Button::new("connections-delete-group-cancel")
                         .compact()
@@ -793,6 +792,7 @@ fn render_group_deletion_confirmation(
 }
 
 /// 删除主机前确认精确名称和配置后果；凭据是否可清理由回执单独说明。
+/// @author kongweiguang
 fn render_host_deletion_confirmation(
     panel: &mut ConnectionsPanel,
     host: &ManagedHost,
@@ -802,7 +802,7 @@ fn render_host_deletion_confirmation(
     let card = div()
         .id("connections-delete-host-confirmation")
         .w_full()
-        .p_5()
+        .p(theme.metrics.dialog_padding)
         .flex()
         .flex_col()
         .gap_3()
@@ -825,11 +825,8 @@ fn render_host_deletion_confirmation(
                 )),
         )
         .child(
-            div()
+            crate::ui_surface::dialog_actions(theme)
                 .w_full()
-                .flex()
-                .justify_end()
-                .gap_2()
                 .child(
                     Button::new("connections-delete-host-cancel")
                         .compact()
@@ -901,7 +898,7 @@ fn render_local_host_deletion_confirmation(
     let card = div()
         .id("connections-delete-local-host-confirmation")
         .w_full()
-        .p_5()
+        .p(theme.metrics.dialog_padding)
         .flex()
         .flex_col()
         .gap_3()
@@ -933,7 +930,7 @@ fn render_local_host_deletion_confirmation(
                 .child(detail),
         );
 
-    let mut actions = div().w_full().flex().justify_end().gap_2().child(
+    let mut actions = crate::ui_surface::dialog_actions(theme).w_full().child(
         Button::new("connections-delete-local-host-cancel")
             .compact()
             .ghost()

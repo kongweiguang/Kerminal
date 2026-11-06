@@ -4,9 +4,38 @@
 
 use super::{
     CUSTOMIZABLE_TOOLS, LegacyContextSettings, ToolRailSections, customizable_settings,
-    move_before_in_sections, move_to_section_end, split_sections,
+    customizer_list_max_height, move_before_in_sections, move_to_section_end, split_sections,
 };
-use kerminal_application::preferences::{ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId};
+use crate::theme::UiMetrics;
+use gpui_kit::px;
+use kerminal_application::preferences::{
+    InterfaceDensity, ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId,
+};
+
+/// 小窗口或放大字号时仍留出可滚动的内容槽，且列表高度不能超过实际视口。
+///
+/// @author kongweiguang
+#[test]
+fn customizer_list_stays_reachable_at_supported_zoom_and_density() {
+    for density in [
+        InterfaceDensity::Compact,
+        InterfaceDensity::Comfortable,
+        InterfaceDensity::Spacious,
+    ] {
+        for rem in [16., 20., 24., 32.] {
+            let metrics = UiMetrics::resolve(density, px(rem));
+            for viewport in [600., 760., 900.] {
+                let height = customizer_list_max_height(px(viewport), metrics);
+                assert!(
+                    height > px(0.),
+                    "{density:?}, rem={rem}, viewport={viewport}"
+                );
+                assert!(height <= px(viewport));
+                assert!(height >= metrics.row_height.min(px(viewport / 3.)));
+            }
+        }
+    }
+}
 
 /// 退役 Context 只保留原配置位置，不进入本次八项编辑器的可见分区。
 #[test]

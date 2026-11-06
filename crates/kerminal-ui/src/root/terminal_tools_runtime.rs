@@ -10,10 +10,16 @@ use std::sync::{
 
 use gpui_kit::{App, Context, Entity, EntityId, Task, Window};
 use kerminal_application::{
-    AppError,
-    sessions::{UiTerminalSearchCommitGate, UiTerminalSearchRequest, UiTerminalSearchViewport},
+    AppError, PublicErrorCode,
+    sessions::{
+        UiSessionBinding, UiTerminalSearchCommitGate, UiTerminalSearchRequest,
+        UiTerminalSearchViewport,
+    },
 };
-use kerminal_domain::identity::{PaneId, SessionId};
+use kerminal_domain::{
+    identity::{PaneId, SessionId},
+    sessions::SessionOwner,
+};
 use kerminal_terminal::snapshot::{SelectionViewport, TerminalSearchRequest, TerminalSelection};
 use tokio_util::sync::CancellationToken;
 
@@ -989,7 +995,38 @@ impl RootView {
                         && error.public_code()
                             != kerminal_application::PublicErrorCode::Cancelled
                     {
-                        root.status = Some(error.public_message().into());
+                        let (generation_race, needs_binding_reconcile) =
+                            match (&callback_owner.scope, &callback_binding.owner) {
+                                (
+                                    TerminalToolsOwnerScope::Workspace { pane_id, .. },
+                                    SessionOwner::Ui { .. },
+                                ) if root
+                                    .workspace_runtime
+                                    .session_for_pane(pane_id)
+                                    == Some(&session_id) =>
+                                {
+                                    let reconnect_in_flight = root
+                                        .session_action_projection(pane_id)
+                                        .is_some_and(|action| action.busy);
+                                    let current_binding =
+                                        root.terminal_view_bindings.get(&session_id);
+                                    let race = selection_conflict_is_generation_race(
+                                        error.public_code(),
+                                        &callback_binding,
+                                        current_binding,
+                                        reconnect_in_flight,
+                                    );
+                                    (
+                                        race,
+                                        race && !reconnect_in_flight
+                                            && current_binding != Some(&callback_binding),
+                                    )
+                                }
+                                _ => (false, false),
+                            };
+                        if !generation_race {
+                            root.status = Some(error.public_message().into());
+                        }
                         if let Some(gesture_id) = gesture_id {
                             root.terminal_tools_runtime
                                 .cancel_selection_gesture(&callback_owner, gesture_id);
@@ -999,6 +1036,21 @@ impl RootView {
                         } else {
                             root.terminal_tools_runtime
                                 .cancel(&callback_owner, TerminalToolsRequestKind::Selection);
+                        }
+                        if needs_binding_reconcile
+                            && let SessionOwner::Ui { tab_id, pane_id } = &callback_binding.owner
+                            && let TerminalToolsOwnerScope::Workspace {
+                                pane_id: owner_pane_id,
+                                ..
+                            } = &callback_owner.scope
+                            && owner_pane_id == pane_id
+                        {
+                            root.request_snapshot_binding_reconcile(
+                                tab_id.clone(),
+                                pane_id.clone(),
+                                session_id.clone(),
+                                cx,
+                            );
                         }
                         if gesture_id.is_some()
                             && matches!(
@@ -1198,6 +1250,29 @@ impl RootView {
                 .terminal_snapshot_for_binding(binding)
                 .is_some_and(|snapshot| snapshot.selection.is_some())
     }
+}
+
+/// 区分重连换代与真实选区冲突：旧 binding 被撤销或已换成同会话新代次时不应提示用户重拖。
+///
+/// 调用方仍需先确认 pane/session 仍属于当前工作区；同一 generation 且绑定未变化的
+/// `Conflict` 必须保留，避免把真实并发失败静默吞掉。
+///
+/// @author kongweiguang
+fn selection_conflict_is_generation_race(
+    error_code: PublicErrorCode,
+    callback_binding: &UiSessionBinding,
+    current_binding: Option<&UiSessionBinding>,
+    reconnect_in_flight: bool,
+) -> bool {
+    if error_code != PublicErrorCode::Conflict {
+        return false;
+    }
+    reconnect_in_flight
+        || current_binding.is_none_or(|current| {
+            current.session_id == callback_binding.session_id
+                && current.owner == callback_binding.owner
+                && current.session_generation != callback_binding.session_generation
+        })
 }
 
 /// Copy 必须等最后一次选择更新经 service 接受；取消或失效时拒绝读取旧 selection。

@@ -16,6 +16,25 @@ use kerminal_domain::{
 use crate::features::quick_open::model::workspace_entries;
 use crate::features::quick_open::{QuickOpenEntry, QuickOpenSelection};
 
+/// 窄窗口与放大字号都必须给浮层留出边距；搜索结果不能挤掉关闭前需要阅读的反馈区域。
+///
+/// @author kongweiguang
+#[test]
+fn quick_open_layout_stays_in_viewport_when_text_is_enlarged() {
+    use crate::features::quick_open::view::quick_open_layout;
+    use gpui_kit::{px, size};
+
+    for (width, height) in [(800., 600.), (1020., 760.), (1440., 900.)] {
+        for rem in [16., 20., 24.] {
+            let layout = quick_open_layout(size(px(width), px(height)), px(rem));
+            assert!(layout.width <= px(width - rem * 2.));
+            assert!(layout.top + layout.height <= px(height - rem));
+            assert!(layout.list_height <= layout.height - px(rem * 7.5));
+            assert!(layout.list_height > px(0.));
+        }
+    }
+}
+
 /// 命令历史只能作为安全的单行草稿插入，字符数与 UTF-8 字节数均受限。
 #[test]
 fn history_insertability_rejects_controls_and_unbounded_text() {

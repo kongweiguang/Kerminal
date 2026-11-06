@@ -308,10 +308,13 @@ impl CommandsView {
         cx.notify();
     }
 
-    /// 执行前确认作为步骤定义属性保存，风险操作的交互策略不依赖命令文本约定。
-    pub(super) fn toggle_workflow_step_confirmation(
+    /// 采用控件请求的明确值更新步骤，避免重绘或重复事件反转用户已经选择的状态。
+    ///
+    /// @author kongweiguang
+    pub(super) fn set_workflow_step_confirmation(
         &mut self,
         index: usize,
+        checked: bool,
         cx: &mut Context<Self>,
     ) {
         if self.workflow_editor_locked() {
@@ -320,8 +323,10 @@ impl CommandsView {
         let Some(step) = self.workflow_steps.get_mut(index) else {
             return;
         };
-        step.definition.requires_confirmation = !step.definition.requires_confirmation;
-        cx.notify();
+        if step.definition.requires_confirmation != checked {
+            step.definition.requires_confirmation = checked;
+            cx.notify();
+        }
     }
 
     /// 按 ID 请求打开工作流并切入详情层；异步读取仍由编辑器代次保护。

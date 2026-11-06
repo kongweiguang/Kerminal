@@ -21,7 +21,7 @@ use crate::theme::ThemeTokens;
 
 impl PreferencesPanel {
     /// 监听草稿与真实连接信息分别呈现，避免把下次启动的端口显示为已生效。
-    /// 分组行使用同一对齐与控件尺寸；草稿说明不冒充运行状态，窄窗允许整组换行。
+    /// 分组行使用共享密度与控件尺寸；草稿说明不冒充运行状态，窄窗允许整组换行。
     pub(super) fn render_mcp_settings(
         &mut self,
         theme: ThemeTokens,
@@ -156,6 +156,7 @@ impl PreferencesPanel {
         let heading = div()
             .w_full()
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap_3()
@@ -166,7 +167,7 @@ impl PreferencesPanel {
                     .gap_2()
                     .child(
                         Icon::new(IconName::Server)
-                            .size(px(16.))
+                            .size(theme.metrics.icon_size)
                             .text_color(theme.accent),
                     )
                     .child(
@@ -188,7 +189,7 @@ impl PreferencesPanel {
                             } else {
                                 IconName::Power
                             })
-                            .size(px(16.)),
+                            .size(theme.metrics.icon_size),
                         )
                         .label(toggle_label)
                         .loading(busy)
@@ -377,7 +378,7 @@ impl PreferencesPanel {
                 Button::new("mcp-connection-info-toggle")
                     .custom(super::render_settings::settings_ghost_variant(theme, cx))
                     .w_full()
-                    .h(px(44.))
+                    .h(theme.metrics.toolbar_height)
                     .toggled(self.connectivity.mcp_connection_expanded)
                     .accessibility_label(crate::locale::text("连接信息", "Connection information"))
                     .child(
@@ -392,7 +393,7 @@ impl PreferencesPanel {
                                 } else {
                                     IconName::ChevronRight
                                 })
-                                .size(px(16.))
+                                .size(theme.metrics.icon_size)
                                 .text_color(theme.muted),
                             )
                             .child(crate::locale::text("连接信息", "Connection information")),
@@ -485,6 +486,8 @@ impl PreferencesPanel {
                                             .compact()
                                             .ghost()
                                             .icon(IconName::RefreshCw)
+                                            .loading(self.mcp_settings.addresses_loading)
+                                            .disabled(self.mcp_settings.addresses_loading)
                                             .label(crate::locale::text("重新读取", "Reload"))
                                             .on_click(cx.listener(
                                                 |panel, _: &ClickEvent, _, cx| {
@@ -536,7 +539,7 @@ impl PreferencesPanel {
                                     } else {
                                         IconName::Copy
                                     })
-                                    .size(px(14.)),
+                                    .size(theme.metrics.icon_size),
                                 )
                                 .label(if self.connectivity.mcp_copied {
                                     crate::locale::text("已复制", "Copied")
@@ -606,7 +609,7 @@ impl PreferencesPanel {
             .child(
                 div()
                     .w_full()
-                    .p_4()
+                    .p(theme.metrics.panel_padding)
                     .flex()
                     .flex_col()
                     .gap_4()

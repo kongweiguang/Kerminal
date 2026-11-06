@@ -1,4 +1,4 @@
-//! 冲突预检计数只处理已读取目标快照，不接触真实文件系统。
+//! 冲突预检保留真实目标与冻结计划，不接触真实文件系统。
 //!
 //! @author kongweiguang
 
@@ -83,6 +83,66 @@ fn quiet_submission_and_cancel_preserve_existing_failure(app: &mut TestAppContex
     let _runtime = fixture.runtime;
 }
 
+/// 来源切换只撤销未受理准备；已开始受理的批次保留原来源关闭屏障，不因右栏换绑而丢失入口。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn switching_origin_does_not_reassign_an_enqueuing_batch(app: &mut TestAppContext) {
+    use kerminal_domain::{
+        files::TransferTask,
+        identity::{PaneId, TransferId},
+    };
+
+    let directory = support::remote_endpoint(&HostId::new(), "/srv/target");
+    let request = pending_conflict(directory.clone(), 7)
+        .plan
+        .items
+        .remove(0)
+        .request;
+    let old_row = TransferTask::queued(TransferId::new(), request)
+        .unwrap()
+        .summary();
+    let fixture = support::entity_fixture(app, directory, |_| {});
+    let original = TransferOrigin::TerminalPane(PaneId::new());
+    let next = TransferOrigin::TerminalPane(PaneId::new());
+    app.update(|cx| {
+        fixture.pane.update(cx, |pane, cx| {
+            pane.set_transfer_origin(Some(original.clone()), cx);
+            assert!(pane.begin_transfer_submission(cx));
+            let submission = pane.transfer_submission.as_mut().unwrap();
+            submission.phase = TransferSubmissionPhase::Enqueuing;
+            let cancellation = submission.cancellation.clone();
+            pane.transfer_rows.push(old_row.clone());
+            pane.all_transfer_rows.push(old_row.clone());
+            pane.set_transfer_origin(Some(next.clone()), cx);
+            let submission = pane.transfer_submission.as_ref().unwrap();
+            assert_eq!(submission.origin, original);
+            assert_eq!(pane.transfer_origin.as_ref(), Some(&next));
+            assert!(pane.transfer_rows.is_empty());
+            assert_eq!(pane.all_transfer_rows.len(), 1);
+            assert!(!cancellation.is_cancelled());
+            assert!(pane.transfer_enqueue_in_progress());
+            assert!(pane.transfer_enqueue_in_progress_for_origin(&original));
+            assert!(!pane.transfer_enqueue_in_progress_for_origin(&next));
+            pane.end_transfer_submission();
+            assert!(!pane.transfer_enqueue_in_progress_for_origin(&original));
+
+            pane.set_transfer_origin(Some(original.clone()), cx);
+            assert!(pane.begin_transfer_submission(cx));
+            let preparation = pane
+                .transfer_submission
+                .as_ref()
+                .unwrap()
+                .cancellation
+                .clone();
+            pane.set_transfer_origin(Some(next.clone()), cx);
+            assert!(preparation.is_cancelled());
+            assert!(pane.transfer_submission.is_none());
+        });
+    });
+    let _runtime = fixture.runtime;
+}
+
 /// 让状态测试共享同一冻结目标和单项请求，避免因测试夹具差异掩盖代次门禁。
 ///
 /// @author kongweiguang
@@ -118,7 +178,10 @@ fn pending_conflict(endpoint: FileEndpoint, generation: u64) -> PendingTransferC
                 generation,
             },
         },
-        conflict_count: 1,
+        conflicts: vec![TransferConflict {
+            item_index: 0,
+            kind: TransferConflictKind::Existing,
+        }],
     }
 }
 
@@ -130,47 +193,66 @@ fn seed_submission(pane: &mut FilesPane) {
     pane.transfer_submission_generation = 1;
     pane.transfer_submission = Some(TransferSubmission {
         generation: 1,
+        origin: pane.transfer_origin.clone().expect("fixture has an origin"),
         cancellation: CancellationToken::new(),
         related_sides: [true, true],
         phase: TransferSubmissionPhase::Preparing,
     });
 }
 
-/// 唯一的不存在目标不应触发决策弹框。
+/// 唯一的不存在目标不应触发决策弹框，也不能被列为冲突对象。
+///
+/// @author kongweiguang
 #[test]
 fn absent_unique_target_is_not_a_conflict() {
     let target = FileEndpoint::Local {
         path: PathBuf::from("target/new-file.txt"),
     };
 
-    assert_eq!(
-        count_existing_transfer_conflicts(&[target], &HashSet::new()),
-        0
-    );
+    assert!(existing_transfer_conflicts(&[(0, target)], &HashSet::new()).is_empty());
 }
 
-/// 已存在目标的每个请求都冲突；不存在目标的同名后续请求也必须先进入策略选择。
+/// 混合批次只返回真实冲突项，既有目标与批次内重名必须区分且保留原请求索引。
+///
+/// @author kongweiguang
 #[test]
-fn counts_existing_and_repeated_targets() {
+fn identifies_existing_and_repeated_targets_without_including_new_items() {
     let existing_target = FileEndpoint::Local {
         path: PathBuf::from("target/existing.txt"),
     };
     let repeated_target = FileEndpoint::Local {
         path: PathBuf::from("target/new.txt"),
     };
+    let unique_target = FileEndpoint::Local {
+        path: PathBuf::from("target/unique.txt"),
+    };
     let existing = HashSet::from([existing_target.clone()]);
 
     assert_eq!(
-        count_existing_transfer_conflicts(
+        existing_transfer_conflicts(
             &[
-                existing_target.clone(),
-                existing_target,
-                repeated_target.clone(),
-                repeated_target,
+                (0, unique_target),
+                (1, existing_target.clone()),
+                (2, repeated_target.clone()),
+                (3, repeated_target),
+                (4, existing_target),
             ],
             &existing,
         ),
-        3
+        vec![
+            TransferConflict {
+                item_index: 1,
+                kind: TransferConflictKind::Existing,
+            },
+            TransferConflict {
+                item_index: 3,
+                kind: TransferConflictKind::Repeated,
+            },
+            TransferConflict {
+                item_index: 4,
+                kind: TransferConflictKind::Existing,
+            },
+        ]
     );
 }
 
@@ -214,7 +296,7 @@ fn stale_target_generation_rejects_conflict_resolution(app: &mut TestAppContext)
     let _runtime = fixture.runtime;
 }
 
-/// 关闭冲突决策静默丢弃未提交批次并释放 busy；下次传输仍使用原队列默认策略。
+/// 冲突展示引用冻结计划的准确对象；取消时整批不入队，下次仍使用原队列默认策略。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]
@@ -226,17 +308,60 @@ fn cancel_conflict_releases_busy_without_changing_default_policy(app: &mut TestA
         support::seed_listing(pane, 1, 4, Vec::new());
         pane.queue.conflict_policy = ConflictPolicy::Overwrite;
         seed_submission(pane);
-        pane.pending_transfer_conflict = Some(pending_conflict(seeded_directory, 4));
+        let mut pending = pending_conflict(seeded_directory, 4);
+        let mut nonconflicting_request = pending.plan.items[0].request.clone();
+        nonconflicting_request.source = support::remote_endpoint(&HostId::new(), "/source/new.txt");
+        nonconflicting_request.destination =
+            child_endpoint(&pending.plan.target.endpoint, "new.txt").expect("new destination");
+        pending.plan.items.insert(
+            0,
+            TransferEnqueueItem {
+                name: "new.txt".to_owned(),
+                request: nonconflicting_request,
+                external_target_lease: None,
+            },
+        );
+        let mut second_conflict = pending.plan.items[1].request.clone();
+        second_conflict.source = support::remote_endpoint(&HostId::new(), "/source/other.txt");
+        second_conflict.destination =
+            child_endpoint(&pending.plan.target.endpoint, "other.txt").expect("other destination");
+        pending.plan.items.push(TransferEnqueueItem {
+            name: "other.txt".to_owned(),
+            request: second_conflict,
+            external_target_lease: None,
+        });
+        pending.plan.total = 3;
+        pending.conflicts[0].item_index = 1;
+        pending.conflicts.push(TransferConflict {
+            item_index: 2,
+            kind: TransferConflictKind::Existing,
+        });
+        pane.pending_transfer_conflict = Some(pending);
     });
     let pane = fixture.pane.clone();
 
     app.update(|cx| {
-        pane.update(cx, |pane, cx| pane.cancel_transfer_conflict(cx));
+        pane.update(cx, |pane, cx| {
+            let pending = pane
+                .pending_transfer_conflict
+                .as_ref()
+                .expect("pending batch");
+            let projected = pending.conflict_items().collect::<Vec<_>>();
+            assert_eq!(pending.plan.items.len(), 3);
+            assert_eq!(projected.len(), 2);
+            assert_eq!(projected[0].0, &pending.plan.items[1].request);
+            assert_eq!(projected[0].1, TransferConflictKind::Existing);
+            assert_eq!(projected[1].0, &pending.plan.items[2].request);
+            assert_eq!(projected[1].1, TransferConflictKind::Existing);
+            assert_eq!(pending.plan.items[0].name, "new.txt");
+            pane.cancel_transfer_conflict(cx);
+        });
     });
     app.update(|cx| {
         pane.read_with(cx, |pane, _| {
             assert!(!pane.transfer_submission_busy);
             assert!(pane.pending_transfer_conflict.is_none());
+            assert!(pane.transfer_rows.is_empty());
             assert_eq!(pane.queue.conflict_policy, ConflictPolicy::Overwrite);
             assert!(pane.status.is_none());
         });

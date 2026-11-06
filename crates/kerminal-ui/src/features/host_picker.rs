@@ -10,8 +10,10 @@ use gpui_kit::{
     assets::IconName,
     base::{Selectable, TestSupportExt},
     component::{
+        Sizable as _,
         input::{Enter, Input, InputState},
         popover::{Popover, PopoverState},
+        spinner::Spinner,
     },
     div,
     prelude::*,
@@ -238,7 +240,7 @@ impl<T: Clone + 'static> HostPickerList<T> {
 /// 结果列表与外置搜索框共用过滤和分组顺序，避免键盘选中与可见结果错位。
 ///
 /// @author kongweiguang
-fn grouped_host_picker_options<T: Clone>(
+pub(crate) fn grouped_host_picker_options<T: Clone>(
     all_options: &[HostPickerOption<T>],
     groups: &[HostPickerGroup],
     query: &str,
@@ -380,6 +382,7 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
     /// 按活动应用主题渲染紧凑列表；缺省投影也保留用户色板，不从系统外观重建默认配色。
     /// 捕获阶段先处理方向键与回车，避免输入控件的按键处理抢走列表导航。
     /// 行的可访问选中状态与高亮样式共用同一状态，供辅助技术和绘制回归读取。
+    /// 已有候选刷新时将忙态留在搜索槽位，避免插入状态行改变键盘滚动索引与可见位置。
     ///
     /// @author kongweiguang
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -392,6 +395,15 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
             .flat_map(|(_, _, options)| options.iter())
             .cloned()
             .collect::<Vec<_>>();
+        let loading = matches!(
+            self.message.as_ref(),
+            Some(HostPickerListMessage::Loading(_))
+        );
+        let inline_loading = loading
+            && !self.external_search_input
+            && self.search_input.is_some()
+            && !visible_options.is_empty();
+        let has_message = self.message.is_some() && !inline_loading;
         let keyboard_state = self.keyboard_state.clone().unwrap_or_else(|| {
             window.use_keyed_state(format!("{}-keyboard-state", self.id), cx, |_, _| {
                 HostPickerListKeyboardState::default()
@@ -409,7 +421,7 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
             .map(ToOwned::to_owned)
             .or_else(|| visible_options.first().map(|option| option.key.to_string()));
         let key_options = visible_options.clone();
-        let mut list_child_index = if self.message.is_some() { 1 } else { 0 };
+        let mut list_child_index = usize::from(has_message);
         let mut key_scroll_indices = Vec::with_capacity(visible_options.len());
         for (_, _, options) in &grouped {
             list_child_index += 1; // 每个真实分组标题也是滚动容器的直接子项。
@@ -522,32 +534,54 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
         if !self.external_search_input
             && let Some(search_input) = self.search_input
         {
+            let reduce_motion = cx.reduce_motion();
             panel = panel.child(
                 div()
                     .id(format!("{}-search", self.id))
                     .w_full()
-                    .h(px(36.))
+                    .h(theme.metrics.control_height)
                     .mb_2()
                     .px_2()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .rounded_md()
+                    .rounded(theme.control_radius)
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.background)
                     .text_color(theme.muted)
-                    .child(IconName::Search)
+                    .child(
+                        div()
+                            .size(theme.metrics.icon_size)
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(!loading, |slot| slot.child(IconName::Search))
+                            .when(loading && reduce_motion, |slot| {
+                                slot.child(IconName::LoaderCircle)
+                            })
+                            .when(loading && !reduce_motion, |slot| {
+                                slot.child(Spinner::new().small().color(theme.muted))
+                            }),
+                    )
                     .child(
                         Input::new(&search_input)
                             .appearance(false)
-                            .aria_label(crate::locale::text(
-                                "搜索主机名称、协议、地址或分组",
-                                "Search host names, protocols, addresses, or groups",
-                            ))
+                            .aria_label(if loading {
+                                crate::locale::text(
+                                    "搜索主机名称、协议、地址或分组；正在加载主机",
+                                    "Search host names, protocols, addresses, or groups; loading hosts",
+                                )
+                            } else {
+                                crate::locale::text(
+                                    "搜索主机名称、协议、地址或分组",
+                                    "Search host names, protocols, addresses, or groups",
+                                )
+                            })
                             .flex_1()
                             .min_w(px(0.))
-                            .h(px(32.))
+                            .h((theme.metrics.control_height - window.rem_size() * 0.25).max(px(0.)))
                             .text_size(theme.text_sm),
                     ),
             );
@@ -566,15 +600,12 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
             .aria_label(crate::locale::text("主机列表", "Host list"))
             .aria_keyshortcuts("ArrowUp ArrowDown Enter")
             .track_scroll(&keyboard_state.read(cx).scroll);
-        let has_message = self.message.is_some();
-        if let Some(message) = self.message {
+        if has_message && let Some(message) = self.message {
             let (icon, label, color) = match message {
                 HostPickerListMessage::Loading(label) => {
                     (IconName::LoaderCircle, label, theme.muted)
                 }
-                HostPickerListMessage::Error(label) => {
-                    (IconName::CircleAlert, label, theme.warning)
-                }
+                HostPickerListMessage::Error(label) => (IconName::CircleAlert, label, theme.error),
                 HostPickerListMessage::Empty(label) => (IconName::Search, label, theme.muted),
             };
             list = list.child(
@@ -668,18 +699,23 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
                         .debug_selector(move || option_debug_selector.clone())
                         .w_full()
                         .min_w(px(0.))
-                        .min_h(px(46.))
+                        .min_h(theme.metrics.row_height + window.rem_size() * 0.875)
                         .px_2()
                         .py_1()
                         .flex()
                         .items_center()
                         .gap_2()
-                        .rounded_md()
+                        .rounded(theme.control_radius)
                         .border_1()
-                        .border_color(gpui_kit::hsla(0.0, 0.0, 0.0, 0.0))
+                        .border_color(theme.panel.alpha(0.))
                         .bg(theme.panel)
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme.hover).border_color(theme.border))
+                        .hover(move |style| {
+                            style.bg(if is_active {
+                                theme.surface_selected()
+                            } else {
+                                theme.surface_hover()
+                            })
+                        })
                         .role(gpui_kit::Role::ListItem)
                         .aria_label(accessible)
                         .aria_selected(is_active)
@@ -691,9 +727,7 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
                             });
                             click_select(target.clone(), window, cx);
                         })
-                        .when(is_active, |row| {
-                            row.border_color(theme.accent).bg(theme.hover)
-                        })
+                        .when(is_active, |row| row.bg(theme.surface_selected()))
                         .child(description)
                         .child(
                             div()

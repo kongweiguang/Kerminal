@@ -237,6 +237,39 @@ impl WorkspaceRuntime {
         })
     }
 
+    /// 重连可能保留 SessionId，因此必须同时撤销旧快照票据与目录基线；旧帧仍供视觉过渡。
+    /// 仅接受明确的当前 pane/session，避免迟到生命周期事件清空替代会话的目录。
+    ///
+    /// @author kongweiguang
+    pub fn invalidate_session_snapshot(
+        &mut self,
+        pane_id: &PaneId,
+        session_id: &SessionId,
+    ) -> Result<bool, WorkspaceRuntimeError> {
+        let pane = self
+            .panes
+            .get_mut(pane_id)
+            .ok_or(WorkspaceRuntimeError::PaneMissing)?;
+        if pane.phase != RuntimePanePhase::Ready || pane.session_id.as_ref() != Some(session_id) {
+            return Ok(false);
+        }
+        pane.snapshot_gate.reset_for_session_change();
+        pane.current_working_directory = None;
+        pane.snapshot_in_flight = None;
+        pane.snapshot_dirty = true;
+        Ok(true)
+    }
+
+    /// 左键继承只使用本代已确认的元数据；首帧明确无目录时仍允许调用方使用启动参数。
+    /// 不以 dirty 或 resize 作为门禁，避免持续输出和普通窗口调整打断一键分屏。
+    ///
+    /// @author kongweiguang
+    pub fn pane_directory_is_current(&self, pane_id: &PaneId) -> bool {
+        self.panes.get(pane_id).is_some_and(|pane| {
+            pane.phase == RuntimePanePhase::Ready && pane.snapshot_gate.has_accepted_snapshot()
+        })
+    }
+
     /// 视口滚动与绝对跳转开始前撤销在途绘制代次，避免旧视口快照短暂覆盖新引擎视口。
     ///
     /// @author kongweiguang
@@ -586,7 +619,7 @@ impl WorkspaceRuntime {
     }
 
     /// 绑定真实 session 时清掉上个实例的目录缓存，防止复用 PaneId 把旧目录投给新连接。
-    /// 重试保留原 PaneId，但禁止重复 session 占用。
+    /// 重试保留原 PaneId，但禁止重复 session 占用；新会话不沿用旧快照增量基线。
     ///
     /// @author kongweiguang
     pub fn install_session(
@@ -621,7 +654,7 @@ impl WorkspaceRuntime {
         pane.status = None;
         pane.last_snapshot_error = false;
         pane.phase = RuntimePanePhase::Ready;
-        pane.snapshot_gate.invalidate();
+        pane.snapshot_gate.reset_for_session_change();
         pane.snapshot_in_flight = None;
         pane.snapshot_dirty = true;
         self.pane_by_session.insert(session_id, pane_id.clone());

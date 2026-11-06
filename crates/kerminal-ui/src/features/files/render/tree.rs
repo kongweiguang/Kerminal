@@ -302,6 +302,7 @@ fn render_tree_row(
 /// 默认行、选中和悬停均使用成对主题令牌；右键菜单与列表共用精简后的命令范围。
 /// 复选框整个命中区由 Kit Base 处理单次切换并隔离树行事件，指示器显式沿用文件面板主题。
 /// 展开箭头保留 Kit 的按下展开与聚焦，只阻断点击冒泡，避免同次操作再触发行的批量选择。
+/// 三类树行共用密度和 rem 投影，虚拟树按首行测量时不会发生高度偏移。
 ///
 /// @author kongweiguang
 fn render_entry_row(view: TreeEntryRowView<'_>) -> AnyElement {
@@ -359,8 +360,8 @@ fn render_entry_row(view: TreeEntryRowView<'_>) -> AnyElement {
             "files-tree-disclosure-{side}-{}",
             tree_entry.item().id
         ))
-        .w(px(14.))
-        .h(px(14.))
+        .w(theme.metrics.icon_size * (14. / 16.))
+        .h(theme.metrics.icon_size * (14. / 16.))
         .flex_shrink_0()
         .flex()
         .items_center()
@@ -371,15 +372,16 @@ fn render_entry_row(view: TreeEntryRowView<'_>) -> AnyElement {
             .child(disclosure)
             .on_click(|_, _, cx| cx.stop_propagation());
     }
-    let indent = px(8. + tree_entry.depth() as f32 * 14.);
+    let indent =
+        theme.metrics.gap + theme.metrics.icon_size * (tree_entry.depth() as f32 * 14. / 16.);
     let click_entity = pane_entity.clone();
     let click_entry = entry.clone();
     let checkbox_entity = pane_entity.clone();
     let checkbox_endpoint = endpoint.clone();
     let checkbox_id = format!("files-tree-checkbox-{side}-{}", tree_entry.item().id);
     let checkbox = Checkbox::new(checkbox_id)
-        .w(px(18.))
-        .h(px(22.))
+        .w(theme.metrics.icon_size * (18. / 16.))
+        .h(theme.metrics.icon_size * (22. / 16.))
         .flex_shrink_0()
         .flex()
         .items_center()
@@ -402,7 +404,7 @@ fn render_entry_row(view: TreeEntryRowView<'_>) -> AnyElement {
         .child(
             CheckboxIndicator::new()
                 .checked(selected)
-                .size(px(12.))
+                .size(theme.metrics.icon_size * (12. / 16.))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
@@ -426,7 +428,7 @@ fn render_entry_row(view: TreeEntryRowView<'_>) -> AnyElement {
         .id(format!("files-tree-row-{side}-{}", tree_entry.item().id))
         .debug_selector(move || row_debug_selector.clone())
         .w_full()
-        .h(px(30.))
+        .h(theme.metrics.row_height)
         .flex_shrink_0()
         .pl(indent)
         .pr_2()
@@ -452,7 +454,7 @@ fn render_entry_row(view: TreeEntryRowView<'_>) -> AnyElement {
         .child(disclosure_slot)
         .child(
             div()
-                .w(px(16.))
+                .w(theme.metrics.icon_size)
                 .flex_shrink_0()
                 .text_color(theme.accent)
                 .child(kind_icon),
@@ -539,7 +541,7 @@ fn render_entry_row(view: TreeEntryRowView<'_>) -> AnyElement {
     .into_any_element()
 }
 
-/// 失败目录行只提供明确重试；加载、未加载与空目录行保持不可交互。
+/// 失败目录行只提供明确重试，并与虚拟树的其他行保持同高。
 ///
 /// @author kongweiguang
 fn render_retry_row(
@@ -553,10 +555,11 @@ fn render_retry_row(
     let request_entity = pane_entity;
     div()
         .id(format!("files-tree-retry-{side}-{}", tree_entry.item().id))
+        .debug_selector(|| "files-tree-retry".into())
         .w_full()
-        .h(px(30.))
+        .h(theme.metrics.row_height)
         .flex_shrink_0()
-        .pl(px(8. + tree_entry.depth() as f32 * 14.))
+        .pl(theme.metrics.gap + theme.metrics.icon_size * (tree_entry.depth() as f32 * 14. / 16.))
         .pr_2()
         .flex()
         .items_center()
@@ -583,7 +586,7 @@ fn render_retry_row(
         .into_any_element()
 }
 
-/// 占位行保持树深度和状态文案，但不伪装成可操作文件。
+/// 占位行保持树深度、统一行高和状态文案，但不伪装成可操作文件。
 ///
 /// @author kongweiguang
 fn render_placeholder_row(tree_entry: &TreeEntry, theme: ThemeTokens) -> AnyElement {
@@ -597,10 +600,11 @@ fn render_placeholder_row(tree_entry: &TreeEntry, theme: ThemeTokens) -> AnyElem
         IconName::ChevronRight
     };
     div()
+        .debug_selector(|| "files-tree-placeholder".into())
         .w_full()
-        .h(px(28.))
+        .h(theme.metrics.row_height)
         .flex_shrink_0()
-        .pl(px(8. + tree_entry.depth() as f32 * 14.))
+        .pl(theme.metrics.gap + theme.metrics.icon_size * (tree_entry.depth() as f32 * 14. / 16.))
         .pr_2()
         .flex()
         .items_center()

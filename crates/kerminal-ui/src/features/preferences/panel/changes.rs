@@ -155,6 +155,7 @@ impl PreferencesPanel {
     }
 
     /// 保存期间错过的 watcher 事件在回执后 typed 读回；冲突先合并，未知结果先核实。
+    /// 最新读取单独投影忙态，较新的 watcher 仍可递增代次，不因界面防重丢掉外部变化。
     ///
     /// @author kongweiguang
     pub(super) fn spawn_settings_revision_check(&mut self, cx: &mut Context<Self>) {
@@ -166,6 +167,8 @@ impl PreferencesPanel {
             return;
         }
         let generation = self.begin_settings_revision_check();
+        self.settings_readback_running = true;
+        cx.notify();
         let service = self.preferences.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
@@ -179,22 +182,25 @@ impl PreferencesPanel {
         .detach();
     }
 
-    /// 每次重新打开设置时重试 unknown/conflict 的只读回读，不重放原写入或增加界面按钮。
+    /// 重新打开或显式核对时重试 unknown/conflict 的只读回读；阻止重复请求，绝不重放原写入。
     ///
     /// @author kongweiguang
-    pub(super) fn recover_pending_settings_on_open(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::features::preferences) fn recover_pending_settings_on_open(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
         let needs_readback = self
             .settings
             .as_ref()
             .is_some_and(|draft| needs_settings_recovery_readback(draft.status()));
-        if needs_readback {
+        if needs_readback && !self.settings_readback_running {
             self.spawn_settings_revision_check(cx);
         }
     }
 
     /// 外部快照按 baseline/local/remote 三方合并；MCP 独立提交也核对同 revision 回读，
     /// 普通设置的未知写入只在回读等于提交快照时确认，
-    /// 同 revision 的成功写入回声则续存保存期间已排队的后续编辑，丢弃的快照不能修改主题缓存。
+    /// 同 revision 的成功写入回声则续存保存期间已排队的后续编辑；只有最新回执释放读回忙态。
     ///
     /// @author kongweiguang
     fn finish_settings_revision_check(
@@ -210,6 +216,8 @@ impl PreferencesPanel {
         if generation != self.settings_load_generation {
             return;
         }
+        self.settings_readback_running = false;
+        cx.notify();
 
         if self.loading_settings && self.settings.is_some() {
             self.finish_settings_load(result, generation, window, cx);

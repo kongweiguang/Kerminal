@@ -109,3 +109,21 @@ fn workbench_palette_preserves_material_alpha_in_all_theme_modes() {
         }
     }
 }
+
+/// 无背景滤镜的平台必须遮住底层正文；同一共享令牌同时约束菜单、弹框和自由工具窗。
+///
+/// @author kongweiguang
+#[test]
+fn floating_surfaces_keep_content_readable_without_a_backdrop_filter() {
+    for appearance in [WindowAppearance::Light, WindowAppearance::Dark] {
+        for mode in [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System] {
+            let theme = ThemeTokens::for_mode(appearance, mode);
+            assert_eq!(theme.floating_surface, theme.tool_panel_floating_surface);
+            assert_eq!(theme.floating_surface, theme.context_menu_surface());
+            #[cfg(target_os = "windows")]
+            assert!((0.9..1.0).contains(&theme.floating_surface.a));
+            #[cfg(not(target_os = "windows"))]
+            assert_eq!(theme.floating_surface.a, 1.0);
+        }
+    }
+}

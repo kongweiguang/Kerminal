@@ -415,7 +415,17 @@ pub(super) struct AgentLauncherInputs {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum LeaveConfirmation {
     Close,
+    ProfileSwitch,
+    ProfileReload,
+    ProfileDelete,
     Quit,
+}
+
+/// 删除确认冻结用户看到的目标与版本，监听回执不能把同一次确认转移给其他 Profile。
+pub(super) struct PendingProfileDelete {
+    pub(super) id: String,
+    pub(super) revision: ConfigRevision,
+    pub(super) name: String,
 }
 
 /// 每种确认各自拥有焦点身份和恢复目标，避免迟到回调覆盖后来的弹层。
@@ -508,6 +518,9 @@ pub struct PreferencesPanel {
     pub(super) settings_content_focus: gpui_kit::FocusHandle,
     pub(super) settings_close_focus: gpui_kit::FocusHandle,
     pub(super) close_confirmation_focus: LeaveConfirmationFocus,
+    pub(super) profile_switch_confirmation_focus: LeaveConfirmationFocus,
+    pub(super) profile_reload_confirmation_focus: LeaveConfirmationFocus,
+    pub(super) profile_delete_confirmation_focus: LeaveConfirmationFocus,
     pub(super) quit_confirmation_focus: LeaveConfirmationFocus,
     pub(super) sftp_advanced_open: bool,
     pub(super) vault_availability: Option<VaultKeyAvailability>,
@@ -537,6 +550,8 @@ pub struct PreferencesPanel {
     /// 有界的末意图/在途关联，不复制 ConfigDraft 的保存状态机。
     workbench_layout_requests: workbench_layout::WorkbenchLayoutRequests,
     pub(super) loading_settings: bool,
+    /// 只投影最新 revision 读取的忙态，不替代 ConfigDraft 或阻止 watcher 更新代次。
+    pub(super) settings_readback_running: bool,
     pub(super) loading_profiles: bool,
     settings_load_generation: u64,
     profiles_load_generation: u64,
@@ -551,6 +566,7 @@ pub struct PreferencesPanel {
     pub(super) profile_reload_confirmation: bool,
     pub(super) profile_delete_confirmation: bool,
     pub(super) pending_profile_selection: Option<Option<String>>,
+    pub(super) pending_profile_delete: Option<PendingProfileDelete>,
     pub(super) profile_list_error: Option<String>,
     pub(super) settings_error: Option<String>,
     // 订阅对象只用于保持 GPUI 输入监听存活；订阅本身不需要被主动读取。
@@ -732,6 +748,9 @@ impl PreferencesPanel {
             settings_content_focus: cx.focus_handle(),
             settings_close_focus: cx.focus_handle(),
             close_confirmation_focus: LeaveConfirmationFocus::new(cx),
+            profile_switch_confirmation_focus: LeaveConfirmationFocus::new(cx),
+            profile_reload_confirmation_focus: LeaveConfirmationFocus::new(cx),
+            profile_delete_confirmation_focus: LeaveConfirmationFocus::new(cx),
             quit_confirmation_focus: LeaveConfirmationFocus::new(cx),
             sftp_advanced_open: false,
             vault_availability: None,
@@ -758,6 +777,7 @@ impl PreferencesPanel {
             agent_launcher_manager: custom_agent::AgentLauncherManagerState::default(),
             workbench_layout_requests: workbench_layout::WorkbenchLayoutRequests::default(),
             loading_settings: false,
+            settings_readback_running: false,
             loading_profiles: false,
             settings_load_generation: 0,
             profiles_load_generation: 0,
@@ -772,6 +792,7 @@ impl PreferencesPanel {
             profile_reload_confirmation: false,
             profile_delete_confirmation: false,
             pending_profile_selection: None,
+            pending_profile_delete: None,
             profile_list_error: None,
             settings_error: None,
             _settings_subscriptions: settings_subscriptions,
@@ -855,12 +876,18 @@ impl PreferencesPanel {
         self.select_section(PreferencesSection::Shortcuts, cx);
     }
 
-    /// 离开确认优先于普通面板获得焦点，迟到的入口不能覆盖确认内已有的用户选择。
+    /// 所有内部确认共用最上层优先的焦点策略，迟到入口不能覆盖确认内已有的用户选择。
     ///
     /// @author kongweiguang
     pub(crate) fn focus_initial_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let confirmation = if self.quit_confirmation {
             Some(&self.quit_confirmation_focus)
+        } else if self.profile_delete_confirmation {
+            Some(&self.profile_delete_confirmation_focus)
+        } else if self.profile_reload_confirmation {
+            Some(&self.profile_reload_confirmation_focus)
+        } else if self.profile_switch_confirmation {
+            Some(&self.profile_switch_confirmation_focus)
         } else if self.close_confirmation {
             Some(&self.close_confirmation_focus)
         } else {
@@ -875,11 +902,15 @@ impl PreferencesPanel {
         }
     }
 
-    /// Root 据此只保留最内层陷阱，避免 Kit 无序选择嵌套焦点范围。
+    /// Root 据此只保留最内层确认陷阱，避免 Kit 在设置和 Profile 陷阱间无序选择。
     ///
     /// @author kongweiguang
     pub(crate) fn has_leave_confirmation(&self) -> bool {
-        self.close_confirmation || self.quit_confirmation
+        self.close_confirmation
+            || self.profile_switch_confirmation
+            || self.profile_reload_confirmation
+            || self.profile_delete_confirmation
+            || self.quit_confirmation
     }
 
     /// 创建确认后捕获可恢复的面板内焦点，并仅在同一代确认仍位于顶层时转移焦点。
@@ -892,6 +923,9 @@ impl PreferencesPanel {
     ) {
         let focus = match confirmation {
             LeaveConfirmation::Close => &mut self.close_confirmation_focus,
+            LeaveConfirmation::ProfileSwitch => &mut self.profile_switch_confirmation_focus,
+            LeaveConfirmation::ProfileReload => &mut self.profile_reload_confirmation_focus,
+            LeaveConfirmation::ProfileDelete => &mut self.profile_delete_confirmation_focus,
             LeaveConfirmation::Quit => &mut self.quit_confirmation_focus,
         };
         focus.generation = focus.generation.wrapping_add(1);
@@ -910,6 +944,15 @@ impl PreferencesPanel {
                         .filter(|focus| panel.settings_panel_focus.contains(focus, window));
                     let focus = match confirmation {
                         LeaveConfirmation::Close => &mut panel.close_confirmation_focus,
+                        LeaveConfirmation::ProfileSwitch => {
+                            &mut panel.profile_switch_confirmation_focus
+                        }
+                        LeaveConfirmation::ProfileReload => {
+                            &mut panel.profile_reload_confirmation_focus
+                        }
+                        LeaveConfirmation::ProfileDelete => {
+                            &mut panel.profile_delete_confirmation_focus
+                        }
                         LeaveConfirmation::Quit => &mut panel.quit_confirmation_focus,
                     };
                     if !focus.container.contains_focused(window, cx) {
@@ -937,7 +980,28 @@ impl PreferencesPanel {
             LeaveConfirmation::Close => {
                 self.close_confirmation
                     && !self.quit_confirmation
+                    && !self.profile_switch_confirmation
+                    && !self.profile_reload_confirmation
+                    && !self.profile_delete_confirmation
                     && self.close_confirmation_focus.generation == generation
+            }
+            LeaveConfirmation::ProfileSwitch => {
+                self.profile_switch_confirmation
+                    && !self.quit_confirmation
+                    && !self.profile_reload_confirmation
+                    && !self.profile_delete_confirmation
+                    && self.profile_switch_confirmation_focus.generation == generation
+            }
+            LeaveConfirmation::ProfileReload => {
+                self.profile_reload_confirmation
+                    && !self.quit_confirmation
+                    && !self.profile_delete_confirmation
+                    && self.profile_reload_confirmation_focus.generation == generation
+            }
+            LeaveConfirmation::ProfileDelete => {
+                self.profile_delete_confirmation
+                    && !self.quit_confirmation
+                    && self.profile_delete_confirmation_focus.generation == generation
             }
             LeaveConfirmation::Quit => {
                 self.quit_confirmation && self.quit_confirmation_focus.generation == generation
@@ -955,6 +1019,9 @@ impl PreferencesPanel {
     ) {
         let focus = match confirmation {
             LeaveConfirmation::Close => &mut self.close_confirmation_focus,
+            LeaveConfirmation::ProfileSwitch => &mut self.profile_switch_confirmation_focus,
+            LeaveConfirmation::ProfileReload => &mut self.profile_reload_confirmation_focus,
+            LeaveConfirmation::ProfileDelete => &mut self.profile_delete_confirmation_focus,
             LeaveConfirmation::Quit => &mut self.quit_confirmation_focus,
         };
         focus.generation = focus.generation.wrapping_add(1);
@@ -988,21 +1055,15 @@ impl PreferencesPanel {
     /// @author kongweiguang
     pub fn focus_navigation_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.has_leave_confirmation() {
-            let container = if self.quit_confirmation {
-                &self.quit_confirmation_focus.container
-            } else {
-                &self.close_confirmation_focus.container
-            };
-            if !container.contains_focused(window, cx) {
-                self.focus_initial_control(window, cx);
-            }
+            self.focus_initial_control(window, cx);
             return;
         }
         let focus = self.navigation_search.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
     }
 
-    /// 普通入口像 main 重新挂载设置正文；保留在途保存，并重新核实上次未确认的写入结果。
+    /// 普通入口重置正文滚动呈现，保留在途保存并重新核实上次未确认的写入结果。
+    /// 新会话换用空滚动句柄，清除旧定位请求，避免首帧按尚未测量的视口边界把顶部字段移出屏幕。
     ///
     /// @author kongweiguang
     pub(crate) fn begin_modal_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1014,7 +1075,7 @@ impl PreferencesPanel {
         self.profile_advanced_open = false;
         set_input(&self.navigation_search, String::new(), window, cx);
         self.reset_page_disclosures();
-        self.content_scroll.scroll_to_top_of_item(0);
+        self.content_scroll = gpui_kit::ScrollHandle::new();
         self.recover_pending_settings_on_open(cx);
         self.refresh_integrations_on_modal_open(cx);
         cx.notify();
@@ -1068,9 +1129,7 @@ impl PreferencesPanel {
             return;
         }
         if self.profile_switch_confirmation {
-            self.profile_switch_confirmation = false;
-            self.pending_profile_selection = None;
-            cx.notify();
+            self.cancel_profile_switch(cx);
             return;
         }
         if self.close_confirmation {
@@ -1164,7 +1223,7 @@ impl PreferencesPanel {
         self.profiles_load_generation
     }
 
-    /// 完成首次加载或显式读回后只尝试可安全提交的末意图；失败 fence 不因读回 Ready 自动解除。
+    /// 最新加载释放被取代的 revision 读回忙态，只尝试可安全提交的末意图；失败 fence 不因读回解除。
     ///
     /// @author kongweiguang
     fn finish_settings_load(
@@ -1179,6 +1238,7 @@ impl PreferencesPanel {
         }
         let reloading = self.settings.is_some();
         self.loading_settings = false;
+        self.settings_readback_running = false;
         match result {
             Ok(mut versioned) => {
                 Self::resolve_legacy_terminal_theme(&mut versioned.settings, window, cx);

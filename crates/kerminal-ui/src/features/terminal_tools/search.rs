@@ -856,6 +856,7 @@ mod interaction_tests;
 
 impl Render for TerminalSearchToolbar {
     /// 搜索卡片只展示本地查询状态；自身拦截交互事件，外层定位容器保持透明以允许点击终端。
+    /// 命中数使用固定状态槽，避免忙态、无结果和计数切换时挤动导航控件。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -949,8 +950,14 @@ impl Render for TerminalSearchToolbar {
                 toolbar.invalidate_query(cx);
             }));
         let count = div()
+            .id("terminal-search-count")
+            .debug_selector(|| "terminal-search-count".to_owned())
+            .w(gpui_kit::rems(5.))
             .px_1()
             .flex_shrink_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
             .text_size(theme.text_xs)
             .text_color(theme.muted)
             .child(count_label);
@@ -968,6 +975,7 @@ impl Render for TerminalSearchToolbar {
                 }
             }));
         let next_button = Button::new("terminal-search-next")
+            .debug_selector(|| "terminal-search-next".to_owned())
             .compact()
             .ghost()
             .flex_shrink_0()

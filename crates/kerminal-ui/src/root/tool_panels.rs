@@ -12,6 +12,7 @@ use kerminal_application::{
     platform::external_launch::ExternalTargetLease,
     preferences::{ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId},
     sessions::UiSessionBinding,
+    transfers::TransferOrigin,
 };
 use kerminal_domain::{
     files::FileEndpoint,
@@ -657,25 +658,44 @@ impl RootView {
     }
 
     /// 优先绑定可信终端，文件 Tab 则只提供父目录及 lease，使连续浏览不依赖来源终端继续活动。
-    /// 文件来源不携带终端 binding；切换过渡期间不把新目标写进旧实体，也不触碰 Agent 绑定。
+    /// 文件来源不携带终端 binding；身份与目录一并同步，队列来源使用稳定 pane 或文件 Tab 身份。
     ///
     /// @author kongweiguang
-    fn try_bind_files_from_active_terminal(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn try_bind_files_from_active_terminal(&mut self, cx: &mut Context<Self>) {
         if !self.tab_tool_contents_are_current() {
             return;
         }
-        let (endpoint, lease, binding) = self
+        let (endpoint, lease, binding, origin) = self
             .active_terminal_files_target()
-            .map(|(endpoint, lease, binding)| (Some(endpoint), lease, Some(binding)))
-            .or_else(|| {
-                self.active_file_browser_target()
-                    .map(|(endpoint, lease)| (Some(endpoint), lease, None))
+            .map(|(endpoint, lease, binding)| {
+                let origin = match &binding.owner {
+                    SessionOwner::Ui { pane_id, .. } => {
+                        Some(TransferOrigin::TerminalPane(pane_id.clone()))
+                    }
+                    _ => None,
+                };
+                (Some(endpoint), lease, Some(binding), origin)
             })
-            .unwrap_or((None, None, None));
+            .or_else(|| {
+                let (endpoint, lease) = self.active_file_browser_target()?;
+                let tab_id = self
+                    .workspace_controller
+                    .as_ref()?
+                    .snapshot()
+                    .active_tab_id
+                    .clone()?;
+                Some((
+                    Some(endpoint),
+                    lease,
+                    None,
+                    Some(TransferOrigin::WorkspaceFile(tab_id)),
+                ))
+            })
+            .unwrap_or((None, None, None, None));
         if let Some(files) = self.sftp_panel.clone() {
             files.update(cx, move |files, cx| {
-                files.set_current_terminal_binding(binding, cx);
-                files.set_current_terminal_target(endpoint, lease, cx);
+                files.set_transfer_origin(origin, cx);
+                files.set_current_terminal_target(endpoint, lease, binding, cx);
             });
         }
     }
@@ -893,7 +913,7 @@ impl RootView {
         WorkbenchToolPanels { layout, renderers }
     }
 
-    /// SFTP 首次出现在当前标签时创建独立 FilesPane，并同时安装其 Root 事件桥接。
+    /// SFTP 首次出现时先固定为紧凑面板，避免首帧沿用共享工作台的来源和布局。
     ///
     /// @author kongweiguang
     fn ensure_sftp_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -903,7 +923,10 @@ impl RootView {
         let panel = Self::new_files_panel(&self.services, cx);
         if let Some(panel) = panel.as_ref() {
             let density = super::preferences::current_interface_density(self);
-            panel.update(cx, |panel, cx| panel.set_interface_density(density, cx));
+            panel.update(cx, |panel, cx| {
+                panel.set_compact_layout(true, cx);
+                panel.set_interface_density(density, cx);
+            });
         }
         let subscriptions = panel
             .as_ref()

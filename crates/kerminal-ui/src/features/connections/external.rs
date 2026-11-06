@@ -146,6 +146,8 @@ impl ConnectionsPanel {
     }
 
     /// 校验显式账号后用原解析请求续接应用路由，再交给现有密码和 host-key 流程。
+    /// 普通账号在受理期间保留且禁止编辑，失败可直接重试；仅成功移交或取消清空，避免丢稿或串到下一请求。
+    /// @author kongweiguang
     pub(super) fn submit_external_username(
         &mut self,
         window: &mut gpui_kit::Window,
@@ -180,13 +182,12 @@ impl ConnectionsPanel {
             }
         };
 
-        super::form::clear_input(&self.external_username_input, window, cx);
         self.external_username_generation = self.external_username_generation.wrapping_add(1);
         let generation = self.external_username_generation;
         self.external_username_submitting = true;
         let executor = self.executor.clone();
         let worker_request = request.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = executor
                 .run(move |cancellation| async move {
                     if cancellation.is_cancelled() {
@@ -205,7 +206,7 @@ impl ConnectionsPanel {
                     Ok(outcome)
                 })
                 .await;
-            cx.update(|app| {
+            let _ = cx.update(|window, app| {
                 let _ = this.update(app, |panel, cx| {
                     let Some(result) = take_current_external_username_result(
                         generation,
@@ -218,6 +219,7 @@ impl ConnectionsPanel {
                     match result {
                         Ok(ExternalLaunchOutcome::Ready { target })
                         | Ok(ExternalLaunchOutcome::PasswordRequired { target }) => {
+                            super::form::clear_input(&panel.external_username_input, window, cx);
                             panel.pending_external_username.take();
                             panel.request_external_target(target, cx);
                         }
@@ -230,6 +232,7 @@ impl ConnectionsPanel {
                             cx.notify();
                         }
                         Ok(ExternalLaunchOutcome::Ignored) => {
+                            super::form::clear_input(&panel.external_username_input, window, cx);
                             panel.pending_external_username.take();
                             panel.status = Some(crate::locale::text(
                                 "外部请求未解析为 SSH/SFTP 连接，未创建目标。",
@@ -537,6 +540,7 @@ pub(super) fn expected_fingerprint_matches(expected: &str, observed: &str) -> bo
 
 /// 显示未注册目标的显式用户名步骤；没有默认账户、保存凭据或临时连接目标可继承，卡片宽度受根 modal 视口约束。
 /// 遮罩使用应用决策层令牌，保持浅深和自定义内置色板中的一致层次。
+/// 续接期间冻结账号编辑，保留原输入供明确失败后继续；取消仍使该请求代次失效。
 ///
 /// @author kongweiguang
 pub(super) fn render_external_username_prompt(
@@ -588,7 +592,11 @@ pub(super) fn render_external_username_prompt(
                             .text_color(theme.muted)
                             .child(format!("{protocol} · {address}")),
                     )
-                    .child(Input::new(&panel.external_username_input).w_full())
+                    .child(
+                        Input::new(&panel.external_username_input)
+                            .disabled(panel.external_username_submitting)
+                            .w_full(),
+                    )
                     .child(
                         div()
                             .text_size(theme.text_xs)

@@ -1256,7 +1256,7 @@ impl RootView {
             return false;
         };
         if self
-            .session_restart_projection(pane_id)
+            .session_action_projection(pane_id)
             .is_some_and(|state| state.busy)
         {
             return false;
@@ -1311,7 +1311,7 @@ impl RootView {
             self.session_reconnect
                 .panel_observation(pane_id, tab_id, &scope.session_id, target);
         let reconnecting = self
-            .session_restart_projection(pane_id)
+            .session_action_projection(pane_id)
             .is_some_and(|state| state.busy);
         if !proxy_readback_matches_observation(
             binding,

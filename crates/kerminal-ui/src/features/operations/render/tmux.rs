@@ -18,6 +18,7 @@ use gpui_kit::{
         ActiveTheme, Disableable,
         button::{Button, ButtonCustomVariant, ButtonVariants},
         input::Input,
+        tooltip::Tooltip,
     },
     div,
     prelude::*,
@@ -723,8 +724,7 @@ impl OperationsView {
         tmux_ssh_host_display_label(display_name.as_deref(), host_id.as_str())
     }
 
-    /// 刷新只在固定尺寸按钮内转动图标，版本与已有内容保持稳定，避免等待文案挤动正文。
-    /// 动作继续保留当前 pane 身份门禁，失败状态不冒充已就绪。
+    /// 目标、状态和动作沿用共享面板页头；刷新只在原按钮内转动，保持已有内容与 pane 身份门禁。
     ///
     /// @author kongweiguang
     fn render_tmux_tool_rail_header(
@@ -741,7 +741,6 @@ impl OperationsView {
             TmuxHeaderTone::Error => theme.error,
             TmuxHeaderTone::Neutral => theme.muted,
         };
-        let mono_font_family = cx.theme().mono_font_family.clone();
         let available = self.tmux_target_available()
             && self.tmux.phase() == SectionPhase::Ready
             && capability.is_some_and(|capability| capability.available);
@@ -756,17 +755,16 @@ impl OperationsView {
         let detach_enabled = self.current_tmux_attach_intent().is_some()
             && self.tmux_detach_pending.is_none()
             && !self.busy;
+        let target_label = self.tmux_tool_rail_target_label();
+        let target_tooltip = target_label.clone();
 
-        div()
+        crate::ui_surface::panel_header(theme)
             .w_full()
-            .flex()
             .flex_col()
+            .items_stretch()
             .gap_2()
-            .p_3()
-            .rounded_xl()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.panel)
+            .px_0()
+            .pt_0()
             .child(
                 div()
                     .w_full()
@@ -774,19 +772,9 @@ impl OperationsView {
                     .items_center()
                     .gap_2()
                     .child(
-                        div()
-                            .size_8()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.secondary)
-                            .child(
-                                gpui_kit::component::Icon::new(IconName::Terminal)
-                                    .text_color(theme.muted),
-                            ),
+                        gpui_kit::component::Icon::new(IconName::Terminal)
+                            .size(theme.metrics.icon_size)
+                            .text_color(theme.accent),
                     )
                     .child(
                         div()
@@ -802,11 +790,10 @@ impl OperationsView {
                                     .line_height(relative(1.5))
                                     .child(
                                         div()
-                                            .text_size(px(11.))
-                                            .font_family(mono_font_family.clone())
+                                            .text_size(theme.text_sm)
                                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                            .text_color(theme.muted)
-                                            .child("TMUX"),
+                                            .text_color(theme.foreground)
+                                            .child("tmux"),
                                     )
                                     .when(available, |row| {
                                         row.child(
@@ -816,14 +803,16 @@ impl OperationsView {
                             )
                             .child(
                                 div()
+                                    .id(format!("tmux-panel-target-{}", cx.entity_id().as_u64()))
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(theme.text_body)
-                                    .font_family(mono_font_family)
-                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                    .text_color(theme.foreground)
-                                    .line_height(relative(10. / 7.))
-                                    .child(self.tmux_tool_rail_target_label()),
+                                    .text_size(theme.text_xs)
+                                    .text_color(theme.muted)
+                                    .line_height(relative(1.5))
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(target_tooltip.clone()).build(window, cx)
+                                    })
+                                    .child(target_label),
                             ),
                     )
                     .child(
@@ -837,6 +826,8 @@ impl OperationsView {
                                     .debug_selector(|| "rr-tmux-refresh".into())
                                     .compact()
                                     .ghost()
+                                    .w(theme.metrics.control_height)
+                                    .h(theme.metrics.control_height)
                                     .icon(IconName::RefreshCw)
                                     .loading_icon(IconName::RefreshCw)
                                     .loading(self.tmux.phase() == SectionPhase::Loading)
@@ -851,6 +842,8 @@ impl OperationsView {
                                 Button::new("tmux-create-open")
                                     .compact()
                                     .ghost()
+                                    .w(theme.metrics.control_height)
+                                    .h(theme.metrics.control_height)
                                     .icon(IconName::Plus)
                                     .accessibility_label(crate::locale::text(
                                         "新建会话",
@@ -866,6 +859,8 @@ impl OperationsView {
                                 Button::new("tmux-detach-current")
                                     .compact()
                                     .ghost()
+                                    .w(theme.metrics.control_height)
+                                    .h(theme.metrics.control_height)
                                     .icon(IconName::LogOut)
                                     .accessibility_label(crate::locale::text(
                                         "退出 tmux",
@@ -887,9 +882,8 @@ impl OperationsView {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .text_size(px(11.))
+                    .text_size(theme.text_xs)
                     .line_height(relative(1.5))
-                    .font_family("monospace")
                     .text_color(theme.muted)
                     .child(status),
             )
@@ -946,11 +940,7 @@ impl OperationsView {
             .debug_selector(|| "rr-tmux-sessions".into())
             .w_full()
             .flex()
-            .flex_col()
-            .rounded_xl()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.panel);
+            .flex_col();
         for (index, session) in sessions.into_iter().enumerate() {
             rows = rows.child(self.render_tmux_tool_rail_session(
                 session,
@@ -1002,7 +992,7 @@ impl OperationsView {
             .flex()
             .flex_col()
             .gap_2()
-            .px_2p5()
+            .px_0()
             .py_2()
             .when(has_next, |row| row.border_b_1().border_color(theme.border))
             .child(
@@ -1211,7 +1201,7 @@ impl OperationsView {
         row.into_any_element()
     }
 
-    /// 整行作为键盘和指针可操作的展开按钮；速查项发送仍只看当前 pane binding 与忙碌状态。
+    /// 速查区沿用列表分隔层级，整行可展开；发送仍只看当前 pane binding 与忙碌状态。
     ///
     /// @author kongweiguang
     fn render_tmux_tool_rail_quickref(
@@ -1221,17 +1211,14 @@ impl OperationsView {
     ) -> impl IntoElement {
         let expanded = self.tmux_panel.quickref_open;
         let entity = cx.entity().clone();
-        let mono_font_family = cx.theme().mono_font_family.clone();
         let mut panel = div()
             .w_full()
             .flex()
             .flex_col()
             .gap_2()
-            .p_3()
-            .rounded_xl()
-            .border_1()
+            .pt_2()
+            .border_t_1()
             .border_color(theme.border)
-            .bg(theme.panel)
             .child(tmux_tool_rail_quickref_toggle(
                 expanded,
                 theme,
@@ -1247,8 +1234,7 @@ impl OperationsView {
                 .child(
                     div()
                         .mb_1p5()
-                        .font_family(mono_font_family.clone())
-                        .text_size(px(10.))
+                        .text_size(theme.text_xs)
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .text_color(theme.muted)
                         .child(crate::locale::text("命令", "Commands")),
@@ -1262,8 +1248,7 @@ impl OperationsView {
                 .child(
                     div()
                         .mb_1p5()
-                        .font_family(mono_font_family)
-                        .text_size(px(10.))
+                        .text_size(theme.text_xs)
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .text_color(theme.muted)
                         .child(crate::locale::text("快捷键", "Shortcuts")),
@@ -2320,7 +2305,7 @@ fn tmux_dialog_card(
         .child(content)
 }
 
-/// 固定右栏复用 main 的标题及描述层级与 ModalShell 分区；Root 仍提供唯一表面和视口约束。
+/// 标题、正文和动作共享弹框的密度与文字尺度；Root 仍提供唯一表面和视口约束。
 ///
 /// @author kongweiguang
 fn tmux_panel_dialog_shell(
@@ -2350,8 +2335,8 @@ fn tmux_panel_dialog_shell(
                 .gap_4()
                 .border_b_1()
                 .border_color(theme.border)
-                .px_5()
-                .py_4()
+                .px(theme.metrics.dialog_padding)
+                .py(theme.metrics.section_gap)
                 .child(
                     div()
                         .min_w(px(0.))
@@ -2361,16 +2346,16 @@ fn tmux_panel_dialog_shell(
                         .gap_1()
                         .child(
                             div()
-                                .text_size(px(17.))
-                                .line_height(px(24.))
+                                .text_size(theme.text_heading)
+                                .line_height(relative(1.5))
                                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                 .child(title),
                         )
                         .when_some(description, |heading, description| {
                             heading.child(
                                 div()
-                                    .text_size(px(13.))
-                                    .line_height(px(20.))
+                                    .text_size(theme.text_sm)
+                                    .line_height(relative(1.5))
                                     .text_color(theme.muted)
                                     .child(description),
                             )
@@ -2384,8 +2369,8 @@ fn tmux_panel_dialog_shell(
                 .min_h(px(0.))
                 .flex()
                 .flex_col()
-                .px_5()
-                .py_4()
+                .px(theme.metrics.dialog_padding)
+                .py(theme.metrics.section_gap)
                 .child(content),
         )
         .child(
@@ -2394,8 +2379,8 @@ fn tmux_panel_dialog_shell(
                 .flex_shrink_0()
                 .border_t_1()
                 .border_color(theme.border)
-                .px_5()
-                .py_4()
+                .px(theme.metrics.dialog_padding)
+                .py(theme.metrics.section_gap)
                 .child(actions),
         )
 }
@@ -2410,7 +2395,7 @@ fn tmux_dialog_field_label(label: SharedString, theme: ThemeTokens) -> impl Into
         .child(label)
 }
 
-/// 标题、计数与箭头属于同一个全宽按钮，使命中区域和键盘焦点保持一致。
+/// 标题、计数与箭头属于同一个全宽按钮，密度变化不改变键盘与指针的命中范围。
 ///
 /// @author kongweiguang
 pub(super) fn tmux_tool_rail_quickref_toggle(
@@ -2422,7 +2407,7 @@ pub(super) fn tmux_tool_rail_quickref_toggle(
         .debug_selector(|| "rr-tmux-quickref-toggle".into())
         .compact()
         .w_full()
-        .h_8()
+        .h(theme.metrics.control_height)
         .ghost()
         .toggled(expanded)
         .accessibility_label(if expanded {
@@ -2439,13 +2424,13 @@ pub(super) fn tmux_tool_rail_quickref_toggle(
                 .child(gpui_kit::component::Icon::new(IconName::CircleDot).text_color(theme.accent))
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(theme.text_sm)
                         .child(crate::locale::text("快捷命令", "Quick commands")),
                 )
                 .child(div().flex_1())
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(theme.text_xs)
                         .text_color(theme.muted)
                         .child(crate::locale::text("20 项", "20 items")),
                 )
@@ -2461,19 +2446,19 @@ pub(super) fn tmux_tool_rail_quickref_toggle(
         .on_click(on_click)
 }
 
-/// 右栏表单标签沿用 main 的 12px 中号字重，完整页表单继续保留原有紧凑层级。
+/// 右栏表单标签随主题文字缩放，保留与输入框的清晰层级。
 ///
 /// @author kongweiguang
 fn tmux_panel_dialog_field_label(label: SharedString, theme: ThemeTokens) -> impl IntoElement {
     div()
-        .text_size(px(12.))
-        .line_height(px(16.))
+        .text_size(theme.text_xs)
+        .line_height(relative(1.5))
         .font_weight(gpui_kit::FontWeight::MEDIUM)
         .text_color(theme.muted)
         .child(label)
 }
 
-/// 单行 Input 的高度由 Styled 外层控制；保留 InputState/Kit 焦点行为并复用 main 字段表面。
+/// 单行输入使用共享控件尺度；保留 InputState/Kit 焦点行为与原字段表面。
 ///
 /// @author kongweiguang
 fn tmux_panel_dialog_input(
@@ -2481,14 +2466,14 @@ fn tmux_panel_dialog_input(
     theme: ThemeTokens,
     system_font_family: SharedString,
 ) -> impl IntoElement {
-    gpui_kit::Styled::h(Input::new(input).w_full(), px(36.))
-        .px(px(12.))
+    gpui_kit::Styled::h(Input::new(input).w_full(), theme.metrics.control_height)
+        .px(theme.metrics.gap * 1.5)
         .rounded(theme.control_radius)
         .border_1()
         .border_color(theme.strong_border())
         .bg(theme.field_surface())
-        .text_size(px(16.))
-        .line_height(px(24.))
+        .text_size(theme.text_sm)
+        .line_height(relative(1.5))
         .font_weight(gpui_kit::FontWeight::NORMAL)
         .font_family(system_font_family)
         .text_color(theme.foreground)
@@ -2543,8 +2528,8 @@ fn tmux_panel_dialog_close_button(
         .is_some_and(|cancellation| cancellation.is_cancelled());
     let label = crate::locale::text("关闭弹框", "Close dialog");
     Button::new("tmux-panel-dialog-close")
-        .w(px(36.))
-        .h(px(36.))
+        .w(theme.metrics.control_height)
+        .h(theme.metrics.control_height)
         .rounded(theme.control_radius)
         .flex_shrink_0()
         .ghost()
@@ -2581,7 +2566,7 @@ fn tmux_dialog_refresh_button(busy: bool, cx: &mut Context<OperationsView>) -> B
         .on_click(cx.listener(|view, _: &ClickEvent, _, cx| view.load_tmux(cx)))
 }
 
-/// 弹框按钮匹配 main 的控件高度与圆角；窄栏仍换成纵向布局并保持取消在前。
+/// 弹框动作使用共享密度；窄栏仍换成纵向布局并保持取消在前。
 ///
 /// @author kongweiguang
 fn tmux_panel_dialog_actions(
@@ -2590,17 +2575,22 @@ fn tmux_panel_dialog_actions(
     cancel: Button,
     submit: Button,
 ) -> impl IntoElement {
-    div()
+    crate::ui_surface::dialog_actions(theme)
         .w_full()
-        .flex()
-        .flex_wrap()
         .when(available_width < 340., |row| row.flex_col().items_stretch())
         .when(available_width >= 340., |row| {
             row.items_center().justify_end()
         })
-        .gap_2()
-        .child(cancel.h(px(32.)).rounded(theme.control_radius))
-        .child(submit.h(px(32.)).rounded(theme.control_radius))
+        .child(
+            cancel
+                .h(theme.metrics.control_height)
+                .rounded(theme.control_radius),
+        )
+        .child(
+            submit
+                .h(theme.metrics.control_height)
+                .rounded(theme.control_radius),
+        )
 }
 
 /// 输入实体暂不可用时仍保留关闭路径，并说明可通过重新打开恢复。
@@ -2622,9 +2612,9 @@ fn tmux_panel_input_unavailable_dialog(
                 "The input is unavailable. Close and reopen this dialog to retry.",
             )),
     );
-    let actions = div().w_full().flex().justify_end().child(
+    let actions = crate::ui_surface::dialog_actions(theme).w_full().child(
         tmux_dialog_cancel_button(view, cx)
-            .h(px(32.))
+            .h(theme.metrics.control_height)
             .rounded(theme.control_radius),
     );
     tmux_panel_dialog_shell(
@@ -3002,7 +2992,7 @@ pub(super) fn tmux_header_tone(
     }
 }
 
-/// 空目标、无 tmux 和零会话共用克制卡片，同时保留各自可执行的说明。
+/// 空目标、无 tmux 和零会话保持紧凑文本层级，同时保留各自可执行的说明。
 ///
 /// @author kongweiguang
 fn tmux_empty_state(
@@ -3015,20 +3005,16 @@ fn tmux_empty_state(
         .flex()
         .flex_col()
         .gap_1()
-        .p_3()
-        .rounded_lg()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.panel)
+        .py_2()
         .child(
             div()
-                .text_size(theme.text_body)
+                .text_size(theme.text_sm)
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .child(title.into()),
         )
         .child(
             div()
-                .text_size(theme.text_sm)
+                .text_size(theme.text_xs)
                 .text_color(theme.muted)
                 .child(detail.into()),
         )

@@ -31,8 +31,15 @@ const WORKBENCH_SFTP_HOST_ID: &str = "acceptance-sftp-host";
 const WORKBENCH_GROUP_ID: &str = "acceptance-pinned-group";
 const WORKBENCH_DROP_GROUP_ID: &str = "acceptance-drop-group";
 
+#[path = "workbench_column_reflow.rs"]
+mod column_reflow;
+#[path = "workbench_motion.rs"]
+mod motion;
 #[path = "workbench_sidebar_menus.rs"]
 mod sidebar_menus;
+#[path = "workbench_split_directory.rs"]
+mod split_directory;
+pub(crate) use split_directory::prepare_capture_surface_for_title;
 const WORKBENCH_READY_TIMEOUT: Duration = Duration::from_secs(45);
 const WORKBENCH_ACTION_TIMEOUT: Duration = Duration::from_secs(25);
 const REPEATED_PROFILE_OPENS: usize = 10;
@@ -58,6 +65,8 @@ struct WorkbenchState {
     terminal_creation_busy: bool,
     pending_terminal_creation_owner: bool,
     terminal_status: Option<String>,
+    workspace_persistence_state: &'static str,
+    pending_workspace_resource: Option<(&'static str, String)>,
     active_local_pane_id: Option<String>,
 }
 
@@ -149,6 +158,19 @@ pub(super) fn requested() -> bool {
 ///
 /// @author kongweiguang
 pub(super) fn run() -> Result<(), Box<dyn Error>> {
+    let specialized_scopes = [
+        column_reflow::requested(),
+        split_directory::requested(),
+        motion::requested(),
+    ];
+    if specialized_scopes
+        .into_iter()
+        .filter(|requested| *requested)
+        .count()
+        > 1
+    {
+        return Err(io::Error::other("workbench acceptance scopes are mutually exclusive").into());
+    }
     let options = requested_options()?;
     let output_directory = match options.output_directory {
         Some(path) => create_requested_output_directory(&path)?,
@@ -160,6 +182,9 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     };
     let config_directory = output_directory.join("config");
     fs::create_dir(&config_directory)?;
+    if split_directory::requested() {
+        split_directory::prepare_isolated_profile(&config_directory)?;
+    }
     drop(seed_isolated_mcp_port(&config_directory)?);
     let runtime = ApplicationRuntime::new()?;
     let mut composition = match runtime.block_on(DesktopComposition::build(
@@ -194,9 +219,16 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
 
     ui_result?;
     shutdown_result?;
+    let report_file = if motion::requested() {
+        "workbench-motion-report.json"
+    } else if column_reflow::requested() {
+        "column-reflow-report.json"
+    } else {
+        WORKBENCH_REPORT_FILE
+    };
     println!(
         "Workbench acceptance report: {}",
-        output_directory.join(WORKBENCH_REPORT_FILE).display()
+        output_directory.join(report_file).display()
     );
     Ok(())
 }
@@ -491,6 +523,13 @@ fn acceptance_profile_shell() -> String {
 
 /// 用真实控件覆盖单击保持终端、双击及键盘连接、失败恢复、分屏与独立关闭，不借助中央详情按钮。
 /// 失败重试恢复本轮真实 shell；报告保留入口，区分普通 cmd 与 Store 应用别名验收。
+/// 专项验收只在显式环境变量开启时复用已创建会话，避免增加普通工作台验收耗时。
+/// 动效采样走平台帧提交，不能用测试驱动的离屏绘制代替真实 present。
+/// 重复打开优先记录有限的状态变化，始终保留带提示的观测以便定位短暂失败。
+/// 准入相关状态与提示一同记录，不把终端 Ready 推断为工作区持久化完成。
+/// 隐藏窗口先经正常原生绘制同步缓冲区和回调，避免离屏布局绕过窗口初始化。
+///
+/// @author kongweiguang
 async fn capture_workbench(
     cx: &mut AsyncApp,
     root: Entity<RootView>,
@@ -511,6 +550,7 @@ async fn capture_workbench(
     )
     .await?;
 
+    split_directory::prepare_capture_surface(cx, window, context.width, context.height).await?;
     click_selector(cx, window, "workspace-tabs-create-terminal")?;
     let first_session = wait_for_workbench_state(
         cx,
@@ -522,10 +562,22 @@ async fn capture_workbench(
         |state| state.ready_session_ids.len() == 1 && state.agent_target_key.is_some(),
     )
     .await?;
+    if column_reflow::requested() {
+        return column_reflow::capture(cx, &root, window, &services, &context, first_session).await;
+    }
+    if split_directory::requested() {
+        return split_directory::capture(cx, &root, window, &services, &context, first_session)
+            .await;
+    }
+    if motion::requested() {
+        return motion::capture(cx, &root, window, &services, &context, first_session).await;
+    }
     let initial_agent_key = first_session
         .agent_target_key
         .clone()
         .ok_or_else(|| io::Error::other("initial Agent target candidate is unavailable"))?;
+    verify_compact_host_drawer(cx, window).await?;
+    ensure_host_navigation_visible(cx, window).await?;
     click_selector(cx, window, "host-navigation-refresh")?;
 
     click_selector(
@@ -573,6 +625,7 @@ async fn capture_workbench(
     };
     capture_sidebar_themes(cx, &root, window, &services, &context.output_directory).await?;
 
+    ensure_host_navigation_visible(cx, window).await?;
     click_selector(
         cx,
         window,
@@ -631,6 +684,7 @@ async fn capture_workbench(
         },
     };
 
+    close_compact_host_drawer(cx, window)?;
     let before_failed_default = workbench_state(cx, &root, window, &fixture)?;
     update_profile_shell(&services, &fixture, acceptance_missing_shell()).await?;
     click_selector(cx, window, "workspace-tabs-create-terminal")?;
@@ -767,29 +821,86 @@ async fn capture_workbench(
     let mut repeated = profile_recovered.clone();
     let mut profile_enter_opens_one_session = None;
     for open_index in 1..=REPEATED_PROFILE_OPENS {
+        let previous = repeated.clone();
+        let action = if open_index == 1 {
+            "enter"
+        } else {
+            "double-click"
+        };
+        eprintln!(
+            "workbench Profile open #{open_index} action={action} before: tabs={}, panes={}, ready_sessions={}, failed_panes={}, creating={}, owner_pending={}, status={:?}, persistence={}, pending_resource={:?}",
+            previous.local_tab_count,
+            previous.local_pane_count,
+            previous.ready_session_ids.len(),
+            previous.failed_pane_ids.len(),
+            previous.terminal_creation_busy,
+            previous.pending_terminal_creation_owner,
+            previous.terminal_status,
+            previous.workspace_persistence_state,
+            previous.pending_workspace_resource,
+        );
+        ensure_host_navigation_visible(cx, window).await?;
         click_selector(
             cx,
             window,
             &format!("host-navigation-profile-{}", fixture.profile_id),
         )?;
-        let previous = repeated.clone();
         if open_index == 1 {
             dispatch_workbench_key(cx, window, "enter")?;
         } else {
             dispatch_workbench_second_click(
                 cx,
+                &root,
                 window,
                 &format!("host-navigation-profile-{}", fixture.profile_id),
+                open_index,
             )?;
         }
+        close_compact_host_drawer(cx, window)?;
+        let stage = format!("repeated default Profile open #{open_index} via {action}");
+        let mut last_observation = None;
+        let mut logged_changes = 0;
+        let mut suppressed_changes = false;
         let opened = wait_for_workbench_state(
             cx,
             &root,
             window,
             &fixture,
             Instant::now() + WORKBENCH_ACTION_TIMEOUT,
-            "repeated default Profile open",
+            &stage,
             |state| {
+                let observation = (
+                    state.local_tab_count,
+                    state.local_pane_count,
+                    state.ready_session_ids.len(),
+                    state.failed_pane_ids.len(),
+                    state.terminal_creation_busy,
+                    state.pending_terminal_creation_owner,
+                    state.terminal_status.clone(),
+                    state.workspace_persistence_state,
+                    state.pending_workspace_resource.clone(),
+                );
+                if last_observation.as_ref() != Some(&observation) {
+                    if logged_changes < 12 || state.terminal_status.is_some() {
+                        eprintln!(
+                            "workbench Profile open #{open_index} action={action} observed: tabs={}, panes={}, ready_sessions={}, failed_panes={}, creating={}, owner_pending={}, status={:?}, persistence={}, pending_resource={:?}",
+                            state.local_tab_count,
+                            state.local_pane_count,
+                            state.ready_session_ids.len(),
+                            state.failed_pane_ids.len(),
+                            state.terminal_creation_busy,
+                            state.pending_terminal_creation_owner,
+                            state.terminal_status,
+                            state.workspace_persistence_state,
+                            state.pending_workspace_resource,
+                        );
+                        logged_changes += 1;
+                    } else if !suppressed_changes {
+                        eprintln!("workbench Profile open #{open_index}: additional changes suppressed");
+                        suppressed_changes = true;
+                    }
+                    last_observation = Some(observation);
+                }
                 state.ready_session_ids.len() == previous.ready_session_ids.len() + 1
                     && state.local_tab_count == previous.local_tab_count + 1
                     && state.local_pane_count == previous.local_pane_count + 1
@@ -1078,7 +1189,7 @@ fn acceptance_missing_shell() -> String {
     )
 }
 
-/// 先驱动隐藏窗口回调再读 Root 状态，避免将尚未绘制的异步变更误判为成功。
+/// 先驱动隐藏窗口回调再读同一批 Root 状态；门禁只采集标签和操作 ID，不复制业务内容。
 fn workbench_state(
     cx: &mut AsyncApp,
     root: &Entity<RootView>,
@@ -1095,6 +1206,8 @@ fn workbench_state(
                 root.workbench_acceptance_local_state();
             let (terminal_creation_busy, pending_terminal_creation_owner, terminal_status) =
                 root.workbench_acceptance_terminal_creation_state();
+            let (workspace_persistence_state, pending_workspace_resource) =
+                root.workbench_acceptance_workspace_admission_state();
             WorkbenchState {
                 ready: root.workbench_acceptance_ready(&fixture.host_id, cx),
                 host_selected: root.workbench_acceptance_host_selected(&fixture.host_id, cx),
@@ -1109,13 +1222,15 @@ fn workbench_state(
                 terminal_creation_busy,
                 pending_terminal_creation_owner,
                 terminal_status,
+                workspace_persistence_state,
+                pending_workspace_resource,
                 active_local_pane_id: root.workbench_acceptance_active_local_pane_id(),
             }
         }))
     })?
 }
 
-/// 以有界轮询等待真实 Root 投影，并在超时时保留当前阶段及计数便于定位挂起环节。
+/// 以有界轮询等待真实 Root 投影；超时保留门禁状态，但不改变完成条件和等待预算。
 async fn wait_for_workbench_state<F>(
     cx: &mut AsyncApp,
     root: &Entity<RootView>,
@@ -1135,7 +1250,7 @@ where
         }
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
-                "workbench acceptance timed out during {stage}: ready={}, host_selected={}, local_profile_selected={}, tabs={}, panes={}, ready_sessions={}, failed_panes={}, creating={}, owner_pending={}, status={:?}",
+                "workbench acceptance timed out during {stage}: ready={}, host_selected={}, local_profile_selected={}, tabs={}, panes={}, ready_sessions={}, failed_panes={}, creating={}, owner_pending={}, status={:?}, persistence={}, pending_resource={:?}",
                 state.ready,
                 state.host_selected,
                 state.local_profile_selected,
@@ -1146,6 +1261,8 @@ where
                 state.terminal_creation_busy,
                 state.pending_terminal_creation_owner,
                 state.terminal_status,
+                state.workspace_persistence_state,
+                state.pending_workspace_resource,
             ))
             .into());
         }
@@ -1185,6 +1302,7 @@ async fn capture_sidebar_themes(
             !state.modal_open()
         })
         .await?;
+        ensure_host_navigation_visible(cx, window).await?;
         let _ = save_frame(
             cx,
             window,
@@ -1193,7 +1311,72 @@ async fn capture_sidebar_themes(
         sidebar_menus::capture(cx, window, output_directory, name).await?;
         sidebar_menus::capture_drag(cx, window, services, output_directory, name).await?;
     }
+    ensure_host_navigation_visible(cx, window).await?;
     sidebar_menus::capture_drag_overflow(cx, window, services, output_directory).await?;
+    Ok(())
+}
+
+/// 窄窗必须经真实按钮完成抽屉开关，并证明关闭后焦点回到原控件；宽窗原侧栏不受影响。
+///
+/// @author kongweiguang
+async fn verify_compact_host_drawer(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+) -> Result<(), Box<dyn Error>> {
+    if workbench_selector_visible(cx, window, "host-navigation-refresh")? {
+        return Ok(());
+    }
+    let before = window
+        .update(cx, |_, window, app| window.focused(app))?
+        .ok_or_else(|| io::Error::other("compact drawer has no prior focus to restore"))?;
+    ensure_host_navigation_visible(cx, window).await?;
+    if !workbench_selector_visible(cx, window, "workbench-close-compact-host-drawer")? {
+        return Err(io::Error::other("compact host drawer close button was not visible").into());
+    }
+    let opened_focus = window.update(cx, |_, window, app| window.focused(app))?;
+    if opened_focus.is_none() || opened_focus.as_ref() == Some(&before) {
+        return Err(io::Error::other("compact host drawer did not take focus").into());
+    }
+    close_compact_host_drawer(cx, window)?;
+    let restored = window.update(cx, |_, window, app| window.focused(app))?;
+    if restored.as_ref() != Some(&before) {
+        return Err(io::Error::other(format!(
+            "compact host drawer did not restore focus: {before:?} -> {restored:?}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// 仅在导航不可见时走工作台入口，并等待实际刷新按钮出现，避免把未挂载的抽屉当成侧栏。
+///
+/// @author kongweiguang
+async fn ensure_host_navigation_visible(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+) -> Result<(), Box<dyn Error>> {
+    if !workbench_selector_visible(cx, window, "host-navigation-refresh")? {
+        click_selector(cx, window, "workbench-toggle-host-sidebar")?;
+        wait_for_selector(cx, window, "host-navigation-refresh", "host navigation").await?;
+    }
+    Ok(())
+}
+
+/// 主机抽屉遮住工作区时使用其关闭按钮，并回读两个真实控件确认遮罩已卸载。
+///
+/// @author kongweiguang
+fn close_compact_host_drawer(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+) -> Result<(), Box<dyn Error>> {
+    if workbench_selector_visible(cx, window, "workbench-close-compact-host-drawer")? {
+        click_selector(cx, window, "workbench-close-compact-host-drawer")?;
+        if workbench_selector_visible(cx, window, "workbench-close-compact-host-drawer")?
+            || workbench_selector_visible(cx, window, "host-navigation-refresh")?
+        {
+            return Err(io::Error::other("compact host drawer did not close").into());
+        }
+    }
     Ok(())
 }
 
@@ -1213,13 +1396,15 @@ fn workbench_selector_visible(
     })??)
 }
 
-/// 与前一个单击组成真实的第二击事件，只驱动私有窗口事件树，不使用操作系统鼠标。
+/// 与前一个单击组成真实第二击；同一窗口更新内读取派发后的状态，供后续轮询对照。
 ///
 /// @author kongweiguang
 fn dispatch_workbench_second_click(
     cx: &mut AsyncApp,
+    root: &Entity<RootView>,
     window: AnyWindowHandle,
     selector: &str,
+    open_index: usize,
 ) -> Result<(), Box<dyn Error>> {
     window.update(cx, |_, window, app| {
         ensure_hidden_window(window)?;
@@ -1249,6 +1434,12 @@ fn dispatch_workbench_second_click(
         ] {
             let _ = window.dispatch_event(event, app);
         }
+        let root = root.read(app);
+        let (persistence, pending_resource) = root.workbench_acceptance_workspace_admission_state();
+        let (_, _, status) = root.workbench_acceptance_terminal_creation_state();
+        eprintln!(
+            "workbench Profile open #{open_index} action=double-click dispatched: status={status:?}, persistence={persistence}, pending_resource={pending_resource:?}"
+        );
         Ok::<_, io::Error>(())
     })??;
     Ok(())

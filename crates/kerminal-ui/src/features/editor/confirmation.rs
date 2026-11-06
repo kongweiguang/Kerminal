@@ -28,7 +28,7 @@ impl FileEditorWorkspace {
         )
     }
 
-    /// 确认说明与可换行按钮分开；根层统一限制短矮视口，按钮仍绑定原 endpoint 与动作语义。
+    /// 确认动作始终绑定原文件，按取消、丢弃、保存排序；未知结果读回不冒充可重试写入。
     /// @author kongweiguang
     pub(super) fn render_confirmation(
         &mut self,
@@ -43,54 +43,59 @@ impl FileEditorWorkspace {
                 div()
                     .id("file-editor-confirm-close")
                     .w_full()
-                    .px_3()
-                    .py_3()
+                    .p(theme.metrics.dialog_padding)
                     .min_w(gpui_kit::px(0.))
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap(theme.metrics.section_gap)
                     .bg(theme.panel)
                     .child(
                         div()
                             .w_full()
                             .min_w(gpui_kit::px(0.))
                             .child(crate::locale::text(
-                                "有未保存修改。保存后关闭、丢弃修改或取消关闭。",
-                                "There are unsaved changes. Save before closing, discard the changes, or cancel.",
+                                format!("“{}”有未保存修改。", endpoint_title(&endpoint)),
+                                format!("“{}” has unsaved changes.", endpoint_title(&endpoint)),
                             )),
                     )
                     .child(
-                        div()
+                        crate::ui_surface::dialog_actions(theme)
                             .w_full()
-                            .min_w(gpui_kit::px(0.))
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
+                            .child(cancel_button(cx))
+                            .child(
+                                Button::new("file-editor-discard-close")
+                                    .debug_selector(|| "file-editor-discard-close".to_owned())
+                                    .compact()
+                                    .flex_shrink_0()
+                                    .danger()
+                                    .label(crate::locale::text("丢弃修改", "Discard changes"))
+                                    .on_click(cx.listener(
+                                        move |workspace, _: &ClickEvent, _, cx| {
+                                            workspace.confirm_discard_and_close(
+                                                discard_endpoint.clone(),
+                                                false,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                            )
                             .child(
                                 Button::new("file-editor-save-close")
+                                    .debug_selector(|| "file-editor-save-close".to_owned())
                                     .compact()
                                     .flex_shrink_0()
                                     .primary()
                                     .label(crate::locale::text("保存并关闭", "Save and close"))
-                                    .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                                        workspace.confirm_save_and_close(save_endpoint.clone(), false, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("file-editor-discard-close")
-                                    .compact()
-                                    .flex_shrink_0()
-                                    .label(crate::locale::text("丢弃修改", "Discard changes"))
-                                    .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                                        workspace.confirm_discard_and_close(
-                                            discard_endpoint.clone(),
-                                            false,
-                                            cx,
-                                        );
-                                    })),
-                            )
-                            .child(cancel_button(cx)),
+                                    .on_click(cx.listener(
+                                        move |workspace, _: &ClickEvent, _, cx| {
+                                            workspace.confirm_save_and_close(
+                                                save_endpoint.clone(),
+                                                false,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                            ),
                     )
             }
             EditorConfirmation::Quit(endpoint) => {
@@ -99,32 +104,50 @@ impl FileEditorWorkspace {
                 div()
                     .id("file-editor-confirm-quit")
                     .w_full()
-                    .px_3()
-                    .py_3()
+                    .p(theme.metrics.dialog_padding)
                     .min_w(gpui_kit::px(0.))
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap(theme.metrics.section_gap)
                     .bg(theme.panel)
                     .child(
                         div()
                             .w_full()
                             .min_w(gpui_kit::px(0.))
                             .child(crate::locale::text(
-                                format!("{} 有未保存修改。", endpoint_title(&endpoint)),
-                                format!("{} has unsaved changes.", endpoint_title(&endpoint)),
+                                format!("“{}”有未保存修改。", endpoint_title(&endpoint)),
+                                format!("“{}” has unsaved changes.", endpoint_title(&endpoint)),
                             )),
                     )
                     .child(
-                        div()
+                        crate::ui_surface::dialog_actions(theme)
                             .w_full()
-                            .min_w(gpui_kit::px(0.))
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
+                            .child(cancel_button(cx))
+                            .child(
+                                Button::new("file-editor-discard-continue-quit")
+                                    .debug_selector(|| {
+                                        "file-editor-discard-continue-quit".to_owned()
+                                    })
+                                    .compact()
+                                    .flex_shrink_0()
+                                    .danger()
+                                    .label(crate::locale::text(
+                                        "丢弃并继续退出",
+                                        "Discard and quit",
+                                    ))
+                                    .on_click(cx.listener(
+                                        move |workspace, _: &ClickEvent, _, cx| {
+                                            workspace.confirm_discard_and_close(
+                                                discard_endpoint.clone(),
+                                                true,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                            )
                             .child(
                                 Button::new("file-editor-save-continue-quit")
+                                    .debug_selector(|| "file-editor-save-continue-quit".to_owned())
                                     .compact()
                                     .flex_shrink_0()
                                     .primary()
@@ -138,26 +161,7 @@ impl FileEditorWorkspace {
                                             );
                                         },
                                     )),
-                            )
-                            .child(
-                                Button::new("file-editor-discard-continue-quit")
-                                    .compact()
-                                    .flex_shrink_0()
-                                    .label(crate::locale::text(
-                                        "放弃并继续退出",
-                                        "Discard and quit",
-                                    ))
-                                    .on_click(cx.listener(
-                                        move |workspace, _: &ClickEvent, _, cx| {
-                                            workspace.confirm_discard_and_close(
-                                                discard_endpoint.clone(),
-                                                true,
-                                                cx,
-                                            );
-                                        },
-                                    )),
-                            )
-                            .child(cancel_button(cx)),
+                            ),
                     )
             }
             EditorConfirmation::Overwrite {
@@ -167,36 +171,35 @@ impl FileEditorWorkspace {
             } => div()
                 .id("file-editor-confirm-overwrite")
                 .w_full()
-                .px_3()
-                .py_3()
+                .p(theme.metrics.dialog_padding)
                 .min_w(gpui_kit::px(0.))
                 .flex()
                 .flex_col()
-                .gap_2()
+                .gap(theme.metrics.section_gap)
                 .bg(theme.panel)
                 .child(
                     div()
                         .w_full()
                         .min_w(gpui_kit::px(0.))
                         .child(crate::locale::text(
-                            "确认覆盖会替换远端文件当前内容。",
-                            "Confirming overwrite replaces the current contents of the remote file.",
+                            format!("覆盖“{}”将替换文件当前内容。", endpoint_title(&endpoint)),
+                            format!(
+                                "Overwriting “{}” replaces its current contents.",
+                                endpoint_title(&endpoint)
+                            ),
                         )),
                 )
                 .child(
-                    div()
+                    crate::ui_surface::dialog_actions(theme)
                         .w_full()
-                        .min_w(gpui_kit::px(0.))
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
+                        .child(cancel_button(cx))
                         .child(
                             Button::new("file-editor-overwrite-confirm")
+                                .debug_selector(|| "file-editor-overwrite-confirm".to_owned())
                                 .compact()
                                 .flex_shrink_0()
-                                .primary()
-                                .label(crate::locale::text("覆盖远端文件", "Overwrite remote file"))
+                                .danger()
+                                .label(crate::locale::text("覆盖文件", "Overwrite file"))
                                 .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
                                     workspace.confirm_overwrite(
                                         endpoint.clone(),
@@ -205,28 +208,36 @@ impl FileEditorWorkspace {
                                         cx,
                                     );
                                 })),
-                        )
-                        .child(cancel_button(cx)),
+                        ),
                 ),
             EditorConfirmation::Reload {
                 endpoint,
                 continue_quit,
                 close_after_readback,
             } => {
+                let title = endpoint_title(&endpoint);
                 let description = if continue_quit {
                     crate::locale::text(
-                        "保存结果待确认。重新读取文件后继续退出；本次保存不会自动重试。",
-                        "The save result is unknown. Read the file back before quitting; the save will not be retried.",
+                        format!("“{title}”的保存结果待确认。读回后继续退出，不会自动重试保存。"),
+                        format!(
+                            "The save result for “{title}” is unknown. Read it back before quitting; the save will not be retried."
+                        ),
                     )
                 } else if close_after_readback {
                     crate::locale::text(
-                        "先读回文件确认当前内容；读取成功后关闭此标签，读取失败会保留原内容。",
-                        "Read the file back first. This tab closes only after a successful read; a failed read keeps the current contents.",
+                        format!(
+                            "先读回“{title}”确认当前内容；读取成功后关闭此标签，读取失败会保留原内容。"
+                        ),
+                        format!(
+                            "Read “{title}” back first. This tab closes only after a successful read; a failed read keeps the current contents."
+                        ),
                     )
                 } else {
                     crate::locale::text(
-                        "重新加载将丢弃本地未保存内容，并读取远端最新版本。",
-                        "Reloading discards local unsaved changes and reads the latest remote version.",
+                        format!("重新加载“{title}”将丢弃本地未保存内容，并读取文件最新版本。"),
+                        format!(
+                            "Reloading “{title}” discards local unsaved changes and reads the latest version."
+                        ),
                     )
                 };
                 let label = if continue_quit {
@@ -239,44 +250,36 @@ impl FileEditorWorkspace {
                 div()
                     .id("file-editor-confirm-reload")
                     .w_full()
-                    .px_3()
-                    .py_3()
+                    .p(theme.metrics.dialog_padding)
                     .min_w(gpui_kit::px(0.))
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap(theme.metrics.section_gap)
                     .bg(theme.panel)
+                    .child(div().w_full().min_w(gpui_kit::px(0.)).child(description))
                     .child(
-                        div()
+                        crate::ui_surface::dialog_actions(theme)
                             .w_full()
-                            .min_w(gpui_kit::px(0.))
-                            .child(description),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w(gpui_kit::px(0.))
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
+                            .child(cancel_button(cx))
                             .child(
                                 Button::new("file-editor-reload-confirm")
                                     .debug_selector(|| "rr-file-editor-reload-confirm".to_owned())
                                     .compact()
                                     .flex_shrink_0()
-                                    .primary()
+                                    .when(continue_quit || close_after_readback, Button::primary)
+                                    .when(!continue_quit && !close_after_readback, Button::danger)
                                     .label(label)
-                                    .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                                        workspace.confirm_reload(
-                                            endpoint.clone(),
-                                            continue_quit,
-                                            close_after_readback,
-                                            cx,
-                                        );
-                                    })),
-                            )
-                            .child(cancel_button(cx)),
+                                    .on_click(cx.listener(
+                                        move |workspace, _: &ClickEvent, _, cx| {
+                                            workspace.confirm_reload(
+                                                endpoint.clone(),
+                                                continue_quit,
+                                                close_after_readback,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                            ),
                     )
             }
         }
@@ -284,8 +287,10 @@ impl FileEditorWorkspace {
 }
 
 /// 给所有确认框使用一致的取消按钮，避免隐藏确认后继续执行旧选择。
+/// @author kongweiguang
 fn cancel_button(cx: &mut Context<FileEditorWorkspace>) -> Button {
     Button::new("file-editor-confirm-cancel")
+        .debug_selector(|| "file-editor-confirm-cancel".to_owned())
         .compact()
         .flex_shrink_0()
         .label(crate::locale::text("取消", "Cancel"))

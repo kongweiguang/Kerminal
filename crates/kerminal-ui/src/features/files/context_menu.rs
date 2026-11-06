@@ -274,6 +274,7 @@ fn file_menu_items(
 }
 
 /// 渲染菜单时冻结对侧目标；回调仍须在提交前再次核验来源、选择和目标代次。
+/// 删除与传输各自投影忙态，避免重复受理而不影响无关动作。
 pub(super) fn build_file_context_menu(
     menu: PopupMenu,
     theme: ThemeTokens,
@@ -335,7 +336,10 @@ pub(super) fn build_file_context_menu(
         pane.transfer_submission_busy,
     );
     let mut menu = crate::ui_popup::context_menu(menu, theme, None);
-    for spec in items {
+    for mut spec in items {
+        if spec.action == FileMenuAction::Delete && pane.delete_action_busy {
+            spec.enabled = false;
+        }
         if spec.action == FileMenuAction::Separator {
             menu = menu.separator();
             continue;
@@ -516,7 +520,7 @@ fn render_file_menu_item(
     item.disabled(!spec.enabled)
 }
 
-/// 将菜单动作交回既有文件用例；忙碌时先忽略重复复制，避免旧菜单覆盖选择或反馈。
+/// 将菜单动作交回既有文件用例；忙碌时先忽略重复复制和删除，避免旧菜单覆盖选择或反馈。
 /// 其余动作仍拒绝过期选区或已切换的对侧目标。
 fn dispatch_file_menu_action(
     pane: &mut FilesPane,
@@ -528,7 +532,9 @@ fn dispatch_file_menu_action(
 ) {
     use FileMenuAction as Action;
 
-    if action == Action::CopyToOther && pane.transfer_submission_busy {
+    if (action == Action::CopyToOther && pane.transfer_submission_busy)
+        || (action == Action::Delete && pane.delete_action_busy)
+    {
         return;
     }
     if !pane.browser_action_snapshot_is_current(

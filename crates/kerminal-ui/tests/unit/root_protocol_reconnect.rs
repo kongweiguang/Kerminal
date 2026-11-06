@@ -14,7 +14,7 @@ use kerminal_domain::{
     },
 };
 
-use super::{ReconnectObservation, SessionReconnectController, SessionReconnectState};
+use super::{ReconnectObservation, ReconnectResultState, SessionReconnectController};
 use crate::root::workspace_runtime::RuntimePanePhase;
 
 /// 构造桌面 composition 注册的所有 terminal target，防止手动重连只覆盖 SSH。
@@ -107,13 +107,17 @@ fn observe(
     );
 }
 
-/// 所有已注册 transport 都可按原身份手动恢复；运行、关闭或未确认的 session 不显示入口。
+/// 所有已注册 transport 都按原身份暴露同一重新连接入口；未确认或关闭的 session 不显示入口。
 ///
 /// @author kongweiguang
 #[test]
-fn disconnected_runtime_targets_offer_manual_reconnect() {
+fn supported_runtime_targets_offer_one_reconnect_action() {
     for target in manual_reconnect_targets() {
-        for lifecycle in [SessionLifecycle::Exited, SessionLifecycle::Failed] {
+        for lifecycle in [
+            SessionLifecycle::Running,
+            SessionLifecycle::Exited,
+            SessionLifecycle::Failed,
+        ] {
             let (tab_id, pane_id, session_id) = identity();
             let mut controller = SessionReconnectController::default();
             observe(
@@ -126,7 +130,7 @@ fn disconnected_runtime_targets_offer_manual_reconnect() {
                 4,
             );
 
-            let projection = controller.projection(
+            let projection = controller.action_projection(
                 &pane_id,
                 &tab_id,
                 &session_id,
@@ -134,11 +138,11 @@ fn disconnected_runtime_targets_offer_manual_reconnect() {
                 RuntimePanePhase::Ready,
             );
             let Some(projection) = projection else {
-                panic!("断开的终端目标应生成重连入口：{target:?}");
+                panic!("受支持的终端目标应生成重新连接入口：{target:?}");
             };
             assert_eq!(projection.binding.session_id, session_id);
             assert_eq!(projection.binding.session_generation, 4);
-            assert_eq!(projection.state, SessionReconnectState::Available);
+            assert!(projection.attempt_id.is_none());
             assert!(
                 controller
                     .begin_attempt(&pane_id, &tab_id, projection.binding, target.clone())
@@ -148,7 +152,6 @@ fn disconnected_runtime_targets_offer_manual_reconnect() {
 
         for lifecycle in [
             SessionLifecycle::Starting,
-            SessionLifecycle::Running,
             SessionLifecycle::Closing,
             SessionLifecycle::Closed,
         ] {
@@ -165,7 +168,7 @@ fn disconnected_runtime_targets_offer_manual_reconnect() {
             );
             assert!(
                 controller
-                    .projection(
+                    .action_projection(
                         &pane_id,
                         &tab_id,
                         &session_id,
@@ -196,7 +199,7 @@ fn terminal_reconnect_remains_retryable_after_cancel_and_failure() {
             7,
         );
         let binding = controller
-            .projection(
+            .action_projection(
                 &pane_id,
                 &tab_id,
                 &session_id,
@@ -206,7 +209,7 @@ fn terminal_reconnect_remains_retryable_after_cancel_and_failure() {
             .map(|projection| projection.binding)
             .expect("断开的终端 pane 应显示重连入口");
 
-        let Some((cancelled_attempt, cancellation)) =
+        let Some((cancelled_attempt, cancellation, _)) =
             controller.begin_attempt(&pane_id, &tab_id, binding.clone(), target.clone())
         else {
             panic!("首次终端重连应能发起");
@@ -221,7 +224,7 @@ fn terminal_reconnect_remains_retryable_after_cancel_and_failure() {
         cancellation.install(late_installed_token.clone());
         assert!(late_installed_token.is_cancelled());
         assert!(matches!(
-            controller.projection(
+            controller.action_projection(
                 &pane_id,
                 &tab_id,
                 &session_id,
@@ -229,11 +232,9 @@ fn terminal_reconnect_remains_retryable_after_cancel_and_failure() {
                 RuntimePanePhase::Ready,
             ),
             Some(projection)
-                if matches!(
-                    projection.state,
-                    SessionReconnectState::Cancelling { attempt_id }
-                        if attempt_id == cancelled_attempt
-                )
+                if projection.busy
+                    && projection.cancelling
+                    && projection.attempt_id == Some(cancelled_attempt)
         ));
         assert!(
             controller
@@ -241,33 +242,47 @@ fn terminal_reconnect_remains_retryable_after_cancel_and_failure() {
                 .is_none(),
             "取消回执到达前必须保留唯一 attempt owner"
         );
-        assert!(controller.finish_attempt(
-            cancelled_attempt,
-            Err(kerminal_application::AppError::cancelled("测试取消")),
-        ));
+        assert!(
+            controller
+                .finish_attempt(
+                    cancelled_attempt,
+                    Err(kerminal_application::AppError::cancelled("测试取消")),
+                )
+                .is_some()
+        );
         assert!(matches!(
-            controller.projection(
+            controller.action_projection(
                 &pane_id,
                 &tab_id,
                 &session_id,
                 &target,
                 RuntimePanePhase::Ready,
             ),
-            Some(projection) if projection.state == SessionReconnectState::Cancelled
+            Some(projection)
+                if !projection.busy
+                    && projection.attempt_id.is_none()
+                    && controller
+                        .panes
+                        .get(&pane_id)
+                        .is_some_and(|state| state.result == ReconnectResultState::Cancelled)
         ));
 
-        let Some((failed_attempt, _)) =
+        let Some((failed_attempt, _, _)) =
             controller.begin_attempt(&pane_id, &tab_id, binding.clone(), target.clone())
         else {
             panic!("取消 ACK 后应允许再次重连");
         };
-        assert!(controller.finish_attempt(
-            failed_attempt,
-            Err(kerminal_application::AppError::infrastructure(
-                "测试连接失败"
-            )),
-        ));
-        let failed_projection = controller.projection(
+        assert!(
+            controller
+                .finish_attempt(
+                    failed_attempt,
+                    Err(kerminal_application::AppError::infrastructure(
+                        "测试连接失败"
+                    )),
+                )
+                .is_some()
+        );
+        let failed_projection = controller.action_projection(
             &pane_id,
             &tab_id,
             &session_id,
@@ -276,7 +291,14 @@ fn terminal_reconnect_remains_retryable_after_cancel_and_failure() {
         );
         assert!(matches!(
             failed_projection,
-            Some(projection) if matches!(projection.state, SessionReconnectState::Failed { .. })
+            Some(projection)
+                if projection.attempt_id.is_none()
+                    && controller
+                        .panes
+                        .get(&pane_id)
+                        .is_some_and(|state| {
+                            matches!(state.result, ReconnectResultState::Failed(_))
+                        })
         ));
         assert!(
             controller

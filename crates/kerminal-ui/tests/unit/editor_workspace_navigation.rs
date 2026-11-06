@@ -5,7 +5,10 @@
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc};
 
 use async_trait::async_trait;
-use gpui_kit::{AppContext as _, Context, Entity, Subscription, TestAppContext, VisualTestContext};
+use gpui_kit::{
+    AppContext as _, Context, Entity, IntoElement as _, Render, Subscription, TestAppContext,
+    VisualTestContext, Window,
+};
 use kerminal_application::{
     AppError, AppResult, ApplicationTaskExecutor,
     files::{FileAccessProvider, FileBookmarkRepository, FileService, editor::FileEditorService},
@@ -17,7 +20,9 @@ use kerminal_domain::files::{
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 
-use super::{EditorWorkspaceProjection, FileEditorWorkspace, FileEditorWorkspaceEvent};
+use super::{
+    EditorConfirmation, EditorWorkspaceProjection, FileEditorWorkspace, FileEditorWorkspaceEvent,
+};
 use crate::features::files::FileTargetNameLookup;
 
 /// 监听真实 Entity 事件并读取当时投影，避免只断言内部字段而漏掉 Root 接收的变化。
@@ -89,6 +94,105 @@ fn fixture(
     });
     let (editor, observer) = mounted.borrow_mut().take().expect("editor fixture mounted");
     (runtime, editor, observer, visual)
+}
+
+/// 根层只提供挂载位置，确认按钮和状态仍来自生产编辑器实体。
+struct ConfirmationHost {
+    editor: Entity<FileEditorWorkspace>,
+}
+
+impl Render for ConfirmationHost {
+    /// 按当前窗口主题渲染生产确认内容，避免测试重建按钮或动作。
+    /// @author kongweiguang
+    fn render(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
+        let theme = crate::theme::ThemeTokens::current(window, cx);
+        self.editor
+            .update(cx, |editor, cx| editor.render_root_confirmation(theme, cx))
+            .unwrap_or_else(|| gpui_kit::div().into_any_element())
+    }
+}
+
+/// 独立窗口只装配真实确认视图，文件端口保持只读且不推进后台 I/O。
+/// @author kongweiguang
+fn confirmation_fixture(
+    app: &mut TestAppContext,
+    confirmation: EditorConfirmation,
+) -> (Runtime, Entity<FileEditorWorkspace>, &mut VisualTestContext) {
+    let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+    let executor = ApplicationTaskExecutor::new(runtime.handle().clone());
+    let files = FileService::new(vec![Arc::new(NoIoProvider)], Arc::new(NoBookmarks))
+        .expect("fixture file ports are registered");
+    let service = FileEditorService::new(files);
+    app.update(gpui_kit::init);
+    let mounted = Rc::new(RefCell::new(None));
+    let mounted_out = mounted.clone();
+    let (_, visual) = app.add_window_view(move |window, cx| {
+        let editor = cx.new(|cx| {
+            let mut editor = FileEditorWorkspace::new(
+                service,
+                executor,
+                FileTargetNameLookup::default(),
+                window,
+                cx,
+            );
+            editor.confirmation = Some(confirmation);
+            editor
+        });
+        *mounted_out.borrow_mut() = Some(editor.clone());
+        let host = cx.new(|_| ConfirmationHost { editor });
+        gpui_kit::base::Root::new(host, window, cx)
+    });
+    let editor = mounted
+        .borrow_mut()
+        .take()
+        .expect("confirmation fixture mounted");
+    (runtime, editor, visual)
+}
+
+/// 关闭和退出确认按取消、丢弃、保存排列；点击取消只撤销待处理确认。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn unsaved_file_confirmation_orders_actions_and_cancel_preserves_the_request_boundary(
+    app: &mut TestAppContext,
+) {
+    for quit in [false, true] {
+        let confirmation = if quit {
+            EditorConfirmation::Quit(endpoint("draft.txt"))
+        } else {
+            EditorConfirmation::Close(endpoint("draft.txt"))
+        };
+        let (_runtime, editor, visual) = confirmation_fixture(app, confirmation);
+        visual.simulate_resize(gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(700.)));
+        visual.run_until_parked();
+        visual.update(|window, app| window.draw(app).clear(app));
+        visual.update(|window, app| window.draw(app).clear(app));
+        let cancel = visual
+            .debug_bounds("file-editor-confirm-cancel")
+            .expect("取消按钮应可测量");
+        let discard = visual
+            .debug_bounds(if quit {
+                "file-editor-discard-continue-quit"
+            } else {
+                "file-editor-discard-close"
+            })
+            .expect("丢弃按钮应可测量");
+        let save = visual
+            .debug_bounds(if quit {
+                "file-editor-save-continue-quit"
+            } else {
+                "file-editor-save-close"
+            })
+            .expect("保存按钮应可测量");
+        assert!(cancel.right() <= discard.origin.x);
+        assert!(discard.right() <= save.origin.x);
+        visual.simulate_click(cancel.center(), Default::default());
+        visual.run_until_parked();
+        visual.update(|_, app| assert!(editor.read(app).confirmation.is_none()));
+    }
 }
 
 /// 派发恢复意图并读取所有相应事件，不推进 Tokio 文件读取以覆盖 pending 状态。

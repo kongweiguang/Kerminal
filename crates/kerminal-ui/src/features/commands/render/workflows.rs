@@ -4,9 +4,11 @@
 
 use gpui_kit::{
     ClickEvent, Context, IntoElement,
+    assets::IconName,
     component::{
-        Disableable,
+        Disableable, Selectable,
         button::{Button, ButtonVariants},
+        checkbox::Checkbox,
         input::{Input, Textarea},
     },
     div,
@@ -20,8 +22,8 @@ use super::super::{CommandsView, WorkflowUnknownReview};
 use crate::theme::ThemeTokens;
 
 impl CommandsView {
-    /// 工作流待确认时锁定定义并展示完整脚本；未知结果保留原目标摘要并在核对前禁用新运行。
-    /// 步骤卡片使用自然高度并共用外层滚动，避免运行面板扩展时内层 flex 视口收缩到零。
+    /// 工作流保留稳定步骤实体和运行门禁；列表与步骤设置使用可键盘操作的语义控件。
+    /// 步骤区域共用外层滚动，避免运行面板扩展时内层视口收缩到零。
     ///
     /// @author kongweiguang
     pub(super) fn render_workflows(
@@ -40,22 +42,18 @@ impl CommandsView {
                     .selected_workflow
                     .as_ref()
                     .is_some_and(|selected| selected.definition.id == id);
-                div()
-                    .id(format!("workflow-entry-{id}"))
+                Button::new(format!("workflow-entry-{id}"))
                     .w_full()
-                    .p_3()
-                    .rounded_md()
-                    .bg(if active { theme.accent } else { theme.panel })
-                    .text_color(if active {
-                        theme.background
-                    } else {
-                        theme.foreground
-                    })
-                    .cursor_pointer()
+                    .ghost()
+                    .compact()
+                    .selected(active)
+                    .tab_stop(true)
+                    .tooltip(title.clone())
+                    .accessibility_label(title.clone())
                     .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
                         view.open_workflow(id.clone(), window, cx);
                     }))
-                    .child(title)
+                    .child(div().flex_1().min_w_0().text_ellipsis().child(title))
             })
             .collect::<Vec<_>>();
         let selected_title = self
@@ -367,7 +365,13 @@ impl CommandsView {
                             .child(
                                 Button::new(format!("workflow-step-up-{index}"))
                                     .compact()
-                                    .label(crate::locale::text("上移", "Move up"))
+                                    .ghost()
+                                    .icon(IconName::ArrowUp)
+                                    .accessibility_label(crate::locale::text(
+                                        "上移步骤",
+                                        "Move step up",
+                                    ))
+                                    .tooltip(crate::locale::text("上移步骤", "Move step up"))
                                     .disabled(!can_move_up || editor_locked)
                                     .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                                         view.move_workflow_step(index, -1, cx);
@@ -376,37 +380,31 @@ impl CommandsView {
                             .child(
                                 Button::new(format!("workflow-step-down-{index}"))
                                     .compact()
-                                    .label(crate::locale::text("下移", "Move down"))
+                                    .ghost()
+                                    .icon(IconName::ArrowDown)
+                                    .accessibility_label(crate::locale::text(
+                                        "下移步骤",
+                                        "Move step down",
+                                    ))
+                                    .tooltip(crate::locale::text("下移步骤", "Move step down"))
                                     .disabled(!can_move_down || editor_locked)
                                     .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                                         view.move_workflow_step(index, 1, cx);
                                     })),
                             )
                             .child(
-                                Button::new(format!("workflow-step-confirmation-{index}"))
-                                    .compact()
-                                    .label(crate::locale::text(
-                                        if confirmation {
-                                            "执行前确认：开"
-                                        } else {
-                                            "执行前确认：关"
-                                        },
-                                        if confirmation {
-                                            "Confirm before run: On"
-                                        } else {
-                                            "Confirm before run: Off"
-                                        },
-                                    ))
-                                    .when(confirmation, Button::primary)
+                                Checkbox::new(format!("workflow-step-confirmation-{index}"))
+                                    .checked(confirmation)
+                                    .label(crate::locale::text("执行前确认", "Confirm before run"))
                                     .disabled(editor_locked)
-                                    .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                                        view.toggle_workflow_step_confirmation(index, cx);
+                                    .on_change(cx.listener(move |view, checked: &bool, _, cx| {
+                                        view.set_workflow_step_confirmation(index, *checked, cx);
                                     })),
                             )
                             .child(
                                 Button::new(format!("workflow-step-remove-{index}"))
                                     .compact()
-                                    .danger()
+                                    .ghost()
                                     .label(crate::locale::text("删除步骤", "Remove step"))
                                     .disabled(!can_remove || editor_locked)
                                     .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
@@ -439,7 +437,6 @@ impl CommandsView {
             .child(
                 Button::new("workflow-new")
                     .compact()
-                    .primary()
                     .label(crate::locale::text("新建工作流", "New workflow"))
                     .disabled(editor_locked)
                     .on_click(cx.listener(|view, _: &ClickEvent, window, cx| {

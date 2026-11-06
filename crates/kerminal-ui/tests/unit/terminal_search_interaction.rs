@@ -424,6 +424,59 @@ fn failed_query_feedback_preserves_query_and_navigation_wraps(cx: &mut TestAppCo
     assert!(search_events(&harness, cx).is_empty());
 }
 
+/// 忙态、无结果和命中计数交替时复用同一状态槽，导航按钮不得在指针下方横向跳动。
+/// 同时覆盖单行和窄面板换行布局，确保查询状态不改变控件几何。
+///
+/// @author kongweiguang
+#[gpui::test]
+fn search_status_changes_do_not_move_navigation_buttons(cx: &mut TestAppContext) {
+    let (harness, cx) = fixture(cx);
+    let toolbar = toolbar_entity(&harness, cx);
+    replace_query(&toolbar, "needle", cx);
+
+    for width in [440., 320.] {
+        cx.update(|_, app| {
+            toolbar.update(app, |toolbar, cx| {
+                toolbar.set_overlay_metrics(gpui::px(width), 0, cx);
+                toolbar.busy = true;
+                toolbar.matches = Arc::from([]);
+                toolbar.selected_match = None;
+                cx.notify();
+            });
+        });
+        draw(cx);
+        let busy = cx
+            .debug_bounds("terminal-search-next")
+            .expect("next button");
+        let count = cx
+            .debug_bounds("terminal-search-count")
+            .expect("status slot");
+
+        cx.update(|_, app| {
+            toolbar.update(app, |toolbar, cx| {
+                toolbar.busy = false;
+                toolbar.submitted_query_revision = Some(toolbar.query_revision);
+                cx.notify();
+            });
+        });
+        draw(cx);
+        assert_eq!(cx.debug_bounds("terminal-search-next"), Some(busy));
+        assert_eq!(cx.debug_bounds("terminal-search-count"), Some(count));
+
+        cx.update(|_, app| {
+            toolbar.update(app, |toolbar, cx| {
+                let result = one_match_result();
+                toolbar.matches = result.matches;
+                toolbar.selected_match = result.selected_match;
+                cx.notify();
+            });
+        });
+        draw(cx);
+        assert_eq!(cx.debug_bounds("terminal-search-next"), Some(busy));
+        assert_eq!(cx.debug_bounds("terminal-search-count"), Some(count));
+    }
+}
+
 /// 置底只是当前命中的避让回退，下次显式导航重新使用顶部边距并能无焦点变化地恢复锚点。
 ///
 /// @author kongweiguang

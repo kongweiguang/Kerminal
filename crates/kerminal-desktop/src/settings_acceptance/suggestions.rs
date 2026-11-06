@@ -573,12 +573,16 @@ async fn measure_warm_latency(
 }
 
 /// 原生 Tab 与左右移动必须经过生产按键路由；菜单只用于读回，不能替 Shell 修复光标或输入。
+/// 失败时先只读能力状态，再回读 Shell；诊断只比较绑定和输出安全元数据，不记录输入正文。
+///
+/// @author kongweiguang
 async fn verify_native_edit_recovery(
     cx: &mut AsyncApp,
     root: &Entity<RootView>,
     window: AnyWindowHandle,
     services: &kerminal_ui::AppServices,
     prompt_epoch: u64,
+    baseline: &ShellEditingSnapshot,
 ) -> Result<(), Box<dyn Error>> {
     press_key(cx, window, "tab")?;
     let recovered = wait_state(cx, root, window, "native Tab recovery", |state| {
@@ -588,6 +592,20 @@ async fn verify_native_edit_recovery(
     if let Err(error) = recovered {
         let before =
             state(cx, root, window)?.ok_or_else(|| io::Error::other("Tab pane missing"))?;
+        let same_binding = before.binding == baseline.binding;
+        let same_session_generation =
+            before.binding.session_generation == baseline.binding.session_generation;
+        let availability_binding = before.binding.clone();
+        let sessions = services.sessions.clone();
+        let availability = services
+            .executor
+            .run(move |_| async move {
+                sessions
+                    .shell_editing_availability(availability_binding)
+                    .await
+            })
+            .await
+            .map_err(|error| error.public_code());
         let sessions = services.sessions.clone();
         let result = services
             .executor
@@ -605,7 +623,11 @@ async fn verify_native_edit_recovery(
                 snapshot.input == PREFIX,
             )
         });
-        return Err(io::Error::other(format!("{error}; Tab readback metadata={detail:?}")).into());
+        return Err(io::Error::other(format!(
+            "{error}; baseline_shell={:?}, same_binding={same_binding}, same_session_generation={same_session_generation}, shell_editing_availability={availability:?}; Tab readback metadata={detail:?}",
+            baseline.shell,
+        ))
+        .into());
     }
     let menu = open_menu(cx, root, window).await?;
     let snapshot = read_shell(cx, root, window, services, &menu).await?;
@@ -983,6 +1005,7 @@ async fn wait_fixture_pane(
 }
 
 /// 通过真实输入和 Shell 回读验证追加与未提交；任何阶段失败都不生成通过报告。
+/// 基线快照仅用于关联同一 prompt 和失败时的绑定诊断，不输出输入正文。
 ///
 /// @author kongweiguang
 pub(super) async fn capture_only(
@@ -1034,7 +1057,7 @@ pub(super) async fn capture_only(
         state.focused && state.input_idle && state.ghost.as_deref() == Some(SUFFIX)
     })
     .await?;
-    verify_native_edit_recovery(cx, root, window, services, prompt_epoch).await?;
+    verify_native_edit_recovery(cx, root, window, services, prompt_epoch, &baseline).await?;
     verify_pointer_interactions(cx, root, window, services, prompt_epoch).await?;
     let latency_samples = measure_warm_latency(cx, root, window).await?;
     let ghost =

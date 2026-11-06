@@ -12,7 +12,7 @@ use crate::{
     terminal_background::TerminalBackgroundSettings,
     terminal_interaction::TerminalInteractionPolicy,
     terminal_metrics::TerminalMetrics,
-    theme::{BackgroundMaterialSettings, ThemeTokens, apply_app_theme},
+    theme::{ActiveInterfaceDensity, BackgroundMaterialSettings, ThemeTokens, apply_app_theme},
 };
 
 /// 从完整设置快照派生当前工作台使用的有限运行态字段，避免 UI 事件各自解释配置语义。
@@ -125,7 +125,7 @@ pub(super) fn refresh_profile_directory(root: &mut RootView, cx: &mut Context<Ro
     }
 }
 
-/// 同一快照统一驱动主题和运行态；旧浅深配置按实际外观只归并一次，保存回声不重复提交终端操作。
+/// 同一快照统一驱动主题、密度和运行态；保存回声不重复提交终端操作，呈现状态不持有事务。
 ///
 /// @author kongweiguang
 pub(super) fn apply_snapshot(
@@ -179,6 +179,7 @@ pub(super) fn apply_snapshot(
     root.settings_snapshot = Some(snapshot.clone());
     root.window_appearance = window.appearance();
     cx.set_global(BackgroundMaterialSettings::from_snapshot(&snapshot));
+    cx.set_global(ActiveInterfaceDensity(snapshot.interface_density));
     apply_app_theme(
         root.theme_mode,
         snapshot.app_color_scheme,

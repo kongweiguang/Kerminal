@@ -3,12 +3,14 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, IntoElement, Render, SharedString, Window,
+    AnyElement, AppContext as _, Context, Entity, IntoElement, Pixels, Render, SharedString,
+    Window,
     assets::IconName,
     base::Selectable as _,
     component::{
         Disableable as _, WindowExt as _,
         button::{Button, ButtonVariants},
+        dialog::DialogEntrance,
         menu::{DropdownMenu as _, PopupMenuItem},
         switch::Switch,
         tooltip::Tooltip,
@@ -19,7 +21,10 @@ use gpui_kit::{
 };
 use kerminal_application::preferences::{ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId};
 
-use crate::{features::preferences::PreferencesPanel, theme::ThemeTokens};
+use crate::{
+    features::preferences::PreferencesPanel,
+    theme::{ThemeTokens, UiMetrics},
+};
 
 use super::{RootView, workbench::tool_rail_icon};
 
@@ -291,8 +296,7 @@ impl ToolRailCustomizer {
 }
 
 impl Render for ToolRailCustomizer {
-    /// main 在标题分隔线后留 8px；GPUI 不能模糊玻璃表面的背景，因此正文用不透明工具面板表面避免底层文字透出。
-    /// 分区单独滚动以保留操作栏，避免内容增多时保存或取消入口离开视区。
+    /// 正文使用统一密度与字号；分区独立滚动，确保内容增多或文字放大时操作栏仍可见。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -326,12 +330,13 @@ impl Render for ToolRailCustomizer {
             .id("tool-rail-customizer-sections")
             .w_full()
             .min_h(px(0.))
-            .max_h(px(
-                (window.viewport_size().height.as_f32() - 225.).clamp(0., 560.)
+            .max_h(customizer_list_max_height(
+                window.viewport_size().height,
+                theme.metrics,
             ))
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(theme.metrics.gap)
             .overflow_y_scroll()
             .child(main_section)
             .child(bottom_section);
@@ -342,10 +347,10 @@ impl Render for ToolRailCustomizer {
             .w_full()
             .flex()
             .flex_col()
-            .gap_3()
-            .px(px(20.))
-            .pt(px(8.))
-            .pb(px(16.))
+            .gap(theme.metrics.gap)
+            .px(theme.metrics.dialog_padding)
+            .pt(theme.metrics.gap)
+            .pb(theme.metrics.panel_padding)
             .child(
                 div()
                     .w_full()
@@ -353,7 +358,7 @@ impl Render for ToolRailCustomizer {
                     .flex_wrap()
                     .items_center()
                     .justify_between()
-                    .gap_2()
+                    .gap(theme.metrics.gap)
                     .text_size(theme.text_xs)
                     .text_color(theme.muted)
                     .child(crate::locale::text(
@@ -370,7 +375,7 @@ impl Render for ToolRailCustomizer {
                         div()
                             .flex()
                             .items_center()
-                            .gap_1()
+                            .gap(theme.metrics.gap / 2.)
                             .child(
                                 Button::new("tool-rail-customizer-show-all")
                                     .compact()
@@ -417,7 +422,7 @@ impl Render for ToolRailCustomizer {
 }
 
 impl ToolRailCustomizer {
-    /// 操作栏由 Dialog 固定承载，正文滚动时仍能保存或取消；不复制草稿和提交状态。
+    /// 操作栏由 Dialog 固定承载；忙碌图标复用原槽位，保存状态变化不挤动取消按钮。
     ///
     /// @author kongweiguang
     fn render_footer(&self, theme: ThemeTokens, cx: &mut Context<Self>) -> AnyElement {
@@ -426,7 +431,6 @@ impl ToolRailCustomizer {
         let dirty = self.draft != self.initial;
         let cancel = Button::new("tool-rail-customizer-cancel")
             .compact()
-            .ghost()
             .label(crate::locale::text("取消", "Cancel"))
             .disabled(saving)
             .on_click(move |_, window, app| {
@@ -438,26 +442,21 @@ impl ToolRailCustomizer {
         let save = Button::new("tool-rail-customizer-save")
             .compact()
             .primary()
-            .icon(if saving {
-                IconName::LoaderCircle
-            } else {
-                IconName::Check
-            })
-            .label(crate::locale::text(
-                if saving { "保存中…" } else { "保存" },
-                if saving { "Saving…" } else { "Save" },
+            .icon(IconName::Check)
+            .loading(saving)
+            .label(crate::locale::text("保存", "Save"))
+            .accessibility_label(crate::locale::text(
+                if saving { "保存中" } else { "保存" },
+                if saving { "Saving" } else { "Save" },
             ))
             .disabled(saving || !dirty)
             .on_click(cx.listener(|customizer, _, _, cx| customizer.submit(cx)));
         #[cfg(feature = "right-rail-acceptance")]
         let save = save.debug_selector(|| "rr-customizer-save".into());
-        div()
+        crate::ui_surface::dialog_actions(theme)
             .w_full()
-            .flex()
-            .justify_end()
-            .gap_2()
-            .px(px(20.))
-            .py(px(16.))
+            .px(theme.metrics.dialog_padding)
+            .py(theme.metrics.panel_padding)
             .border_t_1()
             .border_color(theme.tool_panel_border)
             .child(cancel)
@@ -467,7 +466,7 @@ impl ToolRailCustomizer {
 }
 
 impl ToolRailCustomizer {
-    /// 两个视觉分区共用行模板；只变化分区计数和排序边界，避免设置语义漂移；文本与控件显式映射 main 的尺寸和主题表面。
+    /// 两个分区共用稳定槽位；位置按钮用短名称，完整语义留在提示与菜单，避免英文被截成同一前缀。
     ///
     /// @author kongweiguang
     fn render_section(
@@ -481,17 +480,6 @@ impl ToolRailCustomizer {
         let entity = cx.entity();
         let saving = self.busy;
         let bottom = section == ToolRailSection::Bottom;
-        let description = if bottom {
-            crate::locale::text(
-                "始终贴在右栏底部，内部顺序仍可调整",
-                "Pinned to the rail bottom; its order remains adjustable",
-            )
-        } else {
-            crate::locale::text(
-                "从上到下排列，可在空间不足时滚动",
-                "Ordered from top to bottom; scrolls when space is limited",
-            )
-        };
         let mut section_view = div()
             .id(if bottom {
                 "tool-rail-customizer-bottom-section"
@@ -501,12 +489,8 @@ impl ToolRailCustomizer {
             .w_full()
             .flex()
             .flex_col()
-            .gap_1()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.tool_panel_border)
-            .bg(theme.subtle_background())
+            .gap(theme.metrics.gap / 2.)
+            .py(theme.metrics.gap / 2.)
             .on_drop(
                 cx.listener(move |customizer, dragged: &ToolRailToolId, _, cx| {
                     customizer.drop_at_end(*dragged, bottom, cx);
@@ -518,26 +502,16 @@ impl ToolRailCustomizer {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap_3()
-                    .px_1()
-                    .py_1()
+                    .gap(theme.metrics.gap)
+                    .py(theme.metrics.gap / 2.)
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_size(theme.text_xs)
-                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                    .text_color(theme.foreground)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(theme.muted.opacity(0.72))
-                                    .child(description),
-                            ),
+                            .min_w_0()
+                            .flex_1()
+                            .text_size(theme.text_sm)
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child(title),
                     )
                     .child(
                         div()
@@ -545,7 +519,7 @@ impl ToolRailCustomizer {
                             .py_0p5()
                             .rounded_full()
                             .bg(theme.panel)
-                            .text_size(px(10.))
+                            .text_size(theme.text_xs)
                             .text_color(theme.muted)
                             .child(tools.len().to_string()),
                     ),
@@ -555,19 +529,21 @@ impl ToolRailCustomizer {
             section_view = section_view.child(
                 div()
                     .w_full()
-                    .h(px(48.))
+                    .min_h(theme.metrics.toolbar_height)
+                    .py(theme.metrics.gap)
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded_md()
                     .border_1()
                     .border_color(theme.tool_panel_border)
-                    .text_size(px(11.))
+                    .text_size(theme.text_xs)
                     .text_color(theme.muted)
-                    .child(crate::locale::text(
-                        "将工具拖到这里，或使用每行的固定按钮",
-                        "Drop tools here or use the pin button on a row",
-                    )),
+                    .child(if bottom {
+                        crate::locale::text("暂无固定工具", "No pinned tools")
+                    } else {
+                        crate::locale::text("暂无主区域工具", "No tools in the main area")
+                    }),
             );
         }
 
@@ -593,6 +569,7 @@ impl ToolRailCustomizer {
                 .unwrap_or_else(|| crate::locale::text("贴靠右栏", "Attach to right rail"));
             let label = customizable_tool_label(tool);
             let description = tool_rail_description(tool);
+            let description_tooltip = description.clone();
             let is_bottom = bottom;
             let pin_tooltip = crate::locale::text(
                 if is_bottom {
@@ -621,8 +598,8 @@ impl ToolRailCustomizer {
 
             let drag_handle = div()
                 .id(format!("tool-rail-drag-{tool:?}"))
-                .w(px(28.))
-                .h(px(32.))
+                .w(theme.metrics.control_height)
+                .h(theme.metrics.control_height)
                 .flex_shrink_0()
                 .flex()
                 .items_center()
@@ -647,16 +624,19 @@ impl ToolRailCustomizer {
 
             let mut row = div()
                 .id(format!("tool-rail-customizer-row-{tool:?}"))
+                .when(cfg!(feature = "right-rail-acceptance"), |row| {
+                    row.debug_selector(move || format!("rr-customizer-row-{tool:?}"))
+                })
                 .w_full()
-                .min_h(px(56.))
+                .min_h(theme.metrics.toolbar_height + theme.metrics.gap * 2.)
                 .flex()
                 .flex_wrap()
                 .items_center()
-                .gap_x_2()
-                .gap_y_1()
-                .px_2()
-                .py_1()
-                .rounded_md()
+                .gap_x(theme.metrics.gap)
+                .gap_y(theme.metrics.gap / 2.)
+                .px(theme.metrics.gap)
+                .py(theme.metrics.gap / 2.)
+                .rounded(theme.control_radius)
                 .border_1()
                 .border_color(theme.panel.opacity(0.0))
                 .bg(if visible {
@@ -664,7 +644,6 @@ impl ToolRailCustomizer {
                 } else {
                     theme.subtle_background()
                 })
-                .opacity(if visible { 1.0 } else { 0.62 })
                 .on_drop(
                     cx.listener(move |customizer, dragged: &ToolRailToolId, _, cx| {
                         customizer.drop_before(*dragged, tool, cx);
@@ -681,8 +660,8 @@ impl ToolRailCustomizer {
                 .child(
                     div()
                         .id(format!("tool-rail-customizer-icon-{tool:?}"))
-                        .w(px(32.))
-                        .h(px(32.))
+                        .w(theme.metrics.control_height)
+                        .h(theme.metrics.control_height)
                         .flex_shrink_0()
                         .flex()
                         .items_center()
@@ -694,7 +673,7 @@ impl ToolRailCustomizer {
                 )
                 .child(
                     div()
-                        .min_w(px(128.))
+                        .min_w(gpui_kit::rems(8.))
                         .flex_1()
                         .flex()
                         .flex_col()
@@ -706,10 +685,13 @@ impl ToolRailCustomizer {
                                 .child(
                                     div()
                                         .truncate()
-                                        .text_size(px(13.))
-                                        .line_height(px(19.5))
+                                        .text_size(theme.text_sm)
                                         .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                        .text_color(theme.foreground)
+                                        .text_color(if visible {
+                                            theme.foreground
+                                        } else {
+                                            theme.muted
+                                        })
                                         .child(label.clone()),
                                 )
                                 .when(is_bottom, |this| {
@@ -726,10 +708,13 @@ impl ToolRailCustomizer {
                         )
                         .child(
                             div()
+                                .id(format!("tool-rail-customizer-description-{tool:?}"))
                                 .truncate()
-                                .text_size(px(11.))
-                                .line_height(px(16.5))
-                                .text_color(theme.muted.opacity(0.78))
+                                .text_size(theme.text_xs)
+                                .text_color(theme.muted)
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(description_tooltip.clone()).build(window, cx)
+                                })
                                 .child(description),
                         ),
                 )
@@ -738,7 +723,9 @@ impl ToolRailCustomizer {
                         .compact()
                         .outline()
                         .disabled(saving)
-                        .w(px(112.))
+                        .w(gpui_kit::rems(7.))
+                        .h(theme.metrics.control_height)
+                        .flex_shrink_0()
                         .rounded(theme.control_radius)
                         .bg(theme.field_surface())
                         .border_color(theme.strong_border())
@@ -746,22 +733,23 @@ impl ToolRailCustomizer {
                         .when(saving, |button| button.opacity(0.5))
                         .dropdown_caret(true)
                         .accessibility_label(crate::locale::text(
-                            format!("打开位置 {label}"),
-                            format!("Open placement for {label}"),
+                            format!("{label} 打开位置：{current_placement}"),
+                            format!("{label} placement: {current_placement}"),
                         ))
+                        .tooltip(current_placement.clone())
                         .child(
                             div()
                                 .min_w(px(0.))
                                 .flex_1()
                                 .truncate()
-                                .text_size(px(11.))
-                                .line_height(px(16.5))
-                                .child(current_placement.clone()),
+                                .text_size(theme.text_xs)
+                                .child(placement_trigger_label(placement)),
                         );
                     #[cfg(feature = "right-rail-acceptance")]
                     let placement_button = placement_button
                         .debug_selector(move || format!("rr-customizer-placement-{tool:?}"));
-                    placement_button.dropdown_menu(move |mut menu, _, _| {
+                    placement_button.dropdown_menu(move |menu, _, _| {
+                        let mut menu = crate::ui_popup::dropdown_menu(menu, theme);
                         for (label, candidate_placement) in placement_options.iter().cloned() {
                             let item_entity = menu_entity.clone();
                             menu = menu.item(
@@ -781,6 +769,8 @@ impl ToolRailCustomizer {
                     Button::new(format!("tool-rail-pin-{tool:?}"))
                         .compact()
                         .ghost()
+                        .w(theme.metrics.control_height)
+                        .h(theme.metrics.control_height)
                         .icon(IconName::PanelBottom)
                         .selected(is_bottom)
                         .disabled(saving)
@@ -813,6 +803,8 @@ impl ToolRailCustomizer {
                     Button::new(format!("tool-rail-up-{tool:?}"))
                         .compact()
                         .ghost()
+                        .w(theme.metrics.control_height)
+                        .h(theme.metrics.control_height)
                         .icon(IconName::ArrowUp)
                         .accessibility_label(crate::locale::text(
                             format!("上移 {label}"),
@@ -828,6 +820,8 @@ impl ToolRailCustomizer {
                     Button::new(format!("tool-rail-down-{tool:?}"))
                         .compact()
                         .ghost()
+                        .w(theme.metrics.control_height)
+                        .h(theme.metrics.control_height)
                         .icon(IconName::ArrowDown)
                         .accessibility_label(crate::locale::text(
                             format!("下移 {label}"),
@@ -840,23 +834,43 @@ impl ToolRailCustomizer {
                         }),
                 )
                 .child(
-                    Switch::new(format!("tool-rail-visible-{tool:?}"))
-                        .checked(visible)
-                        .color(theme.accent)
-                        .disabled(saving || last_visible)
-                        .accessibility_label(crate::locale::text(
-                            format!("{} {label}", if visible { "隐藏" } else { "显示" }),
-                            format!("{} {label}", if visible { "Hide" } else { "Show" }),
-                        ))
-                        .on_change(move |next, _, app| {
-                            visibility_entity.update(app, |customizer, cx| {
-                                customizer.set_visible(tool, *next, cx);
-                            });
-                        }),
+                    div()
+                        .id(format!("tool-rail-visibility-slot-{tool:?}"))
+                        .when(cfg!(feature = "right-rail-acceptance"), |slot| {
+                            slot.debug_selector(move || {
+                                format!("rr-customizer-visibility-{tool:?}")
+                            })
+                        })
+                        .flex_shrink_0()
+                        .child(
+                            Switch::new(format!("tool-rail-visible-{tool:?}"))
+                                .checked(visible)
+                                .color(theme.accent)
+                                .disabled(saving || last_visible)
+                                .accessibility_label(crate::locale::text(
+                                    format!("{} {label}", if visible { "隐藏" } else { "显示" }),
+                                    format!("{} {label}", if visible { "Hide" } else { "Show" }),
+                                ))
+                                .on_change(move |next, _, app| {
+                                    visibility_entity.update(app, |customizer, cx| {
+                                        customizer.set_visible(tool, *next, cx);
+                                    });
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(format!("tool-rail-hidden-indicator-{tool:?}"))
+                        .when(cfg!(feature = "right-rail-acceptance"), |slot| {
+                            slot.debug_selector(move || {
+                                format!("rr-customizer-hidden-indicator-{tool:?}")
+                            })
+                        })
+                        .size(theme.metrics.icon_size)
+                        .flex_shrink_0()
+                        .text_color(theme.muted)
+                        .when(!visible, |slot| slot.child(IconName::EyeOff)),
                 );
-            if !visible {
-                row = row.child(div().text_color(theme.muted).child(IconName::EyeOff));
-            }
             row = row.when(saving, |this| this.opacity(0.72));
             section_view = section_view.child(row);
         }
@@ -866,7 +880,7 @@ impl ToolRailCustomizer {
 
 /// Root 创建对话框前复用唯一的设置 panel 实体，保存请求仍进入既有草稿校验和 CAS。
 impl RootView {
-    /// 从当前设置快照准备可复用草稿；Kit 保留焦点门禁，材质参数与 main 的 ModalShell 共用。
+    /// 从当前设置快照准备可复用草稿；Kit 保留焦点门禁并使用与工作台一致的短淡入。
     ///
     /// @author kongweiguang
     pub(super) fn open_tool_rail_customizer(
@@ -898,6 +912,7 @@ impl RootView {
             let header_close = close_entity.clone();
             let height = px((window.viewport_size().height.as_f32() - 48.).clamp(0., 704.));
             dialog
+                .entrance(DialogEntrance::Fade)
                 .backdrop_blur(theme.modal_blur_radius)
                 .surface_backdrop_filter(theme.floating_blur_radius, theme.floating_saturation)
                 .p_0()
@@ -907,29 +922,42 @@ impl RootView {
                 .bg(theme.floating_surface)
                 .margin_top((window.viewport_size().height - height) / 2.)
                 .title(
-                    div().w_full().flex().items_start().justify_between()
-                        .px(px(20.)).py(px(16.)).border_b_1().border_color(theme.tool_panel_border)
-                        .child(div().min_w(px(0.)).flex_1()
-                            .child(div().text_size(px(17.)).line_height(px(24.))
+                    crate::ui_surface::panel_header(theme)
+                        .w_full()
+                        .min_h(theme.metrics.toolbar_height)
+                        .px(theme.metrics.dialog_padding)
+                        .border_color(theme.tool_panel_border)
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .text_size(theme.text_heading)
                                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                .text_color(theme.foreground)
-                                .child(crate::locale::text("自定义工具栏", "Customize toolbar")))
-                            .child(div().mt_1().text_size(px(13.)).line_height(px(20.))
-                                .font_weight(gpui_kit::FontWeight::NORMAL).text_color(theme.muted)
-                                .child(crate::locale::text(
-                                    "每个工具都可独立设置显示、顺序、底部固定位置和内容打开方式。",
-                                    "Set each tool's visibility, order, bottom pin, and panel placement independently."))))
-                        .child(Button::new("tool-rail-customizer-close").compact().ghost()
-                            .icon(IconName::X).disabled(busy)
-                            .accessibility_label(crate::locale::text("关闭弹窗", "Close dialog"))
-                            .on_click(move |_, window, app| {
-                                header_close.update(app, |customizer, cx| customizer.mark_closed(cx));
-                                window.close_dialog(app);
-                            }))
+                                .child(crate::locale::text("自定义工具栏", "Customize toolbar")),
+                        )
+                        .child(
+                            Button::new("tool-rail-customizer-close")
+                                .compact()
+                                .ghost()
+                                .w(theme.metrics.control_height)
+                                .h(theme.metrics.control_height)
+                                .flex_shrink_0()
+                                .icon(IconName::X)
+                                .disabled(busy)
+                                .accessibility_label(crate::locale::text(
+                                    "关闭弹窗",
+                                    "Close dialog",
+                                ))
+                                .on_click(move |_, window, app| {
+                                    header_close
+                                        .update(app, |customizer, cx| customizer.mark_closed(cx));
+                                    window.close_dialog(app);
+                                }),
+                        ),
                 )
                 .footer(footer)
-                .width(px(768.))
-                .max_w(px(768.))
+                .width(window.rem_size() * 48.)
+                .max_w(window.rem_size() * 48.)
                 .keyboard(!busy)
                 .overlay_closable(!busy)
                 .close_button(false)
@@ -1107,6 +1135,18 @@ fn move_to_section_end(sections: &mut ToolRailSections, source: ToolRailToolId, 
     }
 }
 
+/// 触发器用可辨识的短名称；菜单与无障碍标签继续说明完整位置语义。
+///
+/// @author kongweiguang
+fn placement_trigger_label(placement: ToolRailPanelPlacement) -> SharedString {
+    match placement {
+        ToolRailPanelPlacement::Attached => crate::locale::text("贴靠右栏", "Right rail"),
+        ToolRailPanelPlacement::Left => crate::locale::text("左侧栏", "Left sidebar"),
+        ToolRailPanelPlacement::Bottom => crate::locale::text("底部面板", "Bottom panel"),
+        ToolRailPanelPlacement::Center => crate::locale::text("自由浮窗", "Floating"),
+    }
+}
+
 /// 返回 main 自定义器的四种方向名称，菜单值仍使用稳定的 placement 枚举。
 fn placement_options() -> [(SharedString, ToolRailPanelPlacement); 4] {
     [
@@ -1129,19 +1169,24 @@ fn placement_options() -> [(SharedString, ToolRailPanelPlacement); 4] {
     ]
 }
 
-/// 编辑器标题采用 main 右栏的产品名称，不透出 Rust 枚举标识。
+/// 编辑器与工作台共用工具名称，避免同一入口在设置和 Rail 中出现不同叫法。
 fn customizable_tool_label(tool: ToolRailToolId) -> SharedString {
-    match tool {
-        ToolRailToolId::Context => crate::locale::text("当前上下文", "Current context"),
-        ToolRailToolId::AgentLauncher => "Agent Launcher".into(),
-        ToolRailToolId::Sftp => crate::locale::text("文件", "Files"),
-        ToolRailToolId::Containers => crate::locale::text("容器", "Containers"),
-        ToolRailToolId::Snippets => crate::locale::text("片段", "Snippets"),
-        ToolRailToolId::Tmux => "tmux".into(),
-        ToolRailToolId::Ports => crate::locale::text("端口", "Ports"),
-        ToolRailToolId::System => crate::locale::text("系统", "System"),
-        ToolRailToolId::Logs => crate::locale::text("命令历史", "Command history"),
-    }
+    super::workbench::tool_rail_label(tool)
+}
+
+/// 为标题、页脚与反馈保留空间；字体放大时仍保留至少一个可滚动的列表槽位。
+///
+/// @author kongweiguang
+fn customizer_list_max_height(viewport_height: Pixels, metrics: UiMetrics) -> Pixels {
+    let reserved = metrics.dialog_padding * 2.
+        + metrics.toolbar_height * 3.
+        + metrics.gap * 4.
+        + metrics.panel_padding * 2.;
+    let minimum = metrics.row_height.min(viewport_height / 3.);
+    (viewport_height - reserved)
+        .max(minimum)
+        .min(viewport_height)
+        .min(metrics.control_height * 17.5)
 }
 
 /// 为每个 rail 工具提供 main 对应的一行说明，辅助用户确认目标而不暴露内部服务名称。

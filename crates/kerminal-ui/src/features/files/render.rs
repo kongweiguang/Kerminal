@@ -31,7 +31,7 @@ const FILES_WORKBENCH_MIN_COLUMN_WIDTH: f32 = 200.;
 const FILES_WORKBENCH_STACK_THRESHOLD: f32 = FILES_WORKBENCH_MIN_COLUMN_WIDTH * 2. + 20.;
 
 impl Render for FilesPane {
-    /// 工作区按自身测量宽度选择双列或极窄双行；紧凑右栏保持独立的主题和目标语义。
+    /// 工作区按自身测量宽度选择布局；紧凑右栏缺少可信目标时隐藏传输操作，避免暴露其他工作区记录。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -185,7 +185,9 @@ impl Render for FilesPane {
             pane = pane.child(render_bookmarks(self, theme, cx));
         }
         // 传输区只展示当前任务和必要恢复操作，不暴露冷档入口。
-        pane = pane.child(transfers::render_transfers(self, theme, cx));
+        if !self.compact_layout || self.compact_target_is_available() {
+            pane = pane.child(transfers::render_transfers(self, theme, cx));
+        }
         if let Some(details) = render_status_details(self, theme) {
             pane = pane.child(details);
         }
@@ -426,6 +428,7 @@ fn render_bookmarks(
 }
 
 /// 必要反馈可展开或主动关闭；普通成功由对象状态呈现，不产生额外底栏。
+/// 目录错误从当前侧派生并提供原位重试，列表、树与保留旧清单的刷新失败共用同一入口。
 ///
 /// @author kongweiguang
 fn render_status(
@@ -433,9 +436,20 @@ fn render_status(
     theme: ThemeTokens,
     cx: &mut Context<FilesPane>,
 ) -> Option<AnyElement> {
-    let status = pane.status.clone()?;
+    let status = pane.visible_operation_status()?.to_owned();
+    let side = if pane.compact_layout {
+        1
+    } else {
+        pane.active_side
+    };
+    // 底栏重试只跟随尚未内联展示的目录错误；内联错误卡自带重试时不会再出现第二个入口。
+    let directory_retry = if pane.directory_error_is_inline() {
+        None
+    } else {
+        pane.panels[side].directory_error.clone()
+    };
     let status_tooltip = status.clone();
-    let show_details = pane.status.as_deref().is_some_and(|status| {
+    let show_details = pane.visible_operation_status().is_some_and(|status| {
         pane.status_details_expanded
             || status.len() > 36
             || status.contains('\n')
@@ -492,7 +506,22 @@ fn render_status(
                     .child(status),
             )
             .children(details_button)
-            .child(
+            .children(directory_retry.map(|error| {
+                Button::new("files-retry-directory")
+                    .compact()
+                    .ghost()
+                    .icon(IconName::RefreshCw)
+                    .label(locale::text("重试", "Retry"))
+                    .accessibility_label(locale::text(
+                        "重新读取当前目录",
+                        "Retry current directory",
+                    ))
+                    .tooltip(error)
+                    .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
+                        pane.retry_panel_load(side, cx);
+                    }))
+            }))
+            .children(pane.status.as_ref().map(|_| {
                 Button::new("files-dismiss-status")
                     .compact()
                     .ghost()
@@ -502,20 +531,21 @@ fn render_status(
                         pane.status = None;
                         pane.status_details_expanded = false;
                         cx.notify();
-                    })),
-            )
+                    }))
+            }))
             .into_any_element(),
     )
 }
 
 /// 将批量失败和取消详情放入有界滚动区域，避免窄栏状态栏只留下省略后的错误摘要。
+/// 详情与摘要使用同一派生来源，目录错误不重复写入业务反馈状态。
 ///
 /// @author kongweiguang
 fn render_status_details(pane: &FilesPane, theme: ThemeTokens) -> Option<AnyElement> {
     if !pane.status_details_expanded {
         return None;
     }
-    let status = pane.status.as_ref()?;
+    let status = pane.visible_operation_status()?;
     Some(
         div()
             .id("files-status-details-panel")
@@ -531,7 +561,7 @@ fn render_status_details(pane: &FilesPane, theme: ThemeTokens) -> Option<AnyElem
             .text_color(theme.foreground)
             .role(gpui_kit::Role::Region)
             .aria_label(locale::text("完整操作结果", "Full operation result"))
-            .child(status.clone())
+            .child(status.to_owned())
             .into_any_element(),
     )
 }

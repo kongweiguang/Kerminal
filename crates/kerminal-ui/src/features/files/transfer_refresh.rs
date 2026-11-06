@@ -18,8 +18,7 @@ pub(super) enum TransferRefreshScope {
 }
 
 impl FilesPane {
-    /// 队列清理或广播丢帧可能抹去提交回执，保守回读已展示目录并使缓存标签失效。
-    /// 在接收事件时执行，避免后续队列读取被代次门禁丢弃时错过此次失效。
+    /// 无法取得队列快照时仍保守回读已展示目录，避免删除事实随读取失败丢失。
     ///
     /// @author kongweiguang
     pub(super) fn refresh_after_uncertain_transfer_change(&mut self, cx: &mut Context<Self>) {

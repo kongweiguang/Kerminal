@@ -496,6 +496,34 @@ impl RootView {
         });
     }
 
+    /// 重新连接会先撤销旧输入 handler；固定点击时的真实焦点，等新代次绑定安装后再决定是否回焦。
+    /// 鼠标按下这个按钮不会迁移焦点，因此意图必须跨成功、失败和取消保留；否则旧 handler 撤销后
+    /// 终端会失去可输入焦点。实际交接仍核对用户当前焦点，用户期间切到其它控件时不会被抢回。
+    ///
+    /// 不绑定 workspace restore generation，因为重连复用同一 pane；实际回焦仍由
+    /// `restore_pending_pane_focus` 核对当前 Tab、pane、session 与用户焦点。
+    ///
+    /// @author kongweiguang
+    pub(super) fn remember_reconnect_pane_focus_intent(
+        &mut self,
+        tab_id: TabId,
+        pane_id: PaneId,
+        session_id: SessionId,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pane_focus_intent_generation =
+            self.pane_focus_intent_generation.wrapping_add(1).max(1);
+        self.pending_pane_focus_intent = Some(PendingPaneFocusIntent {
+            generation: self.pane_focus_intent_generation,
+            tab_id,
+            pane_id,
+            session_id: Some(session_id),
+            restore_generation: None,
+            expected_focus: window.focused(cx),
+        });
+    }
+
     /// pane 和 Agent 新建共用用户导航代次；显式切换输入目标时撤销所有迟到首帧的抢焦点意图。
     ///
     /// @author kongweiguang

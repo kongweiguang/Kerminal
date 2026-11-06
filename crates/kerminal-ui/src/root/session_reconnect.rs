@@ -10,7 +10,7 @@ use std::{
     },
 };
 
-use gpui_kit::Context;
+use gpui_kit::{Context, Window};
 use kerminal_application::{
     AppError, PublicErrorCode, SessionService,
     sessions::{SessionFilter, UiSessionBinding},
@@ -23,20 +23,17 @@ use tokio_util::sync::CancellationToken;
 
 use super::{RootView, workspace_runtime::RuntimePanePhase};
 
-/// Renderer 可用的重连状态；身份绑定来自 SessionService，不从 terminal 文本推导。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct SessionReconnectProjection {
-    pub binding: UiSessionBinding,
-    pub state: SessionReconnectState,
-}
-
-/// 标题栏刷新按钮使用服务观察到的精确绑定；同 pane 的重连或重启期间维持禁用态。
+/// 标题栏唯一边界会话动作；运行中重建 transport 与断开后恢复连接都投影为同一槽位。
 ///
 /// @author kongweiguang
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct SessionRestartProjection {
+pub(super) struct SessionActionProjection {
     pub binding: UiSessionBinding,
     pub busy: bool,
+    /// 进行中的尝试用于让标题栏同一按钮取消；稳定态没有可取消目标。
+    pub attempt_id: Option<u64>,
+    /// 取消已提交但清理回执未到，按钮必须保留禁用态，不能改投新请求。
+    pub cancelling: bool,
 }
 
 /// 供右栏读取器使用的同轮服务观察；目标与 generation 由 SessionService 一起确认。
@@ -45,16 +42,6 @@ pub(super) struct SessionPanelObservation {
     pub binding: UiSessionBinding,
     pub target: SessionTarget,
     pub lifecycle: SessionLifecycle,
-}
-
-/// 当前 pane 的唯一手动重连动作及服务确认状态。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum SessionReconnectState {
-    Available,
-    Connecting { attempt_id: u64 },
-    Cancelling { attempt_id: u64 },
-    Failed { message: String },
-    Cancelled,
 }
 
 /// 同一 SessionId 的真实列表信息与 engine generation；二者必须在同一查询轮次吻合。
@@ -132,7 +119,6 @@ struct InFlightReconnect {
     incarnation: u64,
     binding: UiSessionBinding,
     target: SessionTarget,
-    kind: SessionOperationKind,
     cancellation: Arc<ReconnectCancellation>,
     cancelling: bool,
 }
@@ -218,7 +204,10 @@ impl SessionReconnectController {
         }
     }
 
-    /// 登记一个与缓存 binding 完全相同的唯一重连；同 pane 的取消收尾未 ACK 时拒绝新尝试。
+    /// 登记与缓存 binding 完全相同的唯一重新连接；运行中走 restart，断开后走 reconnect。
+    ///
+    /// 两种 service 入口的准入生命周期不同，但都复用同一 pane 锁与 generation 校验，
+    /// 因此返回实际操作类型供后台任务选择不会扩大普通 MCP reconnect 的契约。
     ///
     /// @author kongweiguang
     fn begin_attempt(
@@ -227,33 +216,22 @@ impl SessionReconnectController {
         tab_id: &TabId,
         binding: UiSessionBinding,
         target: SessionTarget,
-    ) -> Option<(u64, Arc<ReconnectCancellation>)> {
-        self.begin_operation(
-            pane_id,
-            tab_id,
-            binding,
-            target,
-            SessionOperationKind::Reconnect,
-        )
-    }
-
-    /// 登记唯一的重启操作；与断线重连共享 pane 锁，防止双击或交叉请求替换 transport。
-    ///
-    /// @author kongweiguang
-    fn begin_restart_attempt(
-        &mut self,
-        pane_id: &PaneId,
-        tab_id: &TabId,
-        binding: UiSessionBinding,
-        target: SessionTarget,
-    ) -> Option<(u64, Arc<ReconnectCancellation>)> {
-        self.begin_operation(
-            pane_id,
-            tab_id,
-            binding,
-            target,
-            SessionOperationKind::Restart,
-        )
+    ) -> Option<(u64, Arc<ReconnectCancellation>, SessionOperationKind)> {
+        let kind = match self
+            .panes
+            .get(pane_id)?
+            .observation
+            .as_ref()?
+            .info
+            .lifecycle
+        {
+            SessionLifecycle::Running => SessionOperationKind::Restart,
+            SessionLifecycle::Exited | SessionLifecycle::Failed => SessionOperationKind::Reconnect,
+            _ => return None,
+        };
+        let (attempt_id, cancellation) =
+            self.begin_operation(pane_id, tab_id, binding, target, kind)?;
+        Some((attempt_id, cancellation, kind))
     }
 
     /// 将两类原位服务操作纳入同一 pane 锁，并使操作开始前的 refresh 回执失效。
@@ -302,7 +280,6 @@ impl SessionReconnectController {
                 incarnation,
                 binding,
                 target,
-                kind,
                 cancellation: Arc::clone(&cancellation),
                 cancelling: false,
             },
@@ -383,20 +360,18 @@ impl SessionReconnectController {
         }
     }
 
-    /// 服务操作完成后才释放 in-flight owner；过期 incarnation 不得改变当前 pane 的显示状态。
+    /// 服务操作完成后才释放 in-flight owner；返回可见终态供 Root 决定提示与回焦。
+    ///
+    /// 过期 incarnation 不得改变当前 pane 的显示状态，因此返回 `None` 而不是伪成功。
     fn finish_attempt(
         &mut self,
         attempt_id: u64,
         result: Result<ReconnectObservation, AppError>,
-    ) -> bool {
-        let Some(attempt) = self.in_flight.remove(&attempt_id) else {
-            return false;
-        };
-        let Some(state) = self.panes.get_mut(&attempt.pane_id) else {
-            return false;
-        };
+    ) -> Option<ReconnectResultState> {
+        let attempt = self.in_flight.remove(&attempt_id)?;
+        let state = self.panes.get_mut(&attempt.pane_id)?;
         if state.incarnation != attempt.incarnation || state.active_attempt != Some(attempt_id) {
-            return false;
+            return None;
         }
         state.active_attempt = None;
         match result {
@@ -407,14 +382,9 @@ impl SessionReconnectController {
                     || observation.info.lifecycle != SessionLifecycle::Running
                     || observation.session_generation <= attempt.binding.session_generation
                 {
-                    state.result = ReconnectResultState::Failed(match attempt.kind {
-                        SessionOperationKind::Reconnect => {
-                            "重连完成后会话身份或代次未能确认。".to_owned()
-                        }
-                        SessionOperationKind::Restart => {
-                            "重启完成后会话身份或代次未能确认。".to_owned()
-                        }
-                    });
+                    state.result = ReconnectResultState::Failed(
+                        "重新连接完成后会话身份或代次未能确认。".to_owned(),
+                    );
                 } else {
                     state.observation = Some(observation);
                     state.result = ReconnectResultState::Ready;
@@ -427,88 +397,24 @@ impl SessionReconnectController {
                 state.result = ReconnectResultState::Failed(error.public_message().to_owned());
             }
         }
-        true
+        Some(state.result.clone())
     }
 
-    /// 只为已断开的既有会话生成重连投影，避免 pane 运行或关闭时启动重复 transport。
+    /// 为任何可重新连接的既有 session 返回精确绑定；同 pane 操作在途时只暴露同一 attempt。
     ///
     /// @author kongweiguang
-    fn projection(
+    fn action_projection(
         &self,
         pane_id: &PaneId,
         tab_id: &TabId,
         session_id: &SessionId,
         target: &SessionTarget,
         phase: RuntimePanePhase,
-    ) -> Option<SessionReconnectProjection> {
+    ) -> Option<SessionActionProjection> {
         if phase != RuntimePanePhase::Ready {
             return None;
         }
-        let state = self.panes.get(pane_id)?;
-        if let Some(attempt_id) = state.active_attempt
-            && let Some(attempt) = self.in_flight.get(&attempt_id)
-            && attempt.kind == SessionOperationKind::Reconnect
-            && attempt.incarnation == state.incarnation
-            && attempt.tab_id == *tab_id
-            && attempt.binding.session_id == *session_id
-            && attempt.target == *target
-        {
-            return Some(SessionReconnectProjection {
-                binding: attempt.binding.clone(),
-                state: if attempt.cancelling {
-                    SessionReconnectState::Cancelling { attempt_id }
-                } else {
-                    SessionReconnectState::Connecting { attempt_id }
-                },
-            });
-        }
-
-        if self
-            .in_flight
-            .values()
-            .any(|attempt| attempt.pane_id == *pane_id)
-        {
-            return None;
-        }
-
-        let observation = state.observation.as_ref()?;
-        let binding = UiSessionBinding {
-            session_id: observation.info.session_id.clone(),
-            owner: observation.info.owner.clone(),
-            session_generation: observation.session_generation,
-        };
-        if observation.info.session_id != *session_id
-            || observation.info.target != *target
-            || !observation_matches(observation, tab_id, pane_id, &binding, target)
-            || !can_reconnect(&observation.info)
-        {
-            return None;
-        }
-        let state = match &state.result {
-            ReconnectResultState::Ready => SessionReconnectState::Available,
-            ReconnectResultState::Failed(message) => SessionReconnectState::Failed {
-                message: message.clone(),
-            },
-            ReconnectResultState::Cancelled => SessionReconnectState::Cancelled,
-        };
-        Some(SessionReconnectProjection { binding, state })
-    }
-
-    /// 为任何可显式重启的既有 session 返回精确绑定；同 pane 重连或重启在途时按钮固定禁用。
-    ///
-    /// @author kongweiguang
-    fn restart_projection(
-        &self,
-        pane_id: &PaneId,
-        tab_id: &TabId,
-        session_id: &SessionId,
-        target: &SessionTarget,
-        phase: RuntimePanePhase,
-    ) -> Option<SessionRestartProjection> {
-        if phase != RuntimePanePhase::Ready {
-            return None;
-        }
-        if let Some(attempt) = self.in_flight.values().find(|attempt| {
+        if let Some((attempt_id, attempt)) = self.in_flight.iter().find(|(_, attempt)| {
             attempt.pane_id == *pane_id
                 && attempt.tab_id == *tab_id
                 && attempt.binding.session_id == *session_id
@@ -518,9 +424,11 @@ impl SessionReconnectController {
                     .get(pane_id)
                     .is_some_and(|state| attempt.incarnation == state.incarnation)
         }) {
-            return Some(SessionRestartProjection {
+            return Some(SessionActionProjection {
                 binding: attempt.binding.clone(),
                 busy: true,
+                attempt_id: Some(*attempt_id),
+                cancelling: attempt.cancelling,
             });
         }
         if self
@@ -545,9 +453,11 @@ impl SessionReconnectController {
         {
             return None;
         }
-        Some(SessionRestartProjection {
+        Some(SessionActionProjection {
             binding,
             busy: false,
+            attempt_id: None,
+            cancelling: false,
         })
     }
 
@@ -685,13 +595,15 @@ impl RootView {
         .detach();
     }
 
-    /// 从 pane 现状生成可见 action；异步重连仍会独立复查 service 权威状态。
-    pub(super) fn session_reconnect_projection(
+    /// 为终端标题栏提供唯一重新连接按钮绑定；进行中也投影同一 attempt 供取消。
+    ///
+    /// @author kongweiguang
+    pub(super) fn session_action_projection(
         &self,
         pane_id: &PaneId,
-    ) -> Option<SessionReconnectProjection> {
+    ) -> Option<SessionActionProjection> {
         let pane = self.workspace_runtime.pane(pane_id)?;
-        self.session_reconnect.projection(
+        self.session_reconnect.action_projection(
             pane_id,
             &pane.tab_id,
             pane.session_id.as_ref()?,
@@ -700,147 +612,36 @@ impl RootView {
         )
     }
 
-    /// 为终端标题栏提供重启按钮绑定；即使重连进行中也投影 busy，避免同 pane 并发操作。
+    /// 标题栏断开标记只来自当前 pane 的完整服务观察；启动、重连进行中都不冒充断开。
+    /// 断开的终端正文保持只读，用户需要一眼看到唯一的重连入口。
     ///
     /// @author kongweiguang
-    pub(super) fn session_restart_projection(
-        &self,
-        pane_id: &PaneId,
-    ) -> Option<SessionRestartProjection> {
-        let pane = self.workspace_runtime.pane(pane_id)?;
-        self.session_reconnect.restart_projection(
-            pane_id,
-            &pane.tab_id,
-            pane.session_id.as_ref()?,
-            pane.target.as_ref()?,
-            pane.phase,
-        )
+    pub(super) fn pane_session_disconnected(&self, pane_id: &PaneId) -> bool {
+        self.session_reconnect
+            .panes
+            .get(pane_id)
+            .and_then(|state| state.observation.as_ref())
+            .is_some_and(|observation| {
+                matches!(
+                    observation.info.lifecycle,
+                    SessionLifecycle::Exited | SessionLifecycle::Failed
+                )
+            })
     }
 
-    /// 显式重启绑定原 session；开始时撤销代理旧代投影，即使 SessionId 在重启后保持不变。
+    /// 原位重新连接固定 pane 和 owner；运行中重建 transport，断开后恢复连接，对用户保持同一语义。
+    ///
+    /// 开始即撤销旧输入与未完成选区，避免旧 generation 继续写入；完成、失败和取消都重新读取
+    /// 精确 binding；旧目录和快照票据同步失效，不能在新代首帧前从持久化回退继承旧目录。
+    /// 回焦意图保留到交接时，只有用户仍停留在原焦点且新绑定可写才恢复输入。
     ///
     /// @author kongweiguang
-    pub(super) fn restart_workspace_pane(
+    pub(super) fn reconnect_workspace_pane(
         &mut self,
         tab_id: TabId,
         pane_id: PaneId,
         binding: UiSessionBinding,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(pane) = self.workspace_runtime.pane(&pane_id) else {
-            return;
-        };
-        let Some(target) = pane.target.clone() else {
-            self.status = Some("此 pane 当前没有可重启的终端会话。".into());
-            cx.notify();
-            return;
-        };
-        let expected_owner = SessionOwner::Ui {
-            tab_id: tab_id.clone(),
-            pane_id: pane_id.clone(),
-        };
-        if pane.tab_id != tab_id
-            || pane.phase != RuntimePanePhase::Ready
-            || pane.session_id.as_ref() != Some(&binding.session_id)
-            || binding.owner != expected_owner
-        {
-            self.status = Some("重启请求已过期，终端绑定需要刷新。".into());
-            cx.notify();
-            return;
-        }
-        let Some((attempt_id, cancellation)) = self.session_reconnect.begin_restart_attempt(
-            &pane_id,
-            &tab_id,
-            binding.clone(),
-            target.clone(),
-        ) else {
-            self.status = Some("此终端当前不可重启，状态已变化或正在处理另一请求。".into());
-            cx.notify();
-            return;
-        };
-
-        self.refresh_proxy_panel(cx);
-        self.invalidate_pane_input_handler(&binding.session_id, cx);
-        let sessions = Arc::clone(&self.services.sessions);
-        let executor = self.services.executor.clone();
-        let task_pane = pane_id.clone();
-        let task_tab = tab_id.clone();
-        let completion_session_id = binding.session_id.clone();
-        let completion_pane = task_pane.clone();
-        let completion_tab = task_tab.clone();
-        let this = cx.weak_entity();
-        self.refresh_workspace_views(cx);
-        cx.spawn(async move |_, cx| {
-            let result = executor
-                .run(move |task_cancellation| async move {
-                    cancellation.install(task_cancellation.clone());
-                    if task_cancellation.is_cancelled() {
-                        return Err(AppError::cancelled("终端重启已取消"));
-                    }
-                    let before = read_live_observation(
-                        Arc::clone(&sessions),
-                        binding.session_id.clone(),
-                        binding.owner.clone(),
-                        target.clone(),
-                    )
-                    .await?;
-                    validate_restart_before(&before, &binding, &target, &task_tab, &task_pane)?;
-                    if task_cancellation.is_cancelled() {
-                        return Err(AppError::cancelled("终端重启已取消"));
-                    }
-
-                    let acknowledged = sessions
-                        .restart_cancellable(binding.session_id.clone(), task_cancellation.clone())
-                        .await?;
-                    if acknowledged.session_id != binding.session_id
-                        || acknowledged.owner != binding.owner
-                        || acknowledged.target != target
-                        || acknowledged.lifecycle != SessionLifecycle::Running
-                        || acknowledged.exit_status.is_some()
-                    {
-                        return Err(AppError::conflict("重启返回了不同的会话身份、目标或状态"));
-                    }
-
-                    let after = read_live_observation(
-                        sessions,
-                        binding.session_id.clone(),
-                        binding.owner.clone(),
-                        target.clone(),
-                    )
-                    .await?;
-                    validate_restart_after(&after, &before, &binding, &target)?;
-                    Ok(after)
-                })
-                .await;
-            let failure_message = result
-                .as_ref()
-                .err()
-                .map(|error| error.public_message().to_owned());
-            let _ = this.update(cx, |root, cx| {
-                if root.session_reconnect.finish_attempt(attempt_id, result) {
-                    // 重启期间启动的 watcher 可能仍携带旧 Running/Starting 查询；先撤销票据，再允许 render 建立新代次绑定。
-                    root.invalidate_pane_input_handler(&completion_session_id, cx);
-                    if let Some(message) = failure_message {
-                        root.status = Some(message.into());
-                    }
-                    root.refresh_workspace_views(cx);
-                    root.refresh_proxy_panel(cx);
-                    root.refresh_session_reconnect_state(completion_tab, completion_pane, cx);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// 原位重连固定 pane 和 owner；开始时撤销代理旧代投影，即使 SessionId 不变也不能复用。
-    ///
-    /// @author kongweiguang
-    pub(super) fn start_session_reconnect(
-        &mut self,
-        tab_id: TabId,
-        pane_id: PaneId,
-        binding: UiSessionBinding,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
         let Some(pane) = self.workspace_runtime.pane(&pane_id) else {
@@ -864,7 +665,7 @@ impl RootView {
             cx.notify();
             return;
         }
-        let Some((attempt_id, cancellation)) = self.session_reconnect.begin_attempt(
+        let Some((attempt_id, cancellation, operation)) = self.session_reconnect.begin_attempt(
             &pane_id,
             &tab_id,
             binding.clone(),
@@ -874,11 +675,26 @@ impl RootView {
             cx.notify();
             return;
         };
+        self.remember_reconnect_pane_focus_intent(
+            tab_id.clone(),
+            pane_id.clone(),
+            binding.session_id.clone(),
+            window,
+            cx,
+        );
         self.refresh_proxy_panel(cx);
+        let _ = self
+            .workspace_runtime
+            .invalidate_session_snapshot(&pane_id, &binding.session_id);
+        // 旧 handler 与选区都绑定旧 generation；先撤销，完成后再以 service 新绑定重建。
+        self.invalidate_pane_input_handler(&binding.session_id, cx);
         let sessions = Arc::clone(&self.services.sessions);
         let executor = self.services.executor.clone();
         let task_pane = pane_id.clone();
         let task_tab = tab_id.clone();
+        let completion_session_id = binding.session_id.clone();
+        let completion_pane = pane_id.clone();
+        let completion_tab = tab_id.clone();
         let this = cx.weak_entity();
         self.refresh_workspace_views(cx);
         cx.spawn(async move |_, cx| {
@@ -886,7 +702,7 @@ impl RootView {
                 .run(move |task_cancellation| async move {
                     cancellation.install(task_cancellation.clone());
                     if task_cancellation.is_cancelled() {
-                        return Err(AppError::cancelled("终端重连已取消"));
+                        return Err(AppError::cancelled("终端重新连接已取消"));
                     }
                     let before = read_live_observation(
                         Arc::clone(&sessions),
@@ -895,23 +711,49 @@ impl RootView {
                         target.clone(),
                     )
                     .await?;
-                    validate_reconnect_before(&before, &binding, &target, &task_tab, &task_pane)?;
+                    match operation {
+                        SessionOperationKind::Restart => {
+                            validate_restart_before(
+                                &before, &binding, &target, &task_tab, &task_pane,
+                            )?;
+                        }
+                        SessionOperationKind::Reconnect => {
+                            validate_reconnect_before(
+                                &before, &binding, &target, &task_tab, &task_pane,
+                            )?;
+                        }
+                    }
                     if task_cancellation.is_cancelled() {
-                        return Err(AppError::cancelled("终端重连已取消"));
+                        return Err(AppError::cancelled("终端重新连接已取消"));
                     }
 
-                    let acknowledged = sessions
-                        .reconnect_cancellable(
-                            binding.session_id.clone(),
-                            task_cancellation.clone(),
-                        )
-                        .await?;
+                    let acknowledged = match operation {
+                        SessionOperationKind::Restart => {
+                            sessions
+                                .restart_cancellable(
+                                    binding.session_id.clone(),
+                                    task_cancellation.clone(),
+                                )
+                                .await?
+                        }
+                        SessionOperationKind::Reconnect => {
+                            sessions
+                                .reconnect_cancellable(
+                                    binding.session_id.clone(),
+                                    task_cancellation.clone(),
+                                )
+                                .await?
+                        }
+                    };
                     if acknowledged.session_id != binding.session_id
                         || acknowledged.owner != binding.owner
                         || acknowledged.target != target
                         || acknowledged.lifecycle != SessionLifecycle::Running
+                        || acknowledged.exit_status.is_some()
                     {
-                        return Err(AppError::conflict("重连返回了不同的会话身份或目标"));
+                        return Err(AppError::conflict(
+                            "重新连接返回了不同的会话身份、目标或状态",
+                        ));
                     }
 
                     let after = read_live_observation(
@@ -921,12 +763,22 @@ impl RootView {
                         target.clone(),
                     )
                     .await?;
-                    validate_reconnect_after(&after, &before, &binding, &target)?;
+                    validate_reconnected_after(&after, &before, &binding, &target)?;
                     Ok(after)
                 })
                 .await;
             let _ = this.update(cx, |root, cx| {
-                if root.session_reconnect.finish_attempt(attempt_id, result) {
+                if let Some(outcome) = root.session_reconnect.finish_attempt(attempt_id, result) {
+                    if let ReconnectResultState::Failed(message) = outcome {
+                        root.status = Some(message.into());
+                    }
+                    // finish_attempt 已释放 busy；此时异步重读新 generation 才能重建可输入 handler。
+                    root.request_snapshot_binding_reconcile(
+                        completion_tab,
+                        completion_pane,
+                        completion_session_id,
+                        cx,
+                    );
                     root.refresh_workspace_views(cx);
                     root.refresh_proxy_panel(cx);
                     cx.notify();
@@ -1075,10 +927,10 @@ fn validate_reconnect_before(
     Ok(())
 }
 
-/// 重连 ACK 后再次确认仍是同一 session/owner/target，且新的 runtime generation 已就绪。
+/// 重新连接 ACK 后再次确认仍是同一 session/owner/target，且新的 runtime generation 已就绪。
 ///
 /// @author kongweiguang
-fn validate_reconnect_after(
+fn validate_reconnected_after(
     after: &ReconnectObservation,
     before: &ReconnectObservation,
     binding: &UiSessionBinding,
@@ -1088,9 +940,11 @@ fn validate_reconnect_after(
         || after.info.owner != binding.owner
         || after.info.target != *target
         || after.info.lifecycle != SessionLifecycle::Running
-        || after.session_generation == before.session_generation
+        || after.session_generation <= before.session_generation
     {
-        return Err(AppError::conflict("重连后未能确认原终端会话已运行"));
+        return Err(AppError::conflict(
+            "重新连接后未能确认原终端会话以新代次运行",
+        ));
     }
     Ok(())
 }
@@ -1110,26 +964,6 @@ fn validate_restart_before(
         || !can_restart(&observation.info)
     {
         return Err(AppError::conflict("终端已变化或当前生命周期不允许重启"));
-    }
-    Ok(())
-}
-
-/// 重启 ACK 后必须读回相同 session/owner/target、Running 状态和严格递增的 transport generation。
-///
-/// @author kongweiguang
-fn validate_restart_after(
-    after: &ReconnectObservation,
-    before: &ReconnectObservation,
-    binding: &UiSessionBinding,
-    target: &SessionTarget,
-) -> Result<(), AppError> {
-    if after.info.session_id != binding.session_id
-        || after.info.owner != binding.owner
-        || after.info.target != *target
-        || after.info.lifecycle != SessionLifecycle::Running
-        || after.session_generation <= before.session_generation
-    {
-        return Err(AppError::conflict("重启后未能确认原终端会话以新代次运行"));
     }
     Ok(())
 }

@@ -10,14 +10,14 @@ use serde::Serialize;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopIsolationEvidence {
     pub(super) platform_supported: bool,
-    pub(super) ui_thread_id: Option<u32>,
+    pub(crate) ui_thread_id: Option<u32>,
     pub(super) ui_thread_desktop_name: Option<String>,
     pub(super) input_desktop_name: Option<String>,
     pub(super) foreground_window_handle: Option<usize>,
     pub(super) foreground_window_pid: Option<u32>,
-    pub(super) process_id: Option<u32>,
+    pub(crate) process_id: Option<u32>,
     /// The raw calling-thread result is retained for diagnostics; null is not itself an isolation failure.
-    pub(super) get_active_window_handle: Option<usize>,
+    pub(crate) get_active_window_handle: Option<usize>,
     pub(super) isolation_proven: bool,
 }
 
@@ -36,6 +36,47 @@ impl DesktopIsolationEvidence {
         if active && !self.isolation_proven {
             return Err(io::Error::other(format!(
                 "右栏验收窗口处于活动状态，但未证明其位于独立的非输入桌面：{self:?}",
+            )));
+        }
+        Ok(())
+    }
+
+    /// 动效专项允许显示之前必须先证明 UI 线程属于本轮私有桌面，绝不依赖隐藏窗口的默认状态。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "acceptance-metrics")]
+    pub(crate) fn validate_motion_desktop(&self) -> Result<(), io::Error> {
+        let thread_desktop = self.ui_thread_desktop_name.as_deref().unwrap_or_default();
+        let input_desktop = self.input_desktop_name.as_deref().unwrap_or_default();
+        if !self.platform_supported
+            || !self.isolation_proven
+            || !thread_desktop.starts_with("KerminalRail-settings-")
+            || input_desktop.is_empty()
+            || thread_desktop.eq_ignore_ascii_case(input_desktop)
+            || self.ui_thread_id.is_none()
+            || self.process_id != Some(std::process::id())
+        {
+            return Err(io::Error::other(format!(
+                "动效验收未证明窗口位于独立的非输入桌面：{self:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 采样期间还要确认私有窗口真实显示且当前活动 HWND 未切换，避免稀疏帧伪装成完整动效。
+    ///
+    /// @author kongweiguang
+    #[cfg(feature = "acceptance-metrics")]
+    pub(crate) fn validate_motion_window(
+        &self,
+        visible: bool,
+        active: bool,
+        expected_hwnd: usize,
+    ) -> Result<(), io::Error> {
+        self.validate_motion_desktop()?;
+        if !visible || !active || self.get_active_window_handle != Some(expected_hwnd) {
+            return Err(io::Error::other(format!(
+                "动效验收窗口未保持私有显示及活动状态：{self:?}"
             )));
         }
         Ok(())

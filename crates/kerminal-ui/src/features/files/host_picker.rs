@@ -421,6 +421,7 @@ impl FilesPane {
     }
 
     /// 预检只允许绑定原侧原代次；第一次右侧选主机可沿用既有本机默认目录约定。
+    /// 默认本机起点变化仍是导航重绑，必须拒绝先前目录写入的迟到展示。
     ///
     /// @author kongweiguang
     pub(crate) fn complete_host_selection(
@@ -476,6 +477,7 @@ impl FilesPane {
             let local = FileEndpoint::Local { path: path.clone() };
             self.local_directories[0] = path;
             if self.panels[0].endpoint != local {
+                self.invalidate_file_action_presentation(0);
                 self.panels[0].endpoint = local.clone();
                 self.panels[0].navigation_history.reset(local.clone());
                 self.panels[0].listing = None;
@@ -575,13 +577,17 @@ impl FilesPane {
     }
 
     /// 共享工作区初始右侧本机占位不是远端目标，因此不加载或保留重复的本机目录清单。
+    /// 占位失效也撤销写入回执展示资格，但后台写入仍持有自己的 busy 到完成。
     ///
     /// @author kongweiguang
     fn invalidate_unselected_right_target(&mut self) {
+        self.invalidate_file_action_presentation(1);
         let panel = &mut self.panels[1];
         panel.generation = panel.generation.wrapping_add(1);
         panel.loading = false;
         panel.requested_endpoint = None;
+        panel.directory_error = None;
+        panel.failed_directory = None;
         panel.listing = None;
         panel.selected = None;
         panel.selection.clear();

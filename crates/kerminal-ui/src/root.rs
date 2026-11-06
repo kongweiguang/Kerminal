@@ -929,6 +929,9 @@ pub struct RootView {
     pending_close_batch_confirmation_focus:
         Option<workspace_close::PendingCloseBatchConfirmationFocus>,
     pending_close_batch_focus: Option<workspace_close::PendingCloseBatchFocus>,
+    /// 工作区关闭来源核对只保留一个冻结请求；代次使迟到查询不能回投旧意图。
+    transfer_close_guard_generation: u64,
+    pending_transfer_close_guard: Option<workspace_close::PendingTransferCloseGuard>,
     /// 有仓储时先等待初次分类读取，避免用户新建覆盖尚未加载的 workspace。
     workspace_load_pending: bool,
     /// 一个外部 activation 同一时刻只跑一次，避免 IPC 重投并发创建重复临时连接。
@@ -1673,7 +1676,7 @@ impl RootView {
     }
 
     /// 统一构造与 layout PaneId 一一对应的只读投影；群发页头只接受同 Tab 的有效输入绑定，候选仅占布局槽。
-    /// Pending 不冒充错误，Close owner 单独投影以屏蔽错误恢复入口。
+    /// Pending 不冒充错误，Close owner 单独投影以屏蔽错误恢复入口；目录未完成换代时保留分屏按钮槽位并禁用。
     ///
     /// @author kongweiguang
     fn workspace_pane_projections(
@@ -1730,8 +1733,9 @@ impl RootView {
                         pending_operation,
                         &pane_id,
                     ),
-                    reconnect: self.session_reconnect_projection(&pane_id),
-                    restart: self.session_restart_projection(&pane_id),
+                    split_enabled: self.workspace_pane_can_split(&pane_id),
+                    session_action: self.session_action_projection(&pane_id),
+                    session_disconnected: self.pane_session_disconnected(&pane_id),
                     broadcast: runtime
                         .map(|runtime| {
                             self.workspace_broadcast_header_projection(
@@ -1747,6 +1751,16 @@ impl RootView {
                 }
             })
             .collect()
+    }
+
+    /// 分屏继承只使用本代已确认的目录；重连尚未结束时即使首帧提前到达也不能复制中间态。
+    ///
+    /// @author kongweiguang
+    fn workspace_pane_can_split(&self, pane_id: &PaneId) -> bool {
+        self.workspace_runtime.pane_directory_is_current(pane_id)
+            && self
+                .session_action_projection(pane_id)
+                .is_none_or(|action| !action.busy)
     }
 
     /// 以用户自定义 pane 名优先，并把本地化自动 Tab 名视为默认值，让本地 pane 仍显示真实 shell。
@@ -2365,11 +2379,11 @@ impl RootView {
             (tools.render_overlays(&snapshot), tools.search_overlay())
         });
         let pane_id = projection.pane_id;
-        // 重启持有旧 binding 的整个期间保持只读，避免重绘把 Starting 阶段的旧代次重新装回。
+        // 重新连接持有旧 binding 的整个期间保持只读，避免重绘把 Starting 阶段的旧代次重新装回。
         let input_handler = if projection
-            .restart
+            .session_action
             .as_ref()
-            .is_some_and(|restart| restart.busy)
+            .is_some_and(|action| action.busy)
         {
             None
         } else {
@@ -2731,6 +2745,8 @@ impl RootView {
     /// 处理递归布局事件；最后一个 pane 的关闭复用标签确认门禁，资源回收仍由 controller ACK 提交。
     /// 关闭按钮的瞬时键盘来源只在此核对并归一，controller 不持有焦点句柄，也不能据此跳过 modal/quit 门禁。
     /// 迟到的 RetryPane 事件若已被 ClosePane/CloseTab 接管，只提示回到关闭/清理入口，不重开会话。
+    /// 左键分屏在事件边界冻结明确来源 pane 的本代实时目录，换代同步中拒绝旧帧和旧启动目录回退。
+    /// 右键另选目标不进入目录继承路径。
     ///
     /// @author kongweiguang
     fn handle_workspace_render_event(
@@ -2873,16 +2889,11 @@ impl RootView {
                     cx.notify();
                 }
             }
-            workspace_render::WorkspaceRenderEvent::RefreshPane {
-                tab_id,
-                pane_id,
-                binding,
-            } => self.restart_workspace_pane(tab_id, pane_id, binding, cx),
             workspace_render::WorkspaceRenderEvent::ReconnectPane {
                 tab_id,
                 pane_id,
                 binding,
-            } => self.start_session_reconnect(tab_id, pane_id, binding, cx),
+            } => self.reconnect_workspace_pane(tab_id, pane_id, binding, window, cx),
             workspace_render::WorkspaceRenderEvent::CancelReconnect {
                 tab_id: _,
                 pane_id,
@@ -3014,10 +3025,43 @@ impl RootView {
                         return;
                     }
                 }
+                if let WorkspacePaneEvent::Split { pane_id, .. } = &event
+                    && !self.workspace_pane_can_split(pane_id)
+                {
+                    self.status = Some(crate::locale::text(
+                        "终端正在同步当前目录，请稍后重试分屏。",
+                        "The terminal directory is syncing. Try splitting again shortly.",
+                    ));
+                    self.request_workspace_pane_snapshot(tab_id, pane_id.clone(), cx);
+                    cx.notify();
+                    return;
+                }
+                let runtime = &self.workspace_runtime;
                 let result = self
                     .workspace_controller
                     .as_mut()
-                    .map(|controller| controller.apply_pane_event(&tab_id, event));
+                    .map(|controller| match event {
+                        WorkspacePaneEvent::Split {
+                            pane_id,
+                            direction,
+                            before,
+                        } => {
+                            let current_cwd = runtime
+                                .pane(&pane_id)
+                                .filter(|pane| {
+                                    pane.tab_id == tab_id && pane.phase == RuntimePanePhase::Ready
+                                })
+                                .and_then(|pane| pane.current_working_directory.as_deref());
+                            controller.begin_split(
+                                &tab_id,
+                                &pane_id,
+                                direction,
+                                before,
+                                current_cwd,
+                            )
+                        }
+                        event => controller.apply_pane_event(&tab_id, event),
+                    });
                 match result {
                     Some(Ok(WorkspaceControllerEffect::Unchanged)) => {}
                     Some(Ok(WorkspaceControllerEffect::Changed { .. })) => {
@@ -3871,6 +3915,8 @@ impl RootView {
             pending_close_tab_confirmation_focus: None,
             pending_close_batch_confirmation_focus: None,
             pending_close_batch_focus: None,
+            transfer_close_guard_generation: 0,
+            pending_transfer_close_guard: None,
             workspace_load_pending,
             pending_external_activations: Vec::new(),
             external_ssh_attempts: HashMap::new(),
@@ -6614,7 +6660,8 @@ impl Render for RootView {
                             .min_h(px(0.))
                             .flex()
                             .flex_col()
-                            .px(px(inset))
+                            // 终端卡片直接贴住分隔槽：左右再各留一份密度缩进会让中间框两侧
+                            // 变成双倍留白，与 0.3.x 的 6px 参考相比明显偏宽。
                             .pt(px(if broadcast_bar.is_some() { inset } else { 0. }))
                             .children(broadcast_bar)
                             .child(

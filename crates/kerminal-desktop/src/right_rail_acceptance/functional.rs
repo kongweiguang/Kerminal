@@ -330,6 +330,7 @@ async fn run_refresh_only(
 /// 名称绑定本轮精确 SFTP fixture，目录创建后实测右键菜单，失败后由归属 fixture 清理兜底。
 ///
 /// @author kongweiguang
+/// 确认和取消点击生产按钮，再用精确 fixture listing 回读，避免直接调用 owner 掩盖事件重入。
 async fn run_files(
     cx: &mut AsyncApp,
     root: &Entity<RootView>,
@@ -365,11 +366,11 @@ async fn run_files(
         },
     )
     .await?;
-    poll_root(cx, root, window, "提交新建目录", |root, _, cx| {
-        root.confirm_right_rail_acceptance_sftp_name_action(host, directory, cx)
-            .map(|ready| ready.then_some(()))
-    })
-    .await?;
+    super::functional_transfer_workspace::click_visible_element(
+        cx,
+        window,
+        "files-global-dialog-confirm",
+    )?;
     poll_root(cx, root, window, "新建目录 listing", |root, _, cx| {
         root.right_rail_acceptance_sftp_file_entry_ready(host, directory, &name, true, cx)
             .map(|ready| ready.then_some(()))
@@ -414,11 +415,11 @@ async fn run_files(
         "production_rename_form_opened_for_created_directory",
     )
     .await?;
-    poll_root(cx, root, window, "提交重命名", |root, _, cx| {
-        root.confirm_right_rail_acceptance_sftp_name_action(host, directory, cx)
-            .map(|ready| ready.then_some(()))
-    })
-    .await?;
+    super::functional_transfer_workspace::click_visible_element(
+        cx,
+        window,
+        "files-global-dialog-confirm",
+    )?;
     poll_root(cx, root, window, "重命名 listing", |root, _, cx| {
         let old_absent =
             root.right_rail_acceptance_sftp_file_entry_ready(host, directory, &name, false, cx)?;
@@ -453,27 +454,15 @@ async fn run_files(
             )
             .await?;
         }
-        poll_root(
+        super::functional_transfer_workspace::click_visible_element(
             cx,
-            root,
             window,
             if cancel {
-                "取消删除"
+                "files-global-dialog-cancel"
             } else {
-                "确认删除"
+                "files-global-dialog-confirm"
             },
-            |root, _, cx| {
-                if cancel {
-                    root.cancel_right_rail_acceptance_sftp_delete_confirmation(
-                        host, directory, &renamed, cx,
-                    )
-                } else {
-                    root.confirm_right_rail_acceptance_sftp_delete(host, directory, &renamed, cx)
-                }
-                .map(|ready| ready.then_some(()))
-            },
-        )
-        .await?;
+        )?;
         poll_root(cx, root, window, "删除结果 listing", |root, _, cx| {
             root.right_rail_acceptance_sftp_file_entry_ready(host, directory, &renamed, cancel, cx)
                 .map(|ready| ready.then_some(()))
@@ -639,7 +628,7 @@ pub(super) async fn run(
     Ok(records)
 }
 
-/// 与完整验收共享原目录操作和传输/编辑器闭环；任一步失败仍中止且不生成成功报告。
+/// 跟随或刷新专项显式收窄执行范围；完整模式保留目录操作和传输、编辑器闭环。
 ///
 /// @author kongweiguang
 pub(super) async fn run_sftp_only(
@@ -649,6 +638,9 @@ pub(super) async fn run_sftp_only(
     capture: &RightRailCaptureContext,
     services: &kerminal_ui::AppServices,
 ) -> Result<Vec<FunctionalRecord>, Box<dyn Error>> {
+    if std::env::var_os("KERMINAL_RIGHT_RAIL_FOLLOW_ONLY").is_some() {
+        return super::functional_follow::run(cx, root, window, capture, services).await;
+    }
     if std::env::var_os("KERMINAL_RIGHT_RAIL_REFRESH_ONLY").is_some() {
         return run_refresh_only(cx, root, window, capture).await;
     }

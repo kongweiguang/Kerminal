@@ -21,9 +21,9 @@ use kerminal_application::{
     files::{
         FileService,
         drag_manifest::{DragManifest, build_drag_manifest, validate_prepared_drag_manifest},
-        drag_out::{DragOutSession, DragOutSource, prepare_drag_out_observed},
+        drag_out::{DragOutSession, DragOutSource, prepare_drag_out_observed_for_origin},
     },
-    transfers::TransferService,
+    transfers::{TransferOrigin, TransferService},
 };
 use kerminal_domain::files::{FileEndpoint, FileEntryKind, TransferKind};
 use tokio_util::sync::CancellationToken;
@@ -40,6 +40,7 @@ struct DragPreparation {
     transfers: TransferService,
     executor: ApplicationTaskExecutor,
     sources: Vec<DragOutSource>,
+    origin: TransferOrigin,
 }
 
 struct DragProvider {
@@ -88,7 +89,7 @@ impl DeferredFileDragProvider for DragProvider {
             .collect())
     }
 
-    /// 队列任务在共享应用执行器运行，本机路径可直接供系统使用。
+    /// 队列任务在共享应用执行器运行，延迟准备仍沿用发起拖动时冻结的工作区来源。
     ///
     /// @author kongweiguang
     fn prepare(&self) -> Result<PreparedExternalFileDrag, String> {
@@ -97,11 +98,13 @@ impl DeferredFileDragProvider for DragProvider {
             transfers,
             executor,
             sources,
+            origin,
         } = &self.preparation;
         let manifest = self.manifest()?;
         let files = files.clone();
         let transfers = transfers.clone();
         let sources = sources.clone();
+        let origin = origin.clone();
         let staging = self.staging.clone();
         let observed_staging = staging.clone();
         let uncertain = self.uncertain.clone();
@@ -109,11 +112,12 @@ impl DeferredFileDragProvider for DragProvider {
         let prepared = block_on(executor.run_cancellable(
             self.cancellation.clone(),
             move |cancellation| async move {
-                let result = prepare_drag_out_observed(
+                let result = prepare_drag_out_observed_for_origin(
                     files.clone(),
                     transfers,
                     cancellation.clone(),
                     sources,
+                    origin,
                     move |owner| {
                         if observed_uncertain.load(Ordering::Acquire) {
                             owner.preserve();
@@ -249,7 +253,7 @@ impl DragProvider {
 }
 
 impl FilesPane {
-    /// 在系统接管前重验原目录代次，确保多选和临时主机仍指向拖动开始时的来源。
+    /// 在系统接管前重验原目录代次并冻结工作区来源，延迟回执不能污染切换后的面板。
     /// 入口仅供文件功能内的列表和树渲染调用，不向其它功能暴露拖拽状态。
     ///
     /// @author kongweiguang
@@ -338,12 +342,17 @@ impl FilesPane {
         if drag.entries().is_empty() {
             return None;
         }
+        let origin = self.transfer_origin.clone();
+        if !source_is_local && origin.is_none() {
+            return None;
+        }
         if std::env::var_os("KERMINAL_EXTERNAL_DRAG_DIAGNOSTICS").is_some_and(|value| value == "1")
         {
             eprintln!("KERMINAL_EXTERNAL_DRAG payload_ready");
         }
         self.drag_out_generation = self.drag_out_generation.wrapping_add(1);
         let generation = self.drag_out_generation;
+        let completion_origin = origin.clone();
         let waiting = if source_is_local {
             None
         } else {
@@ -356,7 +365,7 @@ impl FilesPane {
         cx.spawn(async move |this, cx| {
             if let Ok(completion) = receiver.await {
                 let _ = cx.update(|app| this.update(app, |pane, cx| {
-                    if pane.drag_out_generation != generation { return; }
+                    if pane.drag_out_generation != generation || pane.transfer_origin != completion_origin { return; }
                     match completion.outcome {
                         ExternalFileDragOutcome::Cancelled => {
                             if let Some(path) = completion.preserved_directory {
@@ -396,6 +405,7 @@ impl FilesPane {
                 transfers: self.transfers.clone(),
                 executor: self.executor.clone(),
                 sources,
+                origin: origin?,
             },
             cancellation: CancellationToken::new(),
             staging: Arc::new(Mutex::new(None)),

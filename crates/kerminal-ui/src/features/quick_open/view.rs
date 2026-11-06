@@ -284,6 +284,7 @@ impl QuickOpenView {
 impl Render for QuickOpenView {
     /// Kit 的取消回调在 CommandState 更新期间同步触发；延后完整关闭，避免重入清理查询状态。
     /// 全窗遮罩建立阻挡命中区域，避免输入框点击与窗口非客户区命中穿到底层 Canvas。
+    /// 搜索结果和状态区共享视口预算，窗口变窄或界面缩放时不让底部反馈落到窗外。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -291,6 +292,7 @@ impl Render for QuickOpenView {
             return div().id("quick-open-closed").size_0();
         }
         let theme = ThemeTokens::current(window, cx);
+        let layout = quick_open_layout(window.viewport_size(), window.rem_size());
         let view = cx.entity().clone();
         let query_view = view.clone();
         let confirm_view = view.clone();
@@ -316,27 +318,41 @@ impl Render for QuickOpenView {
             None => String::new(),
         };
         let footer_status = self.source_status.clone();
+        let has_footer_status = !footer_status.is_empty();
         let command = Command::new(&self.command_state)
             .items(command_items)
             .filterable(false)
             .placeholder(placeholder)
-            .max_h(px(480.))
-            .footer(move |_, _, _| {
-                div()
-                    .id("quick-open-source-status")
-                    .px_3()
-                    .py_2()
-                    .text_size(px(11.))
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(footer_status.iter().map(|status| {
-                        let (message, color) = match status {
-                            QuickOpenSourceStatus::Info(message) => (message.clone(), theme.muted),
-                            QuickOpenSourceStatus::Error(message) => (message.clone(), theme.error),
-                        };
-                        div().text_color(color).child(message)
-                    }))
+            .bordered(false)
+            .max_h(layout.list_height)
+            .when(has_footer_status, |command| {
+                command.footer(move |_, _, _| {
+                    div()
+                        .id("quick-open-source-status")
+                        .max_h(gpui_kit::rems(4.))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .text_size(theme.text_xs)
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .children(footer_status.iter().map(|status| {
+                            let (message, color) = match status {
+                                QuickOpenSourceStatus::Info(message) => {
+                                    (message.clone(), theme.muted)
+                                }
+                                QuickOpenSourceStatus::Error(message) => {
+                                    (message.clone(), theme.error)
+                                }
+                            };
+                            div()
+                                .min_w_0()
+                                .max_w_full()
+                                .text_color(color)
+                                .child(message)
+                        }))
+                })
             })
             .on_query(move |query, window, app| {
                 let query = query.to_string();
@@ -356,19 +372,49 @@ impl Render for QuickOpenView {
             div()
                 .id("quick-open-modal")
                 .key_context("Modal")
-                .mt(px(54.))
-                .w(px(720.))
-                .max_w_full()
-                .max_h(px(560.))
+                .mt(layout.top)
+                .w(layout.width)
+                .max_h(layout.height)
+                .overflow_hidden()
                 .bg(theme.panel)
                 .border_1()
-                .border_color(theme.muted)
-                .rounded_md()
+                .border_color(theme.border)
+                .rounded(theme.radius_dialog)
                 .shadow_lg()
                 .text_color(theme.foreground)
                 .child(command),
         )
     }
+}
+
+/// 根据同一 rem 尺度约束浮层与结果列表，给搜索框和可能出现的错误反馈预留空间。
+/// 避免窄窗、矮窗或界面放大时把操作和反馈绘制到窗口外。
+///
+/// @author kongweiguang
+pub(super) fn quick_open_layout(
+    viewport: gpui_kit::Size<gpui_kit::Pixels>,
+    rem: gpui_kit::Pixels,
+) -> QuickOpenLayout {
+    let rem = rem.as_f32();
+    let viewport_width = viewport.width.as_f32().max(0.);
+    let viewport_height = viewport.height.as_f32().max(0.);
+    let edge = rem.min(viewport_width / 2.).min(viewport_height / 2.);
+    let top = (rem * 3.375).min((viewport_height - edge * 2.).max(0.));
+    let height = (viewport_height - top - edge).max(0.).min(rem * 35.);
+    QuickOpenLayout {
+        top: px(top),
+        width: px((viewport_width - edge * 2.).max(0.).min(rem * 45.)),
+        height: px(height),
+        list_height: px((height - rem * 7.5).max(0.).min(rem * 30.)),
+    }
+}
+
+/// 几何只描述本帧视口，不持有查询或焦点实体。
+pub(super) struct QuickOpenLayout {
+    pub(super) top: gpui_kit::Pixels,
+    pub(super) width: gpui_kit::Pixels,
+    pub(super) height: gpui_kit::Pixels,
+    pub(super) list_height: gpui_kit::Pixels,
 }
 
 /// 遮罩必须阻挡鼠标和滚动命中；单纯绘制半透明背景不会在 GPUI 中遮蔽后方 Canvas 或标题栏。
@@ -437,7 +483,7 @@ pub(super) fn local_search_entries(
     entries
 }
 
-/// 命令名称对应 Root 的实际作用范围，标签导航不再限定终端，稳定 action ID 仍用于配置和搜索。
+/// 命令名称对应 Root 的实际作用范围；工具入口使用面板同名文案，稳定 action ID 仍用于配置和搜索。
 ///
 /// @author kongweiguang
 fn action_label(action: KeybindingAction) -> String {
@@ -460,7 +506,7 @@ fn action_label(action: KeybindingAction) -> String {
         KeybindingAction::ToolSftp => ("打开 SFTP", "Open SFTP"),
         KeybindingAction::ToolPorts => ("打开端口转发", "Open port forwards"),
         KeybindingAction::ToolSnippets => ("打开命令片段", "Open command snippets"),
-        KeybindingAction::ToolLogs => ("打开终端日志", "Open terminal logs"),
+        KeybindingAction::ToolLogs => ("打开命令历史", "Open command history"),
         KeybindingAction::WorkspaceQuickOpen => ("快速打开", "Quick Open"),
         KeybindingAction::WorkspaceCommandPalette => ("命令面板", "Command Palette"),
     };

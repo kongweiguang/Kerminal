@@ -84,6 +84,129 @@ fn local_target() -> SessionTarget {
     })
 }
 
+/// 同 SessionId 的换代须拒绝旧在途回执，并允许新引擎从更小 revision 重新建立目录基线。
+///
+/// @author kongweiguang
+#[test]
+fn session_snapshot_reset_preserves_frame_but_rejects_old_directory_receipts() {
+    let pane_id = PaneId::new();
+    let session_id = SessionId::new();
+    let size = TerminalSize::default();
+    let mut runtime =
+        WorkspaceRuntime::from_snapshot(&snapshot(pane(pane_id.clone()), TabId::new())).unwrap();
+    runtime
+        .install_session(&pane_id, session_id.clone(), local_target(), size)
+        .unwrap();
+    assert!(!runtime.pane_directory_is_current(&pane_id));
+    let mut old = render_snapshot(session_id.clone(), size, 0, 100);
+    old.current_working_directory = Some(Arc::from("/old-process"));
+    runtime
+        .accept_initial_snapshot(&pane_id, &session_id, old.clone())
+        .unwrap();
+    assert!(runtime.pane_directory_is_current(&pane_id));
+    let (_, old_token, _) = runtime.begin_snapshot(&pane_id).unwrap().unwrap();
+    assert!(
+        runtime
+            .invalidate_session_snapshot(&pane_id, &session_id)
+            .unwrap()
+    );
+    let state = runtime.pane(&pane_id).unwrap();
+    assert_eq!(state.snapshot.as_ref().unwrap().revision, 100);
+    assert!(state.current_working_directory.is_none());
+    assert!(!runtime.pane_directory_is_current(&pane_id));
+    let (_, new_token, request) = runtime.begin_snapshot(&pane_id).unwrap().unwrap();
+    assert_eq!(request.since_revision, None);
+    assert!(
+        !runtime
+            .accept_snapshot(&pane_id, &session_id, old_token, old)
+            .unwrap()
+    );
+    assert!(
+        !runtime
+            .finish_snapshot_request(&pane_id, &session_id, old_token, false, true)
+            .unwrap()
+    );
+    assert!(!runtime.pane_directory_is_current(&pane_id));
+    let mut current = render_snapshot(session_id.clone(), size, 0, 1);
+    current.current_working_directory = Some(Arc::from("/new-process"));
+    assert!(
+        runtime
+            .accept_snapshot(&pane_id, &session_id, new_token, current)
+            .unwrap()
+    );
+    assert!(runtime.pane_directory_is_current(&pane_id));
+    assert_eq!(
+        runtime
+            .pane(&pane_id)
+            .unwrap()
+            .current_working_directory
+            .as_deref(),
+        Some("/new-process")
+    );
+}
+
+/// 失败或取消后同代有效快照也能解除门禁；无 OSC7 与日常 resize/滚动不应误禁一键分屏。
+///
+/// @author kongweiguang
+#[test]
+fn session_snapshot_recovery_accepts_unknown_directory_and_survives_viewport_changes() {
+    let pane_id = PaneId::new();
+    let session_id = SessionId::new();
+    let size = TerminalSize::default();
+    let mut runtime =
+        WorkspaceRuntime::from_snapshot(&snapshot(pane(pane_id.clone()), TabId::new())).unwrap();
+    runtime
+        .install_session(&pane_id, session_id.clone(), local_target(), size)
+        .unwrap();
+    runtime
+        .accept_initial_snapshot(
+            &pane_id,
+            &session_id,
+            render_snapshot(session_id.clone(), size, 0, 4),
+        )
+        .unwrap();
+    assert!(
+        !runtime
+            .invalidate_session_snapshot(&pane_id, &SessionId::new())
+            .unwrap()
+    );
+    assert!(runtime.pane_directory_is_current(&pane_id));
+    for _cancel_or_failure in ["cancel", "failure"] {
+        runtime
+            .invalidate_session_snapshot(&pane_id, &session_id)
+            .unwrap();
+        assert!(!runtime.pane_directory_is_current(&pane_id));
+        let (_, token, _) = runtime.begin_snapshot(&pane_id).unwrap().unwrap();
+        assert!(
+            runtime
+                .accept_snapshot(
+                    &pane_id,
+                    &session_id,
+                    token,
+                    render_snapshot(session_id.clone(), size, 0, 4)
+                )
+                .unwrap()
+        );
+        runtime
+            .finish_snapshot_request(&pane_id, &session_id, token, true, true)
+            .unwrap();
+        assert!(runtime.pane_directory_is_current(&pane_id));
+    }
+    runtime
+        .invalidate_snapshot_for_viewport_change(&pane_id, &session_id)
+        .unwrap();
+    assert!(runtime.pane_directory_is_current(&pane_id));
+    runtime
+        .complete_resize(
+            &pane_id,
+            &session_id,
+            TerminalSize::new(90, 30, 0, 0).unwrap(),
+            true,
+        )
+        .unwrap();
+    assert!(runtime.pane_directory_is_current(&pane_id));
+}
+
 /// 构造固定坐标世代且不含目录信号的轻量快照；各目录测试显式设置元数据，避免隐式共享状态。
 ///
 /// @author kongweiguang

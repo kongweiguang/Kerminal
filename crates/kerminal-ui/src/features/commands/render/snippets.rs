@@ -55,7 +55,7 @@ impl CommandsView {
     /// 紧凑目录沿用 main 右栏的 12px 内边距和分组间距；宽工作区保持原排版。
     /// 搜索快捷键仅在片段子树内接管且不覆盖输入控件焦点；紧凑目录延续宿主表面，避免暗色下叠深第二层面板。
     /// 单行搜索尺寸通过 Styled 指定，避免 Input 的多行专用 h 忽略右栏规格。
-    /// 查询中的旧行继续禁用，但不插入加载横幅；进度统一由标题栏图标表达，避免列表上下跳动。
+    /// 两种布局共用搜索控件尺度；查询中的旧行保持原位并按其来源筛选禁用。
     ///
     /// @author kongweiguang
     pub(super) fn render_snippets(
@@ -67,25 +67,15 @@ impl CommandsView {
         let toolbar = self.render_snippet_toolbar(theme, cx);
         let search_input = gpui_kit::Styled::h(
             Input::new(&self.snippet_query).w_full(),
-            if self.compact_layout {
-                px(36.)
-            } else {
-                px(32.)
-            },
+            theme.metrics.control_height,
+        )
+        .text_size(theme.text_sm)
+        .aria_label(crate::locale::text("搜索命令片段", "Search snippets"))
+        .prefix(
+            Icon::new(IconName::Search)
+                .size(theme.metrics.icon_size)
+                .text_color(theme.subtle),
         );
-        let search_input = if self.compact_layout {
-            search_input
-                .text_size(px(16.))
-                .line_height(px(24.))
-                .aria_label(crate::locale::text("搜索命令片段", "Search snippets"))
-                .prefix(
-                    Icon::new(IconName::Search)
-                        .size(px(16.))
-                        .text_color(theme.subtle),
-                )
-        } else {
-            search_input
-        };
         let search = div()
             .id("snippet-catalog-search")
             .w_full()
@@ -161,9 +151,17 @@ impl CommandsView {
                     loaded_section.unwrap_or(self.snippet_catalog_section),
                     loaded_query.as_deref().unwrap_or_default(),
                 );
-                format!("{error} · 已保留上次成功的“{filter}”结果，旧条目暂不可操作。")
+                crate::locale::text(
+                    format!("{error} · 已保留上次成功的“{filter}”结果，旧条目暂不可操作。"),
+                    format!("{error} · Retained the last successful “{filter}” results; older entries are unavailable."),
+                )
+                .to_string()
             } else {
-                format!("{error} · 已加载的片段仍可用，可重试读取后续内容。")
+                crate::locale::text(
+                    format!("{error} · 已加载的片段仍可用，可重试读取后续内容。"),
+                    format!("{error} · Loaded snippets remain available. Retry to load more."),
+                )
+                .to_string()
             };
             Some(self.render_snippet_catalog_notice(
                 SnippetCatalogNotice {
@@ -626,7 +624,7 @@ impl CommandsView {
             .into_any_element()
     }
 
-    /// 头部目标身份和状态分行，长主机名不会挤掉状态；操作仍只调用已接入的目录用例。
+    /// 头部使用共享控件尺度；目标身份与状态分行，长名称不会挤掉操作槽位。
     ///
     /// @author kongweiguang
     fn render_snippet_toolbar(
@@ -643,9 +641,12 @@ impl CommandsView {
             .w_full()
             .flex()
             .items_center()
-            .gap_3()
-            .when(self.compact_layout, |toolbar| toolbar.gap_2())
-            .when(!self.compact_layout, |toolbar| toolbar.px_3().py_1())
+            .gap(theme.metrics.gap)
+            .when(!self.compact_layout, |toolbar| {
+                toolbar
+                    .px(theme.metrics.panel_padding)
+                    .py(theme.metrics.gap / 2.)
+            })
             .child(
                 div()
                     .id("snippet-current-target")
@@ -678,7 +679,7 @@ impl CommandsView {
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .text_size(px(11.))
+                            .text_size(theme.text_xs)
                             .text_color(theme.muted)
                             .child(target_status),
                     ),
@@ -687,16 +688,7 @@ impl CommandsView {
                 Button::new("snippet-import")
                     .compact()
                     .ghost()
-                    .w(if self.compact_layout {
-                        px(36.)
-                    } else {
-                        px(32.)
-                    })
-                    .h(if self.compact_layout {
-                        px(36.)
-                    } else {
-                        px(32.)
-                    })
+                    .size(theme.metrics.control_height)
                     .icon(IconName::Upload)
                     .accessibility_label(crate::locale::text("导入片段", "Import snippets"))
                     .tooltip(crate::locale::text("导入片段", "Import snippets"))
@@ -709,16 +701,7 @@ impl CommandsView {
                 Button::new("snippet-export")
                     .compact()
                     .ghost()
-                    .w(if self.compact_layout {
-                        px(36.)
-                    } else {
-                        px(32.)
-                    })
-                    .h(if self.compact_layout {
-                        px(36.)
-                    } else {
-                        px(32.)
-                    })
+                    .size(theme.metrics.control_height)
                     .icon(IconName::Download)
                     .accessibility_label(crate::locale::text("导出片段", "Export snippets"))
                     .tooltip(crate::locale::text("导出片段", "Export snippets"))
@@ -732,16 +715,7 @@ impl CommandsView {
                 Button::new("snippet-library-manager")
                     .compact()
                     .ghost()
-                    .w(if self.compact_layout {
-                        px(36.)
-                    } else {
-                        px(32.)
-                    })
-                    .h(if self.compact_layout {
-                        px(36.)
-                    } else {
-                        px(32.)
-                    })
+                    .size(theme.metrics.control_height)
                     .icon(IconName::Settings2)
                     .accessibility_label(crate::locale::text(
                         "打开片段库管理",
@@ -759,17 +733,8 @@ impl CommandsView {
             .child(
                 Button::new("snippet-new")
                     .compact()
-                    .primary()
-                    .w(if self.compact_layout {
-                        px(36.)
-                    } else {
-                        px(32.)
-                    })
-                    .h(if self.compact_layout {
-                        px(36.)
-                    } else {
-                        px(32.)
-                    })
+                    .ghost()
+                    .size(theme.metrics.control_height)
                     .icon(IconName::Plus)
                     .accessibility_label(crate::locale::text("新建片段", "New snippet"))
                     .tooltip(crate::locale::text("新建片段", "New snippet"))

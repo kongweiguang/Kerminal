@@ -81,11 +81,11 @@ fn quit_deferral(
 }
 
 impl PreferencesPanel {
-    /// 普通关闭只取消未提交的扫描项；Profile 和关键词草稿继续共用丢弃确认。
+    /// 已有确认时先由其完成或取消；普通关闭保留 Profile 和关键词草稿的丢弃门禁。
     ///
     /// @author kongweiguang
     pub fn request_close(&mut self, cx: &mut Context<Self>) {
-        if self.quit_confirmation {
+        if self.has_leave_confirmation() {
             return;
         }
         self.cancel_profile_scan();
@@ -308,7 +308,7 @@ impl PreferencesPanel {
         true
     }
 
-    /// 用户确认丢弃草稿后撤销内部陷阱，具体进程退出仍由 RootView 串行处理。
+    /// 确认丢弃后清除旧的内部确认；即使后续编辑器取消退出，也不能恢复失效的 Profile 目标。
     ///
     /// @author kongweiguang
     pub(in crate::features::preferences) fn confirm_quit(
@@ -320,6 +320,12 @@ impl PreferencesPanel {
             return;
         }
         self.quit_confirmation = false;
+        self.close_confirmation = false;
+        self.profile_switch_confirmation = false;
+        self.profile_reload_confirmation = false;
+        self.profile_delete_confirmation = false;
+        self.pending_profile_selection = None;
+        self.pending_profile_delete = None;
         cx.emit(PreferencesEvent::LeaveConfirmationChanged);
         self.discard_settings_and_profile_drafts();
         self.restore_form_inputs(window, cx);

@@ -10,7 +10,7 @@ use kerminal_domain::{
 };
 
 use super::{
-    ReconnectObservation, ReconnectResultState, SessionReconnectController, SessionReconnectState,
+    ReconnectObservation, ReconnectResultState, SessionOperationKind, SessionReconnectController,
     matching_closed_target,
 };
 use crate::root::workspace_runtime::RuntimePanePhase;
@@ -78,9 +78,9 @@ fn observe(
     );
 }
 
-/// 断开的 UI SSH pane 才生成带 exact binding 的显式重连动作。
+/// 标题栏动作只来自精确 UI owner、target 和受支持生命周期。
 #[test]
-fn projection_requires_matching_ui_ssh_owner_and_disconnected_lifecycle() {
+fn action_projection_requires_matching_identity_and_supported_lifecycle() {
     let (tab_id, pane_id, session_id) = identity();
     let target = ssh_target();
     let mut controller = SessionReconnectController::default();
@@ -94,7 +94,7 @@ fn projection_requires_matching_ui_ssh_owner_and_disconnected_lifecycle() {
         9,
     );
 
-    let projection = controller.projection(
+    let projection = controller.action_projection(
         &pane_id,
         &tab_id,
         &session_id,
@@ -106,11 +106,12 @@ fn projection_requires_matching_ui_ssh_owner_and_disconnected_lifecycle() {
         Some(projection)
             if projection.binding.session_id == session_id
                 && projection.binding.session_generation == 9
-                && projection.state == SessionReconnectState::Available
+                && projection.attempt_id.is_none()
+                && !projection.busy
     ));
     assert!(
         controller
-            .projection(
+            .action_projection(
                 &pane_id,
                 &tab_id,
                 &session_id,
@@ -123,7 +124,7 @@ fn projection_requires_matching_ui_ssh_owner_and_disconnected_lifecycle() {
     let other_tab = TabId::new();
     assert!(
         controller
-            .projection(
+            .action_projection(
                 &pane_id,
                 &other_tab,
                 &session_id,
@@ -142,24 +143,25 @@ fn projection_requires_matching_ui_ssh_owner_and_disconnected_lifecycle() {
         SessionLifecycle::Running,
         10,
     );
-    assert!(
-        controller
-            .projection(
-                &pane_id,
-                &tab_id,
-                &session_id,
-                &target,
-                RuntimePanePhase::Ready,
-            )
-            .is_none()
-    );
+    assert!(matches!(
+        controller.action_projection(
+            &pane_id,
+            &tab_id,
+            &session_id,
+            &target,
+            RuntimePanePhase::Ready,
+        ),
+        Some(projection)
+            if projection.binding.session_generation == 10
+                && projection.attempt_id.is_none()
+    ));
 }
 
-/// 重启入口覆盖运行中和断开态，但 Starting/Closing/Closed 均不能生成操作绑定。
+/// 重新连接入口覆盖运行中和断开态，但 Starting/Closing/Closed 均不能生成操作绑定。
 ///
 /// @author kongweiguang
 #[test]
-fn restart_projection_requires_a_supported_lifecycle() {
+fn session_action_projection_requires_a_supported_lifecycle() {
     let (tab_id, pane_id, session_id) = identity();
     let target = ssh_target();
     for lifecycle in [
@@ -177,7 +179,7 @@ fn restart_projection_requires_a_supported_lifecycle() {
             lifecycle,
             11,
         );
-        let projection = controller.restart_projection(
+        let projection = controller.action_projection(
             &pane_id,
             &tab_id,
             &session_id,
@@ -185,12 +187,25 @@ fn restart_projection_requires_a_supported_lifecycle() {
             RuntimePanePhase::Ready,
         );
         assert!(matches!(
-            projection,
+            &projection,
             Some(projection)
                 if projection.binding.session_id == session_id
                     && projection.binding.session_generation == 11
                     && !projection.busy
+                    && projection.attempt_id.is_none()
         ));
+        let binding = projection.expect("supported lifecycle action").binding;
+        let (_, _, operation) = controller
+            .begin_attempt(&pane_id, &tab_id, binding, target.clone())
+            .expect("supported lifecycle should start reconnect");
+        assert_eq!(
+            operation,
+            if lifecycle == SessionLifecycle::Running {
+                SessionOperationKind::Restart
+            } else {
+                SessionOperationKind::Reconnect
+            }
+        );
     }
 
     for lifecycle in [
@@ -210,7 +225,7 @@ fn restart_projection_requires_a_supported_lifecycle() {
         );
         assert!(
             controller
-                .restart_projection(
+                .action_projection(
                     &pane_id,
                     &tab_id,
                     &session_id,
@@ -222,11 +237,11 @@ fn restart_projection_requires_a_supported_lifecycle() {
     }
 }
 
-/// 重启与重连共享 pane 操作锁；busy 投影持续使用发起时的 binding，防止双击和交叉请求。
+/// 两种重新连接路径共享 pane 操作锁；busy 投影持续使用发起时的 binding，防止双击和交叉请求。
 ///
 /// @author kongweiguang
 #[test]
-fn restart_and_reconnect_share_a_busy_pane_lock() {
+fn reconnect_paths_share_a_busy_pane_lock() {
     let (tab_id, pane_id, session_id) = identity();
     let target = ssh_target();
     let mut controller = SessionReconnectController::default();
@@ -240,70 +255,77 @@ fn restart_and_reconnect_share_a_busy_pane_lock() {
         4,
     );
     let binding = controller
-        .restart_projection(
+        .action_projection(
             &pane_id,
             &tab_id,
             &session_id,
             &target,
             RuntimePanePhase::Ready,
         )
-        .expect("running pane 应提供重启 binding")
+        .expect("running pane 应提供重新连接 binding")
         .binding;
-    let Some((attempt_id, _)) =
-        controller.begin_restart_attempt(&pane_id, &tab_id, binding.clone(), target.clone())
+    let Some((attempt_id, _, operation)) =
+        controller.begin_attempt(&pane_id, &tab_id, binding.clone(), target.clone())
     else {
-        panic!("首个重启操作应被接受");
+        panic!("首个重新连接操作应被接受");
     };
+    assert_eq!(operation, SessionOperationKind::Restart);
 
-    assert!(
-        controller
-            .begin_restart_attempt(&pane_id, &tab_id, binding.clone(), target.clone())
-            .is_none()
-    );
     assert!(
         controller
             .begin_attempt(&pane_id, &tab_id, binding.clone(), target.clone())
             .is_none()
     );
     assert!(matches!(
-        controller.restart_projection(
+        controller.action_projection(
             &pane_id,
             &tab_id,
             &session_id,
             &target,
             RuntimePanePhase::Ready,
         ),
-        Some(projection) if projection.busy && projection.binding == binding
+        Some(projection)
+            if projection.busy
+                && projection.binding == binding
+                && projection.attempt_id == Some(attempt_id)
+                && !projection.cancelling
     ));
 
-    assert!(controller.finish_attempt(
-        attempt_id,
-        Ok(observation(
-            &tab_id,
-            &pane_id,
-            &session_id,
-            target.clone(),
-            SessionLifecycle::Running,
-            5,
-        )),
-    ));
+    assert!(
+        controller
+            .finish_attempt(
+                attempt_id,
+                Ok(observation(
+                    &tab_id,
+                    &pane_id,
+                    &session_id,
+                    target.clone(),
+                    SessionLifecycle::Running,
+                    5,
+                )),
+            )
+            .is_some()
+    );
     assert!(matches!(
-        controller.restart_projection(
+        controller.action_projection(
             &pane_id,
             &tab_id,
             &session_id,
             &target,
             RuntimePanePhase::Ready,
         ),
-        Some(projection) if !projection.busy && projection.binding.session_generation == 5
+        Some(projection)
+            if !projection.busy
+                && projection.binding.session_generation == 5
+                && projection.attempt_id.is_none()
     ));
 }
 
-/// Restart ACK 即使状态仍为 Running，也必须验证 generation 严格前进才解除操作失败标记。
+/// 重新连接 ACK 即使状态仍为 Running，也必须验证 generation 严格前进才解除操作失败标记。
 ///
 /// @author kongweiguang
 #[test]
-fn restart_rejects_running_ack_without_a_new_generation() {
+fn reconnect_rejects_running_ack_without_a_new_generation() {
     let (tab_id, pane_id, session_id) = identity();
     let target = ssh_target();
     let mut controller = SessionReconnectController::default();
@@ -317,30 +339,35 @@ fn restart_rejects_running_ack_without_a_new_generation() {
         8,
     );
     let binding = controller
-        .restart_projection(
+        .action_projection(
             &pane_id,
             &tab_id,
             &session_id,
             &target,
             RuntimePanePhase::Ready,
         )
-        .expect("exited pane 也可以显式重启")
+        .expect("exited pane 也可以重新连接")
         .binding;
-    let (attempt_id, _) = controller
-        .begin_restart_attempt(&pane_id, &tab_id, binding, target.clone())
-        .expect("重启应被接受");
+    let (attempt_id, _, operation) = controller
+        .begin_attempt(&pane_id, &tab_id, binding, target.clone())
+        .expect("重新连接应被接受");
+    assert_eq!(operation, SessionOperationKind::Reconnect);
 
-    assert!(controller.finish_attempt(
-        attempt_id,
-        Ok(observation(
-            &tab_id,
-            &pane_id,
-            &session_id,
-            target,
-            SessionLifecycle::Running,
-            8,
-        )),
-    ));
+    assert!(
+        controller
+            .finish_attempt(
+                attempt_id,
+                Ok(observation(
+                    &tab_id,
+                    &pane_id,
+                    &session_id,
+                    target,
+                    SessionLifecycle::Running,
+                    8,
+                )),
+            )
+            .is_some()
+    );
     assert!(matches!(
         controller.panes.get(&pane_id).map(|state| &state.result),
         Some(ReconnectResultState::Failed(_))
@@ -365,7 +392,7 @@ fn cancellation_keeps_owner_until_ack_and_stale_finish_cannot_touch_replacement(
         2,
     );
     let binding = controller
-        .projection(
+        .action_projection(
             &pane_id,
             &tab_id,
             &session_id,
@@ -376,11 +403,12 @@ fn cancellation_keeps_owner_until_ack_and_stale_finish_cannot_touch_replacement(
     let Some(binding) = binding else {
         panic!("断开的 UI SSH pane 应可重连");
     };
-    let Some((attempt_id, cancellation)) =
+    let Some((attempt_id, cancellation, operation)) =
         controller.begin_attempt(&pane_id, &tab_id, binding.clone(), target.clone())
     else {
         panic!("第一个重连 attempt 应被接受");
     };
+    assert_eq!(operation, SessionOperationKind::Reconnect);
 
     assert!(
         controller
@@ -395,7 +423,7 @@ fn cancellation_keeps_owner_until_ack_and_stale_finish_cannot_touch_replacement(
     );
     assert_eq!(controller.in_flight.len(), 1);
     assert!(matches!(
-        controller.projection(
+        controller.action_projection(
             &pane_id,
             &tab_id,
             &session_id,
@@ -403,7 +431,9 @@ fn cancellation_keeps_owner_until_ack_and_stale_finish_cannot_touch_replacement(
             RuntimePanePhase::Ready,
         ),
         Some(projection)
-            if projection.state == SessionReconnectState::Cancelling { attempt_id }
+            if projection.busy
+                && projection.cancelling
+                && projection.attempt_id == Some(attempt_id)
     ));
 
     controller.cancel_for_pane(&pane_id);
@@ -422,7 +452,7 @@ fn cancellation_keeps_owner_until_ack_and_stale_finish_cannot_touch_replacement(
     );
     assert!(
         controller
-            .projection(
+            .action_projection(
                 &pane_id,
                 &tab_id,
                 &replacement_session,
@@ -432,20 +462,28 @@ fn cancellation_keeps_owner_until_ack_and_stale_finish_cannot_touch_replacement(
             .is_none()
     );
 
-    assert!(!controller.finish_attempt(
-        attempt_id,
-        Err(kerminal_application::AppError::cancelled("测试取消")),
-    ));
+    assert!(
+        controller
+            .finish_attempt(
+                attempt_id,
+                Err(kerminal_application::AppError::cancelled("测试取消")),
+            )
+            .is_none()
+    );
     assert_eq!(controller.in_flight.len(), 0);
     assert!(matches!(
-        controller.projection(
+        controller.action_projection(
             &pane_id,
             &tab_id,
             &replacement_session,
             &target,
             RuntimePanePhase::Ready,
         ),
-        Some(projection) if projection.state == SessionReconnectState::Available
+        Some(projection)
+            if !projection.busy
+                && !projection.cancelling
+                && projection.attempt_id.is_none()
+                && projection.binding.session_generation == 1
     ));
 }
 
@@ -487,7 +525,7 @@ fn stale_refresh_does_not_replace_newer_observation() {
         )),
     );
 
-    let projection = controller.projection(
+    let projection = controller.action_projection(
         &pane_id,
         &tab_id,
         &session_id,
@@ -498,11 +536,11 @@ fn stale_refresh_does_not_replace_newer_observation() {
         projection,
         Some(projection)
             if projection.binding.session_generation == 5
-                && projection.state == SessionReconnectState::Available
+                && projection.attempt_id.is_none()
     ));
 }
 
-/// 重连成功后必须换 generation、保留原 target；只有兼容的新 runtime 才能清除重连状态。
+/// 重连成功后必须换 generation、保留原 target；失败也保留同一入口供重试。
 #[test]
 fn completed_attempt_requires_same_session_and_new_running_generation() {
     let (tab_id, pane_id, session_id) = identity();
@@ -518,7 +556,7 @@ fn completed_attempt_requires_same_session_and_new_running_generation() {
         11,
     );
     let Some(binding) = controller
-        .projection(
+        .action_projection(
             &pane_id,
             &tab_id,
             &session_id,
@@ -529,7 +567,7 @@ fn completed_attempt_requires_same_session_and_new_running_generation() {
     else {
         panic!("测试前应存在可重连投影");
     };
-    let Some((attempt_id, _)) =
+    let Some((attempt_id, _, _)) =
         controller.begin_attempt(&pane_id, &tab_id, binding, target.clone())
     else {
         panic!("测试重连应能启动");
@@ -542,18 +580,19 @@ fn completed_attempt_requires_same_session_and_new_running_generation() {
         SessionLifecycle::Running,
         12,
     );
-    assert!(controller.finish_attempt(attempt_id, Ok(result)));
-    assert!(
-        controller
-            .projection(
-                &pane_id,
-                &tab_id,
-                &session_id,
-                &target,
-                RuntimePanePhase::Ready,
-            )
-            .is_none()
-    );
+    assert!(controller.finish_attempt(attempt_id, Ok(result)).is_some());
+    assert!(matches!(
+        controller.action_projection(
+            &pane_id,
+            &tab_id,
+            &session_id,
+            &target,
+            RuntimePanePhase::Ready,
+        ),
+        Some(projection)
+            if projection.binding.session_generation == 12
+                && projection.attempt_id.is_none()
+    ));
 
     let (tab_id, pane_id, session_id) = identity();
     let mut same_generation_controller = SessionReconnectController::default();
@@ -567,7 +606,7 @@ fn completed_attempt_requires_same_session_and_new_running_generation() {
         12,
     );
     let Some(binding) = same_generation_controller
-        .projection(
+        .action_projection(
             &pane_id,
             &tab_id,
             &session_id,
@@ -578,7 +617,7 @@ fn completed_attempt_requires_same_session_and_new_running_generation() {
     else {
         panic!("测试前应存在可重连投影");
     };
-    let Some((attempt_id, _)) =
+    let Some((attempt_id, _, _)) =
         same_generation_controller.begin_attempt(&pane_id, &tab_id, binding, target.clone())
     else {
         panic!("测试重连应能启动");
@@ -591,9 +630,13 @@ fn completed_attempt_requires_same_session_and_new_running_generation() {
         SessionLifecycle::Running,
         12,
     );
-    assert!(same_generation_controller.finish_attempt(attempt_id, Ok(same_generation_result),));
+    assert!(
+        same_generation_controller
+            .finish_attempt(attempt_id, Ok(same_generation_result))
+            .is_some()
+    );
     assert!(matches!(
-        same_generation_controller.projection(
+        same_generation_controller.action_projection(
             &pane_id,
             &tab_id,
             &session_id,
@@ -601,7 +644,13 @@ fn completed_attempt_requires_same_session_and_new_running_generation() {
             RuntimePanePhase::Ready,
         ),
         Some(projection)
-            if matches!(projection.state, SessionReconnectState::Failed { .. })
+            if projection.attempt_id.is_none()
+                && same_generation_controller
+                    .panes
+                    .get(&pane_id)
+                    .is_some_and(|state| {
+                        matches!(state.result, ReconnectResultState::Failed(_))
+                    })
     ));
 }
 
@@ -612,7 +661,7 @@ fn empty_controller_does_not_invent_a_reconnect_observation() {
     let controller = SessionReconnectController::default();
     assert!(
         controller
-            .projection(
+            .action_projection(
                 &pane_id,
                 &tab_id,
                 &session_id,
@@ -680,7 +729,7 @@ fn panel_observation_is_unavailable_while_reconnect_owns_the_pane() {
         17,
     );
     let binding = controller
-        .projection(
+        .action_projection(
             &pane_id,
             &tab_id,
             &session_id,
@@ -756,7 +805,7 @@ fn exact_closed_receipt_cancels_stale_work_and_preserves_readonly_identity() {
         17,
     );
     let binding = controller
-        .projection(
+        .action_projection(
             &pane_id,
             &tab_id,
             &session_id,
@@ -765,7 +814,7 @@ fn exact_closed_receipt_cancels_stale_work_and_preserves_readonly_identity() {
         )
         .expect("退出 pane 应有原会话 binding")
         .binding;
-    let (attempt_id, cancellation) = controller
+    let (attempt_id, cancellation, _) = controller
         .begin_attempt(&pane_id, &tab_id, binding.clone(), target.clone())
         .expect("重连 attempt 应持有原 pane");
     let stale_refresh = controller.begin_refresh(
@@ -812,17 +861,19 @@ fn exact_closed_receipt_cancels_stale_work_and_preserves_readonly_identity() {
     assert_eq!(panel.lifecycle, SessionLifecycle::Closed);
 
     assert!(
-        !controller.finish_attempt(
-            attempt_id,
-            Ok(observation(
-                &tab_id,
-                &pane_id,
-                &session_id,
-                target.clone(),
-                SessionLifecycle::Running,
-                18,
-            )),
-        ),
+        controller
+            .finish_attempt(
+                attempt_id,
+                Ok(observation(
+                    &tab_id,
+                    &pane_id,
+                    &session_id,
+                    target.clone(),
+                    SessionLifecycle::Running,
+                    18,
+                )),
+            )
+            .is_none(),
         "旧 attempt ACK 不能改写新的 Closed incarnation"
     );
     assert_eq!(

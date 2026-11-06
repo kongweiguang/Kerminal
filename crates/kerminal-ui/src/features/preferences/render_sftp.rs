@@ -33,7 +33,7 @@ impl PreferencesPanel {
         }
     }
 
-    /// 复用原输入实体保留数字编辑中间态；列数依 main 的视口 md 断点而非卡片可用宽度确定。
+    /// 复用原输入实体保留数字编辑中间态；事务错误由外层固定呈现，列数依视口断点确定。
     ///
     /// @author kongweiguang
     pub(super) fn render_sftp(
@@ -250,10 +250,6 @@ impl PreferencesPanel {
                     .values()
                     .map(|message| super::render_settings::issue_row(message, theme)),
             )
-            .children(super::render::settings_error_banner(
-                self.settings_error.as_deref(),
-                theme,
-            ))
             .child(self.render_save_notice(theme));
 
         content.into_any_element()

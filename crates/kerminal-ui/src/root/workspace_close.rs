@@ -9,6 +9,7 @@ use kerminal_application::platform::external_launch::ExternalTargetLease;
 use kerminal_application::sessions::{
     DEFAULT_SESSION_CLOSE_BUDGET, SessionDeadline, UiSessionBinding,
 };
+use kerminal_application::transfers::{TransferOrigin, TransferService};
 use kerminal_application::workspace::WorkspaceSessionTab;
 use kerminal_domain::{
     files::FileEndpoint,
@@ -16,6 +17,214 @@ use kerminal_domain::{
     sessions::{SessionOwner, SessionTarget, TerminalSize},
     workspace::TerminalLayoutNode,
 };
+use tokio_util::sync::CancellationToken;
+
+/// 资源 descriptor 保留 pane/tab 的持久身份，队列来源与 descriptor 分开核对。
+#[derive(Clone, Debug, PartialEq)]
+struct TransferCloseTarget {
+    origin: TransferOrigin,
+    descriptor: TransferCloseDescriptor,
+}
+
+/// 终端来源由 PaneId 唯一定位，但仍携带父 Tab descriptor 验证 pane 未被布局替换。
+#[derive(Clone, Debug, PartialEq)]
+enum TransferCloseDescriptor {
+    Tab(WorkspaceSessionTab),
+    Pane {
+        tab: WorkspaceSessionTab,
+        pane_id: PaneId,
+    },
+}
+
+/// 异步核对后沿原始用户事件或 controller 资源操作继续；可选的大型焦点票据盒装，避免撑大普通事件。
+#[derive(Clone, Debug)]
+enum PendingTransferCloseAction {
+    WorkspaceEvent(WorkspaceTabEvent),
+    ResourceOperation {
+        operation: WorkspaceResourceOperation,
+        close_focus: Option<Box<CloseSurvivorFocusIntent>>,
+        close_tab_focus: Option<CloseTabFocusIntent>,
+    },
+}
+
+/// 关闭确认前冻结全部待查来源；迟到查询不能应用到替换后的 pane/tab。
+#[derive(Clone, Debug)]
+pub(super) struct PendingTransferCloseGuard {
+    generation: u64,
+    action: PendingTransferCloseAction,
+    targets: Vec<TransferCloseTarget>,
+}
+
+impl PendingTransferCloseGuard {
+    /// 关闭请求按来源及完整 descriptor 快照校验；标签被替换或请求换代时丢弃迟到回执。
+    ///
+    /// @author kongweiguang
+    fn new(
+        generation: u64,
+        action: PendingTransferCloseAction,
+        targets: Vec<TransferCloseTarget>,
+    ) -> Self {
+        Self {
+            generation,
+            action,
+            targets,
+        }
+    }
+
+    /// 代次及每个来源的完整持久身份必须同时匹配；pane 还须仍属于原 layout。
+    ///
+    /// @author kongweiguang
+    fn is_current(&self, generation: u64, current_tabs: &[WorkspaceSessionTab]) -> bool {
+        self.generation == generation
+            && self.targets.iter().all(|target| match &target.descriptor {
+                TransferCloseDescriptor::Tab(expected) => {
+                    current_tabs.iter().any(|current| current == expected)
+                }
+                TransferCloseDescriptor::Pane { tab, pane_id } => {
+                    current_tabs.iter().any(|current| {
+                        current == tab
+                            && current
+                                .terminal_layout()
+                                .is_some_and(|layout| layout.contains_pane(pane_id))
+                    })
+                }
+            })
+    }
+}
+
+/// 将关闭目标内每种持久文件来源映射到稳定 TransferOrigin，临时工作台不进入工作区快照。
+///
+/// @author kongweiguang
+fn transfer_close_targets_for_tab(tab: &WorkspaceSessionTab) -> Vec<TransferCloseTarget> {
+    match tab {
+        WorkspaceSessionTab::Terminal { layout, .. } => layout
+            .pane_ids()
+            .into_iter()
+            .map(|pane_id| TransferCloseTarget {
+                origin: TransferOrigin::TerminalPane(pane_id.clone()),
+                descriptor: TransferCloseDescriptor::Pane {
+                    tab: tab.clone(),
+                    pane_id,
+                },
+            })
+            .collect(),
+        WorkspaceSessionTab::SftpTransfer { .. } => vec![TransferCloseTarget {
+            origin: TransferOrigin::SftpWorkspace(tab.id().clone()),
+            descriptor: TransferCloseDescriptor::Tab(tab.clone()),
+        }],
+        WorkspaceSessionTab::WorkspaceFile { .. } => vec![TransferCloseTarget {
+            origin: TransferOrigin::WorkspaceFile(tab.id().clone()),
+            descriptor: TransferCloseDescriptor::Tab(tab.clone()),
+        }],
+        WorkspaceSessionTab::Unsupported { .. } => Vec::new(),
+    }
+}
+
+/// 批次按点击时捕获的目标集合收集 TerminalPane、SFTP 与 WorkspaceFile 来源。
+///
+/// @author kongweiguang
+fn transfer_close_targets_for_event(
+    event: &WorkspaceTabEvent,
+    tabs: &[WorkspaceSessionTab],
+    workbench_tab_id: &TabId,
+) -> Vec<TransferCloseTarget> {
+    let ids = match event {
+        WorkspaceTabEvent::Close(tab_id) => std::slice::from_ref(tab_id),
+        WorkspaceTabEvent::CloseBatch(intent) => intent.tab_ids(),
+        _ => return Vec::new(),
+    };
+    ids.iter()
+        .filter(|id| *id != workbench_tab_id)
+        .filter_map(|id| tabs.iter().find(|tab| tab.id() == id))
+        .flat_map(transfer_close_targets_for_tab)
+        .collect()
+}
+
+/// 独立资源操作也走同一来源门禁，覆盖单 pane 与非批量 CloseTab 的直接回执入口。
+///
+/// @author kongweiguang
+fn transfer_close_targets_for_operation(
+    operation: &WorkspaceResourceOperation,
+    tabs: &[WorkspaceSessionTab],
+) -> Vec<TransferCloseTarget> {
+    match operation {
+        WorkspaceResourceOperation::ClosePane {
+            tab_id, pane_id, ..
+        } => tabs
+            .iter()
+            .find(|tab| tab.id() == tab_id)
+            .filter(|tab| {
+                tab.terminal_layout()
+                    .is_some_and(|layout| layout.contains_pane(pane_id))
+            })
+            .map(|tab| TransferCloseTarget {
+                origin: TransferOrigin::TerminalPane(pane_id.clone()),
+                descriptor: TransferCloseDescriptor::Pane {
+                    tab: tab.clone(),
+                    pane_id: pane_id.clone(),
+                },
+            })
+            .into_iter()
+            .collect(),
+        WorkspaceResourceOperation::CloseTab { tab, .. } => {
+            transfer_close_targets_for_tab(tab.as_ref())
+        }
+        WorkspaceResourceOperation::CreatePane { .. } => Vec::new(),
+    }
+}
+
+/// 保留来源顺序并逐个读取 application owner；共享 cancellation token 贯穿整批预检。
+///
+/// @author kongweiguang
+async fn query_transfer_close_blockers(
+    transfers: &TransferService,
+    targets: &[TransferCloseTarget],
+    cancellation: &CancellationToken,
+) -> kerminal_application::AppResult<Vec<TransferCloseTarget>> {
+    let mut blockers = Vec::new();
+    for target in targets {
+        if transfers
+            .origin_has_close_blockers(&target.origin, cancellation.clone())
+            .await?
+        {
+            blockers.push(target.clone());
+        }
+    }
+    Ok(blockers)
+}
+
+/// 退出路径、缺少传输服务或没有可查来源时不建立关闭门禁。
+///
+/// @author kongweiguang
+fn should_start_transfer_close_guard(
+    host_shutdown_requested: bool,
+    transfer_service_available: bool,
+    target_count: usize,
+) -> bool {
+    !host_shutdown_requested && transfer_service_available && target_count > 0
+}
+
+/// 将一份 application 查询结果转换为唯一的关闭决策；查询错误和任一 blocker 都不允许回投。
+///
+/// @author kongweiguang
+fn transfer_close_guard_decision(
+    result: kerminal_application::AppResult<Vec<TransferCloseTarget>>,
+) -> TransferCloseGuardDecision {
+    match result {
+        Ok(blockers) if blockers.is_empty() => TransferCloseGuardDecision::Allow,
+        Ok(blockers) => TransferCloseGuardDecision::Blocked(blockers),
+        Err(error) => TransferCloseGuardDecision::QueryFailed(error),
+    }
+}
+
+/// 批次只有零 blocker 才能应用；错误单独保留安全错误文案。
+#[derive(Debug)]
+enum TransferCloseGuardDecision {
+    Allow,
+    Blocked(Vec<TransferCloseTarget>),
+    QueryFailed(kerminal_application::AppError),
+}
+
 use kerminal_terminal::snapshot::RenderSnapshot;
 use std::{collections::HashMap, future::Future, time::Duration};
 
@@ -1485,12 +1694,391 @@ impl RootView {
         true
     }
 
+    /// 仅在工作区批量关闭时预检全部持久传输来源；普通退出路径不经过此入口。
+    ///
+    /// @author kongweiguang
+    fn defer_transfer_close_until_clear(
+        &mut self,
+        event: &WorkspaceTabEvent,
+        window: &mut Window,
+        cx: &mut Context<RootView>,
+    ) -> bool {
+        if self.host_shutdown_requested || !matches!(event, WorkspaceTabEvent::CloseBatch(_)) {
+            return false;
+        }
+        let tabs = self
+            .workspace_controller
+            .as_ref()
+            .map(|controller| controller.snapshot().terminal_tabs.clone())
+            .unwrap_or_default();
+        let targets = transfer_close_targets_for_event(event, &tabs, &self.sftp_workbench_tab_id);
+        self.begin_transfer_close_guard(
+            PendingTransferCloseAction::WorkspaceEvent(event.clone()),
+            targets,
+            Some(window),
+            cx,
+        )
+    }
+
+    /// ClosePane/CloseTab 复用同一来源票据；只在异步持有时盒装焦点意图，回投仍使用原所有权。
+    ///
+    /// @author kongweiguang
+    fn defer_transfer_resource_operation(
+        &mut self,
+        operation: WorkspaceResourceOperation,
+        close_focus: Option<CloseSurvivorFocusIntent>,
+        close_tab_focus: Option<CloseTabFocusIntent>,
+        cx: &mut Context<RootView>,
+    ) -> bool {
+        if self.host_shutdown_requested {
+            return false;
+        }
+        let tabs = self
+            .workspace_controller
+            .as_ref()
+            .map(|controller| controller.snapshot().terminal_tabs.clone())
+            .unwrap_or_default();
+        let targets = transfer_close_targets_for_operation(&operation, &tabs);
+        self.begin_transfer_close_guard(
+            PendingTransferCloseAction::ResourceOperation {
+                operation,
+                close_focus: close_focus.map(Box::new),
+                close_tab_focus,
+            },
+            targets,
+            None,
+            cx,
+        )
+    }
+
+    /// 同一单槽门禁覆盖窗口事件和直接资源操作；服务缺失时沿原流程关闭，已装配服务的查询错误则失败关闭。
+    ///
+    /// @author kongweiguang
+    fn begin_transfer_close_guard(
+        &mut self,
+        action: PendingTransferCloseAction,
+        targets: Vec<TransferCloseTarget>,
+        window: Option<&mut Window>,
+        cx: &mut Context<RootView>,
+    ) -> bool {
+        let transfers = self.services.transfers.clone();
+        if !should_start_transfer_close_guard(
+            self.host_shutdown_requested,
+            transfers.is_some(),
+            targets.len(),
+        ) {
+            return false;
+        }
+        if self.pending_transfer_close_guard.is_some() {
+            let message = crate::locale::text(
+                "正在核对传输状态，请稍后重试关闭。",
+                "Transfer status is being checked. Try closing again shortly.",
+            );
+            self.reject_transfer_blocked_resource_operation(&action, message, cx);
+            return true;
+        }
+        if !self.prepare_transfer_close_targets(&targets, cx) {
+            if let PendingTransferCloseAction::ResourceOperation { operation, .. } = &action {
+                self.complete_workspace_resource_failure(
+                    operation.operation_id(),
+                    crate::locale::text(
+                        "传输任务正在加入队列，关闭未执行。",
+                        "A transfer is still being queued; the close was not run.",
+                    ),
+                    cx,
+                );
+            }
+            return true;
+        }
+        let Some(transfers) = transfers else {
+            return false;
+        };
+
+        self.transfer_close_guard_generation = self.transfer_close_guard_generation.wrapping_add(1);
+        let generation = self.transfer_close_guard_generation;
+        let ticket = PendingTransferCloseGuard::new(generation, action, targets);
+        let query_targets = ticket.targets.clone();
+        self.pending_transfer_close_guard = Some(ticket);
+        let executor = self.services.executor.clone();
+        let query = async move {
+            executor
+                .run(move |cancellation| async move {
+                    query_transfer_close_blockers(&transfers, &query_targets, &cancellation).await
+                })
+                .await
+        };
+        if let Some(window) = window {
+            cx.spawn_in(window, async move |this, cx| {
+                let result = query.await;
+                let _ = this.update_in(cx, |root, window, cx| {
+                    root.finish_transfer_close_guard(generation, result, Some(window), cx);
+                });
+            })
+            .detach();
+        } else {
+            cx.spawn(async move |this, cx| {
+                let result = query.await;
+                let _ = this.update(cx, |root, cx| {
+                    root.finish_transfer_close_guard(generation, result, None, cx);
+                });
+            })
+            .detach();
+        }
+        true
+    }
+
+    /// 受理屏障按冻结批次来源核对，面板切换不使在途提交失去门禁；仅取消当前匹配来源的未提交准备。
+    ///
+    /// @author kongweiguang
+    fn prepare_transfer_close_targets(
+        &mut self,
+        targets: &[TransferCloseTarget],
+        cx: &mut Context<RootView>,
+    ) -> bool {
+        let mut panes = Vec::new();
+        for target in targets {
+            let pane = match &target.origin {
+                TransferOrigin::TerminalPane(_) | TransferOrigin::WorkspaceFile(_) => self
+                    .sftp_panel
+                    .clone()
+                    .filter(|pane| pane.read(cx).transfer_origin_matches(&target.origin)),
+                TransferOrigin::SftpWorkspace(tab_id) => self.workspace_files.files_pane(tab_id),
+                TransferOrigin::SharedWorkbench => None,
+            };
+            if let Some(pane) = pane
+                && !panes.iter().any(
+                    |existing: &gpui_kit::Entity<crate::features::files::FilesPane>| {
+                        existing.entity_id() == pane.entity_id()
+                    },
+                )
+            {
+                panes.push(pane);
+            }
+        }
+        let compact_enqueue_pending = self.sftp_panel.as_ref().is_some_and(|pane| {
+            targets.iter().any(|target| {
+                pane.read(cx)
+                    .transfer_enqueue_in_progress_for_origin(&target.origin)
+            })
+        });
+        if compact_enqueue_pending
+            || panes
+                .iter()
+                .any(|pane| pane.read(cx).transfer_enqueue_in_progress())
+        {
+            self.status = Some(crate::locale::text(
+                "传输任务正在加入队列，请等待受理结果后再关闭。",
+                "Transfer tasks are being queued. Wait for the result before closing.",
+            ));
+            cx.notify();
+            return false;
+        }
+        for pane in panes {
+            pane.update(cx, |pane, cx| pane.cancel_transfer_preparation(cx));
+        }
+        true
+    }
+
+    /// 异步结果先验证请求代次和完整目标 descriptor；回投前解包原焦点票据，不重建当前选择意图。
+    ///
+    /// @author kongweiguang
+    fn finish_transfer_close_guard(
+        &mut self,
+        generation: u64,
+        result: kerminal_application::AppResult<Vec<TransferCloseTarget>>,
+        window: Option<&mut Window>,
+        cx: &mut Context<RootView>,
+    ) {
+        let Some(current_ticket) = self.pending_transfer_close_guard.as_ref() else {
+            return;
+        };
+        if current_ticket.generation != generation {
+            return;
+        }
+        let Some(ticket) = self.pending_transfer_close_guard.take() else {
+            return;
+        };
+        if self.host_shutdown_requested {
+            return;
+        }
+        let current_tabs = self
+            .workspace_controller
+            .as_ref()
+            .map(|controller| controller.snapshot().terminal_tabs.clone())
+            .unwrap_or_default();
+        if !ticket.is_current(generation, &current_tabs) {
+            if let PendingTransferCloseAction::ResourceOperation { operation, .. } = &ticket.action
+            {
+                self.complete_workspace_resource_failure(
+                    operation.operation_id(),
+                    crate::locale::text(
+                        "关闭目标已变化，原资源操作未执行。",
+                        "The close target changed; the original resource operation was not run.",
+                    ),
+                    cx,
+                );
+            }
+            return;
+        }
+        if !self.prepare_transfer_close_targets(&ticket.targets, cx) {
+            if let PendingTransferCloseAction::ResourceOperation { operation, .. } = &ticket.action
+            {
+                self.complete_workspace_resource_failure(
+                    operation.operation_id(),
+                    crate::locale::text(
+                        "传输任务正在加入队列，关闭未执行。",
+                        "A transfer is still being queued; the close was not run.",
+                    ),
+                    cx,
+                );
+            }
+            return;
+        }
+        match transfer_close_guard_decision(result) {
+            TransferCloseGuardDecision::Allow => match ticket.action {
+                PendingTransferCloseAction::WorkspaceEvent(event) => {
+                    if let Some(window) = window {
+                        self.apply_workspace_tab_event(&event, window, cx);
+                    }
+                }
+                PendingTransferCloseAction::ResourceOperation {
+                    operation,
+                    close_focus,
+                    close_tab_focus,
+                } => self.apply_workspace_resource_operation_with_focus(
+                    operation,
+                    close_focus.map(|intent| *intent),
+                    close_tab_focus,
+                    cx,
+                ),
+            },
+            TransferCloseGuardDecision::Blocked(blockers) => {
+                if let Some(window) = window {
+                    self.reveal_transfer_close_sources(&blockers, Some(window), cx);
+                } else {
+                    self.reveal_transfer_close_sources(&blockers, None, cx);
+                }
+                let message = crate::locale::text(
+                    "传输仍有待处理工作，标签保持打开；请先处理传输队列。",
+                    "Transfers still need attention. The tab remains open; review the transfer queue first.",
+                );
+                self.reject_transfer_blocked_resource_operation(&ticket.action, message, cx);
+            }
+            TransferCloseGuardDecision::QueryFailed(error) => {
+                if let Some(window) = window {
+                    self.reveal_transfer_close_sources(&ticket.targets, Some(window), cx);
+                } else {
+                    self.reveal_transfer_close_sources(&ticket.targets, None, cx);
+                }
+                let message = crate::locale::text(
+                    format!("传输状态核对失败，标签保持打开：{}", error.public_message()),
+                    format!(
+                        "Transfer status check failed; the tab remains open: {}",
+                        error.public_message()
+                    ),
+                );
+                self.reject_transfer_blocked_resource_operation(&ticket.action, message, cx);
+            }
+        }
+    }
+
+    /// 资源入口没有 Window 时仍刷新精确来源队列；窗口事件另外激活对应工作区与 SFTP 工具。
+    ///
+    /// @author kongweiguang
+    fn reveal_transfer_close_sources(
+        &mut self,
+        targets: &[TransferCloseTarget],
+        window: Option<&mut Window>,
+        cx: &mut Context<RootView>,
+    ) {
+        if let (Some(first), Some(window)) = (targets.first(), window) {
+            match (&first.origin, &first.descriptor) {
+                (
+                    TransferOrigin::TerminalPane(_),
+                    TransferCloseDescriptor::Pane { tab, pane_id },
+                ) => {
+                    self.activate_workspace_tab_surface(tab.id(), true, window, cx);
+                    self.focus_workspace_pane(tab.id().clone(), pane_id.clone(), window, cx);
+                    self.reveal_sftp_tool_if_needed(window, cx);
+                    self.try_bind_files_from_active_terminal(cx);
+                }
+                (_, TransferCloseDescriptor::Tab(tab)) => {
+                    self.activate_workspace_tab_surface(tab.id(), true, window, cx);
+                    if matches!(tab, WorkspaceSessionTab::WorkspaceFile { .. }) {
+                        self.reveal_sftp_tool_if_needed(window, cx);
+                        self.try_bind_files_from_active_terminal(cx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for target in targets {
+            match &target.origin {
+                TransferOrigin::SftpWorkspace(tab_id) => {
+                    if let Some(pane) = self.workspace_files.files_pane(tab_id) {
+                        pane.update(cx, |pane, cx| pane.reveal_transfer_queue(cx));
+                    }
+                }
+                TransferOrigin::TerminalPane(_) | TransferOrigin::WorkspaceFile(_) => {
+                    if let Some(pane) = self.sftp_panel.clone()
+                        && pane.read(cx).transfer_origin_matches(&target.origin)
+                    {
+                        pane.update(cx, |pane, cx| pane.reveal_transfer_queue(cx));
+                    }
+                }
+                TransferOrigin::SharedWorkbench => {}
+            }
+        }
+    }
+
+    /// 用户看到的既有 SFTP 工具已打开时不调用 toggle，防止阻塞反馈反而隐藏队列。
+    ///
+    /// @author kongweiguang
+    fn reveal_sftp_tool_if_needed(&mut self, window: &mut Window, cx: &mut Context<RootView>) {
+        let tool = kerminal_application::preferences::ToolRailToolId::Sftp;
+        if self.tool_rail_state.attached_tool() != Some(tool) {
+            self.activate_tool_rail_panel_from_shortcut(tool, window, cx);
+        }
+    }
+
+    /// 资源操作已经由 controller 占有时，阻塞回执必须释放为可重试失败，不能悬置 pending owner。
+    ///
+    /// @author kongweiguang
+    fn reject_transfer_blocked_resource_operation(
+        &mut self,
+        action: &PendingTransferCloseAction,
+        message: SharedString,
+        cx: &mut Context<RootView>,
+    ) {
+        if let PendingTransferCloseAction::ResourceOperation { operation, .. } = action {
+            self.complete_workspace_resource_failure(operation.operation_id(), message, cx);
+        } else {
+            self.status = Some(message);
+            cx.notify();
+        }
+    }
+
     /// Root 单独接管共享工作台临时 Tab，持久标签与资源 ACK 仍由 controller 更新和关闭。
     /// 返回值只表示 Activate 已接受：持久标签须获 reducer 的 Changed/Unchanged，临时工作台须仍有效；其它路径一律拒绝 Root 导航。
     /// CloseTab 只在窗口入口捕获原活动 tab 的焦点代次，后台 ACK 不按届时的 active tab 重建意图。
     ///
     /// @author kongweiguang
     pub(super) fn handle_workspace_tab_event(
+        &mut self,
+        event: &WorkspaceTabEvent,
+        window: &mut Window,
+        cx: &mut Context<RootView>,
+    ) -> bool {
+        if self.defer_transfer_close_until_clear(event, window, cx) {
+            return false;
+        }
+        self.apply_workspace_tab_event(event, window, cx)
+    }
+
+    /// 关闭来源门禁回执确认无待办后直接应用冻结事件，避免再次触发异步预检。
+    ///
+    /// @author kongweiguang
+    fn apply_workspace_tab_event(
         &mut self,
         event: &WorkspaceTabEvent,
         window: &mut Window,
@@ -1795,6 +2383,32 @@ impl RootView {
     ///
     /// @author kongweiguang
     fn handle_workspace_resource_operation_with_focus(
+        &mut self,
+        operation: WorkspaceResourceOperation,
+        close_focus: Option<CloseSurvivorFocusIntent>,
+        close_tab_focus: Option<CloseTabFocusIntent>,
+        cx: &mut Context<RootView>,
+    ) {
+        if self.defer_transfer_resource_operation(
+            operation.clone(),
+            close_focus.clone(),
+            close_tab_focus.clone(),
+            cx,
+        ) {
+            return;
+        }
+        self.apply_workspace_resource_operation_with_focus(
+            operation,
+            close_focus,
+            close_tab_focus,
+            cx,
+        );
+    }
+
+    /// 传输核对完成后继续原 controller 操作，避免从通用入口重复创建资源 owner。
+    ///
+    /// @author kongweiguang
+    fn apply_workspace_resource_operation_with_focus(
         &mut self,
         operation: WorkspaceResourceOperation,
         close_focus: Option<CloseSurvivorFocusIntent>,
@@ -3301,6 +3915,10 @@ impl RootView {
 #[cfg(test)]
 #[path = "../../tests/unit/root_workspace_close.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/workspace_close_transfer_guard.rs"]
+mod transfer_close_guard_tests;
 
 /// 只撤销同一文件的 CloseTab 候选；迟到取消不得释放其它资源操作的所有权。
 ///

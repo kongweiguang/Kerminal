@@ -504,6 +504,7 @@ impl CommandsView {
     }
 
     /// 右栏 Run 按 main 的风险、敏感值、耗时和多行规则确认，并冻结当前正文及目标快照。
+    /// 确认层沿用统一淡入及减少动态效果策略，不改变冻结计划的提交门禁。
     ///
     /// @author kongweiguang
     pub(super) fn request_snippet_run_terminal(
@@ -625,6 +626,7 @@ impl CommandsView {
         window.open_dialog(cx, move |dialog, _, _| {
             let parent_for_close = parent.clone();
             dialog
+                .entrance(gpui_kit::component::dialog::DialogEntrance::Fade)
                 .backdrop_blur(dialog_theme.modal_blur_radius)
                 .surface_backdrop_filter(
                     dialog_theme.floating_blur_radius,

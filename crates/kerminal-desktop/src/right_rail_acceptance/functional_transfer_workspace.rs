@@ -121,6 +121,7 @@ struct WorkspaceFixture {
 }
 
 /// 通过真实窗口事件完成主机切换、右键复制和两类拖拽，并以端点与正文回读确认。
+/// 共享页先产生真实任务，再激活独立标签验证其队列为空，防止来源隔离只在测试替身中成立。
 ///
 /// @author kongweiguang
 pub(super) async fn run(
@@ -533,6 +534,13 @@ pub(super) async fn run(
         },
     )
     .await?;
+    // 共享工作台已经完成多次复制；新标签必须保持自己的空队列，不能借用全局任务投影。
+    let independent_rows = window.update(cx, |_, _, app| {
+        root.update(app, |root, cx| root.transfer_workspace_acceptance_rows(cx))
+    })?;
+    if independent_rows.is_none_or(|rows| !rows.is_empty()) {
+        return Err(io::Error::other("独立传输标签显示了其它来源的传输记录").into());
+    }
     select_host(cx, root, window, capture, 0, fixture.source_host.as_str()).await?;
     wait_endpoint(cx, root, window, 0, &fixture.source_root).await?;
     functional::poll_root(
@@ -1683,7 +1691,7 @@ async fn reveal_fixture_row(
     .await
 }
 
-/// 虚拟行未渲染或被裁切时从列表顶部真实滚动扫描，失败也保留末帧和几何供定位。
+/// 已挂载的虚拟行按实际裁切区域对齐；未挂载时从顶部小步扫描，避免窄视口跨过目标。
 ///
 /// @author kongweiguang
 pub(super) async fn reveal_file_row(
@@ -1704,7 +1712,9 @@ pub(super) async fn reveal_file_row(
     let mut initial = None;
     let mut last_geometry = serde_json::Value::Null;
     let mut scroll_count = 0;
-    for attempt in 0..80 {
+    let mut reset_to_top = false;
+    let mut scroll_trace = Vec::new();
+    for attempt in 0..=80 {
         let _ = super::frame_signature(cx, window)?;
         let (row, list, viewport) = window.update(cx, |_, window, _| {
             (
@@ -1713,20 +1723,26 @@ pub(super) async fn reveal_file_row(
                 window.visual_viewport_bounds(),
             )
         })?;
+        let clip = list.map(|list| list.intersect(&viewport));
         let geometry = serde_json::json!({
             "rowSelector": row_selector,
             "listSelector": list_selector,
             "rowBounds": format!("{row:?}"),
             "listBounds": format!("{list:?}"),
             "windowBounds": format!("{viewport:?}"),
+            "clipBounds": format!("{clip:?}"),
             "clickPoint": row.map(|bounds| format!("{:?}", bounds.center())),
         });
         if initial.is_none() {
             initial = Some(geometry.clone());
         }
         last_geometry = geometry.clone();
-        let clip = list.map(|list| list.intersect(&viewport));
         if clip.is_some_and(|clip| row.is_some_and(|row| row_inside_clip(row, clip))) {
+            scroll_trace.push(serde_json::json!({
+                "frame": attempt + 1,
+                "geometry": geometry,
+                "scrollDelta": null,
+            }));
             fs::write(
                 capture
                     .output_directory
@@ -1737,12 +1753,37 @@ pub(super) async fn reveal_file_row(
                     "scrollCount": scroll_count,
                     "frameCount": attempt + 1,
                     "initialFrame": initial_frame,
+                    "scrollTrace": scroll_trace,
                 }))?,
             )?;
             return Ok(());
         }
-        if let Some(clip) = clip.filter(|clip| !clip.is_empty()) {
-            let delta = if scroll_count == 0 { 10000. } else { -120. };
+        let delta = if attempt < 80 {
+            clip.filter(|clip| !clip.is_empty()).and_then(|clip| {
+                let max_step = (clip.size.height.as_f32() / 2.).min(120.);
+                if max_step <= 0. {
+                    None
+                } else if let Some(row) = row {
+                    let adjustment = (clip.center().y - row.center().y)
+                        .as_f32()
+                        .clamp(-max_step, max_step);
+                    (adjustment != 0.).then_some(adjustment)
+                } else if !reset_to_top {
+                    reset_to_top = true;
+                    Some(10000.)
+                } else {
+                    Some(-max_step)
+                }
+            })
+        } else {
+            None
+        };
+        scroll_trace.push(serde_json::json!({
+            "frame": attempt + 1,
+            "geometry": geometry,
+            "scrollDelta": delta,
+        }));
+        if let (Some(clip), Some(delta)) = (clip, delta) {
             window.update(cx, |_, window, app| {
                 let _ = window.dispatch_event(
                     ScrollWheelEvent {
@@ -1756,6 +1797,9 @@ pub(super) async fn reveal_file_row(
                 );
             })?;
             scroll_count += 1;
+        }
+        if attempt == 80 {
+            break;
         }
         cx.background_executor().timer(super::ACCEPTANCE_POLL).await;
     }
@@ -1776,6 +1820,7 @@ pub(super) async fn reveal_file_row(
             "scrollCount": scroll_count,
             "initialFrame": initial_frame,
             "finalFrame": final_frame,
+            "scrollTrace": scroll_trace,
         }))?,
     )?;
     Err(io::Error::other(format!("文件行未进入列表裁切区域: {row_selector}")).into())

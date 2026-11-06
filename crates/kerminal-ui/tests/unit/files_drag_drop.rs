@@ -24,6 +24,75 @@ fn remote(host_id: &HostId, path: &str) -> FileEndpoint {
     FileEndpoint::remote(host_id.clone(), path).expect("valid remote fixture path")
 }
 
+/// 共用复制入口必须保留 POSIX 名称；只有无法落入目标文件系统时才禁用，不能按宿主拒绝远端复制。
+///
+/// @author kongweiguang
+#[test]
+fn posix_backslash_copy_obeys_destination_platform() {
+    let host = HostId::new();
+    let source_root = remote(&host, "/source");
+    let name = r"backup\2026.txt";
+    let source = entry(
+        remote(&host, &format!("/source/{name}")),
+        name,
+        FileEntryKind::File,
+    );
+    let target = remote(&HostId::new(), "/target");
+    let (items, issues) = plan_copy_entries(
+        std::slice::from_ref(&source),
+        &source_root,
+        &target,
+        ConflictPolicy::Overwrite,
+    );
+    assert!(issues.is_empty());
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].1.destination, target.join_name(name).unwrap());
+    assert_eq!(
+        copy_target_rejection([&source], &source_root, &target),
+        None
+    );
+
+    let local = FileEndpoint::Local {
+        path: PathBuf::from("downloads"),
+    };
+    let (items, issues) = plan_copy_entries(
+        std::slice::from_ref(&source),
+        &source_root,
+        &local,
+        ConflictPolicy::Overwrite,
+    );
+    if cfg!(windows) {
+        assert!(items.is_empty());
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            copy_target_rejection([&source], &source_root, &local),
+            Some(DropRejection::InvalidDestination)
+        );
+    } else {
+        assert!(issues.is_empty());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].1.destination, local.join_name(name).unwrap());
+    }
+}
+
+/// 放行合法 POSIX 字符不能放宽条目身份约束，伪造显示名称仍不得进入传输请求。
+///
+/// @author kongweiguang
+#[test]
+fn posix_copy_still_rejects_mismatched_entry_names() {
+    let host = HostId::new();
+    let source_root = remote(&host, "/source");
+    let source = entry(
+        remote(&host, r"/source/backup\2026.txt"),
+        "2026.txt",
+        FileEntryKind::File,
+    );
+    assert_eq!(
+        validate_drop_entry(&source, &source_root, &remote(&HostId::new(), "/target")),
+        Err(DropRejection::InvalidName)
+    );
+}
+
 /// 构造最小文件行快照，使测试集中验证拖放边界而非列表投影细节。
 ///
 /// @author kongweiguang

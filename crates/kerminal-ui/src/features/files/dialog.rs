@@ -12,13 +12,20 @@ use gpui_kit::{
     },
     div,
     prelude::*,
-    px,
+    px, relative,
 };
 use kerminal_domain::files::{ConflictPolicy, FileEndpoint, FileEntry, FileEntryKind};
 
 use crate::{locale, theme::ThemeTokens};
 
-use super::{FilesPane, NameAction};
+use super::{FileTargetNameState, FilesPane, NameAction, TransferConflictKind};
+
+/// 展示值使用可读名称，完整身份留给提示；两者都来自同一个已冻结端点。
+struct TransferConflictPreview {
+    source: (String, String),
+    destination: (String, String),
+    kind: TransferConflictKind,
+}
 
 impl FilesPane {
     /// 文件弹框沿用 main SFTP `max-w-xl` 的 576 逻辑像素上限，由 Root 外框负责表面样式。
@@ -51,7 +58,7 @@ impl FilesPane {
             .clone()
     }
 
-    /// 在同一根遮罩中渲染 FilesPane 所有全局弹框，避免删除与表单使用两套视觉和焦点行为。
+    /// 在同一根遮罩中渲染文件弹框；冲突预览仅取预检确认的请求，不改变冻结计划。
     ///
     /// @author kongweiguang
     pub(crate) fn render_global_dialog(
@@ -64,9 +71,23 @@ impl FilesPane {
         }
         let close_focus = self.global_dialog_focus_handle(cx);
         let theme = ThemeTokens::current(window, cx).for_tool_panel();
-        if let Some(conflict_count) = self.pending_transfer_conflict_count() {
+        if let Some(pending) = self.pending_transfer_conflict.as_ref() {
+            let conflict_count = pending.conflicts.len();
+            let previews = pending
+                .conflict_items()
+                .take(3)
+                .map(|(request, kind)| TransferConflictPreview {
+                    source: conflict_endpoint_preview(&request.source, &self.target_names),
+                    destination: conflict_endpoint_preview(
+                        &request.destination,
+                        &self.target_names,
+                    ),
+                    kind,
+                })
+                .collect();
             return Some(render_transfer_conflict_dialog(
                 conflict_count,
+                previews,
                 theme,
                 &close_focus,
                 cx,
@@ -147,6 +168,7 @@ impl FilesPane {
     }
 
     /// 权限操作从文件行右键菜单进入，并冻结行 endpoint 以匹配主分支的单项 chmod 对话框。
+    /// 不替换尚未收尾的名称或权限表单，使旧回执不会清除新操作的忙碌状态。
     ///
     /// @author kongweiguang
     pub(super) fn prepare_permissions(
@@ -155,6 +177,9 @@ impl FilesPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.name_action_busy || self.permissions.busy {
+            return;
+        }
         let Some(entry) = self
             .panels
             .get(side)
@@ -185,11 +210,13 @@ impl FilesPane {
     }
 }
 
-/// 按 main 的三张策略卡片即时提交已冻结批次，不增加额外确认步骤。
+/// 冲突策略立即应用于冻结批次；预览限定高度，防止多项冲突挤出小窗口的决策入口。
+/// listener 已借用 FilesPane，回调直接使用该借用，不能再次通过 Entity::update 重入。
 ///
 /// @author kongweiguang
 fn render_transfer_conflict_dialog(
     conflict_count: usize,
+    previews: Vec<TransferConflictPreview>,
     theme: ThemeTokens,
     close_focus: &FocusHandle,
     cx: &mut Context<FilesPane>,
@@ -199,22 +226,21 @@ fn render_transfer_conflict_dialog(
             "files-transfer-conflict-overwrite",
             ConflictPolicy::Overwrite,
             locale::text("覆盖目标", "Overwrite target"),
-            locale::text("替换目标文件。", "Replace the destination file."),
+            locale::text("替换目标项目。", "Replace the destination item."),
         ),
         (
             "files-transfer-conflict-rename",
             ConflictPolicy::Rename,
             locale::text("自动重命名", "Rename automatically"),
-            locale::text("生成新文件名。", "Generate a new file name."),
+            locale::text("生成新名称。", "Generate a new name."),
         ),
         (
             "files-transfer-conflict-skip",
             ConflictPolicy::Skip,
             locale::text("跳过冲突", "Skip conflicts"),
-            locale::text("跳过已存在项目。", "Skip existing items."),
+            locale::text("跳过冲突项目。", "Skip conflicting items."),
         ),
     ];
-    let cancel_pane = cx.entity().clone();
     dialog_surface(theme)
         .id("files-transfer-conflict-dialog")
         .child(dialog_header(
@@ -223,23 +249,17 @@ fn render_transfer_conflict_dialog(
                 "请选择冲突处理方式。",
                 "Choose how to handle the conflicts.",
             ),
-            dialog_close_button(false, close_focus, cx),
+            dialog_close_button(false, close_focus, theme, cx),
             theme,
         ))
         .child(
-            dialog_body()
+            dialog_body(theme)
                 .child(
                     div()
                         .w_full()
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme.warning.opacity(0.24))
-                        .bg(theme.warning.opacity(0.12))
-                        .px_3()
-                        .py_3()
                         .child(
                             div()
                                 .flex()
@@ -265,6 +285,11 @@ fn render_transfer_conflict_dialog(
                                 )),
                         ),
                 )
+                .child(render_transfer_conflict_previews(
+                    conflict_count,
+                    previews,
+                    theme,
+                ))
                 .child(
                     div()
                         .w_full()
@@ -272,13 +297,13 @@ fn render_transfer_conflict_dialog(
                         .flex_col()
                         .gap_2()
                         .children(options.into_iter().map(|(id, policy, label, description)| {
-                            let action_pane = cx.entity().clone();
                             Button::new(id)
                                 .small()
                                 .outline()
+                                .when(policy == ConflictPolicy::Overwrite, Button::danger)
                                 .rounded(theme.radius_sm)
                                 .w_full()
-                                .h(px(68.))
+                                .h(theme.metrics.control_height * 1.5)
                                 .justify_start()
                                 .child(
                                     div()
@@ -291,7 +316,13 @@ fn render_transfer_conflict_dialog(
                                             div()
                                                 .text_size(theme.text_sm)
                                                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                                .text_color(theme.foreground)
+                                                .text_color(
+                                                    if policy == ConflictPolicy::Overwrite {
+                                                        theme.error
+                                                    } else {
+                                                        theme.foreground
+                                                    },
+                                                )
                                                 .child(label),
                                         )
                                         .child(
@@ -301,24 +332,19 @@ fn render_transfer_conflict_dialog(
                                                 .child(description),
                                         ),
                                 )
-                                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                                    action_pane.update(cx, |pane, cx| {
-                                        pane.resolve_transfer_conflict(policy, cx);
-                                    });
+                                .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
+                                    pane.resolve_transfer_conflict(policy, cx);
                                 }))
                         })),
                 ),
         )
         .child(
-            div()
+            crate::ui_surface::dialog_actions(theme)
                 .w_full()
-                .flex_shrink_0()
-                .flex()
-                .justify_end()
                 .border_t_1()
                 .border_color(theme.border)
-                .px_5()
-                .py_4()
+                .px(theme.metrics.dialog_padding)
+                .py(theme.metrics.section_gap)
                 .child(
                     dialog_button_label(
                         Button::new("files-transfer-conflict-cancel")
@@ -326,17 +352,122 @@ fn render_transfer_conflict_dialog(
                             .ghost(),
                         locale::text("取消", "Cancel"),
                     )
-                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                        cancel_pane.update(cx, |pane, cx| {
-                            pane.cancel_transfer_conflict(cx);
-                        });
+                    .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
+                        pane.cancel_transfer_conflict(cx);
                     })),
                 ),
         )
         .into_any_element()
 }
 
+/// 文件名和短目标名优先用于识别，完整路径与身份留在提示中，避免长父目录挤走实际对象。
+///
+/// @author kongweiguang
+fn conflict_endpoint_preview(
+    endpoint: &FileEndpoint,
+    target_names: &FileTargetNameState,
+) -> (String, String) {
+    (
+        format!(
+            "{} · {}",
+            super::endpoint_name(endpoint).unwrap_or_else(|| endpoint_path_label(endpoint)),
+            target_names.display(endpoint).compact
+        ),
+        target_names.endpoint_detail(endpoint),
+    )
+}
+
+/// 来源和目标各占一行以保留两端对象；预览随密度缩放并滚动，完整身份在受视口约束的提示中换行。
+///
+/// @author kongweiguang
+fn render_transfer_conflict_previews(
+    conflict_count: usize,
+    previews: Vec<TransferConflictPreview>,
+    theme: ThemeTokens,
+) -> impl IntoElement {
+    let hidden_count = conflict_count.saturating_sub(previews.len());
+    div()
+        .id("files-transfer-conflict-previews")
+        .w_full()
+        .max_h(theme.metrics.control_height * 2.)
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .children(previews.into_iter().enumerate().map(|(index, preview)| {
+            let paths = [
+                ("source", locale::text("来源", "From"), preview.source),
+                (
+                    "destination",
+                    locale::text("目标", "To"),
+                    preview.destination,
+                ),
+            ];
+            div()
+                .w_full()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(theme.secondary)
+                .text_size(theme.text_xs)
+                .line_height(relative(1.5))
+                .children(paths.into_iter().map(|(part, label, (value, full))| {
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(div().flex_shrink_0().text_color(theme.muted).child(label))
+                        .child(
+                            div()
+                                .id(format!("files-transfer-conflict-{index}-{part}"))
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .tooltip(move |window, cx| {
+                                    let width = px((window.viewport_size().width.as_f32() - 64.)
+                                        .clamp(160., 520.));
+                                    let detail = full.clone();
+                                    gpui_kit::component::tooltip::Tooltip::element(move |_, _| {
+                                        div().w(width).whitespace_normal().child(detail.clone())
+                                    })
+                                    .max_w(width + px(16.))
+                                    .build(window, cx)
+                                })
+                                .child(value),
+                        )
+                }))
+                .when(preview.kind == TransferConflictKind::Repeated, |item| {
+                    item.child(div().text_color(theme.warning).child(locale::text(
+                        "本批次中目标重名",
+                        "Duplicate destination in this batch",
+                    )))
+                })
+        }))
+        .when(hidden_count > 0, |list| {
+            list.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(theme.text_xs)
+                    .text_color(theme.muted)
+                    .child(locale::text(
+                        format!("还有 {hidden_count} 个冲突未显示。"),
+                        format!("{hidden_count} more conflicts are not shown."),
+                    )),
+            )
+        })
+}
+
 /// 新建与重命名共用受限名称输入，但标题和已冻结目标明确区分两种动作。
+/// 按钮沿用 listener 提供的唯一实体借用，保持鼠标提交与输入框 Enter 使用同一操作入口。
 ///
 /// @author kongweiguang
 fn render_name_dialog(
@@ -374,18 +505,16 @@ fn render_name_dialog(
         .map(|input| dialog_text_input(input, theme, cx.theme().font_family.clone()));
     let has_input = input.is_some();
     let error = (!busy).then(|| pane.status.clone()).flatten();
-    let cancel_pane = cx.entity().clone();
-    let confirm_pane = cx.entity().clone();
     dialog_surface(theme)
         .id("files-global-name-dialog")
         .child(dialog_header(
             title,
             detail,
-            dialog_close_button(busy, close_focus, cx),
+            dialog_close_button(busy, close_focus, theme, cx),
             theme,
         ))
         .child(
-            dialog_body()
+            dialog_body(theme)
                 .when(is_rename, |body| {
                     body.child(dialog_readonly_field(
                         "files-global-dialog-parent",
@@ -416,8 +545,8 @@ fn render_name_dialog(
                 locale::text("取消", "Cancel"),
             )
             .disabled(busy)
-            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                cancel_pane.update(cx, |pane, cx| pane.cancel_global_dialog(cx));
+            .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
+                pane.cancel_global_dialog(cx);
             })),
             dialog_button_label(
                 Button::new("files-global-dialog-confirm")
@@ -431,8 +560,8 @@ fn render_name_dialog(
                 },
             )
             .disabled(busy || !has_input)
-            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                confirm_pane.update(cx, |pane, cx| pane.confirm_global_dialog(cx));
+            .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
+                pane.confirm_global_dialog(cx);
             })),
             theme,
         ))
@@ -440,6 +569,7 @@ fn render_name_dialog(
 }
 
 /// POSIX mode 弹框展示路径和真实权限，不把 Windows ACL 或缺失 metadata 伪装成八进制值。
+/// listener 内直接操作当前 pane，避免按钮在处理点击时重入其实体。
 ///
 /// @author kongweiguang
 fn render_permission_dialog(
@@ -467,18 +597,16 @@ fn render_permission_dialog(
         .map(|input| dialog_text_input(input, theme, cx.theme().font_family.clone()));
     let has_input = input.is_some();
     let error = (!busy).then(|| pane.status.clone()).flatten();
-    let cancel_pane = cx.entity().clone();
-    let confirm_pane = cx.entity().clone();
     dialog_surface(theme)
         .id("files-global-permissions-dialog")
         .child(dialog_header(
             locale::text("修改权限", "Change permissions"),
             endpoint_path_label(endpoint),
-            dialog_close_button(busy, close_focus, cx),
+            dialog_close_button(busy, close_focus, theme, cx),
             theme,
         ))
         .child(
-            dialog_body()
+            dialog_body(theme)
                 .child(dialog_readonly_field(
                     "files-global-dialog-path",
                     locale::text("文件路径", "File path"),
@@ -514,8 +642,8 @@ fn render_permission_dialog(
                 locale::text("取消", "Cancel"),
             )
             .disabled(busy)
-            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                cancel_pane.update(cx, |pane, cx| pane.cancel_global_dialog(cx));
+            .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
+                pane.cancel_global_dialog(cx);
             })),
             dialog_button_label(
                 Button::new("files-global-dialog-confirm")
@@ -529,15 +657,17 @@ fn render_permission_dialog(
                 },
             )
             .disabled(busy || !has_input)
-            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                confirm_pane.update(cx, |pane, cx| pane.confirm_global_dialog(cx));
+            .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
+                pane.confirm_global_dialog(cx);
             })),
             theme,
         ))
         .into_any_element()
 }
 
-/// 删除弹框冻结目标类型，批量预览最多显示八项并说明目录递归删除范围。
+/// 删除弹框冻结目标类型，以短标题说明动作，完整对象路径和递归范围留在正文。
+/// 文件名长度不受界面控制，因此不放入标题，避免窄窗口中标点孤行或挤压主要操作。
+/// 点击回调复用 listener 的当前借用，不再对同一 FilesPane 调用嵌套 update。
 ///
 /// @author kongweiguang
 fn render_delete_dialog(
@@ -571,10 +701,17 @@ fn render_delete_dialog(
         )
         .to_string()
     };
-    let title = if total > 1 {
-        locale::text(format!("删除 {total} 项"), format!("Delete {total} items"))
+    let title = if let [entry] = entries.as_slice() {
+        if entry.kind == FileEntryKind::Directory {
+            locale::text("删除目录？", "Delete folder?")
+        } else {
+            locale::text("删除文件？", "Delete file?")
+        }
     } else {
-        locale::text("删除", "Delete")
+        locale::text(
+            format!("删除 {total} 项？"),
+            format!("Delete {total} items?"),
+        )
     };
     let description = delete_dialog_description(&entries);
     let labels = entries
@@ -583,18 +720,16 @@ fn render_delete_dialog(
         .map(|entry| entry.name.clone())
         .collect::<Vec<_>>();
     let hidden_count = total.saturating_sub(labels.len());
-    let cancel_pane = cx.entity().clone();
-    let confirm_pane = cx.entity().clone();
     dialog_surface(theme)
         .id("files-global-delete-dialog")
         .child(dialog_header(
             title,
             description,
-            dialog_close_button(false, close_focus, cx),
+            dialog_close_button(false, close_focus, theme, cx),
             theme,
         ))
         .child(
-            dialog_body()
+            dialog_body(theme)
                 .child(
                     div()
                         .text_size(theme.text_sm)
@@ -654,25 +789,22 @@ fn render_delete_dialog(
                 Button::new("files-global-dialog-cancel").compact().ghost(),
                 locale::text("取消", "Cancel"),
             )
-            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                cancel_pane.update(cx, |pane, cx| pane.cancel_global_dialog(cx));
+            .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
+                pane.cancel_global_dialog(cx);
             })),
             dialog_button_label(
                 Button::new("files-global-dialog-confirm")
                     .compact()
                     .danger()
-                    .icon(gpui_kit::assets::IconName::Check),
+                    .icon(gpui_kit::assets::IconName::Trash),
                 if total > 1 {
-                    locale::text(
-                        format!("确认删除 {total} 项"),
-                        format!("Confirm delete {total} items"),
-                    )
+                    locale::text(format!("删除 {total} 项"), format!("Delete {total} items"))
                 } else {
-                    locale::text("确认删除", "Confirm delete")
+                    locale::text("删除", "Delete")
                 },
             )
-            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                confirm_pane.update(cx, |pane, cx| pane.confirm_global_dialog(cx));
+            .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
+                pane.confirm_global_dialog(cx);
             })),
             theme,
         ))
@@ -690,7 +822,7 @@ fn dialog_surface(theme: ThemeTokens) -> gpui_kit::Div {
         .text_color(theme.foreground)
 }
 
-/// 标题、路径和关闭动作复用 main ModalShell 的 header 结构；Root 持有表面与遮罩。
+/// 标题、路径和关闭动作复用主题字号及弹层留白；Root 持有表面与遮罩。
 ///
 /// @author kongweiguang
 fn dialog_header(
@@ -705,11 +837,11 @@ fn dialog_header(
         .flex()
         .items_start()
         .justify_between()
-        .gap_4()
+        .gap(theme.metrics.section_gap)
         .border_b_1()
         .border_color(theme.border)
-        .px_5()
-        .py_4()
+        .px(theme.metrics.dialog_padding)
+        .py(theme.metrics.section_gap)
         .child(
             div()
                 .min_w(px(0.))
@@ -718,16 +850,16 @@ fn dialog_header(
                 .flex_col()
                 .child(
                     div()
-                        .text_size(px(17.))
-                        .line_height(px(24.))
+                        .text_size(theme.text_heading)
+                        .line_height(relative(1.25))
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .child(title),
                 )
                 .child(
                     div()
                         .mt_1()
-                        .text_size(px(13.))
-                        .line_height(px(20.))
+                        .text_size(theme.text_xs)
+                        .line_height(relative(1.5))
                         .text_color(theme.muted)
                         .child(description),
                 ),
@@ -735,19 +867,19 @@ fn dialog_header(
         .child(close)
 }
 
-/// 关闭按钮复用已有取消路径；表单提交占用输入时禁用，避免出现可见但无效的关闭动作。
+/// 关闭按钮复用已有取消路径与共享控件槽；表单提交期间禁用，避免出现无效关闭动作。
 ///
 /// @author kongweiguang
 fn dialog_close_button(
     busy: bool,
     close_focus: &FocusHandle,
+    theme: ThemeTokens,
     cx: &mut Context<FilesPane>,
 ) -> Button {
     let label = locale::text("关闭弹框", "Close dialog");
     Button::new("files-global-dialog-close")
         .focus_handle(close_focus)
-        .w(px(36.))
-        .h(px(36.))
+        .size(theme.metrics.control_height)
         .flex_shrink_0()
         .ghost()
         .icon(gpui_kit::assets::IconName::X)
@@ -759,35 +891,29 @@ fn dialog_close_button(
         }))
 }
 
-/// Button 会在内容行内应用 compact 字体；弹框动作必须在可见文字节点显式指定 main 字号。
+/// 动作文案交给 Kit Button 排版，使字号、图标间距和用户界面缩放保持同一尺度。
 ///
 /// @author kongweiguang
 fn dialog_button_label(button: Button, label: impl Into<gpui_kit::SharedString>) -> Button {
     let label = label.into();
-    button.accessibility_label(label.clone()).child(
-        div()
-            .text_size(px(16.))
-            .line_height(px(24.))
-            .font_weight(gpui_kit::FontWeight::NORMAL)
-            .child(label),
-    )
+    button.accessibility_label(label.clone()).label(label)
 }
 
-/// 正文使用 ModalShell 的内容区内边距，字段分组各自处理标签间距。
+/// 正文与标题、操作栏共享弹层留白；字段分组各自处理标签间距。
 ///
 /// @author kongweiguang
-fn dialog_body() -> gpui_kit::Div {
+fn dialog_body(theme: ThemeTokens) -> gpui_kit::Div {
     div()
         .w_full()
         .min_h(px(0.))
         .flex()
         .flex_col()
-        .gap_3()
-        .px_5()
-        .py_4()
+        .gap(theme.metrics.panel_padding)
+        .px(theme.metrics.dialog_padding)
+        .py(theme.metrics.section_gap)
 }
 
-/// 保留输入实体与焦点，并使用系统字体及文件工具栏字段令牌，避免继承默认输入色。
+/// 保留输入实体与焦点，并使用系统字体和主题字号，避免对话框字段与工作区各用一套文本尺度。
 ///
 /// @author kongweiguang
 fn dialog_text_input(
@@ -795,10 +921,10 @@ fn dialog_text_input(
     theme: ThemeTokens,
     system_font_family: gpui_kit::SharedString,
 ) -> impl IntoElement {
-    let input = gpui_kit::Styled::h(Input::new(input).w_full(), px(36.));
+    let input = gpui_kit::Styled::h(Input::new(input).w_full(), theme.metrics.control_height);
     let input = gpui_kit::Styled::px(input, px(12.));
-    let input = gpui_kit::Styled::text_size(input, px(16.));
-    let input = gpui_kit::Styled::line_height(input, px(24.));
+    let input = gpui_kit::Styled::text_size(input, theme.text_sm);
+    let input = gpui_kit::Styled::line_height(input, relative(1.5));
     let input = gpui_kit::Styled::font_weight(input, gpui_kit::FontWeight::NORMAL);
     let input = gpui_kit::Styled::font_family(input, system_font_family);
     let input = gpui_kit::Styled::bg(input, theme.field_surface());
@@ -806,19 +932,19 @@ fn dialog_text_input(
     gpui_kit::Styled::text_color(input, theme.foreground)
 }
 
-/// 表单标签始终与真实输入绑定，并给八进制草稿保留等宽字形。
+/// 标签使用主题辅助文本尺度，使长文案和界面放大与字段保持一致。
 ///
 /// @author kongweiguang
 fn dialog_field_label(label: impl IntoElement, theme: ThemeTokens) -> impl IntoElement {
     div()
-        .text_size(px(12.))
-        .line_height(px(16.))
+        .text_size(theme.text_xs)
+        .line_height(relative(4. / 3.))
         .font_weight(gpui_kit::FontWeight::MEDIUM)
         .text_color(theme.muted)
         .child(label)
 }
 
-/// 只读路径用次级表面表达上下文，不允许确认时把显示路径误当成可编辑目标。
+/// 只读路径用次级表面表达上下文；等宽文字随界面缩放，执行目标仍由冻结的 endpoint 持有。
 ///
 /// @author kongweiguang
 fn dialog_readonly_field(
@@ -844,8 +970,8 @@ fn dialog_readonly_field(
                 .border_1()
                 .border_color(theme.border)
                 .bg(theme.secondary)
-                .text_size(px(12.))
-                .line_height(px(16.))
+                .text_size(theme.text_xs)
+                .line_height(relative(4. / 3.))
                 .font_family("monospace")
                 .overflow_hidden()
                 .text_ellipsis()
@@ -904,20 +1030,16 @@ fn delete_dialog_description(entries: &[FileEntry]) -> String {
     }
 }
 
-/// 按钮顺序固定为取消后确认，危险动作仅改变确认按钮语义色。
+/// 按钮顺序固定为取消后确认，窄窗口和放大字体时允许换行并保留两个操作。
 ///
 /// @author kongweiguang
 fn dialog_footer(cancel: Button, confirm: Button, theme: ThemeTokens) -> impl IntoElement {
-    div()
+    crate::ui_surface::dialog_actions(theme)
         .w_full()
-        .flex_shrink_0()
-        .flex()
-        .justify_end()
-        .gap_2()
         .border_t_1()
         .border_color(theme.border)
-        .px_5()
-        .py_4()
+        .px(theme.metrics.dialog_padding)
+        .py(theme.metrics.section_gap)
         .child(cancel)
         .child(confirm)
 }

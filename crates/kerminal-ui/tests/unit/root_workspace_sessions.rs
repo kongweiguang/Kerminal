@@ -57,8 +57,8 @@ use crate::{
         workspace_runtime::{OrphanCleanupInput, RuntimePanePhase, WorkspaceRuntime},
         workspace_sessions::{
             StartupWorkspaceFocusGate, container_exec_command, initial_workspace_file_center_panel,
-            record_workspace_restore_failure, startup_workspace_terminal_focus_target,
-            tmux_binding_matches_target,
+            record_workspace_restore_failure, should_recover_snapshot_conflict,
+            startup_workspace_terminal_focus_target, tmux_binding_matches_target,
         },
         workspace_transient::without_transient_resources,
     },
@@ -81,6 +81,25 @@ fn pending_terminal_creation_owner_rejects_stale_generation() {
     assert!(!owner.matches(&tab_id, &pane_id, 6));
     assert!(!owner.matches(&tab_id, &PaneId::new(), 7));
     assert!(!owner.matches(&TabId::new(), &pane_id, 7));
+}
+
+/// 首个 generation 冲突静默重绑，重复冲突才允许把真实失败呈现给用户。
+///
+/// @author kongweiguang
+#[test]
+fn snapshot_conflict_recovery_is_bounded_to_the_first_cas_race() {
+    assert!(should_recover_snapshot_conflict(
+        PublicErrorCode::Conflict,
+        false
+    ));
+    assert!(!should_recover_snapshot_conflict(
+        PublicErrorCode::Conflict,
+        true
+    ));
+    assert!(!should_recover_snapshot_conflict(
+        PublicErrorCode::NotFound,
+        false
+    ));
 }
 
 /// 失败新建 reservation 只清理当前 owner；旧代次回执不能删除后续复用同身份的 pane。

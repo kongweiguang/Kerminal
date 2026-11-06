@@ -508,7 +508,7 @@ impl WorkspaceController {
                 pane_id,
                 direction,
                 before,
-            } => self.begin_split(tab_id, &pane_id, direction, before),
+            } => self.begin_split(tab_id, &pane_id, direction, before, None),
             WorkspacePaneEvent::ChooseSplitTarget { .. } => {
                 Err(AppError::unsupported("分屏目标选择必须由工作区根层完成"))
             }
@@ -943,19 +943,24 @@ impl WorkspaceController {
         self.changed_if_selection_differs(old)
     }
 
-    /// Split 复制明确来源 pane 的连接参数，生成新身份并等待 Root 为其创建独立 session。
-    fn begin_split(
+    /// 同目标分屏优先冻结 Root 提供的实时目录；只改新 pane，不能污染来源参数或跨主机复制。
+    /// 未观测到目录时沿用已保存参数，失败重试继续使用同一候选而不重新读取来源。
+    ///
+    /// @author kongweiguang
+    pub fn begin_split(
         &mut self,
         tab_id: &TabId,
         source_pane_id: &PaneId,
         direction: SplitDirection,
         before: bool,
+        current_cwd: Option<&str>,
     ) -> AppResult<WorkspaceControllerEffect> {
+        self.ensure_no_pending_resource()?;
         let tab = self.terminal_tab(tab_id)?.clone();
         let layout = tab
             .terminal_layout()
             .ok_or_else(|| AppError::invalid("非终端标签不支持分屏"))?;
-        let source = self.pane(source_pane_id)?.clone();
+        let mut source = self.pane(source_pane_id)?.clone();
         if !layout.contains_pane(source_pane_id) {
             return Err(AppError::not_found("终端 pane 不属于当前标签"));
         }
@@ -970,6 +975,13 @@ impl WorkspaceController {
             )
         ) {
             return Err(AppError::unsupported("当前 pane 目标不可用于创建分屏"));
+        }
+        if matches!(
+            source.target.as_ref(),
+            Some(WorkspaceTargetRef::Local { .. } | WorkspaceTargetRef::Ssh { .. })
+        ) && let Some(directory) = current_cwd.filter(|directory| !directory.is_empty())
+        {
+            source.current_cwd = Some(directory.to_owned());
         }
         self.begin_split_with_pane(tab_id, source_pane_id, source, direction, before)
     }

@@ -19,6 +19,20 @@ use super::{
 const ACCEPTANCE_NAME_PREFIX: &str = "rr-ui-";
 
 impl FilesPane {
+    /// 仅投影真实控件所属状态，供原生验收核对点击结果，不替代生产按钮事件。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_follow_enabled(&self) -> bool {
+        self.follow_terminal_directory
+    }
+
+    /// 只回读面板已接收的终端目标，避免 Root 更新先于面板时误判为立即同步。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_follow_target(&self) -> Option<&FileEndpoint> {
+        self.current_terminal_endpoint.as_ref()
+    }
+
     /// 只读取同一 fixture 目录的刷新事实；在途状态也必须保留已提交清单。
     ///
     /// @author kongweiguang
@@ -395,11 +409,11 @@ impl FilesPane {
         }
 
         self.confirm_delete_confirmation(cx);
-        Ok(self.delete_confirmation.is_none()
-            && acceptance_delete_in_progress(self.status.as_deref()))
+        Ok(self.delete_confirmation.is_none() && self.delete_action_busy)
     }
 
     /// 状态查询同时等待生产 mutation、Root 弹框和 listing reload 收敛，再核对精确目录项。
+    /// 删除等待使用 owner 的 busy，不依赖可翻译、可关闭的展示文案。
     ///
     /// @author kongweiguang
     pub(crate) fn right_rail_acceptance_file_entry_ready(
@@ -410,10 +424,7 @@ impl FilesPane {
         should_exist: bool,
     ) -> Result<bool, String> {
         validate_acceptance_name(name)?;
-        if self.name_action_busy
-            || self.pending_global_dialog()
-            || acceptance_delete_in_progress(self.status.as_deref())
-        {
+        if self.name_action_busy || self.pending_global_dialog() || self.delete_action_busy {
             return Ok(false);
         }
         let Some(listing) = self.acceptance_directory_listing(host_id, directory)? else {
@@ -614,12 +625,4 @@ fn validate_acceptance_name(name: &str) -> Result<(), String> {
         );
     }
     Ok(())
-}
-
-/// 删除服务没有单独 busy 字段，使用生产删除状态文案延续同一请求的等待窗口。
-///
-/// @author kongweiguang
-fn acceptance_delete_in_progress(status: Option<&str>) -> bool {
-    status
-        .is_some_and(|status| status.starts_with("Deleting ") || status.starts_with("正在删除所选"))
 }

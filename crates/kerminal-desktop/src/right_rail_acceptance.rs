@@ -9,6 +9,7 @@ mod functional;
 mod functional_agent;
 mod functional_compose;
 mod functional_containers;
+mod functional_follow;
 mod functional_forwarding;
 mod functional_logs;
 mod functional_snippets;
@@ -219,9 +220,28 @@ pub(super) fn run_drag_acceptance() -> Result<(), Box<dyn Error>> {
 }
 
 /// 只从隔离 fixture 读取配置并复制到新输出目录，用户配置不进入验收 Composition。
+/// 仅向 stderr 输出固定 target 的脱敏提交诊断；无法安装全局订阅器时中止验收。
 ///
 /// @author kongweiguang
 pub(super) fn run() -> Result<(), Box<dyn Error>> {
+    use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.target() == "kerminal_atomic_commit_diagnostic"
+                && metadata.level() <= &tracing::Level::WARN
+        }))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stderr)
+                .with_ansi(false),
+        )
+        .try_init()
+        .map_err(|error| {
+            io::Error::other(format!(
+                "右栏验收诊断订阅器初始化失败（可能已有全局订阅器）：{error}"
+            ))
+        })?;
     let options = requested_options()?;
     let requested_window_width = options.window_width;
     let requested_window_height = options.window_height;
@@ -1204,6 +1224,7 @@ async fn wait_for_window_size(
 /// 隧道专用开关同样只作用于功能模式，保留默认完整验收流程。
 /// 容器专项只在截图模式执行，并单独登记范围，不依赖其他工具的采样与交互。
 /// 片段专项仅作用于截图模式并独立标记范围，不替代其他工具的完整验收。
+/// 先等待隐藏窗口的原生绘制目标与实际视口一致，再进行状态和帧采样。
 ///
 /// @author kongweiguang
 async fn capture_right_rail(
@@ -1220,6 +1241,26 @@ async fn capture_right_rail(
     let requested_window_height = capture.requested_window_height;
     let requested_bounds_size = capture.requested_bounds_size;
     let restart_requested = capture.transfer_restart.is_some();
+    wait_for_window_size(cx, window, requested_bounds_size).await?;
+    let (surface_width, surface_height) = window.update(cx, |_, window, _| {
+        let bounds = window.bounds();
+        (bounds.size.width.as_f32(), bounds.size.height.as_f32())
+    })?;
+    if !surface_width.is_finite()
+        || !surface_height.is_finite()
+        || surface_width < 1.0
+        || surface_height < 1.0
+    {
+        return Err(io::Error::other("右栏验收窗口逻辑尺寸无效").into());
+    }
+    crate::settings_acceptance::prepare_capture_surface_for_title(
+        cx,
+        window,
+        surface_width.round() as u32,
+        surface_height.round() as u32,
+        "Kerminal Right Rail Acceptance",
+    )
+    .await?;
     wait_for_window_size(cx, window, requested_bounds_size).await?;
     if !matches!(
         &capture.transfer_restart,
@@ -2534,6 +2575,30 @@ async fn wait_for_stable_frame_with_candidates(
 #[path = "../tests/unit/right_rail_frame_stability.rs"]
 mod frame_stability_tests;
 
+/// 核对实际栅格与当前逻辑视口，避免离屏 GPU 初始 1×1 目标被当作有效的稳定帧。
+///
+/// @author kongweiguang
+fn validate_capture_viewport(window: &gpui_pre::Window, width: u32, height: u32) -> io::Result<()> {
+    let viewport = window.viewport_size();
+    let scale = window.scale_factor();
+    let expected_width = viewport.width.as_f32() * scale;
+    let expected_height = viewport.height.as_f32() * scale;
+    if !scale.is_finite()
+        || scale <= 0.0
+        || !expected_width.is_finite()
+        || !expected_height.is_finite()
+        || expected_width < 1.0
+        || expected_height < 1.0
+        || width != expected_width.round() as u32
+        || height != expected_height.round() as u32
+    {
+        return Err(io::Error::other(format!(
+            "原生截图与视口不匹配：预期={expected_width:.3}x{expected_height:.3}，实测={width}x{height}，scale={scale}"
+        )));
+    }
+    Ok(())
+}
+
 /// 从原生 renderer 采样当前窗口像素摘要，稳定等待与最终截图使用同一帧证据来源。
 /// 隐藏 HWND 没有可见帧循环，绘制后显式交付 Kit 的下一帧回调，令生产焦点转移与可见窗口一致。
 /// 每次采样立即检查平台状态，意外激活时停止当前步骤，不等整批截图完成才发现问题。
@@ -2554,9 +2619,7 @@ fn frame_signature(
             clear.clear(app);
         }
         let image = window.render_to_image().map_err(io::Error::other)?;
-        if image.width() == 0 || image.height() == 0 {
-            return Err(io::Error::other("原生 renderer 返回零尺寸截图"));
-        }
+        validate_capture_viewport(window, image.width(), image.height())?;
         if !image
             .as_raw()
             .as_chunks::<4>()
@@ -2571,7 +2634,7 @@ fn frame_signature(
     Ok(signature)
 }
 
-/// 强制渲染并保存最终验收帧；零尺寸或全透明帧不作为成功证据。
+/// 强制渲染并保存最终验收帧；不匹配当前视口或全透明的帧不作为成功证据。
 ///
 /// @author kongweiguang
 fn save_frame(
@@ -2585,14 +2648,14 @@ fn save_frame(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "截图文件名无效"))?
         .to_owned();
     let capture = window_handle.update(cx, |_, window, app| {
+        isolation::capture()?
+            .validate_window_state(window.is_visible(), window.is_window_active())?;
         let clear = window.draw(app);
         clear.clear(app);
         let image = window.render_to_image().map_err(io::Error::other)?;
         let width = image.width();
         let height = image.height();
-        if width == 0 || height == 0 {
-            return Err(io::Error::other("原生 renderer 返回零尺寸截图"));
-        }
+        validate_capture_viewport(window, width, height)?;
         if !image
             .as_raw()
             .as_chunks::<4>()

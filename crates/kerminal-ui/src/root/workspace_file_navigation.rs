@@ -295,6 +295,7 @@ impl RootView {
 }
 
 /// descriptor 只表达可恢复目标；本机容器使用临时标签，原始端点始终由 runtime 保留。
+/// 标题按端点平台提取名称，保留 POSIX 文件名中的反斜杠，避免导航后名称被截断。
 ///
 /// @author kongweiguang
 fn file_navigation_descriptor(
@@ -369,11 +370,16 @@ fn file_navigation_descriptor(
     if path.is_empty() || path.chars().any(char::is_control) {
         return Err(AppError::invalid("文件路径为空或包含控制字符"));
     }
-    let title = path
-        .rsplit(['/', '\\'])
-        .find(|part| !part.is_empty())
-        .unwrap_or(&path)
-        .to_owned();
+    let title = match endpoint {
+        FileEndpoint::Local { path } => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+        FileEndpoint::Remote { .. } | FileEndpoint::Container { .. } => path
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .map(str::to_owned),
+    }
+    .unwrap_or_else(|| path.clone());
     Ok((
         WorkspaceSessionTab::WorkspaceFile {
             id: TabId::new(),

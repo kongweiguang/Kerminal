@@ -3,8 +3,8 @@
 //! @author kongweiguang
 
 use super::super::{
-    ReconnectObservation, SessionReconnectController, SessionReconnectState,
-    validate_reconnect_after, validate_reconnect_before,
+    ReconnectObservation, SessionReconnectController, validate_reconnect_before,
+    validate_reconnected_after,
 };
 use super::{identity, manual_reconnect_targets, observation, observe};
 use crate::root::workspace_runtime::RuntimePanePhase;
@@ -80,7 +80,7 @@ fn reconnect_validation_binds_every_transport_identity_and_generation() {
             SessionLifecycle::Running,
             9,
         );
-        assert!(validate_reconnect_after(&after, &before, &binding, &target).is_ok());
+        assert!(validate_reconnected_after(&after, &before, &binding, &target).is_ok());
 
         let same_generation = observation(
             &tab_id,
@@ -90,7 +90,7 @@ fn reconnect_validation_binds_every_transport_identity_and_generation() {
             SessionLifecycle::Running,
             8,
         );
-        assert!(validate_reconnect_after(&same_generation, &before, &binding, &target).is_err());
+        assert!(validate_reconnected_after(&same_generation, &before, &binding, &target).is_err());
 
         let changed_target = observation(
             &tab_id,
@@ -100,7 +100,7 @@ fn reconnect_validation_binds_every_transport_identity_and_generation() {
             SessionLifecycle::Running,
             9,
         );
-        assert!(validate_reconnect_after(&changed_target, &before, &binding, &target).is_err());
+        assert!(validate_reconnected_after(&changed_target, &before, &binding, &target).is_err());
 
         let changed_owner = ReconnectObservation {
             info: SessionInfo {
@@ -112,7 +112,7 @@ fn reconnect_validation_binds_every_transport_identity_and_generation() {
             },
             session_generation: after.session_generation,
         };
-        assert!(validate_reconnect_after(&changed_owner, &before, &binding, &target).is_err());
+        assert!(validate_reconnected_after(&changed_owner, &before, &binding, &target).is_err());
 
         let changed_session = observation(
             &tab_id,
@@ -122,7 +122,7 @@ fn reconnect_validation_binds_every_transport_identity_and_generation() {
             SessionLifecycle::Running,
             9,
         );
-        assert!(validate_reconnect_after(&changed_session, &before, &binding, &target).is_err());
+        assert!(validate_reconnected_after(&changed_session, &before, &binding, &target).is_err());
     }
 }
 
@@ -144,7 +144,7 @@ fn late_transport_ack_cannot_replace_any_new_pane_incarnation() {
             12,
         );
         let old_binding = controller
-            .projection(
+            .action_projection(
                 &pane_id,
                 &old_tab,
                 &old_session,
@@ -153,7 +153,7 @@ fn late_transport_ack_cannot_replace_any_new_pane_incarnation() {
             )
             .expect("故障终端应生成原位重连入口")
             .binding;
-        let (old_attempt, cancellation) = controller
+        let (old_attempt, cancellation, _) = controller
             .begin_attempt(&pane_id, &old_tab, old_binding.clone(), target.clone())
             .expect("首次手动重连应发起");
 
@@ -181,7 +181,7 @@ fn late_transport_ack_cannot_replace_any_new_pane_incarnation() {
         );
         assert!(
             controller
-                .projection(
+                .action_projection(
                     &pane_id,
                     &new_tab,
                     &new_session,
@@ -213,9 +213,13 @@ fn late_transport_ack_cannot_replace_any_new_pane_incarnation() {
             SessionLifecycle::Running,
             13,
         );
-        assert!(!controller.finish_attempt(old_attempt, Ok(late_old_ack)));
+        assert!(
+            controller
+                .finish_attempt(old_attempt, Ok(late_old_ack))
+                .is_none()
+        );
         assert!(matches!(
-            controller.projection(
+            controller.action_projection(
                 &pane_id,
                 &new_tab,
                 &new_session,
@@ -224,7 +228,8 @@ fn late_transport_ack_cannot_replace_any_new_pane_incarnation() {
             ),
             Some(projection)
                 if projection.binding == new_binding
-                    && projection.state == SessionReconnectState::Available
+                    && projection.attempt_id.is_none()
+                    && !projection.busy
         ));
         assert!(
             controller

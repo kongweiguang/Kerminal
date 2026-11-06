@@ -21,7 +21,7 @@ use gpui_kit::{
     },
     div,
     prelude::*,
-    px,
+    px, relative,
 };
 use kerminal_application::operations::ManagedPortForwardSnapshot;
 use kerminal_application::sessions::UiSessionBinding;
@@ -32,7 +32,9 @@ use std::net::IpAddr;
 #[path = "forwarding_proxy_scripts.rs"]
 mod proxy_scripts;
 
-/// 隧道控件沿用 Kit 的焦点、禁用和事件语义，仅投影 main 的 36px 描边按钮与控制圆角。
+/// 隧道动作复用工具栏尺寸与 Kit 按钮语义，避免每个状态切换时改变点击区域。
+///
+/// @author kongweiguang
 fn forward_action_button(
     theme: ThemeTokens,
     id: impl Into<ElementId>,
@@ -41,10 +43,8 @@ fn forward_action_button(
 ) -> Button {
     let label = label.into();
     icon_button(id, icon, label.clone())
-        .secondary()
-        .compact()
-        .w(px(36.))
-        .h(px(36.))
+        .w(theme.metrics.control_height)
+        .h(theme.metrics.control_height)
         .rounded(theme.control_radius)
         .tooltip(label)
 }
@@ -272,7 +272,7 @@ impl OperationsView {
     /// 列表只展示隧道状态和动作；刷新保留最近成功布局，只旋转原按钮内的刷新图标。
     /// 失败由工作区提示，恢复入口始终绑定原事务，已确认的空态不因一次读取失败而闪退。
     /// 菜单点击时复核原复选状态，避免打开期间的策略变化把用户意图反向执行。
-    /// 添加按钮与刷新使用统一的次级样式，减少不同主题下的颜色分支。
+    /// 添加、刷新与行操作使用同一工具按钮密度，减少不同主题下的颜色分支。
     /// 容器目标显示专用提示且不改变 HostId 写入门禁。
     ///
     /// @author kongweiguang
@@ -291,16 +291,16 @@ impl OperationsView {
                 super::super::forward_unavailable_hint(self.tool_rail_container_target.as_ref());
             return section_page(
                 crate::locale::text("SSH 隧道", "SSH tunnels"),
-                div()
+                crate::ui_surface::panel_header(theme)
                     .w_full()
-                    .p_4()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.panel)
+                    .flex_col()
+                    .items_stretch()
+                    .px_0()
+                    .pt_0()
                     .child(
                         div()
-                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_size(theme.text_sm)
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                             .child(crate::locale::text("SSH 隧道", "SSH tunnels")),
                     )
                     .child(
@@ -347,23 +347,21 @@ impl OperationsView {
             .data()
             .map_or_else(SharedString::default, |_| {
                 crate::locale::text(
-                    format!("{} 个会话", rows.len()),
-                    format!("{} sessions", rows.len()),
+                    format!("{} 个隧道", rows.len()),
+                    format!("{} tunnels", rows.len()),
                 )
             });
+        let endpoint_tooltip = endpoint_label.clone();
         let mut body = div().w_full().flex().flex_col().gap_3();
         body = body.child(
-            div()
+            crate::ui_surface::panel_header(theme)
                 .id("operations-forward-header-card")
                 .w_full()
-                .flex()
                 .flex_col()
-                .gap_4()
-                .p_4()
-                .rounded(theme.radius)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.panel)
+                .items_stretch()
+                .gap_2()
+                .px_0()
+                .pt_0()
                 .child(
                     div()
                         .w_full()
@@ -380,25 +378,43 @@ impl OperationsView {
                                 .gap_1()
                                 .child(
                                     div()
-                                        .text_size(theme.text_heading)
-                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                        .text_color(theme.foreground)
-                                        .child(crate::locale::text("SSH 隧道", "SSH tunnels")),
+                                        .w_full()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Icon::new(IconName::Network)
+                                                .size(theme.metrics.icon_size)
+                                                .text_color(theme.accent),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(theme.text_sm)
+                                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                                .text_color(theme.foreground)
+                                                .child(crate::locale::text("SSH 隧道", "SSH tunnels")),
+                                        ),
                                 )
                                 .child(
                                     div()
+                                        .id(format!("forward-panel-target-{}", cx.entity_id().as_u64()))
                                         .min_w_0()
                                         .truncate()
                                         .font_family("monospace")
                                         .text_size(theme.text_xs)
                                         .text_color(theme.muted)
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(endpoint_tooltip.clone()).build(window, cx)
+                                        })
                                         .child(endpoint_label),
                                 ),
                         )
                         .child(
                             div()
                                 .flex_shrink_0()
-                                .text_size(px(11.))
+                                .text_size(theme.text_xs)
                                 .text_color(theme.muted)
                                 .child(count_label),
                         ),
@@ -411,15 +427,12 @@ impl OperationsView {
                         .items_center()
                         .gap_2()
                         .child(
-                            Button::new("operations-forward-add")
-                                .compact()
-                                .secondary()
-                                .w(px(36.))
-                                .h(px(36.))
-                                .rounded(theme.control_radius)
-                                .icon(IconName::Plus)
-                                .accessibility_label(crate::locale::text("添加隧道", "Add tunnel"))
-                                .tooltip(crate::locale::text("添加隧道", "Add tunnel"))
+                            forward_action_button(
+                                theme,
+                                "operations-forward-add",
+                                IconName::Plus,
+                                crate::locale::text("添加隧道", "Add tunnel"),
+                            )
                                 .disabled(
                                     self.busy
                                         || self.forward_save_pending.is_some()
@@ -436,8 +449,6 @@ impl OperationsView {
                                 IconName::RefreshCw,
                                 crate::locale::text("刷新隧道列表", "Refresh tunnel list"),
                             )
-                            .with_size(gpui_kit::component::Size::Medium)
-                            .h(px(36.))
                             .debug_selector(|| "rr-forwards-refresh".to_owned())
                             .loading_icon(IconName::RefreshCw)
                             .loading(
@@ -507,7 +518,7 @@ impl OperationsView {
                     .items_center()
                     .gap_2()
                     .px_2()
-                    .py_8()
+                    .py_3()
                     .child(
                         div()
                             .text_size(theme.text_body)
@@ -1035,7 +1046,7 @@ impl OperationsView {
     /// 表单只对齐 ModalShell 内容间距并独立于右栏布局。
     /// 宽度封顶 1024px，低于 720px 时纵向排列端点，避免窄窗口压缩输入控件；忙碌时继续等待真实用例回执。
     /// 标题与操作栏固定，错误由根层右下角通知承载，不在正文插入反馈挤动输入框。
-    /// 主动作保持稳定文案与尺寸；保存结果未知时只核对原请求，不把核对伪装成启动。
+    /// 表单使用共享弹框与控件尺度；保存结果未知时只核对原请求，不把核对伪装成启动。
     /// 只有字段正文滚动；高度使用 Root 扣除边框后的预算。
     ///
     /// @author kongweiguang
@@ -1235,8 +1246,8 @@ impl OperationsView {
             .items_start()
             .justify_between()
             .gap_4()
-            .px_5()
-            .py_4()
+            .px(theme.metrics.dialog_padding)
+            .py(theme.metrics.section_gap)
             .border_b_1()
             .border_color(theme.border)
             .child(
@@ -1247,8 +1258,8 @@ impl OperationsView {
                     .flex_col()
                     .child(
                         div()
-                            .text_size(px(17.))
-                            .line_height(px(24.))
+                            .text_size(theme.text_heading)
+                            .line_height(relative(1.5))
                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                             .child(if self.forward_edit_expected.is_some() {
                                 crate::locale::text("编辑 SSH 隧道", "Edit SSH tunnel")
@@ -1261,8 +1272,8 @@ impl OperationsView {
             .child(
                 Button::new("forward-form-close")
                     .ghost()
-                    .w(px(36.))
-                    .h(px(36.))
+                    .w(theme.metrics.control_height)
+                    .h(theme.metrics.control_height)
                     .icon(IconName::X)
                     .accessibility_label(crate::locale::text("关闭弹窗", "Close dialog"))
                     .tooltip(crate::locale::text("关闭弹窗", "Close dialog"))
@@ -1276,8 +1287,8 @@ impl OperationsView {
             .flex()
             .flex_col()
             .gap_4()
-            .px_5()
-            .py_4()
+            .px(theme.metrics.dialog_padding)
+            .py(theme.metrics.section_gap)
             .child(scenario_picker)
             .child(
                 div()
@@ -1608,37 +1619,22 @@ impl OperationsView {
             .w_full()
             .flex_shrink_0()
             .flex()
-            .px_5()
-            .py_4()
+            .px(theme.metrics.dialog_padding)
+            .py(theme.metrics.section_gap)
             .border_t_1()
             .border_color(theme.border);
         let disabled =
             self.busy || (self.forward_save_pending.is_none() && !self.can_save_forward());
-        // main 用与 floating-surface 相同的颜色作为不透明 surface-solid 按钮表面。
-        let solid_action_surface = theme.floating_surface.alpha(1.);
-        let footer_action_style = ButtonCustomVariant::new(cx)
-            .color(solid_action_surface)
-            .foreground(theme.foreground)
-            .hover(theme.surface_hover())
-            .active(theme.surface_hover());
         footer = footer.child(
-            div()
+            crate::ui_surface::dialog_actions(theme)
                 .w_full()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_end()
-                .gap_2()
                 .child(
                     Button::new("forward-cancel")
-                        .h(px(36.))
-                        .px(px(14.))
-                        .text_size(px(16.))
-                        .line_height(px(24.))
+                        .h(theme.metrics.control_height)
+                        .text_size(theme.text_sm)
+                        .line_height(relative(1.5))
                         .rounded(theme.control_radius)
-                        .border_1()
-                        .border_color(theme.tool_panel_border)
-                        .custom(footer_action_style)
+                        .secondary()
                         .label(if self.forward_save_pending.is_some() {
                             crate::locale::text("关闭", "Close")
                         } else {
@@ -1651,14 +1647,16 @@ impl OperationsView {
                 )
                 .child(
                     Button::new("forward-start")
-                        .h(px(36.))
-                        .px(px(14.))
-                        .text_size(px(16.))
-                        .line_height(px(24.))
+                        .h(theme.metrics.control_height)
+                        .text_size(theme.text_sm)
+                        .line_height(relative(1.5))
                         .rounded(theme.control_radius)
-                        .border_1()
-                        .border_color(theme.tool_panel_border)
-                        .custom(footer_action_style)
+                        .when(self.forward_save_pending.is_none(), |button| {
+                            button.primary()
+                        })
+                        .when(self.forward_save_pending.is_some(), |button| {
+                            button.secondary()
+                        })
                         .icon(if self.forward_save_pending.is_some() {
                             IconName::RefreshCw
                         } else if self.forward_edit_expected.is_some() {
@@ -1714,7 +1712,7 @@ impl OperationsView {
     }
 }
 
-/// Kit 的 Input::h 只控制多行编辑器；单行输入由外层样式精炼设定尺寸与字段表面，并保留 Kit 焦点环。
+/// 单行输入由 Styled 应用共享高度与文字尺度，同时保留 Kit 的焦点环和禁用门禁。
 ///
 /// @author kongweiguang
 fn forward_form_input(
@@ -1722,19 +1720,22 @@ fn forward_form_input(
     theme: ThemeTokens,
     disabled: bool,
 ) -> AnyElement {
-    gpui_kit::Styled::h(Input::new(input).disabled(disabled).w_full(), px(36.))
-        .px(px(12.))
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.strong_border())
-        .bg(theme.field_surface())
-        .text_size(px(12.))
-        .line_height(px(16.))
-        .font_weight(gpui_kit::FontWeight::MEDIUM)
-        .when(!disabled, |input| {
-            input.hover_style(gpui_kit::StyleRefinement::default().bg(theme.field_hover_surface()))
-        })
-        .into_any_element()
+    gpui_kit::Styled::h(
+        Input::new(input).disabled(disabled).w_full(),
+        theme.metrics.control_height,
+    )
+    .px(theme.metrics.gap * 1.5)
+    .rounded(theme.radius)
+    .border_1()
+    .border_color(theme.strong_border())
+    .bg(theme.field_surface())
+    .text_size(theme.text_sm)
+    .line_height(relative(1.5))
+    .font_weight(gpui_kit::FontWeight::MEDIUM)
+    .when(!disabled, |input| {
+        input.hover_style(gpui_kit::StyleRefinement::default().bg(theme.field_hover_surface()))
+    })
+    .into_any_element()
 }
 
 /// 服务地址和端口固定上下全宽，避免宽屏并排挤压字段并保持表单阅读顺序。

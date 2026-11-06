@@ -50,7 +50,7 @@ impl<'a> TransferEndpoints<'a> {
     }
 }
 
-/// 使用隔离 fixture 验证真实传输、正文隐藏和菜单行为；无论成功或失败均按本轮身份清理。
+/// 使用隔离 fixture 验证真实传输、权限保留、正文隐藏和菜单行为；无论成功或失败均按本轮身份清理。
 ///
 /// @author kongweiguang
 pub(super) async fn run(
@@ -214,6 +214,26 @@ pub(super) async fn run(
         completed_ids.push(seeded.id.clone());
         require_actual_destination(&seeded, &overwrite_target)?;
         assert_sha256(executor, &files, overwrite_target.clone(), &overwrite_v1).await?;
+        let permission_files = files.clone();
+        let permission_target = overwrite_target.clone();
+        executor
+            .run(move |cancellation| async move {
+                permission_files
+                    .chmod(cancellation, permission_target, 0o600)
+                    .await
+            })
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let permission_directory = FileEndpoint::remote(host_id.clone(), remote_directory)
+            .map_err(|error| io::Error::other(format!("invalid fixture directory: {error:?}")))?;
+        assert_remote_mode(
+            executor,
+            &files,
+            &permission_directory,
+            &overwrite_target,
+            0o600,
+        )
+        .await?;
 
         write_fixture_source(local_root, run_id, &overwrite_name, &overwrite_v2, true)?;
         assert_sha256(executor, &files, overwrite_source.clone(), &overwrite_v2).await?;
@@ -276,13 +296,21 @@ pub(super) async fn run(
         completed_ids.push(overwritten.id.clone());
         require_actual_destination(&overwritten, &overwrite_target)?;
         assert_sha256(executor, &files, overwrite_target.clone(), &overwrite_v2).await?;
+        assert_remote_mode(
+            executor,
+            &files,
+            &permission_directory,
+            &overwrite_target,
+            0o600,
+        )
+        .await?;
         functional::checkpoint(
             cx,
             window,
             capture,
             records,
             "sftp-transfer-overwritten",
-            "overwrite_changed_only_the_current_run_remote_fixture_file",
+            "overwrite_replaced_fixture_content_and_preserved_existing_0600_mode",
         )
         .await?;
 
@@ -1631,7 +1659,14 @@ async fn verify_transfer_history_controls(
         return Err(io::Error::other("The transfer history did not start expanded").into());
     }
     let fourth_selector = format!("rr-files-transfer-{}", rows[3].id);
-    scroll_queue_to_selector(cx, window, &fourth_selector)?;
+    scroll_queue_to_selector(
+        cx,
+        window,
+        capture,
+        &fourth_selector,
+        "transfer-history-expanded",
+    )
+    .await?;
     assert_transfer_percentage_visible(cx, window, &rows[3].id)?;
     assert_archive_control_absent(cx, window)?;
     functional::checkpoint(
@@ -1681,7 +1716,14 @@ async fn verify_transfer_history_controls(
         },
     )
     .await?;
-    scroll_queue_to_selector(cx, window, &fourth_selector)?;
+    scroll_queue_to_selector(
+        cx,
+        window,
+        capture,
+        &fourth_selector,
+        "transfer-history-reopened",
+    )
+    .await?;
     super::menus::click_selector(cx, window, "rr-files-transfer-clear")?;
     functional::poll_root(
         cx,
@@ -1795,41 +1837,25 @@ fn assert_transfer_percentage_visible(
     Ok(())
 }
 
-/// 通过实际滚轮把较早的已展开任务滚入列表可视区域，不依赖离屏控件的几何记录。
+/// 复用逐帧几何驱动的真实滚轮扫描，避免窄队列的固定步长跨过整行并保留诊断证据。
 ///
 /// @author kongweiguang
-fn scroll_queue_to_selector(
+async fn scroll_queue_to_selector(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
     selector: &str,
+    stage: &str,
 ) -> Result<(), Box<dyn Error>> {
-    for _ in 0..12 {
-        let _ = super::frame_signature(cx, window)?;
-        let (list, viewport, row) = window.update(cx, |_, window, _| {
-            (
-                window.debug_selector_bounds("rr-files-transfer-list"),
-                window.visual_viewport_bounds(),
-                window.debug_selector_bounds(selector),
-            )
-        })?;
-        let list = list.ok_or_else(|| io::Error::other("Transfer list is not mounted"))?;
-        if row.is_some_and(|bounds| bounds_inside_clip(bounds, list.intersect(&viewport))) {
-            return Ok(());
-        }
-        window.update(cx, |_, window, app| {
-            let _ = window.dispatch_event(
-                ScrollWheelEvent {
-                    position: list.center(),
-                    delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
-                    touch_phase: TouchPhase::Moved,
-                    ..ScrollWheelEvent::default()
-                }
-                .to_platform_input(),
-                app,
-            );
-        })?;
-    }
-    Err(io::Error::other("An expanded transfer row did not enter the viewport").into())
+    super::functional_transfer_workspace::reveal_file_row(
+        cx,
+        window,
+        capture,
+        "rr-files-transfer-list",
+        selector,
+        stage,
+    )
+    .await
 }
 
 /// 容忍设备像素舍入，同时要求整行处于滚动区和窗口的共同可视范围。
@@ -1925,7 +1951,7 @@ async fn wait_for_conflict(
     .await
 }
 
-/// Cancel only the conflict request whose exact fixture endpoints were verified by the modal readiness probe.
+/// 先核对精确 fixture 冲突，再点击生产取消按钮，真实事件不能被 owner 方法调用代替。
 ///
 /// @author kongweiguang
 async fn cancel_conflict(
@@ -1935,20 +1961,15 @@ async fn cancel_conflict(
     target: &RightRailSftpTransferTarget<'_>,
     item: RightRailSftpTransferItem<'_>,
 ) -> Result<(), Box<dyn Error>> {
-    functional::poll_root(
+    wait_for_conflict(cx, root, window, target, item).await?;
+    super::functional_transfer_workspace::click_visible_element(
         cx,
-        root,
         window,
-        "cancel fixture transfer conflict",
-        |root, _, cx| {
-            root.cancel_right_rail_acceptance_sftp_transfer_conflict(target, &item, cx)
-                .map(|cancelled| cancelled.then_some(()))
-        },
+        "files-transfer-conflict-cancel",
     )
-    .await
 }
 
-/// Apply the selected policy only after the same production conflict plan is still current.
+/// 精确冲突计划就绪后点击对应策略；后续队列回读证明受理和结果，按钮回调自身也必须可靠。
 ///
 /// @author kongweiguang
 async fn resolve_conflict(
@@ -1959,17 +1980,13 @@ async fn resolve_conflict(
     item: RightRailSftpTransferItem<'_>,
     policy: ConflictPolicy,
 ) -> Result<(), Box<dyn Error>> {
-    functional::poll_root(
-        cx,
-        root,
-        window,
-        "resolve fixture transfer conflict",
-        |root, _, cx| {
-            root.resolve_right_rail_acceptance_sftp_transfer_conflict(target, &item, policy, cx)
-                .map(|resolved| resolved.then_some(()))
-        },
-    )
-    .await
+    wait_for_conflict(cx, root, window, target, item).await?;
+    let selector = match policy {
+        ConflictPolicy::Overwrite => "files-transfer-conflict-overwrite",
+        ConflictPolicy::Rename => "files-transfer-conflict-rename",
+        ConflictPolicy::Skip => "files-transfer-conflict-skip",
+    };
+    super::functional_transfer_workspace::click_visible_element(cx, window, selector)
 }
 
 /// Wait for a new queue ID with exact endpoints and require the worker's terminal result to be a committed file.
@@ -2053,6 +2070,37 @@ async fn assert_no_new_transfer(
             && summary.request.destination == *endpoints.destination
     }) {
         return Err(io::Error::other("canceled fixture transfer was unexpectedly enqueued").into());
+    }
+    Ok(())
+}
+
+/// 在共享执行器回读真实目录属性，防止覆盖权限策略虽有单测却未接入实际远端发布路径。
+///
+/// @author kongweiguang
+async fn assert_remote_mode(
+    executor: &ApplicationTaskExecutor,
+    files: &FileService,
+    directory: &FileEndpoint,
+    endpoint: &FileEndpoint,
+    expected: u32,
+) -> Result<(), Box<dyn Error>> {
+    let files = files.clone();
+    let directory = directory.clone();
+    let listing = executor
+        .run(move |cancellation| async move { files.list_directory(cancellation, directory).await })
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let actual = listing
+        .entries
+        .iter()
+        .find(|entry| entry.endpoint == *endpoint)
+        .and_then(|entry| entry.permissions)
+        .map(|mode| mode & 0o7777);
+    if actual != Some(expected) {
+        return Err(io::Error::other(format!(
+            "fixture permissions changed: expected {expected:04o}, actual {actual:?}"
+        ))
+        .into());
     }
     Ok(())
 }

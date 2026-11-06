@@ -18,6 +18,7 @@ use super::{
     MenuSelection, TerminalCommandSuggestionMenu, TerminalCommandSuggestionMenuEvent,
     TerminalCommandSuggestionMenuKey, TerminalSuggestionMenuProjection,
     TerminalSuggestionQueryState, bounded_tooltip_text, candidate_description,
+    suggestion_tooltip_max_size,
 };
 
 /// 保留真实菜单事件订阅，避免只检查视图状态而漏掉错误的接受或重试意图。
@@ -83,6 +84,20 @@ fn tooltip_preview_is_unicode_safe_and_bounded() {
     let preview = bounded_tooltip_text(&"中".repeat(513));
     assert_eq!(preview.chars().count(), 513);
     assert!(preview.ends_with('…'));
+}
+
+/// 长命令提示不能超出实际窗口；缩放文字时上限与界面尺度一起变化。
+///
+/// @author kongweiguang
+#[test]
+fn tooltip_size_respects_window_and_interface_scale() {
+    let normal = suggestion_tooltip_max_size(size(px(800.), px(600.)), px(16.));
+    let enlarged = suggestion_tooltip_max_size(size(px(800.), px(600.)), px(24.));
+    assert_eq!(normal, size(px(360.), px(160.)));
+    assert_eq!(enlarged, size(px(540.), px(240.)));
+
+    let narrow = suggestion_tooltip_max_size(size(px(220.), px(150.)), px(24.));
+    assert_eq!(narrow, size(px(172.), px(102.)));
 }
 
 /// 同一请求更新候选时保留仍有效的高亮 ID，避免异步排序变化误选另一命令。
@@ -692,6 +707,49 @@ fn narrow_menu_keeps_long_candidate_and_controls_inside_bounds(app: &mut TestApp
                 assert!(viewport.bottom() <= retry.bounds().top() + px(1.), "{details}");
             });
         }
+    }
+}
+
+/// 放大界面字号后候选仍可滚动，重试和关闭操作不能被菜单高度裁切。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn enlarged_interface_keeps_suggestion_actions_reachable(app: &mut TestAppContext) {
+    app.update(crate::init);
+    let candidates = (0..20)
+        .map(|index| candidate(&format!("candidate-{index}")))
+        .collect();
+    let mut projection = menu_projection(7, candidates);
+    projection.partial_failure = true;
+    let (_, visual) = app.add_window_view(move |window, cx| {
+        let menu = cx.new(|_| TerminalCommandSuggestionMenu::new(projection));
+        gpui_kit::base::Root::new(menu, window, cx)
+    });
+    visual.simulate_resize(size(px(360.), px(260.)));
+
+    for rem in [16., 24.] {
+        visual.update(|window, app| {
+            gpui_kit::component::Theme::update(app, |theme| theme.font_size = px(rem));
+            window.set_rem_size(px(rem));
+        });
+        draw_menu(visual);
+        visual.update(|window, _| {
+            let menu = window
+                .debug_selector_bounds("terminal-command-suggestion-menu")
+                .expect("menu visible");
+            let close =
+                gpui_kit::base::test_support::find(window, &[], &"suggestion-menu-dismiss".into())
+                    .expect("close button available");
+            let retry = gpui_kit::base::test_support::find(
+                window,
+                &[],
+                &"suggestion-menu-retry-partial".into(),
+            )
+            .expect("retry button available");
+            assert!(close.visible() && retry.visible(), "rem={rem}");
+            assert!(close.bounds().bottom() <= menu.bottom(), "rem={rem}");
+            assert!(retry.bounds().bottom() <= menu.bottom(), "rem={rem}");
+        });
     }
 }
 

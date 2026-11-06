@@ -107,6 +107,34 @@ fn local_file_keeps_its_parent_available_for_continuous_browsing() {
     assert!(runtime.file_browser_target(&TabId::new()).is_none());
 }
 
+/// 远端和容器遵循 POSIX 名称规则，工作区标签与编辑器标签都必须保留完整 basename。
+///
+/// @author kongweiguang
+#[test]
+fn posix_file_navigation_preserves_backslash_in_title() {
+    let path = RemotePath::parse(r"/srv/backup\2026.txt").unwrap();
+    let endpoints = [
+        FileEndpoint::Remote {
+            host_id: HostId::parse("host-a").unwrap(),
+            path: path.clone(),
+        },
+        FileEndpoint::Container {
+            host_id: None,
+            runtime: ContainerRuntime::Docker,
+            container_id: "container-a".into(),
+            path,
+        },
+    ];
+    for endpoint in endpoints {
+        let (tab, _) = file_navigation_descriptor(&endpoint, None).unwrap();
+        assert_eq!(tab.title(), r"backup\2026.txt");
+        let WorkspaceSessionTab::WorkspaceFile { path, .. } = tab else {
+            panic!("expected file tab");
+        };
+        assert_eq!(path, r"/srv/backup\2026.txt");
+    }
+}
+
 /// 临时目标缺失或错配 lease 必须拒绝，不能把匹配路径误当成访问授权。
 #[test]
 fn external_file_requires_its_exact_target_lease() {

@@ -36,16 +36,34 @@ use kerminal_domain::{
 use tokio_util::sync::CancellationToken;
 
 use super::history_query::{HistoryScope, PAGE_SIZE, page_window as logs_page_window};
-use crate::theme::ThemeTokens;
+use crate::theme::{ThemeTokens, UiMetrics};
 
 #[cfg(feature = "right-rail-acceptance")]
 #[path = "logs/right_rail_acceptance.rs"]
 pub(super) mod right_rail_acceptance;
 
 const HISTORY_LIMIT: usize = 100;
-const HISTORY_ROW_HEIGHT: f32 = 52.;
-const HISTORY_HEADER_HEIGHT: f32 = 37.;
-const HISTORY_PAGINATION_HEIGHT: f32 = 45.;
+
+/// 列表绘制与分页测量共用同一份密度投影，避免文字放大后沿用旧的固定行容量。
+#[derive(Clone, Copy)]
+struct HistoryGeometry {
+    row_height: gpui_kit::Pixels,
+    header_height: gpui_kit::Pixels,
+    pagination_height: gpui_kit::Pixels,
+}
+
+impl HistoryGeometry {
+    /// 控件、留白与物理边线分别取自共享度量和单像素边界，紧凑默认保持原有可见容量。
+    ///
+    /// @author kongweiguang
+    fn from_metrics(metrics: UiMetrics) -> Self {
+        Self {
+            row_height: metrics.control_height + metrics.panel_padding + metrics.gap,
+            header_height: metrics.control_height + metrics.gap / 2. + px(1.),
+            pagination_height: metrics.control_height + metrics.panel_padding + px(1.),
+        }
+    }
+}
 
 /// Logs 当前绑定的 pane、目标和可信 host；session generation 只用于迟到响应保护。
 #[derive(Clone, Debug)]
@@ -1072,11 +1090,12 @@ impl Render for LogsView {
     /// 主机名只用于卡片可读性，HostId 留在悬浮与辅助标签；独立右栏使用 main 中性色阶且保留冻结 pane scope。
     /// 历史卡占满剩余高度，按实际卡片高度分页；被动布局不作废操作反馈或焦点票据。
     /// 只有列表负责溢出滚动，分页始终留在底部。
-    /// 单行搜索用 Styled 设置高度；显式刷新作废旧成功提示，异步刷新则保留待核对结果。
+    /// 绘制和分页共享密度几何；刷新只更新原位置反馈并保留待核对的写入结果。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ThemeTokens::current(window, cx).for_tool_panel();
+        let geometry = HistoryGeometry::from_metrics(theme.metrics);
         let target = self.target.clone();
         let selected_source = self.source;
         let source_options = source_options();
@@ -1095,15 +1114,14 @@ impl Render for LogsView {
             .compact()
             .dropdown_caret(true)
             .icon(IconName::ListFilter)
-            .w(px(144.))
-            .h(px(36.))
+            .w(theme.metrics.control_height * 4.5)
+            .h(theme.metrics.control_height)
             .bg(theme.panel)
             .border_color(theme.border)
             .text_color(theme.foreground)
             .child(
                 div()
-                    .text_size(px(16.))
-                    .line_height(px(24.))
+                    .text_size(theme.text_sm)
                     .font_weight(gpui_kit::FontWeight::NORMAL)
                     .child(selected_source_label),
             )
@@ -1164,13 +1182,13 @@ impl Render for LogsView {
                 };
                 let height = f32::from(bounds.size.height);
                 let state = entity.read(cx);
-                if state.page_size == history_page_size(height, state.entries.len()) {
+                if state.page_size == history_page_size(height, state.entries.len(), geometry) {
                     return;
                 }
                 // 延后更新避免在布局阶段重入；保持页码，防止翻页清除反馈后容量增加又跳回上一页。
                 cx.defer(move |cx| {
                     entity.update(cx, |state, cx| {
-                        let page_size = history_page_size(height, state.entries.len());
+                        let page_size = history_page_size(height, state.entries.len(), geometry);
                         if state.page_size != page_size {
                             state.page_size = page_size;
                             state.page =
@@ -1231,10 +1249,10 @@ impl Render for LogsView {
                     .id(format!("logs-history-row-{entry_id}"))
                     .debug_selector(move || row_selector)
                     .w_full()
-                    .h(px(HISTORY_ROW_HEIGHT))
+                    .h(geometry.row_height)
                     .flex_shrink_0()
-                    .px_3()
-                    .py(px(6.))
+                    .px(theme.metrics.panel_padding)
+                    .py(theme.metrics.panel_padding / 2.)
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1247,7 +1265,7 @@ impl Render for LogsView {
                             .min_w(px(0.))
                             .flex()
                             .flex_col()
-                            .gap(px(2.))
+                            .gap(theme.metrics.gap / 4.)
                             .child(
                                 div()
                                     .id(format!("logs-history-command-{entry_id}"))
@@ -1256,8 +1274,8 @@ impl Render for LogsView {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
-                                    .text_size(px(13.))
-                                    .line_height(px(20.))
+                                    .text_size(theme.text_sm)
+                                    .line_height(theme.text_sm * (20. / 14.))
                                     .font_family("monospace")
                                     .text_color(theme.foreground)
                                     .tooltip(move |window, cx| {
@@ -1273,8 +1291,8 @@ impl Render for LogsView {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
-                                    .text_size(px(11.))
-                                    .line_height(px(16.5))
+                                    .text_size(theme.text_xs)
+                                    .line_height(theme.text_xs * 1.5)
                                     .text_color(theme.muted)
                                     .aria_label(metadata_tooltip.clone())
                                     .tooltip(move |window, cx| {
@@ -1368,8 +1386,7 @@ impl Render for LogsView {
                 Button::new("logs-clear-search")
                     .compact()
                     .ghost()
-                    .w(px(24.))
-                    .h(px(24.))
+                    .size(theme.metrics.icon_size + theme.metrics.gap)
                     .icon(IconName::X)
                     .accessibility_label(crate::locale::text(
                         "清空命令搜索",
@@ -1381,24 +1398,26 @@ impl Render for LogsView {
                     })),
             );
         }
-        let query_input = gpui_kit::Styled::h(query_input.flex_1().min_w(px(0.)), px(36.))
-            .bg(theme.panel)
-            .border_color(theme.border)
-            .text_color(theme.foreground)
-            .text_size(px(16.));
+        let query_input = gpui_kit::Styled::h(
+            query_input.flex_1().min_w(px(0.)),
+            theme.metrics.control_height,
+        )
+        .bg(theme.panel)
+        .border_color(theme.border)
+        .text_color(theme.foreground)
+        .text_size(theme.text_sm);
         let mut content = div()
             .id("terminal-logs-view")
             .size_full()
             .flex()
             .flex_col()
-            .gap_3()
-            .p_3()
+            .gap(theme.metrics.gap)
+            .p(theme.metrics.panel_padding)
             .overflow_hidden()
             .child(
                 div()
                     .flex_shrink_0()
-                    .text_size(px(18.))
-                    .line_height(px(28.))
+                    .text_size(theme.text_heading)
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .text_color(theme.foreground)
                     .child(crate::locale::text("命令历史", "Command history")),
@@ -1407,7 +1426,7 @@ impl Render for LogsView {
                 div()
                     .id("logs-history-target")
                     .w_full()
-                    .h(px(36.))
+                    .h(theme.metrics.control_height)
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -1458,8 +1477,8 @@ impl Render for LogsView {
                                     .compact()
                                     .ghost()
                                     .icon(IconName::RefreshCw)
-                                    .w(px(32.))
-                                    .h(px(32.))
+                                    .size(theme.metrics.control_height)
+                                    .loading(loading)
                                     .accessibility_label(refresh_label.clone())
                                     .tooltip(refresh_label)
                                     .disabled(unbound || !available || loading || clearing)
@@ -1474,8 +1493,7 @@ impl Render for LogsView {
                                     .ghost()
                                     .text_color(theme.error)
                                     .icon(IconName::Trash)
-                                    .w(px(32.))
-                                    .h(px(32.))
+                                    .size(theme.metrics.control_height)
                                     .accessibility_label(crate::locale::text(
                                         "清空命令历史",
                                         "Clear command history",
@@ -1575,21 +1593,21 @@ impl Render for LogsView {
                         div()
                             .id("logs-history-card-header")
                             .w_full()
-                            .h(px(HISTORY_HEADER_HEIGHT))
+                            .h(geometry.header_height)
                             .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_between()
                             .gap_3()
-                            .px_3()
-                            .py_2()
+                            .px(theme.metrics.panel_padding)
+                            .py(theme.metrics.gap / 2.)
                             .border_b_1()
                             .border_color(theme.border)
                             .child(
                                 div()
                                     .text_size(theme.text_sm)
                                     .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                    .line_height(px(20.))
+                                    .line_height(theme.text_sm * (20. / 14.))
                                     .text_color(theme.foreground)
                                     .child(crate::locale::text("最近命令", "Recent commands")),
                             )
@@ -1622,8 +1640,8 @@ impl Render for LogsView {
                                         .text_size(theme.text_sm)
                                         .text_color(theme.muted)
                                         .child(crate::locale::text(
-                                            "正在加载命令历史...",
-                                            "Loading command history...",
+                                            "正在加载命令历史…",
+                                            "Loading command history…",
                                         )),
                                 )
                             })
@@ -1648,7 +1666,7 @@ impl Render for LogsView {
                                     .id("logs-history-pagination")
                                     .debug_selector(|| "rr-logs-pagination".into())
                                     .w_full()
-                                    .h(px(HISTORY_PAGINATION_HEIGHT))
+                                    .h(geometry.pagination_height)
                                     .flex_shrink_0()
                                     .flex()
                                     .items_center()
@@ -1670,8 +1688,7 @@ impl Render for LogsView {
                                                     .compact()
                                                     .ghost()
                                                     .icon(IconName::ChevronLeft)
-                                                    .w(px(32.))
-                                                    .h(px(32.))
+                                                    .size(theme.metrics.control_height)
                                                     .accessibility_label(crate::locale::text(
                                                         "上一页命令历史",
                                                         "Previous history page",
@@ -1689,14 +1706,13 @@ impl Render for LogsView {
                                             .child(
                                                 div()
                                                     .debug_selector(|| "rr-logs-page-label".into())
-                                                    .min_w(px(64.))
-                                                    .h(px(32.))
+                                                    .min_w(theme.metrics.control_height * 2.)
+                                                    .h(theme.metrics.control_height)
                                                     .flex()
                                                     .items_center()
                                                     .justify_center()
                                                     .text_center()
-                                                    .text_size(px(12.))
-                                                    .line_height(px(20.))
+                                                    .text_size(theme.text_xs)
                                                     .child(format!(
                                                         "{current_page} / {page_count}"
                                                     )),
@@ -1707,8 +1723,7 @@ impl Render for LogsView {
                                                     .compact()
                                                     .ghost()
                                                     .icon(IconName::ChevronRight)
-                                                    .w(px(32.))
-                                                    .h(px(32.))
+                                                    .size(theme.metrics.control_height)
                                                     .accessibility_label(crate::locale::text(
                                                         "下一页命令历史",
                                                         "Next history page",
@@ -1861,18 +1876,18 @@ fn pagination_visible(entry_count: usize, page_size: usize) -> bool {
 }
 
 /// 容量取决于卡片实际高度；仅在需要分页时预留底栏，避免高面板仍被固定八条限制。
-/// 极小窗口至少保留一条，额外溢出由列表滚动承接，不挤走分页按钮。
+/// 容量与实际绘制共用密度和 rem 几何，极小窗口至少保留一条并由列表承接溢出。
 ///
 /// @author kongweiguang
-fn history_page_size(card_height: f32, total: usize) -> usize {
-    let available = (card_height - 2. - HISTORY_HEADER_HEIGHT).max(0.);
-    let without_footer = (available / HISTORY_ROW_HEIGHT).floor() as usize;
+fn history_page_size(card_height: f32, total: usize, geometry: HistoryGeometry) -> usize {
+    let available = (card_height - 2. - geometry.header_height.as_f32()).max(0.);
+    let without_footer = (available / geometry.row_height.as_f32()).floor() as usize;
     let available = if total > without_footer {
-        (available - HISTORY_PAGINATION_HEIGHT).max(0.)
+        (available - geometry.pagination_height.as_f32()).max(0.)
     } else {
         available
     };
-    ((available / HISTORY_ROW_HEIGHT).floor() as usize).clamp(1, HISTORY_LIMIT)
+    ((available / geometry.row_height.as_f32()).floor() as usize).clamp(1, HISTORY_LIMIT)
 }
 
 /// 列表卡片沿用 main 的页内范围格式；空列表始终显示 `0 / 0`。

@@ -4,7 +4,9 @@
 
 use super::*;
 
-/// 每个主题使用生产菜单和真正的编辑器入口，截图与动作结果分别保留，避免用静态像素替代接线。
+/// 每个主题使用生产菜单和真正的编辑器入口；窄窗经分类下拉验证协议，避免把折叠布局误判成缺失草稿。
+///
+/// @author kongweiguang
 pub(super) async fn capture(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
@@ -97,27 +99,50 @@ pub(super) async fn capture(
         wait_for_menu(cx, window, true).await?;
         click_menu_label(cx, window, &wanted)?;
         wait_for_editor(cx, window, true).await?;
-        if target == "sftp-copy-ssh" {
-            // Button.selected 只控制样式，不发布可访问性 selected；终端分类只会由 SSH 草稿提供。
-            let ssh_selected = window.update(cx, |_, window, _| {
-                gpui_kit::base::test_support::snapshots(window)
-                    .iter()
-                    .any(|node| {
-                        node.visible()
-                            && node.label()
-                                == Some(kerminal_ui::locale::text("终端", "Terminal").as_ref())
-                            && node.role() == Some(gpui_pre::Role::Button)
-                    })
-            })?;
-            if !ssh_selected {
-                return Err(io::Error::other("SFTP duplicate did not open an SSH draft").into());
-            }
-        }
         let editor_capture = save_frame(
             cx,
             window,
             directory.join(format!("sidebar-action-{theme}-{target}.png")),
         )?;
+        if target == "sftp-copy-ssh" {
+            // Button.selected 不发布可访问性 selected；终端分类只会由 SSH 草稿提供。
+            let terminal_label = kerminal_ui::locale::text("终端", "Terminal").to_string();
+            let ssh_selected =
+                if workbench_selector_visible(cx, window, "connections-editor-section-picker")? {
+                    wait_for_menu(cx, window, false).await?;
+                    click_selector(cx, window, "connections-editor-section-picker")?;
+                    wait_for_menu(cx, window, true).await?;
+                    let labels = menu_labels(cx, window)?;
+                    let _ = save_frame(
+                        cx,
+                        window,
+                        directory.join(format!("sidebar-sections-{theme}-{target}.png")),
+                    )?;
+                    let has_terminal = labels.contains(&terminal_label);
+                    press_key(cx, window, "escape")?;
+                    wait_for_menu(cx, window, false).await?;
+                    if !workbench_selector_visible(cx, window, "connections-editor-save")? {
+                        return Err(io::Error::other(
+                            "closing the compact section menu also closed the connection editor",
+                        )
+                        .into());
+                    }
+                    has_terminal
+                } else {
+                    window.update(cx, |_, window, _| {
+                        gpui_kit::base::test_support::snapshots(window)
+                            .iter()
+                            .any(|node| {
+                                node.visible()
+                                    && node.label() == Some(terminal_label.as_str())
+                                    && node.role() == Some(gpui_pre::Role::Button)
+                            })
+                    })?
+                };
+            if !ssh_selected {
+                return Err(io::Error::other("SFTP duplicate did not open an SSH draft").into());
+            }
+        }
         press_key(cx, window, "escape")?;
         wait_for_editor(cx, window, false).await?;
         records.push(serde_json::json!({

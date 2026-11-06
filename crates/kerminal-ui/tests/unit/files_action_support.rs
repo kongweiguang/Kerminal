@@ -3,7 +3,7 @@
 //! @author kongweiguang
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -29,10 +29,12 @@ use crate::features::files::{FilePaneSide, FileTargetNameLookup, FilesPane};
 /// 仅记录文件写操作，确认取消路径没有越过 UI 边界提交任何变更。
 #[derive(Default)]
 pub(crate) struct MutationCalls {
+    pub(crate) list_directory: AtomicUsize,
     pub(crate) create_directory: AtomicUsize,
     pub(crate) rename: AtomicUsize,
     pub(crate) chmod: AtomicUsize,
     pub(crate) delete: AtomicUsize,
+    pub(crate) directory_listing: Mutex<Option<DirectoryListing>>,
 }
 
 /// 状态型 FilesPane 测试共用独立 runtime 和拒绝 IO 的 application ports。
@@ -311,12 +313,26 @@ impl FileAccessProvider for StateOnlyFileProvider {
         true
     }
 
-    /// 测试不执行目录读取，避免将 UI 状态测试变成文件系统测试。
+    /// 默认拒绝读取；计数和显式内存 listing 允许验证真实目录回读次数，不执行实际 IO。
+    ///
+    /// @author kongweiguang
     async fn list_directory(
         &self,
         _: CancellationToken,
-        _: FileEndpoint,
+        endpoint: FileEndpoint,
     ) -> AppResult<DirectoryListing> {
+        self.mutations.list_directory.fetch_add(1, Ordering::AcqRel);
+        if let Some(listing) = self
+            .mutations
+            .directory_listing
+            .lock()
+            .expect("in-memory listing mutex")
+            .as_ref()
+            .filter(|listing| listing.directory == endpoint)
+            .cloned()
+        {
+            return Ok(listing);
+        }
         Err(AppError::unsupported("state-only test provider"))
     }
 

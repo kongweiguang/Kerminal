@@ -50,7 +50,7 @@ use kerminal_application::{
     platform::external_launch::ExternalTargetLease,
     preferences::{InterfaceDensity, ThemeMode},
     sessions::UiSessionBinding,
-    transfers::{TransferQueueEvent, TransferRecoveryRecord, TransferService},
+    transfers::{TransferOrigin, TransferQueueEvent, TransferRecoveryRecord, TransferService},
 };
 use kerminal_domain::files::{
     BookmarkTarget, ConflictPolicy, DeleteTargetKind, DirectoryListing, FileBookmark, FileEndpoint,
@@ -60,9 +60,9 @@ use kerminal_domain::identity::HostId;
 use tokio_util::sync::CancellationToken;
 
 use crate::locale;
-#[cfg(test)]
-use transfer_refresh::TransferRefreshScope;
-use transfer_refresh::{completed_transfer_refresh_directories, panel_needs_transfer_refresh};
+use transfer_refresh::{
+    TransferRefreshScope, completed_transfer_refresh_directories, panel_needs_transfer_refresh,
+};
 
 /// 文件面板冻结编辑目标及其独立临时连接 owner，避免切换终端后文档失去原目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,7 +77,7 @@ pub(crate) struct ActivateEditorFileRequested {
     pub(crate) endpoint: FileEndpoint,
 }
 
-/// 紧凑 SFTP 栏请求 Root 对冻结的终端会话执行 shell 目录跟随配置。
+/// 文件面板只向 Root 投递端点变化与主机选择，不在 UI 安装远端 Shell 配置。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FilesPaneEvent {
     TransferEndpointsChanged {
@@ -88,21 +88,21 @@ pub(crate) enum FilesPaneEvent {
         side: FilePaneSide,
         generation: u64,
     },
-    SetupTerminalDirectoryFollow {
-        binding: UiSessionBinding,
-    },
 }
 
-/// Root 将脚本提交到冻结的交互式 SSH 会话，并使用命令退出状态回报配置结果。
+/// 恢复与权限回读要求目标仍存在，传输目标则可能尚未发布到父目录。
 ///
 /// @author kongweiguang
-pub(crate) fn build_terminal_directory_follow_setup_script() -> String {
-    directory_follow::build_directory_follow_setup_script()
+enum PendingSelection {
+    Required(String),
+    IfPresent(String),
 }
 
 /// 左右面板各自维护当前目录和选择，切换目标不会重建后台传输任务。
 struct BrowserPanel {
     endpoint: FileEndpoint,
+    /// 根目录读取的取消 owner 独立于 FileTreeBrowser 的子树请求生命周期。
+    root_request_cancellation: Option<RootDirectoryRequestCancellation>,
     /// 正在读取时保留用户最新请求的目录；成功回执前 endpoint 仍是旧的已提交清单位置。
     requested_endpoint: Option<FileEndpoint>,
     listing: Option<DirectoryListing>,
@@ -111,12 +111,14 @@ struct BrowserPanel {
     /// 每侧只持有一个列表焦点句柄，虚拟行滚动复用同一复合控件焦点。
     list_focus_handle: Option<gpui_kit::FocusHandle>,
     keyboard_focus: FileListKeyboardFocus,
-    pending_selection: Option<String>,
+    pending_selection: Option<PendingSelection>,
     path_input: Option<Entity<InputState>>,
     path_input_endpoint: Option<String>,
     _path_subscription: Option<Subscription>,
     loading: bool,
     directory_error: Option<String>,
+    /// 失败读取仍指向原请求，重试不能退回保留旧清单的已提交目录。
+    failed_directory: Option<FileEndpoint>,
     generation: u64,
     tree: tree::FileTreeBrowser,
     tree_widget: Option<tree::TreeWidget>,
@@ -126,6 +128,11 @@ struct BrowserPanel {
     navigation_history: NavigationHistory,
 }
 
+struct RootDirectoryRequestCancellation {
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
 /// 键盘活动项按目录与文件名绑定；虚拟列表滚动和排序不会留下行索引焦点。
 ///
 /// @author kongweiguang
@@ -133,6 +140,17 @@ struct BrowserPanel {
 pub(super) struct FileListKeyboardFocus {
     directory: Option<FileEndpoint>,
     active_name: Option<String>,
+}
+
+/// 键盘事件绑定到绘制帧的目标、顺序和尺寸，避免在缩放或切换目录时混用不同快照。
+///
+/// @author kongweiguang
+struct FileListNavigation<'a> {
+    side: usize,
+    generation: u64,
+    directory: &'a FileEndpoint,
+    ordered_names: &'a [String],
+    row_height: f32,
 }
 
 /// 将文件列表行高映射到 main 与全局界面偏好共用的三个密度等级。
@@ -412,6 +430,7 @@ pub struct FilesPane {
     target_name_lookup: FileTargetNameLookup,
     target_names: FileTargetNameState,
     panels: [BrowserPanel; 2],
+    directory_navigation_generations: [u64; 2],
     local_directories: [PathBuf; 2],
     locked_left_host_id: Option<HostId>,
     external_target_lease: Option<ExternalTargetLease>,
@@ -419,13 +438,16 @@ pub struct FilesPane {
     follow_terminal_directory: bool,
     current_terminal_endpoint: Option<FileEndpoint>,
     current_terminal_binding: Option<UiSessionBinding>,
-    directory_follow_setup_bindings: Vec<UiSessionBinding>,
+    /// 只标记自动跟随发起的根读取；关闭开关不能取消用户手动导航。
+    terminal_directory_follow_generation: Option<u64>,
     bookmarks: Vec<FileBookmark>,
     bookmarks_target: Option<BookmarkTarget>,
     bookmark_request_target: Option<BookmarkTarget>,
     bookmark_generation: u64,
     bookmark_error: Option<String>,
     bookmark_error_target: Option<BookmarkTarget>,
+    transfer_origin: Option<TransferOrigin>,
+    all_transfer_rows: Vec<TransferSummary>,
     transfer_rows: Vec<TransferSummary>,
     transfer_recovery_rows: Vec<TransferRecoveryRecord>,
     queue: transfer_queue::TransferQueueUi,
@@ -446,6 +468,7 @@ pub struct FilesPane {
     initialized: bool,
     queue_watch_started: bool,
     delete_confirmation: Option<Vec<FileEntry>>,
+    delete_action_busy: bool,
     next_host_key_trust_request_id: u64,
     pending_host_key_trust: Option<PendingHostKeyTrust>,
     name_input: Option<Entity<InputState>>,
@@ -515,6 +538,7 @@ enum TransferSubmissionPhase {
 /// 同一面板至多一个提交，代次隔离迟到回执，侧别限定目录变化的取消范围。
 struct TransferSubmission {
     generation: u64,
+    origin: TransferOrigin,
     cancellation: CancellationToken,
     related_sides: [bool; 2],
     phase: TransferSubmissionPhase,
@@ -523,7 +547,32 @@ struct TransferSubmission {
 /// 只有已确认存在冲突的批次才跨帧保留，用于主窗口级决策弹框。
 struct PendingTransferConflict {
     plan: TransferBatchPlan,
-    conflict_count: usize,
+    conflicts: Vec<TransferConflict>,
+}
+
+/// 区分已有目标与批次内重复目标，避免将尚未创建的文件描述为已经存在。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransferConflictKind {
+    Existing,
+    Repeated,
+}
+
+/// 索引只引用同一冻结计划，保留原请求及租约的唯一所有权。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransferConflict {
+    item_index: usize,
+    kind: TransferConflictKind,
+}
+
+impl PendingTransferConflict {
+    /// 预检索引与冻结计划一起生成，投影时沿用原请求，不重新读取可能变化的目录。
+    ///
+    /// @author kongweiguang
+    fn conflict_items(&self) -> impl Iterator<Item = (&TransferRequest, TransferConflictKind)> {
+        self.conflicts
+            .iter()
+            .map(|conflict| (&self.plan.items[conflict.item_index].request, conflict.kind))
+    }
 }
 
 /// 下载对话框完成前保存已验证的来源，目标路径只在用户确认本机目录后构造。
@@ -604,6 +653,7 @@ async fn delete_file_entries(
 /// @author kongweiguang
 async fn enqueue_transfer_items(
     transfers: TransferService,
+    origin: TransferOrigin,
     cancellation: CancellationToken,
     items: Vec<TransferEnqueueItem>,
     total: usize,
@@ -624,14 +674,13 @@ async fn enqueue_transfer_items(
             outcome.cancelled_remaining = items_count.saturating_sub(index);
             break;
         }
-        let result = match item.external_target_lease.as_ref() {
-            Some(lease) => {
-                transfers
-                    .enqueue_with_external_target(item.request, lease)
-                    .await
-            }
-            None => transfers.enqueue(item.request).await,
-        };
+        let result = transfers
+            .enqueue_for_origin(
+                item.request,
+                origin.clone(),
+                item.external_target_lease.as_ref(),
+            )
+            .await;
         match result {
             Ok(_) => outcome.queued += 1,
             Err(error) => {
@@ -644,27 +693,27 @@ async fn enqueue_transfer_items(
     outcome
 }
 
-/// 先按父目录读取每个目标文件系统的现状；任一目录无法核验时整批阻断，避免把未知误报为无冲突。
+/// 按父目录核验目标并保留原批次索引；任一目录读取失败时整批阻断，不把未知目标误报为无冲突。
 ///
 /// @author kongweiguang
-async fn count_transfer_conflicts(
+async fn find_transfer_conflicts(
     files: &FileService,
     cancellation: &CancellationToken,
     items: &[TransferEnqueueItem],
-) -> AppResult<usize> {
-    let mut directories: Vec<(FileEndpoint, Vec<FileEndpoint>)> = Vec::new();
-    for item in items {
+) -> AppResult<Vec<TransferConflict>> {
+    let mut directories: Vec<(FileEndpoint, Vec<(usize, FileEndpoint)>)> = Vec::new();
+    for (item_index, item) in items.iter().enumerate() {
         let destination = item.request.destination.clone();
         let parent = parent_endpoint(&destination)
             .ok_or_else(|| AppError::invalid("传输目标没有可检查的父目录"))?;
         if let Some((_, targets)) = directories.iter_mut().find(|(path, _)| *path == parent) {
-            targets.push(destination);
+            targets.push((item_index, destination));
         } else {
-            directories.push((parent, vec![destination]));
+            directories.push((parent, vec![(item_index, destination)]));
         }
     }
 
-    let mut conflicts = 0;
+    let mut conflicts = Vec::new();
     for (parent, targets) in directories {
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("传输冲突预检已取消"));
@@ -680,23 +729,36 @@ async fn count_transfer_conflicts(
             .into_iter()
             .map(|entry| entry.endpoint)
             .collect::<HashSet<_>>();
-        conflicts += count_existing_transfer_conflicts(&targets, &existing);
+        conflicts.extend(existing_transfer_conflicts(&targets, &existing));
     }
+    conflicts.sort_by_key(|conflict| conflict.item_index);
     Ok(conflicts)
 }
 
-/// 既有目标逐项计为冲突；未存在的重复计划只把后续副本计冲突，避免盲目提交第二个同名写入。
+/// 已有目标逐项标记；尚不存在的重复目标只标记后续请求，并保留真实冲突原因供界面说明。
 ///
 /// @author kongweiguang
-fn count_existing_transfer_conflicts(
-    targets: &[FileEndpoint],
+fn existing_transfer_conflicts(
+    targets: &[(usize, FileEndpoint)],
     existing: &HashSet<FileEndpoint>,
-) -> usize {
+) -> Vec<TransferConflict> {
     let mut planned = HashSet::with_capacity(targets.len());
     targets
         .iter()
-        .filter(|target| existing.contains(*target) || !planned.insert((*target).clone()))
-        .count()
+        .filter_map(|(item_index, target)| {
+            let kind = if existing.contains(target) {
+                TransferConflictKind::Existing
+            } else if !planned.insert(target.clone()) {
+                TransferConflictKind::Repeated
+            } else {
+                return None;
+            };
+            Some(TransferConflict {
+                item_index: *item_index,
+                kind,
+            })
+        })
+        .collect()
 }
 
 /// 全部受理的结果已在传输列表可见，只对未受理、部分失败或取消保留反馈，避免成功底栏挤动列表。
@@ -764,6 +826,7 @@ fn batch_enqueue_message(
 
 impl FilesPane {
     /// 组合根传入的 Local endpoint 是浏览起点，左右本机栏都从该目录开始而不依赖进程启动目录。
+    /// 写操作的导航身份独立于读取代次，普通刷新不能使在途结果失去反馈。
     ///
     /// @author kongweiguang
     pub(crate) fn new(
@@ -788,6 +851,7 @@ impl FilesPane {
             target_name_lookup,
             target_names: FileTargetNameState::default(),
             panels: [BrowserPanel::new(local), BrowserPanel::new(target)],
+            directory_navigation_generations: [0, 0],
             local_directories: [local_directory.clone(), local_directory],
             locked_left_host_id: None,
             external_target_lease: None,
@@ -795,13 +859,15 @@ impl FilesPane {
             follow_terminal_directory: false,
             current_terminal_endpoint: None,
             current_terminal_binding: None,
-            directory_follow_setup_bindings: Vec::new(),
+            terminal_directory_follow_generation: None,
             bookmarks: Vec::new(),
             bookmarks_target: None,
             bookmark_request_target: None,
             bookmark_generation: 0,
             bookmark_error: None,
             bookmark_error_target: None,
+            transfer_origin: Some(TransferOrigin::SharedWorkbench),
+            all_transfer_rows: Vec::new(),
             transfer_rows: Vec::new(),
             transfer_recovery_rows: Vec::new(),
             queue: transfer_queue::TransferQueueUi::default(),
@@ -822,6 +888,7 @@ impl FilesPane {
             initialized: false,
             queue_watch_started: false,
             delete_confirmation: None,
+            delete_action_busy: false,
             next_host_key_trust_request_id: 0,
             pending_host_key_trust: None,
             name_input: None,
@@ -843,6 +910,9 @@ impl FilesPane {
             return;
         }
         self.compact_layout = compact;
+        if compact {
+            self.set_transfer_origin(None, cx);
+        }
         if !compact {
             self.permission_dialog_target = None;
         }
@@ -850,6 +920,36 @@ impl FilesPane {
             self.load_panel(0, cx);
         }
         cx.notify();
+    }
+
+    /// 切换来源立即撤销旧投影和未受理操作，已入队批次继续使用提交时冻结的身份。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn set_transfer_origin(
+        &mut self,
+        origin: Option<TransferOrigin>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.transfer_origin == origin {
+            return;
+        }
+        self.cancel_transfer_preparation(cx);
+        self.transfer_origin = origin;
+        self.transfer_rows.clear();
+        self.transfer_recovery_rows.clear();
+        let generation = self.queue.begin_transfer_refresh();
+        self.queue.finish_recovery_refresh(generation, Ok(()));
+        if self.initialized {
+            self.reload_transfers(cx);
+        }
+        cx.notify();
+    }
+
+    /// 关闭门禁只读取当前面板来源，避免把另一 pane/tab 的入队状态当成目标来源状态。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn transfer_origin_matches(&self, origin: &TransferOrigin) -> bool {
+        self.transfer_origin.as_ref() == Some(origin)
     }
 
     /// 复用全局界面密度偏好驱动文件行高，确保分页键步幅与真实可见行数一致。
@@ -900,8 +1000,9 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// Root 为独立文件 rail 提供终端或活动文件的可信本机/SSH 目标；终端身份另行绑定，不能由目录推断。
-    /// 目标失效会撤销旧数据以阻断跨目标操作，文件 Tab 因此可保留浏览能力而不获得发送终端的权限。
+    /// 会话身份与可信目录原子同步，避免同主机换终端被误判成文件系统切换而丢失清单和取消资格。
+    /// 文件来源没有终端 binding，切换文件时采用其父目录；隐藏的跟随开关不影响文件来源。
+    /// 目标失效仍撤销旧数据；跟随以在途目录为准，避免 A→B→A 的慢响应覆盖最新位置。
     ///
     /// @author kongweiguang
     ///
@@ -909,14 +1010,32 @@ impl FilesPane {
         &mut self,
         endpoint: Option<FileEndpoint>,
         lease: Option<ExternalTargetLease>,
+        binding: Option<UiSessionBinding>,
         cx: &mut Context<Self>,
     ) {
-        let action = compact_target_update_action(
+        let binding_changed = self.current_terminal_binding != binding;
+        let file_source = binding.is_none();
+        let mut action = compact_target_update_action(
             self.current_terminal_endpoint.as_ref(),
-            &self.panels[1].endpoint,
+            self.panels[1]
+                .requested_endpoint
+                .as_ref()
+                .unwrap_or(&self.panels[1].endpoint),
             endpoint.as_ref(),
-            self.follow_terminal_directory,
+            self.follow_terminal_directory || file_source,
         );
+        // 本机终端保留手动目录；本机文件 Tab 则必须采用新文件的父目录。
+        if file_source && action == CompactTargetUpdateAction::PreservePath {
+            action = CompactTargetUpdateAction::FollowDirectory;
+        }
+        if binding_changed
+            && (file_source
+                || (self.follow_terminal_directory
+                    && matches!(endpoint, Some(FileEndpoint::Remote { .. }))))
+            && action == CompactTargetUpdateAction::Unchanged
+        {
+            action = CompactTargetUpdateAction::FollowDirectory;
+        }
         if action == CompactTargetUpdateAction::Unavailable {
             if self.compact_target_is_cleared() {
                 return;
@@ -971,15 +1090,19 @@ impl FilesPane {
 
         let target_changed = self.current_terminal_endpoint.as_ref() != Some(&endpoint);
         let lease_changed = self.external_target_lease != retained_lease;
-        if action == CompactTargetUpdateAction::Unchanged && !target_changed && !lease_changed {
+        if action == CompactTargetUpdateAction::Unchanged
+            && !target_changed
+            && !lease_changed
+            && !binding_changed
+        {
             return;
         }
 
+        self.current_terminal_binding = binding;
         self.current_terminal_endpoint = Some(endpoint.clone());
         self.external_target_lease = retained_lease;
 
-        // A filesystem switch binds the exact new endpoint. Local CWD changes never move the
-        // user's browser; only a same-host SSH target may follow its directory when opted in.
+        // 文件系统切换清除旧目标；文件 Tab 跟随父目录，终端来源遵守本机保留和 SSH opt-in。
         let should_notify = match action {
             CompactTargetUpdateAction::BindTarget => {
                 self.invalidate_compact_target(cx);
@@ -989,31 +1112,16 @@ impl FilesPane {
                 true
             }
             CompactTargetUpdateAction::FollowDirectory => {
-                self.open_endpoint_on_side(1, endpoint, cx);
+                self.follow_terminal_directory_to(endpoint, cx);
                 true
             }
-            CompactTargetUpdateAction::PreservePath => lease_changed,
-            CompactTargetUpdateAction::Unchanged => lease_changed,
+            CompactTargetUpdateAction::PreservePath => lease_changed || binding_changed,
+            CompactTargetUpdateAction::Unchanged => lease_changed || binding_changed,
             CompactTargetUpdateAction::Unavailable => false,
         };
         if should_notify {
             cx.notify();
         }
-    }
-
-    /// 目录配置事件只携带 Root 已验证的当前会话绑定，防止根据主机标签重建终端身份。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn set_current_terminal_binding(
-        &mut self,
-        binding: Option<UiSessionBinding>,
-        cx: &mut Context<Self>,
-    ) {
-        if self.current_terminal_binding == binding {
-            return;
-        }
-        self.current_terminal_binding = binding;
-        cx.notify();
     }
 
     /// 验收只接受已绑定主机下精确目录的已提交 listing；导航仍由普通面板加载链执行。
@@ -1133,53 +1241,6 @@ impl FilesPane {
         Ok(())
     }
 
-    /// 目录跟随只适用于紧凑 SSH 文件栏；本机浏览始终保留手动路径，重开不追溯跳转。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn set_follow_terminal_directory(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if self.compact_layout
-            && enabled
-            && !matches!(
-                self.current_terminal_endpoint.as_ref(),
-                Some(FileEndpoint::Remote { .. })
-            )
-        {
-            return;
-        }
-        if self.follow_terminal_directory == enabled {
-            return;
-        }
-        self.follow_terminal_directory = enabled;
-        if enabled
-            && let Some(endpoint) = self.current_terminal_endpoint.clone()
-            && self.panels[1].endpoint != endpoint
-        {
-            self.open_endpoint_on_side(1, endpoint, cx);
-        }
-        cx.notify();
-    }
-
-    /// 仅向 Root 请求当前远端终端安装 prompt hook；命令执行结果由 Root 回报后再解除 busy。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn request_directory_follow_setup(&mut self, cx: &mut Context<Self>) {
-        if !matches!(
-            self.current_terminal_endpoint.as_ref(),
-            Some(FileEndpoint::Remote { .. })
-        ) {
-            return;
-        }
-        let Some(binding) = self.current_terminal_binding.clone() else {
-            return;
-        };
-        if self.directory_follow_setup_bindings.contains(&binding) {
-            return;
-        }
-        self.directory_follow_setup_bindings.push(binding.clone());
-        cx.emit(FilesPaneEvent::SetupTerminalDirectoryFollow { binding });
-        cx.notify();
-    }
-
     /// 将紧凑文件栏的显式信任动作交给 Root 复用连接层的 inspect/trust/readback 状态机。
     ///
     /// @author kongweiguang
@@ -1260,50 +1321,20 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 按请求 binding 收尾；旧终端回执不得阻塞新终端请求或覆盖当前状态。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn report_directory_follow_setup(
-        &mut self,
-        binding: UiSessionBinding,
-        result: Result<(), String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(index) = self
-            .directory_follow_setup_bindings
-            .iter()
-            .position(|pending| pending == &binding)
-        else {
-            return;
-        };
-        self.directory_follow_setup_bindings.remove(index);
-        if self.current_terminal_binding.as_ref() != Some(&binding) {
-            cx.notify();
-            return;
-        }
-        self.status = Some(match result {
-            Ok(()) => locale::text(
-                "目录跟随配置已写入远端 shell；重新登录或重新加载配置后生效。",
-                "Directory tracking was added to the remote shell config; sign in again or reload it to take effect.",
-            )
-            .to_string(),
-            Err(error) => locale::text(
-                format!("无法配置目录跟随：{error}"),
-                format!("Could not configure directory tracking: {error}"),
-            )
-            .to_string(),
-        });
-        cx.notify();
-    }
-
-    /// 清除旧文件系统的可见清单、选择及待加载 endpoint，并推进代次拒收迟到回执。
+    /// 清除旧文件系统的清单和表单、取消根 provider，并推进代次拒收迟到回执。
+    /// 已提交名称、权限和删除操作继续持有 busy 到真实回执；撤销展示不能假装后台操作已结束。
     ///
     /// @author kongweiguang
     fn invalidate_compact_target(&mut self, cx: &mut Context<Self>) {
+        self.terminal_directory_follow_generation = None;
+        self.directory_navigation_generations[1] =
+            self.directory_navigation_generations[1].wrapping_add(1);
         let panel = &mut self.panels[1];
+        panel.cancel_root_request_cancellation();
         panel.generation = panel.generation.wrapping_add(1);
         panel.loading = false;
         panel.directory_error = None;
+        panel.failed_directory = None;
         panel.requested_endpoint = None;
         panel.listing = None;
         panel.selected = None;
@@ -1320,6 +1351,10 @@ impl FilesPane {
         self.pending_host_key_trust = None;
         self.delete_confirmation = None;
         self.name_action = None;
+        self.name_action_side = None;
+        self.name_action_target = None;
+        self.permission_dialog_target = None;
+        self.permissions.reset_selection();
         self.status = None;
         self.cancel_transfer_preparation_for_side(1, cx);
     }
@@ -1345,6 +1380,7 @@ impl FilesPane {
             && self.pending_host_key_trust.is_none()
             && self.delete_confirmation.is_none()
             && self.name_action.is_none()
+            && self.permission_dialog_target.is_none()
             && self.status.is_none()
     }
 
@@ -1402,6 +1438,89 @@ impl FilesPane {
         panel.generation == generation
             && &panel.endpoint == endpoint
             && (!self.compact_layout || self.compact_target_is_available())
+    }
+
+    /// 写入回执绑定导航身份，同目录刷新不使其失效；离开再返回同一路径仍拒绝旧回执。
+    ///
+    /// @author kongweiguang
+    fn file_action_directory_is_current(
+        &self,
+        side: usize,
+        generation: u64,
+        directory: &FileEndpoint,
+    ) -> bool {
+        self.panels.get(side).is_some_and(|panel| {
+            panel.endpoint == *directory
+                && self.directory_navigation_generations[side] == generation
+                && panel
+                    .requested_endpoint
+                    .as_ref()
+                    .is_none_or(|requested| requested == directory)
+        })
+    }
+
+    /// 读取错误保留在目录 owner，渲染按当前侧派生；业务反馈无需依靠翻译后的文本猜测来源。
+    ///
+    /// @author kongweiguang
+    fn visible_operation_status(&self) -> Option<&str> {
+        if let Some(status) = self.status.as_deref() {
+            return Some(status);
+        }
+        // 列表已用内联错误卡展示同一失败时底栏不再复述，重试只出现一次；无法渲染列表
+        // （未绑定终端目标）或保留旧清单时，底栏仍补位并提供原位重试。
+        if self.directory_error_is_inline() {
+            return None;
+        }
+        let side = if self.compact_layout {
+            1
+        } else {
+            self.active_side
+        };
+        self.panels[side].directory_error.as_deref()
+    }
+
+    /// 目录错误是否已由列表内联卡片展示；与 `render_browser` 的错误卡判定保持同一条件。
+    ///
+    /// @author kongweiguang
+    fn directory_error_is_inline(&self) -> bool {
+        let side = if self.compact_layout {
+            1
+        } else {
+            self.active_side
+        };
+        let panel = &self.panels[side];
+        if panel.directory_error.is_none() || panel.listing.is_some() {
+            return false;
+        }
+        if self.compact_layout {
+            self.compact_target_is_available()
+        } else {
+            !(self.host_picker.enabled && self.host_picker.target_unselected[side])
+        }
+    }
+
+    /// 新导航只撤销该侧的旧表单与回执展示资格；在途任务继续独占 busy，直到真实回执收尾。
+    ///
+    /// @author kongweiguang
+    fn invalidate_file_action_presentation(&mut self, side: usize) {
+        self.directory_navigation_generations[side] =
+            self.directory_navigation_generations[side].wrapping_add(1);
+        self.status = None;
+        self.status_details_expanded = false;
+        if self.name_action_side == Some(side) {
+            self.name_action = None;
+            self.name_action_side = None;
+            self.name_action_target = None;
+        }
+        if self
+            .permission_dialog_target
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == side)
+        {
+            self.permission_dialog_target = None;
+            self.permissions.reset_selection();
+        }
+        self.delete_confirmation = None;
     }
 
     /// 切换语言时只更新已有输入的提示，不重建实体或覆盖用户正在编辑的路径和名称草稿。
@@ -1781,6 +1900,7 @@ impl FilesPane {
 
     /// 主机默认目录仅用于首次绑定；共享工作台延迟选主机时只在左侧仍处初始路径时应用本机默认目录。
     /// 同一远端再次打开保留用户位置，恢复或显式导航优先于默认值。
+    /// 本机起点重绑也撤销旧写入的展示资格，不释放在途请求的 busy。
     ///
     /// @author kongweiguang
     pub(crate) fn open_host_endpoint(
@@ -1815,6 +1935,7 @@ impl FilesPane {
                 && self.panels[0].generation == 0
                 && self.locked_left_host_id.is_none()
             {
+                self.invalidate_file_action_presentation(0);
                 self.panels[0].endpoint = FileEndpoint::Local { path };
             }
             self.initialized = true;
@@ -1825,6 +1946,7 @@ impl FilesPane {
         } else if apply_shared_local_start && let Some(path) = initial_local_directory {
             let local_endpoint = FileEndpoint::Local { path };
             if self.panels[0].endpoint != local_endpoint {
+                self.invalidate_file_action_presentation(0);
                 self.panels[0].endpoint = local_endpoint.clone();
                 self.panels[0]
                     .navigation_history
@@ -1867,14 +1989,14 @@ impl FilesPane {
         self.open_endpoint_on_side_with_selection(side, endpoint, None, cx);
     }
 
-    /// 将 endpoint 与可选恢复项一次写入面板，再发起目录读取，避免响应快于选择设置。
+    /// 将 endpoint 与待选策略一次写入面板，再发起目录读取，避免响应快于选择设置。
     ///
     /// @author kongweiguang
     fn open_endpoint_on_side_with_selection(
         &mut self,
         side: usize,
         endpoint: FileEndpoint,
-        pending_selection: Option<String>,
+        pending_selection: Option<PendingSelection>,
         cx: &mut Context<Self>,
     ) {
         if self.host_picker.enabled && side < self.panels.len() {
@@ -1957,13 +2079,16 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// Enter 提交当前 endpoint 的路径草稿；错误保留草稿与旧列表，供用户修正或取消。
+    /// Enter 和跳转按钮共用路径提交；输入法组合未结束时保留草稿与目录，避免提交未确认文本。
     ///
     /// @author kongweiguang
     fn commit_path_edit(&mut self, side: usize, cx: &mut Context<Self>) {
         let Some(input) = self.panels[side].path_input.as_ref().cloned() else {
             return;
         };
+        if input.read(cx).is_composing() {
+            return;
+        }
         let draft = input.update(cx, |state, _| state.value().to_string());
         let endpoint = match render::browser::endpoint_for_path(&self.panels[side].endpoint, &draft)
         {
@@ -2135,19 +2260,22 @@ impl FilesPane {
         }
     }
 
-    /// 校验目标后按当前 viewport 移动，并直接滚动到活动行。
+    /// 校验目标后按当前 viewport 移动，并直接滚动到活动行；行高沿用触发事件的绘制帧，避免文字缩放后翻页错位。
     ///
     /// @author kongweiguang
     fn move_list_keyboard_focus(
         &mut self,
-        side: usize,
-        generation: u64,
-        directory: &FileEndpoint,
-        ordered_names: &[String],
+        navigation: FileListNavigation<'_>,
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) {
-        let row_height = self.file_row_height;
+        let FileListNavigation {
+            side,
+            generation,
+            directory,
+            ordered_names,
+            row_height,
+        } = navigation;
         let movement = match event.keystroke.key.to_ascii_lowercase().as_str() {
             "up" => FileListMovement::Previous,
             "down" => FileListMovement::Next,
@@ -2369,7 +2497,7 @@ impl FilesPane {
         });
     }
 
-    /// 打开传输目标所在目录并选中目标项，确保队列中的完整 endpoint 可被定位。
+    /// 打开传输目标的父目录；目标可能尚未发布，只有存在时才选择它。
     ///
     /// @author kongweiguang
     pub(super) fn locate_transfer_destination(
@@ -2397,11 +2525,12 @@ impl FilesPane {
         } else {
             1
         };
-        let selection = endpoint_name(&destination);
+        let selection = endpoint_name(&destination).map(PendingSelection::IfPresent);
         self.open_endpoint_on_side_with_selection(side, parent, selection, cx);
     }
 
     /// 恢复一个独立的双面板传输工作区，并校验左侧锁定主机与初始选择。
+    /// 两侧重绑均更换导航身份，旧写入只收尾资源，不干扰恢复后的工作区。
     ///
     /// @author kongweiguang
     pub fn open_workspace_transfer(
@@ -2432,6 +2561,8 @@ impl FilesPane {
         let right_endpoint = right.unwrap_or_else(|| FileEndpoint::Local {
             path: self.local_directories[1].clone(),
         });
+        self.invalidate_file_action_presentation(0);
+        self.invalidate_file_action_presentation(1);
         self.panels[0].endpoint = left;
         let left_endpoint = self.panels[0].endpoint.clone();
         self.panels[0].navigation_history.reset(left_endpoint);
@@ -2441,7 +2572,7 @@ impl FilesPane {
         self.panels[1].endpoint = right_endpoint;
         let right_endpoint = self.panels[1].endpoint.clone();
         self.panels[1].navigation_history.reset(right_endpoint);
-        self.panels[1].pending_selection = initial_right_selection;
+        self.panels[1].pending_selection = initial_right_selection.map(PendingSelection::Required);
         self.panels[1].selected = None;
         self.panels[1].selection.clear();
         self.sync_target_name_requests(cx);
@@ -2628,10 +2759,11 @@ impl FilesPane {
     }
 
     /// 开始创建目录并冻结目的目录；紧凑栏通过 Root 弹框提交，宽工作台保留原内联编辑。
+    /// 名称和权限操作共用表单槽；原请求回执收尾前不能替换草稿或清除它的 busy 所有权。
     ///
     /// @author kongweiguang
     pub(crate) fn prepare_create_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.name_action_busy {
+        if self.name_action_busy || self.permissions.busy {
             return;
         }
         self.ensure_name_input(window, cx);
@@ -2657,10 +2789,11 @@ impl FilesPane {
     }
 
     /// 开始重命名时冻结所选 endpoint 并预填短名称，路径的父目录仍由 endpoint 类型保留。
+    /// 已提交的文件表单保持独占，防止旧回执释放后来操作的 busy。
     ///
     /// @author kongweiguang
     fn prepare_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.name_action_busy {
+        if self.name_action_busy || self.permissions.busy {
             return;
         }
         self.ensure_name_input(window, cx);
@@ -2687,6 +2820,7 @@ impl FilesPane {
     }
 
     /// 验证名称为单一目录项后调用 FileService；成功由目录回读呈现，仅失败保留反馈，避免额外状态条。
+    /// busy 独占该请求到真实完成；先释放操作所有权，再核验表单和目录代次，旧操作不打断新导航。
     ///
     /// @author kongweiguang
     fn commit_name_action(&mut self, cx: &mut Context<Self>) {
@@ -2730,6 +2864,8 @@ impl FilesPane {
         }
         let files = self.files.clone();
         let executor = self.executor.clone();
+        let directory = self.panels[side].endpoint.clone();
+        let generation = self.directory_navigation_generations[side];
         let external_target_lease = self.external_target_lease_for_endpoint(&target);
         match action {
             NameAction::CreateDirectory => {
@@ -2754,13 +2890,22 @@ impl FilesPane {
                         .await;
                     cx.update(|app| {
                         let _ = this.update(app, |pane, cx| {
+                            pane.name_action_busy = false;
                             if pane.name_action != Some(NameAction::CreateDirectory)
                                 || pane.name_action_side != Some(side)
                                 || pane.name_action_target.as_ref() != Some(&request_target)
                             {
+                                cx.notify();
                                 return;
                             }
-                            pane.name_action_busy = false;
+                            if !pane.file_action_directory_is_current(side, generation, &directory)
+                            {
+                                pane.name_action = None;
+                                pane.name_action_side = None;
+                                pane.name_action_target = None;
+                                cx.notify();
+                                return;
+                            }
                             let succeeded = result.is_ok();
                             match result {
                                 Ok(()) => {
@@ -2814,13 +2959,22 @@ impl FilesPane {
                         .await;
                     cx.update(|app| {
                         let _ = this.update(app, |pane, cx| {
+                            pane.name_action_busy = false;
                             if pane.name_action != Some(NameAction::Rename)
                                 || pane.name_action_side != Some(side)
                                 || pane.name_action_target.as_ref() != Some(&request_target)
                             {
+                                cx.notify();
                                 return;
                             }
-                            pane.name_action_busy = false;
+                            if !pane.file_action_directory_is_current(side, generation, &directory)
+                            {
+                                pane.name_action = None;
+                                pane.name_action_side = None;
+                                pane.name_action_target = None;
+                                cx.notify();
+                                return;
+                            }
                             let succeeded = result.is_ok();
                             match result {
                                 Ok(()) => {
@@ -2843,10 +2997,14 @@ impl FilesPane {
         }
     }
 
-    /// 对所选项目执行统一二次确认，目录是否可删由 FileService 按协议规则判断。
+    /// 删除批次在真实回执前独占提交；确认后冻结项目与租约，目录是否可删仍由 FileService 判断。
+    /// 回执只刷新原目录代次，避免旧删除打断导航或重新读取已经失效的终端目标。
     ///
     /// @author kongweiguang
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        if self.delete_action_busy {
+            return;
+        }
         let side = self.active_side;
         let entries = if self.view_mode == view_mode::FilesViewMode::Tree {
             self.panels[side]
@@ -2885,6 +3043,8 @@ impl FilesPane {
         }
 
         let total = entries.len();
+        let directory = self.panels[side].endpoint.clone();
+        let generation = self.directory_navigation_generations[side];
         let items = entries
             .into_iter()
             .map(|entry| {
@@ -2898,6 +3058,7 @@ impl FilesPane {
             })
             .collect::<Vec<_>>();
         self.delete_confirmation = None;
+        self.delete_action_busy = true;
         let files = self.files.clone();
         let executor = self.executor.clone();
         self.status = Some(
@@ -2916,7 +3077,19 @@ impl FilesPane {
                     .await;
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
-                    pane.status = Some(match result {
+                    pane.delete_action_busy = false;
+                    if !pane.file_action_directory_is_current(side, generation, &directory) {
+                        cx.notify();
+                        return;
+                    }
+                    pane.status = match result {
+                        Ok(outcome)
+                            if outcome.deleted == outcome.total
+                                && outcome.cancelled_remaining == 0
+                                && outcome.issues.is_empty() =>
+                        {
+                            None
+                        }
                         Ok(outcome) => {
                             let mut message = locale::text(
                                 format!("已删除 {}/{} 项。", outcome.deleted, outcome.total),
@@ -2939,10 +3112,10 @@ impl FilesPane {
                                     outcome.issues.join(&locale::text("；", "; "))
                                 ));
                             }
-                            message
+                            Some(message)
                         }
-                        Err(error) => localized_error(&error),
-                    });
+                        Err(error) => Some(localized_error(&error)),
+                    };
                     pane.load_panel(side, cx);
                     cx.notify();
                 });
@@ -3194,7 +3367,8 @@ impl FilesPane {
         self.prompt_upload_kind_to(destination_directory, UploadSelectionKind::Directories, cx);
     }
 
-    /// 保留单文件保存框与批量目录选择；用户确认路径后才构造目标并检查覆盖风险。
+    /// 本机名称按宿主平台校验，远端 POSIX 身份不能被 Windows 解释为子目录或数据流。
+    /// 保留单文件保存框与批量目录选择，确认路径后才构造目标并检查覆盖风险。
     ///
     /// @author kongweiguang
     fn prompt_download(&mut self, cx: &mut Context<Self>) {
@@ -3236,12 +3410,20 @@ impl FilesPane {
         let mut sources = Vec::new();
         let mut issues = Vec::new();
         for entry in selected {
-            let Some(name) = endpoint_name(&entry.endpoint).filter(|name| valid_item_name(name))
-            else {
+            let Some(name) = endpoint_name(&entry.endpoint).filter(|name| {
+                FileEndpoint::Local {
+                    path: PathBuf::new(),
+                }
+                .join_name(name)
+                .is_ok()
+            }) else {
                 issues.push(
                     locale::text(
-                        format!("{}: 无法安全读取文件名。", entry.name),
-                        format!("{}: the name cannot be represented safely.", entry.name),
+                        format!("{}: 文件名无法安全保存到本机，请先重命名。", entry.name),
+                        format!(
+                            "{}: rename this item before saving it to this device.",
+                            entry.name
+                        ),
                     )
                     .to_string(),
                 );
@@ -3477,10 +3659,34 @@ impl FilesPane {
         self.load_panel_at(side, endpoint, cx);
     }
 
-    /// 新目录请求切换到目标视图；同目录刷新保留滚动与选择，回执仍绑定 generation。
+    /// 重试使用失败请求的精确端点，保留旧清单时也不能静默回到原目录。
+    ///
+    /// @author kongweiguang
+    fn retry_panel_load(&mut self, side: usize, cx: &mut Context<Self>) {
+        let endpoint = self.panels[side]
+            .failed_directory
+            .clone()
+            .unwrap_or_else(|| self.panels[side].endpoint.clone());
+        self.load_panel_at(side, endpoint, cx);
+    }
+
+    /// 新导航取消旧根 provider 并撤销原目录表单；同目录刷新保留滚动、选择和独立操作反馈。
+    /// 只有原读取错误随重试清理；待选项按来源区分必需恢复和传输目标尚未发布。
     ///
     /// @author kongweiguang
     fn load_panel_at(&mut self, side: usize, endpoint: FileEndpoint, cx: &mut Context<Self>) {
+        if side == 1 {
+            self.terminal_directory_follow_generation = None;
+        }
+        let previous_intent = self.panels[side]
+            .requested_endpoint
+            .as_ref()
+            .or(self.panels[side].failed_directory.as_ref())
+            .unwrap_or(&self.panels[side].endpoint);
+        let changing_directory = previous_intent != &endpoint;
+        if changing_directory {
+            self.invalidate_file_action_presentation(side);
+        }
         self.cancel_transfer_preparation_for_side(side, cx);
         self.panels[side]
             .keyboard_focus
@@ -3488,15 +3694,18 @@ impl FilesPane {
         if self.panels[side].endpoint != endpoint {
             self.panels[side].list_scroll = VirtualListScrollHandle::new();
         }
-        let generation = {
+        let (generation, cancellation) = {
             let panel = &mut self.panels[side];
             panel.directory_error = None;
-            begin_panel_load_request(
+            panel.failed_directory = None;
+            let generation = begin_panel_load_request(
                 &mut panel.generation,
                 &mut panel.loading,
                 &mut panel.requested_endpoint,
                 &endpoint,
-            )
+            );
+            let cancellation = panel.begin_root_request_cancellation(generation);
+            (generation, cancellation)
         };
         let requested_endpoint = endpoint.clone();
         self.panels[side]
@@ -3507,7 +3716,7 @@ impl FilesPane {
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |cancel| async move {
+                .run_cancellable(cancellation, move |cancel| async move {
                     let _external_target_scope = external_target_lease;
                     files.list_directory(cancel, endpoint).await
                 })
@@ -3516,6 +3725,7 @@ impl FilesPane {
                 let _ = this.update(app, |pane, cx| {
                     let locked_left_host_id = pane.locked_left_host_id.clone();
                     let panel = &mut pane.panels[side];
+                    panel.finish_root_request_cancellation(generation);
                     if !finish_panel_load_request(
                         panel.generation,
                         generation,
@@ -3524,8 +3734,12 @@ impl FilesPane {
                     ) {
                         return;
                     }
+                    if side == 1 && pane.terminal_directory_follow_generation == Some(generation) {
+                        pane.terminal_directory_follow_generation = None;
+                    }
                     panel.loading = false;
                     panel.directory_error = None;
+                    panel.failed_directory = None;
                     match result {
                         Ok(listing) => {
                             if side == 0
@@ -3582,7 +3796,11 @@ impl FilesPane {
                             }
                             panel.endpoint = listing.directory.clone();
                             let requested_selection = panel.pending_selection.take();
-                            let selected = if let Some(name) = requested_selection.as_ref() {
+                            let selected = if let Some(selection) = requested_selection.as_ref() {
+                                let name = match selection {
+                                    PendingSelection::Required(name)
+                                    | PendingSelection::IfPresent(name) => name,
+                                };
                                 listing
                                     .entries
                                     .iter()
@@ -3597,17 +3815,19 @@ impl FilesPane {
                                         .cloned()
                                 })
                             };
-                            if requested_selection.is_some()
-                                && let Some(entry) = selected.as_ref()
-                            {
-                                panel.selection.select_only(&entry.name);
+                            if requested_selection.is_some() {
+                                panel.selection.clear();
+                                if let Some(entry) = selected.as_ref() {
+                                    panel.selection.select_only(&entry.name);
+                                }
                             }
                             panel.selection.retain_visible(&visible_names);
                             panel
                                 .keyboard_focus
                                 .retain_visible(&listing.directory, &keyboard_visible_names);
-                            if requested_selection.is_some() && selected.is_none() {
-                                panel.selected = None;
+                            if matches!(requested_selection, Some(PendingSelection::Required(_)))
+                                && selected.is_none()
+                            {
                                 pane.status = Some(
                                     locale::text(
                                         "恢复的选择项当前不可用。",
@@ -3615,10 +3835,8 @@ impl FilesPane {
                                     )
                                     .to_string(),
                                 );
-                            } else {
-                                panel.selected = selected;
-                                pane.status = None;
                             }
+                            panel.selected = selected;
                             panel.listing = Some(listing);
                             if let FileEndpoint::Local { path } = &panel.endpoint {
                                 pane.local_directories[side] = path.clone();
@@ -3630,9 +3848,9 @@ impl FilesPane {
                         }
                         Err(error) => {
                             let error_message = localized_error(&error);
-                            panel.directory_error = Some(error_message.clone());
+                            panel.directory_error = Some(error_message);
+                            panel.failed_directory = Some(requested_endpoint.clone());
                             pane.panels[side].pending_selection = None;
-                            pane.status = Some(error_message);
                         }
                     }
                     pane.sync_target_name_requests(cx);
@@ -3766,6 +3984,7 @@ impl FilesPane {
     }
 
     /// 目录项进入目录，普通文件保留显式编辑入口。
+    /// 先撤销旧表单的展示资格，再提交目录，避免迟到写入刷新覆盖新位置。
     ///
     /// @author kongweiguang
     fn activate_entry(&mut self, side: usize, entry: FileEntry, cx: &mut Context<Self>) {
@@ -3786,6 +4005,7 @@ impl FilesPane {
         let switched_side = self.active_side != side;
         self.active_side = side;
         if entry.kind == FileEntryKind::Directory {
+            self.invalidate_file_action_presentation(side);
             self.panels[side]
                 .navigation_history
                 .push(entry.endpoint.clone());
@@ -3807,6 +4027,7 @@ impl FilesPane {
     }
 
     /// 返回一层目录的父路径；POSIX 远端路径不经过 Windows Path 规则解释。
+    /// 父目录导航与地址栏跳转共用写入回执失效约束，不因预写 endpoint 而漏掉导航身份。
     ///
     /// @author kongweiguang
     fn navigate_parent(&mut self, side: usize, cx: &mut Context<Self>) {
@@ -3851,6 +4072,7 @@ impl FilesPane {
             return;
         }
         self.panels[side].navigation_history.push(endpoint.clone());
+        self.invalidate_file_action_presentation(side);
         self.panels[side].endpoint = endpoint;
         self.panels[side].pending_selection = None;
         self.panels[side].selected = None;
@@ -4086,7 +4308,7 @@ impl FilesPane {
         self.enqueue_transfer_batch_started(plan, cx);
     }
 
-    /// 接收已持有提交闩锁的异步计划，避免系统选择器期间出现重复批次。
+    /// 接收已持有提交闩锁的异步计划；冲突索引与冻结计划一同回传，避免界面改用后来的目标。
     ///
     /// @author kongweiguang
     fn enqueue_transfer_batch_started(&mut self, plan: TransferBatchPlan, cx: &mut Context<Self>) {
@@ -4116,7 +4338,7 @@ impl FilesPane {
             let result = executor
                 .run_cancellable(cancellation, move |cancellation| async move {
                     let conflicts =
-                        count_transfer_conflicts(&files, &cancellation, &plan.items).await?;
+                        find_transfer_conflicts(&files, &cancellation, &plan.items).await?;
                     Ok((plan, conflicts))
                 })
                 .await;
@@ -4126,17 +4348,13 @@ impl FilesPane {
                         return;
                     }
                     match result {
-                        Ok((plan, conflict_count))
-                            if pane.transfer_target_is_current(&plan.target) =>
-                        {
-                            if conflict_count == 0 {
+                        Ok((plan, conflicts)) if pane.transfer_target_is_current(&plan.target) => {
+                            if conflicts.is_empty() {
                                 pane.submit_transfer_batch(plan, cx);
                             } else {
                                 pane.status = None;
-                                pane.pending_transfer_conflict = Some(PendingTransferConflict {
-                                    plan,
-                                    conflict_count,
-                                });
+                                pane.pending_transfer_conflict =
+                                    Some(PendingTransferConflict { plan, conflicts });
                                 cx.notify();
                             }
                         }
@@ -4179,6 +4397,8 @@ impl FilesPane {
         }
         submission.phase = TransferSubmissionPhase::Enqueuing;
         let generation = submission.generation;
+        let origin = submission.origin.clone();
+        let result_origin = origin.clone();
         let transfers = self.transfers.clone();
         let executor = self.executor.clone();
         let labels = plan.labels;
@@ -4187,6 +4407,7 @@ impl FilesPane {
                 .run(move |cancel| async move {
                     Ok(enqueue_transfer_items(
                         transfers,
+                        origin,
                         cancel,
                         plan.items,
                         plan.total,
@@ -4206,6 +4427,10 @@ impl FilesPane {
                     }
                     pane.end_transfer_submission();
                     pane.pending_transfer_conflict = None;
+                    if pane.transfer_origin.as_ref() != Some(&result_origin) {
+                        pane.reload_transfers(cx);
+                        return;
+                    }
                     match result {
                         Ok(outcome) => {
                             pane.status =
@@ -4387,6 +4612,15 @@ impl FilesPane {
             .is_some_and(|submission| submission.phase == TransferSubmissionPhase::Enqueuing)
     }
 
+    /// 面板切到其它来源后仍须保留原批次的受理屏障，队列登记前不能按当前展示来源放行关闭。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn transfer_enqueue_in_progress_for_origin(&self, origin: &TransferOrigin) -> bool {
+        self.transfer_submission.as_ref().is_some_and(|submission| {
+            submission.phase == TransferSubmissionPhase::Enqueuing && &submission.origin == origin
+        })
+    }
+
     /// 关闭冲突弹框只丢弃未提交计划；已排队的任务不受关闭动作影响。
     ///
     /// @author kongweiguang
@@ -4396,13 +4630,13 @@ impl FilesPane {
         }
     }
 
-    /// 仅为决策弹框暴露本次预检数量；没有冻结批次时不显示冲突界面。
+    /// 冲突数量从冻结的逐项结果推导，避免数量与弹框对象各自漂移。
     ///
     /// @author kongweiguang
     fn pending_transfer_conflict_count(&self) -> Option<usize> {
         self.pending_transfer_conflict
             .as_ref()
-            .map(|pending| pending.conflict_count)
+            .map(|pending| pending.conflicts.len())
     }
 
     /// 同一文件面板只允许一个传输批次；原操作按钮表达忙态，重复提交不再插入状态条或覆盖已有错误。
@@ -4423,11 +4657,13 @@ impl FilesPane {
         if self.transfer_submission_busy {
             return None;
         }
+        let origin = self.transfer_origin.clone()?;
         self.transfer_submission_generation = self.transfer_submission_generation.wrapping_add(1);
         let generation = self.transfer_submission_generation;
         let cancellation = CancellationToken::new();
         self.transfer_submission = Some(TransferSubmission {
             generation,
+            origin,
             cancellation: cancellation.clone(),
             related_sides,
             phase: TransferSubmissionPhase::Preparing,
@@ -4458,14 +4694,23 @@ impl FilesPane {
         self.transfer_submission_busy = false;
     }
 
-    /// 队列快照变化仅重读新提交回执对应的当前目标目录，不改变用户的在途导航意图。
+    /// 权威快照先于目录回读；删除补偿与同批新终态合并，避免重复读取及漏掉迟到提交。
     /// 读取仍经过 panel generation 门禁，旧路径或迟到回执不能覆盖新目录。
     ///
     /// @author kongweiguang
-    fn apply_transfer_rows(&mut self, rows: Vec<TransferSummary>, cx: &mut Context<Self>) {
-        let refresh_directories =
-            completed_transfer_refresh_directories(&self.transfer_rows, &rows);
-        self.transfer_rows = rows;
+    fn apply_transfer_rows(
+        &mut self,
+        rows: Vec<TransferSummary>,
+        visible_rows: Vec<TransferSummary>,
+        cx: &mut Context<Self>,
+    ) {
+        let refresh_directories = if self.queue.take_uncertain_transfer_change() {
+            vec![TransferRefreshScope::All]
+        } else {
+            completed_transfer_refresh_directories(&self.all_transfer_rows, &rows)
+        };
+        self.all_transfer_rows = rows;
+        self.transfer_rows = visible_rows;
         self.invalidate_inactive_transfer_directories(&refresh_directories);
         for side in 0..self.panels.len() {
             let should_refresh = {
@@ -4484,24 +4729,30 @@ impl FilesPane {
         }
     }
 
-    /// 所有活队列读取共用代次，只接纳最新的任务与恢复材料，避免归档前快照迟到复活。
-    /// 首次另读一页冷档以保留历史入口，进度广播不会反复扫描冷历史；启动时通知等待态。
+    /// 活队列与恢复材料共用读取代次，只接纳当前来源的最新快照。
+    /// 进度广播不扫描没有界面入口的冷档，避免无用的后台读取。
     ///
     /// @author kongweiguang
     fn reload_transfers(&mut self, cx: &mut Context<Self>) {
         let generation = self.queue.begin_transfer_refresh();
         cx.notify();
-        if !self.queue.archive_loaded && !self.queue.archive_loading {
-            self.load_transfer_archive_page(None, cx);
-        }
         let transfers = self.transfers.clone();
         let executor = self.executor.clone();
+        let origin = self.transfer_origin.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |cancellation| async move {
                     let rows = transfers.list().await;
-                    let recovery = transfers.list_recovery(cancellation).await;
-                    Ok((rows, recovery))
+                    let (visible, recovery) = match origin {
+                        Some(origin) => (
+                            transfers.list_for_origin(&origin).await,
+                            transfers
+                                .list_recovery_for_origin(&origin, cancellation)
+                                .await,
+                        ),
+                        None => (Vec::new(), Ok(Vec::new())),
+                    };
+                    Ok((rows, visible, recovery))
                 })
                 .await;
             cx.update(|app| {
@@ -4510,8 +4761,8 @@ impl FilesPane {
                         return;
                     }
                     match result {
-                        Ok((rows, recovery)) => {
-                            pane.apply_transfer_rows(rows, cx);
+                        Ok((rows, visible, recovery)) => {
+                            pane.apply_transfer_rows(rows, visible, cx);
                             match recovery {
                                 Ok(recovery) => {
                                     pane.transfer_recovery_rows = recovery;
@@ -4523,6 +4774,9 @@ impl FilesPane {
                             }
                         }
                         Err(error) => {
+                            if pane.queue.take_uncertain_transfer_change() {
+                                pane.refresh_after_uncertain_transfer_change(cx);
+                            }
                             pane.queue.finish_recovery_refresh(generation, Err(error));
                         }
                     }
@@ -4534,6 +4788,7 @@ impl FilesPane {
     }
 
     /// 队列信号允许合并；活任务状态快照用于识别一次性的提交成功并刷新精确目标目录。
+    /// 删除事件立即使缓存失效，并跨代次保留补偿；接受权威快照后才合并目录回读。
     /// 事件读取与按钮共用代次，同时保持串行读取以免进度广播堆积磁盘任务。
     /// 后台读取开始后立即通知，让 loading 不依赖其它窗口输入事件。
     ///
@@ -4567,22 +4822,33 @@ impl FilesPane {
                             wake,
                             TransferQueueEvent::Cleared | TransferQueueEvent::Resync
                         ) {
-                            pane.refresh_after_uncertain_transfer_change(cx);
+                            pane.queue.mark_uncertain_transfer_change();
+                            pane.invalidate_inactive_transfer_directories(&[
+                                TransferRefreshScope::All,
+                            ]);
                         }
                         let generation = pane.queue.begin_transfer_refresh();
                         cx.notify();
-                        generation
+                        (generation, pane.transfer_origin.clone())
                     })
                 });
-                let Ok(generation) = generation else {
+                let Ok((generation, origin)) = generation else {
                     break;
                 };
                 let service = transfers.clone();
                 let result = executor
                     .run(move |cancellation| async move {
                         let rows = service.list().await;
-                        let recovery = service.list_recovery(cancellation).await;
-                        Ok((rows, recovery))
+                        let (visible, recovery) = match origin {
+                            Some(origin) => (
+                                service.list_for_origin(&origin).await,
+                                service
+                                    .list_recovery_for_origin(&origin, cancellation)
+                                    .await,
+                            ),
+                            None => (Vec::new(), Ok(Vec::new())),
+                        };
+                        Ok((rows, visible, recovery))
                     })
                     .await;
                 cx.update(|app| {
@@ -4591,8 +4857,8 @@ impl FilesPane {
                             return;
                         }
                         match result {
-                            Ok((rows, recovery)) => {
-                                pane.apply_transfer_rows(rows, cx);
+                            Ok((rows, visible, recovery)) => {
+                                pane.apply_transfer_rows(rows, visible, cx);
                                 match recovery {
                                     Ok(recovery) => {
                                         pane.transfer_recovery_rows = recovery;
@@ -4604,6 +4870,9 @@ impl FilesPane {
                                 }
                             }
                             Err(error) => {
+                                if pane.queue.take_uncertain_transfer_change() {
+                                    pane.refresh_after_uncertain_transfer_change(cx);
+                                }
                                 pane.queue.finish_recovery_refresh(generation, Err(error));
                             }
                         }
@@ -4615,7 +4884,7 @@ impl FilesPane {
         .detach();
     }
 
-    /// 取消在目标项回执处延后、在项间停止后续提交；最终回执屏障确定迟到取消竞态。
+    /// 固定当前来源后再取消，目标项回执屏障仍由全局队列负责。
     ///
     /// @author kongweiguang
     fn cancel_transfer(
@@ -4623,14 +4892,24 @@ impl FilesPane {
         id: kerminal_domain::identity::TransferId,
         cx: &mut Context<Self>,
     ) {
+        let Some(origin) = self.transfer_origin.clone() else {
+            return;
+        };
+        let result_origin = origin.clone();
         let transfers = self.transfers.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |_| async move { transfers.cancel(&id).await })
+                .run(move |cancellation| async move {
+                    transfers.ensure_origin(&id, &origin, cancellation).await?;
+                    transfers.cancel(&id).await
+                })
                 .await;
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
+                    if pane.transfer_origin.as_ref() != Some(&result_origin) {
+                        return;
+                    }
                     if let Err(error) = result {
                         pane.status = Some(localized_error(&error));
                     }
@@ -4641,21 +4920,44 @@ impl FilesPane {
         .detach();
     }
 
-    /// 按原任务 endpoint 决定是否需要同 HostId 的临时 lease，避免把当前 pane 凭据传给无关任务。
+    /// 续传保留原任务，普通重试创建后继；待清理 owner 必须先确认释放才可继续。
+    /// 同一忙态覆盖清理与重试，取消或来源切换不得把原结果投影到新页面。
     ///
     /// @author kongweiguang
     fn retry_transfer(
         &mut self,
         id: kerminal_domain::identity::TransferId,
+        resume: bool,
         cx: &mut Context<Self>,
     ) {
+        let Some(origin) = self.transfer_origin.clone() else {
+            return;
+        };
+        if !self.queue.begin_transfer_retry(id.clone()) {
+            return;
+        }
+        let retry_id = id.clone();
+        let result_origin = origin.clone();
         let external_target_lease = self.external_target_lease.clone();
         let transfers = self.transfers.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |_| async move {
+                .run(move |cancellation| async move {
+                    transfers
+                        .ensure_origin(&id, &origin, cancellation.clone())
+                        .await?;
                     let summary = transfers.get(&id).await?;
+                    if summary.cleanup_pending
+                        && summary.failure_kind
+                            != Some(kerminal_domain::files::TransferFailureKind::CommitUnknown)
+                    {
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                        cancellation
+                            .run_until_cancelled(transfers.retry_cleanup_until(&id, deadline.into()))
+                            .await
+                            .ok_or_else(|| AppError::cancelled("传输重试已取消，请回读清理状态"))??;
+                    }
                     match temporary_host_for_request(&summary.request)? {
                         Some(required_host) => {
                             let Some(lease) = external_target_lease
@@ -4664,23 +4966,30 @@ impl FilesPane {
                             else {
                                 return Ok(None);
                             };
-                            transfers
-                                .retry_with_external_target(&id, lease)
-                                .await
-                                .map(Some)
+                            if resume {
+                                transfers.resume_with_external_target(&id, lease).await.map(Some)
+                            } else {
+                                transfers.retry_with_external_target(&id, lease).await.map(Some)
+                            }
                         }
+                        None if resume => transfers.resume(&id).await.map(Some),
                         None => transfers.retry(&id).await.map(Some),
                     }
                 })
                 .await;
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
+                    pane.queue.finish_transfer_retry(&retry_id);
+                    if pane.transfer_origin.as_ref() != Some(&result_origin) {
+                        cx.notify();
+                        return;
+                    }
                     match result {
                         Ok(Some(_)) => pane.status = None,
                         Ok(None) => {
                             pane.status = Some(locale::text(
-                                "原临时目标连接已失效；请重新连接同一目标并重新创建传输任务。旧任务不会切换到新目标。",
-                                "The temporary target lease expired. Reconnect to the same target and create a new transfer; this task will not switch targets."
+                                "原临时目标连接已失效；请重新连接同一目标后再试。此任务不会切换到新目标。",
+                                "The temporary target lease expired. Reconnect to the same target and try again; this task will not switch targets."
                             ).to_string())
                         }
                         Err(error) => pane.status = Some(localized_error(&error)),
@@ -4690,10 +4999,46 @@ impl FilesPane {
             });
         })
         .detach();
+        cx.notify();
     }
 }
 
 impl BrowserPanel {
+    /// 新根读取替换旧 owner，并将同一 token 交给 application executor 驱动 provider 取消。
+    ///
+    /// @author kongweiguang
+    fn begin_root_request_cancellation(&mut self, generation: u64) -> CancellationToken {
+        self.cancel_root_request_cancellation();
+        let cancellation = CancellationToken::new();
+        self.root_request_cancellation = Some(RootDirectoryRequestCancellation {
+            generation,
+            cancellation: cancellation.clone(),
+        });
+        cancellation
+    }
+
+    /// 目标失效、tab 离开或 panel Drop 时同步通知根 provider，不改变 tree 的子树取消状态。
+    ///
+    /// @author kongweiguang
+    fn cancel_root_request_cancellation(&mut self) {
+        if let Some(request) = self.root_request_cancellation.take() {
+            request.cancellation.cancel();
+        }
+    }
+
+    /// 仅清理匹配的根读取 owner，迟到旧回执不能移除当前请求 token。
+    ///
+    /// @author kongweiguang
+    fn finish_root_request_cancellation(&mut self, generation: u64) {
+        if self
+            .root_request_cancellation
+            .as_ref()
+            .is_some_and(|request| request.generation == generation)
+        {
+            self.root_request_cancellation = None;
+        }
+    }
+
     /// 新面板区分已提交清单与空请求，并从无键盘滚动意图开始，避免跨目录继承旧视口目标。
     ///
     /// @author kongweiguang
@@ -4701,6 +5046,7 @@ impl BrowserPanel {
         let navigation_history = NavigationHistory::new(endpoint.clone());
         Self {
             endpoint,
+            root_request_cancellation: None,
             requested_endpoint: None,
             listing: None,
             selected: None,
@@ -4713,6 +5059,7 @@ impl BrowserPanel {
             _path_subscription: None,
             loading: false,
             directory_error: None,
+            failed_directory: None,
             generation: 0,
             tree: tree::FileTreeBrowser::default(),
             tree_widget: None,
@@ -4725,10 +5072,11 @@ impl BrowserPanel {
 }
 
 impl Drop for BrowserPanel {
-    /// pane 被关闭时取消仍在读取的子树请求，避免把已关闭视图当作资源 owner。
+    /// panel 释放时取消根目录与子树读取，避免关闭的视图继续拥有远程工作。
     ///
     /// @author kongweiguang
     fn drop(&mut self) {
+        self.cancel_root_request_cancellation();
         self.tree.cancel_pending_requests();
     }
 }
@@ -4744,6 +5092,14 @@ impl EventEmitter<CreateSftpHostRequested> for FilesPane {}
 ///
 /// @author kongweiguang
 fn localized_error(error: &AppError) -> String {
+    // 传输层以稳定英文上下文表达 TCP 建连失败；文件栏给出与连接面板一致的可操作说明。
+    if error.public_message() == "SSH TCP connection failed" {
+        return locale::text(
+            "无法连接 SSH 主机，请检查网络、地址和端口后重试。",
+            "Cannot connect to the SSH host. Check the network, address and port, then retry.",
+        )
+        .to_string();
+    }
     let english = match error.public_code() {
         PublicErrorCode::Invalid => "The file request is invalid.",
         PublicErrorCode::NotFound => "The selected file or directory was not found.",
@@ -4791,28 +5147,11 @@ fn retain_file_target_lease(
     lease.retain().map(Some)
 }
 
-/// 从 endpoint 形成同一文件系统的子项，远端路径仅经领域 join_name 校验。
+/// 目标文件系统拥有名称规则，统一领域入口防止 UI 复制把远端名称变成本机路径。
+///
+/// @author kongweiguang
 fn child_endpoint(endpoint: &FileEndpoint, name: &str) -> Option<FileEndpoint> {
-    match endpoint {
-        FileEndpoint::Local { path } => Some(FileEndpoint::Local {
-            path: path.join(name),
-        }),
-        FileEndpoint::Remote { host_id, path } => Some(FileEndpoint::Remote {
-            host_id: host_id.clone(),
-            path: path.join_name(name).ok()?,
-        }),
-        FileEndpoint::Container {
-            host_id,
-            runtime,
-            container_id,
-            path,
-        } => Some(FileEndpoint::Container {
-            host_id: host_id.clone(),
-            runtime: *runtime,
-            container_id: container_id.clone(),
-            path: path.join_name(name).ok()?,
-        }),
-    }
+    endpoint.join_name(name).ok()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5043,13 +5382,14 @@ fn endpoint_same_filesystem(left: &FileEndpoint, right: &FileEndpoint) -> bool {
     }
 }
 
-/// 名称必须是一个合法目录项，所有 endpoint adapter 共用该 UI 前置校验。
+/// 这里只排除跨目录和不可显示的名称；反斜杠在 POSIX 上合法，目标平台限制由 child_endpoint 核对。
+///
+/// @author kongweiguang
 fn valid_item_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
         && !name.contains('/')
-        && !name.contains('\\')
         && !name.chars().any(char::is_control)
 }
 
@@ -5169,3 +5509,15 @@ pub(crate) mod action_test_support;
 #[cfg(test)]
 #[path = "../../../tests/unit/files_action_regressions.rs"]
 mod action_regression_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/files_transfer_interactions.rs"]
+mod transfer_interaction_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/files_dialog_interactions.rs"]
+mod dialog_interaction_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/files_root_request_cancellation.rs"]
+mod root_request_cancellation_tests;

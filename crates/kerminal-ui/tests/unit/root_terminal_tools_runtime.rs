@@ -361,6 +361,55 @@ fn session_cleanup_cancels_reads_and_preserves_log_receipt_owner() {
     assert!(runtime.is_current(&log));
 }
 
+/// 生命周期换代只静默旧 generation 的选区 Conflict；同代次真实冲突必须继续提示。
+///
+/// @author kongweiguang
+#[test]
+fn selection_conflict_is_suppressed_only_for_reconnect_generation_changes() {
+    let pane_id = PaneId::new();
+    let binding = UiSessionBinding {
+        session_id: SessionId::new(),
+        owner: SessionOwner::Ui {
+            tab_id: kerminal_domain::identity::TabId::new(),
+            pane_id,
+        },
+        session_generation: 4,
+    };
+    let mut rebound = binding.clone();
+    rebound.session_generation = 5;
+
+    assert!(selection_conflict_is_generation_race(
+        PublicErrorCode::Conflict,
+        &binding,
+        None,
+        false,
+    ));
+    assert!(selection_conflict_is_generation_race(
+        PublicErrorCode::Conflict,
+        &binding,
+        Some(&rebound),
+        false,
+    ));
+    assert!(selection_conflict_is_generation_race(
+        PublicErrorCode::Conflict,
+        &binding,
+        Some(&binding),
+        true,
+    ));
+    assert!(!selection_conflict_is_generation_race(
+        PublicErrorCode::Conflict,
+        &binding,
+        Some(&binding),
+        false,
+    ));
+    assert!(!selection_conflict_is_generation_race(
+        PublicErrorCode::NotFound,
+        &binding,
+        Some(&rebound),
+        true,
+    ));
+}
+
 /// 待写入日志状态的请求不能与旧状态读取并行，避免旧读回覆盖新状态。
 #[test]
 fn log_mutation_has_priority_over_state_refresh() {

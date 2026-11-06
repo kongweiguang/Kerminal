@@ -20,6 +20,7 @@ mod theme;
 mod ui_backdrop;
 mod ui_button;
 mod ui_popup;
+mod ui_surface;
 pub mod window_state;
 
 #[cfg(test)]

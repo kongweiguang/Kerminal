@@ -1213,6 +1213,7 @@ fn panel_slot_mut(
 /// 设置离开确认独占焦点陷阱，避免父子陷阱同时包含焦点时 Tab 落回遮罩后的设置控件。
 /// 隧道表单的状态提示位于其遮罩之上，其余模态继续维持原有层级和计时规则。
 /// 面板布局先切换到最终状态，独立动效只改变透明度，退场不再挂载可交互面板。
+/// 抽屉与浮层使用共享主题度量；终端、窗口及拖动命中区继续使用各自的已测量几何。
 ///
 /// @author kongweiguang
 pub(super) fn render_workbench(
@@ -1530,6 +1531,7 @@ pub(super) fn render_workbench(
                 .child(render_settings_button(
                     "workbench-open-preferences-sidebar",
                     "workbench-open-preferences-sidebar-tooltip",
+                    theme,
                     cx.listener(RootView::open_preferences),
                 ))
                 .child(div().flex_1())
@@ -1701,7 +1703,7 @@ pub(super) fn render_workbench(
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .text_size(px(12.))
+                                .text_size(theme.text_xs)
                                 .text_color(theme.error)
                                 .tooltip(move |window, cx| {
                                     Tooltip::new(recovery_title_tooltip.clone()).build(window, cx)
@@ -1736,7 +1738,7 @@ pub(super) fn render_workbench(
                 .py_2()
                 .overflow_hidden()
                 .bg(panel_background)
-                .text_size(px(12.))
+                .text_size(theme.text_xs)
                 .text_color(theme.muted)
                 .whitespace_nowrap()
                 .text_ellipsis()
@@ -1770,7 +1772,7 @@ pub(super) fn render_workbench(
                 .px_3()
                 .py_2()
                 .bg(panel_background)
-                .text_size(px(12.))
+                .text_size(theme.text_xs)
                 .text_color(theme.error)
                 .child(
                     div()
@@ -2268,15 +2270,19 @@ pub(super) fn render_workbench(
         } else {
             0.0
         };
-    // 左栏的半槽与中心的半槽合成 8px；右栏收起时由中心独自补齐，隐藏左栏则保持两侧 4px。
-    let closed_dock_gutter = if effective_host_sidebar_collapsed {
+    // 每个面板已在自身一侧保留 4px 分隔槽，中心区不再叠加第二份半槽：叠加会让终端卡片
+    // 两侧出现双倍留白（0.3.x 为 6px，双份槽在 150% 缩放下约 13px）。
+    let closed_dock_gutter = RESIZABLE_EDGE_GUTTER;
+    // 侧栏展开时其右槽已经给出间隙；仅侧栏收起时由中心补出左侧 4px，避免卡片贴住窗口边缘。
+    let center_left_gutter = if effective_host_sidebar_collapsed {
         RESIZABLE_EDGE_GUTTER
     } else {
-        RESIZABLE_EDGE_GUTTER * 2.0
+        0.0
     };
     let main_workspace_min_width = center_area_min_width
         + if dock_is_visible {
-            workbench_layout::ATTACHED_DOCK_CONTENT_MIN_WIDTH + RESIZABLE_EDGE_GUTTER * 3.0
+            // 中心不再自带槽位，Dock 侧只剩自身 4px 槽与 1px 手柄的预算。
+            workbench_layout::ATTACHED_DOCK_CONTENT_MIN_WIDTH + RESIZABLE_EDGE_GUTTER * 2.0
         } else {
             RESIZABLE_EDGE_GUTTER + closed_dock_gutter
         };
@@ -2298,7 +2304,7 @@ pub(super) fn render_workbench(
     let main_workspace = if compact_panels {
         div()
             .size_full()
-            .pl(px(RESIZABLE_EDGE_GUTTER))
+            .pl(px(center_left_gutter))
             .pr(px(closed_dock_gutter))
             .child(center_area)
             .into_any_element()
@@ -2332,7 +2338,8 @@ pub(super) fn render_workbench(
                     .child(
                         div()
                             .size_full()
-                            .px(px(RESIZABLE_EDGE_GUTTER))
+                            // 两侧相邻面板各自保留 4px 槽位，中心再补一份会把终端卡片推得比
+                            // Dock 更靠内，拖动手柄两侧留白也不再对称。
                             .child(center_area),
                     ),
             )
@@ -2358,7 +2365,7 @@ pub(super) fn render_workbench(
     } else {
         div()
             .size_full()
-            .pl(px(RESIZABLE_EDGE_GUTTER))
+            .pl(px(center_left_gutter))
             .pr(px(closed_dock_gutter))
             .child(center_area)
             .into_any_element()
@@ -2654,28 +2661,25 @@ pub(super) fn render_workbench(
                     root.handle_center_tool_panel_key_down(tool, event, window, cx);
                 }))
                 .child(
-                    div()
+                    crate::ui_surface::panel_header(theme)
                         .id("workbench-tool-panel-center-header")
                         .w_full()
-                        .h(px(40.))
-                        .flex_shrink_0()
-                        .px_3()
-                        .flex()
-                        .items_center()
+                        .min_h(theme.metrics.toolbar_height)
                         .justify_between()
-                        .border_b_1()
                         .border_color(theme.tool_panel_border)
-                        .text_color(theme.foreground)
                         .child(
                             div()
                                 .id("workbench-tool-panel-center-drag-handle")
                                 .debug_selector(|| "workbench-tool-panel-center-drag-handle".into())
                                 .flex_1()
                                 .min_w(px(0.))
-                                .h_full()
+                                .h(theme.metrics.control_height)
                                 .flex()
                                 .items_center()
-                                .gap_2()
+                                .gap(theme.metrics.gap)
+                                .rounded(theme.control_radius)
+                                .border_1()
+                                .border_color(theme.border.alpha(0.))
                                 .cursor(if root.tool_rail_state.floating_drag_is_active() {
                                     gpui_kit::CursorStyle::ClosedHand
                                 } else {
@@ -2726,14 +2730,24 @@ pub(super) fn render_workbench(
                                 .child(
                                     Icon::new(IconName::GripVertical)
                                         .rotate(gpui_kit::radians(std::f32::consts::FRAC_PI_2))
-                                        .size(px(16.)),
+                                        .size(theme.metrics.icon_size),
                                 )
-                                .child(tool_rail_label(tool)),
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(tool_rail_label(tool)),
+                                ),
                         )
                         .child(
                             Button::new("workbench-close-center-tool-panel")
                                 .compact()
                                 .ghost()
+                                .w(theme.metrics.control_height)
+                                .h(theme.metrics.control_height)
+                                .flex_shrink_0()
                                 .icon(IconName::X)
                                 .accessibility_label(close_label.clone())
                                 .tooltip(close_label)
@@ -2836,7 +2850,7 @@ pub(super) fn render_workbench(
         .flex_col()
         .overflow_hidden()
         .font_family(ui_font_family)
-        .text_size(px(14.))
+        .text_size(theme.text_body)
         .text_color(theme.foreground)
         .child(title_bar)
         .child(workbench_body);
@@ -2859,7 +2873,7 @@ pub(super) fn render_workbench(
             .flex()
             .flex_col()
             .overflow_hidden()
-            .rounded(px(20.))
+            .rounded(theme.radius_dialog)
             .border_1()
             .border_color(theme.border)
             .bg(theme.floating_surface)
@@ -2917,7 +2931,7 @@ pub(super) fn render_workbench(
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .rounded_lg()
+                .rounded(theme.radius_dialog)
                 .border_1()
                 .border_color(theme.border)
                 .bg(theme.panel)
@@ -3054,11 +3068,7 @@ pub(super) fn render_workbench(
                             .flex()
                             .flex_col()
                             .overflow_hidden()
-                            .rounded(if rail_dialog {
-                                theme.radius_dialog
-                            } else {
-                                px(8.)
-                            })
+                            .rounded(theme.radius_dialog)
                             .border_1()
                             .border_color(theme.border)
                             .bg(if rail_dialog {
@@ -3321,7 +3331,8 @@ struct FeedbackPlacement {
 }
 
 /// 用短暂浮层替代常驻状态栏；普通状态可关闭并自动消失，布局保存异常仍带恢复入口。
-/// 宽度按真实视口扣除 ToolRail 与两侧留白，恢复操作允许换行以免窄窗溢出。
+/// 宽度按真实视口扣除 ToolRail 与两侧留白，间距及动作尺寸随主题密度和文字缩放变化。
+/// 恢复操作允许换行以免窄窗溢出。
 /// 常规工作区可合并布局状态；隧道模态上方只渲染短暂状态，不暴露遮罩后的布局操作。
 ///
 /// @author kongweiguang
@@ -3335,7 +3346,6 @@ fn render_workbench_feedback(
     cx: &mut Context<RootView>,
 ) -> Option<AnyElement> {
     let FeedbackPlacement { max_width, bottom } = placement;
-    let density = super::preferences::interface_density_metrics(root);
     let status = show_status.then(|| root.status.clone()).flatten();
     let layout_error = show_layout
         .then(|| root.workbench_layout_save_error.clone())
@@ -3371,10 +3381,10 @@ fn render_workbench_feedback(
         .min_w(px(max_width.min(220.)))
         .flex()
         .flex_col()
-        .gap(px(density.item_gap / 2.0))
-        .px(px(density.item_padding_x))
-        .py(px(density.item_padding_y))
-        .rounded_md()
+        .gap(theme.metrics.gap)
+        .px(theme.metrics.panel_padding)
+        .py(theme.metrics.gap)
+        .rounded(theme.radius)
         .border_1()
         .border_color(theme.border)
         .bg(panel_background);
@@ -3402,7 +3412,7 @@ fn render_workbench_feedback(
                 .flex()
                 .flex_wrap()
                 .items_center()
-                .gap_1()
+                .gap(theme.metrics.gap)
                 .text_size(theme.text_xs)
                 .text_color(theme.muted)
                 .child(saving_label)
@@ -3410,7 +3420,7 @@ fn render_workbench_feedback(
                     Button::new("workbench-layout-open-settings")
                         .ghost()
                         .compact()
-                        .with_size(px(28.))
+                        .with_size(theme.metrics.control_height)
                         .label(crate::locale::text("设置读回", "Settings"))
                         .disabled(layout_in_flight)
                         .on_click(cx.listener(RootView::open_preferences)),
@@ -3419,7 +3429,7 @@ fn render_workbench_feedback(
                     Button::new("workbench-layout-confirm-readback")
                         .ghost()
                         .compact()
-                        .with_size(px(28.))
+                        .with_size(theme.metrics.control_height)
                         .label(crate::locale::text("核对", "Verify"))
                         .disabled(layout_in_flight)
                         .on_click(cx.listener(|root, _, _, cx| {
@@ -3430,7 +3440,7 @@ fn render_workbench_feedback(
                     Button::new("workbench-layout-retry")
                         .ghost()
                         .compact()
-                        .with_size(px(28.))
+                        .with_size(theme.metrics.control_height)
                         .label(crate::locale::text("重试", "Retry"))
                         .disabled(layout_in_flight)
                         .on_click(cx.listener(|root, _, _, cx| {
@@ -3565,20 +3575,21 @@ fn tool_rail_button_id(tool: ToolRailToolId) -> &'static str {
     }
 }
 
-/// 设置沿用 main 的齿轮图标；独立提示触发器不改变按钮命中区或终端焦点生命周期。
+/// 设置沿用统一的工具命中尺寸；独立提示触发器不改变终端焦点生命周期。
 ///
 /// @author kongweiguang
 fn render_settings_button(
     button_id: &'static str,
     tooltip_id: &'static str,
+    theme: ThemeTokens,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let label = crate::locale::text("设置", "Settings");
     let tooltip_label = label.clone();
     div()
         .id(tooltip_id)
-        .w(px(32.))
-        .h(px(32.))
+        .w(theme.metrics.control_height)
+        .h(theme.metrics.control_height)
         .flex_shrink_0()
         .flex()
         .items_center()
@@ -3588,6 +3599,8 @@ fn render_settings_button(
             Button::new(button_id)
                 .compact()
                 .ghost()
+                .w(theme.metrics.control_height)
+                .h(theme.metrics.control_height)
                 .icon(IconName::Settings)
                 .accessibility_label(label)
                 .tab_stop(true)

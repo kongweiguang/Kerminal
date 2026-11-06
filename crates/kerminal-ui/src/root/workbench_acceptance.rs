@@ -12,6 +12,10 @@ use kerminal_domain::{
     sessions::SessionTarget,
 };
 
+use crate::features::workspace_controller::{
+    WorkspacePersistenceState, WorkspaceResourceOperation,
+};
+
 use super::{CenterPanel, RootView, workspace_runtime::RuntimePanePhase};
 
 impl RootView {
@@ -83,6 +87,37 @@ impl RootView {
         )
     }
 
+    /// 仅暴露准入门禁的状态标签和资源操作身份，避免验收日志包含工作区快照或连接内容。
+    ///
+    /// @author kongweiguang
+    pub fn workbench_acceptance_workspace_admission_state(
+        &self,
+    ) -> (&'static str, Option<(&'static str, String)>) {
+        let Some(controller) = self.workspace_controller.as_ref() else {
+            return ("Unavailable", None);
+        };
+        let persistence = match controller.persistence_state() {
+            WorkspacePersistenceState::Clean => "Clean",
+            WorkspacePersistenceState::Dirty => "Dirty",
+            WorkspacePersistenceState::Saving { .. } => "Saving",
+            WorkspacePersistenceState::Conflict { .. } => "Conflict",
+            WorkspacePersistenceState::OutcomeUnknown { .. } => "OutcomeUnknown",
+            WorkspacePersistenceState::ReadbackConfirmedUncommitted { .. } => {
+                "ReadbackConfirmedUncommitted"
+            }
+            WorkspacePersistenceState::Failed => "Failed",
+        };
+        let pending_resource = controller.pending_resource_operation().map(|operation| {
+            let kind = match operation {
+                WorkspaceResourceOperation::CreatePane { .. } => "CreatePane",
+                WorkspaceResourceOperation::ClosePane { .. } => "ClosePane",
+                WorkspaceResourceOperation::CloseTab { .. } => "CloseTab",
+            };
+            (kind, operation.operation_id().to_owned())
+        });
+        (persistence, pending_resource)
+    }
+
     /// 只投影本地 pane 并按稳定 ID 去重，使桌面验收能分辨独立 Tab、Session 和失败状态。
     ///
     /// @author kongweiguang
@@ -150,5 +185,31 @@ impl RootView {
             && pane.phase == RuntimePanePhase::Ready
             && pane.session_id.is_some())
         .then(|| pane_id.to_string())
+    }
+
+    /// 仅供隔离验收读取本机实时目录及会话身份，避免依赖持久化启动参数推断分屏结果。
+    ///
+    /// @author kongweiguang
+    pub fn workbench_acceptance_local_panes(&self) -> Vec<(String, String, Option<String>)> {
+        let mut panes = self
+            .workspace_runtime
+            .panes()
+            .filter_map(|(pane_id, pane)| {
+                if pane.phase != RuntimePanePhase::Ready
+                    || !matches!(pane.target.as_ref(), Some(SessionTarget::Local(_)))
+                {
+                    return None;
+                }
+                Some((
+                    pane_id.to_string(),
+                    pane.session_id.as_ref()?.to_string(),
+                    pane.current_working_directory
+                        .as_ref()
+                        .map(ToString::to_string),
+                ))
+            })
+            .collect::<Vec<_>>();
+        panes.sort_by(|left, right| left.0.cmp(&right.0));
+        panes
     }
 }

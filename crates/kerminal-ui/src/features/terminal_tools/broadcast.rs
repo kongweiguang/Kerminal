@@ -7,8 +7,9 @@ use std::collections::BTreeSet;
 use gpui_kit::{
     ClickEvent, Context, EventEmitter, IntoElement, Render, Window,
     component::{
-        Disableable,
+        Disableable, Sizable as _,
         button::{Button, ButtonVariants as _},
+        checkbox::Checkbox,
     },
     div,
     prelude::*,
@@ -129,19 +130,31 @@ impl BroadcastTargetPicker {
         self.cancel(cx);
     }
 
-    /// 只允许选择当前可用会话并限制数量，所有权校验仍由应用层广播用例负责。
-    fn toggle_target(&mut self, session_id: &SessionId, cx: &mut Context<Self>) {
-        if self.selected.contains(session_id) {
-            self.selected.remove(session_id);
-            cx.notify();
+    /// 接受复选控件请求的目标值而非盲目翻转，避免重复事件或迟到事件改变已提交的选择。
+    /// 失效目标仍可取消选择，新增目标必须通过当前会话投影和数量上限检查。
+    ///
+    /// @author kongweiguang
+    fn set_target_selected(
+        &mut self,
+        session_id: &SessionId,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending || self.active {
             return;
         }
-        let available = self
-            .targets
-            .iter()
-            .any(|target| &target.session_id == session_id && target.available);
-        if available && self.selected.len() < MAX_BROADCAST_TARGETS {
-            self.selected.insert(session_id.clone());
+        let changed = if selected {
+            let available = self
+                .targets
+                .iter()
+                .any(|target| &target.session_id == session_id && target.available);
+            available
+                && self.selected.len() < MAX_BROADCAST_TARGETS
+                && self.selected.insert(session_id.clone())
+        } else {
+            self.selected.remove(session_id)
+        };
+        if changed {
             cx.notify();
         }
     }
@@ -183,7 +196,9 @@ impl BroadcastTargetPicker {
 }
 
 impl Render for BroadcastTargetPicker {
-    /// 显示每个目标的可用性和显式启动/取消状态，不在视图线程写入终端。
+    /// 复用受控复选框的键盘和无障碍语义，目标变多时只滚动列表并保留固定的提交操作。
+    ///
+    /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ThemeTokens::current(window, cx);
         if self.active {
@@ -193,21 +208,22 @@ impl Render for BroadcastTargetPicker {
                 .px_2()
                 .py_1()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .gap_2()
                 .bg(theme.panel)
                 .text_color(theme.accent)
-                .child(crate::locale::text(
+                .child(div().flex_1().min_w_0().child(crate::locale::text(
                     format!("广播输入已启用 · {} 个目标", self.selected.len()),
                     format!(
                         "Broadcast input is active · {} targets",
                         self.selected.len()
                     ),
-                ))
+                )))
                 .child(
                     Button::new("terminal-broadcast-stop")
                         .compact()
-                        .danger()
+                        .outline()
                         .label(if self.pending {
                             crate::locale::text("正在停止…", "Stopping…")
                         } else {
@@ -234,7 +250,7 @@ impl Render for BroadcastTargetPicker {
                     .child(panel)
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(theme.text_xs)
                             .text_color(theme.error)
                             .child(error),
                     )
@@ -261,30 +277,19 @@ impl Render for BroadcastTargetPicker {
                 } else {
                     crate::locale::text(target.title.clone(), target.title.clone())
                 };
-                div()
-                    .id(format!("terminal-broadcast-target-{}", session_id.as_str()))
+                let selector = format!("terminal-broadcast-target-{}", session_id.as_str());
+                Checkbox::new(selector.clone())
+                    .debug_selector(move || selector)
                     .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new(format!("terminal-broadcast-toggle-{}", session_id.as_str()))
-                            .compact()
-                            .label(if selected { "✓" } else { "○" })
-                            .disabled(disabled)
-                            .on_click(cx.listener(move |picker, _: &ClickEvent, _, cx| {
-                                picker.toggle_target(&session_id, cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_color(if unavailable {
-                                theme.muted
-                            } else {
-                                theme.foreground
-                            })
-                            .child(label),
-                    )
+                    .min_w(px(0.))
+                    .py_1()
+                    .small()
+                    .checked(selected)
+                    .disabled(disabled)
+                    .label(label)
+                    .on_change(cx.listener(move |picker, checked: &bool, _, cx| {
+                        picker.set_target_selected(&session_id, *checked, cx);
+                    }))
             })
             .collect::<Vec<_>>();
         let can_start = !self.pending
@@ -298,6 +303,7 @@ impl Render for BroadcastTargetPicker {
         let error = self.error.clone();
         let mut panel = div()
             .id("terminal-broadcast-picker")
+            .debug_selector(|| "terminal-broadcast-picker".to_owned())
             .w_full()
             .p_2()
             .flex()
@@ -310,7 +316,15 @@ impl Render for BroadcastTargetPicker {
                 "选择要接收后续键盘输入的终端",
                 "Select the terminals that will receive subsequent keyboard input.",
             ))
-            .children(target_rows)
+            .child(
+                div()
+                    .id("terminal-broadcast-target-list")
+                    .w_full()
+                    .min_h(px(0.))
+                    .max_h(gpui_kit::rems(16.))
+                    .overflow_y_scroll()
+                    .children(target_rows),
+            )
             .when(self.targets.is_empty(), |panel| {
                 panel.child(
                     div()
@@ -326,15 +340,26 @@ impl Render for BroadcastTargetPicker {
                 div()
                     .w_full()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .child(crate::locale::text(
+                    .child(div().flex_1().min_w_0().child(crate::locale::text(
                         format!("已选 {} / {MAX_BROADCAST_TARGETS}", self.selected.len()),
                         format!("{} / {MAX_BROADCAST_TARGETS} selected", self.selected.len()),
-                    ))
-                    .child(div().flex_1())
+                    )))
+                    .child(
+                        Button::new("terminal-broadcast-cancel")
+                            .debug_selector(|| "terminal-broadcast-cancel".to_owned())
+                            .compact()
+                            .label(crate::locale::text("取消", "Cancel"))
+                            .disabled(self.pending)
+                            .on_click(cx.listener(|picker, _: &ClickEvent, _, cx| {
+                                picker.cancel(cx);
+                            })),
+                    )
                     .child(
                         Button::new("terminal-broadcast-start")
+                            .debug_selector(|| "terminal-broadcast-start".to_owned())
                             .compact()
                             .primary()
                             .label(if self.pending {
@@ -346,21 +371,12 @@ impl Render for BroadcastTargetPicker {
                             .on_click(cx.listener(|picker, _: &ClickEvent, _, cx| {
                                 picker.start(cx);
                             })),
-                    )
-                    .child(
-                        Button::new("terminal-broadcast-cancel")
-                            .compact()
-                            .label(crate::locale::text("取消", "Cancel"))
-                            .disabled(self.pending)
-                            .on_click(cx.listener(|picker, _: &ClickEvent, _, cx| {
-                                picker.cancel(cx);
-                            })),
                     ),
             );
         if let Some(error) = error {
             panel = panel.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.text_xs)
                     .text_color(theme.error)
                     .child(error),
             );
@@ -368,3 +384,7 @@ impl Render for BroadcastTargetPicker {
         panel.into_any_element()
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/terminal_broadcast_picker.rs"]
+mod tests;

@@ -408,7 +408,7 @@ fn validate_remote_target_state(
     }
 }
 
-/// Accept a pending dialog only when it represents one exact fixture item and its original target generation.
+/// 只接受原代次中唯一的真实冲突和精确夹具请求，防止驱动误确认其他未提交批次。
 ///
 /// @author kongweiguang
 fn acceptance_transfer_conflict_matches(
@@ -419,7 +419,7 @@ fn acceptance_transfer_conflict_matches(
     let Some(pending) = pane.pending_transfer_conflict.as_ref() else {
         return Ok(false);
     };
-    if pending.conflict_count != 1 || pending.plan.items.len() != 1 || pending.plan.total != 1 {
+    if pending.conflicts.len() != 1 || pending.plan.items.len() != 1 || pending.plan.total != 1 {
         return Err("The fixture transfer conflict is not a single-file batch".to_owned());
     }
     let item = &pending.plan.items[0];

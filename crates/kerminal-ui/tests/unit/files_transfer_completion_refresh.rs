@@ -604,3 +604,325 @@ fn uncertain_queue_change_refreshes_cached_and_in_flight_directories() {
         &current, None, false, false, &scopes
     ));
 }
+
+mod subscription_regressions {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use gpui_kit::TestAppContext;
+    use kerminal_application::transfers::{
+        TransferBackend, TransferExecutionContext, TransferExecutionError, TransferExecutionResult,
+        TransferPhase, TransferProgressUpdate, TransferQueueEvent, TransferQueueOptions,
+        TransferService,
+    };
+    use kerminal_domain::files::{DirectoryListing, TransferRequest, TransferStatus};
+    use tokio::{runtime::Runtime, sync::Notify};
+    use tokio_util::sync::CancellationToken;
+
+    use super::super::action_test_support as support;
+    use super::*;
+
+    /// 后端使用可靠提交屏障；可选的逐帧握手确保进度确实进入生产广播而非被 watch 合并。
+    struct TestTransferBackend {
+        flood: bool,
+        observed_events: Arc<AtomicUsize>,
+        verification_finished: AtomicBool,
+        resume_commit: Notify,
+    }
+
+    #[async_trait]
+    impl TransferBackend for TestTransferBackend {
+        /// 测试只使用隔离端点，所有请求都由该唯一内存后端处理。
+        ///
+        /// @author kongweiguang
+        fn supports(&self, _: &TransferRequest) -> bool {
+            true
+        }
+
+        /// 先逐帧确认校验唤醒，再等待测试释放真实提交，便于观察读目录次数。
+        ///
+        /// @author kongweiguang
+        async fn execute(
+            &self,
+            context: TransferExecutionContext,
+        ) -> Result<TransferExecutionResult, TransferExecutionError> {
+            let destination = context.request.destination.clone();
+            context
+                .progress
+                .begin_transfer(Some(1))
+                .await
+                .expect("begin transfer");
+            if self.flood {
+                for _ in 0..4_387 {
+                    let before = self.observed_events.load(Ordering::Acquire);
+                    context.progress.report(TransferProgressUpdate {
+                        confirmed_bytes: 0,
+                        total_bytes: Some(1),
+                        phase: TransferPhase::Verifying,
+                        actual_destination: Some(destination.clone()),
+                        checkpoint: None,
+                        activity_sequence: 0,
+                    });
+                    while self.observed_events.load(Ordering::Acquire) == before {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                self.verification_finished.store(true, Ordering::Release);
+                self.resume_commit.notified().await;
+            }
+            context
+                .progress
+                .begin_commit(destination.clone(), 1, Some(1), None)
+                .await
+                .expect("commit permit");
+            context
+                .progress
+                .record_committed_entry(1)
+                .await
+                .expect("commit receipt");
+            context
+                .progress
+                .finish_commit()
+                .await
+                .expect("final commit barrier");
+            Ok(TransferExecutionResult {
+                actual_destination: destination,
+                total_bytes: Some(1),
+                skipped: false,
+                unchanged: false,
+            })
+        }
+    }
+
+    /// 让 GPUI 和其独立 Tokio runtime 交替推进，直到真实文件端口看到指定回读次数。
+    ///
+    /// @author kongweiguang
+    fn pump_until_reads(
+        app: &mut TestAppContext,
+        runtime: &Runtime,
+        reads: &AtomicUsize,
+        expected: usize,
+    ) {
+        for _ in 0..4_000 {
+            app.run_until_parked();
+            runtime.block_on(tokio::task::yield_now());
+            if reads.load(Ordering::Acquire) >= expected {
+                break;
+            }
+        }
+        assert_eq!(reads.load(Ordering::Acquire), expected);
+    }
+
+    /// 活 worker 的退出与终态发布分离，等待完整收尾后才允许测试历史容量裁剪。
+    ///
+    /// @author kongweiguang
+    async fn wait_settled(service: &TransferService, id: &TransferId) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if service
+                    .get_settled(id)
+                    .await
+                    .expect("task exists")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transfer settles");
+    }
+
+    /// 多千次已确认广播经过 FilesPane 订阅时不读取目录，随后真正提交只读取一次。
+    ///
+    /// @author kongweiguang
+    #[gpui_kit::test]
+    fn transfer_verification_lag_does_not_read_directory(app: &mut TestAppContext) {
+        let host = HostId::new();
+        let directory = remote(&host, "/uploads");
+        let destination = remote(&host, "/uploads/file.bin");
+        let fixture = support::entity_fixture(app, directory.clone(), |pane| {
+            support::seed_listing(pane, 1, 1, Vec::new());
+        });
+        *fixture
+            .mutations
+            .directory_listing
+            .lock()
+            .expect("listing mutex") = Some(DirectoryListing {
+            directory: directory.clone(),
+            entries: Vec::new(),
+        });
+        let observed = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(TestTransferBackend {
+            flood: true,
+            observed_events: observed.clone(),
+            verification_finished: AtomicBool::new(false),
+            resume_commit: Notify::new(),
+        });
+        let service = TransferService::new(
+            vec![backend.clone()],
+            fixture.runtime.handle().clone(),
+            TransferQueueOptions::default(),
+        )
+        .expect("test queue");
+        let mut monitor = service.subscribe();
+        let monitor_cancel = CancellationToken::new();
+        let monitor_token = monitor_cancel.clone();
+        let monitor_task = fixture.runtime.spawn(async move {
+            while monitor.recv_event(monitor_token.clone()).await.is_some() {
+                observed.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        app.update(|cx| {
+            fixture.pane.update(cx, |pane, cx| {
+                pane.transfers = service.clone();
+                pane.watch_transfer_queue(cx);
+            })
+        });
+        app.run_until_parked();
+        let request = TransferRequest {
+            source: local("source/input"),
+            destination,
+            kind: TransferKind::File,
+            conflict_policy: ConflictPolicy::Rename,
+            idle_timeout_seconds: None,
+        };
+        let accepted = fixture
+            .runtime
+            .block_on(service.enqueue(request))
+            .expect("enqueue");
+        fixture.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !backend.verification_finished.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all verification progress reaches the queue");
+        });
+        for _ in 0..600 {
+            app.run_until_parked();
+            fixture.runtime.block_on(tokio::task::yield_now());
+        }
+        assert_eq!(fixture.mutations.list_directory.load(Ordering::Acquire), 0);
+
+        backend.resume_commit.notify_one();
+        fixture
+            .runtime
+            .block_on(wait_settled(&service, &accepted.id));
+        pump_until_reads(app, &fixture.runtime, &fixture.mutations.list_directory, 1);
+        for _ in 0..100 {
+            app.run_until_parked();
+            fixture.runtime.block_on(tokio::task::yield_now());
+        }
+        assert_eq!(fixture.mutations.list_directory.load(Ordering::Acquire), 1);
+        monitor_cancel.cancel();
+        fixture
+            .runtime
+            .block_on(monitor_task)
+            .expect("monitor exits");
+        fixture
+            .runtime
+            .block_on(service.shutdown())
+            .expect("queue shutdown");
+    }
+
+    /// 容量裁剪与新提交在同一快照被观察时，只发起一次保守目录回读。
+    ///
+    /// @author kongweiguang
+    #[gpui_kit::test]
+    fn transfer_pruning_and_new_commit_share_one_directory_read(app: &mut TestAppContext) {
+        let host = HostId::new();
+        let directory = remote(&host, "/uploads");
+        let fixture = support::entity_fixture(app, directory.clone(), |pane| {
+            support::seed_listing(pane, 1, 1, Vec::new());
+        });
+        *fixture
+            .mutations
+            .directory_listing
+            .lock()
+            .expect("listing mutex") = Some(DirectoryListing {
+            directory,
+            entries: Vec::new(),
+        });
+        let backend = Arc::new(TestTransferBackend {
+            flood: false,
+            observed_events: Arc::new(AtomicUsize::new(0)),
+            verification_finished: AtomicBool::new(false),
+            resume_commit: Notify::new(),
+        });
+        let service = TransferService::new(
+            vec![backend],
+            fixture.runtime.handle().clone(),
+            TransferQueueOptions {
+                max_history: 1,
+                ..TransferQueueOptions::default()
+            },
+        )
+        .expect("bounded test queue");
+        app.update(|cx| {
+            fixture.pane.update(cx, |pane, cx| {
+                pane.transfers = service.clone();
+                pane.watch_transfer_queue(cx);
+            })
+        });
+        let mut pruning_monitor = service.subscribe();
+        let mut task_ids = Vec::new();
+        for name in ["first.bin", "second.bin", "third.bin"] {
+            let request = TransferRequest {
+                source: local("source/input"),
+                destination: remote(&host, &format!("/uploads/{name}")),
+                kind: TransferKind::File,
+                conflict_policy: ConflictPolicy::Rename,
+                idle_timeout_seconds: None,
+            };
+            let accepted = fixture
+                .runtime
+                .block_on(service.enqueue(request))
+                .expect("enqueue");
+            fixture
+                .runtime
+                .block_on(wait_settled(&service, &accepted.id));
+            task_ids.push(accepted.id);
+        }
+        assert_eq!(
+            fixture
+                .runtime
+                .block_on(pruning_monitor.recv_event(CancellationToken::new())),
+            Some(TransferQueueEvent::Resync),
+            "the subscription observed the history removal epoch"
+        );
+        let rows = fixture.runtime.block_on(service.list());
+        assert!(
+            (1..=2).contains(&rows.len()),
+            "settling workers may leave one extra terminal record"
+        );
+        assert!(
+            rows.iter().all(|row| row.id != task_ids[0]),
+            "the oldest task was pruned"
+        );
+        let latest = rows
+            .iter()
+            .find(|row| row.id == task_ids[2])
+            .expect("the latest task remains");
+        assert_eq!(latest.status, TransferStatus::Succeeded);
+        pump_until_reads(app, &fixture.runtime, &fixture.mutations.list_directory, 1);
+        for _ in 0..100 {
+            app.run_until_parked();
+            fixture.runtime.block_on(tokio::task::yield_now());
+        }
+        assert_eq!(fixture.mutations.list_directory.load(Ordering::Acquire), 1);
+        fixture
+            .runtime
+            .block_on(service.shutdown())
+            .expect("queue shutdown");
+    }
+}

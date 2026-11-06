@@ -988,6 +988,86 @@ fn host_search_keyboard_selects_each_side_and_preserves_escape_focus(app: &mut T
     let _runtime = runtime;
 }
 
+/// 已显示的目标在刷新期间不移动，方向键仍对应同一组过滤后的真实行。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn host_search_refresh_keeps_existing_rows_and_keyboard_selection_stable(app: &mut TestAppContext) {
+    let local = FileEndpoint::Local {
+        path: PathBuf::from("C:\\work"),
+    };
+    let host = HostId::new();
+    let (runtime, pane, _, visual) = support::window_fixture(app, local, |_| {});
+    visual.update(|_, app| {
+        pane.update(app, |pane, cx| pane.set_host_picker_enabled(true, cx));
+    });
+    support::draw(visual);
+    let search = visual
+        .debug_bounds("files-sftp-host-picker-toggle-0")
+        .expect("host search rendered")
+        .center();
+    click_host_search(visual, search);
+    visual.update(|_, app| {
+        pane.update(app, |pane, cx| {
+            pane.host_picker.generation = pane.host_picker.generation.wrapping_add(1);
+            pane.host_picker.loading = false;
+            pane.host_picker.error = None;
+            pane.host_picker.hosts = vec![SftpHostChoice {
+                id: host.clone(),
+                name: "existing host".to_owned(),
+                address: "127.0.0.1".to_owned(),
+                username: "test".to_owned(),
+                port: 22,
+                protocol: RemoteProtocol::Ssh,
+                group_id: None,
+            }];
+            cx.notify();
+        });
+    });
+    support::draw(visual);
+    let row_id: gpui_kit::ElementId =
+        format!("files-sftp-host-picker-list-0-option-{}", host.as_str()).into();
+    let refresh_id: gpui_kit::ElementId = "files-sftp-host-picker-refresh-0".into();
+    let (row_before, refresh_before) = visual.update(|window, _| {
+        (
+            gpui_kit::base::test_support::find(window, &[], &row_id)
+                .expect("host row before refresh")
+                .bounds(),
+            gpui_kit::base::test_support::find(window, &[], &refresh_id)
+                .expect("refresh before request")
+                .bounds(),
+        )
+    });
+    visual.update(|_, app| {
+        pane.update(app, |pane, cx| {
+            pane.host_picker.loading = true;
+            cx.notify();
+        });
+    });
+    support::draw(visual);
+    visual.update(|window, _| {
+        let row = gpui_kit::base::test_support::find(window, &[], &row_id)
+            .expect("host row during refresh");
+        let refresh = gpui_kit::base::test_support::find(window, &[], &refresh_id)
+            .expect("refresh during request");
+        assert_eq!(row.bounds(), row_before, "refresh moved the existing host");
+        assert_eq!(refresh.bounds(), refresh_before, "refresh changed its slot");
+        assert!(
+            !refresh.supports_click(),
+            "refresh must reject duplicate clicks"
+        );
+        assert!(matches!(
+            refresh.label(),
+            Some("正在刷新主机列表" | "Refreshing host list")
+        ));
+    });
+    visual.simulate_keystrokes("down");
+    support::draw(visual);
+    assert_host_search_selection(visual, 0, &["local-device", host.as_str()], host.as_str());
+
+    let _runtime = runtime;
+}
+
 /// 使用同一帧的原生选中语义检查高亮，避免把键盘内部状态误认为已经绘制。
 ///
 /// @author kongweiguang

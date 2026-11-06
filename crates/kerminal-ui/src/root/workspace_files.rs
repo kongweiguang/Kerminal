@@ -13,6 +13,7 @@ use kerminal_application::{
     AppError, AppResult,
     platform::external_launch::ExternalTargetLease,
     preferences::ToolRailToolId,
+    transfers::TransferOrigin,
     workspace::{
         WorkspaceFileAccess, WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTargetRef,
         WorkspaceTargetUnavailableReason,
@@ -792,9 +793,6 @@ impl RootView {
                     return;
                 }
                 match event {
-                    FilesPaneEvent::SetupTerminalDirectoryFollow { binding } => {
-                        root.setup_terminal_directory_follow(source.clone(), binding.clone(), cx);
-                    }
                     FilesPaneEvent::TransferEndpointsChanged { left, right } => {
                         root.sync_sftp_transfer_endpoints(source, left, right, cx);
                     }
@@ -921,63 +919,6 @@ impl RootView {
                 });
             });
             lock_files_pane_tasks(&tasks).remove(&request.request_id);
-        })
-        .detach();
-    }
-
-    /// 安装只使用按钮点击时冻结的 SSH binding；切 Tab 后仍完成原主机请求，不改投当前选择。
-    /// @author kongweiguang
-    fn setup_terminal_directory_follow(
-        &mut self,
-        source: Entity<FilesPane>,
-        binding: kerminal_application::sessions::UiSessionBinding,
-        cx: &mut Context<Self>,
-    ) {
-        let host_id = self
-            .pane_input_handlers
-            .get(&binding.session_id)
-            .filter(|registration| registration.binding == binding)
-            .and_then(|_| match &binding.owner {
-                kerminal_domain::sessions::SessionOwner::Ui { pane_id, .. } => {
-                    self.workspace_runtime.pane(pane_id)
-                }
-                _ => None,
-            })
-            .and_then(|pane| match pane.target.as_ref()? {
-                kerminal_domain::sessions::SessionTarget::Ssh(target) => {
-                    Some(target.host_id.clone())
-                }
-                _ => None,
-            });
-        let Some((operations, host_id)) = self.services.operations.clone().zip(host_id) else {
-            source.update(cx, |files, cx| {
-                files.report_directory_follow_setup(
-                    binding.clone(),
-                    Err("终端目标已失效或不是 SSH 终端。".to_owned()),
-                    cx,
-                )
-            });
-            return;
-        };
-        let executor = self.services.executor.clone();
-        cx.spawn(async move |_, cx| {
-            let result = executor
-                .run(move |cancel| async move {
-                    operations
-                        .configure_terminal_directory_follow(
-                            host_id,
-                            crate::features::files::build_terminal_directory_follow_setup_script(),
-                            cancel,
-                        )
-                        .await
-                })
-                .await
-                .map_err(|error| error.public_message().to_owned());
-            cx.update(|app| {
-                source.update(app, |files, cx| {
-                    files.report_directory_follow_setup(binding, result, cx)
-                })
-            });
         })
         .detach();
     }
@@ -1338,6 +1279,7 @@ impl RootView {
         });
         let density = super::preferences::current_interface_density(self);
         let open_result = pane.update(cx, |files, cx| {
+            files.set_transfer_origin(Some(TransferOrigin::SftpWorkspace(tab_id.clone())), cx);
             files.set_interface_density(density, cx);
             files.open_workspace_transfer(
                 endpoints.left.clone(),

@@ -915,6 +915,21 @@ impl SnapshotRequestGate {
     pub fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
     }
+
+    /// 会话换代还须撤销增量基线，防止新引擎较小的 revision 被旧进程快照永久拒绝。
+    ///
+    /// @author kongweiguang
+    pub fn reset_for_session_change(&mut self) {
+        self.invalidate();
+        self.accepted_revision = None;
+    }
+
+    /// 视口和尺寸失效仅撤销在途回执；本代首帧是否已确认独立于这些正常绘制变化。
+    ///
+    /// @author kongweiguang
+    pub fn has_accepted_snapshot(&self) -> bool {
+        self.accepted_revision.is_some()
+    }
 }
 
 #[cfg(test)]

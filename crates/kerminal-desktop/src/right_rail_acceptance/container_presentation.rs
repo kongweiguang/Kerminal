@@ -6,7 +6,10 @@ use std::{error::Error, io};
 
 use gpui_kit::{AnyWindowHandle, AsyncApp, Entity};
 use gpui_pre::{InputEvent, KeyDownEvent, KeyUpEvent, Keystroke};
-use kerminal_domain::{identity::HostId, operations::ComposeProjectTarget};
+use kerminal_domain::{
+    identity::HostId,
+    operations::{ComposeProjectTarget, ContainerStatus},
+};
 use kerminal_ui::RootView;
 use serde::Serialize;
 
@@ -466,7 +469,8 @@ async fn back_to_list(
     .await
 }
 
-/// 三主题均在原生窗口中重复验证列表点击、菜单详情和两个 YAML 入口，不向夹具发送写命令。
+/// 三主题均在原生窗口中验证列表点击、菜单详情和 YAML 入口，不向夹具发送写命令。
+/// 项目成员使用已校验的 Compose 所有权及真实 ID，不能用独立容器的身份代替。
 ///
 /// @author kongweiguang
 pub(super) async fn capture_compose(
@@ -630,15 +634,25 @@ pub(super) async fn capture_compose(
         )
         .await?,
     );
-    let container_id =
-        wait_for_acceptance_value(cx, root, window, "running container target", |root, cx| {
-            root.right_rail_acceptance_container_target_id(
-                host,
-                &capture.fixture_container_name,
-                cx,
-            )
-        })
-        .await?;
+    let container_id = wait_for_acceptance_value(
+        cx,
+        root,
+        window,
+        "running Compose container target",
+        |root, cx| {
+            let Some(owned) = root.right_rail_acceptance_compose_owned_state(host, &target, cx)?
+            else {
+                return Ok(None);
+            };
+            match owned.as_slice() {
+                [(id, ContainerStatus::Running)] => Ok(Some(id.clone())),
+                [] => Err("Compose fixture 缺少归属容器".to_owned()),
+                [(_, status)] => Err(format!("Compose fixture 容器未运行：{status:?}")),
+                _ => Err("Compose fixture 存在多个归属容器".to_owned()),
+            }
+        },
+    )
+    .await?;
     menus::click_selector(cx, window, "rr-compose-tab-containers")?;
     poll_root(cx, root, window, "Compose 容器页签", |_, window, _| {
         Ok(window

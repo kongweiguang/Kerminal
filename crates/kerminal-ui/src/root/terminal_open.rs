@@ -159,12 +159,11 @@ pub(super) fn lifecycle_retains_terminal_history(lifecycle: SessionLifecycle) ->
 impl RootView {
     /// Ready 不重放创建前已发布的 Running lifecycle，因此可见首帧接管后显式查 context；后台恢复 pane 等待焦点路径按需绑定。
     /// lifecycle 仍查询隐藏 pane 以退休历史；只有所属 tab 可见时才安装 Running handler，且每个回执都经过身份与 generation 门禁。
-    ///
-    /// @author kongweiguang
-    ///
     /// Fresh probe 只在可见 pane 的精确 binding 真正安装后触发；若 Ready 入场或回执时 pane 已隐藏，
     /// 则消费 fresh 标记并记录固定拒绝原因，不延迟到用户之后激活 pane 时注入探针。普通输入绑定仍由焦点路径按需恢复。
     /// 此入口只协调 UI pane，从 tab/pane 派生 owner，避免调用方传入互相矛盾的身份。
+    ///
+    /// @author kongweiguang
     fn request_terminal_input_context_reconcile(
         &mut self,
         tab_id: TabId,
@@ -178,6 +177,8 @@ impl RootView {
             tab_id: tab_id.clone(),
             pane_id: pane_id.clone(),
         };
+        let snapshot_tab_id = tab_id.clone();
+        let snapshot_pane_id = pane_id.clone();
         if self.workspace_runtime.session_for_pane(&pane_id) != Some(&session_id)
             || self.session_command_owner(&session_id).as_ref() != Some(&owner)
         {
@@ -254,7 +255,7 @@ impl RootView {
                         return;
                     }
                     if root
-                        .session_restart_projection(&pane_id)
+                        .session_action_projection(&pane_id)
                         .is_some_and(|projection| projection.busy)
                     {
                         root.invalidate_pane_input_handler(&session_id, cx);
@@ -263,7 +264,7 @@ impl RootView {
                     if let Ok(Some((_, Some(context)))) = input_context.as_ref()
                         && !lifecycle_context_generation_is_current(
                             context.session_generation,
-                            root.session_restart_projection(&pane_id)
+                            root.session_action_projection(&pane_id)
                                 .map(|projection| projection.binding.session_generation),
                         )
                     {
@@ -326,10 +327,44 @@ impl RootView {
                     }
                     root.refresh_proxy_panel(cx);
                     root.refresh_session_reconnect_state(tab_id, pane_id, cx);
+                    // lifecycle 先换 binding 再读快照；由这里统一补读，避免使用旧 generation 抢先请求。
+                    root.request_workspace_pane_snapshot(
+                        snapshot_tab_id,
+                        snapshot_pane_id,
+                        cx,
+                    );
                 });
             });
         })
         .detach();
+    }
+
+    /// 快照因旧 generation 被拒后只允许一次静默重绑；补读仍由精确 lifecycle binding 决定。
+    ///
+    /// 这里不创建伪探针，也不把内部 CAS 竞态转成用户错误；若重绑后仍失败，
+    /// 调用方会基于 pane 的失败锁存给出一次真实提示。watch 的合并流可能跳过 lifecycle，
+    /// 因此旧 binding 冲突触发补查时也先撤销目录，避免新 generation 首帧前继承旧进程目录。
+    ///
+    /// @author kongweiguang
+    pub(super) fn request_snapshot_binding_reconcile(
+        &mut self,
+        tab_id: TabId,
+        pane_id: PaneId,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self
+            .workspace_runtime
+            .invalidate_session_snapshot(&pane_id, &session_id);
+        self.request_terminal_input_context_reconcile(
+            tab_id,
+            pane_id,
+            session_id,
+            false,
+            #[cfg(feature = "acceptance-metrics")]
+            Arc::new(AtomicBool::new(false)),
+            cx,
+        );
     }
 
     /// 按预留身份接收资源回执；首帧 identity 未核实时不绑定 pane，避免真实 session 留在未发布布局。
@@ -340,6 +375,7 @@ impl RootView {
     /// 验收探针仅由精确匹配的 fresh pane generation 或新建 split 输入 binding 首次成功安装触发，恢复和重连不启动探针。
     /// acceptance-metrics watch task 若早于异步输入绑定启动，会在每次收到变化后重试读取 generation；首次成功后固定该代。
     /// 新 tab 的持久化失败需将 Ready session 转交 orphan cleanup，避免 pane 不可见后遗留运行资源。
+    /// lifecycle 仅触发换代核对而不终止订阅；旧帧可见但目录要等当前绑定的有效快照重新确认。
     ///
     /// @author kongweiguang
     pub(super) fn open_workspace_terminal_pane(
@@ -1251,6 +1287,16 @@ impl RootView {
                     } else {
                         // Ready 与后续 lifecycle 共用同一查询/回执门，避免重连和退出规则分叉。
                         let _ = this.update(cx, |root, cx| {
+                            if !root
+                                .workspace_runtime
+                                .snapshot_session_is_current(&pane_id, &watch_session_id)
+                            {
+                                return;
+                            }
+                            let _ = root.workspace_runtime.invalidate_session_snapshot(
+                                &pane_id,
+                                &watch_session_id,
+                            );
                             root.request_terminal_input_context_reconcile(
                                 tab_id.clone(),
                                 pane_id.clone(),
@@ -1260,6 +1306,8 @@ impl RootView {
                                 fresh_terminal_probe_pending.clone(),
                                 cx,
                             );
+                            root.refresh_workspace_views(cx);
+                            cx.notify();
                         });
                     }
                     let owner = this
@@ -1351,7 +1399,10 @@ impl RootView {
                             .snapshot_session_is_current(&pane_id, &watch_session_id)
                     })
                     .unwrap_or(false);
-                if session_is_current {
+                if !session_is_current || change.kind == SessionChangeKind::Closed {
+                    break;
+                }
+                if change.kind != SessionChangeKind::Lifecycle {
                     let _ = this.update(cx, |root, cx| {
                         root.request_workspace_pane_snapshot(
                             tab_id.clone(),
@@ -1359,8 +1410,6 @@ impl RootView {
                             cx,
                         );
                     });
-                } else {
-                    break;
                 }
             }
         })

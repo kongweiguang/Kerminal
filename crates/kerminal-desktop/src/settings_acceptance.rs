@@ -48,6 +48,7 @@ mod sync;
 mod terminal;
 #[path = "settings_acceptance/workbench.rs"]
 mod workbench;
+pub(crate) use workbench::prepare_capture_surface_for_title;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(45);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -569,6 +570,7 @@ async fn resize_acceptance_window(
 /// 在隔离生产 Root 上使用真实快捷键和滚轮；先保存 Profile，使三主题截图覆盖真实记录。
 /// 紧凑窗口中入口及字段必须先进入可见区域。
 /// 专项只缩小场景，仍使用相同的生产入口、私有桌面和资源收尾边界。
+/// 隐藏窗口等待原生 GPU 目标与视口一致后才允许截图，避免逻辑尺寸就绪掩盖 1×1 目标。
 ///
 /// @author kongweiguang
 async fn capture_settings(
@@ -593,7 +595,14 @@ async fn capture_settings(
         )
         .into());
     }
-    resize_acceptance_window(cx, window, context.width, context.height).await?;
+    workbench::prepare_capture_surface_for_title(
+        cx,
+        window,
+        context.width,
+        context.height,
+        "Kerminal Settings Parity Acceptance",
+    )
+    .await?;
     if !mcp_only && initial.ready_local_session_ids().is_empty() {
         press_key(cx, window, "ctrl-shift-t")?;
         wait_for_state(cx, &root, window, Instant::now() + READY_TIMEOUT, |state| {
@@ -1976,7 +1985,7 @@ async fn reveal_navigation_selector(
     .into())
 }
 
-/// 等待受限状态并在超时时输出安全运行态，便于区分未保存、主题投影和终端快照问题。
+/// 等待受限状态并在超时时输出安全运行态和设置事务阶段，便于区分保存错误、主题投影和终端快照问题。
 ///
 /// @author kongweiguang
 async fn wait_for_state<F>(
@@ -1996,13 +2005,14 @@ where
         }
         if Instant::now() >= deadline {
             return Err(io::Error::other(format!(
-                "settings state wait timed out: page={}, modal={}, ready={}, loading={}, draft_ready={}, dirty={}, theme={:?}, app_draft={:?}, app_applied={:?}, kit_matches={}, terminal_generation={}, rendered_terminal={}, sessions={}, density={:?}, rules={:?}, language={:?}, selected_language={:?}, protocol_settled={}, sync_ready={}, sync_busy={}, sync_outcome={:?}, sync_error_present={}",
+                "settings state wait timed out: page={}, modal={}, ready={}, loading={}, draft_ready={}, dirty={}, draft_diagnostic={}, theme={:?}, app_draft={:?}, app_applied={:?}, kit_matches={}, terminal_generation={}, rendered_terminal={}, sessions={}, density={:?}, rules={:?}, language={:?}, selected_language={:?}, protocol_settled={}, sync_ready={}, sync_busy={}, sync_outcome={:?}, sync_error_present={}",
                 state.page_id(),
                 state.modal_open(),
                 state.settings_ready(),
                 state.settings_loading(),
                 state.draft_ready(),
                 state.draft_dirty(),
+                state.draft_diagnostic(),
                 state.draft_theme_mode(),
                 state.draft_app_color_scheme(),
                 state.applied_app_color_scheme(),
@@ -2404,7 +2414,9 @@ fn press_key(cx: &mut AsyncApp, window: AnyWindowHandle, key: &str) -> Result<()
     Ok(())
 }
 
-/// Draws hidden-window next-frame callbacks before screenshotting, since no visible compositor frame loop runs.
+/// 隐藏窗口先推进布局，再拒绝与当前物理视口不符的截图，避免初始 1×1 目标被记为视觉验收成功。
+///
+/// @author kongweiguang
 fn save_frame(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
@@ -2421,10 +2433,22 @@ fn save_frame(
         let image = window.render_to_image().map_err(io::Error::other)?;
         let width = image.width();
         let height = image.height();
-        if width == 0 || height == 0 {
-            return Err(io::Error::other(
-                "native renderer returned a zero-sized image",
-            ));
+        let viewport = window.viewport_size();
+        let scale = window.scale_factor();
+        let expected_width = viewport.width.as_f32() * scale;
+        let expected_height = viewport.height.as_f32() * scale;
+        if !scale.is_finite()
+            || scale <= 0.0
+            || !expected_width.is_finite()
+            || !expected_height.is_finite()
+            || expected_width < 1.0
+            || expected_height < 1.0
+            || width != expected_width.round() as u32
+            || height != expected_height.round() as u32
+        {
+            return Err(io::Error::other(format!(
+                "native screenshot does not match viewport: expected={expected_width:.3}x{expected_height:.3}, observed={width}x{height}, scale={scale}"
+            )));
         }
         if !image
             .as_raw()

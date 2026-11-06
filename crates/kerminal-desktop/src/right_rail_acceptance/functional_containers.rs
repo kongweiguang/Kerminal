@@ -1,4 +1,4 @@
-//! 对固定 nginx fixture 验证生产容器状态、确认交互和日志入口。
+//! 对固定 HTTP fixture 验证生产容器状态、确认交互和日志入口。
 //!
 //! @author kongweiguang
 
@@ -956,6 +956,7 @@ async fn restore_compose_fixture(
 }
 
 /// 通过实际详情、确认、状态刷新和 StartedAt 回读，区分取消、停止、启动与重启结果。
+/// 日志必须来自精确容器并含 nginx 启动标记或本轮 HTTP fixture 的唯一标记，不能用任意非空输出冒充成功。
 ///
 /// @author kongweiguang
 async fn run_container_flow(
@@ -968,6 +969,11 @@ async fn run_container_flow(
 ) -> Result<(), Box<dyn Error>> {
     let host_id = &capture.fixture_host_id;
     let (container_id, name, fixture_terminal_tab_id) = fixture;
+    let startup_marker = format!(
+        "kerminal-fixture-http-starting:{}",
+        name.strip_prefix("kerminal-rr-")
+            .ok_or_else(|| io::Error::other("HTTP fixture 缺少本轮运行标识"))?
+    );
     let initial_started_at = read_started_at(cx, root, window, host_id, container_id).await?;
     checkpoint(
         cx,
@@ -1181,20 +1187,24 @@ async fn run_container_flow(
             cx,
             root,
             window,
-            "fixture nginx 启动日志回读",
+            "fixture HTTP 启动日志回读",
             |root, _, _| {
                 root.right_rail_acceptance_container_logs_text(host_id, container_id)
                     .map(|text| {
                         text.filter(|text| {
                             text.contains("Configuration complete")
                                 || text.contains("start worker process")
+                                || text.contains(startup_marker.as_str())
                         })
                     })
             },
         )
         .await?;
-        if !logs.contains("Configuration complete") && !logs.contains("start worker process") {
-            return Err(io::Error::other("fixture 容器日志缺少 nginx 固定启动标记").into());
+        if !logs.contains("Configuration complete")
+            && !logs.contains("start worker process")
+            && !logs.contains(startup_marker.as_str())
+        {
+            return Err(io::Error::other("fixture 容器日志缺少已知启动标记").into());
         }
         wait_for_container_status(
             cx,
@@ -1212,7 +1222,7 @@ async fn run_container_flow(
             capture,
             records,
             "container-logs-request",
-            "exact_fixture_log_terminal_contains_nginx_startup_marker",
+            "exact_fixture_log_terminal_contains_known_startup_marker",
         )
         .await?;
         Ok::<(), Box<dyn Error>>(())

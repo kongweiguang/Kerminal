@@ -11,14 +11,14 @@ use gpui_kit::{
     component::{
         ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
         button::{Button, ButtonCustomVariant, ButtonVariants as _},
-        input::{Input, InputGroup, InputGroupAddon, InputGroupText},
+        input::{Enter, Escape, Input, InputGroup, InputGroupAddon, InputGroupText},
         menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
         scroll::ScrollableElement as _,
         tooltip::Tooltip,
     },
     div,
     prelude::*,
-    px, size,
+    px, relative, size,
 };
 use kerminal_application::{AppError, AppResult};
 use kerminal_domain::files::{ConflictPolicy, FileEndpoint, FileEntry, FileEntryKind, RemotePath};
@@ -35,7 +35,7 @@ use super::super::drag_drop::{
     drop_rejection_message, external_drop_directory_ready, external_paths_drop_is_allowed,
     internal_drop_is_allowed,
 };
-use super::super::{FileSort, FileSortColumn};
+use super::super::{FileListNavigation, FileSort, FileSortColumn};
 use super::{FilesPane, asset_icon_button, icon_button};
 
 /// 单个目录面板的动作视图快照，宽窄布局共用同一份选择、目标和测量后的工具栏状态。
@@ -50,6 +50,7 @@ struct FileActionsView<'a> {
     loading: bool,
     conflict_policy: ConflictPolicy,
     delete_confirmation: bool,
+    delete_action_busy: bool,
     endpoint: &'a FileEndpoint,
     selected: Option<&'a FileEntry>,
     selected_count: usize,
@@ -119,8 +120,6 @@ struct FilePathBarView<'a> {
     current_path_bookmarkable: bool,
     current_path_is_bookmarked: bool,
     follow_terminal_directory: bool,
-    can_setup_directory_follow: bool,
-    directory_follow_setup_busy: bool,
     theme: ThemeTokens,
 }
 
@@ -220,6 +219,7 @@ impl FileBrowserLayout {
 }
 
 /// 视图、类型筛选和窄栏次要动作共享菜单，保证目录栏缩窄时命令仍可访问。
+/// 在途删除只禁用对应菜单动作，保留导航、刷新与其它工具的可用性。
 ///
 /// @author kongweiguang
 fn render_file_more_menu(
@@ -240,6 +240,7 @@ fn render_file_more_menu(
         file_count,
         directory_count,
         delete_confirmation,
+        delete_action_busy,
         endpoint,
         has_remote_selection,
         transfer_submission_busy,
@@ -365,14 +366,16 @@ fn render_file_more_menu(
             menu = menu.separator();
             let action = entity.clone();
             menu = menu.item(
-                PopupMenuItem::new(if delete_confirmation {
+                PopupMenuItem::new(if delete_action_busy {
+                    locale::text("删除中…", "Deleting…")
+                } else if delete_confirmation {
                     locale::text("确认删除所选项目", "Confirm deletion")
                 } else {
                     locale::text("删除所选项目", "Delete selected items")
                 })
                 .danger()
                 .icon(Icon::new(AssetIconName::Trash))
-                .disabled(!has_selection)
+                .disabled(delete_action_busy || !has_selection)
                 .on_click(move |_, _, app| {
                     action.update(app, |pane, cx| {
                         pane.activate_side(side, cx);
@@ -437,8 +440,9 @@ fn render_file_more_menu(
 
 /// 路径和操作统一为两排；紧凑模式仅显示当前终端目标，工具栏和列按当前面板实际 bounds 分档。
 /// 紧凑右栏复用 rail 自身外壳，独立边框只属于文件列表卡；中央工作区继续用 endpoint 边界显示活动面板。
-/// 键盘焦点留在列表 owner；键盘移动后直接滚动到活动行。
+/// 键盘焦点留在列表 owner；实际行、虚拟尺寸和翻页共用当前帧的缩放行高。
 /// 同目录刷新保留已提交清单；导航到其它目录时不冒用旧清单，忙态只由原刷新图标表达。
+/// 删除忙态仅投影到对应菜单，避免阻止用户在后台删除时继续浏览。
 ///
 /// @author kongweiguang
 pub(super) fn render_browser(
@@ -746,18 +750,14 @@ pub(super) fn render_browser(
             side,
             compact_layout: pane.compact_layout,
             show_scheme: !pane.compact_layout || columns.size,
-            show_terminal_follow: toolbar_projection.show_terminal_follow,
+            show_terminal_follow: toolbar_projection.show_terminal_follow
+                && pane.current_terminal_binding.is_some(),
             bookmarks: path_bookmarks,
             bookmarks_loading,
             bookmark_error,
             current_path_bookmarkable,
             current_path_is_bookmarked,
             follow_terminal_directory: pane.follow_terminal_directory,
-            can_setup_directory_follow: pane.current_terminal_binding.is_some(),
-            directory_follow_setup_busy: pane
-                .current_terminal_binding
-                .as_ref()
-                .is_some_and(|binding| pane.directory_follow_setup_bindings.contains(binding)),
             theme,
         },
         cx,
@@ -771,6 +771,7 @@ pub(super) fn render_browser(
             transfer_submission_busy: pane.transfer_submission_busy,
             conflict_policy,
             delete_confirmation,
+            delete_action_busy: pane.delete_action_busy,
             endpoint: &endpoint,
             selected: selected.as_ref(),
             selected_count,
@@ -824,7 +825,8 @@ pub(super) fn render_browser(
     )
     .into_any_element();
 
-    if tree_mode {
+    // 根目录读取失败时树没有可展示节点；沿用列表内联错误卡，保持同一错误文案与唯一重试入口。
+    if tree_mode && (listing.is_some() || panel.directory_error.is_none()) {
         let background_entity = cx.entity().clone();
         let background_snapshot = FileMenuSnapshot {
             side,
@@ -863,6 +865,7 @@ pub(super) fn render_browser(
     let keyboard_names = Arc::clone(&ordered_names);
     let keyboard_directory = endpoint.clone();
     let keyboard_generation = panel_generation;
+    let row_height = pane.file_row_height * window.rem_size().as_f32() / 16.;
     let list_debug_selector = if pane.compact_layout {
         format!("files-browser-list-{side}")
     } else {
@@ -893,10 +896,13 @@ pub(super) fn render_browser(
                 "up" | "down" | "pageup" | "pagedown" | "home" | "end"
             ) {
                 pane.move_list_keyboard_focus(
-                    side,
-                    keyboard_generation,
-                    &keyboard_directory,
-                    keyboard_names.as_slice(),
+                    FileListNavigation {
+                        side,
+                        generation: keyboard_generation,
+                        directory: &keyboard_directory,
+                        ordered_names: keyboard_names.as_slice(),
+                        row_height,
+                    },
                     event,
                     cx,
                 );
@@ -966,11 +972,28 @@ pub(super) fn render_browser(
         // 首次读取没有可信内容时保持列表框架，避免重复加载文案与工具栏争夺空间。
         list = list.child(div().flex_1());
     } else if listing.is_none() {
-        let trust_button = (pane.compact_layout
-            && side == 1
+        // 错误卡是这一侧唯一的失败说明，也承载原位恢复动作；信任只属于真实主机密钥请求，
+        // 不能用“读取失败”推断用户需要写入 known_hosts。重试始终命中失败目录本身。
+        let can_retry = panel.directory_error.is_some() && panel.failed_directory.is_some();
+        let can_trust = side == 1
             && panel.directory_error.is_some()
-            && matches!(&endpoint, FileEndpoint::Remote { .. }))
-        .then(|| {
+            && matches!(&endpoint, FileEndpoint::Remote { .. })
+            && trust_request
+                .as_ref()
+                .is_some_and(|request| endpoint.host_id() == Some(&request.host_id));
+        let retry_button = can_retry.then(|| {
+            Button::new(format!("files-directory-error-retry-{side}"))
+                .compact()
+                .ghost()
+                .icon(IconName::RefreshCw)
+                .label(locale::text("重试", "Retry"))
+                .accessibility_label(locale::text("重新读取当前目录", "Retry current directory"))
+                .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
+                    pane.retry_panel_load(side, cx);
+                }))
+                .into_any_element()
+        });
+        let trust_button = can_trust.then(|| {
             Button::new("files-trust-host-key")
                 .compact()
                 .danger()
@@ -985,6 +1008,16 @@ pub(super) fn render_browser(
                 .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
                     pane.request_host_key_trust(cx);
                 }))
+                .into_any_element()
+        });
+        let actions = (retry_button.is_some() || trust_button.is_some()).then(|| {
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_end()
+                .gap_2()
+                .children(retry_button)
+                .children(trust_button)
                 .into_any_element()
         });
         let (title, detail) = panel.directory_error.as_ref().map_or_else(
@@ -1009,7 +1042,7 @@ pub(super) fn render_browser(
             title,
             detail,
             false,
-            trust_button,
+            actions,
             theme,
         ));
     } else if entries.is_empty() {
@@ -1033,7 +1066,6 @@ pub(super) fn render_browser(
         }
     } else {
         let rows = Rc::new(entries);
-        let row_height = pane.file_row_height;
         let row_sizes = Rc::new(vec![size(px(1.), px(row_height)); rows.len()]);
         let selected_rows = Arc::new(
             rows.iter()
@@ -1203,7 +1235,8 @@ fn endpoint_short_label(
 /// 地址、跳转和书签保持同一条导航带；只有输入区域收缩，固定控件不会换行或挤成两排。
 /// 按钮和 Enter 共用导航校验，窄栏仍可通过编辑与完整路径提示访问长路径。
 /// 书签空态保留保存路径的提示，使图标操作在无数据时也可发现。
-/// InputGroup 独占地址边框和焦点态；键盘容器不裁切描边，宽窄布局共用同一几何契约。
+/// 路径栏只保留目录跟随开关并暴露其开关状态；Shell 上报由会话集成负责，不在此写入远端启动文件。
+/// InputGroup 独占地址边框和焦点态；组合输入优先消费 Enter/Escape，避免误提交或清空路径。
 ///
 /// @author kongweiguang
 fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> impl IntoElement {
@@ -1220,8 +1253,6 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
         current_path_bookmarkable,
         current_path_is_bookmarked,
         follow_terminal_directory,
-        can_setup_directory_follow,
-        directory_follow_setup_busy,
         theme,
     } = view;
     let scheme = match endpoint {
@@ -1231,15 +1262,29 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
     };
     let full_path = endpoint_path(endpoint);
     let system_font_family = cx.theme().font_family.clone();
+    let enter_input = path_input.clone();
+    let escape_input = path_input.clone();
+    let key_input = path_input.clone();
     let path_field = div()
         .id(format!("files-path-keyboard-{side}"))
         .debug_selector(move || format!("rr-files-path-input-{side}"))
         .min_w_0()
-        .h(if compact_layout { px(34.) } else { px(32.) })
+        .h(theme.metrics.control_height)
         .flex()
         .items_center()
         .tooltip(move |window, cx| Tooltip::new(full_path.clone()).build(window, cx))
+        .capture_action(move |_: &Enter, _, cx| {
+            if enter_input.read(cx).is_composing() {
+                cx.stop_propagation();
+            }
+        })
+        .capture_action(move |_: &Escape, window, cx| {
+            crate::features::input_composition::cancel_input_composition(&escape_input, window, cx);
+        })
         .on_key_down(cx.listener(move |pane, event: &KeyDownEvent, window, cx| {
+            if key_input.read(cx).is_composing() {
+                return;
+            }
             match event.keystroke.key.to_ascii_lowercase().as_str() {
                 "enter" => {
                     pane.commit_path_edit(side, cx);
@@ -1263,11 +1308,7 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
                     Input::new(path_input)
                         .w_full()
                         .h_full()
-                        .text_size(if compact_layout {
-                            px(16.)
-                        } else {
-                            theme.text_sm
-                        })
+                        .text_size(theme.text_sm)
                         .when(compact_layout, |input| {
                             input.font_family(system_font_family)
                         })
@@ -1285,7 +1326,7 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
         .compact()
         .w_8()
         .when(compact_layout, |button| button.w_6())
-        .h(px(32.))
+        .h(theme.metrics.control_height)
         .flex_shrink_0()
         .ghost()
         .when(compact_layout, Button::outline)
@@ -1300,7 +1341,7 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
         .compact()
         .w_8()
         .when(compact_layout, |button| button.w_6())
-        .h(px(32.))
+        .h(theme.metrics.control_height)
         .when(current_path_is_bookmarked, Button::primary)
         .when(!current_path_is_bookmarked, Button::ghost)
         .icon(AssetIconName::Bookmark)
@@ -1326,8 +1367,8 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
     let bookmark_menu_button = Button::new(format!("files-bookmark-menu-{side}"))
         .debug_selector(move || format!("rr-files-bookmarks-{side}"))
         .compact()
-        .w(px(24.))
-        .h(px(32.))
+        .w(theme.metrics.icon_size + theme.metrics.gap)
+        .h(theme.metrics.control_height)
         .ghost()
         .icon(IconName::ChevronDown)
         .tooltip(locale::text("路径书签", "Path bookmarks"))
@@ -1436,10 +1477,11 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
             .compact()
             .w_8()
             .when(compact_layout, |button| button.w_6())
-            .h(px(32.))
+            .h(theme.metrics.control_height)
             .outline()
             .when(follow_terminal_directory, Button::primary)
             .when(!follow_terminal_directory, Button::ghost)
+            .toggled(follow_terminal_directory)
             .icon(IconName::SquareTerminal)
             .tooltip(locale::text(
                 "跟随当前 SSH 终端目录",
@@ -1450,31 +1492,8 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
                 pane.set_follow_terminal_directory(!follow_terminal_directory, cx);
             }))
     });
-    let setup_follow = (show_terminal_follow && can_setup_directory_follow).then(|| {
-        Button::new(format!("files-setup-follow-terminal-{side}"))
-            .compact()
-            .w_8()
-            .when(compact_layout, |button| button.w_6())
-            .h(px(32.))
-            .ghost()
-            .outline()
-            .icon(IconName::Settings2)
-            .loading(directory_follow_setup_busy)
-            .disabled(directory_follow_setup_busy)
-            .tooltip(locale::text(
-                "自动配置目录跟随",
-                "Automatically configure directory tracking",
-            ))
-            .accessibility_label(locale::text(
-                "自动配置 SFTP 目录跟随",
-                "Set up SFTP directory tracking",
-            ))
-            .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
-                pane.request_directory_follow_setup(cx);
-            }))
-    });
     let bookmark_control = div()
-        .h(px(32.))
+        .h(theme.metrics.control_height)
         .flex()
         .items_center()
         .rounded_md()
@@ -1488,7 +1507,7 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
     let path_controls = div()
         .w_full()
         .min_w_0()
-        .h_10()
+        .min_h(theme.metrics.toolbar_height)
         .flex()
         .flex_nowrap()
         .items_center()
@@ -1503,15 +1522,18 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
         .child(path_field.flex_1())
         .child(jump)
         .child(bookmark_control.flex_shrink_0())
-        .when_some(follow, |bar, follow| bar.child(follow.flex_shrink_0()))
-        .when_some(setup_follow, |bar, setup| bar.child(setup.flex_shrink_0()));
+        .when_some(follow, |bar, follow| bar.child(follow.flex_shrink_0()));
 
     div()
         .id(format!("files-path-bar-{side}"))
         .w_full()
-        .h_12()
+        .min_h(theme.metrics.toolbar_height + theme.metrics.gap)
         .flex_shrink_0()
-        .px(if compact_layout { px(8.) } else { px(12.) })
+        .px(if compact_layout {
+            theme.metrics.gap
+        } else {
+            theme.metrics.panel_padding
+        })
         .flex()
         .items_center()
         .when(!compact_layout, |bar| {
@@ -1533,8 +1555,8 @@ fn compact_toolbar_button(button: Button, theme: ThemeTokens, disabled: bool) ->
         .when(disabled, |button| button.opacity(0.45))
 }
 
-/// 宽窄工作台共用 main 的高频动作条：上级、刷新、隐藏、上传、新建、传输、计数和更多。
-/// 历史、改名和删除等次要命令留在“…”菜单；路径外壳与 32px 点击区在两种布局保持一致。
+/// 宽窄工作台共用上级、刷新、隐藏、上传、新建、传输、计数和更多动作。
+/// 紧凑动作槽从同一密度投影计算，刷新时保留原有命中区；窄栏放大字号时换行以保留所有操作。
 /// 两种布局始终只显示当前投影项数；类型、树展开范围和已选数在悬停说明中明确区分。
 ///
 /// @author kongweiguang
@@ -1572,8 +1594,7 @@ fn render_file_actions(
             theme,
             false,
         )
-        .w(px(32.))
-        .h(px(32.))
+        .size(theme.metrics.control_height)
         .flex_shrink_0()
         .icon(IconName::Ellipsis)
         .tooltip(locale::text("切换文件视图", "Switch file view"))
@@ -1618,8 +1639,7 @@ fn render_file_actions(
         parent_disabled,
     );
     let parent = compact_toolbar_button(parent, theme, parent_disabled)
-        .w(px(32.))
-        .h(px(32.))
+        .size(theme.metrics.control_height)
         .flex_shrink_0()
         .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| pane.navigate_parent(side, cx)));
     let refresh_disabled = loading;
@@ -1630,8 +1650,7 @@ fn render_file_actions(
         refresh_disabled,
     );
     let refresh = compact_toolbar_button(refresh, theme, false)
-        .w(px(32.))
-        .h(px(32.))
+        .size(theme.metrics.control_height)
         .flex_shrink_0()
         .loading(refresh_disabled)
         .loading_icon(IconName::RefreshCw)
@@ -1664,13 +1683,14 @@ fn render_file_actions(
         .id(format!("files-actions-{side}"))
         .debug_selector(move || format!("rr-files-actions-{side}"))
         .w_full()
-        .min_h(px(40.))
+        .min_h(theme.metrics.toolbar_height)
         .flex_shrink_0()
-        .px(px(8.))
-        .py_1()
+        .px(theme.metrics.gap)
+        .py(theme.metrics.gap / 2.)
         .flex()
+        .flex_wrap()
         .items_center()
-        .gap(px(2.))
+        .gap(theme.metrics.gap / 4.)
         .border_b_1()
         .border_color(theme.border)
         .bg(theme.panel)
@@ -1696,8 +1716,8 @@ fn render_file_actions(
                 theme,
                 false,
             )
-            .w(px(32.))
-            .h(px(32.))
+            .size(theme.metrics.control_height)
+            .flex_shrink_0()
             .when(show_hidden_files, |button| {
                 button
                     .border_color(theme.accent.opacity(0.45))
@@ -1721,8 +1741,7 @@ fn render_file_actions(
                 theme,
                 transfer_submission_busy,
             )
-            .w(px(32.))
-            .h(px(32.))
+            .size(theme.metrics.control_height)
             .flex_shrink_0()
             .debug_selector(|| "rr-files-upload-menu".into())
             .dropdown_menu(move |menu, _, _| {
@@ -1768,8 +1787,8 @@ fn render_file_actions(
             theme,
             false,
         )
-        .w(px(32.))
-        .h(px(32.))
+        .size(theme.metrics.control_height)
+        .flex_shrink_0()
         .debug_selector(move || format!("files-new-folder-{side}"))
         .on_click(cx.listener(move |pane, _: &ClickEvent, window, cx| {
             pane.activate_side(side, cx);
@@ -1798,8 +1817,7 @@ fn render_file_actions(
                     theme,
                     transfer_submission_busy || !has_remote_selection,
                 )
-                .w(px(32.))
-                .h(px(32.))
+                .size(theme.metrics.control_height)
                 .flex_shrink_0()
                 .debug_selector(move || format!("files-download-{side}"))
                 .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
@@ -1854,8 +1872,7 @@ fn render_file_actions(
                 theme,
                 copy_disabled,
             )
-            .w(px(32.))
-            .h(px(32.))
+            .size(theme.metrics.control_height)
             .flex_shrink_0()
             .debug_selector(move || format!("files-copy-to-other-{side}"))
             .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
@@ -1864,29 +1881,40 @@ fn render_file_actions(
             })),
         );
     }
+    // 计数沿用左栏分组徽标的胶囊样式：使用固定最小尺寸而非随文本伸缩，
+    // 目录项数变化时不会带动右侧“更多”入口位移，超长计数仍按上限省略。
+    let count_pill = div()
+        .id(format!("files-toolbar-count-{side}"))
+        .debug_selector(move || format!("files-toolbar-count-{side}"))
+        .min_w(px(22.))
+        .h(px(22.))
+        .mx(px(2.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .px_1()
+        .rounded_full()
+        .bg(theme.secondary)
+        .text_center()
+        .text_color(theme.muted)
+        .text_size(theme.text_xs)
+        .max_w(theme.metrics.control_height * 5.)
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .aria_label(count_tooltip.clone())
+        .tooltip(move |window, cx| Tooltip::new(count_tooltip.clone()).build(window, cx))
+        .child(count_label);
+
     actions
         .child(div().flex_1().min_w(px(0.)))
-        .child(
-            div()
-                .id(format!("files-toolbar-count-{side}"))
-                .debug_selector(move || format!("files-toolbar-count-{side}"))
-                .w_auto()
-                .min_w(px(0.))
-                .max_w(px(160.))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_size(theme.text_xs)
-                .text_color(theme.subtle)
-                .aria_label(count_tooltip.clone())
-                .tooltip(move |window, cx| Tooltip::new(count_tooltip.clone()).build(window, cx))
-                .child(count_label),
-        )
+        .child(count_pill)
         .child(more)
         .into_any_element()
 }
 
-/// 上传菜单行使用主题 sky 色的16px图标，同时沿用 PopupMenu 的点击、键盘和焦点行为。
+/// 上传菜单行使用共享字体和行高，同时沿用 PopupMenu 的点击、键盘和焦点行为。
 ///
 /// @author kongweiguang
 fn upload_menu_item(
@@ -1901,19 +1929,19 @@ fn upload_menu_item(
         div()
             .id(id.clone())
             .w_full()
-            .h(px(32.))
+            .h(theme.metrics.row_height)
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.))
+            .gap(theme.metrics.gap)
             .rounded(theme.control_radius)
-            .text_size(px(16.))
-            .line_height(px(24.))
+            .text_size(theme.text_sm)
+            .line_height(relative(1.25))
             .text_color(theme.foreground)
             .aria_label(accessible_label.clone())
             .child(
                 Icon::new(icon)
-                    .size(px(16.))
+                    .size(theme.metrics.icon_size)
                     .text_color(theme.file_upload_menu_icon()),
             )
             .child(

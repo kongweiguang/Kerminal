@@ -19,8 +19,14 @@ use crate::theme::ThemeTokens;
 
 use super::panel::PreferencesPanel;
 
+/// 每列基准占整行 30%：三列加两个间隙仍能换行在同一行，四列必定换行，
+/// 因此在设置正文宽度变化时始终稳定为三列。
+///
+/// @author kongweiguang
+const PALETTE_COLUMN_BASIS: f32 = 0.30;
+
 /// 使用稳定的内置色板顺序和 Kit 单选语义，所有选择都进入现有草稿及保存流程。
-/// 横向组由其实际内容宽度自动换行，避免设置弹框宽度与窗口宽度不同时出现裁剪。
+/// 横向组按列基准换行后均分本行剩余宽度，三列与应用外观选项卡同列，末列不再留白。
 ///
 /// @author kongweiguang
 pub(super) fn app_color_scheme_choices(
@@ -40,7 +46,10 @@ pub(super) fn app_color_scheme_choices(
             let selected_here = scheme == selected;
             Radio::new(scheme.as_str())
                 .debug_selector(move || format!("app-color-{}", scheme.as_str()))
-                .w(rems(7.))
+                // 基准宽度保证每行稳定为三列（与应用外观的三个选项卡同列），本行剩余
+                // 宽度再按列均分，使最右列与同一表单内的整行控件共用一条右边界。
+                .flex_basis(relative(PALETTE_COLUMN_BASIS))
+                .flex_grow(1.)
                 .max_w(relative(1.))
                 .min_w(rems(0.))
                 .p_2()

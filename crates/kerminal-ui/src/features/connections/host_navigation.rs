@@ -36,11 +36,11 @@ use kerminal_domain::{
 use tokio_util::sync::CancellationToken;
 
 use crate::features::workspace_controller::WorkspaceSplitTargetOption;
-use crate::theme::ThemeTokens;
+use crate::theme::{ThemeTokens, UiMetrics};
 
 const DUPLICATE_OPEN_GUARD: Duration = Duration::from_millis(650);
 
-/// 导航侧栏只调整自身的可见密度，不改变共享字体令牌或主工作区的几何。
+/// 导航保留双行主机的专用几何；输入控件与全局密度共用尺度。
 /// @author kongweiguang
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HostNavigationLayoutMetrics {
@@ -62,10 +62,14 @@ struct HostNavigationLayoutMetrics {
     child_indent: f32,
 }
 
-/// 图标按钮使用独立宽度，保留命中高度并把有限的侧栏空间优先留给搜索输入。
+/// 图标按钮使用独立宽度；所有侧栏几何随窗口 rem 缩放，避免放大字体后裁剪主机行。
+/// 控件高度来自共享指标，主机双行与分组间距保留导航自身的密度节奏。
 /// @author kongweiguang
-fn host_navigation_layout_metrics(density: InterfaceDensity) -> HostNavigationLayoutMetrics {
-    match density {
+fn host_navigation_layout_metrics(
+    density: InterfaceDensity,
+    rem_size: Pixels,
+) -> HostNavigationLayoutMetrics {
+    let mut metrics = match density {
         InterfaceDensity::Compact => HostNavigationLayoutMetrics {
             control_height: 28.,
             action_width: 24.,
@@ -117,7 +121,26 @@ fn host_navigation_layout_metrics(density: InterfaceDensity) -> HostNavigationLa
             icon_size: 32.,
             child_indent: 14.,
         },
-    }
+    };
+    let scale = rem_size.as_f32() / 16.;
+    metrics.control_height = UiMetrics::resolve(density, rem_size)
+        .control_height
+        .as_f32();
+    metrics.action_width *= scale;
+    metrics.header_gap *= scale;
+    metrics.header_padding_x *= scale;
+    metrics.header_padding_y *= scale;
+    metrics.row_height *= scale;
+    metrics.group_header_height *= scale;
+    metrics.tree_gap *= scale;
+    metrics.section_gap *= scale;
+    metrics.list_padding_x *= scale;
+    metrics.list_padding_bottom *= scale;
+    metrics.row_padding_x *= scale;
+    metrics.row_gap *= scale;
+    metrics.icon_size *= scale;
+    metrics.child_indent *= scale;
+    metrics
 }
 
 /// 左侧导航表达主机目录、主机选择、连接与 SFTP 意图；协议动作仍由 Root 交给现有面板。
@@ -1748,7 +1771,7 @@ impl Render for HostNavigation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.start_configuration_watch(cx);
         let theme = ThemeTokens::current(window, cx).for_workbench();
-        let metrics = host_navigation_layout_metrics(self.density);
+        let metrics = host_navigation_layout_metrics(self.density, window.rem_size());
         let search_focused = self
             .search_input
             .read(cx)
@@ -2358,6 +2381,7 @@ fn host_primary_action_label(protocol: RemoteProtocol) -> gpui_kit::SharedString
 
 /// 搜索框取得按钮组以外的全部宽度；窄图标槽位保留控件高度，避免搜索被三枚方形按钮挤压。
 /// 刷新沿用同一异步加载门禁，按钮组只在相邻动作间保留小间距。
+/// 搜索悬停与普通工具动作使用中性色，强调色保留给真实焦点或选中状态。
 /// @author kongweiguang
 fn render_navigation_header(
     navigation: &mut HostNavigation,
@@ -2388,10 +2412,14 @@ fn render_navigation_header(
         } else {
             theme.secondary.opacity(0.18)
         })
-        .hover(|style| {
-            style
-                .border_color(theme.accent.opacity(0.55))
-                .bg(theme.panel)
+        .hover(move |style| {
+            if search_focused {
+                style.border_color(theme.accent).bg(theme.panel)
+            } else {
+                style
+                    .border_color(theme.strong_border())
+                    .bg(theme.field_hover_surface())
+            }
         })
         .child(
             Input::new(&navigation.search_input)
@@ -2438,7 +2466,7 @@ fn render_navigation_header(
             .custom(
                 ButtonCustomVariant::new(cx)
                     .color(theme.sidebar.opacity(0.))
-                    .foreground(theme.accent)
+                    .foreground(theme.muted)
                     .hover(theme.hover)
                     .active(theme.selected),
             )

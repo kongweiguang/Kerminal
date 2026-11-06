@@ -239,7 +239,8 @@ struct PolicyToggleConfig {
     disabled: bool,
 }
 
-/// 行与 Switch 共用受控回调；Switch 停止冒泡以免一次点击重复提交，禁用时不注册行点击。
+/// 行与 Switch 共用受控回调；只用开关表达选中，避免设置列表被大面积强调色干扰。
+/// Switch 停止冒泡以免一次点击重复提交，禁用时不注册行点击。
 ///
 /// @author kongweiguang
 fn policy_toggle(
@@ -266,15 +267,19 @@ fn policy_toggle(
         .min_w(px(0.))
         .flex()
         .items_center()
-        .gap_3()
-        .px_3()
+        .gap(theme.metrics.gap)
+        .px(theme.metrics.gap)
         .py_2()
-        .min_h(px(44.))
+        .min_h(theme.metrics.toolbar_height)
         .rounded(theme.control_radius)
         .border_1()
         .border_color(theme.border)
         .bg(theme.panel)
-        .child(Icon::new(icon).text_color(theme.accent))
+        .child(
+            Icon::new(icon)
+                .size(theme.metrics.icon_size)
+                .text_color(theme.muted),
+        )
         .child(
             div()
                 .flex_1()
@@ -284,7 +289,7 @@ fn policy_toggle(
         )
         .child(
             Switch::new(id)
-                .track_size(px(40.), px(24.))
+                .track_size(theme.metrics.icon_size * 2.5, theme.metrics.icon_size * 1.5)
                 .checked(checked)
                 .disabled(disabled)
                 .accessibility_label(switch_accessible_label)
@@ -292,11 +297,7 @@ fn policy_toggle(
                     cx.stop_propagation();
                     switch_change(panel, *enabled, cx);
                 })),
-        )
-        .when(checked, |row| {
-            row.border_color(theme.accent.opacity(0.3))
-                .bg(theme.surface_selected())
-        });
+        );
     if !disabled {
         row = row.cursor_pointer().on_click(
             cx.listener(move |panel, _: &ClickEvent, _, cx| row_change(panel, !checked, cx)),
@@ -521,7 +522,7 @@ impl PreferencesPanel {
             .child(self.render_save_notice(theme))
     }
 
-    /// 关于页呈现真实版本、许可、仓库和更新事务状态；GitHub 外链保留语义按钮并将图标放在文字之后对齐 main。
+    /// 关于页呈现真实版本、许可、仓库和更新事务状态；刷新使用原按钮忙态，避免内容位移。
     pub(super) fn render_about_settings(
         &mut self,
         theme: ThemeTokens,
@@ -553,19 +554,16 @@ impl PreferencesPanel {
             .flex_wrap()
             .items_center()
             .gap_2()
+            .max_w_full()
             .flex_shrink_0();
         if let Some(state) = &update {
-            let check_label = if state.checking {
-                crate::locale::text("检查中", "Checking")
-            } else {
-                crate::locale::text("检查", "Check")
-            };
             actions = actions.child(
                 Button::new("settings-about-check-updates")
                     .compact()
                     .outline()
                     .disabled(!state.can_check)
-                    .label(check_label)
+                    .loading(state.checking)
+                    .label(crate::locale::text("检查", "Check"))
                     .icon(IconName::RefreshCw)
                     .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
                         panel.run_inline_update_action(AboutUpdateAction::Check, cx)
@@ -608,7 +606,7 @@ impl PreferencesPanel {
         let about_card = div()
             .id("settings-about-card")
             .w_full()
-            .p_4()
+            .p(theme.metrics.panel_padding)
             .flex()
             .flex_col()
             .gap_4()
@@ -625,11 +623,6 @@ impl PreferencesPanel {
                 div()
                     .id("settings-about-list")
                     .w_full()
-                    .overflow_hidden()
-                    .rounded(theme.radius_sm)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.panel)
                     .child(about_row(
                         IconName::Hash,
                         crate::locale::text("版本", "Version"),
@@ -989,7 +982,7 @@ fn notification_number_field(
         )
 }
 
-/// 用 main 的图标、标签和值层级显示版本及许可元数据。
+/// 用共享图标和间距展示元数据，行与标题对齐，不叠加第二层容器。
 fn about_row(
     icon: IconName,
     label: impl Into<SharedString>,
@@ -1000,12 +993,16 @@ fn about_row(
         .w_full()
         .flex()
         .items_start()
-        .gap_3()
+        .gap(theme.metrics.gap)
         .border_b_1()
         .border_color(theme.border)
-        .px_3()
-        .py(px(10.))
-        .child(Icon::new(icon).mt(px(2.)).text_color(theme.muted))
+        .py(theme.metrics.gap)
+        .child(
+            Icon::new(icon)
+                .size(theme.metrics.icon_size)
+                .mt(px(2.))
+                .text_color(theme.muted),
+        )
         .child(
             div()
                 .flex_1()
@@ -1028,7 +1025,7 @@ fn about_row(
         )
 }
 
-/// 外链操作与 URL 文字同一行，保持错误无关的 About 更新状态。
+/// 外链与其对象保持邻近，并允许长 URL 在窄窗口中收缩。
 fn about_action_row(
     icon: IconName,
     label: impl Into<SharedString>,
@@ -1041,12 +1038,16 @@ fn about_action_row(
         .flex()
         .flex_wrap()
         .items_start()
-        .gap_3()
+        .gap(theme.metrics.gap)
         .border_b_1()
         .border_color(theme.border)
-        .px_3()
-        .py(px(10.))
-        .child(Icon::new(icon).mt(px(2.)).text_color(theme.muted))
+        .py(theme.metrics.gap)
+        .child(
+            Icon::new(icon)
+                .size(theme.metrics.icon_size)
+                .mt(px(2.))
+                .text_color(theme.muted),
+        )
         .child(
             div()
                 .flex_1()
@@ -1070,7 +1071,7 @@ fn about_action_row(
         .child(action)
 }
 
-/// 错误和正常更新状态使用主题令牌区分，不将未知结果伪装成最新版。
+/// 更新状态与操作可换行，避免文字放大时固定最小宽度挤出视口。
 fn about_status_row(
     icon: IconName,
     label: impl Into<SharedString>,
@@ -1085,14 +1086,18 @@ fn about_status_row(
         .flex()
         .flex_wrap()
         .items_center()
-        .gap_3()
-        .px_3()
-        .py(px(10.))
-        .child(Icon::new(icon).mt(px(2.)).text_color(theme.muted))
+        .gap(theme.metrics.gap)
+        .py(theme.metrics.gap)
+        .child(
+            Icon::new(icon)
+                .size(theme.metrics.icon_size)
+                .mt(px(2.))
+                .text_color(theme.muted),
+        )
         .child(
             div()
                 .flex_1()
-                .min_w(px(160.))
+                .min_w(px(0.))
                 .flex()
                 .flex_col()
                 .gap_1()

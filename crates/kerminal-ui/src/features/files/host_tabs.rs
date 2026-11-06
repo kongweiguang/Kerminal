@@ -145,7 +145,7 @@ impl FilesPane {
         self.activate_host_tab(side, id, cx);
     }
 
-    /// 切标签时移动整个浏览面板，递增代次并撤销旧回执；尚未完成的目录读取在返回时重发。
+    /// 切标签时移动整个浏览面板并取消旧根 provider；尚未完成的目录读取在返回时重发。
     ///
     /// @author kongweiguang
     pub(super) fn activate_host_tab(
@@ -179,6 +179,7 @@ impl FilesPane {
         self.cancel_pending_side_actions(index, cx);
         let previous_id = self.host_picker.host_tabs.active[index];
         let mut previous = std::mem::replace(&mut self.panels[index], next_panel);
+        previous.cancel_root_request_cancellation();
         let generation = self.host_picker.host_tabs.panel_generations[index]
             .max(previous.generation)
             .max(self.panels[index].generation)
@@ -373,23 +374,11 @@ impl FilesPane {
     }
 
     /// 按侧撤销尚未提交的面板动作；入队中的传输和已提交文件操作继续使用原目标。
+    /// 切标签也推进独立导航身份，撤销展示但保留 busy，不能由缓存面板复活旧写入回执。
     ///
     /// @author kongweiguang
     fn cancel_pending_side_actions(&mut self, side: usize, cx: &mut Context<Self>) {
+        self.invalidate_file_action_presentation(side);
         self.cancel_transfer_preparation_for_side(side, cx);
-        if self.name_action_side == Some(side) && !self.name_action_busy {
-            self.name_action = None;
-            self.name_action_side = None;
-            self.name_action_target = None;
-        }
-        if self
-            .permission_dialog_target
-            .as_ref()
-            .is_some_and(|(owner, _)| *owner == side)
-            && !self.permissions.busy
-        {
-            self.permission_dialog_target = None;
-        }
-        self.delete_confirmation = None;
     }
 }

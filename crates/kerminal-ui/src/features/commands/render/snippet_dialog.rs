@@ -30,6 +30,7 @@ impl CommandsView {
     /// 紧凑编辑器仅保存定义，宽工作台保留非敏感草稿的复制与执行入口。
     /// 紧凑底栏遵循 main 的 36px 控件与整钮禁用透明度，避免 Kit 默认把主操作替换成灰色文字。
     /// 紧凑命令框保持 main 的 128px 最小编辑高度；固定模态视口通过正文滚动容纳它。
+    /// 保存期间连同变量定义一起冻结，避免成功回执重建表单时覆盖等待期间的新输入。
     ///
     /// @author kongweiguang
     pub(crate) fn render_snippet_dialog_content(
@@ -328,7 +329,7 @@ impl CommandsView {
                     .when(show_variable_definitions, |body| {
                         body.children(self.render_snippet_variable_definitions(
                             theme,
-                            writable && !send_in_flight,
+                            writable && !self.snippet_saving && !send_in_flight,
                             compact_layout,
                             cx,
                         ))

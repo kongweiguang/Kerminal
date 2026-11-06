@@ -14,6 +14,7 @@ mod render_desktop_about;
 mod render_keyword_highlights;
 mod render_mcp;
 mod render_profiles;
+mod render_save_recovery;
 mod render_settings;
 mod render_sftp;
 mod render_sync;

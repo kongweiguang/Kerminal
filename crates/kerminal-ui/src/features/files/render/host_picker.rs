@@ -21,7 +21,8 @@ use crate::{
     features::host_picker::{
         HostPickerExternalKey, HostPickerGroup, HostPickerList, HostPickerListKeyboardState,
         HostPickerListMessage, HostPickerOption, HostPickerPopoverConfig,
-        HostPickerSearchProjection, handle_external_host_picker_key, host_picker_popover,
+        HostPickerSearchProjection, grouped_host_picker_options, handle_external_host_picker_key,
+        host_picker_popover,
     },
     locale,
     theme::ThemeTokens,
@@ -48,6 +49,7 @@ struct SftpHostPickerListProjection {
     groups: Vec<HostPickerGroup>,
     query: String,
     loading: bool,
+    show_loading_message: bool,
     error: Option<String>,
     has_remote_options: bool,
     theme: ThemeTokens,
@@ -90,7 +92,7 @@ fn render_trigger(
 }
 
 /// 主机标签由外框统一绘制焦点边界（包含关闭按钮），并按视口约束、选择和焦点显露。
-/// 关闭按钮保留独立键盘焦点；关闭焦点标签后交回活动标签或搜索框。
+/// 关闭按钮保留独立键盘焦点；刷新消息与键盘行号使用同一过滤结果，避免列表跳动和索引错位。
 ///
 /// @author kongweiguang
 pub(super) fn render_selector_header(
@@ -156,6 +158,8 @@ pub(super) fn render_selector_header(
         title: locale::text("本地", "Local"),
     }];
     groups.extend(pane.host_picker.groups.clone());
+    let show_loading_message =
+        loading && grouped_host_picker_options(&options, &groups, &query).is_empty();
     let keyboard_state = pane.ensure_host_keyboard_state(side, cx);
     let trigger_input = search_input.clone();
     let key_input = search_input.clone();
@@ -163,8 +167,11 @@ pub(super) fn render_selector_header(
     let key_options = options.clone();
     let key_groups = groups.clone();
     let key_query = query.clone();
-    let key_message =
-        loading || error.is_some() || (!has_remote_options && query.trim().is_empty());
+    let key_message = if loading {
+        show_loading_message
+    } else {
+        error.is_some() || (!has_remote_options && query.trim().is_empty())
+    };
     let confirm_input = key_input.clone();
     let confirm_state = key_state.clone();
     let confirm_options = key_options.clone();
@@ -190,6 +197,7 @@ pub(super) fn render_selector_header(
                 groups: groups.clone(),
                 query: query.clone(),
                 loading,
+                show_loading_message,
                 error: error.clone(),
                 has_remote_options,
                 theme,
@@ -549,7 +557,7 @@ pub(super) fn render_selector_header(
         .into_any_element()
 }
 
-/// 组装 HostId 列表与 SFTP owner 操作；重试、刷新和创建均保留既有 FilesPane/Root 路径。
+/// 组装 HostId 列表与 SFTP owner 操作；刷新保留已有选项几何并在原按钮展示真实忙态。
 ///
 /// @author kongweiguang
 fn sftp_host_picker_list(
@@ -564,6 +572,7 @@ fn sftp_host_picker_list(
         groups,
         query,
         loading,
+        show_loading_message,
         error,
         has_remote_options,
         theme,
@@ -591,14 +600,14 @@ fn sftp_host_picker_list(
     .groups(groups)
     .theme(theme);
 
-    if loading {
+    if show_loading_message {
         list = list.message(HostPickerListMessage::Loading(locale::text(
             "正在读取已保存的 SSH/SFTP 主机…",
             "Loading saved SSH/SFTP hosts…",
         )));
-    } else if let Some(error) = error.clone() {
+    } else if !loading && let Some(error) = error.clone() {
         list = list.message(HostPickerListMessage::Error(error.into()));
-    } else if !has_remote_options && query.trim().is_empty() {
+    } else if !loading && !has_remote_options && query.trim().is_empty() {
         list = list.message(HostPickerListMessage::Empty(locale::text(
             "没有已启用 SFTP 的主机。",
             "No hosts with SFTP enabled are available.",
@@ -617,7 +626,13 @@ fn sftp_host_picker_list(
                 .compact()
                 .ghost()
                 .icon(gpui_kit::component::IconName::RefreshCw)
-                .accessibility_label(locale::text("刷新主机列表", "Refresh host list"))
+                .loading(loading)
+                .loading_icon(gpui_kit::component::IconName::RefreshCw)
+                .accessibility_label(if loading {
+                    locale::text("正在刷新主机列表", "Refreshing host list")
+                } else {
+                    locale::text("刷新主机列表", "Refresh host list")
+                })
                 .tooltip(locale::text("刷新主机列表", "Refresh host list"))
                 .disabled(loading)
                 .on_click(move |_, window, app| {

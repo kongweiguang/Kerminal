@@ -6,6 +6,17 @@
 #[path = "root_preferences_quit.rs"]
 mod preferences_quit;
 
+// 分屏目录回归复用隔离 Root，确保真实事件入口读取运行态而不是旧的工作区启动目录。
+#[path = "root_split_directory.rs"]
+mod split_directory;
+
+// Lifecycle 必须保留同一真实订阅，使用显式内存模式与认证失败样本隔离。
+#[path = "root_split_lifecycle.rs"]
+mod split_lifecycle;
+
+#[path = "root_external_username.rs"]
+mod username;
+
 use super::*;
 
 use std::{
@@ -319,6 +330,7 @@ impl SavedExternalTargetLookup for TemporaryTargets {
 #[derive(Default)]
 struct CapturingSessions {
     creates: Mutex<Vec<CreateSessionRequest>>,
+    live: Mutex<Option<split_lifecycle::LiveSession>>,
 }
 
 #[async_trait]
@@ -327,18 +339,52 @@ impl SessionService for CapturingSessions {
     async fn create(&self, _: CreateSessionRequest) -> AppResult<SessionInfo> {
         unavailable()
     }
-    /// 捕获生产请求后模拟认证失败，不启动 PTY 或联网。
+    /// 默认仍模拟认证失败；显式 live 样本仅返回内存身份，不启动 PTY 或联网。
     async fn create_cancellable(
         &self,
         request: CreateSessionRequest,
         _: CancellationToken,
     ) -> AppResult<SessionInfo> {
-        self.creates.lock().unwrap().push(request);
+        self.creates.lock().unwrap().push(request.clone());
+        if let Some(live) = self.live.lock().unwrap().as_mut() {
+            live.info.target = request.target;
+            live.info.owner = request.owner;
+            live.info.size = request.size;
+            return Ok(live.info.clone());
+        }
         Err(AppError::authentication_failed())
     }
-    /// 禁止查询真实会话。
-    async fn list(&self, _: SessionFilter) -> AppResult<Vec<SessionInfo>> {
-        unavailable()
+    /// 只查询显式启用的单个内存 session，外部认证样本不获得额外能力。
+    async fn list(&self, filter: SessionFilter) -> AppResult<Vec<SessionInfo>> {
+        let live = self.live.lock().unwrap();
+        let Some(live) = live.as_ref() else {
+            return unavailable();
+        };
+        Ok((filter
+            .owner
+            .as_ref()
+            .is_none_or(|owner| owner == &live.info.owner)
+            && filter
+                .target
+                .as_ref()
+                .is_none_or(|target| target == &live.info.target))
+        .then(|| live.info.clone())
+        .into_iter()
+        .collect())
+    }
+    /// 输入上下文从同一内存会话和代次生成，用于检验生产 lifecycle 重绑门禁。
+    async fn terminal_command_context(
+        &self,
+        session_id: SessionId,
+    ) -> AppResult<TerminalCommandContext> {
+        let live = self.live.lock().unwrap();
+        let Some(live) = live
+            .as_ref()
+            .filter(|live| live.info.session_id == session_id)
+        else {
+            return unavailable();
+        };
+        Ok(live.command_context())
     }
     /// 无会话资源可查询。
     async fn runtime_metadata(&self, _: SessionId) -> AppResult<SessionRuntimeMetadata> {
@@ -363,21 +409,36 @@ impl SessionService for CapturingSessions {
     async fn resize(&self, _: SessionId, _: TerminalSize) -> AppResult<()> {
         unavailable()
     }
-    /// 不读取真实终端快照。
+    /// 只读取内存引擎快照，使生命周期与 Output 回归经过实际快照接受链路。
     async fn render_snapshot(
         &self,
-        _: SessionId,
-        _: RenderSnapshotRequest,
+        session_id: SessionId,
+        request: RenderSnapshotRequest,
     ) -> AppResult<RenderSnapshot> {
-        unavailable()
+        let mut live = self.live.lock().unwrap();
+        let Some(live) = live
+            .as_mut()
+            .filter(|live| live.info.session_id == session_id)
+        else {
+            return unavailable();
+        };
+        Ok(live.engine.render_snapshot(request))
     }
-    /// 不修改真实终端调色板。
+    /// 内存样本允许初始化显示配置，默认认证样本仍拒绝操作。
     async fn set_palette(&self, _: SessionId, _: TerminalPalette) -> AppResult<()> {
-        unavailable()
+        if self.live.lock().unwrap().is_some() {
+            Ok(())
+        } else {
+            unavailable()
+        }
     }
-    /// 不修改真实终端历史容量。
-    async fn set_scrollback_limit(&self, _: SessionId, _: usize) -> AppResult<usize> {
-        unavailable()
+    /// 只回执内存样本的初始化请求，不改变用户终端历史容量。
+    async fn set_scrollback_limit(&self, _: SessionId, lines: usize) -> AppResult<usize> {
+        if self.live.lock().unwrap().is_some() {
+            Ok(lines)
+        } else {
+            unavailable()
+        }
     }
     /// 不读取真实终端文本。
     async fn plaintext_snapshot(
@@ -419,6 +480,26 @@ impl SessionService for CapturingSessions {
     ) -> AppResult<SessionInfo> {
         unavailable()
     }
+    /// 失败样本立即拒绝，取消样本明确进入挂起端口后等待 token，避免依赖调度时机制造取消。
+    async fn restart_cancellable(
+        &self,
+        session_id: SessionId,
+        cancellation: CancellationToken,
+    ) -> AppResult<SessionInfo> {
+        let entered = self
+            .live
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|live| live.info.session_id == session_id)
+            .and_then(|live| live.restart_wait_for_cancellation.clone());
+        if let Some(entered) = entered {
+            entered.cancel();
+            cancellation.cancelled().await;
+            return Err(AppError::cancelled("内存终端重连已取消"));
+        }
+        unavailable()
+    }
     /// 没有已建立的 session 可关闭。
     async fn close(&self, _: SessionId) -> AppResult<()> {
         unavailable()
@@ -431,9 +512,16 @@ impl SessionService for CapturingSessions {
     async fn close_all(&self) -> AppResult<()> {
         unavailable()
     }
-    /// 不订阅真实终端。
-    async fn subscribe(&self, _: SessionId) -> AppResult<SessionSubscription> {
-        unavailable()
+    /// 使用真实 SessionSubscription 合并流验证 watch 循环，不访问真实终端。
+    async fn subscribe(&self, session_id: SessionId) -> AppResult<SessionSubscription> {
+        let live = self.live.lock().unwrap();
+        let Some(live) = live
+            .as_ref()
+            .filter(|live| live.info.session_id == session_id)
+        else {
+            return unavailable();
+        };
+        Ok(SessionSubscription::from_receiver(live.changes.subscribe()))
     }
     /// 不执行远端命令。
     async fn execute_shell_command(
@@ -1233,6 +1321,79 @@ fn click_root_button(visual: &mut VisualTestContext, selector: &str) {
     visual.simulate_click(target, Default::default());
     visual.run_until_parked();
     visual.update(|window, app| window.draw(app).clear(app));
+}
+
+/// 自定义器的末行必须能滚入真实命中区，且滚动不能移动页脚；覆盖曾只采集静态图的两种尺寸。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn tool_customizer_last_controls_scroll_into_view_without_moving_footer(app: &mut TestAppContext) {
+    use gpui_kit::{ScrollDelta, ScrollWheelEvent, point, px, size};
+
+    let (runtime, root, _, _, visual) = fixture(app);
+    settle(&runtime, visual);
+    visual.update(|window, _| window.activate_window());
+    visual.run_until_parked();
+    for (width, height) in [(800., 600.), (1440., 900.)] {
+        visual.simulate_resize(size(px(width), px(height)));
+        visual.update(|window, app| {
+            root.update(app, |root, cx| root.open_tool_rail_customizer(window, cx));
+        });
+        for _ in 0..2 {
+            visual.run_until_parked();
+            visual.update(|window, app| window.draw(app).clear(app));
+        }
+        let (footer, first) = visual.update(|window, app| {
+            assert!(
+                root.read(app)
+                    .tool_rail_customizer
+                    .as_ref()
+                    .is_some_and(|customizer| customizer.read(app).is_open())
+            );
+            let button = |id: &str| {
+                gpui_kit::base::test_support::snapshots(window)
+                    .into_iter()
+                    .filter(|node| node.visible() && node.path().contains(&id.to_owned().into()))
+                    .min_by_key(|node| node.path().len())
+                    .unwrap_or_else(|| panic!("customizer control {id} is mounted"))
+                    .bounds()
+            };
+            (
+                button("tool-rail-customizer-cancel"),
+                button("tool-rail-placement-AgentLauncher"),
+            )
+        });
+        assert!(footer.top() >= px(0.) && footer.bottom() <= px(height));
+        visual.simulate_mouse_move(first.center(), None, Default::default());
+        visual.simulate_event(ScrollWheelEvent {
+            position: first.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-5_000.))),
+            ..Default::default()
+        });
+        visual.run_until_parked();
+        visual.update(|window, app| {
+            window.draw(app).clear(app);
+            let last =
+                gpui_kit::base::test_support::find(window, &[], &"tool-rail-placement-Logs".into())
+                    .expect("last tool placement is mounted");
+            assert!(last.visible());
+            assert!(last.bounds().top() >= px(0.));
+            assert!(
+                last.bounds().bottom() <= footer.top(),
+                "{width} × {height}: {:?}",
+                last.bounds()
+            );
+            let after = gpui_kit::base::test_support::find(
+                window,
+                &[],
+                &"tool-rail-customizer-cancel".into(),
+            )
+            .expect("footer remains mounted")
+            .bounds();
+            assert_eq!(after, footer, "scrolling must keep footer actions stable");
+        });
+        click_root_button(visual, "tool-rail-customizer-cancel");
+    }
 }
 
 /// 点击真实标签的正文命中区域，避免把关闭按钮或直接发事件当作导航验收。
@@ -2193,14 +2354,14 @@ fn compact_sftp_context_menu_escape_preserves_drawer_until_second_press(app: &mu
     });
 }
 
-/// 关闭只阻挡受理中的目标；批量关闭先整体检查，其他标签仍可独立关闭。
+/// 受理屏障只阻挡原目标；等待真实异步预检回执后，验证其他标签和已解除屏障的标签可关闭。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]
 fn transfer_enqueue_blocks_only_targeted_close_and_batch(app: &mut TestAppContext) {
     use crate::features::workspace_tabs::{WorkspaceCloseBatchIntent, WorkspaceTabEvent};
 
-    let (_runtime, _file_runtime, root, shared, visual) = file_queue_fixture(app);
+    let (runtime, _file_runtime, root, shared, visual) = file_queue_fixture(app);
     let first_id = TabId::new();
     let second_id = TabId::new();
     let host_id = HostId::new();
@@ -2265,9 +2426,14 @@ fn transfer_enqueue_blocks_only_targeted_close_and_batch(app: &mut TestAppContex
                 window,
                 cx,
             );
-            assert!(root.workspace_files.files_pane(&second_id).is_none());
+            assert!(root.pending_transfer_close_guard.is_some());
             assert!(root.workspace_files.files_pane(&first_id).is_some());
         });
+    });
+    settle(&runtime, visual);
+    root.read_with(visual, |root, _| {
+        assert!(root.workspace_files.files_pane(&second_id).is_none());
+        assert!(root.workspace_files.files_pane(&first_id).is_some());
     });
     visual.update(|window, app| {
         first.update(app, |pane, _| file_support::finish_enqueue_barrier(pane));
@@ -2277,8 +2443,13 @@ fn transfer_enqueue_blocks_only_targeted_close_and_batch(app: &mut TestAppContex
                 window,
                 cx,
             );
-            assert!(root.workspace_files.files_pane(&first_id).is_none());
         });
+    });
+    settle(&runtime, visual);
+    root.read_with(visual, |root, _| {
+        assert!(root.workspace_files.files_pane(&first_id).is_none());
+    });
+    visual.update(|window, app| {
         shared.update(app, file_support::begin_enqueue_barrier);
         root.update(app, |root, cx| {
             root.close_shared_sftp_workbench(window, cx);

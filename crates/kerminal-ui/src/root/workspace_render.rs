@@ -21,16 +21,16 @@ use kerminal_domain::{
 };
 use kerminal_terminal::snapshot::RenderSnapshot;
 
-use super::session_reconnect::SessionRestartProjection;
-use super::session_reconnect::{SessionReconnectProjection, SessionReconnectState};
+use super::session_reconnect::SessionActionProjection;
 use super::workspace_runtime::RuntimePanePhase;
 use crate::{
     features::host_picker::HostPickerPopoverProjection,
     features::workspace_broadcast::PaneBroadcastProjection,
     features::workspace_controller::WorkspaceResourceOperation,
     features::workspace_panes::{
-        PaneHeaderProjection, PaneRefreshProjection, SplitCandidatePreview,
-        SplitCandidateProbeContext, WorkspacePaneEvent, WorkspacePaneRefreshEvent, WorkspacePanes,
+        PaneHeaderProjection, PaneSessionActionKind, PaneSessionActionProjection,
+        SplitCandidatePreview, SplitCandidateProbeContext, WorkspacePaneEvent,
+        WorkspacePaneSessionActionEvent, WorkspacePanes,
     },
     theme::ThemeTokens,
 };
@@ -49,9 +49,12 @@ pub(super) struct WorkspacePaneProjection {
     pub split_candidate_cancelable: bool,
     /// ClosePane/CloseTab 已拥有该 pane 时禁止把同一错误状态误呈现为恢复重试。
     pub close_operation_pending: bool,
-    pub reconnect: Option<SessionReconnectProjection>,
-    /// 当前 pane 的重启 binding 与忙碌状态，按钮在 pane 生命周期内始终占据固定槽位。
-    pub restart: Option<SessionRestartProjection>,
+    /// 换代目录未确认时保持动作槽位，防止复制上一进程的目录。
+    pub split_enabled: bool,
+    /// 当前 pane 唯一的重新连接动作；稳定态来自服务观察，进行中携带同一 attempt。
+    pub session_action: Option<SessionActionProjection>,
+    /// 服务观察确认会话已退出或失败；正文只读，标题栏必须给出可见的重连入口。
+    pub session_disconnected: bool,
     pub broadcast: PaneBroadcastProjection,
 }
 
@@ -67,11 +70,6 @@ pub(super) enum WorkspaceRenderEvent {
         pane_id: PaneId,
     },
     ReconnectPane {
-        tab_id: TabId,
-        pane_id: PaneId,
-        binding: UiSessionBinding,
-    },
-    RefreshPane {
         tab_id: TabId,
         pane_id: PaneId,
         binding: UiSessionBinding,
@@ -126,13 +124,14 @@ pub(super) struct WorkspaceRender {
     host_picker: Rc<RefCell<Option<HostPickerPopoverProjection>>>,
     panes: Entity<WorkspacePanes>,
     _pane_subscription: Subscription,
-    _pane_refresh_subscription: Subscription,
+    _pane_session_action_subscription: Subscription,
 }
 
 impl EventEmitter<WorkspaceRenderEvent> for WorkspaceRender {}
 
 impl WorkspaceRender {
-    /// 创建稳定的 pane 事件桥；候选上下文按批传递，标题和内容共用持久 pane Entity。
+    /// 创建稳定的 pane 事件桥；标题、分屏可用性和内容共用同一投影，避免旧目录帧留下可操作入口。
+    /// 候选上下文按批传递，持久 pane Entity 保留焦点与布局身份。
     ///
     /// @author kongweiguang
     pub(super) fn new(
@@ -199,24 +198,22 @@ impl WorkspaceRender {
                 move |pane_id| match title_index.borrow().lookup(pane_id) {
                     Ok(projection) => PaneHeaderProjection {
                         title: projection.title.clone(),
-                        refresh: projection
-                            .restart
-                            .as_ref()
-                            .map(|restart| PaneRefreshProjection {
-                                binding: restart.binding.clone(),
-                                busy: restart.busy,
-                            }),
+                        split_enabled: projection.split_enabled,
+                        session_action: pane_session_action_projection(&projection),
                         host_picker: header_host_picker.borrow().clone().filter(|picker| {
                             picker.request.tab_id == header_tab_id
                                 && picker.request.pane_id == *pane_id
                         }),
                         broadcast: projection.broadcast,
+                        session_disconnected: projection.session_disconnected,
                     },
                     Err(_) => PaneHeaderProjection {
                         title: crate::locale::text("本地终端", "Local terminal"),
-                        refresh: None,
+                        split_enabled: false,
+                        session_action: None,
                         host_picker: None,
                         broadcast: PaneBroadcastProjection::default(),
+                        session_disconnected: false,
                     },
                 },
             )
@@ -229,29 +226,39 @@ impl WorkspaceRender {
                     event: event.clone(),
                 });
             });
-        let refresh_tab_id = tab_id.clone();
-        let refresh_projection = Rc::clone(&projection_index);
-        let pane_refresh_subscription = cx.subscribe(
+        let action_tab_id = tab_id.clone();
+        let action_projection = Rc::clone(&projection_index);
+        let pane_session_action_subscription = cx.subscribe(
             &panes,
-            move |_, _, event: &WorkspacePaneRefreshEvent, cx| {
-                let current_binding = refresh_projection
+            move |_, _, event: &WorkspacePaneSessionActionEvent, cx| {
+                let Some(validated) = action_projection
                     .borrow()
                     .lookup(&event.pane_id)
                     .ok()
-                    .and_then(|projection| {
-                        projection
-                            .restart
-                            .filter(|restart| !restart.busy && restart.binding == event.binding)
-                            .map(|restart| restart.binding)
-                    });
-                let Some(binding) = current_binding else {
+                    .and_then(|projection| validated_pane_session_action(&projection, event))
+                else {
                     return;
                 };
-                cx.emit(WorkspaceRenderEvent::RefreshPane {
-                    tab_id: refresh_tab_id.clone(),
-                    pane_id: event.pane_id.clone(),
-                    binding,
-                });
+                match validated {
+                    PaneSessionActionKind::Reconnect => {
+                        cx.emit(WorkspaceRenderEvent::ReconnectPane {
+                            tab_id: action_tab_id.clone(),
+                            pane_id: event.pane_id.clone(),
+                            binding: event.binding.clone(),
+                        });
+                    }
+                    PaneSessionActionKind::CancelReconnect => {
+                        let Some(attempt_id) = event.attempt_id else {
+                            return;
+                        };
+                        cx.emit(WorkspaceRenderEvent::CancelReconnect {
+                            tab_id: action_tab_id.clone(),
+                            pane_id: event.pane_id.clone(),
+                            binding: event.binding.clone(),
+                            attempt_id,
+                        });
+                    }
+                }
             },
         );
         panes.update(cx, |panes, cx| {
@@ -271,7 +278,7 @@ impl WorkspaceRender {
             host_picker: host_picker_projection,
             panes,
             _pane_subscription: pane_subscription,
-            _pane_refresh_subscription: pane_refresh_subscription,
+            _pane_session_action_subscription: pane_session_action_subscription,
         }
     }
 
@@ -455,6 +462,57 @@ impl ProjectionIndex {
 enum ProjectionLookupError {
     Missing,
     Duplicate,
+}
+
+/// 将服务观察折叠到标题栏唯一“重新连接”槽位；进行中同槽位转为取消。
+///
+/// 连接中仍允许点击以取消，取消收尾则禁用；稳定与进行态都保留图标槽位，不新增整行。
+///
+/// @author kongweiguang
+fn pane_session_action_projection(
+    projection: &WorkspacePaneProjection,
+) -> Option<PaneSessionActionProjection> {
+    let action = projection.session_action.as_ref()?;
+    let in_flight = action.attempt_id.is_some();
+    Some(PaneSessionActionProjection {
+        binding: action.binding.clone(),
+        kind: if in_flight {
+            PaneSessionActionKind::CancelReconnect
+        } else {
+            PaneSessionActionKind::Reconnect
+        },
+        enabled: !action.cancelling,
+        busy: action.busy,
+        attempt_id: action.attempt_id,
+    })
+}
+
+/// 点击回执必须对应当前渲染批次与 attempt，防止旧动作穿透到后续连接。
+///
+/// @author kongweiguang
+fn validated_pane_session_action(
+    projection: &WorkspacePaneProjection,
+    event: &WorkspacePaneSessionActionEvent,
+) -> Option<PaneSessionActionKind> {
+    match event.kind {
+        PaneSessionActionKind::Reconnect => projection
+            .session_action
+            .as_ref()
+            .filter(|action| {
+                action.binding == event.binding && action.attempt_id.is_none() && !action.busy
+            })
+            .map(|_| PaneSessionActionKind::Reconnect),
+        PaneSessionActionKind::CancelReconnect => projection
+            .session_action
+            .as_ref()
+            .filter(|action| {
+                action.binding == event.binding
+                    && !action.cancelling
+                    && action.attempt_id.is_some()
+                    && event.attempt_id == action.attempt_id
+            })
+            .map(|_| PaneSessionActionKind::CancelReconnect),
+    }
 }
 
 /// 只有真实会话 ID 与同 ID 的终端快照配对时，Root 才能绘制该 pane 的交互画布。
@@ -692,12 +750,10 @@ fn render_pane_projection(
     }
 
     match pane_surface_state(&projection) {
-        PaneSurfaceState::Ready => {
-            render_ready_pane(&projection, tab_id, renderer, reconnect_emitter, window, cx)
-        }
+        PaneSurfaceState::Ready => render_ready_pane(&projection, renderer, window, cx),
         PaneSurfaceState::Closing => {
             if projection.session_id.is_some() && projection.snapshot.is_some() {
-                render_ready_pane(&projection, tab_id, renderer, reconnect_emitter, window, cx)
+                render_ready_pane(&projection, renderer, window, cx)
             } else {
                 render_placeholder(
                     pane_id,
@@ -798,14 +854,12 @@ fn candidate_retry_pane(
         .then(|| candidate_pane_id.clone())
 }
 
-/// 给有效的单 pane 数据委托给 Root；半透明背景保留根 underlay，重连仍绑定原 session。
+/// 给有效的单 pane 数据委托给 Root；会话状态只使用窄标题栏操作，不额外占用终端正文。
 ///
 /// @author kongweiguang
 fn render_ready_pane(
     projection: &WorkspacePaneProjection,
-    tab_id: &TabId,
     renderer: &Rc<PaneContentRenderer>,
-    reconnect_emitter: &Rc<ReconnectEmitter>,
     window: &mut Window,
     cx: &mut Context<WorkspacePanes>,
 ) -> AnyElement {
@@ -834,85 +888,6 @@ fn render_ready_pane(
                 .text_color(theme.muted)
                 .child(message),
         );
-    }
-
-    if let Some(reconnect) = projection.reconnect.as_ref() {
-        let binding = reconnect.binding.clone();
-        let pane_id = projection.pane_id.clone();
-        let tab_id = tab_id.clone();
-        let action = Rc::clone(reconnect_emitter);
-        let control = match &reconnect.state {
-            SessionReconnectState::Available
-            | SessionReconnectState::Failed { .. }
-            | SessionReconnectState::Cancelled => {
-                let event = WorkspaceRenderEvent::ReconnectPane {
-                    tab_id,
-                    pane_id,
-                    binding,
-                };
-                let action = Rc::clone(&action);
-                Button::new(format!(
-                    "workspace-pane-reconnect-{}",
-                    projection.pane_id.as_str()
-                ))
-                .compact()
-                .label(crate::locale::text("重连", "Reconnect"))
-                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                    action(event.clone(), cx);
-                }))
-                .into_any_element()
-            }
-            SessionReconnectState::Connecting { attempt_id } => {
-                let event = WorkspaceRenderEvent::CancelReconnect {
-                    tab_id,
-                    pane_id,
-                    binding,
-                    attempt_id: *attempt_id,
-                };
-                let action = Rc::clone(&action);
-                Button::new(format!(
-                    "workspace-pane-reconnect-cancel-{}",
-                    projection.pane_id.as_str()
-                ))
-                .compact()
-                .label(crate::locale::text("取消重连", "Cancel reconnect"))
-                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                    action(event.clone(), cx);
-                }))
-                .into_any_element()
-            }
-            SessionReconnectState::Cancelling { .. } => div()
-                .px_2()
-                .py_1()
-                .text_color(theme.muted)
-                .child(crate::locale::text(
-                    "正在取消重连…",
-                    "Cancelling reconnect…",
-                ))
-                .into_any_element(),
-        };
-
-        let mut controls = div()
-            .id(format!(
-                "workspace-pane-reconnect-bar-{}",
-                projection.pane_id.as_str()
-            ))
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .bg(theme.sidebar);
-        if let SessionReconnectState::Failed { message } = &reconnect.state {
-            controls = controls.child(
-                div()
-                    .flex_1()
-                    .text_color(theme.error)
-                    .child(SharedString::from(message.clone())),
-            );
-        }
-        body = body.child(controls.child(control));
     }
 
     body.child(div().flex_1().min_h(px(0.)).child(content))

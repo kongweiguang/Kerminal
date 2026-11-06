@@ -5,6 +5,7 @@
 use gpui_kit::{Context, Entity, Window};
 use kerminal_application::{
     preferences::settings::ToolRailToolId,
+    sessions::UiSessionBinding,
     workspace::{WorkspaceSessionTab, WorkspaceTargetRef},
 };
 use kerminal_domain::{
@@ -22,6 +23,60 @@ use super::{RootConfirmationOwner, RootView};
 pub type RightRailFileTabState = (TabId, usize, usize, bool, bool);
 
 impl RootView {
+    /// 在挂载文件面板前核对真实终端目录，使验收首个 SFTP 读取也限定在 fixture 内。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_follow_terminal_snapshot(
+        &self,
+        host_id: &HostId,
+    ) -> Result<Option<(UiSessionBinding, Option<String>)>, String> {
+        let Some(binding) = self.right_rail_acceptance_fixture_binding(host_id)? else {
+            return Ok(None);
+        };
+        let Some(pane_id) = self.workspace_runtime.pane_for_session(&binding.session_id) else {
+            return Ok(None);
+        };
+        let Some(pane) = self.workspace_runtime.pane(pane_id) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            binding,
+            pane.current_working_directory.as_deref().map(str::to_owned),
+        )))
+    }
+
+    /// 同时回读活动 SSH 身份、实际 OSC7 目录和面板开关，防止启动目录回退冒充终端上报。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_follow_snapshot(
+        &self,
+        host_id: &HostId,
+        cx: &Context<Self>,
+    ) -> Result<Option<(UiSessionBinding, Option<String>, Option<String>, bool)>, String> {
+        let Some((binding, cwd)) = self.right_rail_acceptance_follow_terminal_snapshot(host_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(files) = self.right_rail_acceptance_fixture_sftp_panel(host_id)? else {
+            return Ok(None);
+        };
+        let files = files.read(cx);
+        let target = match files.right_rail_acceptance_follow_target() {
+            Some(FileEndpoint::Remote {
+                host_id: actual,
+                path,
+            }) if actual == host_id => Some(path.as_str().to_owned()),
+            Some(_) => return Err("SFTP 跟随目标不属于当前 fixture 主机".to_owned()),
+            None => None,
+        };
+        Ok(Some((
+            binding,
+            cwd,
+            target,
+            files.right_rail_acceptance_follow_enabled(),
+        )))
+    }
+
     /// 只投影当前 fixture 右栏的刷新状态，不改变目录或替代生产按钮事件。
     ///
     /// @author kongweiguang

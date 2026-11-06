@@ -59,13 +59,13 @@ pub(crate) fn floating_surface(
     .into_any_element()
 }
 
-/// 菜单滤镜匹配 main 的 30px 玻璃模糊，同时让原 PopupMenu 保持唯一布局和交互树。
+/// 菜单和其它浮层使用同一轻量材质，原 PopupMenu 保持唯一布局和交互树。
 ///
 /// @author kongweiguang
 pub(crate) fn context_menu_surface(content: impl IntoElement, theme: ThemeTokens) -> AnyElement {
     BackdropFilterElement {
         content: content.into_any_element(),
-        radius: px(30.),
+        radius: theme.floating_blur_radius,
         corners: Corners::all(theme.radius),
         saturation: theme.floating_saturation,
     }

@@ -241,6 +241,8 @@ pub(super) fn supports_posix_mode_endpoint(endpoint: &FileEndpoint) -> bool {
 
 impl super::FilesPane {
     /// 校验完整 octal 草稿；缺失元数据时拒绝猜测，成功由回读呈现，不新增短暂提示条。
+    /// 在途请求始终收尾 busy，只有原目录代次、选择和表单仍匹配时才投影结果，避免迟到回执改写新目标。
+    /// 权限写入后的回读必须重新选中原项目，缺失时保留明确提示。
     ///
     /// @author kongweiguang
     pub(super) fn apply_permissions(&mut self, cx: &mut Context<Self>) {
@@ -279,6 +281,9 @@ impl super::FilesPane {
         };
 
         let endpoint = entry.endpoint.clone();
+        let directory = self.panels[side].endpoint.clone();
+        let generation = self.directory_navigation_generations[side];
+        let dialog_target = self.permission_dialog_target.clone();
         let command_endpoint = endpoint.clone();
         let selected_name = entry.name.clone();
         let external_target_lease = self.external_target_lease_for_endpoint(&endpoint);
@@ -296,6 +301,16 @@ impl super::FilesPane {
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
                     pane.permissions.busy = false;
+                    if !pane.file_action_directory_is_current(side, generation, &directory)
+                        || pane.permission_dialog_target != dialog_target
+                        || pane.panels[side]
+                            .selected
+                            .as_ref()
+                            .is_none_or(|entry| entry.endpoint != endpoint)
+                    {
+                        cx.notify();
+                        return;
+                    }
                     match result {
                         Ok(()) => {
                             if pane
@@ -307,7 +322,8 @@ impl super::FilesPane {
                             }
                             pane.status = None;
                             pane.permissions.reset_selection();
-                            pane.panels[side].pending_selection = Some(selected_name);
+                            pane.panels[side].pending_selection =
+                                Some(super::PendingSelection::Required(selected_name));
                             pane.load_panel(side, cx);
                         }
                         Err(error) => {

@@ -15,6 +15,7 @@ pub struct SettingsAcceptanceState {
     settings_loading: bool,
     draft_ready: bool,
     draft_dirty: bool,
+    draft_diagnostic: String,
     page_id: &'static str,
     draft_theme_mode: Option<&'static str>,
     draft_app_color_scheme: Option<&'static str>,
@@ -159,6 +160,12 @@ impl SettingsAcceptanceState {
     /// Returns whether the typed settings draft differs from its confirmed revision.
     pub fn draft_dirty(&self) -> bool {
         self.draft_dirty
+    }
+
+    /// 单独暴露设置事务诊断以区分失败、未知结果与保存未完成，保持原生等待条件不变。
+    /// @author kongweiguang
+    pub fn draft_diagnostic(&self) -> &str {
+        &self.draft_diagnostic
     }
 
     /// Returns the selected production PreferencesSection as its stable acceptance ID.
@@ -440,7 +447,7 @@ impl RootView {
             .settings_acceptance_content_bounds()
     }
 
-    /// 从生产 Root 和面板读取快照，区分草稿、运行态和真实终端而不更改业务状态。
+    /// 从生产 Root 和面板读取快照，区分草稿、运行态和真实终端而不更改业务状态；诊断仅含阶段和公开错误。
     ///
     /// @author kongweiguang
     pub fn settings_acceptance_state(&self, cx: &Context<Self>) -> SettingsAcceptanceState {
@@ -482,6 +489,7 @@ impl RootView {
             settings_loading: panel.settings_acceptance_loading(),
             draft_ready,
             draft_dirty: panel.settings_acceptance_draft_dirty(),
+            draft_diagnostic: panel.settings_acceptance_draft_diagnostic(),
             page_id: panel.settings_acceptance_page_id(),
             draft_theme_mode: panel.settings_acceptance_draft_theme(),
             draft_app_color_scheme: panel.settings_acceptance_draft_app_color_scheme(),

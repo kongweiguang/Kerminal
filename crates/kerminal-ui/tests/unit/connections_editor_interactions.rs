@@ -7,6 +7,165 @@ use gpui_kit::Focusable as _;
 use super::super::super::local_hosts::LocalHostEditorSection;
 use super::*;
 
+/// 长指纹和错误说明不能把信任操作挤出窄矮窗口，取消仍须撤销原待处理请求。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn host_key_confirmation_keeps_actions_visible_in_a_short_window(app: &mut TestAppContext) {
+    use super::super::{PendingAction, PendingTrust};
+    use kerminal_application::connections::{HostKeyIdentity, HostKeyStatus};
+    use kerminal_domain::files::FileEndpoint;
+
+    let (_runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
+    visual.simulate_resize(gpui_kit::size(gpui_kit::px(480.), gpui_kit::px(300.)));
+    let host_id = HostId::new();
+    let fingerprint = format!("SHA256:{}", "a".repeat(43));
+    let challenge = HostKeyChallenge {
+        host_id: host_id.clone(),
+        peer: HostKeyPeer::Target,
+        endpoint: HostEndpoint {
+            host: "long-host-name.example.test".to_owned(),
+            port: 22,
+            username: "fixture".to_owned(),
+        },
+        algorithm: "ssh-ed25519".to_owned(),
+        fingerprint_sha256: fingerprint.clone(),
+        identity: HostKeyIdentity {
+            algorithm: "ssh-ed25519".to_owned(),
+            fingerprint_sha256: fingerprint,
+            public_key_openssh: "ssh-ed25519 AAAA".to_owned(),
+        },
+        status: HostKeyStatus::Changed {
+            previous_fingerprint_sha256: format!("SHA256:{}", "b".repeat(43)),
+        },
+    };
+    update_panel(&panel, visual, |panel, _, cx| {
+        panel.pending_trust = Some(PendingTrust {
+            challenge,
+            action: PendingAction::SftpSelection {
+                endpoint: FileEndpoint::Local {
+                    path: std::path::PathBuf::from("fixture"),
+                },
+                request_id: "fixture".to_owned(),
+            },
+            display_host: None,
+            external_classification: None,
+            second_confirmation: false,
+            operation_busy: false,
+            operation_cancellation: None,
+        });
+        cx.notify();
+    });
+
+    let body = visual
+        .debug_bounds("connections-hostkey-body")
+        .expect("信任正文应可测量");
+    let actions = visual
+        .debug_bounds("connections-hostkey-actions")
+        .expect("信任操作栏应可测量");
+    let viewport = visual.update(|window, _| window.viewport_size());
+    assert!(body.size.height > gpui_kit::px(0.));
+    assert!(
+        body.bottom() <= actions.origin.y,
+        "正文视口与操作栏重叠：body={body:?}, actions={actions:?}, viewport={viewport:?}"
+    );
+    assert!(actions.bottom() <= viewport.height);
+    let identity = visual
+        .debug_bounds("connections-hostkey-identity")
+        .expect("信任正文首行应可测量");
+    let position = body.center();
+    visual.simulate_mouse_move(position, None, Default::default());
+    visual.simulate_event(gpui_kit::ScrollWheelEvent {
+        position,
+        delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(-12.))),
+        ..Default::default()
+    });
+    draw(visual);
+    let scrolled = visual
+        .debug_bounds("connections-hostkey-identity")
+        .expect("信任正文滚动后仍应可测量");
+    assert!(scrolled.origin.y < identity.origin.y, "正文应独立滚动");
+    assert_eq!(
+        visual.debug_bounds("connections-hostkey-body"),
+        Some(body),
+        "滚动正文不能移动可视窗口"
+    );
+    assert_eq!(
+        visual.debug_bounds("connections-hostkey-actions"),
+        Some(actions),
+        "滚动正文不能移动确认操作栏"
+    );
+
+    let cancel = visual
+        .debug_bounds("connections-hostkey-cancel")
+        .expect("取消按钮应可点击");
+    visual.simulate_click(cancel.center(), Default::default());
+    draw(visual);
+    visual.update(|_, app| assert!(panel.read(app).pending_trust.is_none()));
+}
+
+/// 本地和远程表单出现或清除反馈时，字段起点与保存按钮位置都不能随之跳动。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn host_editor_feedback_preserves_field_and_action_positions(app: &mut TestAppContext) {
+    for local in [false, true] {
+        let (runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
+        visual.simulate_resize(gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(700.)));
+        update_panel(&panel, visual, |panel, window, cx| {
+            if local {
+                panel.begin_create_local_host(None, window, cx);
+            } else {
+                panel.begin_create_host(window, cx);
+            }
+        });
+        pump_runtime(&runtime, visual);
+        update_panel(&panel, visual, |panel, _, cx| {
+            panel.status = None;
+            panel.local_hosts.status = None;
+            cx.notify();
+        });
+        let (field, save) = if local {
+            (
+                "connections-local-editor-viewport",
+                "connections-local-editor-save",
+            )
+        } else {
+            ("connections-editor-username-row", "connections-editor-save")
+        };
+        let field_before = visual.debug_bounds(field).expect("表单字段应可测量");
+        let save_before = visual.debug_bounds(save).expect("保存按钮应可测量");
+        update_panel(&panel, visual, |panel, _, cx| {
+            if local {
+                panel.local_hosts.status = Some("读取失败，请重试。".repeat(12));
+            } else {
+                panel.status = Some("连接测试失败，请重试。".repeat(12));
+            }
+            cx.notify();
+        });
+        assert!(visual.debug_bounds("connections-editor-feedback").is_some());
+        assert_eq!(
+            visual.debug_bounds(field).expect("字段仍应存在").origin.y,
+            field_before.origin.y
+        );
+        assert_eq!(
+            visual
+                .debug_bounds(save)
+                .expect("保存按钮仍应存在")
+                .origin
+                .y,
+            save_before.origin.y
+        );
+        update_panel(&panel, visual, |panel, _, cx| {
+            if local {
+                panel.local_hosts.status = None;
+            } else {
+                panel.status = None;
+            }
+            cx.notify();
+        });
+        assert!(visual.debug_bounds("connections-editor-feedback").is_none());
+    }
+}
+
 /// 迟到的旧回执不能填隐藏表单；返回后必须重新取得默认值，同时保护用户后来输入。
 /// @author kongweiguang
 #[gpui_kit::test]
