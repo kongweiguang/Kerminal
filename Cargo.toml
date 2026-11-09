@@ -11,6 +11,7 @@ members = [
     "crates/kerminal-desktop",
     "xtask",
     "sdk/protocol",
+    "sdk/script-host",
 ]
 exclude = [
     "vendor/alacritty_terminal",
@@ -36,6 +37,9 @@ repository = "https://github.com/kongweiguang/Kerminal.git"
 kerminal-plugin-protocol = { path = "sdk/protocol", version = "1.0.0" }
 schemars = "=1.2.3"
 jsonschema = { version = "=0.37.4", default-features = false }
+rquickjs = { version = "=0.14.0", features = ["full"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+cap-std = "=3.4.5"
 kerminal-domain = { path = "crates/domain", version = "0.4.0-beta.5" }
 kerminal-application = { path = "crates/application", version = "0.4.0-beta.5" }
 kerminal-terminal = { path = "crates/terminal", version = "0.4.0-beta.5" }

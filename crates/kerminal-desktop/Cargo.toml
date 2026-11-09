@@ -18,7 +18,7 @@ name = "kerminal-migrate"
 path = "src/bin/kerminal-migrate.rs"
 
 [features]
-acceptance-metrics = ["kerminal-ui/acceptance-metrics"]
+acceptance-metrics = ["kerminal-ui/acceptance-metrics", "dep:windows"]
 right-rail-acceptance = [
     "kerminal-ui/right-rail-acceptance",
     "dep:gpui_pre_windows",
@@ -56,6 +56,7 @@ rmcp = { workspace = true, features = ["client", "transport-streamable-http-clie
 embed-resource = "=3.0.12"
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", optional = true, features = ["Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11", "Win32_System_WinRT", "Win32_System_WinRT_Graphics_Capture", "Win32_System_WinRT_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
 gpui_pre_windows = { package = "gpui-pre-windows", path = "../../vendor/gpui-pre-windows", optional = true }
 windows-sys = { workspace = true, features = ["Win32_UI_Shell", "Win32_System_StationsAndDesktops", "Win32_System_DataExchange", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse"] }
 

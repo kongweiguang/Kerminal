@@ -20,6 +20,22 @@ use super::{
 
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
+/// 原生子窗口的依赖例外不能被用来取得文件系统、进程或跨平台系统接口。
+#[test]
+fn native_window_dependencies_are_scoped_to_windows_and_rendering_features() {
+    let mut valid = json!({"dependencies":[{"name":"windows-sys", "target":"cfg(windows)", "features":["Win32_Graphics_Gdi"]}]});
+    let mut violations = Vec::new();
+    super::validate_ui_native_window_dependencies(&valid, &mut violations);
+    assert!(violations.is_empty());
+    valid["dependencies"][0]["features"] = json!(["Win32_Storage_FileSystem"]);
+    super::validate_ui_native_window_dependencies(&valid, &mut violations);
+    assert_eq!(violations.len(), 1);
+    valid["dependencies"][0]["features"] = json!(["Win32_Graphics_Gdi"]);
+    valid["dependencies"][0]["target"] = json!(null);
+    super::validate_ui_native_window_dependencies(&valid, &mut violations);
+    assert_eq!(violations.len(), 2);
+}
+
 /// 插件进程与开发工具不得链接产品实现，宿主也只能消费独立协议。
 #[test]
 fn plugin_sdk_and_product_dependency_directions_remain_separate() {
@@ -176,7 +192,7 @@ fn ui_rejects_direct_resource_sdks_but_keeps_gpui_and_pure_utilities() {
     let forbidden = BTreeSet::from([
         "dirs".to_owned(),
         "reqwest".to_owned(),
-        "windows-sys".to_owned(),
+        "arboard".to_owned(),
     ]);
     validate_internal_edges("kerminal-ui", &forbidden, &mut violations);
     assert_eq!(violations.len(), forbidden.len());

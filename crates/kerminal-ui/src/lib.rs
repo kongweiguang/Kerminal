@@ -9,6 +9,7 @@ pub mod acceptance_metrics;
 pub mod features;
 mod keybindings;
 pub mod locale;
+pub mod plugins;
 mod root;
 mod shell_arguments;
 mod terminal_background;

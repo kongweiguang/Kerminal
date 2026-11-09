@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 #[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
 use std::{
@@ -7,7 +9,7 @@ use std::{
 #[cfg(target_family = "wasm")]
 use web_time::Instant;
 
-use gpui::{App, Entity, Global, OwnedMenu};
+use gpui::{App, Entity, Global, OwnedMenu, WindowId};
 
 use crate::text::TextViewState;
 
@@ -18,10 +20,15 @@ use crate::text::TextViewState;
 /// there is nothing inside to read.
 pub struct DeferredPopover(#[allow(dead_code)] Rc<()>);
 
+struct DeferredPopoverRegistration {
+    window_id: Option<WindowId>,
+    token: Weak<()>,
+}
+
 /// Application-wide state shared by Base behaviors.
 pub struct GlobalState {
     app_menus: Vec<OwnedMenu>,
-    deferred_popovers: Vec<Weak<()>>,
+    deferred_popovers: Vec<DeferredPopoverRegistration>,
     suppress_text_selection: bool,
     /// The text views being prepainted or painted, innermost last. Kept
     /// apart from what views read of this global: pushing and popping as
@@ -136,11 +143,21 @@ impl GlobalState {
 
     /// Returns whether any deferred popup currently owns an open interaction
     /// context.
+    /// 无窗口登记仍参与全局查询，保证旧调用方的交互行为保持一致。
     pub fn is_in_deferred_context(cx: &App) -> bool {
         Self::global(cx)
             .deferred_popovers
             .iter()
-            .any(|popover| popover.strong_count() > 0)
+            .any(|popover| popover.token.strong_count() > 0)
+    }
+
+    /// 原生子窗口只避让同一窗口的弹层；尚未初始化时只读返回 false，不创建全局状态。
+    pub fn has_deferred_popover_in_window(window_id: WindowId, cx: &App) -> bool {
+        cx.try_global::<Self>().is_some_and(|state| {
+            state.deferred_popovers.iter().any(|popover| {
+                popover.window_id == Some(window_id) && popover.token.strong_count() > 0
+            })
+        })
     }
 
     /// Registers an open deferred popup, which stays registered for as long as
@@ -154,13 +171,31 @@ impl GlobalState {
     /// application believing a popup is open forever, and everything that
     /// steps aside for open popups (the native context menu of a text input,
     /// say) would stay disabled for the rest of the session.
+    /// 无窗口调用保留原有全局交互语义，不影响其他窗口的原生子视图。
     pub fn register_deferred_popover(cx: &mut App) -> DeferredPopover {
+        Self::register_deferred_popover_for(None, cx)
+    }
+
+    /// 将弹层绑定到实际窗口，并继续依赖持有令牌的生命周期自动撤销登记。
+    pub fn register_deferred_popover_in_window(
+        window_id: WindowId,
+        cx: &mut App,
+    ) -> DeferredPopover {
+        Self::register_deferred_popover_for(Some(window_id), cx)
+    }
+
+    /// 共用弱引用表维护全局及窗口查询；每次登记清理失效项，无需后台清理计时器。
+    fn register_deferred_popover_for(window_id: Option<WindowId>, cx: &mut App) -> DeferredPopover {
+        Self::init(cx);
         let token = Rc::new(());
         let state = Self::global_mut(cx);
         state
             .deferred_popovers
-            .retain(|popover| popover.strong_count() > 0);
-        state.deferred_popovers.push(Rc::downgrade(&token));
+            .retain(|popover| popover.token.strong_count() > 0);
+        state.deferred_popovers.push(DeferredPopoverRegistration {
+            window_id,
+            token: Rc::downgrade(&token),
+        });
         DeferredPopover(token)
     }
 }
@@ -168,6 +203,50 @@ impl GlobalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 嵌套弹层及旧式登记不能影响其他窗口；释放任一所有者只撤销自己的登记。
+    #[gpui::test]
+    fn deferred_popovers_are_window_scoped_and_drop_safe(cx: &mut gpui::TestAppContext) {
+        let first = cx
+            .add_empty_window()
+            .update(|window, _| window.window_handle().window_id());
+        let second = cx
+            .add_empty_window()
+            .update(|window, _| window.window_handle().window_id());
+
+        cx.update(|cx| {
+            assert!(!GlobalState::has_deferred_popover_in_window(first, cx));
+            assert!(!cx.has_global::<GlobalState>());
+
+            let legacy = GlobalState::register_deferred_popover(cx);
+            assert!(GlobalState::is_in_deferred_context(cx));
+            assert!(!GlobalState::has_deferred_popover_in_window(first, cx));
+            assert!(!GlobalState::has_deferred_popover_in_window(second, cx));
+
+            let outer = GlobalState::register_deferred_popover_in_window(first, cx);
+            let inner = GlobalState::register_deferred_popover_in_window(first, cx);
+            assert!(GlobalState::has_deferred_popover_in_window(first, cx));
+            assert!(!GlobalState::has_deferred_popover_in_window(second, cx));
+            let other = GlobalState::register_deferred_popover_in_window(second, cx);
+
+            drop(outer);
+            assert!(GlobalState::has_deferred_popover_in_window(first, cx));
+            drop(inner);
+            assert!(!GlobalState::has_deferred_popover_in_window(first, cx));
+            assert!(GlobalState::has_deferred_popover_in_window(second, cx));
+            drop(other);
+            assert!(!GlobalState::has_deferred_popover_in_window(second, cx));
+            assert!(GlobalState::is_in_deferred_context(cx));
+            drop(legacy);
+            assert!(!GlobalState::is_in_deferred_context(cx));
+
+            let reopened = GlobalState::register_deferred_popover_in_window(first, cx);
+            assert_eq!(GlobalState::global(cx).deferred_popovers.len(), 1);
+            assert!(!GlobalState::has_deferred_popover_in_window(second, cx));
+            drop(reopened);
+            assert!(!GlobalState::has_deferred_popover_in_window(first, cx));
+        });
+    }
 
     #[gpui::test]
     fn initialization_is_idempotent_and_suppression_can_be_reset(cx: &mut gpui::TestAppContext) {

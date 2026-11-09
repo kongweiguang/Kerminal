@@ -6,7 +6,7 @@ use gpui::{
     Anchor, AnyElement, App, Context, DismissEvent, ElementId, EventEmitter, FocusHandle,
     Focusable, InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _,
     Render, RenderOnce, Role, StatefulInteractiveElement as _, StyleRefinement, Styled,
-    Subscription, Window, div, prelude::FluentBuilder as _,
+    Subscription, Window, WindowId, div, prelude::FluentBuilder as _,
 };
 
 use crate::{
@@ -41,9 +41,11 @@ pub struct PopoverState {
     /// Held while open, so that a state collected without being closed — this
     /// lives in element state — takes its registration with it.
     deferred_context: Option<DeferredPopover>,
+    deferred_window: Option<WindowId>,
 }
 
 impl PopoverState {
+    /// 状态可能在选择窗口前创建，窗口绑定延迟到渲染或显式状态切换。
     pub fn new(default_open: bool, cx: &mut App) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
@@ -53,6 +55,7 @@ impl PopoverState {
             on_open_change: None,
             dismiss_subscription: None,
             deferred_context: None,
+            deferred_window: None,
         }
     }
 
@@ -72,10 +75,26 @@ impl PopoverState {
         }
     }
 
+    /// 兼容无窗口参数的调用，下一次渲染再绑定窗口，不额外改变焦点或回调。
     #[doc(hidden)]
     pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.open = open;
         self.deferred_context = open.then(|| GlobalState::register_deferred_popover(cx));
+        self.deferred_window = None;
+    }
+
+    /// 默认打开和受控弹层可能跳过状态切换；复用已有令牌避免每帧重复登记。
+    fn bind_deferred_context(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let window_id = window.window_handle().window_id();
+        if !self.open {
+            self.deferred_context = None;
+            self.deferred_window = None;
+        } else if self.deferred_context.is_none() || self.deferred_window != Some(window_id) {
+            self.deferred_context = Some(GlobalState::register_deferred_popover_in_window(
+                window_id, cx,
+            ));
+            self.deferred_window = Some(window_id);
+        }
     }
 
     #[doc(hidden)]
@@ -88,6 +107,7 @@ impl PopoverState {
         self.transition_to(!self.open, true, window, cx);
     }
 
+    /// 仅登记实际绘制弹层的窗口，同时保持焦点、关闭和受控更新的原有语义。
     fn transition_to(
         &mut self,
         opening: bool,
@@ -96,12 +116,14 @@ impl PopoverState {
         cx: &mut Context<Self>,
     ) {
         if self.open == opening {
+            self.bind_deferred_context(window, cx);
             return;
         }
         if opening {
             self.previous_focus_handle = window.focused(cx);
         }
-        self.set_open(opening, cx);
+        self.open = opening;
+        self.bind_deferred_context(window, cx);
 
         if self.open {
             // Weak: the subscription is stored on this state, so a strong
@@ -344,7 +366,7 @@ impl Styled for Popover {
 }
 
 impl RenderOnce for Popover {
-    /// 受控锚点可跳过鼠标切换监听；定位、焦点和关闭路径仍由同一个 PopoverState 管理。
+    /// 受控锚点可跳过鼠标切换监听；首次默认打开也绑定实际窗口，避免原生子视图盖住弹层。
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = window.use_keyed_state(self.id.clone(), cx, |_, cx| {
             PopoverState::new(self.default_open, cx)
@@ -355,6 +377,7 @@ impl RenderOnce for Popover {
             if let Some(open) = self.open {
                 state.sync_open(open, window, cx);
             }
+            state.bind_deferred_context(window, cx);
         });
 
         let open = state.read(cx).is_open();
@@ -520,6 +543,45 @@ mod tests {
         });
     }
 
+    /// 初始受控打开及旧接口可能跳过切换，仍须绑定窗口并在释放时清理。
+    #[gpui::test]
+    fn controlled_popover_binds_the_actual_window_without_reopening(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        let state = cx.update(|window, cx| {
+            let state = cx.new(|cx| PopoverState::new(true, cx));
+            state.update(cx, |state, cx| state.sync_open(true, window, cx));
+            assert!(GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx
+            ));
+            state.update(cx, |state, cx| state.set_open(true, cx));
+            assert!(!GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx
+            ));
+            state.update(cx, |state, cx| state.sync_open(true, window, cx));
+            assert!(GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx
+            ));
+            state.update(cx, |state, cx| state.sync_open(false, window, cx));
+            assert!(!GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx
+            ));
+            state.update(cx, |state, cx| state.sync_open(true, window, cx));
+            state
+        });
+        cx.update(|_, _| drop(state));
+        cx.update(|window, cx| {
+            assert!(!GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx
+            ));
+        });
+    }
+
     struct PopoverHarness {
         changes: Rc<RefCell<Vec<bool>>>,
         default_open: bool,
@@ -583,6 +645,7 @@ mod tests {
         assert_eq!(&*changes.borrow(), &[true, false]);
     }
 
+    /// 默认打开不经过动作切换，渲染时也须先登记窗口再协调原生子视图。
     #[gpui::test]
     fn default_open_renders_content_without_activation(cx: &mut gpui::TestAppContext) {
         cx.update(crate::init);
@@ -593,6 +656,12 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("base-popover-content").is_some());
+        cx.update(|window, cx| {
+            assert!(GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx
+            ));
+        });
     }
 
     /// A trigger that keeps "open" and "selected" apart, the way a downstream

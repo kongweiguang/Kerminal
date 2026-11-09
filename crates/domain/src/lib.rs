@@ -9,6 +9,7 @@ pub mod error;
 pub mod files;
 pub mod identity;
 pub mod operations;
+pub mod plugins;
 pub mod preferences;
 pub mod sessions;
 pub mod workspace;

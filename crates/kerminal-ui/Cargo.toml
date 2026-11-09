@@ -38,6 +38,28 @@ unicode_width.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 futures = { version = "0.3", default-features = false, features = ["executor"] }
+webview2-com = "=0.39.1"
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Com"] }
+windows-core = "=0.62.2"
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
+wry = "=0.57.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "=0.18.2"
+x11-dl = "=2.21.0"
+webkit2gtk = "=2.0.2"
+cairo-rs = { version = "=0.18.5", features = ["png"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 快照调用直接使用这些类型；显式依赖与 Wry 锁定的 objc2 家族保持同一套版本。
+block2 = "=0.6.2"
+objc2 = "=0.6.5"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSImage", "NSView", "NSWindow", "objc2-quartz-core"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSData", "NSError", "NSGeometry"] }
+objc2-web-kit = { version = "=0.3.2", default-features = false, features = ["std", "block2", "WKSnapshotConfiguration"] }
+image = { workspace = true, features = ["tiff"] }
 
 [dev-dependencies]
 # Headless tests exercise the selected GPUI backend without resolving Kit's optional fast backend.

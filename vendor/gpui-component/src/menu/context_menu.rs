@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -131,6 +133,7 @@ struct ContextMenuSharedState {
     /// the previously rendered frame, where the menu's own element is not yet.
     trigger_focus_handle: Option<FocusHandle>,
     _subscription: Option<Subscription>,
+    deferred_context: Option<gpui_base::DeferredPopover>,
 }
 
 pub struct ContextMenuState {
@@ -147,6 +150,7 @@ pub struct ContextMenuState {
 }
 
 impl Default for ContextMenuState {
+    /// 空闲触发器不持有弹层令牌，只有实际构建的非空菜单才需要避让。
     fn default() -> Self {
         Self {
             element: None,
@@ -158,6 +162,7 @@ impl Default for ContextMenuState {
                 position: Default::default(),
                 trigger_focus_handle: None,
                 _subscription: None,
+                deferred_context: None,
             })),
         }
     }
@@ -416,7 +421,7 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
 
 type MenuBuilder = dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu;
 
-/// Builds the menu and shows it at `position`.
+/// 替换和关闭共用窗口级令牌；保留已关闭的菜单实体不能继续隐藏原生子视图。
 fn open_menu(
     shared_state: &Rc<RefCell<ContextMenuSharedState>>,
     builder: &Option<Rc<MenuBuilder>>,
@@ -456,6 +461,7 @@ fn open_menu(
         shared_state.menu_view = None;
         shared_state.selection_input = None;
         shared_state._subscription = None;
+        shared_state.deferred_context = None;
         shared_state.position = position;
         shared_state.open = true;
     }
@@ -519,6 +525,7 @@ fn open_menu(
                         let mut state = shared_state.borrow_mut();
                         state.open = false;
                         state.selection_input = None;
+                        state.deferred_context = None;
                         window.refresh();
                     }
                 }
@@ -530,6 +537,12 @@ fn open_menu(
                 state.menu_view = Some(menu.clone());
                 state.selection_input = selection_input;
                 state._subscription = Some(_subscription);
+                state.deferred_context = (!menu.read(cx).is_empty()).then(|| {
+                    gpui_base::GlobalState::register_deferred_popover_in_window(
+                        window.window_handle().window_id(),
+                        cx,
+                    )
+                });
                 window.refresh();
             }
         }
@@ -548,6 +561,75 @@ mod tests {
     use std::cell::Cell;
 
     actions!(context_menu_test, [RemoveTab, CopyText]);
+
+    /// 旧菜单实体及迟到关闭事件不能影响新菜单，释放触发器也须清理登记。
+    #[gpui::test]
+    fn context_menu_registration_follows_open_owner_not_retained_entities(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        let shared = ContextMenuState::default().shared_state;
+        let builder: Option<Rc<MenuBuilder>> =
+            Some(Rc::new(|menu, _, _| menu.menu("Copy", Box::new(CopyText))));
+
+        cx.update(|window, cx| open_menu(&shared, &builder, Point::default(), window, cx));
+        cx.run_until_parked();
+        let old_menu = shared.borrow().menu_view.clone().unwrap();
+        cx.update(|window, cx| {
+            assert!(gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
+            open_menu(&shared, &builder, Point::default(), window, cx);
+        });
+        cx.run_until_parked();
+        let replacement = shared.borrow().menu_view.clone().unwrap();
+        assert_ne!(old_menu.entity_id(), replacement.entity_id());
+        cx.update(|_, cx| old_menu.update(cx, |_, cx| cx.emit(DismissEvent)));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
+            replacement.update(cx, |_, cx| cx.emit(DismissEvent));
+        });
+        cx.run_until_parked();
+        assert!(shared.borrow().menu_view.is_some());
+        cx.update(|window, cx| {
+            assert!(!gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
+            open_menu(&shared, &builder, Point::default(), window, cx);
+        });
+        cx.run_until_parked();
+        let retained_open_menu = shared.borrow().menu_view.clone().unwrap();
+        cx.update(|_, _| drop(shared));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
+            drop(retained_open_menu);
+        });
+    }
+
+    /// 空菜单没有可见弹层，即使触发器保留状态也不应遮挡原生视图。
+    #[gpui::test]
+    fn empty_context_menu_does_not_register_a_window_overlay(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        let shared = ContextMenuState::default().shared_state;
+        cx.update(|window, cx| open_menu(&shared, &None, Point::default(), window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
+        });
+    }
 
     /// The regression shape: the action handler lives on the trigger's
     /// ancestor (like an action bar), which is NOT on the focus path while
@@ -583,6 +665,7 @@ mod tests {
         }
     }
 
+    /// 覆盖真实指针路径和动作路由，确认菜单绘制到键盘关闭期间持续避让原生视图。
     #[gpui::test]
     fn action_bubbles_from_trigger_and_focus_restores_on_dismiss(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -622,12 +705,22 @@ mod tests {
         cx.run_until_parked();
         cx.update(|window, cx| {
             _ = window.draw(cx);
+            assert!(gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
         });
 
         // Select "Close" and confirm. Keyboard confirm and mouse click share
         // the same `confirm` path in `PopupMenu`.
         cx.simulate_keystrokes("down enter");
         cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
+        });
 
         // The action must reach the handler on the trigger's ancestor chain,
         // even though the action bar was never on the focus path.

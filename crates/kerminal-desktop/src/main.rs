@@ -7,8 +7,8 @@
     windows_subsystem = "windows"
 )]
 
-// gpui-kit 0.7.3 的 Action derive 固定展开 gpui:: 路径，因此仅在有该动作的 macOS 构建提供 facade 别名。
-#[cfg(target_os = "macos")]
+// Action derive 固定展开 gpui:: 路径；macOS 菜单与原生探针共用同一 Kit facade。
+#[cfg(any(target_os = "macos", feature = "acceptance-metrics"))]
 extern crate gpui_kit as gpui;
 
 #[cfg(feature = "acceptance-metrics")]
@@ -22,6 +22,8 @@ mod external_activation;
 mod fonts;
 mod host_coordinator;
 mod logging;
+#[cfg(feature = "acceptance-metrics")]
+mod native_list_probe;
 mod platform_lifecycle;
 mod profile_import;
 #[cfg(feature = "right-rail-acceptance")]
@@ -30,6 +32,8 @@ mod runtime;
 #[cfg(feature = "right-rail-acceptance")]
 mod settings_acceptance;
 mod update_configuration;
+#[cfg(feature = "acceptance-metrics")]
+mod webview_probe;
 
 use std::{
     error::Error,
@@ -98,10 +102,41 @@ type StartupError = Arc<Mutex<Option<String>>>;
 #[action(name = "kerminal.requestQuit", no_json, no_register)]
 struct MacApplicationQuit;
 
-/// 验收入口先限定隔离环境；普通启动先完成同一 Rust 迁移用例，失败时不得初始化业务服务。
+/// 探针参数缺少编译能力时明确拒绝，普通启动仍先经过迁移门禁再装配服务。
 ///
 /// @author kongweiguang
 fn main() {
+    #[cfg(not(feature = "acceptance-metrics"))]
+    if std::env::args_os().nth(1).is_some_and(|argument| {
+        argument == "--native-list-probe"
+            || argument == "--native-list-probe-worker"
+            || argument == "--webview-probe"
+    }) {
+        eprintln!("原生列表探针未编译；请使用 --features acceptance-metrics 构建。");
+        std::process::exit(2);
+    }
+    #[cfg(feature = "acceptance-metrics")]
+    if let Some(exit_code) = webview_probe::run_from_args(std::env::args_os().skip(1)) {
+        std::process::exit(exit_code);
+    }
+    // 原生性能探针只编译进验收构建，始终使用显式隔离根，不进入普通迁移或服务装配。
+    #[cfg(feature = "acceptance-metrics")]
+    if let Some(argument) = std::env::args_os().nth(1) {
+        let result = if argument == "--native-list-probe" {
+            Some(native_list_probe::run())
+        } else if argument == "--native-list-probe-worker" {
+            Some(native_list_probe::run_worker())
+        } else {
+            None
+        };
+        if let Some(result) = result {
+            if let Err(error) = result {
+                eprintln!("原生列表探针失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     // 离线校验必须早于配置迁移和桌面初始化；脚本只能读取显式指定的根目录。
     if let Some(exit_code) = configuration_validation::run_from_args(std::env::args_os().skip(1)) {
         std::process::exit(exit_code);

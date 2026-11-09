@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 use gpui::{
     AnyElement, App, ClickEvent, Context, DismissEvent, Edges, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, Length, ParentElement, Render,
@@ -135,6 +137,7 @@ where
     title_prefix: Option<SharedString>,
     focus_ring_enabled: bool,
     hover_style: Option<StyleRefinement>,
+    deferred_window: Option<gpui::WindowId>,
 }
 
 /// A Select element.
@@ -154,7 +157,7 @@ where
     D: SearchableListDelegate + 'static,
     <D::Item as SearchableListItem>::Value: PartialEq + Clone,
 {
-    /// Create a Select state with no hover override so existing callers keep the default theme.
+    /// 默认不覆盖悬停主题；窗口登记随打开和实际渲染绑定，避免影响其他窗口。
     ///
     /// @author kongweiguang
     pub fn new(
@@ -303,6 +306,7 @@ where
             title_prefix: None,
             focus_ring_enabled: true,
             hover_style: None,
+            deferred_window: None,
         }
     }
 
@@ -440,15 +444,28 @@ where
         });
     }
 
+    /// 保留原有关闭事件；无窗口参数的打开请求先登记全局状态，再由渲染绑定实际窗口。
     fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         let dismissed = self.state.open && !open;
         self.state.open = open;
         self.state.deferred_context = open.then(|| GlobalState::register_deferred_popover(cx));
+        self.deferred_window = None;
 
         if dismissed {
             cx.emit(DismissEvent);
         }
         cx.notify();
+    }
+
+    /// 菜单可能随实体迁到其他窗口；只在窗口变化时替换令牌，避免每帧重复登记。
+    fn bind_deferred_window(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let window_id = window.window_handle().window_id();
+        if self.state.open && self.deferred_window != Some(window_id) {
+            self.state.deferred_context = Some(GlobalState::register_deferred_popover_in_window(
+                window_id, cx,
+            ));
+            self.deferred_window = Some(window_id);
+        }
     }
 
     fn clean(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -518,10 +535,11 @@ where
     D: SearchableListDelegate + 'static,
     <D::Item as SearchableListItem>::Value: PartialEq + Clone,
 {
-    /// 只在启用时把可选 refinement 合并到触发器外框，避免 disabled 控件出现悬停状态。
+    /// 渲染前绑定菜单窗口；悬停覆盖仅用于启用状态，避免禁用控件出现悬停效果。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.bind_deferred_window(window, cx);
         let searchable = self.searchable;
         let is_focused = self.state.focus_handle.is_focused(window);
         let show_clean = self.state.cleanable && self.selected_index(cx).is_some();
@@ -892,13 +910,37 @@ where
 
 #[cfg(test)]
 mod tests {
-    use gpui::{AppContext as _, RenderOnce as _, TestAppContext};
+    use gpui::{AppContext as _, Render as _, RenderOnce as _, TestAppContext};
 
     use crate::{
         IndexPath,
         searchable_list::{SearchableListDelegate as _, SearchableVec},
         select::{Select, SelectGroup, SelectState},
     };
+
+    /// 实际渲染下拉菜单后登记所属窗口，关闭时立即释放，防止遮挡原生子视图。
+    #[gpui::test]
+    fn select_menu_registers_and_releases_its_window(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let state =
+                cx.new(|cx| SelectState::new(SearchableVec::new(vec!["Rust"]), None, window, cx));
+            state.update(cx, |state, cx| {
+                state.set_open(true, cx);
+                _ = state.render(window, cx);
+            });
+            assert!(gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
+            state.update(cx, |state, cx| state.set_open(false, cx));
+            assert!(!gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
+        });
+    }
 
     #[gpui::test]
     fn an_explicit_accessibility_label_does_not_replace_the_placeholder(cx: &mut TestAppContext) {

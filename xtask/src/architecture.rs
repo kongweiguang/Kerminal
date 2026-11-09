@@ -69,8 +69,6 @@ const UI_FORBIDDEN_RESOURCE_DEPENDENCIES: &[&str] = &[
     "toml",
     "toml_edit",
     "ureq",
-    "windows",
-    "windows-sys",
     "xterm",
     "xterm-addon-fit",
     "xterm-addon-web-links",
@@ -173,12 +171,55 @@ fn validate_packages(root: &Path, packages: &BTreeMap<String, Value>) -> Vec<Str
         validate_version_pins(name, package, &mut violations);
         validate_external_tests(name, package, &mut violations);
         if name == "kerminal-ui" {
+            validate_ui_native_window_dependencies(package, &mut violations);
             validate_ui_resource_sources(package, &mut violations);
         }
     }
 
     validate_legacy_web_inputs(root, &mut violations);
     violations
+}
+
+/// WebView 子窗口必须调用系统绘制 API；只放行 Windows 目标与明确的窗口/内存 COM 功能。
+/// 文件、进程和网络功能仍不属于 UI，即使通过依赖别名或新增 feature 请求也必须拒绝。
+fn validate_ui_native_window_dependencies(package: &Value, violations: &mut Vec<String>) {
+    for dependency in package
+        .get("dependencies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = dependency.get("name").and_then(Value::as_str).unwrap_or("");
+        let allowed: &[&str] = match name {
+            "windows" => &["Win32_Foundation", "Win32_System_Com"],
+            "windows-sys" => &[
+                "Win32_Foundation",
+                "Win32_Graphics_Gdi",
+                "Win32_UI_WindowsAndMessaging",
+                "Win32_UI_Input_KeyboardAndMouse",
+            ],
+            _ => continue,
+        };
+        if dependency.get("kind").and_then(Value::as_str) == Some("dev") {
+            continue;
+        }
+        let target = dependency.get("target").and_then(Value::as_str);
+        let features_valid = dependency
+            .get("features")
+            .and_then(Value::as_array)
+            .is_some_and(|features| {
+                features.iter().all(|feature| {
+                    feature
+                        .as_str()
+                        .is_some_and(|feature| allowed.contains(&feature))
+                })
+            });
+        if target != Some("cfg(windows)") || !features_valid {
+            violations.push(format!(
+                "kerminal-ui {name} may only enable reviewed Windows child-window features"
+            ));
+        }
+    }
 }
 
 /// 产品集合保持固定；SDK 按阶段加入，但只能使用已评审的独立工具包名。

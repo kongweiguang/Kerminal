@@ -1,3 +1,5 @@
+// @author kongweiguang
+
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Edges, ElementId, Entity,
     EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, Length,
@@ -123,6 +125,7 @@ where
     >,
     footer: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>>,
     focus_ring_enabled: bool,
+    deferred_window: Option<gpui::WindowId>,
 }
 
 /// Events emitted by [`ComboboxState`].
@@ -141,7 +144,7 @@ where
     D: SearchableListDelegate + 'static,
     <D::Item as SearchableListItem>::Value: PartialEq + Clone,
 {
-    /// Create a new `Combobox` state.
+    /// 菜单状态先独立创建，实际所属窗口在渲染时确认，避免误遮挡其他窗口。
     pub fn new(
         delegate: D,
         selected_indices: Vec<IndexPath>,
@@ -277,6 +280,7 @@ where
             render_trigger: None,
             footer: None,
             focus_ring_enabled: true,
+            deferred_window: None,
         }
     }
 
@@ -533,11 +537,24 @@ where
         cx.notify();
     }
 
+    /// 无窗口参数的打开保留全局交互登记，下一次渲染再绑定实际窗口。
     fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.state.open = open;
         self.state.deferred_context = open.then(|| GlobalState::register_deferred_popover(cx));
+        self.deferred_window = None;
 
         cx.notify();
+    }
+
+    /// 状态在原窗口重复渲染时复用令牌，窗口变化后才转移遮挡登记。
+    fn bind_deferred_window(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let window_id = window.window_handle().window_id();
+        if self.state.open && self.deferred_window != Some(window_id) {
+            self.state.deferred_context = Some(GlobalState::register_deferred_popover_in_window(
+                window_id, cx,
+            ));
+            self.deferred_window = Some(window_id);
+        }
     }
 
     fn clean(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -598,7 +615,9 @@ where
     D: SearchableListDelegate + 'static,
     <D::Item as SearchableListItem>::Value: PartialEq + Clone,
 {
+    /// 先绑定实际绘制菜单的窗口，再生成触发器和延迟弹层。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.bind_deferred_window(window, cx);
         let searchable = self.searchable;
         let is_focused = self.state.focus_handle.is_focused(window);
         let show_clean = self.state.cleanable && !self.state.selection.is_empty();
@@ -1086,7 +1105,7 @@ mod tests {
 
     use gpui::{
         AppContext as _, Bounds, Context, Entity, Modifiers, MouseButton, MouseDownEvent, Pixels,
-        Point, Subscription, TestAppContext, point, px, size,
+        Point, Render as _, Subscription, TestAppContext, point, px, size,
     };
 
     use crate::{
@@ -1097,6 +1116,30 @@ mod tests {
             SearchableVec,
         },
     };
+
+    /// 组合框的真实菜单渲染应登记本窗口，关闭后立即解除原生视图避让。
+    #[gpui::test]
+    fn combobox_menu_registers_and_releases_its_window(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let state = cx
+                .new(|cx| ComboboxState::new(SearchableVec::new(vec!["Rust"]), vec![], window, cx));
+            state.update(cx, |state, cx| {
+                state.set_open(true, cx);
+                _ = state.render(window, cx);
+            });
+            assert!(gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
+            state.update(cx, |state, cx| state.set_open(false, cx));
+            assert!(!gpui_base::GlobalState::has_deferred_popover_in_window(
+                window.window_handle().window_id(),
+                cx,
+            ));
+        });
+    }
 
     struct TestComboboxEventCollector {
         event_count: Rc<Cell<usize>>,

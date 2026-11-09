@@ -15,6 +15,35 @@ use std::{
 const CARGO_ABOUT_VERSION: &str = "cargo-about 0.9.2";
 const THIRD_PARTY_REPORT: &str = "licenses/THIRD_PARTY_DEPENDENCIES.html";
 
+/// 性能探针复用私有桌面启动器；显式候选与输出目录使原始数据对应可核对的构建。
+/// 不在此入口隐式构建或占用当前桌面，便于主任务统一排队重型工作。
+pub fn run_plugin_list_probe(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let [executable_flag, executable, output_flag, output] = arguments else {
+        return Err(
+            "usage: cargo xtask plugin-list-probe --executable <path> --output-dir <path>".into(),
+        );
+    };
+    if executable_flag != "--executable" || output_flag != "--output-dir" {
+        return Err("expected --executable and --output-dir".into());
+    }
+    if !cfg!(windows) {
+        return Err("Windows private desktop launcher requires Windows; use --native-list-probe in isolated Xvfb on Linux".into());
+    }
+    let status = Command::new("pwsh")
+        .current_dir(root)
+        .args([
+            "-NoProfile",
+            "-File",
+            "scripts/acceptance/native-list-probe.ps1",
+            "-ExecutablePath",
+            executable,
+            "-OutputDirectory",
+            output,
+        ])
+        .status()?;
+    require_success("native plugin list probe", status)
+}
+
 /// 显式 `--config` 会改变 cargo-packager 的相对路径基准，因此临时配置中的输入路径必须绝对化。
 pub(super) struct TemporaryPackagerConfig {
     pub(super) path: PathBuf,

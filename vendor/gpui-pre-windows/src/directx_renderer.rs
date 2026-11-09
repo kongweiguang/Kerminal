@@ -1263,9 +1263,12 @@ impl DirectXRenderPipelines {
 }
 
 impl DirectComposition {
+    /// 原生 WebView 使用子 HWND，GPUI 合成树必须位于子窗口之后，避免不透明背景遮住网页。
+    /// 弹层期间由宿主隐藏子窗口并绘制快照；不能依靠最上层合成树代替显隐协调。
+    /// CreateTargetForHwnd 的 topmost 语义见 Microsoft DirectComposition 文档。
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {

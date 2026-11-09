@@ -47,6 +47,7 @@ fn dispatch(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         "smoke" => command::run_desktop(&root, true),
         "run" => command::run_desktop(&root, false),
         "session-acceptance" => command::run_session_acceptance(&root, &arguments[1..]),
+        "plugin-list-probe" => command::run_plugin_list_probe(&root, &arguments[1..]),
         "package" => {
             let target = parse_package_target(&arguments)?;
             command::package(&root, target)
