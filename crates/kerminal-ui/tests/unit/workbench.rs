@@ -168,7 +168,9 @@ fn container_tool_rail_uses_container_identity_and_default_width() {
         "workbench-tool-containers"
     );
     assert!(matches!(
-        super::tool_rail_icon(ToolRailToolId::Containers),
+        crate::plugins::tools::builtin_presentation(ToolRailToolId::Containers)
+            .expect("built-in container presentation")
+            .icon(),
         gpui_kit::assets::IconName::Container
     ));
     let label = tool_rail_label(ToolRailToolId::Containers).to_string();

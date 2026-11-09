@@ -304,7 +304,6 @@ async fn prepare_fixture(
         route: HostRouteSettings::default(),
         serial: None,
         tags: Vec::new(),
-        is_favorite: false,
         sort_order: 0,
         connect_timeout_ms: 15_000,
         keepalive_interval_ms: None,

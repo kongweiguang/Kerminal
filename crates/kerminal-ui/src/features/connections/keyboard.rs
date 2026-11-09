@@ -67,6 +67,10 @@ impl ConnectionsPanel {
         ) {
             return;
         }
+        if self.plugin_forms.has_active() {
+            self.save_plugin_form(window, cx);
+            return;
+        }
         match self.active_editor_kind {
             Some(ConnectionsEditorKind::Local) => self.save_local_host(window, cx),
             Some(ConnectionsEditorKind::Remote) => self.save_editor(window, cx),

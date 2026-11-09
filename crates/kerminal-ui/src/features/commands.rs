@@ -341,6 +341,15 @@ pub struct SnippetEditorVisibilityChanged {
     pub focus_command_draft: bool,
 }
 
+/// 标题栏只表达期望的宿主，实际移动仍由 Root 核对活动标签和当前挂载。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SnippetHostMoveRequested {
+    Center,
+    ToolRail,
+}
+
 /// 新建片段时冻结当前 pane 的命令块身份；Root 只按此身份读取 transcript。
 ///
 /// @author kongweiguang
@@ -614,6 +623,7 @@ pub struct CommandsView {
 }
 
 impl EventEmitter<SnippetCurrentCommandRequested> for CommandsView {}
+impl EventEmitter<SnippetHostMoveRequested> for CommandsView {}
 
 type PanelLoad = (
     Option<Result<SessionInfo, AppError>>,
@@ -1180,6 +1190,18 @@ impl CommandsView {
     /// 为工具快捷键提供稳定入口；片段编辑状态仍由同一个 CommandsView Entity 持有。
     pub fn select_snippets(&mut self, cx: &mut Context<Self>) {
         self.select_section(CommandsSection::Snippets, cx);
+    }
+
+    /// 仅向已显示的片段目录交接焦点，编辑弹层仍保有自己的输入焦点。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn focus_snippets(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.section != CommandsSection::Snippets || self.snippet_editor_open() {
+            return false;
+        }
+        self.snippet_query
+            .update(cx, |input, cx| input.focus(window, cx));
+        true
     }
 
     /// 工作流导航复用同一 CommandsView，保留原编辑草稿、revision 与运行确认状态。

@@ -10,6 +10,7 @@ use kerminal_application::preferences::ToolRailToolId;
 use crate::features::{
     commands::{
         CommandsView, LogsView, SnippetCurrentCommandRequested, SnippetEditorVisibilityChanged,
+        SnippetHostMoveRequested,
     },
     files::FilesPane,
     operations::{OperationsView, proxy_panel::ProxyApplicationPanel},
@@ -23,6 +24,7 @@ pub(super) struct RetainedTabToolContents {
     snippet_editor_subscription: Option<Subscription>,
     snippet_fill_subscription: Option<Subscription>,
     snippet_current_command_subscription: Option<Subscription>,
+    snippet_host_move_subscription: Option<Subscription>,
     logs_view: Option<Entity<LogsView>>,
     logs_fill_subscription: Option<Subscription>,
     sftp_panel: Option<Entity<FilesPane>>,
@@ -78,6 +80,7 @@ impl RetainedTabToolContents {
             snippet_editor_subscription: root._snippet_editor_visibility_subscription.take(),
             snippet_fill_subscription: root._snippet_terminal_fill_subscription.take(),
             snippet_current_command_subscription: root._snippet_current_command_subscription.take(),
+            snippet_host_move_subscription: root._snippet_host_move_subscription.take(),
             logs_view: root.logs_view.take(),
             logs_fill_subscription: root._logs_fill_subscription.take(),
             sftp_panel: root.sftp_panel.take(),
@@ -102,6 +105,7 @@ impl RetainedTabToolContents {
         root._snippet_editor_visibility_subscription = self.snippet_editor_subscription;
         root._snippet_terminal_fill_subscription = self.snippet_fill_subscription;
         root._snippet_current_command_subscription = self.snippet_current_command_subscription;
+        root._snippet_host_move_subscription = self.snippet_host_move_subscription;
         root.logs_view = self.logs_view;
         root._logs_fill_subscription = self.logs_fill_subscription;
         if root.commands_view.is_none() {
@@ -110,6 +114,7 @@ impl RetainedTabToolContents {
                 root._snippet_editor_visibility_subscription,
                 root._snippet_terminal_fill_subscription,
                 root._snippet_current_command_subscription,
+                root._snippet_host_move_subscription,
             ) = RootView::subscribe_commands_view(root.commands_view.as_ref(), window, cx);
         }
         if root.logs_view.is_none() {
@@ -222,9 +227,10 @@ impl RootView {
         Option<Subscription>,
         Option<Subscription>,
         Option<Subscription>,
+        Option<Subscription>,
     ) {
         let Some(view) = view else {
-            return (None, None, None);
+            return (None, None, None, None);
         };
         let editor = cx.subscribe_in(
             view,
@@ -259,7 +265,30 @@ impl RootView {
                 }
             },
         );
-        (Some(editor), Some(fill), Some(current_command))
+        let move_host = cx.subscribe_in(
+            view,
+            window,
+            |root, source, target: &SnippetHostMoveRequested, window, cx| {
+                if root.commands_view.as_ref() != Some(source)
+                    || !root.tab_tool_contents_are_current()
+                {
+                    return;
+                }
+                if let Err(error) = root.move_snippets_host(*target, window, cx) {
+                    root.status = Some(crate::locale::text(
+                        format!("移动片段失败：{error}"),
+                        format!("Could not move snippets: {error}"),
+                    ));
+                    cx.notify();
+                }
+            },
+        );
+        (
+            Some(editor),
+            Some(fill),
+            Some(current_command),
+            Some(move_host),
+        )
     }
 
     /// 隐藏标签中的迟到导航事件不能切换共享编辑器，也不能打开根确认。

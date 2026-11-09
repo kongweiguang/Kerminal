@@ -254,9 +254,8 @@ impl WorkbenchLayoutSettings {
         self
     }
 }
-/// 右栏工具标识；序列化拼写与现行 TOML 的 camelCase 值一致。
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "camelCase")]
+/// 右栏工具标识；内置名称保持原值，合法的新贡献按原字符串往返。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ToolRailToolId {
     Context,
     AgentLauncher,
@@ -267,6 +266,86 @@ pub enum ToolRailToolId {
     Ports,
     System,
     Logs,
+    Plugin(PluginToolRailId),
+}
+
+/// 外部贡献包含插件命名空间；192 字节容纳清单上限，同时保留 Copy 身份和有界存储。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PluginToolRailId {
+    bytes: [u8; 192],
+    len: u8,
+}
+
+impl ToolRailToolId {
+    /// 复用注册校验与历史映射；命名空间贡献也按完整身份保存，不截断或哈希。
+    ///
+    /// @author kongweiguang
+    pub fn from_id(value: &str) -> Result<Self, crate::plugins::PluginRegistryError> {
+        let _ = crate::plugins::ToolId::new(value)?;
+        Ok(match value {
+            "context" => Self::Context,
+            "agentLauncher" => Self::AgentLauncher,
+            "sftp" => Self::Sftp,
+            "containers" => Self::Containers,
+            "snippets" => Self::Snippets,
+            "tmux" => Self::Tmux,
+            "ports" => Self::Ports,
+            "system" => Self::System,
+            "logs" => Self::Logs,
+            _ => {
+                let mut bytes = [0; 192];
+                bytes[..value.len()].copy_from_slice(value.as_bytes());
+                Self::Plugin(PluginToolRailId {
+                    bytes,
+                    len: value.len() as u8,
+                })
+            }
+        })
+    }
+
+    /// 持久化与工厂查找使用同一稳定字符串，展示名称不能改变身份。
+    ///
+    /// @author kongweiguang
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Context => "context",
+            Self::AgentLauncher => "agentLauncher",
+            Self::Sftp => "sftp",
+            Self::Containers => "containers",
+            Self::Snippets => "snippets",
+            Self::Tmux => "tmux",
+            Self::Ports => "ports",
+            Self::System => "system",
+            Self::Logs => "logs",
+            Self::Plugin(id) => std::str::from_utf8(&id.bytes[..usize::from(id.len)])
+                .expect("tool identity is copied from validated UTF-8"),
+        }
+    }
+}
+
+impl Serialize for ToolRailToolId {
+    /// TOML 表键和数组都沿用字符串编码，避免改变现有配置格式。
+    ///
+    /// @author kongweiguang
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolRailToolId {
+    /// 未注册但合法的工具仍保留身份，注册目录恢复后可重新使用原偏好。
+    ///
+    /// @author kongweiguang
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_id(&value).map_err(serde::de::Error::custom)
+    }
 }
 
 /// 工具面板在工作区中的停靠方式。
@@ -337,7 +416,9 @@ impl ToolRailSettings {
         }
         let mut hidden = Vec::new();
         for tool in self.hidden {
-            if order.contains(&tool) && !hidden.contains(&tool) {
+            if (order.contains(&tool) || matches!(tool, ToolRailToolId::Plugin(_)))
+                && !hidden.contains(&tool)
+            {
                 hidden.push(tool);
             }
         }
@@ -348,18 +429,25 @@ impl ToolRailSettings {
             .collect::<Vec<_>>();
         if !customizable.is_empty()
             && customizable.iter().all(|tool| hidden.contains(tool))
-            && let Some(first) = customizable.first()
+            && let Some(first) = customizable
+                .iter()
+                .find(|tool| !matches!(tool, ToolRailToolId::Plugin(_)))
         {
             hidden.retain(|tool| tool != first);
         }
-        let bottom = order
+        let mut bottom = order
             .iter()
             .copied()
             .filter(|tool| self.bottom.contains(tool))
-            .collect();
+            .collect::<Vec<_>>();
+        for tool in self.bottom {
+            if matches!(tool, ToolRailToolId::Plugin(_)) && !bottom.contains(&tool) {
+                bottom.push(tool);
+            }
+        }
         let mut placements = Self::default().panel_placements;
         for (tool, placement) in self.panel_placements {
-            if order.contains(&tool) {
+            if order.contains(&tool) || matches!(tool, ToolRailToolId::Plugin(_)) {
                 placements.insert(tool, placement);
             }
         }

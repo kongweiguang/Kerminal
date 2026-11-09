@@ -133,6 +133,7 @@ fn palette_families_have_distinct_visible_colors() {
 }
 
 /// 全局主题更新在系统明暗变化后保留配色，并同步 Kit、自绘区域和独立终端色盘。
+/// 行号槽与正文必须同源，防止编辑器高亮表面在切换后继续使用旧主题。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]
@@ -170,6 +171,12 @@ fn runtime_theme_switch_keeps_kit_and_views_in_sync(app: &mut gpui_kit::TestAppC
                 assert_eq!(KitTheme::global(cx).colors.slider_bar, expected.primary);
                 assert_eq!(KitTheme::global(cx).colors.caret, expected.accent);
                 assert_eq!(KitTheme::global(cx).colors.button_danger, expected.error);
+                let editor = &KitTheme::global(cx).highlight_theme.style;
+                assert_eq!(editor.editor_background, Some(expected.code_surface()));
+                assert_eq!(editor.editor_gutter_background, editor.editor_background);
+                assert_eq!(editor.editor_active_line, Some(expected.surface_hover()));
+                assert_eq!(editor.editor_line_number, Some(expected.muted));
+                assert_eq!(editor.editor_active_line_number, Some(expected.foreground));
                 assert_eq!(
                     terminal,
                     terminal_palette_for_mode(
@@ -185,6 +192,11 @@ fn runtime_theme_switch_keeps_kit_and_views_in_sync(app: &mut gpui_kit::TestAppC
                 assert_eq!(ThemeTokens::current(window, cx).panel, expected.panel);
                 assert_eq!(KitTheme::global(cx).colors.primary, expected.primary);
                 let colors = KitTheme::global(cx).colors;
+                let editor = &KitTheme::global(cx).highlight_theme.style;
+                assert_eq!(editor.editor_background, Some(expected.code_surface()));
+                assert_eq!(editor.editor_gutter_background, editor.editor_background);
+                assert_eq!(editor.editor_active_line, Some(expected.surface_hover()));
+                assert_eq!(editor.editor_line_number, Some(expected.muted));
                 for (foreground, backgrounds) in [
                     (
                         colors.danger_foreground,

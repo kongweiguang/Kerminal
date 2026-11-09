@@ -40,6 +40,7 @@ pub use root::SuggestionsAcceptanceState;
 #[cfg(feature = "right-rail-acceptance")]
 pub use root::{AgentAcceptanceSetup, ComposeAcceptanceOpenRequest};
 pub use root::{AppServices, QuitIntent, RootHostLifecycle, RootView, RootViewEvent};
+pub use root::{PluginUiBridge, PluginUiRegistration};
 
 /// 先注册 Kit 基础按键，再限定选择器和聚焦终端的覆盖，保留其它控件的正常焦点导航。
 pub fn init(cx: &mut gpui_kit::App) {

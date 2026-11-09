@@ -24,7 +24,10 @@ use gpui_kit::{
 use kerminal_application::{
     ApplicationTaskExecutor, ConfigurationChangeService,
     configuration_changes::ConfigurationChangeMessage,
-    connections::management::{HostGroup, HostGroupDraft, HostManagementService, ManagedHost},
+    connections::{
+        host_types::PluginHost,
+        management::{HostGroup, HostGroupDraft, HostManagementService, ManagedHost},
+    },
     preferences::{InterfaceDensity, ProfileService, VersionedProfile},
     workspace::{WorkspacePinnedContainer, WorkspaceTargetRef},
 };
@@ -146,6 +149,15 @@ fn host_navigation_layout_metrics(
 /// 左侧导航表达主机目录、主机选择、连接与 SFTP 意图；协议动作仍由 Root 交给现有面板。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostNavigationEvent {
+    PluginHostSelected {
+        host_id: HostId,
+    },
+    PluginHostOpenRequested {
+        host_id: HostId,
+    },
+    PluginHostEditRequested {
+        host_id: HostId,
+    },
     CreateLocalProfileRequested {
         group_id: Option<String>,
     },
@@ -340,6 +352,7 @@ pub struct HostNavigation {
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
     rows: Vec<ManagedHost>,
+    plugin_rows: Vec<PluginHost>,
     /// 为保留现有导航渲染，主机列表使用无环境变量的私有投影；不包含模板。
     profile_rows: Vec<VersionedProfile>,
     default_profile_name: Option<gpui_kit::SharedString>,
@@ -408,6 +421,7 @@ impl HostNavigation {
             search_input,
             _search_subscription: search_subscription,
             rows: Vec::new(),
+            plugin_rows: Vec::new(),
             profile_rows: Vec::new(),
             default_profile_name: None,
             groups: Vec::new(),
@@ -528,6 +542,13 @@ impl HostNavigation {
                 local: false,
             });
         }
+        if let Some(host) = self.plugin_rows.iter().find(|host| &host.id == host_id) {
+            return Some(HostMoveSnapshot {
+                group_id: host.group_id.as_deref(),
+                revision: &host.revision,
+                local: false,
+            });
+        }
         self.profile_rows
             .iter()
             .find(|row| row.profile.id == host_id.as_str())
@@ -555,13 +576,14 @@ impl HostNavigation {
             let result = executor
                 .run(move |_| async move {
                     let rows = hosts.list_hosts().await?;
+                    let plugin_hosts = hosts.list_plugin_hosts().await?;
                     let local_hosts = hosts.list_local_hosts().await?;
                     let groups = hosts.load_groups().await?;
                     let profiles = match profiles {
                         Some(profiles) => profiles.list_profiles().await?,
                         None => Vec::new(),
                     };
-                    Ok((rows, local_hosts, groups, profiles))
+                    Ok((rows, plugin_hosts, local_hosts, groups, profiles))
                 })
                 .await;
             cx.update(|app| {
@@ -572,8 +594,9 @@ impl HostNavigation {
                             navigation.reload_pending = true;
                         } else {
                             match result {
-                                Ok((rows, local_hosts, groups, profiles)) => {
+                                Ok((rows, plugin_hosts, local_hosts, groups, profiles)) => {
                                     navigation.rows = rows;
+                                    navigation.plugin_rows = plugin_hosts;
                                     navigation.groups = groups.groups;
                                     navigation.group_revision = groups.revision;
                                     navigation.default_profile_name =
@@ -589,6 +612,10 @@ impl HostNavigation {
                                         .collect();
                                     if navigation.selected_host.as_ref().is_some_and(|selected| {
                                         !navigation.rows.iter().any(|host| &host.id == selected)
+                                            && !navigation
+                                                .plugin_rows
+                                                .iter()
+                                                .any(|host| &host.id == selected)
                                     }) {
                                         navigation.selected_host = None;
                                     }
@@ -1083,6 +1110,40 @@ impl HostNavigation {
         cx.notify();
     }
 
+    /// 插件选择单独通知宿主，以便切换目标时清理旧主机的上下文。
+    fn select_plugin_host(&mut self, host_id: HostId, cx: &mut Context<Self>) {
+        self.selected_host = Some(host_id.clone());
+        self.selected_profile = None;
+        self.feedback = None;
+        cx.emit(HostNavigationEvent::PluginHostSelected { host_id });
+        cx.notify();
+    }
+
+    /// 打开时重新检查当前目录快照；没有运行提供方或主机已移除时不派发意图。
+    fn request_plugin_host_open(&mut self, host_id: HostId, cx: &mut Context<Self>) {
+        if !self
+            .plugin_rows
+            .iter()
+            .any(|host| host.id == host_id && host.is_runnable())
+        {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "插件主机不可用，请检查提供方后刷新。",
+                    "This plugin host is unavailable. Check its provider and refresh.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        if self.suppress_duplicate_open(&host_id) {
+            return;
+        }
+        self.select_plugin_host(host_id.clone(), cx);
+        cx.emit(HostNavigationEvent::PluginHostOpenRequested { host_id });
+    }
+
     /// 快速打开和上下文导航按当前目录校验目标；失效主机只显示反馈并刷新，不伪造选择。
     ///
     /// @author kongweiguang
@@ -1119,6 +1180,11 @@ impl HostNavigation {
         self.feedback = None;
         self.reload(cx);
         cx.notify();
+    }
+
+    /// 扩展主机保存回执同样先记录身份再重读，不能要求旧目录已包含新行。
+    pub(crate) fn select_saved_plugin_host(&mut self, host_id: HostId, cx: &mut Context<Self>) {
+        self.select_saved_host(host_id, cx);
     }
 
     /// 明确保存本地主机后按 ProfileId 选中；本地目标清除远端 Host 选择。
@@ -1257,7 +1323,7 @@ impl HostNavigation {
         cx.emit(event);
     }
 
-    /// 分组写操作只接受真实 groups.toml 条目，避免把收藏或未分组筛选当作可写实体。
+    /// 分组写操作只接受真实 groups.toml 条目，避免把未分组筛选当作可写实体。
     /// @author kongweiguang
     fn request_group_action(
         &mut self,
@@ -1695,6 +1761,8 @@ impl HostNavigation {
         );
         if local {
             self.select_local_profile(host_id.as_str().to_owned(), cx);
+        } else if self.plugin_rows.iter().any(|host| host.id == host_id) {
+            self.select_plugin_host(host_id.clone(), cx);
         } else {
             self.select_host(host_id.clone(), cx);
         }
@@ -1766,7 +1834,8 @@ impl HostNavigation {
 }
 
 impl Render for HostNavigation {
-    /// 侧栏使用 main 的工作台主题；背景菜单提供无分组的新建入口，不从当前选中行推断目标。
+    /// 导航不重复绘制宿主材质，保证停靠侧栏与紧凑抽屉都只合成一次背景。
+    /// 背景菜单提供无分组的新建入口，不从当前选中行推断目标。
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.start_configuration_watch(cx);
@@ -1783,7 +1852,6 @@ impl Render for HostNavigation {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(theme.materials.chrome)
             .text_color(theme.foreground)
             .child(render_navigation_header(
                 self,
@@ -1814,6 +1882,8 @@ impl Render for HostNavigation {
         }
         let filtered_profiles =
             filtered_profiles(&self.profile_rows, &self.groups, self.search.as_str());
+        let filtered_plugins =
+            filtered_plugin_hosts(&self.plugin_rows, &self.groups, self.search.as_str());
         // 空分组是用户保存的导航对象；无成员时仍须保留可右键管理的入口。
         let has_visible_saved_group = self.groups.iter().any(|group| {
             should_render_saved_group_header(&group.name, self.search.as_str(), false)
@@ -1847,7 +1917,11 @@ impl Render for HostNavigation {
             .overflow_y_scroll()
             .track_scroll(&self.host_tree_scroll_handle);
 
-        if self.loading && self.rows.is_empty() && self.profile_rows.is_empty() {
+        if self.loading
+            && self.rows.is_empty()
+            && self.plugin_rows.is_empty()
+            && self.profile_rows.is_empty()
+        {
             host_tree = host_tree.child(
                 div()
                     .w_full()
@@ -1862,6 +1936,7 @@ impl Render for HostNavigation {
                     .child(crate::locale::text("正在读取主机目录…", "Loading hosts…")),
             );
         } else if self.rows.is_empty()
+            && self.plugin_rows.is_empty()
             && self.profile_rows.is_empty()
             && let Some(status) = self.status.clone()
         {
@@ -1882,9 +1957,14 @@ impl Render for HostNavigation {
                             })),
                     ),
             );
-        } else if filtered.is_empty() && filtered_profiles.is_empty() && !has_visible_saved_group {
+        } else if filtered.is_empty()
+            && filtered_plugins.is_empty()
+            && filtered_profiles.is_empty()
+            && !has_visible_saved_group
+        {
             host_tree = host_tree.child(empty_state(
                 self.rows.is_empty()
+                    && self.plugin_rows.is_empty()
                     && self.profile_rows.is_empty()
                     && self.search.trim().is_empty(),
                 self.recovery.mode == ConfigurationMode::ReadOnlyRecovery,
@@ -1893,7 +1973,7 @@ impl Render for HostNavigation {
         } else {
             host_tree = render_tree_groups(
                 self,
-                (&filtered, &filtered_profiles),
+                (&filtered, &filtered_profiles, &filtered_plugins),
                 theme,
                 metrics,
                 window,
@@ -1903,7 +1983,8 @@ impl Render for HostNavigation {
         }
         content = content.child(host_tree.test_support());
 
-        let has_cached_catalog = !self.rows.is_empty() || !self.profile_rows.is_empty();
+        let has_cached_catalog =
+            !self.rows.is_empty() || !self.plugin_rows.is_empty() || !self.profile_rows.is_empty();
         let floating_feedback = self.feedback.as_ref().map_or_else(
             || {
                 (has_cached_catalog && !self.status_dismissed)
@@ -2047,7 +2128,7 @@ fn effective_navigation_group(group_id: Option<&str>, groups: &[HostGroup]) -> O
         .map(str::to_owned)
 }
 
-/// 搜索只裁剪当前分组树，未知分组引用归入未分组，不附加“收藏/全部”伪分组筛选。
+/// 搜索只裁剪当前分组树，未知分组引用归入未分组，不附加伪分组筛选。
 /// @author kongweiguang
 fn filtered_hosts(rows: &[ManagedHost], groups: &[HostGroup], query: &str) -> Vec<ManagedHost> {
     let query = query.trim().to_lowercase();
@@ -2102,7 +2183,7 @@ fn unique_default_profile_name(rows: &[VersionedProfile]) -> Option<gpui_kit::Sh
     (!name.is_empty()).then(|| gpui_kit::SharedString::from(name.to_owned()))
 }
 
-/// 本地 Profile 与主机共用搜索词和分组树，但不伪装成远程收藏项。
+/// 本地 Profile 与主机共用搜索词和分组树，但不伪装成远程主机项。
 /// @author kongweiguang
 fn filtered_profiles(
     rows: &[VersionedProfile],
@@ -2132,12 +2213,35 @@ fn filtered_profiles(
         .collect()
 }
 
+/// 插件主机按名称、类型和所属组搜索，不把配置正文或凭据引用用于搜索。
+fn filtered_plugin_hosts(
+    rows: &[PluginHost],
+    groups: &[HostGroup],
+    query: &str,
+) -> Vec<PluginHost> {
+    let query = query.trim().to_lowercase();
+    rows.iter()
+        .filter(|host| {
+            query.is_empty()
+                || host.name.to_lowercase().contains(&query)
+                || host.type_id.to_lowercase().contains(&query)
+                || host
+                    .group_id
+                    .as_deref()
+                    .and_then(|id| groups.iter().find(|group| group.id == id))
+                    .is_some_and(|group| group.name.to_lowercase().contains(&query))
+        })
+        .cloned()
+        .collect()
+}
+
 /// 两种配置快照均较大且体积不等，装箱让混排目录的枚举保持紧凑，避免按较大快照扩张每行空间。
 /// @author kongweiguang
 #[derive(Clone)]
 enum GroupNavigationItem {
     RemoteHost(Box<ManagedHost>),
     LocalHost(Box<VersionedProfile>),
+    PluginHost(Box<PluginHost>),
     PinnedContainer(Box<WorkspacePinnedContainer>),
 }
 
@@ -2146,6 +2250,7 @@ enum GroupNavigationItem {
 fn group_navigation_items(
     hosts: &[ManagedHost],
     profiles: &[VersionedProfile],
+    plugin_hosts: &[PluginHost],
     pinned_containers: &[WorkspacePinnedContainer],
     query: &str,
 ) -> Vec<GroupNavigationItem> {
@@ -2159,6 +2264,12 @@ fn group_navigation_items(
                 .cloned()
                 .map(|profile| GroupNavigationItem::LocalHost(Box::new(profile))),
         )
+        .chain(
+            plugin_hosts
+                .iter()
+                .cloned()
+                .map(|host| GroupNavigationItem::PluginHost(Box::new(host))),
+        )
         .collect::<Vec<_>>();
     items.sort_by(|left, right| {
         let (left_order, left_name, left_kind, left_id) = match left {
@@ -2171,6 +2282,9 @@ fn group_navigation_items(
                 0_u8,
                 profile.profile.id.as_str(),
             ),
+            GroupNavigationItem::PluginHost(host) => {
+                (host.sort_order, host.name.as_str(), 2_u8, host.id.as_str())
+            }
             GroupNavigationItem::PinnedContainer(container) => (
                 0,
                 container.name.as_str(),
@@ -2188,6 +2302,9 @@ fn group_navigation_items(
                 0_u8,
                 profile.profile.id.as_str(),
             ),
+            GroupNavigationItem::PluginHost(host) => {
+                (host.sort_order, host.name.as_str(), 2_u8, host.id.as_str())
+            }
             GroupNavigationItem::PinnedContainer(container) => (
                 0,
                 container.name.as_str(),
@@ -2532,14 +2649,14 @@ fn render_navigation_header(
 /// @author kongweiguang
 fn render_tree_groups(
     navigation: &mut HostNavigation,
-    filtered_items: (&[ManagedHost], &[VersionedProfile]),
+    filtered_items: (&[ManagedHost], &[VersionedProfile], &[PluginHost]),
     theme: ThemeTokens,
     metrics: HostNavigationLayoutMetrics,
     window: &mut Window,
     cx: &mut Context<HostNavigation>,
     mut tree: gpui_kit::Stateful<gpui_kit::Div>,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
-    let (filtered, filtered_profiles) = filtered_items;
+    let (filtered, filtered_profiles, filtered_plugins) = filtered_items;
     for group in navigation.groups.clone() {
         let hosts = filtered
             .iter()
@@ -2551,9 +2668,15 @@ fn render_tree_groups(
             .filter(|row| row.profile.sidebar_group_id.as_deref() == Some(&group.id))
             .cloned()
             .collect::<Vec<_>>();
+        let plugins = filtered_plugins
+            .iter()
+            .filter(|host| host.group_id.as_deref() == Some(&group.id))
+            .cloned()
+            .collect::<Vec<_>>();
         let items = group_navigation_items(
             &hosts,
             &profiles,
+            &plugins,
             &navigation.pinned_containers,
             navigation.search.as_str(),
         );
@@ -2598,9 +2721,21 @@ fn render_tree_groups(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let ungrouped_plugins = filtered_plugins
+        .iter()
+        .filter(|host| {
+            host.group_id.is_none()
+                || !navigation
+                    .groups
+                    .iter()
+                    .any(|group| Some(group.id.as_str()) == host.group_id.as_deref())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let ungrouped_items = group_navigation_items(
         &ungrouped,
         &ungrouped_profiles,
+        &ungrouped_plugins,
         &navigation.pinned_containers,
         navigation.search.as_str(),
     );
@@ -2934,6 +3069,9 @@ fn navigation_item_row(
         GroupNavigationItem::RemoteHost(host) => {
             host_row(navigation, *host, theme, metrics, window, cx).into_any_element()
         }
+        GroupNavigationItem::PluginHost(host) => {
+            plugin_host_row(navigation, *host, theme, metrics, window, cx).into_any_element()
+        }
         GroupNavigationItem::PinnedContainer(container) => {
             pinned_container_row(navigation, *container, theme, metrics, window, cx)
                 .into_any_element()
@@ -3225,6 +3363,211 @@ fn local_profile_row(
                 app.new(|_| HostDragPreview {
                     title: preview_title.clone(),
                     icon: Icon::new(IconName::SquareTerminal),
+                    cursor_offset,
+                })
+            })
+            .child(row)
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    }
+}
+
+/// 插件行保留稳定焦点和分组移动能力，缺失运行提供方时仍展示原记录且不发出打开意图。
+/// @author kongweiguang
+fn plugin_host_row(
+    navigation: &mut HostNavigation,
+    host: PluginHost,
+    theme: ThemeTokens,
+    metrics: HostNavigationLayoutMetrics,
+    window: &mut Window,
+    cx: &mut Context<HostNavigation>,
+) -> impl IntoElement + 'static {
+    let host_id = host.id.clone();
+    let dom_id = host_id.as_str().to_owned();
+    let focus_handle = window
+        .use_keyed_state(
+            format!("host-navigation-plugin-focus-{dom_id}"),
+            cx,
+            |_, cx| cx.focus_handle(),
+        )
+        .read(cx)
+        .clone();
+    let selected = navigation.selected_host.as_ref() == Some(&host_id);
+    let runnable = host.is_runnable();
+    let readonly = navigation.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
+    let editable = host.is_available() && !readonly;
+    let can_drag = !readonly
+        && navigation.pending_host_move.is_none()
+        && !navigation.loading
+        && navigation.status.is_none();
+    let pending = navigation
+        .pending_host_move
+        .as_ref()
+        .is_some_and(|pending| pending.host_id == host_id);
+    let subtitle = if !host.is_available() {
+        crate::locale::text("插件配置不可用", "Plugin configuration unavailable")
+    } else if !runnable {
+        crate::locale::text("插件运行提供方不可用", "Plugin runtime unavailable")
+    } else {
+        crate::locale::text(host.type_id.clone(), host.type_id.clone())
+    };
+    let name = host.name.clone();
+    let click_id = host_id.clone();
+    let menu_id = host_id.clone();
+    let menu_entity = cx.entity().clone();
+    let move_revision = host.revision.clone();
+    let drag = HostNavigationDrag {
+        source_navigation: cx.entity_id(),
+        host_id,
+        revision: host.revision,
+    };
+    let drag_entity = cx.entity().clone();
+    let preview_title: gpui_kit::SharedString = name.clone().into();
+    let row = navigation_row_button(
+        format!("host-navigation-plugin-{dom_id}"),
+        selected,
+        theme,
+        metrics,
+    )
+    .focus_handle(&focus_handle)
+    .min_w(px(0.))
+    .custom(
+        ButtonCustomVariant::new(cx)
+            .color(if selected {
+                theme.selected
+            } else {
+                theme.sidebar.opacity(0.)
+            })
+            .foreground(theme.foreground)
+            .hover(if selected {
+                theme.selected
+            } else {
+                theme.hover
+            })
+            .active(theme.selected),
+    )
+    .child(
+        div()
+            .size(px(metrics.icon_size))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_lg()
+            .bg(theme.selected)
+            .text_color(if runnable { theme.accent } else { theme.muted })
+            .child(Icon::new(gpui_kit::assets::IconName::Box).size(px(15.))),
+    )
+    .child(
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .flex()
+            .flex_col()
+            .items_start()
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(13.))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .child(name.clone()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(theme.text_xs)
+                    .text_color(theme.muted)
+                    .child(subtitle),
+            ),
+    )
+    .child(
+        div()
+            .w_4()
+            .flex_shrink_0()
+            .flex()
+            .justify_center()
+            .when(pending, |slot| {
+                slot.child(Spinner::new().small().color(theme.muted))
+            }),
+    )
+    .accessibility_label(if runnable {
+        crate::locale::text(
+            format!("{name}，单击选择，双击或按 Enter 打开"),
+            format!("{name}; click to select, double-click or press Enter to open"),
+        )
+    } else {
+        crate::locale::text(
+            format!("{name}，插件主机不可用"),
+            format!("{name}; plugin host unavailable"),
+        )
+    })
+    .on_click(
+        cx.listener(move |navigation, event: &ClickEvent, window, cx| {
+            if is_open_gesture(event) {
+                navigation.request_plugin_host_open(click_id.clone(), cx);
+            } else if event.click_count() == 1 {
+                window.focus(&focus_handle, cx);
+                navigation.select_plugin_host(click_id.clone(), cx);
+            }
+        }),
+    )
+    .context_menu(move |mut menu, window, cx| {
+        if runnable {
+            let open_entity = menu_entity.clone();
+            let open_id = menu_id.clone();
+            menu = menu.item(
+                PopupMenuItem::new(crate::locale::text("打开", "Open")).on_click(
+                    move |_, _, app| {
+                        open_entity.update(app, |navigation, cx| {
+                            navigation.request_plugin_host_open(open_id.clone(), cx)
+                        });
+                    },
+                ),
+            );
+        }
+        if editable {
+            let edit_entity = menu_entity.clone();
+            let edit_id = menu_id.clone();
+            menu = menu.item(
+                PopupMenuItem::new(crate::locale::text("编辑", "Edit")).on_click(
+                    move |_, _, app| {
+                        edit_entity.update(app, |_, cx| {
+                            cx.emit(HostNavigationEvent::PluginHostEditRequested {
+                                host_id: edit_id.clone(),
+                            });
+                        });
+                    },
+                ),
+            );
+        }
+        if !readonly {
+            menu = append_host_move_menu(
+                menu,
+                menu_entity.clone(),
+                menu_id.clone(),
+                move_revision.clone(),
+                window,
+                cx,
+            );
+        }
+        menu
+    });
+    if can_drag {
+        div()
+            .id(format!("host-navigation-plugin-drag-{dom_id}"))
+            .w_full()
+            .on_drag(drag, move |drag, cursor_offset, window, app| {
+                drag_entity.update(app, |navigation, cx| {
+                    navigation.begin_host_drag(drag.clone(), window, cx);
+                });
+                app.new(|_| HostDragPreview {
+                    title: preview_title.clone(),
+                    icon: Icon::new(gpui_kit::assets::IconName::Box),
                     cursor_offset,
                 })
             })

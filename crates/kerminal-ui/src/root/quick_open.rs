@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use gpui_kit::{Context, Window};
+use gpui_kit::{Context, FocusHandle, Window};
 use kerminal_application::{
     preferences::ToolRailToolId,
     sessions::{
@@ -21,11 +21,12 @@ use crate::features::quick_open::{
     QuickOpenTerminalTarget,
 };
 
-use super::{RootView, SessionCommand, terminal_keyboard};
+use super::{CenterPanel, RootView, SessionCommand, terminal_keyboard};
 
 impl RootView {
     /// 打开时固定 workspace 快照和当前可信 prompt binding，并镜像模态状态以隔离底层输入。
     /// 输入门禁只读 Root 的镜像，不能在 Command 回调持有子实体时反向借用面板。
+    /// 非终端发起焦点单独捕获；终端继续用 binding 恢复，避免绕过重连代次校验。
     ///
     /// @author kongweiguang
     pub(super) fn open_quick_open(
@@ -38,6 +39,14 @@ impl RootView {
             self.set_quick_open_status("快速打开面板尚未装配。", "Quick Open is unavailable.", cx);
             return;
         };
+        if !self.quick_open_modal_open {
+            self.quick_open_return_focus = window.focused(cx).filter(|focus| {
+                !self
+                    .pane_input_handlers
+                    .values()
+                    .any(|registration| registration.entity.read(cx).focus_handle() == *focus)
+            });
+        }
         let context = self.quick_open_open_context();
         view.update(cx, |view, cx| view.open(mode, context, window, cx));
         self.quick_open_modal_open = true;
@@ -85,6 +94,7 @@ impl RootView {
 
     /// 将 typed 选择还原为现有操作；终端动作沿用打开面板时捕获的 binding，禁止失效后转投。
     /// 事件在实体更新结束后处理；若面板已重开，旧关闭事件不能解除新一轮模态门禁。
+    /// 先恢复有效发起焦点再派发选择，目标失效或只更新列表选择时也不会遗留隐藏输入焦点。
     ///
     /// @author kongweiguang
     pub(super) fn handle_quick_open_event(
@@ -101,10 +111,16 @@ impl RootView {
             return;
         }
         self.quick_open_modal_open = false;
+        let return_focus = self.quick_open_return_focus.take();
+        let binding = match event {
+            QuickOpenEvent::Dismissed { origin_binding } => origin_binding.as_ref(),
+            QuickOpenEvent::Selected {
+                terminal_binding, ..
+            } => terminal_binding.as_ref(),
+        };
+        self.restore_quick_open_focus_or_root(return_focus.as_ref(), binding, window, cx);
         match event {
-            QuickOpenEvent::Dismissed { origin_binding } => {
-                self.restore_quick_open_focus_or_root(origin_binding.as_ref(), window, cx);
-            }
+            QuickOpenEvent::Dismissed { .. } => {}
             QuickOpenEvent::Selected {
                 selection,
                 origin,
@@ -170,18 +186,6 @@ impl RootView {
                             );
                         }
                     } else {
-                        if matches!(
-                            *action,
-                            crate::keybindings::KeybindingAction::SettingsOpen
-                                | crate::keybindings::KeybindingAction::SettingsKeybindings
-                        ) {
-                            // Preferences modal 保存 return focus 前先把焦点移出即将卸载的 Quick Open 输入框。
-                            self.restore_quick_open_focus_or_root(
-                                terminal_binding.as_ref(),
-                                window,
-                                cx,
-                            );
-                        }
                         self.dispatch_keybinding_action(*action, window, cx);
                     }
                 }
@@ -218,15 +222,22 @@ impl RootView {
         }
     }
 
-    /// 关闭面板时仅恢复仍属于原 UI pane 或 Agent session incarnation 的焦点。
+    /// 取消时优先返回仍挂载的非终端发起控件，终端仍须核验原 session incarnation。
+    /// 控件已卸载时退回常驻 Root，不将焦点交给已销毁的搜索框。
     ///
     /// @author kongweiguang
     fn restore_quick_open_focus_or_root(
         &mut self,
+        return_focus: Option<&FocusHandle>,
         binding: Option<&UiSessionBinding>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(focus) = return_focus.filter(|focus| self.focus_handle.contains(focus, window))
+        {
+            window.focus(focus, cx);
+            return;
+        }
         if !binding.is_some_and(|binding| self.restore_quick_open_focus(binding, window, cx)) {
             // 搜索框会随面板/设置模态卸载；无效目标时用常驻 Root handle，避免恢复到已销毁控件。
             window.focus(&self.focus_handle, cx);
@@ -393,7 +404,8 @@ impl RootView {
         self.focus_workspace_pane(tab_id.clone(), pane_id.clone(), window, cx);
     }
 
-    /// 只打开仍存在的 WorkspaceFile descriptor，并沿用 workspace 的文件脏状态门禁。
+    /// 只定位仍存在的文件宿主或内部文档描述，不凭内部路径伪造顶层标签；脏状态仍由原 owner 保护。
+    /// @author kongweiguang
     fn activate_quick_open_file(
         &mut self,
         tab_id: &TabId,
@@ -545,27 +557,42 @@ impl RootView {
         let _ = panel.update(cx, |panel, cx| panel.select_existing_agent(id, cx));
     }
 
-    /// 只沿现有 Window 打开未显示的工具，保持此入口不关闭面板、也不触发隐藏后的焦点恢复。
+    /// 使用真实挂载结果打开工具；窄窗中已有槽位但抽屉隐藏时只重新显示抽屉。
     ///
     /// @author kongweiguang
-    fn ensure_tool_panel_visible(
+    pub(super) fn ensure_tool_panel_visible(
         &mut self,
         tool: ToolRailToolId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let settings = self
-            .settings_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.tool_rail.clone())
-            .unwrap_or_default();
+        self.sync_tool_rail_active_tab();
+        if tool == ToolRailToolId::Snippets && self.center_panel == CenterPanel::Commands {
+            self.open_snippets_content(window, cx);
+            return;
+        }
+        let settings = self.current_tool_rail_settings();
         let slots = self.tool_rail_state.project(&settings).panels;
-        let mounted = slots.attached == Some(tool)
+        if super::workbench::tool_rail_panel_mounted(self, slots, tool, window, cx) {
+            return;
+        }
+        let has_slot = slots.attached == Some(tool)
             || slots.left == Some(tool)
             || slots.bottom == Some(tool)
             || slots.center == Some(tool);
-        if !mounted || (slots.attached == Some(tool) && self.right_dock_collapsed) {
+        if has_slot && !(slots.attached == Some(tool) && self.right_dock_collapsed) {
+            self.show_compact_tool_panel(tool, window, cx);
+        } else {
             self.toggle_tool_rail_panel(tool, window, cx);
+            let slots = self.tool_rail_state.project(&settings).panels;
+            let has_slot = slots.attached == Some(tool)
+                || slots.left == Some(tool)
+                || slots.bottom == Some(tool)
+                || slots.center == Some(tool);
+            if has_slot && !super::workbench::tool_rail_panel_mounted(self, slots, tool, window, cx)
+            {
+                self.show_compact_tool_panel(tool, window, cx);
+            }
         }
     }
 

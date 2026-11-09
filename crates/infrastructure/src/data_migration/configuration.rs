@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use kerminal_application::{
     AppError, AppResult,
-    connections::management::is_reserved_serial_host_tag,
+    connections::{host_types::HostConfigurationCatalog, management::is_reserved_serial_host_tag},
     preferences::{KeybindingPreference, SettingsSnapshot},
 };
 use kerminal_domain::preferences::{ConfigDocumentPath, ConfigurationIssueKind, ConfigurationMode};
@@ -74,17 +74,18 @@ struct DocumentSource {
     bytes: Vec<u8>,
 }
 
-/// 在任何写事务前完成当前文档校验、旧格式转换和输出校验；不创建目录或初始化指南。
-///
-/// @author kongweiguang
-pub(super) fn plan_configuration_migration(root: &Path) -> AppResult<Vec<super::FileEdit>> {
+/// 迁移规划携带冻结目录；缺失提供方的合法文档保留原文，已安装 codec 仍须通过。
+pub(super) fn plan_configuration_migration_with_host_types(
+    root: &Path,
+    host_types: Option<&HostConfigurationCatalog>,
+) -> AppResult<Vec<super::FileEdit>> {
     let mut sources = collect_configuration_sources(root)?;
     sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    ensure_recovery_state_is_migratable(root, &sources)?;
+    ensure_recovery_state_is_migratable(root, &sources, host_types)?;
 
     let mut edits = Vec::new();
     for source in sources {
-        if let Some(edit) = plan_document_edit(source)? {
+        if let Some(edit) = plan_document_edit(source, host_types)? {
             if path_contains_symlink(root, &edit.relative_path)? {
                 return Err(AppError::conflict(
                     "需要迁移的配置路径经过符号链接，迁移已拒绝",
@@ -279,8 +280,17 @@ fn path_contains_symlink(root: &Path, relative_path: &Path) -> AppResult<bool> {
 /// 只允许旧 host schema 与 snippet canonical rename 可解释的预检诊断；输出仍逐文档校验。
 ///
 /// @author kongweiguang
-fn ensure_recovery_state_is_migratable(root: &Path, sources: &[DocumentSource]) -> AppResult<()> {
-    let recovery = configuration::inspect_current_configuration(root);
+fn ensure_recovery_state_is_migratable(
+    root: &Path,
+    sources: &[DocumentSource],
+    host_types: Option<&HostConfigurationCatalog>,
+) -> AppResult<()> {
+    let recovery = match host_types {
+        Some(host_types) => {
+            configuration::inspect_current_configuration_with_host_types(root, host_types)
+        }
+        None => configuration::inspect_current_configuration(root),
+    };
     if recovery.mode == ConfigurationMode::ReadWrite {
         return Ok(());
     }
@@ -340,7 +350,10 @@ fn legacy_profile_without_group_is_valid(source: &DocumentSource) -> bool {
 /// 在只读源上规划一份配置文件编辑，并用当前 validator 检查输出文档。
 ///
 /// @author kongweiguang
-fn plan_document_edit(source: DocumentSource) -> AppResult<Option<super::FileEdit>> {
+fn plan_document_edit(
+    source: DocumentSource,
+    host_types: Option<&HostConfigurationCatalog>,
+) -> AppResult<Option<super::FileEdit>> {
     let original = std::str::from_utf8(&source.bytes)
         .map_err(|error| storage_error("配置文件不是有效 UTF-8", error))?;
     let mut document = original
@@ -395,12 +408,12 @@ fn plan_document_edit(source: DocumentSource) -> AppResult<Option<super::FileEdi
 
     validate_document_identity(&source.document_path, &document)?;
     if !migrated {
-        configuration::validate_current_configuration_document(&source.document_path, original)?;
+        validate_migrated_document(&source.document_path, original, host_types)?;
         return Ok(None);
     }
 
     let replacement = document.to_string();
-    configuration::validate_current_configuration_document(&source.document_path, &replacement)?;
+    validate_migrated_document(&source.document_path, &replacement, host_types)?;
     let after = replacement.into_bytes();
     if after == source.bytes {
         return Ok(None);
@@ -410,6 +423,20 @@ fn plan_document_edit(source: DocumentSource) -> AppResult<Option<super::FileEdi
         before: Some(source.bytes),
         after,
     }))
+}
+
+/// 保留旧测试和独立迁移默认入口，同时让显式目录控制插件字段验证。
+fn validate_migrated_document(
+    path: &ConfigDocumentPath,
+    source: &str,
+    host_types: Option<&HostConfigurationCatalog>,
+) -> AppResult<()> {
+    match host_types {
+        Some(host_types) => configuration::validate_current_configuration_document_with_host_types(
+            path, source, host_types,
+        ),
+        None => configuration::validate_current_configuration_document(path, source),
+    }
 }
 
 /// 保持现有文件 ID 与其受限路径一致，避免 schema 转换后仍无法由当前仓储读取。
@@ -693,6 +720,19 @@ fn add_missing_inline_defaults(table: &mut InlineTable, defaults: &[(&str, &str)
 ///
 /// @author kongweiguang
 fn migrate_host_document(document: &mut DocumentMut, schema_version: i64) -> AppResult<bool> {
+    if schema_version == HOST_SCHEMA_V3
+        && document
+            .get("protocol")
+            .and_then(Item::as_str)
+            .is_some_and(|protocol| {
+                !matches!(
+                    protocol,
+                    "local" | "ssh" | "sftp" | "rdp" | "telnet" | "serial"
+                )
+            })
+    {
+        return Ok(false);
+    }
     match schema_version {
         HOST_SCHEMA_V3 => return migrate_host_connection_options(document),
         HOST_SCHEMA_V1 => {

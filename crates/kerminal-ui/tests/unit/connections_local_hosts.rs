@@ -3,9 +3,10 @@
 //! @author kongweiguang
 
 use super::{
-    LocalHostDefaultValues, LocalHostEditorLoadIntent, LocalHostEditorMode, LocalHostInputBaseline,
-    LocalHostState, LocalHostUnknownMutation, LocalHostValidationField, local_host_draft,
-    local_host_needs_save, local_host_projection, local_host_validation_field,
+    LocalHostDefaultRequest, LocalHostDefaultValues, LocalHostEditorLoadIntent,
+    LocalHostEditorMode, LocalHostInputBaseline, LocalHostState, LocalHostUnknownMutation,
+    LocalHostValidationField, format_environment, local_host_draft, local_host_needs_save,
+    local_host_projection, local_host_validation_field, local_shell_candidate_fields,
     parse_profile_arguments, parse_profile_environment, profile_to_draft,
     project_explicit_local_defaults, project_untouched_local_defaults,
 };
@@ -26,6 +27,7 @@ use kerminal_application::{
             LocalHostSaveRecoveryToken, ManagedHost, ManagedLocalHost,
         },
     },
+    local_shells::LocalShellCandidate,
     preferences::{
         DefaultLocalShellProvider, ProfileDraft, ProfileRepository, ProfileRevision,
         VersionedProfile,
@@ -45,6 +47,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+use std::{ffi::OsString, path::PathBuf};
 use tokio::{
     runtime::{Builder, Runtime},
     sync::Semaphore,
@@ -86,6 +89,211 @@ fn local_host_projection_keeps_host_identity_and_explicit_environment() {
     assert_eq!(draft.args, vec!["-NoLogo"]);
 }
 
+/// 候选经可逆格式投影后保留空参数和多行参数，同时拒绝 OS 不可启动的空字符。
+/// @author kongweiguang
+#[test]
+fn local_shell_candidate_fields_preserve_special_argv_and_reject_nulls() {
+    let program = std::env::current_exe().expect("测试 executable 路径可用");
+    let expected_program = program
+        .as_os_str()
+        .to_str()
+        .expect("测试 executable 路径可表示为文本");
+    let candidate = LocalShellCandidate::new(
+        "test-shell",
+        "Test shell",
+        program.as_os_str().to_os_string(),
+        vec![OsString::from("--login"), OsString::new()],
+    )
+    .expect("测试候选有效");
+    let fields = local_shell_candidate_fields(&candidate).expect("候选字段可无损投影");
+
+    assert_eq!(fields.0, expected_program);
+    assert_eq!(fields.1, "--login\n\"\"");
+    assert_eq!(
+        parse_profile_arguments(&fields.1).unwrap(),
+        vec!["--login".to_owned(), String::new()]
+    );
+
+    let multiline = LocalShellCandidate::new(
+        "test-shell-newline",
+        "Test shell with multiline argument",
+        PathBuf::from(format!("{}-shell", program.display())).into_os_string(),
+        vec![OsString::from("--login\n--interactive")],
+    )
+    .expect("候选发现契约不解析 argv 字符含义");
+    let fields = local_shell_candidate_fields(&multiline).unwrap();
+    assert_eq!(
+        parse_profile_arguments(&fields.1).unwrap(),
+        ["--login\n--interactive"]
+    );
+    let empty_argument = LocalShellCandidate::new(
+        "empty-arg",
+        "Empty argument",
+        program.clone().into_os_string(),
+        vec![OsString::new()],
+    )
+    .unwrap();
+    let fields = local_shell_candidate_fields(&empty_argument).unwrap();
+    assert_eq!(parse_profile_arguments(&fields.1).unwrap(), [""]);
+    let null_argument = LocalShellCandidate::new(
+        "null-arg",
+        "Null argument",
+        program.into_os_string(),
+        vec![OsString::from("bad\0arg")],
+    )
+    .unwrap();
+    assert!(local_shell_candidate_fields(&null_argument).is_err());
+}
+
+/// 共享可执行文件的开发者环境以 argv 区分，不能把其他参数变体显示为已选中。
+/// @author kongweiguang
+#[test]
+fn shell_candidate_selection_matches_program_and_arguments() {
+    let program = std::env::current_exe().unwrap();
+    let plain = LocalShellCandidate::new(
+        "plain",
+        "Plain",
+        program.clone().into_os_string(),
+        Vec::new(),
+    )
+    .unwrap();
+    let developer = LocalShellCandidate::new(
+        "developer",
+        "Developer",
+        program.clone().into_os_string(),
+        vec![OsString::from("/k"), OsString::from("developer.cmd")],
+    )
+    .unwrap();
+    let program = program.to_str().unwrap();
+    assert!(super::local_shell_candidate_matches(&plain, program, ""));
+    assert!(!super::local_shell_candidate_matches(
+        &plain,
+        program,
+        "/k\ndeveloper.cmd"
+    ));
+    assert!(super::local_shell_candidate_matches(
+        &developer,
+        program,
+        "/k\ndeveloper.cmd"
+    ));
+    assert!(!super::local_shell_candidate_matches(
+        &developer, program, ""
+    ));
+}
+
+/// Shell 扫描的空结果、失败与取消使用不同状态，且失败不得丢掉上次可用候选。
+/// @author kongweiguang
+#[test]
+fn local_shell_discovery_distinguishes_empty_failure_and_cancellation() {
+    let candidate = LocalShellCandidate::new(
+        "test-shell",
+        "Test shell",
+        std::env::current_exe()
+            .expect("测试 executable 路径可用")
+            .into_os_string(),
+        Vec::new(),
+    )
+    .expect("测试候选有效");
+    let mut state = LocalHostState {
+        shell_candidates: vec![candidate],
+        shell_discovery_loaded: true,
+        shell_discovery_loading: true,
+        ..LocalHostState::default()
+    };
+
+    state.complete_shell_discovery(Err(AppError::unsupported("扫描不可用")));
+    assert!(!state.shell_discovery_loading);
+    assert!(state.shell_discovery_loaded);
+    assert_eq!(state.shell_candidates.len(), 1);
+    assert!(state.shell_discovery_error.is_some());
+
+    state.complete_shell_discovery(Err(AppError::cancelled("用户取消扫描")));
+    assert!(!state.shell_discovery_loading);
+    assert!(state.shell_discovery_loaded);
+    assert_eq!(state.shell_candidates.len(), 1);
+    assert!(state.shell_discovery_error.is_none());
+
+    state.complete_shell_discovery(Ok(Vec::new()));
+    assert!(!state.shell_discovery_loading);
+    assert!(state.shell_discovery_loaded);
+    assert!(state.shell_candidates.is_empty());
+    assert!(state.shell_discovery_error.is_none());
+}
+
+/// 取消会停止当前 adapter token 并使在途 generation 失效，但保留已扫描候选。
+/// @author kongweiguang
+#[test]
+fn cancelling_local_shell_discovery_invalidates_the_request_and_keeps_candidates() {
+    let cancellation = CancellationToken::new();
+    let candidate = LocalShellCandidate::new(
+        "test-shell",
+        "Test shell",
+        std::env::current_exe()
+            .expect("测试 executable 路径可用")
+            .into_os_string(),
+        Vec::new(),
+    )
+    .expect("测试候选有效");
+    let mut state = LocalHostState {
+        shell_candidates: vec![candidate],
+        shell_discovery_generation: 7,
+        shell_discovery_loading: true,
+        shell_discovery_cancellation: Some(cancellation.clone()),
+        ..LocalHostState::default()
+    };
+    let generation = state.shell_discovery_generation;
+
+    state.cancel_shell_discovery();
+
+    assert!(cancellation.is_cancelled());
+    assert_eq!(state.shell_discovery_generation, generation + 1);
+    assert!(!state.shell_discovery_loading);
+    assert_eq!(state.shell_candidates.len(), 1);
+}
+
+/// 零参数 Shell 候选被显式选择后，迟到的系统默认目标不得再补入其它 Shell 的参数。
+/// @author kongweiguang
+#[test]
+fn explicit_zero_argument_shell_choice_rejects_a_late_default_target_projection() {
+    let candidate = LocalShellCandidate::new(
+        "test-bash",
+        "Test Bash",
+        std::env::current_exe()
+            .expect("测试 executable 路径可用")
+            .into_os_string(),
+        Vec::new(),
+    )
+    .expect("测试候选有效");
+    let (selected_shell, selected_args) =
+        local_shell_candidate_fields(&candidate).expect("Shell 字段可表示");
+    assert!(selected_args.is_empty());
+
+    let original = baseline("Local", "", "", "", "");
+    let selected = baseline("Local", &selected_shell, "", &selected_args, "");
+    let late_defaults = LocalHostDefaultValues {
+        shell: "pwsh.exe".to_owned(),
+        cwd: String::new(),
+        args: "-NoLogo".to_owned(),
+        env: String::new(),
+    };
+    let projection = project_untouched_local_defaults(&original, &selected, late_defaults);
+    assert!(projection.shell.is_none());
+    assert!(projection.args.is_none());
+
+    let mut state = LocalHostState {
+        default_target_request: Some(LocalHostDefaultRequest {
+            profile_id: None,
+            explicit_override: None,
+        }),
+        ..LocalHostState::default()
+    };
+    let stale_generation = state.default_target_generation;
+    state.invalidate_default_target_resolution();
+
+    assert!(state.default_target_request.is_none());
+    assert!(!state.accepts_default_target_generation(stale_generation));
+}
+
 /// 给每个本地主机字段构造一致的原始输入快照，验证默认值异步到达时的保护规则。
 fn baseline(name: &str, shell: &str, cwd: &str, args: &str, env: &str) -> LocalHostInputBaseline {
     LocalHostInputBaseline {
@@ -99,7 +307,8 @@ fn baseline(name: &str, shell: &str, cwd: &str, args: &str, env: &str) -> LocalH
 }
 
 #[test]
-/// 默认目标晚于用户输入返回时，只填补仍未修改的对应字段，不污染名称基线。
+/// 默认目标晚于参数编辑时，不另换 Shell 造成命令混用；目录和环境仍按各自基线保护。
+/// @author kongweiguang
 fn late_default_result_only_projects_fields_unchanged_since_editor_opened() {
     let original = baseline("本地主机", "", "", "", "");
     let current = baseline("用户改过的名称", "", "", "--login\n--noprofile", "K=custom");
@@ -112,16 +321,42 @@ fn late_default_result_only_projects_fields_unchanged_since_editor_opened() {
 
     let projection = project_untouched_local_defaults(&original, &current, defaults);
 
-    assert_eq!(projection.shell.as_deref(), Some("pwsh.exe"));
+    assert_eq!(projection.shell, None);
     assert_eq!(projection.cwd.as_deref(), Some("C:\\work"));
     assert_eq!(projection.args, None);
     assert_eq!(projection.env, None);
     assert_eq!(projection.baseline.name, original.name);
-    assert_eq!(projection.baseline.shell, "pwsh.exe");
+    assert_eq!(projection.baseline.shell, original.shell);
     assert_eq!(projection.baseline.cwd, "C:\\work");
     assert_eq!(projection.baseline.args, original.args);
     assert_eq!(projection.baseline.env, original.env);
     assert_ne!(current.name, original.name);
+}
+
+/// 手动输入和文件选择都只改程序字段；默认及主动 Profile 回执均不得把其它 Shell 参数混入。
+/// @author kongweiguang
+#[test]
+fn late_profile_command_projection_keeps_program_and_arguments_together() {
+    let original = baseline("Local", "", "", "", "");
+    for current in [
+        baseline("Local", "cmd.exe", "", "", ""),
+        baseline("Local", "", "", "/k\ncustom.cmd", ""),
+    ] {
+        let defaults = LocalHostDefaultValues {
+            shell: "pwsh.exe".to_owned(),
+            cwd: "workspace".to_owned(),
+            args: "-NoLogo".to_owned(),
+            env: "TERM=xterm".to_owned(),
+        };
+        let automatic = project_untouched_local_defaults(&original, &current, defaults.clone());
+        let explicit = project_explicit_local_defaults(&original, &current, defaults, &original);
+        for projection in [automatic, explicit] {
+            assert!(projection.shell.is_none());
+            assert!(projection.args.is_none());
+            assert_eq!(projection.cwd.as_deref(), Some("workspace"));
+            assert_eq!(projection.env.as_deref(), Some("TERM=xterm"));
+        }
+    }
 }
 
 #[test]
@@ -181,13 +416,15 @@ fn explicit_default_request_overrides_prior_values_and_preserves_later_edits() {
 }
 
 #[test]
-/// 空参数编辑区表达零参数，显式空行仍代表一个空参数以保持现有表单兼容性。
+/// 空编辑区表达零参数，显式空行保持兼容，引用项可明确表达单个空参数。
 fn argument_lines_preserve_explicit_empty_arguments() {
-    assert_eq!(parse_profile_arguments(""), Vec::<String>::new());
+    assert_eq!(parse_profile_arguments("").unwrap(), Vec::<String>::new());
     assert_eq!(
-        parse_profile_arguments("--flag\n\nvalue"),
+        parse_profile_arguments("--flag\n\nvalue").unwrap(),
         vec!["--flag".to_owned(), "".to_owned(), "value".to_owned()]
     );
+    assert_eq!(parse_profile_arguments("\"\"").unwrap(), [""]);
+    assert!(parse_profile_arguments("\"unfinished").is_err());
 }
 
 #[test]
@@ -198,6 +435,107 @@ fn environment_lines_split_once_and_reject_duplicate_keys() {
     assert_eq!(values.get("TERM").map(String::as_str), Some("xterm"));
     assert!(parse_profile_environment("MISSING_SEPARATOR").is_err());
     assert!(parse_profile_environment("DUP=first\nDUP=second").is_err());
+}
+
+/// 值内换行和等号不得生成新变量；既有合法键的空白和引号也不能在改名保存时改变。
+/// @author kongweiguang
+#[test]
+fn environment_text_roundtrip_keeps_multiline_values_and_exact_keys() {
+    let values = BTreeMap::from([
+        ("TOKEN".to_owned(), "first\nEXTRA=second".to_owned()),
+        (
+            "OTHER".to_owned(),
+            "second line\nwithout separator\r\n\"quote\"".to_owned(),
+        ),
+        (" spaced key ".to_owned(), r"C:\temp\new".to_owned()),
+        ("line\nkey".to_owned(), String::new()),
+    ]);
+    assert_eq!(
+        parse_profile_environment(&format_environment(&values)).unwrap(),
+        values
+    );
+    assert!(parse_profile_environment("\"KEY=value").is_err());
+    assert!(parse_profile_environment("A=ok\n\"A=second\nline\"").is_err());
+    assert!(parse_profile_environment("KEY=bad\0value").is_err());
+}
+
+/// 生产编辑器仅改名称时须保留单空参数和多行参数/环境，不依赖纯编解码测试相互抵消。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn renaming_local_editor_preserves_typed_arguments_and_environment(app: &mut TestAppContext) {
+    let (_runtime, panel, visual) = local_delete_fixture(app, delayed_local_host_repository());
+    for args in [
+        vec![String::new()],
+        vec!["-Command".to_owned(), "first\nsecond".to_owned()],
+    ] {
+        visual.update(|window, app| {
+            panel.update(app, |panel, cx| {
+                let env = BTreeMap::from([("TOKEN".to_owned(), "first\nEXTRA=second".to_owned())]);
+                let draft = ProfileDraft {
+                    id: Some("local-roundtrip".to_owned()),
+                    name: "original".to_owned(),
+                    shell: "pwsh.exe".to_owned(),
+                    args: args.clone(),
+                    cwd: None,
+                    env: env.clone(),
+                    sidebar_group_id: None,
+                    sort_order: 0,
+                };
+                let editor = panel.make_local_host_editor(
+                    draft,
+                    Some(ConfigRevision::from_sha256("saved".to_owned())),
+                    LocalHostEditorMode::Edit,
+                    window,
+                    cx,
+                );
+                editor
+                    .name
+                    .update(cx, |input, cx| input.replace_all("renamed", window, cx));
+                let submitted = editor.draft(cx).unwrap();
+                assert_eq!(submitted.name, "renamed");
+                assert_eq!(submitted.args, args);
+                assert_eq!(submitted.env, env);
+            })
+        });
+    }
+}
+
+/// 两种列表的格式错误由生产保存入口定位到各自字段，且不能进入仓储写入。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn local_list_syntax_errors_focus_their_own_field(app: &mut TestAppContext) {
+    use super::super::panel::ConnectionsEditorKind;
+    let (_runtime, panel, visual) = local_delete_fixture(app, delayed_local_host_repository());
+    visual.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.activate_local_host_editor(window, cx);
+            assert_eq!(panel.active_editor_kind, Some(ConnectionsEditorKind::Local));
+            for field in [
+                LocalHostValidationField::Arguments,
+                LocalHostValidationField::Environment,
+            ] {
+                let editor = panel.local_hosts.editor.as_ref().unwrap();
+                editor
+                    .args
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                editor
+                    .env
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                let input = if field == LocalHostValidationField::Arguments {
+                    &editor.args
+                } else {
+                    &editor.env
+                };
+                input.update(cx, |input, cx| input.set_value("\"unfinished", window, cx));
+                panel.save_local_host(window, cx);
+                assert!(!panel.local_hosts.saving);
+                assert_eq!(
+                    panel.local_hosts.editor.as_ref().unwrap().validation_field,
+                    Some(field)
+                );
+            }
+        })
+    });
 }
 
 /// Profile 校验只聚焦已知字段，复合参数限制按原始启动参数决定聚焦终端页的哪一项。

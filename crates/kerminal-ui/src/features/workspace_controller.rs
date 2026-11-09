@@ -41,6 +41,9 @@ pub enum WorkspaceRestoreItem {
     WorkspaceFile {
         tab: Box<WorkspaceSessionTab>,
     },
+    Extension {
+        tab: Box<WorkspaceSessionTab>,
+    },
     UnsupportedTab {
         tab: Box<WorkspaceSessionTab>,
     },
@@ -234,7 +237,8 @@ impl WorkspaceController {
         &self.snapshot
     }
 
-    /// 用快照生成 tabs 组件纯投影，非终端 tab 不伪造 layout 或 pane。
+    /// 文件宿主与内部文档共用文件恢复身份但不伪造 pane；扩展内容保留自己的提供方身份。
+    /// @author kongweiguang
     pub fn tab_projections(&self) -> Vec<WorkspaceTabProjection> {
         ordered_tab_indices(&self.snapshot)
             .into_iter()
@@ -250,6 +254,10 @@ impl WorkspaceController {
                     WorkspaceSessionTab::WorkspaceFile { .. } => {
                         (WorkspaceTabKind::WorkspaceFile, None)
                     }
+                    WorkspaceSessionTab::Extension { content_id, .. } => (
+                        WorkspaceTabKind::Extension(SharedString::from(content_id.clone())),
+                        None,
+                    ),
                     WorkspaceSessionTab::Unsupported { kind, .. } => (
                         WorkspaceTabKind::Unsupported(SharedString::from(kind.clone())),
                         None,
@@ -289,7 +297,8 @@ impl WorkspaceController {
             .collect()
     }
 
-    /// 返回全部恢复意图；Root 必须按 ID 各自创建，不复用一个 live session 给多个 pane。
+    /// 文件宿主等待目标恢复回执，不为内部目录制造会话；扩展标签仍按提供者身份恢复。
+    /// @author kongweiguang
     pub fn restore_plan(&self) -> Vec<WorkspaceRestoreItem> {
         let panes = self
             .snapshot
@@ -317,6 +326,11 @@ impl WorkspaceController {
                 }
                 WorkspaceSessionTab::WorkspaceFile { .. } => {
                     items.push(WorkspaceRestoreItem::WorkspaceFile {
+                        tab: Box::new(tab.clone()),
+                    });
+                }
+                WorkspaceSessionTab::Extension { .. } => {
+                    items.push(WorkspaceRestoreItem::Extension {
                         tab: Box::new(tab.clone()),
                     });
                 }
@@ -383,6 +397,37 @@ impl WorkspaceController {
         snapshot: WorkspaceSessionSnapshot,
     ) -> AppResult<WorkspaceControllerEffect> {
         self.synchronize_snapshot_inner(snapshot, None)
+    }
+
+    /// 提取的插件草稿先进入同一工作区状态机，使在途 CAS 和未知提交继续由原门禁处理。
+    /// @author kongweiguang
+    pub fn update_plugin_tab_state(
+        &mut self,
+        tab_id: &TabId,
+        state_version: u32,
+        state: serde_json::Value,
+    ) -> AppResult<bool> {
+        let mut snapshot = self.snapshot.clone();
+        let tab = snapshot
+            .terminal_tabs
+            .iter_mut()
+            .find(|tab| tab.id() == tab_id)
+            .ok_or_else(|| AppError::not_found("扩展标签不存在"))?;
+        let WorkspaceSessionTab::Extension {
+            state_version: current_version,
+            state: current_state,
+            ..
+        } = tab
+        else {
+            return Err(AppError::invalid("工作区标签不是扩展内容"));
+        };
+        if *current_version == state_version && *current_state == state {
+            return Ok(false);
+        }
+        *current_version = state_version;
+        *current_state = state;
+        self.synchronize_snapshot(snapshot)?;
+        Ok(true)
     }
 
     /// 只为 Root 已核实的本机临时容器放行目标为空的 UI snapshot；该 pane 仍由运行态 owner 绑定。
@@ -1780,7 +1825,8 @@ impl WorkspaceController {
         self.commit_local_change(candidate)
     }
 
-    /// 激活任意标签时只计算聚合字段；实体和资源实际重建顺序留给 Root。
+    /// 激活非终端标签时清除陈旧 pane 焦点；实例的实际激活由宿主负责。
+    /// @author kongweiguang
     fn select_tab(&mut self, tab: &WorkspaceSessionTab) {
         self.snapshot.active_tab_id = Some(tab.id().clone());
         match tab {
@@ -1813,7 +1859,7 @@ impl WorkspaceController {
                 self.snapshot.focused_pane_id = None;
                 self.snapshot.selected_machine_id = Some(machine_id.clone());
             }
-            WorkspaceSessionTab::Unsupported { .. } => {
+            WorkspaceSessionTab::Extension { .. } | WorkspaceSessionTab::Unsupported { .. } => {
                 self.snapshot.focused_pane_id = None;
                 self.snapshot.selected_machine_id = None;
             }
@@ -1951,7 +1997,8 @@ impl WorkspaceController {
     }
 }
 
-/// 根据已验证目标初始化恢复状态；未知协议或缺少目标明确不可用，不回退到 machineId。
+/// 扩展恢复等待工厂回执；未知协议或缺少目标明确不可用，不回退到其他资源。
+/// @author kongweiguang
 fn initial_restore_status(
     snapshot: &WorkspaceSessionSnapshot,
 ) -> BTreeMap<WorkspaceRestoreItemId, WorkspaceRestoreStatus> {
@@ -1983,7 +2030,8 @@ fn initial_restore_status(
                     WorkspaceRestoreStatus::Failed(WorkspaceRestoreFailure::UnsupportedTab),
                 );
             }
-            WorkspaceSessionTab::SftpTransfer { id, .. } => {
+            WorkspaceSessionTab::SftpTransfer { id, .. }
+            | WorkspaceSessionTab::Extension { id, .. } => {
                 status.insert(
                     WorkspaceRestoreItemId::Tab(id.clone()),
                     WorkspaceRestoreStatus::Pending,
@@ -2009,7 +2057,8 @@ fn restore_status_for_target(target: Option<&WorkspaceTargetRef>) -> WorkspaceRe
     }
 }
 
-/// Root 只能把已创建资源的显式目标写入快照；缺失或未知目标不能伪装成 Ready。
+/// 新文件宿主与文档同样要求明确目标，避免普通同步把不可恢复资源伪装成 Ready。
+/// @author kongweiguang
 fn validate_new_runtime_targets(
     previous: &WorkspaceSessionSnapshot,
     next: &WorkspaceSessionSnapshot,
@@ -2111,7 +2160,8 @@ fn remove_tab_from_snapshot(snapshot: &mut WorkspaceSessionSnapshot, index: usiz
     }
 }
 
-/// 激活后继 tab 时重新绑定焦点到其第一 pane，非终端 tab 不继承前一终端焦点。
+/// 激活后继 tab 时重新绑定焦点到其第一 pane，扩展标签不继承前一终端焦点。
+/// @author kongweiguang
 fn set_active_tab(snapshot: &mut WorkspaceSessionSnapshot, tab: &WorkspaceSessionTab) {
     snapshot.active_tab_id = Some(tab.id().clone());
     match tab {
@@ -2136,19 +2186,21 @@ fn set_active_tab(snapshot: &mut WorkspaceSessionSnapshot, tab: &WorkspaceSessio
             snapshot.focused_pane_id = None;
             snapshot.selected_machine_id = Some(machine_id.clone());
         }
-        WorkspaceSessionTab::Unsupported { .. } => {
+        WorkspaceSessionTab::Extension { .. } | WorkspaceSessionTab::Unsupported { .. } => {
             snapshot.focused_pane_id = None;
             snapshot.selected_machine_id = None;
         }
     }
 }
 
-/// 更新 tab enum 的 group 引用而不触及布局、恢复目标或任何 Root-owned session 映射。
+/// 更新标签的组引用而不触及布局、扩展状态或运行中的资源。
+/// @author kongweiguang
 fn set_tab_group(tab: &mut WorkspaceSessionTab, group_id: Option<WorkspaceTabGroupId>) {
     match tab {
         WorkspaceSessionTab::Terminal { tab_group_id, .. }
         | WorkspaceSessionTab::SftpTransfer { tab_group_id, .. }
         | WorkspaceSessionTab::WorkspaceFile { tab_group_id, .. }
+        | WorkspaceSessionTab::Extension { tab_group_id, .. }
         | WorkspaceSessionTab::Unsupported { tab_group_id, .. } => *tab_group_id = group_id,
     }
 }
@@ -2224,12 +2276,14 @@ fn ensure_unique_group_title(
     Ok(())
 }
 
-/// 只改 tab enum 的 title 字段，保留每个 tab kind 的 target/layout/编辑状态。
+/// 只改标签标题，保留目标、布局与插件提供者的状态。
+/// @author kongweiguang
 fn set_tab_title(tab: &mut WorkspaceSessionTab, title: String) {
     match tab {
         WorkspaceSessionTab::Terminal { title: current, .. }
         | WorkspaceSessionTab::SftpTransfer { title: current, .. }
         | WorkspaceSessionTab::WorkspaceFile { title: current, .. }
+        | WorkspaceSessionTab::Extension { title: current, .. }
         | WorkspaceSessionTab::Unsupported { title: current, .. } => *current = title,
     }
 }

@@ -140,13 +140,7 @@ fn sidebar_density_scales_geometry_with_interface_text() {
 }
 
 /// 只构造导航筛选所需的完整 managed host 快照，备注为空以保持筛选样例不含额外语义。
-fn host(
-    name: &str,
-    address: &str,
-    group_id: Option<&str>,
-    favorite: bool,
-    tags: &[&str],
-) -> ManagedHost {
+fn host(name: &str, address: &str, group_id: Option<&str>, tags: &[&str]) -> ManagedHost {
     ManagedHost {
         id: HostId::new(),
         group_id: group_id.map(str::to_owned),
@@ -164,7 +158,6 @@ fn host(
         route: HostRouteSettings::default(),
         serial: None,
         tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
-        is_favorite: favorite,
         sort_order: 0,
         connect_timeout_ms: 30_000,
         keepalive_interval_ms: Some(60_000),
@@ -369,8 +362,8 @@ fn group_row_hit_area_does_not_increase_navigation_density() {
 #[test]
 fn search_matches_name_address_and_tags() {
     let hosts = vec![
-        host("Database", "db.internal", None, false, &[]),
-        host("Build", "ci.internal", None, false, &["Staging"]),
+        host("Database", "db.internal", None, &[]),
+        host("Build", "ci.internal", None, &["Staging"]),
     ];
 
     assert_eq!(filtered_hosts(&hosts, &[], "  DATABASE ").len(), 1);
@@ -378,20 +371,14 @@ fn search_matches_name_address_and_tags() {
     assert_eq!(filtered_hosts(&hosts, &[], "staging").len(), 1);
 }
 
-/// 搜索为空时保留全部分组与收藏状态不同的主机，不再投影“全部/收藏/其他”额外筛选层。
+/// 搜索为空时保留全部分组与不同标签的主机，不再投影额外筛选层。
 #[test]
 fn unfiltered_navigation_keeps_all_hosts_in_the_group_tree() {
     let hosts = vec![
-        host("Favorite", "fav.internal", Some("group:prod"), true, &[]),
-        host(
-            "Production",
-            "prod.internal",
-            Some("group:prod"),
-            false,
-            &[],
-        ),
-        host("Local", "local.internal", None, true, &[]),
-        host("Stale", "stale.internal", Some("group:deleted"), false, &[]),
+        host("Favorite", "fav.internal", Some("group:prod"), &[]),
+        host("Production", "prod.internal", Some("group:prod"), &[]),
+        host("Local", "local.internal", None, &[]),
+        host("Stale", "stale.internal", Some("group:deleted"), &[]),
     ];
     let groups = vec![HostGroup {
         id: "group:prod".to_owned(),
@@ -451,9 +438,9 @@ fn profiles_with_missing_group_remain_in_ungrouped_navigation() {
 /// @author kongweiguang
 #[test]
 fn local_and_remote_hosts_interleave_by_order_and_name() {
-    let mut remote_charlie = host("Charlie", "charlie.internal", Some("group"), false, &[]);
+    let mut remote_charlie = host("Charlie", "charlie.internal", Some("group"), &[]);
     remote_charlie.sort_order = 1;
-    let mut remote_equal = host("Equal", "equal.internal", Some("group"), false, &[]);
+    let mut remote_equal = host("Equal", "equal.internal", Some("group"), &[]);
     remote_equal.sort_order = 2;
 
     let mut local_alpha = profile("local-alpha", Some("group"));
@@ -470,6 +457,7 @@ fn local_and_remote_hosts_interleave_by_order_and_name() {
         &[remote_charlie, remote_equal],
         &[local_alpha, local_bravo, local_equal],
         &[],
+        &[],
         "",
     );
     let displayed = items
@@ -477,6 +465,7 @@ fn local_and_remote_hosts_interleave_by_order_and_name() {
         .map(|item| match item {
             GroupNavigationItem::RemoteHost(host) => host.name.as_str(),
             GroupNavigationItem::LocalHost(profile) => profile.profile.name.as_str(),
+            GroupNavigationItem::PluginHost(_) => panic!("no plugin hosts were projected"),
             GroupNavigationItem::PinnedContainer(_) => panic!("no pins were projected"),
         })
         .collect::<Vec<_>>();
@@ -494,7 +483,7 @@ fn local_and_remote_hosts_interleave_by_order_and_name() {
 /// @author kongweiguang
 #[test]
 fn pinned_container_is_nested_after_its_parent_and_searchable() {
-    let parent = host("Production", "prod.internal", Some("group"), false, &[]);
+    let parent = host("Production", "prod.internal", Some("group"), &[]);
     let pin = WorkspacePinnedContainer {
         target: ContainerTarget {
             host_id: Some(parent.id.clone()),
@@ -508,6 +497,7 @@ fn pinned_container_is_nested_after_its_parent_and_searchable() {
 
     let items = group_navigation_items(
         std::slice::from_ref(&parent),
+        &[],
         &[],
         std::slice::from_ref(&pin),
         "",
@@ -617,13 +607,13 @@ fn primary_action_respects_sftp_only_protocol() {
     );
 }
 
-/// 右键菜单动作按当前协议与已启用设置投影；禁用时仍保留 SSH 终端，SFTP-only 不伪造主动作。
+/// 菜单与运行时共用协议能力；禁用附加文件能力只影响 SSH，独立 SFTP 始终保留文件入口。
 /// 同一策略也由菜单回调按最新主机快照复验，覆盖菜单打开后能力被关闭的情况。
 ///
 /// @author kongweiguang
 #[test]
 fn host_context_menu_actions_follow_enabled_sftp_capability() {
-    let enabled_ssh = host("SSH", "ssh.example", None, false, &[]);
+    let enabled_ssh = host("SSH", "ssh.example", None, &[]);
     assert_eq!(
         host_context_menu_actions(&enabled_ssh),
         HostContextMenuActions {
@@ -644,7 +634,7 @@ fn host_context_menu_actions_follow_enabled_sftp_capability() {
         }
     );
 
-    let mut enabled_sftp_only = host("SFTP", "sftp.example", None, false, &[]);
+    let mut enabled_sftp_only = host("SFTP", "sftp.example", None, &[]);
     enabled_sftp_only.protocol = RemoteProtocol::Sftp;
     assert_eq!(
         host_context_menu_actions(&enabled_sftp_only),
@@ -659,13 +649,13 @@ fn host_context_menu_actions_follow_enabled_sftp_capability() {
     assert_eq!(
         host_context_menu_actions(&enabled_sftp_only),
         HostContextMenuActions {
-            show_primary: false,
+            show_primary: true,
             show_open_files: false,
-            show_transfer_tab: false,
+            show_transfer_tab: true,
         }
     );
 
-    let mut rdp = host("RDP", "rdp.example", None, false, &[]);
+    let mut rdp = host("RDP", "rdp.example", None, &[]);
     rdp.protocol = RemoteProtocol::Rdp;
     assert_eq!(
         host_context_menu_actions(&rdp),
@@ -681,11 +671,11 @@ fn host_context_menu_actions_follow_enabled_sftp_capability() {
 #[test]
 fn split_target_filter_excludes_file_and_remote_desktop_hosts() {
     let mut hosts = vec![
-        host("SSH", "ssh.example", None, false, &[]),
-        host("Telnet", "telnet.example", None, false, &[]),
-        host("Serial", "serial.example", None, false, &[]),
-        host("SFTP", "sftp.example", None, false, &[]),
-        host("RDP", "rdp.example", None, false, &[]),
+        host("SSH", "ssh.example", None, &[]),
+        host("Telnet", "telnet.example", None, &[]),
+        host("Serial", "serial.example", None, &[]),
+        host("SFTP", "sftp.example", None, &[]),
+        host("RDP", "rdp.example", None, &[]),
     ];
     hosts[1].protocol = RemoteProtocol::Telnet;
     hosts[2].protocol = RemoteProtocol::Serial;

@@ -3,9 +3,10 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    AppContext as _, Context, Div, Entity, EventEmitter, IntoElement, Render, Stateful, Window,
+    AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, IntoElement, Render,
+    Stateful, Window,
     component::{
-        Disableable as _,
+        Disableable as _, FocusTrapElement as _,
         command::{Command, CommandItem, CommandState},
     },
     div,
@@ -35,6 +36,7 @@ use super::{
 pub struct QuickOpenView {
     services: AppServices,
     command_state: Entity<CommandState>,
+    modal_focus: FocusHandle,
     mode: Option<QuickOpenMode>,
     context: Option<QuickOpenOpenContext>,
     query: String,
@@ -55,11 +57,12 @@ impl QuickOpenView {
         self.mode.is_some()
     }
 
-    /// 注入桌面已装配服务并复用 Kit CommandState，重开面板时搜索焦点和实体均稳定。
+    /// 搜索与模态边界各保留稳定句柄，避免 Tab 遍历离开 Command 后进入被遮挡的工作台。
     pub fn new(services: AppServices, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             services,
             command_state: cx.new(|cx| CommandState::new(window, cx)),
+            modal_focus: cx.focus_handle(),
             mode: None,
             context: None,
             query: String::new(),
@@ -285,6 +288,7 @@ impl Render for QuickOpenView {
     /// Kit 的取消回调在 CommandState 更新期间同步触发；延后完整关闭，避免重入清理查询状态。
     /// 全窗遮罩建立阻挡命中区域，避免输入框点击与窗口非客户区命中穿到底层 Canvas。
     /// 搜索结果和状态区共享视口预算，窗口变窄或界面缩放时不让底部反馈落到窗外。
+    /// 模态陷阱由独立容器持有，不与 Command 内部重复追踪同一焦点身份。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -371,6 +375,7 @@ impl Render for QuickOpenView {
         quick_open_overlay_surface(theme).child(
             div()
                 .id("quick-open-modal")
+                .debug_selector(|| "quick-open-modal".to_owned())
                 .key_context("Modal")
                 .mt(layout.top)
                 .w(layout.width)
@@ -382,7 +387,8 @@ impl Render for QuickOpenView {
                 .rounded(theme.radius_dialog)
                 .shadow_lg()
                 .text_color(theme.foreground)
-                .child(command),
+                .child(command)
+                .focus_trap("quick-open-focus-trap", &self.modal_focus),
         )
     }
 }

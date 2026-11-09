@@ -97,6 +97,21 @@ impl RuntimePreferences {
     }
 }
 
+/// 布局快照只改变工作台几何；完整比较其它字段，避免漏掉与布局同时到达的业务设置。
+///
+/// @author kongweiguang
+pub(super) fn workbench_layout_only_update(
+    previous: Option<&SettingsSnapshot>,
+    next: &SettingsSnapshot,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    let mut comparable = previous.clone();
+    comparable.workbench_layout = next.workbench_layout.clone();
+    comparable == *next
+}
+
 /// 配色和保存回声只更新呈现，避免重新测量终端、推进引擎 revision 或重置命令建议。
 /// 比较完整快照使未来新增设置也默认走既有完整投影，不因遗漏字段而静默跳过真实更新。
 ///

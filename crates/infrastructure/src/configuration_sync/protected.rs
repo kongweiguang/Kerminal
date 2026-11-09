@@ -15,6 +15,7 @@ pub(super) const REQUIRED_IGNORE_RULES: &[&str] = &[
     "secrets/vault.toml.bak.*",
     "secrets/.vault-transaction/",
     ".storage-transactions/",
+    "*.toml.*.tmp",
     "backups/",
     ".storage.lock",
     "storage-manifest.toml",
@@ -32,12 +33,22 @@ pub(super) const REQUIRED_IGNORE_RULES: &[&str] = &[
 
 /// 即使用户显式 force-add，本地格式标记和迁移目录仍由路径策略保护。
 /// 路径比较忽略大小写，并统一 Windows Git 输出中的分隔符。
+/// 未知配置提交的同目录暂存含待确认内容，按仓储 UUID 命名保护，不能混入正常配置同步。
+///
+/// @author kongweiguang
 pub(super) fn is_protected_path(path: &[u8]) -> bool {
     let mut normalized = String::from_utf8_lossy(path).replace('\\', "/");
     while let Some(rest) = normalized.strip_prefix("./") {
         normalized = rest.to_owned();
     }
     let normalized = normalized.trim_start_matches('/').to_ascii_lowercase();
+    if normalized
+        .strip_suffix(".tmp")
+        .and_then(|path| path.rsplit_once(".toml."))
+        .is_some_and(|(_, id)| uuid::Uuid::parse_str(id).is_ok())
+    {
+        return true;
+    }
 
     const EXACT: &[&str] = &[
         "secrets/vault-key.toml",

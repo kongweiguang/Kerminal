@@ -23,9 +23,14 @@ right-rail-acceptance = [
     "kerminal-ui/right-rail-acceptance",
     "dep:gpui_pre_windows",
     "gpui_pre_windows/test-support",
+    "dep:async-trait",
+    "dep:toml",
 ]
 
 [dependencies]
+zeroize.workspace = true
+kerminal-plugin-protocol.workspace = true
+async-trait = { workspace = true, optional = true }
 gpui_kit.workspace = true
 tokio-util.workspace = true
 gpui_pre.workspace = true
@@ -45,6 +50,7 @@ tracing_appender.workspace = true
 tracing_subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml = { workspace = true, optional = true }
 rfd.workspace = true
 
 [dev-dependencies]

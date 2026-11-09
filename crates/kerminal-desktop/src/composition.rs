@@ -23,6 +23,7 @@ use kerminal_application::{
             CredentialService, CredentialVaultRepository, VaultKeyManagementService,
             VaultKeyRepository,
         },
+        host_types::{BuiltinHostProvider, HostConfigurationCatalog, PluginHostService},
         management::{CredentialCleanupStatus, HostManagementRepository, HostManagementService},
         probe::{ConnectionProbeBackend, ConnectionProbeService},
     },
@@ -39,6 +40,7 @@ use kerminal_application::{
         ExternalLaunchService, ExternalTemporaryTargetRegistry, SavedExternalTargetLookup,
     },
     platform::{DesktopNotificationService, ExternalProtocolService, NotificationPort},
+    plugins::PluginRegistry,
     preferences::{
         ConfigurationRepository, ConfigurationValidationService, PreferencesService,
         ProfileRepository, ProfileService,
@@ -67,7 +69,7 @@ use kerminal_infrastructure::{
     connections::{
         ExternalRuntimeRegistry, KnownHostsStore, RusshRemoteConnectionDependencies,
         RusshRemoteConnectionService, SshSessionTransportFactory, SystemRdpPlatformLauncher,
-        management::HostConfigurationRepository,
+        management::{AtomicHostCredentialCleanup, HostConfigurationRepository},
         probe::SystemConnectionProbe,
         serial::{SerialRuntimeConfig, SerialSessionTransportFactory, TokioSerialPortRepository},
         telnet::{TelnetRuntimeConfig, TelnetSessionTransportFactory},
@@ -97,7 +99,14 @@ use kerminal_infrastructure::{
     workspace::WorkspaceSessionStore,
 };
 use kerminal_mcp::{McpRuntimeController, McpServices};
-use kerminal_ui::AppServices;
+use kerminal_ui::{
+    AppServices,
+    plugins::{
+        content::ContentFactory,
+        host_forms::{HostFormFactories, HostFormFactory},
+        tools::ToolFactory,
+    },
+};
 use tokio::{
     runtime::Handle,
     task::JoinHandle,
@@ -108,6 +117,9 @@ use tokio_util::sync::CancellationToken;
 #[path = "notification_bridge.rs"]
 mod notification_bridge;
 use notification_bridge::NotificationBridge;
+
+#[path = "builtin_plugins.rs"]
+mod builtin_plugins;
 
 const STARTUP_CLEANUP_BUDGET: Duration = Duration::from_secs(12);
 
@@ -131,8 +143,17 @@ fn configuration_validator_command(executable: &Path, configuration_root: &Path)
     ))
 }
 
+/// 将静态扩展的窗口工厂集中传入，目录和实际实例仍各自保持独立生命周期。
+#[derive(Default)]
+pub struct PluginFactories {
+    pub content: Vec<Arc<dyn ContentFactory>>,
+    pub tools: Vec<Arc<dyn ToolFactory>>,
+    pub host_forms: Vec<Arc<dyn HostFormFactory>>,
+}
+
 /// 桌面唯一服务组合根；同一配置、会话、Vault、连接和 Tokio 执行器在各入口间共享。
 pub struct DesktopComposition {
+    external_plugins: Option<crate::plugins::assembly::DesktopPlugins>,
     runtime: Handle,
     app_services: AppServices,
     configuration: ConfigurationStore,
@@ -167,26 +188,72 @@ pub struct DesktopComposition {
 }
 
 impl DesktopComposition {
-    /// 使用宿主创建的唯一 runtime 和显式数据根装配生产服务，避免触碰进程默认用户目录。
+    /// 测试和验收从内置目录独立装配，普通启动由迁移阶段传入同一冻结目录。
+    ///
+    /// @author kongweiguang
+    #[cfg(any(test, feature = "right-rail-acceptance"))]
     pub async fn build(runtime: Handle, config_root: impl AsRef<Path>) -> AppResult<Self> {
         Self::build_with_update_service(runtime, config_root, None).await
     }
 
-    /// 允许注入 updater；主机默认值、SFTP 开关及持久恢复仓储复用同一配置根与服务实例。
-    /// 命令历史、建议反馈和片段偏好共享 SQLite；连接测试复用正式认证与 transport 而不建会话。
-    /// 恢复仓储与配置、主机信任共用 coordinator，避免同进程读取误争跨进程根锁。
-    /// 本地建议在同一聚合器内注册；其有界缓存无常驻任务，不创建第二套历史或执行器。
+    /// 在扫描配置前冻结内置贡献与 codec；随后复用同一应用服务和存储协调器。
     ///
     /// @author kongweiguang
+    #[cfg(any(test, feature = "right-rail-acceptance"))]
     pub async fn build_with_update_service(
         runtime: Handle,
         config_root: impl AsRef<Path>,
         update_service: Option<UpdateService>,
     ) -> AppResult<Self> {
+        let (plugins, host_types) = crate::plugin_catalogs::builtin_catalogs()?;
+        Self::build_with_plugin_catalogs(runtime, config_root, update_service, plugins, host_types)
+            .await
+    }
+
+    /// 测试或静态扩展可注入完整冻结目录；两者先双向核对，再允许首次配置扫描。
+    /// 配置、会话和 UI 继续共享原来的运行服务，目录本身不拥有后台资源。
+    /// 恢复仓储与主机信任共用 coordinator；连接测试复用正式认证与 transport。
+    /// 命令历史、建议反馈和片段偏好共享 SQLite，本地建议缓存不创建第二套执行器。
+    ///
+    /// @author kongweiguang
+    pub async fn build_with_plugin_catalogs(
+        runtime: Handle,
+        config_root: impl AsRef<Path>,
+        update_service: Option<UpdateService>,
+        plugins: Arc<PluginRegistry>,
+        host_types: Arc<HostConfigurationCatalog>,
+    ) -> AppResult<Self> {
+        Self::build_with_plugin_factories(
+            runtime,
+            config_root,
+            update_service,
+            plugins,
+            host_types,
+            PluginFactories::default(),
+        )
+        .await
+    }
+
+    /// 工厂只在所有应用服务准备后注入 UI；扫描前先核对工厂的声明与唯一身份。
+    ///
+    /// @author kongweiguang
+    pub async fn build_with_plugin_factories(
+        runtime: Handle,
+        config_root: impl AsRef<Path>,
+        update_service: Option<UpdateService>,
+        plugins: Arc<PluginRegistry>,
+        host_types: Arc<HostConfigurationCatalog>,
+        factories: PluginFactories,
+    ) -> AppResult<Self> {
+        crate::plugin_catalogs::validate_host_catalog(&plugins, &host_types)?;
+        builtin_plugins::validate_content_factories(&plugins, &factories.content)?;
+        builtin_plugins::validate_tool_factories(&plugins, &factories.tools)?;
+        let host_forms = Arc::new(HostFormFactories::new(&host_types, factories.host_forms)?);
         let config_root = config_root.as_ref().to_path_buf();
-        let configuration = ConfigurationStore::initialize(&config_root).map_err(|source| {
-            AppError::infrastructure_with_source("初始化 Kerminal 配置根失败", source)
-        })?;
+        let configuration =
+            ConfigurationStore::initialize_with_host_types(&config_root, host_types).map_err(
+                |source| AppError::infrastructure_with_source("初始化 Kerminal 配置根失败", source),
+            )?;
         let update_service = match update_service {
             Some(service) => service,
             None => {
@@ -253,7 +320,12 @@ impl DesktopComposition {
             host_management_repository,
             credential_service.clone(),
         )
+        .with_credential_cleanup(Arc::new(AtomicHostCredentialCleanup::new(
+            configuration.clone(),
+        )))
         .with_local_environment_resolver(vault_credential_resolver.clone());
+        let plugin_hosts =
+            PluginHostService::new(host_management.clone(), configuration.host_types().clone());
         if writable {
             // 恢复失败保留本地主机写门禁；整个工作台仍可启动，并由主机面板展示重试入口。
             match host_management.recover_pending_local_host_save().await {
@@ -341,7 +413,20 @@ impl DesktopComposition {
         ));
         let connection_probe_port: Arc<dyn ConnectionProbeBackend> =
             connection_probe_backend.clone();
-        let connection_probe_service = Arc::new(ConnectionProbeService::new(connection_probe_port));
+        // 提供方持有不再分派的探测入口，UI 则通过同一冻结目录查找对应实现。
+        let builtin_probe = Arc::new(ConnectionProbeService::new(connection_probe_port.clone()));
+        let builtin_provider = Arc::new(BuiltinHostProvider::new(builtin_probe));
+        for type_id in ["ssh", "sftp", "rdp", "telnet", "serial", "local"] {
+            configuration.host_types().bind_runtime_provider(
+                "kerminal",
+                type_id,
+                builtin_provider.clone(),
+            )?;
+        }
+        let connection_probe_service = Arc::new(
+            ConnectionProbeService::new(connection_probe_port)
+                .with_host_types(configuration.host_types().clone()),
+        );
         let sessions = Arc::new(
             SessionManager::new(
                 session_factory,
@@ -540,6 +625,11 @@ impl DesktopComposition {
             preferences.clone(),
             profiles.clone(),
         )
+        .with_plugins(plugins)
+        .with_content_factories(factories.content)
+        .with_tool_factories(factories.tools)
+        .with_host_form_factories(host_forms)
+        .with_plugin_hosts(plugin_hosts)
         .with_vault_keys(vault_keys)
         .with_screen_color_sampler(Arc::new(
             kerminal_infrastructure::platform::color_sampler::PlatformScreenColorSampler,
@@ -595,6 +685,7 @@ impl DesktopComposition {
         )
         .await;
         let mut composition = Self {
+            external_plugins: None,
             runtime,
             app_services,
             configuration,
@@ -641,6 +732,54 @@ impl DesktopComposition {
         self.app_services.clone()
     }
 
+    /// 基础服务就绪后建立插件路由并装配冻结的界面工厂，避免声明可见却无法创建实例；
+    /// 先保留运行服务所有权，后续装配失败仍沿用组合根的资源收尾门禁。
+    pub async fn install_external_plugins(
+        &mut self,
+        startup: Arc<crate::plugins::startup::StartupPlugins>,
+    ) -> AppResult<()> {
+        if self.external_plugins.is_some() {
+            return Err(AppError::conflict("外部插件服务已装配"));
+        }
+        let hosts = self
+            .app_services
+            .hosts
+            .clone()
+            .ok_or_else(|| AppError::not_found("主机服务"))?;
+        let locale = self
+            .app_services
+            .system_locale
+            .clone()
+            .unwrap_or_else(|| "en".into());
+        let theme = match self.preferences.load_settings().await?.settings.theme_mode {
+            kerminal_application::preferences::settings::ThemeMode::Dark => "dark",
+            kerminal_application::preferences::settings::ThemeMode::Light => "light",
+            kerminal_application::preferences::settings::ThemeMode::System => "system",
+        };
+        let plugins = crate::plugins::assembly::DesktopPlugins::new(
+            startup.clone(),
+            self.configuration.clone(),
+            self._vault.clone(),
+            hosts,
+            self.task_executor.clone(),
+            locale.clone(),
+            theme.into(),
+        )?;
+        self.app_services.plugin_ui = Some(plugins.ui.clone());
+        self.app_services.external_plugin_runtime = Some(plugins.runtime.clone());
+        self.app_services.external_plugin_settings = Some(plugins.settings.clone());
+        self.app_services.external_plugins = startup.enabled.clone();
+        self.app_services.plugin_events = Some(plugins.events.clone());
+        self.external_plugins = Some(plugins);
+        let plugins = self
+            .external_plugins
+            .as_ref()
+            .ok_or_else(|| AppError::not_found("外部插件服务"))?;
+        crate::plugins::native_ui::install(&mut self.app_services, plugins, &locale)?;
+        plugins.activate_startup().await;
+        Ok(())
+    }
+
     /// 返回与所有持久化适配器共用的配置根协调器，供桌面侧安全装配后续能力。
     pub fn storage_coordinator(&self) -> kerminal_infrastructure::storage::StorageCoordinator {
         self.storage.clone()
@@ -660,6 +799,10 @@ impl DesktopComposition {
     ///
     /// @author kongweiguang
     pub async fn shutdown_until(&mut self, deadline: Instant) -> AppResult<()> {
+        // 插件 actor 依赖共享执行器；先给其同一截止时间关闭，再关闭 executor intake。
+        if let Some(plugins) = self.external_plugins.as_mut() {
+            plugins.shutdown_until(deadline.into_std()).await?;
+        }
         self.settings_refresh_cancellation.cancel();
         self.mcp_runtime.begin_shutdown();
         if let Some(notification_bridge) = self.notification_bridge.as_ref() {

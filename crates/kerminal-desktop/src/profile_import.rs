@@ -105,9 +105,24 @@ where
     })
 }
 
-/// 预演与提交调用同一应用服务；公共错误只输出稳定代码和脱敏文案。
+/// 预演与提交共用冻结目录；公共错误只输出稳定代码和脱敏文案。
+///
+/// @author kongweiguang
 fn execute(arguments: ImportArguments) -> (i32, Value) {
-    let repository = FileDataMigrationRepository::new(arguments.target);
+    let (_, host_types) = match crate::plugin_catalogs::offline_catalogs(&arguments.target) {
+        Ok(catalogs) => catalogs,
+        Err(error) => {
+            let mode = match arguments.mode {
+                ImportMode::DryRun => "dry_run",
+                ImportMode::Apply => "apply",
+            };
+            return (
+                1,
+                json!({"ok":false,"mode":mode,"code":error.public_code().as_str(),"message":error.public_message()}),
+            );
+        }
+    };
+    let repository = FileDataMigrationRepository::new(arguments.target).with_host_types(host_types);
     let service = DataMigrationService::new(Arc::new(repository));
     match arguments.mode {
         ImportMode::DryRun => match service.preview_legacy_profiles(&arguments.source) {

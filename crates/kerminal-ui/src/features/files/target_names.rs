@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use kerminal_application::{
     AppError, AppResult,
-    connections::management::{HostGroup, HostManagementService},
+    connections::management::{HostGroup, HostManagementService, HostSftpOptions},
     operations::OperationsService,
 };
 use kerminal_domain::{
@@ -131,7 +131,7 @@ impl FileTargetNameLookup {
             .into_iter()
             .filter(|host| {
                 matches!(host.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp)
-                    && host.sftp_options.enabled
+                    && HostSftpOptions::enabled_for(host.protocol, host.sftp_options.enabled)
             })
             .map(|host| SftpHostChoice {
                 id: host.id,

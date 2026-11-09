@@ -15,6 +15,7 @@ pub mod files;
 pub mod local_pty;
 pub mod operations;
 pub mod platform;
+pub mod plugins;
 pub(crate) mod process_tree;
 pub mod session_logs;
 pub mod sessions;

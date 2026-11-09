@@ -98,7 +98,8 @@ fn failed_or_unknown_migration_never_starts_desktop_resources() {
 fn successful_migration_commits_before_the_start_callback() {
     let fixture = tempfile::tempdir().expect("isolated bootstrap fixture");
     let root = fixture.path().join("new-current-root");
-    let service = migration_service(&root, None);
+    let (_, host_types) = crate::plugin_catalogs::builtin_catalogs().expect("冻结内置目录");
+    let service = migration_service(&root, None, host_types);
     let started = AtomicBool::new(false);
     run_after_migration(&service, |_| {
         assert!(matches!(
@@ -112,4 +113,45 @@ fn successful_migration_commits_before_the_start_callback() {
     })
     .expect("migration succeeded");
     assert!(started.load(Ordering::SeqCst));
+}
+
+/// 已安装提供方的 codec 必须进入迁移预检；缺失提供方时保留同一份原文。
+///
+/// @author kongweiguang
+#[test]
+fn migration_service_uses_the_supplied_host_catalog() {
+    use kerminal_application::connections::host_types::HostConfigurationType;
+    use kerminal_infrastructure::configuration::host_configuration_catalog;
+
+    let fixture = tempfile::tempdir().expect("隔离配置根");
+    let hosts = fixture.path().join("hosts");
+    std::fs::create_dir(&hosts).expect("创建主机目录");
+    let path = hosts.join("migration-host.toml");
+    let raw = "schema_version = 3\nid = \"migration-host\"\nprotocol = \"example-host\"\nprovider_id = \"example.plugin\"\nname = \"Migration\"\nsort_order = 0\nconfiguration_version = 1\ncreated_at = \"2026-01-01T00:00:00Z\"\nupdated_at = \"2026-01-01T00:00:00Z\"\n\n[configuration]\naddress = \"\"\n";
+    std::fs::write(&path, raw).expect("写入插件主机");
+    let unknown = host_configuration_catalog(Vec::new()).expect("内置目录");
+    let codec = unknown
+        .get("kerminal", "ssh")
+        .expect("内置 codec")
+        .codec
+        .clone();
+    let extension =
+        HostConfigurationType::new("example.plugin", "example-host", codec).expect("扩展类型");
+    let known = host_configuration_catalog(vec![extension]).expect("扩展目录");
+
+    assert_eq!(
+        migration_service(fixture.path(), None, known)
+            .inspect()
+            .expect("已安装预检")
+            .readiness,
+        DataMigrationReadiness::Blocked
+    );
+    assert_eq!(
+        migration_service(fixture.path(), None, unknown)
+            .inspect()
+            .expect("缺失提供方预检")
+            .readiness,
+        DataMigrationReadiness::Legacy
+    );
+    assert_eq!(std::fs::read_to_string(path).expect("原文未改写"), raw);
 }

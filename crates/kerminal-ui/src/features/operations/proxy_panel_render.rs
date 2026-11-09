@@ -84,7 +84,8 @@ fn should_suppress_compact_empty_hint(
 }
 
 impl Render for ProxyApplicationPanel {
-    /// 干净空态不重复展示 SOCKS 提示；任何运行、回执、历史或恢复信息都走原详细视图。
+    /// 干净空态不重复展示 SOCKS 提示；详细视图只叠加轻量内容面，避免透明工作台出现整块实色。
+    /// 输入和脚本阅读面仍由各自控件负责，运行、回执、历史与恢复信息不因外观设置而省略。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -158,7 +159,7 @@ impl Render for ProxyApplicationPanel {
             .gap_2()
             .p_3()
             .rounded_md()
-            .bg(theme.panel)
+            .bg(theme.content_surface())
             .text_color(theme.foreground)
             .child(
                 div()

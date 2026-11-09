@@ -36,7 +36,6 @@ fn ssh_draft(mode: HostAuthenticationMode) -> HostDraft {
         route: HostRouteSettings::default(),
         serial: None,
         tags: Vec::new(),
-        is_favorite: false,
         sort_order: 0,
         connect_timeout_ms: 30_000,
         keepalive_interval_ms: Some(60_000),
@@ -136,6 +135,49 @@ fn sftp_probe_plan_carries_normalized_start_directory_and_root_default() {
             .as_ref()
             .map(|path| path.as_str()),
         Some("/")
+    );
+}
+
+/// SSH 仅在草稿启用可选 SFTP 时附带子系统探测，并复用同一已校验的起始路径。
+/// @author kongweiguang
+#[test]
+fn ssh_probe_plan_records_optional_sftp_check_and_directory() {
+    let mut draft = ssh_draft(HostAuthenticationMode::Agent);
+    draft.sftp_options.remote_start_directory = Some("/srv/files".to_owned());
+    let enabled = build_probe_target(request(draft.clone(), Vec::new())).expect("SSH draft");
+    assert!(enabled.check_optional_sftp);
+    assert_eq!(
+        enabled
+            .sftp_remote_start_directory
+            .as_ref()
+            .map(|path| path.as_str()),
+        Some("/srv/files")
+    );
+
+    draft.sftp_options.enabled = false;
+    let disabled = build_probe_target(request(draft, Vec::new())).expect("SSH draft");
+    assert!(!disabled.check_optional_sftp);
+    assert!(disabled.sftp_remote_start_directory.is_none());
+}
+
+/// Serial 前置错误用稳定字段 ID 定位，设备和波特率无效时均不进入传输后端。
+/// @author kongweiguang
+#[test]
+fn serial_probe_input_issues_identify_the_invalid_field() {
+    let mut draft = ssh_draft(HostAuthenticationMode::Agent);
+    draft.protocol = RemoteProtocol::Serial;
+    draft.serial = Some(SerialSessionTarget::new(PathBuf::new()));
+    assert_eq!(
+        serial_probe_input_issue(&draft),
+        Some((ProbeField::SerialDevice, "串口设备路径不能为空"))
+    );
+
+    let mut serial = SerialSessionTarget::new(PathBuf::from("/dev/ttyUSB0"));
+    serial.baud_rate = 0;
+    draft.serial = Some(serial);
+    assert_eq!(
+        serial_probe_input_issue(&draft),
+        Some((ProbeField::SerialBaud, "串口波特率必须大于零"))
     );
 }
 

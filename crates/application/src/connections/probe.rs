@@ -19,7 +19,11 @@ use zeroize::Zeroizing;
 
 use super::{
     HostKeyPeer,
-    management::{HostAuthenticationMode, HostCredentialChange, HostCredentialSlot, HostDraft},
+    host_types::HostConfigurationCatalog,
+    management::{
+        HostAuthenticationMode, HostCredentialChange, HostCredentialSlot, HostDraft,
+        HostSftpOptions,
+    },
 };
 use crate::{AppError, AppResult};
 
@@ -115,9 +119,35 @@ pub struct RdpConnectivityProbe {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionProbeOutcome {
     Verified(ProbeVerificationLevel),
+    /// SSH 认证已成功；附加 SFTP 检查失败不会覆写主连接结果。
+    SshAuthenticated {
+        sftp: SftpProbeStatus,
+    },
+    /// 连接前可定位的字段错误，以 typed field 避免界面解析错误文案。
+    InvalidInput {
+        field: ProbeField,
+        message: &'static str,
+    },
     RdpConnectivity(RdpConnectivityProbe),
     RequiresHostKeyTrust(ProbeHostKeyChallenge),
     HostKeyChanged(ProbeHostKeyChanged),
+}
+
+/// 只对当前 probe 能在拨号前确定的输入字段提供精确定位。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeField {
+    SerialDevice,
+    SerialBaud,
+}
+
+/// SSH 主连接保持权威结果，同时单独报告用户启用的可选 SFTP 能力。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SftpProbeStatus {
+    Available,
+    Failed {
+        code: crate::PublicErrorCode,
+        message: &'static str,
+    },
 }
 
 /// 可以证明的连接层级，不把 Telnet TCP 或串口打开误报为远端登录。
@@ -135,6 +165,8 @@ pub struct ConnectionProbeTarget {
     pub profile: HostConnectionProfile,
     /// SFTP 探测的只读起始目录；SFTP 未配置时按 UI 默认根目录 `/` 探测，其它协议为 None。
     pub sftp_remote_start_directory: Option<RemotePath>,
+    /// SSH 主认证成功后是否额外打开 SFTP 子系统；SFTP-only 始终执行自己的子系统探测。
+    pub check_optional_sftp: bool,
     pub serial: Option<SerialSessionTarget>,
     pub timeout: Duration,
     pub host_key_confirmation: Option<ProbeHostKeyConfirmation>,
@@ -173,15 +205,31 @@ impl fmt::Debug for ProbeCredential {
 /// 以显式 backend 注入创建 probe 用例，避免应用层自行获取网络、设备或文件系统能力。
 pub struct ConnectionProbeService {
     backend: Arc<dyn ConnectionProbeBackend>,
+    host_types: Option<Arc<HostConfigurationCatalog>>,
 }
 
 impl ConnectionProbeService {
     /// 只绑定一个执行端口，确保未保存草稿不绕过统一基础设施连接实现。
     pub fn new(backend: Arc<dyn ConnectionProbeBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            host_types: None,
+        }
     }
 
-    /// 校验草稿并调用单次探测端口；取消在执行前即返回，不触碰设备或网络。
+    /// UI 用例通过已冻结类型目录分派；提供方持有未分派版本防止递归。
+    pub fn with_host_types(mut self, host_types: Arc<HostConfigurationCatalog>) -> Self {
+        self.host_types = Some(host_types);
+        self
+    }
+
+    /// 提供方只获得不再分派的实例，调用者误传目录版本也不会造成递归。
+    pub(super) fn direct(&self) -> Self {
+        Self::new(self.backend.clone())
+    }
+
+    /// 先返回可定位的串口前置错误，再校验草稿并调用单次探测端口；取消不触碰设备或网络。
+    /// @author kongweiguang
     pub async fn probe(
         &self,
         request: ConnectionProbeRequest,
@@ -189,6 +237,28 @@ impl ConnectionProbeService {
     ) -> AppResult<ConnectionProbeOutcome> {
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("连接测试已取消"));
+        }
+        if let Some((field, message)) = serial_probe_input_issue(&request.draft) {
+            return Ok(ConnectionProbeOutcome::InvalidInput { field, message });
+        }
+        if let Some(host_types) = &self.host_types {
+            let type_id = match request.draft.protocol {
+                RemoteProtocol::Ssh => "ssh",
+                RemoteProtocol::Sftp => "sftp",
+                RemoteProtocol::Telnet => "telnet",
+                RemoteProtocol::Serial => "serial",
+                RemoteProtocol::Rdp => "rdp",
+            };
+            let provider = host_types
+                .runtime_provider("kerminal", type_id)?
+                .ok_or_else(|| AppError::unsupported("内置主机运行提供方不可用"))?;
+            let result = provider
+                .probe_builtin_draft(request, cancellation.clone())
+                .await;
+            if cancellation.is_cancelled() {
+                return Err(AppError::cancelled("连接测试已取消"));
+            }
+            return result;
         }
         let target = build_probe_target(request)?;
         self.backend.probe(target, cancellation).await
@@ -210,6 +280,7 @@ fn build_probe_target(mut request: ConnectionProbeRequest) -> AppResult<Connecti
         apply_transient_credentials(&mut request.draft, request.credential_changes)?;
 
     let protocol = request.draft.protocol;
+    let check_optional_sftp = protocol == RemoteProtocol::Ssh && request.draft.sftp_options.enabled;
     let authentication = if matches!(protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp) {
         Some(resolve_authentication(
             request.draft.authentication.take(),
@@ -250,7 +321,7 @@ fn build_probe_target(mut request: ConnectionProbeRequest) -> AppResult<Connecti
     } else {
         None
     };
-    let sftp_remote_start_directory = if protocol == RemoteProtocol::Sftp {
+    let sftp_remote_start_directory = if protocol == RemoteProtocol::Sftp || check_optional_sftp {
         let directory = request
             .draft
             .sftp_options
@@ -276,11 +347,28 @@ fn build_probe_target(mut request: ConnectionProbeRequest) -> AppResult<Connecti
     Ok(ConnectionProbeTarget {
         profile,
         sftp_remote_start_directory,
+        check_optional_sftp,
         serial,
         timeout: request.timeout,
         host_key_confirmation: request.host_key_confirmation,
         transient_credentials,
     })
+}
+
+/// 将可直接定位的 Serial 输入错误返回为稳定字段 ID，避免 UI 根据校验句子猜控件。
+/// @author kongweiguang
+fn serial_probe_input_issue(draft: &HostDraft) -> Option<(ProbeField, &'static str)> {
+    if draft.protocol != RemoteProtocol::Serial {
+        return None;
+    }
+    let serial = draft.serial.as_ref()?;
+    if serial.device.as_os_str().is_empty() {
+        Some((ProbeField::SerialDevice, "串口设备路径不能为空"))
+    } else if serial.baud_rate == 0 {
+        Some((ProbeField::SerialBaud, "串口波特率必须大于零"))
+    } else {
+        None
+    }
 }
 
 /// 仅验证连接测试所需字段，避免调用主机保存路径或复用其持久化副作用。
@@ -354,11 +442,12 @@ fn validate_probe_input(
             }
         }
     }
-    if draft
-        .sftp_options
-        .remote_start_directory
-        .as_deref()
-        .is_some_and(|path| !super::management::valid_remote_start_directory(path))
+    if HostSftpOptions::enabled_for(draft.protocol, draft.sftp_options.enabled)
+        && draft
+            .sftp_options
+            .remote_start_directory
+            .as_deref()
+            .is_some_and(|path| !super::management::valid_remote_start_directory(path))
     {
         return Err(AppError::invalid("SFTP 起始目录无效"));
     }

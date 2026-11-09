@@ -9,6 +9,7 @@ use std::{
 
 use kerminal_application::{
     AppError, AppResult,
+    connections::host_types::HostConfigurationCatalog,
     data_migration::{
         DataMigrationInspection, DataMigrationOutcome, DataMigrationReadiness, DataMigrationReport,
     },
@@ -33,6 +34,7 @@ pub(super) fn apply_locked(
     root: &Path,
     legacy_window_state: &Option<PathBuf>,
     mut inspection_result: DataMigrationInspection,
+    host_types: Option<&HostConfigurationCatalog>,
 ) -> AppResult<DataMigrationReport> {
     if inspection_result.readiness == DataMigrationReadiness::Blocked {
         return Err(AppError::conflict("用户数据迁移预检存在阻断项"));
@@ -47,7 +49,8 @@ pub(super) fn apply_locked(
             active.state = JournalState::Committed;
             recovered = report(DataMigrationOutcome::Resumed, changed, true, Some(backup));
         }
-        inspection_result = inspection::inspect_root(root, legacy_window_state.as_deref())?;
+        inspection_result =
+            inspection::inspect_root(root, legacy_window_state.as_deref(), host_types)?;
         if inspection_result.readiness == DataMigrationReadiness::Current
             && !inspection_result.recovery_pending
         {
@@ -70,8 +73,10 @@ pub(super) fn apply_locked(
         legacy_window_state,
         inspection_result,
         previous_committed.as_ref(),
+        host_types,
     )?;
-    let final_inspection = inspection::inspect_root(root, legacy_window_state.as_deref())?;
+    let final_inspection =
+        inspection::inspect_root(root, legacy_window_state.as_deref(), host_types)?;
     if final_inspection.readiness != DataMigrationReadiness::Current
         || final_inspection.recovery_pending
     {
@@ -124,8 +129,9 @@ fn apply_new_transaction(
     legacy_window_state: &Option<PathBuf>,
     inspection_result: DataMigrationInspection,
     previous_committed: Option<&MigrationJournal>,
+    host_types: Option<&HostConfigurationCatalog>,
 ) -> AppResult<DataMigrationReport> {
-    let mut edits = inspection::collect_plan(root, legacy_window_state.as_deref())
+    let mut edits = inspection::collect_plan(root, legacy_window_state.as_deref(), host_types)
         .map_err(|_| AppError::conflict("用户数据不满足当前迁移规则"))?;
     if inspection_result.readiness == DataMigrationReadiness::Fresh {
         edits.extend(super::profile_hosts::plan_initial_profiles()?);

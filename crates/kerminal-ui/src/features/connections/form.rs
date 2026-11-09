@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, ScrollAnchor, ScrollHandle, SharedString, Subscription,
-    Window,
+    AppContext as _, Context, Entity, Focusable as _, ScrollAnchor, ScrollHandle, SharedString,
+    Subscription, Window,
     component::{
         input::{InputEvent, InputState, TextareaState},
         searchable_list::SearchableListItem,
@@ -30,7 +30,10 @@ use kerminal_domain::{
     },
 };
 
-use super::panel::ConnectionsPanel;
+use super::{
+    editor_text::{ListSeparator, format_list, parse_list},
+    panel::ConnectionsPanel,
+};
 
 /// 集中保存主机、认证、串口与代理表单输入；秘密在 host 草稿之外单独转换为 vault 用例。
 pub(super) struct HostEditor {
@@ -41,8 +44,8 @@ pub(super) struct HostEditor {
     pub(super) scroll_handle: ScrollHandle,
     pub(super) validation_anchor: ScrollAnchor,
     pub(super) authentication_mode: HostAuthenticationMode,
+    pub(super) private_key_input_mode: PrivateKeyInputMode,
     pub(super) selected_group: Option<String>,
-    pub(super) favorite: bool,
     pub(super) proxy_enabled: bool,
     pub(super) proxy_protocol: ProxyProtocol,
     pub(super) sftp_enabled: bool,
@@ -74,6 +77,13 @@ pub(super) struct HostEditor {
     _probe_subscriptions: Vec<Subscription>,
     _group_select_subscription: Subscription,
     _serial_select_subscriptions: Vec<Subscription>,
+}
+
+/// 来源选择只控制当前输入入口，不增加持久化字段；保存仍使用文件路径或加密私钥引用。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PrivateKeyInputMode {
+    File,
+    Paste,
 }
 
 /// 让 Kit 搜索式下拉保存稳定分组 ID；显示名称变化不会污染主机草稿值。
@@ -181,7 +191,10 @@ pub(super) enum HostEditorField {
     Network,
     Terminal,
     Transfer,
+    SftpRemoteDirectory,
     Display,
+    RdpWidth,
+    RdpHeight,
     Proxy,
     JumpHosts,
     Tags,
@@ -212,7 +225,7 @@ impl HostEditorValidationIssue {
             }
             "串口 endpoint 必须由设备路径投影，且不包含网络端口或用户名"
             | "串口设备路径必须能编码为 UTF-8" => {
-                (HostEditorField::Host, HostEditorSection::Terminal)
+                (HostEditorField::Host, HostEditorSection::Properties)
             }
             "连接端口必须为 1 到 65535" => {
                 (HostEditorField::Port, HostEditorSection::Properties)
@@ -220,13 +233,15 @@ impl HostEditorValidationIssue {
             "此协议需要有效的用户名" | "RDP 用户名不能包含控制字符" => {
                 (HostEditorField::Username, HostEditorSection::Properties)
             }
-            "主机标签不能包含控制字符" | "串口参数必须填写在串口设置中，不能作为主机标签" => {
+            "主机标签不能包含控制字符"
+            | "串口参数必须填写在串口设置中，不能作为主机标签"
+            | "标签格式无效；含逗号的标签请用双引号包裹，项内双引号写成两个" => {
                 (HostEditorField::Tags, HostEditorSection::Properties)
             }
             "波特率必须为 300 到 4000000"
             | "串口连接必须提供完整串口参数"
             | "串口波特率必须大于零" => {
-                (HostEditorField::SerialBaud, HostEditorSection::Terminal)
+                (HostEditorField::SerialBaud, HostEditorSection::Properties)
             }
             "SSH 超时必须为 1 到 600 秒"
             | "SSH 心跳必须为 0 到 600 秒"
@@ -238,6 +253,16 @@ impl HostEditorValidationIssue {
             }
             "SFTP 主机并发必须为 1 到 8" | "SFTP 起始目录或主机并发数无效" => {
                 (HostEditorField::Transfer, HostEditorSection::Transfer)
+            }
+            "SFTP 起始目录无效" => (
+                HostEditorField::SftpRemoteDirectory,
+                HostEditorSection::Transfer,
+            ),
+            "RDP 宽度必须为 640 到 8192" => {
+                (HostEditorField::RdpWidth, HostEditorSection::Display)
+            }
+            "RDP 高度必须为 480 到 8192" => {
+                (HostEditorField::RdpHeight, HostEditorSection::Display)
             }
             "RDP 窗口尺寸必须成对填写且在支持范围内" => {
                 (HostEditorField::Display, HostEditorSection::Display)
@@ -261,7 +286,9 @@ impl HostEditorValidationIssue {
                 HostEditorField::Authentication,
                 HostEditorSection::Properties,
             ),
-            "私钥正文与私钥文件路径只能填写一项" => {
+            "私钥正文与私钥文件路径只能填写一项"
+            | "请选择私钥文件或切换为粘贴内容"
+            | "请粘贴私钥内容或切换为文件" => {
                 (HostEditorField::PrivateKey, HostEditorSection::Properties)
             }
             "主机备注不能超过 4096 个字符或包含不支持的控制字符" => {
@@ -293,7 +320,6 @@ struct HostEditorCommonBaseline {
     name: String,
     tags: String,
     selected_group: Option<String>,
-    favorite: bool,
 }
 
 /// 隐藏协议只缓存其独有字段的脏态，共用字段恢复原值不能被历史标记阻断关闭。
@@ -385,6 +411,7 @@ struct HostProtocolDraft {
     baseline: HostEditorBaseline,
     protocol_dirty_when_hidden: bool,
     authentication_mode: HostAuthenticationMode,
+    private_key_input_mode: PrivateKeyInputMode,
     private_key_file_source: bool,
     proxy_enabled: bool,
     proxy_protocol: ProxyProtocol,
@@ -413,6 +440,7 @@ impl HostProtocolDraft {
             baseline: editor.baseline.clone(),
             protocol_dirty_when_hidden: editor.current_protocol_is_dirty(cx),
             authentication_mode: editor.authentication_mode,
+            private_key_input_mode: editor.private_key_input_mode,
             private_key_file_source: editor.private_key_file_source,
             proxy_enabled: editor.proxy_enabled,
             proxy_protocol: editor.proxy_protocol,
@@ -439,6 +467,7 @@ impl HostProtocolDraft {
         editor.inputs = self.inputs;
         editor.baseline = self.baseline;
         editor.authentication_mode = self.authentication_mode;
+        editor.private_key_input_mode = self.private_key_input_mode;
         editor.private_key_file_source = self.private_key_file_source;
         editor.proxy_enabled = self.proxy_enabled;
         editor.proxy_protocol = self.proxy_protocol;
@@ -502,7 +531,7 @@ pub(super) struct JumpInputs {
 /// 将已保存主机映射成可编辑输入；密码只显示“已关联”状态，不从 vault 解密回填。
 impl HostEditor {
     /// 创建新或已保存主机表单；空的新建表单折叠低频元信息，有保存值时展开以便核对和编辑。
-    /// 高级项仍使用同一输入/脏状态链路，不维护绕过 CAS 的配置副本。
+    /// 高级项仍使用同一输入/脏状态链路，不维护绕过 CAS 的配置副本；已存 Vault 私钥优先于历史路径显示来源。
     /// @author kongweiguang
     pub(super) fn new(
         host: Option<ManagedHost>,
@@ -790,18 +819,21 @@ impl HostEditor {
             tags: create_input(
                 window,
                 cx,
-                crate::locale::text("标签，用逗号分隔", "Tags, separated by commas"),
-                &host
-                    .as_ref()
-                    .map_or_else(String::new, |value| value.tags.join(", ")),
+                crate::locale::text(
+                    "逗号分隔；含逗号的标签用双引号包裹",
+                    "Comma separated; quote tags containing commas",
+                ),
+                &host.as_ref().map_or_else(String::new, |value| {
+                    format_list(&value.tags, ListSeparator::Commas)
+                }),
                 false,
             ),
             secret: create_input(
                 window,
                 cx,
                 crate::locale::text(
-                    "新凭据；留空保留现有引用",
-                    "New credential; leave empty to keep the saved reference",
+                    "输入密码；留空保留已保存密码",
+                    "Password; leave empty to keep the saved password",
                 ),
                 "",
                 true,
@@ -809,10 +841,7 @@ impl HostEditor {
             key_path: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "私钥文件路径（不读取文件内容）",
-                    "Private key path (file contents are not read)",
-                ),
+                crate::locale::text("私钥文件路径", "Private key file path"),
                 &private_key_path,
                 false,
             ),
@@ -822,8 +851,8 @@ impl HostEditor {
                 window,
                 cx,
                 crate::locale::text(
-                    "私钥口令；留空保留现有引用",
-                    "Key passphrase; leave empty to keep the saved reference",
+                    "私钥口令（可选）；留空保留已保存口令",
+                    "Key passphrase (optional); leave empty to keep the saved passphrase",
                 ),
                 "",
                 true,
@@ -863,8 +892,8 @@ impl HostEditor {
                 window,
                 cx,
                 crate::locale::text(
-                    "新代理密码；留空保留现有引用",
-                    "New proxy password; leave empty to keep the saved reference",
+                    "代理密码；留空保留已保存密码",
+                    "Proxy password; leave empty to keep the saved password",
                 ),
                 "",
                 true,
@@ -881,10 +910,11 @@ impl HostEditor {
             section: HostEditorSection::Properties,
             validation_issue: None,
             selected_group,
-            favorite: host.as_ref().is_some_and(|value| value.is_favorite),
             proxy_enabled: proxy.is_some(),
             proxy_protocol: proxy.map_or(ProxyProtocol::Socks5, |value| value.protocol),
-            sftp_enabled: host.as_ref().is_none_or(|value| value.sftp_options.enabled),
+            sftp_enabled: host.as_ref().is_none_or(|value| {
+                HostSftpOptions::enabled_for(value.protocol, value.sftp_options.enabled)
+            }),
             preserve_mtime: host
                 .as_ref()
                 .is_none_or(|value| value.sftp_options.preserve_mtime),
@@ -900,6 +930,19 @@ impl HostEditor {
             serial_flow_control,
             protocol,
             authentication_mode,
+            private_key_input_mode: if host.as_ref().is_some_and(|host| {
+                matches!(
+                    host.authentication,
+                    Some(SshAuthentication::PrivateKey {
+                        secret: Some(_),
+                        ..
+                    })
+                )
+            }) {
+                PrivateKeyInputMode::Paste
+            } else {
+                PrivateKeyInputMode::File
+            },
             scroll_handle,
             validation_anchor,
             inputs,
@@ -921,7 +964,6 @@ impl HostEditor {
                     name: String::new(),
                     tags: String::new(),
                     selected_group: None,
-                    favorite: false,
                 },
                 protocol: HostProtocolBaseline {
                     protocol,
@@ -968,27 +1010,27 @@ impl HostEditor {
             ),
             (
                 &self.inputs.tags,
-                crate::locale::text("标签，用逗号分隔", "Tags, separated by commas"),
+                crate::locale::text(
+                    "逗号分隔；含逗号的标签用双引号包裹",
+                    "Comma separated; quote tags containing commas",
+                ),
             ),
             (
                 &self.inputs.secret,
                 crate::locale::text(
-                    "新凭据；留空保留现有引用",
-                    "New credential; leave empty to keep the saved reference",
+                    "输入密码；留空保留已保存密码",
+                    "Password; leave empty to keep the saved password",
                 ),
             ),
             (
                 &self.inputs.key_path,
-                crate::locale::text(
-                    "私钥文件路径（不读取文件内容）",
-                    "Private key path (file contents are not read)",
-                ),
+                crate::locale::text("私钥文件路径", "Private key file path"),
             ),
             (
                 &self.inputs.passphrase,
                 crate::locale::text(
-                    "私钥口令；留空保留现有引用",
-                    "Key passphrase; leave empty to keep the saved reference",
+                    "私钥口令（可选）；留空保留已保存口令",
+                    "Key passphrase (optional); leave empty to keep the saved passphrase",
                 ),
             ),
             (
@@ -1010,8 +1052,8 @@ impl HostEditor {
             (
                 &self.inputs.proxy_password,
                 crate::locale::text(
-                    "新代理密码；留空保留现有引用",
-                    "New proxy password; leave empty to keep the saved reference",
+                    "代理密码；留空保留已保存密码",
+                    "Proxy password; leave empty to keep the saved password",
                 ),
             ),
         ];
@@ -1053,9 +1095,9 @@ impl HostEditor {
         editor
     }
 
-    /// 表单变化使 probe 失效；路径输入切换到文件来源并清除粘贴值，反向粘贴则清路径。
+    /// 连接字段使 probe 失效，元数据仅清理本字段错误；路径与正文互斥并保留原输入实体。
     /// @author kongweiguang
-    fn subscribe_probe_invalidations(
+    pub(super) fn subscribe_probe_invalidations(
         &mut self,
         window: &Window,
         cx: &mut Context<ConnectionsPanel>,
@@ -1064,14 +1106,50 @@ impl HostEditor {
             .input_entities()
             .iter()
             .map(|input| {
-                cx.subscribe(input, |panel, _, event: &InputEvent, cx| {
+                cx.subscribe(input, |panel, changed_input, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
+                        if let Some(editor) = panel.editor.as_mut() {
+                            editor.cancel_pending_credential_clear(&changed_input, cx);
+                        }
                         panel.reset_connection_probe();
                         cx.notify();
                     }
                 })
             })
             .collect();
+        for (input, field) in [
+            (self.inputs.name.clone(), HostEditorField::Name),
+            (self.inputs.tags.clone(), HostEditorField::Tags),
+        ] {
+            subscriptions.push(cx.subscribe(
+                &input,
+                move |panel, input, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let cleared = panel.editor.as_mut().and_then(|editor| {
+                            editor.clear_metadata_validation(field, input.entity_id())
+                        });
+                        if cleared.is_some() && cleared.as_deref() == panel.status.as_deref() {
+                            panel.status = None;
+                        }
+                        cx.notify();
+                    }
+                },
+            ));
+        }
+        subscriptions.push(cx.subscribe(
+            &self.inputs.note,
+            |panel, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let cleared = panel.editor.as_mut().and_then(|editor| {
+                        editor.clear_metadata_validation(HostEditorField::Note, input.entity_id())
+                    });
+                    if cleared.is_some() && cleared.as_deref() == panel.status.as_deref() {
+                        panel.status = None;
+                    }
+                    cx.notify();
+                }
+            },
+        ));
         let private_key = self.inputs.private_key.clone();
         let window_handle = window.window_handle();
         subscriptions.push(cx.subscribe(
@@ -1086,6 +1164,7 @@ impl HostEditor {
                         }
                         editor.clear_private_key = false;
                         editor.private_key_file_source = false;
+                        editor.private_key_input_mode = PrivateKeyInputMode::Paste;
                         Some(editor.inputs.key_path.clone())
                     });
                     if let Some(key_path) = key_path {
@@ -1115,6 +1194,9 @@ impl HostEditor {
                             &path,
                             editor.has_target_private_key(),
                         );
+                        if !path.trim().is_empty() {
+                            editor.private_key_input_mode = PrivateKeyInputMode::File;
+                        }
                         (!path.trim().is_empty()).then(|| editor.inputs.private_key.clone())
                     });
                     if let Some(private_key) = private_key {
@@ -1132,6 +1214,115 @@ impl HostEditor {
         self._probe_subscriptions = subscriptions;
     }
 
+    /// 显式切换时清掉另一来源输入，确保界面、探测与保存只有一种生效材料，并把焦点交给可见控件。
+    /// @author kongweiguang
+    pub(super) fn select_private_key_input_mode(
+        &mut self,
+        mode: PrivateKeyInputMode,
+        window: &mut Window,
+        cx: &mut Context<ConnectionsPanel>,
+    ) {
+        if self.private_key_input_mode == mode {
+            return;
+        }
+        self.private_key_input_mode = mode;
+        let focus = match mode {
+            PrivateKeyInputMode::File => {
+                self.inputs
+                    .private_key
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.private_key_file_source = private_key_file_source_selected(
+                    &read_input(&self.inputs.key_path, cx),
+                    self.has_target_private_key(),
+                );
+                self.inputs.key_path.read(cx).focus_handle(cx)
+            }
+            PrivateKeyInputMode::Paste => {
+                clear_input(&self.inputs.key_path, window, cx);
+                self.private_key_file_source = false;
+                self.inputs.private_key.read(cx).focus_handle(cx)
+            }
+        };
+        self.validation_issue = None;
+        window.focus(&focus, cx);
+    }
+
+    /// 认证错误与私钥字段错误定位到当前可见来源，避免焦点落入已卸载的输入实体。
+    /// @author kongweiguang
+    pub(super) fn private_key_focus_handle(&self, cx: &gpui_kit::App) -> gpui_kit::FocusHandle {
+        match self.private_key_input_mode {
+            PrivateKeyInputMode::File => self.inputs.key_path.read(cx).focus_handle(cx),
+            PrivateKeyInputMode::Paste => self.inputs.private_key.read(cx).focus_handle(cx),
+        }
+    }
+
+    /// 只清当前实体的元数据错误，迟到事件不能影响新草稿，也不撤销与连接参数无关的测试结果。
+    /// @author kongweiguang
+    fn clear_metadata_validation(
+        &mut self,
+        field: HostEditorField,
+        input: gpui_kit::EntityId,
+    ) -> Option<String> {
+        let expected = match field {
+            HostEditorField::Name => self.inputs.name.entity_id(),
+            HostEditorField::Tags => self.inputs.tags.entity_id(),
+            HostEditorField::Note => self.inputs.note.entity_id(),
+            _ => return None,
+        };
+        if expected != input
+            || !self
+                .validation_issue
+                .as_ref()
+                .is_some_and(|issue| issue.field == field)
+        {
+            return None;
+        }
+        self.validation_issue.take().map(|issue| issue.message)
+    }
+
+    /// 非空秘密表示用户已选择替换凭据，因此撤销对应 Clear 状态并同步按钮反馈。
+    /// @author kongweiguang
+    fn cancel_pending_credential_clear(
+        &mut self,
+        changed_input: &Entity<InputState>,
+        cx: &gpui_kit::App,
+    ) {
+        if input_is_empty(changed_input, cx) {
+            return;
+        }
+        let changed_id = changed_input.entity_id();
+        if self.inputs.secret.entity_id() == changed_id {
+            match self.protocol {
+                RemoteProtocol::Ssh | RemoteProtocol::Sftp => {
+                    self.clear_target_credential =
+                        clear_requested_after_input(self.clear_target_credential, true);
+                }
+                RemoteProtocol::Rdp => {
+                    self.clear_rdp_password =
+                        clear_requested_after_input(self.clear_rdp_password, true);
+                }
+                RemoteProtocol::Telnet | RemoteProtocol::Serial => {}
+            }
+        }
+        if self.inputs.passphrase.entity_id() == changed_id
+            && matches!(self.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp)
+        {
+            self.clear_passphrase = clear_requested_after_input(self.clear_passphrase, true);
+        }
+        if self.inputs.proxy_password.entity_id() == changed_id {
+            self.clear_proxy_password =
+                clear_requested_after_input(self.clear_proxy_password, true);
+        }
+        for jump in &mut self.jumps {
+            if jump.secret.entity_id() == changed_id {
+                jump.clear_credential = clear_requested_after_input(jump.clear_credential, true);
+            }
+            if jump.passphrase.entity_id() == changed_id {
+                jump.clear_passphrase = clear_requested_after_input(jump.clear_passphrase, true);
+            }
+        }
+    }
+
     /// 返回所有会影响探测目标或认证材料的输入实体，导航状态不参与探测失效判断。
     /// @author kongweiguang
     fn input_entities(&self) -> Vec<Entity<InputState>> {
@@ -1145,11 +1336,9 @@ impl HostEditor {
             self.inputs.sftp_concurrency.clone(),
             self.inputs.rdp_width.clone(),
             self.inputs.rdp_height.clone(),
-            self.inputs.name.clone(),
             self.inputs.host.clone(),
             self.inputs.port.clone(),
             self.inputs.username.clone(),
-            self.inputs.tags.clone(),
             self.inputs.secret.clone(),
             self.inputs.key_path.clone(),
             self.inputs.passphrase.clone(),
@@ -1248,7 +1437,7 @@ impl HostEditor {
         }
     }
 
-    /// 仅读取本协议独有配置，隐藏草稿的比较不受共用名称、分组或收藏变化影响。
+    /// 仅读取本协议独有配置，隐藏草稿的比较不受共用名称或分组变化影响。
     /// @author kongweiguang
     fn protocol_snapshot(&self, cx: &gpui_kit::App) -> HostProtocolBaseline {
         HostProtocolBaseline {
@@ -1315,12 +1504,11 @@ impl HostEditor {
             name: read_input(&self.inputs.name, cx),
             tags: read_input(&self.inputs.tags, cx),
             selected_group: self.selected_group.clone(),
-            favorite: self.favorite,
         }
     }
 
-    /// 将编辑字段转换成 HostDraft；隐藏协议的高级项沿用原值，不让半填字段阻断其它协议保存。
-    /// 串口 endpoint 只由设备路径投影，读取过程不改表单状态或把线制参数混入标签。
+    /// 仅投影当前协议生效的高级字段；禁用字段保留原值，避免无关草稿阻止保存。
+    /// 串口 endpoint 只由设备路径投影，SFTP-only 能力固定开启；所选私钥来源未完成时不退用隐藏材料。
     /// @author kongweiguang
     pub(super) fn to_draft(
         &self,
@@ -1337,6 +1525,21 @@ impl HostEditor {
             parse_port(&port_text, self.protocol)?
         };
         let pasted_private_key = self.inputs.private_key.read(cx).value().to_string();
+        if matches!(self.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp)
+            && self.authentication_mode == HostAuthenticationMode::PrivateKey
+            && self.private_key_input_mode == PrivateKeyInputMode::File
+            && read_input(&self.inputs.key_path, cx).trim().is_empty()
+        {
+            return Err(AppError::invalid("请选择私钥文件或切换为粘贴内容"));
+        }
+        if matches!(self.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp)
+            && self.authentication_mode == HostAuthenticationMode::PrivateKey
+            && self.private_key_input_mode == PrivateKeyInputMode::Paste
+            && (self.clear_private_key || !self.has_target_private_key())
+            && pasted_private_key.trim().is_empty()
+        {
+            return Err(AppError::invalid("请粘贴私钥内容或切换为文件"));
+        }
         if matches!(self.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp)
             && self.authentication_mode == HostAuthenticationMode::PrivateKey
             && !pasted_private_key.trim().is_empty()
@@ -1420,13 +1623,9 @@ impl HostEditor {
                 username,
             }
         };
-        let tags = read_input(&self.inputs.tags, cx)
-            .split(',')
-            .map(str::trim)
-            .filter(|tag| !tag.is_empty())
-            .filter(|tag| !tag.eq_ignore_ascii_case("favorite"))
-            .map(str::to_owned)
-            .collect();
+        let tags = parse_list(&read_input(&self.inputs.tags, cx), ListSeparator::Commas).map_err(
+            |_| AppError::invalid("标签格式无效；含逗号的标签请用双引号包裹，项内双引号写成两个"),
+        )?;
         Ok(HostDraft {
             id: self.original.as_ref().map(|value| value.id.clone()),
             group_id: self.selected_group.clone(),
@@ -1442,7 +1641,6 @@ impl HostEditor {
             route,
             serial,
             tags,
-            is_favorite: self.favorite,
             sort_order: self.original.as_ref().map_or(0, |value| value.sort_order),
             connect_timeout_ms: if matches!(
                 self.protocol,
@@ -1472,6 +1670,7 @@ impl HostEditor {
                     600,
                     "SSH 心跳必须为 0 到 600 秒",
                 )?
+                .or(Some(60))
                 .filter(|value| *value != 0)
                 .map(|value| u64::from(value) * 1000)
             } else {
@@ -1493,9 +1692,18 @@ impl HostEditor {
                     .map(|host| host.terminal_options.clone())
                     .unwrap_or_default()
             },
-            sftp_options: if matches!(self.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp) {
-                HostSftpOptions {
-                    enabled: self.sftp_enabled,
+            sftp_options: match self.protocol {
+                RemoteProtocol::Ssh if !self.sftp_enabled => {
+                    let mut options = self
+                        .original
+                        .as_ref()
+                        .map(|host| host.sftp_options.clone())
+                        .unwrap_or_default();
+                    options.enabled = false;
+                    options
+                }
+                RemoteProtocol::Ssh | RemoteProtocol::Sftp => HostSftpOptions {
+                    enabled: self.protocol == RemoteProtocol::Sftp || self.sftp_enabled,
                     local_start_directory: optional_option_text(&read_input(
                         &self.inputs.sftp_local_directory,
                         cx,
@@ -1513,16 +1721,16 @@ impl HostEditor {
                         8,
                         "SFTP 主机并发必须为 1 到 8",
                     )?,
-                }
-            } else {
-                self.original
+                },
+                _ => self
+                    .original
                     .as_ref()
                     .map(|host| host.sftp_options.clone())
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
             },
-            rdp_display: if self.protocol == RemoteProtocol::Rdp {
+            rdp_display: if self.protocol == RemoteProtocol::Rdp && !self.rdp_fullscreen {
                 RdpDisplayOptions {
-                    fullscreen: self.rdp_fullscreen,
+                    fullscreen: false,
                     width: parse_option_number(
                         &read_input(&self.inputs.rdp_width, cx),
                         640,
@@ -1536,6 +1744,14 @@ impl HostEditor {
                         "RDP 高度必须为 480 到 8192",
                     )?,
                 }
+            } else if self.protocol == RemoteProtocol::Rdp {
+                let mut display = self
+                    .original
+                    .as_ref()
+                    .map(|host| host.rdp_display.clone())
+                    .unwrap_or_default();
+                display.fullscreen = true;
+                display
             } else {
                 self.original
                     .as_ref()
@@ -1555,17 +1771,12 @@ impl HostEditor {
         match self.protocol {
             RemoteProtocol::Ssh | RemoteProtocol::Sftp => match self.authentication_mode {
                 HostAuthenticationMode::Password => {
-                    if self.clear_target_credential {
-                        changes.push(HostCredentialChange::Clear {
-                            slot: HostCredentialSlot::TargetPassword,
-                        });
-                    } else {
-                        push_replace(
-                            &mut changes,
-                            HostCredentialSlot::TargetPassword,
-                            read_input(&self.inputs.secret, cx),
-                        );
-                    }
+                    append_clearable_credential_change(
+                        &mut changes,
+                        HostCredentialSlot::TargetPassword,
+                        self.clear_target_credential,
+                        read_input(&self.inputs.secret, cx),
+                    );
                 }
                 HostAuthenticationMode::PrivateKey => {
                     let key = self.inputs.private_key.read(cx).value().to_string();
@@ -1588,32 +1799,22 @@ impl HostEditor {
                     } else {
                         // 空输入保持已保存引用不变；只有显式清除标记会生成 Clear 用例。
                     }
-                    if self.clear_passphrase {
-                        changes.push(HostCredentialChange::Clear {
-                            slot: HostCredentialSlot::TargetKeyPassphrase,
-                        });
-                    } else {
-                        push_replace(
-                            &mut changes,
-                            HostCredentialSlot::TargetKeyPassphrase,
-                            read_input(&self.inputs.passphrase, cx),
-                        );
-                    }
+                    append_clearable_credential_change(
+                        &mut changes,
+                        HostCredentialSlot::TargetKeyPassphrase,
+                        self.clear_passphrase,
+                        read_input(&self.inputs.passphrase, cx),
+                    );
                 }
                 HostAuthenticationMode::Agent => {}
             },
             RemoteProtocol::Rdp => {
-                if self.clear_rdp_password {
-                    changes.push(HostCredentialChange::Clear {
-                        slot: HostCredentialSlot::RdpPassword,
-                    });
-                } else {
-                    push_replace(
-                        &mut changes,
-                        HostCredentialSlot::RdpPassword,
-                        read_input(&self.inputs.secret, cx),
-                    );
-                }
+                append_clearable_credential_change(
+                    &mut changes,
+                    HostCredentialSlot::RdpPassword,
+                    self.clear_rdp_password,
+                    read_input(&self.inputs.secret, cx),
+                );
             }
             RemoteProtocol::Telnet | RemoteProtocol::Serial => {}
         }
@@ -1621,44 +1822,35 @@ impl HostEditor {
             match jump.authentication_mode {
                 HostAuthenticationMode::Agent => {}
                 HostAuthenticationMode::Password => {
-                    if jump.clear_credential {
-                        changes.push(HostCredentialChange::Clear {
-                            slot: HostCredentialSlot::JumpPassword(index),
-                        });
-                    } else {
-                        push_replace(
-                            &mut changes,
-                            HostCredentialSlot::JumpPassword(index),
-                            read_input(&jump.secret, cx),
-                        );
-                    }
+                    append_clearable_credential_change(
+                        &mut changes,
+                        HostCredentialSlot::JumpPassword(index),
+                        jump.clear_credential,
+                        read_input(&jump.secret, cx),
+                    );
                 }
                 HostAuthenticationMode::PrivateKey => {
-                    if jump.clear_passphrase {
+                    if jump.uses_replacement_key_file(cx) {
                         changes.push(HostCredentialChange::Clear {
-                            slot: HostCredentialSlot::JumpKeyPassphrase(index),
+                            slot: HostCredentialSlot::JumpPrivateKey(index),
                         });
-                    } else {
-                        push_replace(
-                            &mut changes,
-                            HostCredentialSlot::JumpKeyPassphrase(index),
-                            read_input(&jump.passphrase, cx),
-                        );
                     }
+                    append_clearable_credential_change(
+                        &mut changes,
+                        HostCredentialSlot::JumpKeyPassphrase(index),
+                        jump.clear_passphrase,
+                        read_input(&jump.passphrase, cx),
+                    );
                 }
             }
         }
         if matches!(self.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp) && self.proxy_enabled
         {
-            if self.clear_proxy_password {
-                append_proxy_credential_change(&mut changes, true, String::new());
-            } else {
-                append_proxy_credential_change(
-                    &mut changes,
-                    false,
-                    read_input(&self.inputs.proxy_password, cx),
-                );
-            }
+            append_proxy_credential_change(
+                &mut changes,
+                self.clear_proxy_password,
+                read_input(&self.inputs.proxy_password, cx),
+            );
         }
         changes
     }
@@ -1765,6 +1957,7 @@ impl HostEditor {
         } else {
             self.inputs = self.new_protocol_inputs(protocol, window, cx);
             self.authentication_mode = default_authentication(protocol);
+            self.private_key_input_mode = PrivateKeyInputMode::File;
             self.proxy_enabled = false;
             self.proxy_protocol = ProxyProtocol::Socks5;
             self.sftp_enabled = true;
@@ -1790,7 +1983,7 @@ impl HostEditor {
             self.baseline = self.snapshot(cx);
             self.baseline.common = common_baseline;
         }
-        self.section = HostEditorSection::normalize(protocol, self.section);
+        self.section = HostEditorSection::Properties;
         self.validation_issue = None;
         self.scroll_handle.set_offset(Default::default());
         self.subscribe_probe_invalidations(window, cx);
@@ -1839,8 +2032,8 @@ impl HostEditor {
                 window,
                 cx,
                 crate::locale::text(
-                    "新凭据；留空保留现有引用",
-                    "New credential; leave empty to keep the saved reference",
+                    "输入密码；留空保留已保存密码",
+                    "Password; leave empty to keep the saved password",
                 ),
                 "",
                 true,
@@ -1848,10 +2041,7 @@ impl HostEditor {
             key_path: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "私钥文件路径（不读取文件内容）",
-                    "Private key path (file contents are not read)",
-                ),
+                crate::locale::text("私钥文件路径", "Private key file path"),
                 "",
                 false,
             ),
@@ -1861,8 +2051,8 @@ impl HostEditor {
                 window,
                 cx,
                 crate::locale::text(
-                    "私钥口令；留空保留现有引用",
-                    "Key passphrase; leave empty to keep the saved reference",
+                    "私钥口令（可选）；留空保留已保存口令",
+                    "Key passphrase (optional); leave empty to keep the saved passphrase",
                 ),
                 "",
                 true,
@@ -1899,14 +2089,14 @@ impl HostEditor {
                 window,
                 cx,
                 crate::locale::text(
-                    "新代理密码；留空保留现有引用",
-                    "New proxy password; leave empty to keep the saved reference",
+                    "代理密码；留空保留已保存密码",
+                    "Proxy password; leave empty to keep the saved password",
                 ),
                 "",
                 true,
             ),
             connect_timeout: create_input(window, cx, "30", "30", false),
-            keepalive: create_input(window, cx, "0", "0", false),
+            keepalive: create_input(window, cx, "60", "60", false),
             term: create_input(window, cx, "xterm-256color", "xterm-256color", false),
             working_directory: create_input(window, cx, "/home/user", "", false),
             sftp_local_directory: create_input(window, cx, "", "", false),
@@ -2027,17 +2217,33 @@ fn proxy_password_matches_route(
 }
 
 /// 将代理密码表单状态投影成 Replace/Clear；空输入本身不产生改动，保留旧 opaque ref。
+/// 非空新密码优先于待清除状态，避免 UI 允许输入却静默忽略新值。
+/// @author kongweiguang
 fn append_proxy_credential_change(
     changes: &mut Vec<HostCredentialChange>,
     clearing: bool,
     secret: String,
 ) {
-    if clearing {
-        changes.push(HostCredentialChange::Clear {
-            slot: HostCredentialSlot::ProxyPassword,
-        });
-    } else {
-        push_replace(changes, HostCredentialSlot::ProxyPassword, secret);
+    append_clearable_credential_change(
+        changes,
+        HostCredentialSlot::ProxyPassword,
+        clearing,
+        secret,
+    );
+}
+
+/// 非空输入一律替换；只有空值与显式清除同时存在时才移除 Vault 引用。
+/// @author kongweiguang
+fn append_clearable_credential_change(
+    changes: &mut Vec<HostCredentialChange>,
+    slot: HostCredentialSlot,
+    clearing: bool,
+    secret: String,
+) {
+    if !secret.is_empty() {
+        push_replace(changes, slot, secret);
+    } else if clearing {
+        changes.push(HostCredentialChange::Clear { slot });
     }
 }
 
@@ -2243,7 +2449,26 @@ impl JumpInputs {
         }
     }
 
-    /// 将跳板表单映射为应用层类型并沿用原 opaque credential refs。
+    /// 只有新文件路径替换原 Vault 私钥；清空或改回原路径时保持原引用，便于保存前撤销。
+    /// @author kongweiguang
+    fn uses_replacement_key_file(&self, cx: &gpui_kit::App) -> bool {
+        let path = read_input(&self.key_path, cx);
+        let path = path.trim();
+        if path.is_empty() {
+            return false;
+        }
+        match self.original_authentication.as_ref() {
+            Some(SshAuthentication::PrivateKey {
+                path: original_path,
+                secret: Some(_),
+                ..
+            }) => original_path.as_deref() != Some(std::path::Path::new(path)),
+            _ => false,
+        }
+    }
+
+    /// 草稿与凭据用例共用文件来源判定，防止新路径在探测时仍被旧 Vault 私钥遮蔽。
+    /// @author kongweiguang
     fn to_model(&self, cx: &mut Context<ConnectionsPanel>) -> Result<ManagedJumpHost, AppError> {
         let name = read_input(&self.name, cx).trim().to_owned();
         let host = read_input(&self.host, cx).trim().to_owned();
@@ -2271,7 +2496,11 @@ impl JumpInputs {
                 };
                 Some(SshAuthentication::PrivateKey {
                     path: optional_path(&read_input(&self.key_path, cx))?,
-                    secret,
+                    secret: if self.uses_replacement_key_file(cx) {
+                        None
+                    } else {
+                        secret
+                    },
                     passphrase,
                 })
             }
@@ -2378,6 +2607,12 @@ pub(super) fn read_input(input: &Entity<InputState>, cx: &gpui_kit::App) -> Stri
 /// 只读取秘密输入是否为空，避免脏状态检查复制口令或私钥正文。
 fn input_is_empty(input: &Entity<InputState>, cx: &gpui_kit::App) -> bool {
     input.read(cx).value().is_empty()
+}
+
+/// 仅非空新值撤销显式清除；清除按钮清空输入时仍保留待删状态。
+/// @author kongweiguang
+fn clear_requested_after_input(clear_requested: bool, has_new_value: bool) -> bool {
+    clear_requested && !has_new_value
 }
 
 /// 保存完成或表单取消后清空输入组件内仍持有的秘密文本。

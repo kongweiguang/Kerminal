@@ -20,6 +20,7 @@ use zeroize::Zeroize;
 use super::{
     CredentialCleanupStatus, HostDeletionReceipt, HostManagementService, LocalHostDraft,
     LocalHostSaveRecoveryToken, ManagedLocalHost, RecoverableLocalHostSaveOutcome,
+    ReferencedCredentialBehavior,
 };
 use crate::{
     AppError, AppResult, PublicErrorCode,
@@ -361,12 +362,28 @@ impl HostManagementService {
         &self,
         recovery: &LocalHostSaveRecoveryToken,
     ) -> AppResult<CredentialCleanupStatus> {
-        let _ = self.repository.load_local_host(&recovery.host_id).await?;
+        let current = self
+            .repository
+            .load_local_host(&recovery.host_id)
+            .await?
+            .and_then(|host| host.environment_ref);
         let old = self
-            .cleanup_local_environment(&recovery.host_id, recovery.old_reference.as_ref())
+            .cleanup_local_environment(
+                &recovery.host_id,
+                recovery
+                    .old_reference
+                    .as_ref()
+                    .filter(|reference| Some(*reference) != current.as_ref()),
+            )
             .await;
         let new = self
-            .cleanup_local_environment(&recovery.host_id, recovery.new_reference.as_ref())
+            .cleanup_local_environment(
+                &recovery.host_id,
+                recovery
+                    .new_reference
+                    .as_ref()
+                    .filter(|reference| Some(*reference) != current.as_ref()),
+            )
             .await;
         let cleanup = match (old, new) {
             (CredentialCleanupStatus::Complete, CredentialCleanupStatus::Complete) => {
@@ -465,7 +482,7 @@ impl HostManagementService {
         Ok(HostDeletionReceipt { credential_cleanup })
     }
 
-    /// 清理前重新读取同一 host；错误、错位引用和不确定结果均保留密文。
+    /// 已证明仍被引用的候选交由其当前使用方保留；覆盖或删除不确定时保留恢复记录。
     ///
     /// @author kongweiguang
     async fn cleanup_local_environment(
@@ -479,21 +496,15 @@ impl HostManagementService {
         if validate_local_environment_reference(host_id, reference).is_err() {
             return CredentialCleanupStatus::Deferred { remaining: 1 };
         }
-        match self.repository.load_local_host(host_id).await {
-            Ok(Some(host)) if host.environment_ref.as_ref() == Some(reference) => {
-                return CredentialCleanupStatus::Complete;
-            }
-            Ok(_) => {}
-            Err(_) => return CredentialCleanupStatus::Deferred { remaining: 1 },
-        }
         let Some(credentials) = self.credentials.as_ref() else {
             return CredentialCleanupStatus::Deferred { remaining: 1 };
         };
-        if credentials.remove(reference).await.is_err() {
-            CredentialCleanupStatus::Deferred { remaining: 1 }
-        } else {
-            CredentialCleanupStatus::Complete
-        }
+        self.cleanup_credential_candidates(
+            credentials,
+            std::slice::from_ref(reference),
+            ReferencedCredentialBehavior::Preserve,
+        )
+        .await
     }
 }
 

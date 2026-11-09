@@ -159,12 +159,16 @@ impl RootView {
     }
 }
 
-/// WorkspaceFile 直接保留其文件宿主身份，不伪造终端 session binding 或依赖侧栏选择。
+/// 文件工作区与内部文档直接保留冻结宿主身份，不伪造终端 binding 或依赖侧栏选择。
 ///
 /// @author kongweiguang
 fn workspace_file_host_context(tab: &WorkspaceSessionTab) -> Option<ContainerPanelContext> {
-    let WorkspaceSessionTab::WorkspaceFile { id, target, .. } = tab else {
-        return None;
+    let (id, target) = match tab {
+        WorkspaceSessionTab::WorkspaceFile { id, target, .. } => (id, target),
+        WorkspaceSessionTab::Terminal { .. }
+        | WorkspaceSessionTab::SftpTransfer { .. }
+        | WorkspaceSessionTab::Extension { .. }
+        | WorkspaceSessionTab::Unsupported { .. } => return None,
     };
     let host_id = match target {
         WorkspaceTargetRef::Ssh { host_id }

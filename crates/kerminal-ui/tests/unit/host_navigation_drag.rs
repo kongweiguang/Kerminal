@@ -318,7 +318,6 @@ fn remote(id: &str, group_id: Option<&str>) -> ManagedHost {
         route: Default::default(),
         serial: None,
         tags: Vec::new(),
-        is_favorite: false,
         sort_order: 0,
         connect_timeout_ms: 30_000,
         keepalive_interval_ms: Some(60_000),

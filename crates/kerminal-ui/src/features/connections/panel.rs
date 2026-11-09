@@ -20,6 +20,7 @@ use kerminal_application::{
         RdpClientLifecycle, RdpLaunchId, RdpLaunchReceipt, RdpLaunchRequest, RdpLaunchService,
         RdpLaunchStatus, RdpLaunchStatusService, RemoteConnectionService, SerialPortDescriptor,
         SerialPortService,
+        host_types::{PluginHostOpenIntent, PluginHostService},
         management::{
             CredentialCleanupStatus, HostAuthenticationMode, HostCredentialChange,
             HostCredentialSlot, HostDeletionReceipt, HostDraft, HostGroup,
@@ -27,7 +28,7 @@ use kerminal_application::{
             HostSaveRecoveryToken, ManagedHost, RecoverableHostSaveOutcome,
         },
         probe::{
-            ConnectionProbeOutcome, ConnectionProbeRequest, ConnectionProbeService,
+            ConnectionProbeOutcome, ConnectionProbeRequest, ConnectionProbeService, ProbeField,
             ProbeHostKeyConfirmation,
         },
     },
@@ -113,7 +114,7 @@ use super::form::{
     create_input, set_input_placeholder,
 };
 
-/// 将领域校验字段映射回现有控件句柄；没有可聚焦控件时仍由锚点滚动展示错误。
+/// 字段类别与真实输入句柄一一对应，宽高和目录错误不得都落到分区首项。
 /// @author kongweiguang
 fn editor_validation_focus_handle(
     editor: &HostEditor,
@@ -128,16 +129,23 @@ fn editor_validation_focus_handle(
         HostEditorField::Username => editor.inputs.username.read(cx).focus_handle(cx),
         HostEditorField::Authentication => match editor.authentication_mode {
             HostAuthenticationMode::Password => editor.inputs.secret.read(cx).focus_handle(cx),
-            HostAuthenticationMode::PrivateKey => editor.inputs.key_path.read(cx).focus_handle(cx),
+            HostAuthenticationMode::PrivateKey => editor.private_key_focus_handle(cx),
             HostAuthenticationMode::Agent => return None,
         },
-        HostEditorField::PrivateKey => editor.inputs.private_key.read(cx).focus_handle(cx),
+        HostEditorField::PrivateKey => editor.private_key_focus_handle(cx),
         HostEditorField::Note => editor.inputs.note.read(cx).focus_handle(cx),
         HostEditorField::SerialBaud => editor.inputs.serial_baud.read(cx).focus_handle(cx),
         HostEditorField::Network => editor.inputs.connect_timeout.read(cx).focus_handle(cx),
         HostEditorField::Terminal => editor.inputs.term.read(cx).focus_handle(cx),
         HostEditorField::Transfer => editor.inputs.sftp_concurrency.read(cx).focus_handle(cx),
+        HostEditorField::SftpRemoteDirectory => editor
+            .inputs
+            .sftp_remote_directory
+            .read(cx)
+            .focus_handle(cx),
         HostEditorField::Display => editor.inputs.rdp_width.read(cx).focus_handle(cx),
+        HostEditorField::RdpWidth => editor.inputs.rdp_width.read(cx).focus_handle(cx),
+        HostEditorField::RdpHeight => editor.inputs.rdp_height.read(cx).focus_handle(cx),
         HostEditorField::Proxy => editor.inputs.proxy_host.read(cx).focus_handle(cx),
         HostEditorField::JumpHosts => {
             return editor
@@ -162,6 +170,9 @@ pub enum ConnectionsEvent {
         host_id: HostId,
     },
     HostSaved {
+        host_id: HostId,
+    },
+    PluginHostSaved {
         host_id: HostId,
     },
     LocalProfileSaved {
@@ -636,7 +647,6 @@ fn host_draft_from_managed_host(host: &ManagedHost) -> HostDraft {
         route: host.route.clone(),
         serial: host.serial.clone(),
         tags: host.tags.clone(),
-        is_favorite: host.is_favorite,
         sort_order: host.sort_order,
         connect_timeout_ms: host.connect_timeout_ms,
         keepalive_interval_ms: host.keepalive_interval_ms,
@@ -1012,6 +1022,7 @@ impl ConnectionRequestEpoch {
 /// 主机目录和分组快照通过 application 读取；UI 状态只含可安全展示的类型数据。
 pub struct ConnectionsPanel {
     pub(super) hosts: HostManagementService,
+    plugin_hosts: Option<PluginHostService>,
     pub(super) remote: Arc<dyn RemoteConnectionService>,
     pub(super) rdp: Option<Arc<RdpLaunchService>>,
     pub(super) executor: ApplicationTaskExecutor,
@@ -1034,6 +1045,7 @@ pub struct ConnectionsPanel {
     pub(super) configuration_mutation_busy: bool,
     status_after_reload: Option<String>,
     pub(super) editor: Option<HostEditor>,
+    pub(super) plugin_forms: super::plugin_forms::PluginHostForms,
     pub(super) local_hosts: super::local_hosts::LocalHostState,
     pub(super) active_editor_kind: Option<ConnectionsEditorKind>,
     group_editor_return: Option<GroupEditorReturn>,
@@ -1051,6 +1063,7 @@ pub struct ConnectionsPanel {
     pending_new_host_id: Option<HostId>,
     pub(super) probe_service: Option<Arc<ConnectionProbeService>>,
     pub(super) probe_running: bool,
+    pub(super) probe_cancelled: bool,
     pub(super) probe_outcome: Option<ConnectionProbeOutcome>,
     pub(super) probe_error: Option<String>,
     probe_challenge_draft: Option<kerminal_application::connections::management::HostDraft>,
@@ -1131,6 +1144,7 @@ impl ConnectionsPanel {
         );
         let mut panel = Self {
             hosts,
+            plugin_hosts: None,
             remote,
             rdp,
             executor,
@@ -1153,6 +1167,7 @@ impl ConnectionsPanel {
             configuration_mutation_busy: false,
             status_after_reload: None,
             editor: None,
+            plugin_forms: super::plugin_forms::PluginHostForms::default(),
             local_hosts: super::local_hosts::LocalHostState::default(),
             active_editor_kind: None,
             group_editor_return: None,
@@ -1169,6 +1184,7 @@ impl ConnectionsPanel {
             pending_new_host_id: None,
             probe_service: None,
             probe_running: false,
+            probe_cancelled: false,
             probe_outcome: None,
             probe_error: None,
             probe_challenge_draft: None,
@@ -1269,12 +1285,25 @@ impl ConnectionsPanel {
         self
     }
 
+    /// 生产连接通过同一主机目录的运行提供方；未注入的隔离测试沿用原预检流程。
+    pub fn with_plugin_hosts(mut self, service: PluginHostService) -> Self {
+        self.plugin_hosts = Some(service);
+        self
+    }
+
     /// 供 Root 选择是否把同一面板实体投影为编辑弹层内容。
     /// @author kongweiguang
     pub fn editor_open(&self) -> bool {
         self.editor.is_some()
             || self.local_hosts.editor.is_some()
             || self.local_hosts.editor_load_intent.is_some()
+            || self.plugin_forms.is_open()
+    }
+
+    /// 文件选择器发起的创建会在确认保存后继续原选择流程，按钮文案必须体现这一步。
+    /// @author kongweiguang
+    pub(super) fn is_sftp_host_creation_flow(&self) -> bool {
+        self.sftp_host_creation_flow_id.is_some()
     }
 
     /// 外层 Root 焦点陷阱在嵌套确认或分组弹层打开期间应暂停，焦点由最上层表单拥有。
@@ -1286,6 +1315,9 @@ impl ConnectionsPanel {
     /// 返回当前编辑器是否绑定已保存身份；复制和新建仍可切换协议，避免 UI 与提交策略分叉。
     /// @author kongweiguang
     pub(super) fn editor_protocol_locked(&self) -> bool {
+        if self.plugin_forms.active_is_existing() {
+            return true;
+        }
         match self.active_editor_kind {
             Some(ConnectionsEditorKind::Remote) => self
                 .editor
@@ -1362,6 +1394,7 @@ impl ConnectionsPanel {
                     path,
                     editor.has_target_private_key(),
                 );
+                editor.private_key_input_mode = super::form::PrivateKeyInputMode::File;
                 clear_textarea(&editor.inputs.private_key, window, cx);
                 self.reset_connection_probe();
             }
@@ -1450,6 +1483,9 @@ impl ConnectionsPanel {
     /// 仅聚焦当前分区实际可编辑的字段；无可输入项时留在分区容器，避免焦点落入隐藏表单。
     /// @author kongweiguang
     pub fn focus_editor_primary_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plugin_forms.focus_active(window, cx) {
+            return;
+        }
         let local =
             self.active_editor_kind == Some(ConnectionsEditorKind::Local) || self.editor.is_none();
         let disabled = if local {
@@ -1478,21 +1514,16 @@ impl ConnectionsPanel {
                 })
         } else if let Some(editor) = self.editor.as_ref() {
             let input = match editor.section {
-                HostEditorSection::Properties | HostEditorSection::Authentication
-                    if editor.protocol == RemoteProtocol::Serial =>
-                {
-                    Some(&editor.inputs.name)
-                }
                 HostEditorSection::Properties | HostEditorSection::Authentication => {
                     Some(&editor.inputs.host)
                 }
                 HostEditorSection::Proxy if editor.proxy_enabled => Some(&editor.inputs.proxy_host),
-                HostEditorSection::Terminal if editor.protocol == RemoteProtocol::Serial => {
-                    Some(&editor.inputs.serial_baud)
-                }
+                HostEditorSection::Terminal if editor.protocol == RemoteProtocol::Serial => None,
                 HostEditorSection::Terminal => Some(&editor.inputs.term),
                 HostEditorSection::Network => Some(&editor.inputs.connect_timeout),
-                HostEditorSection::Transfer if editor.sftp_enabled => {
+                HostEditorSection::Transfer
+                    if editor.protocol == RemoteProtocol::Sftp || editor.sftp_enabled =>
+                {
                     Some(&editor.inputs.sftp_local_directory)
                 }
                 HostEditorSection::Display if !editor.rdp_fullscreen => {
@@ -1501,7 +1532,13 @@ impl ConnectionsPanel {
                 HostEditorSection::JumpHosts => editor.jumps.first().map(|jump| &jump.host),
                 _ => None,
             };
-            input.map(|input| input.read(cx).focus_handle(cx))
+            input
+                .map(|input| input.read(cx).focus_handle(cx))
+                .or_else(|| {
+                    (editor.protocol == RemoteProtocol::Serial
+                        && editor.section == HostEditorSection::Terminal)
+                        .then(|| editor.serial_data_bits_select.read(cx).focus_handle(cx))
+                })
         } else {
             None
         };
@@ -2330,6 +2367,25 @@ impl ConnectionsPanel {
         self.connect_selected(false, cx);
     }
 
+    /// Root 已核对提供方意图时只执行原连接流程，避免再次分派导致递归。
+    pub(crate) fn request_connect_builtin_host(
+        &mut self,
+        host_id: &HostId,
+        expected_protocol: RemoteProtocol,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !host_rows_contain_protocol(
+            self.rows.iter().map(|host| (&host.id, host.protocol)),
+            host_id,
+            expected_protocol,
+        ) {
+            return false;
+        }
+        self.select_host(host_id.clone(), cx);
+        self.connect_selected_with_destination_direct(false, false, None, cx);
+        true
+    }
+
     /// 保留侧栏容器请求的独立身份穿过多轮指纹预检，防止同主机的后续连接误消费回执。
     ///
     /// @author kongweiguang
@@ -3145,11 +3201,116 @@ impl ConnectionsPanel {
         self.connect_selected_with_destination(true, true, None, cx);
     }
 
-    /// 统一验证连接意图并在异步信任回执后恢复原消费端；SFTP 请求 ID 在首轮预检前发布，
-    /// 后续信任等待与重试沿用该 ID，使 Root 能拒绝抢占新焦点的迟到成功回执。
+    /// 先由注册提供方核对主机，再交给原连接预检；取消和目标切换使迟到结果失效。
     ///
     /// @author kongweiguang
     fn connect_selected_with_destination(
+        &mut self,
+        sftp: bool,
+        create_transfer_tab: bool,
+        intent_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(service) = self.plugin_hosts.clone() else {
+            self.connect_selected_with_destination_direct(sftp, create_transfer_tab, intent_id, cx);
+            return;
+        };
+        self.cancel_connection_request(cx);
+        let Some(host) = self
+            .selected_host
+            .as_ref()
+            .and_then(|host_id| self.rows.iter().find(|host| &host.id == host_id).cloned())
+        else {
+            self.connect_selected_with_destination_direct(sftp, create_transfer_tab, intent_id, cx);
+            return;
+        };
+        let host_id = host.id.clone();
+        let expected_revision = host.revision.clone();
+        let expected_protocol = host.protocol;
+        let callback_revision = expected_revision.clone();
+        let task_host_id = host_id.clone();
+        let hosts = self.hosts.clone();
+        let executor = self.executor.clone();
+        self.sidebar_container_intent = intent_id.clone();
+        let (generation, request_cancellation) = self.begin_connection_request();
+        let callback_cancellation = request_cancellation.clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .run(move |executor_token| async move {
+                    let cancel = request_cancellation.bind_to(&executor_token);
+                    let intent = service.open(&task_host_id, cancel.clone()).await?;
+                    if !builtin_host_intent_matches(&intent, &task_host_id, expected_protocol) {
+                        return Err(AppError::invalid("内置主机打开意图不匹配"));
+                    }
+                    let current = hosts.load_host(&task_host_id).await?;
+                    if cancel.is_cancelled() {
+                        return Err(AppError::cancelled("主机打开请求已取消"));
+                    }
+                    if !current.as_ref().is_some_and(|host| {
+                        builtin_host_snapshot_matches(
+                            host,
+                            &task_host_id,
+                            expected_protocol,
+                            &expected_revision,
+                        )
+                    }) {
+                        return Err(AppError::conflict("主机配置已变化，请重新读取"));
+                    }
+                    Ok(())
+                })
+                .await;
+            cx.update(|app| {
+                let _ = this.update(app, |panel, cx| {
+                    if !panel
+                        .connection_request
+                        .is_current(generation, &callback_cancellation)
+                    {
+                        return;
+                    }
+                    let current = panel.selected_host.as_ref() == Some(&host_id)
+                        && panel.rows.iter().any(|host| {
+                            builtin_host_snapshot_matches(
+                                host,
+                                &host_id,
+                                expected_protocol,
+                                &callback_revision,
+                            )
+                        });
+                    let result = if current {
+                        result
+                    } else {
+                        Err(AppError::conflict("主机配置已变化，请重新读取"))
+                    };
+                    match result {
+                        Ok(()) => panel.connect_selected_with_destination_direct(
+                            sftp,
+                            create_transfer_tab,
+                            intent_id,
+                            cx,
+                        ),
+                        Err(error) => {
+                            let message = localized_error(&error);
+                            panel.sidebar_container_failure = panel
+                                .sidebar_container_intent
+                                .take()
+                                .map(|id| (id, message.clone()));
+                            panel.status = Some(message);
+                            if error.public_code() == PublicErrorCode::Conflict {
+                                panel.reload(cx);
+                            }
+                            cx.notify();
+                        }
+                    }
+                });
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 保留原协议、SFTP 与容器意图，信任预检及后续回执仍使用既有 owner。
+    /// @author kongweiguang
+    fn connect_selected_with_destination_direct(
         &mut self,
         sftp: bool,
         create_transfer_tab: bool,
@@ -3451,6 +3612,17 @@ impl ConnectionsPanel {
     /// 未知保存与冲突重读期间拒绝替换编辑目标，保持原表单和恢复请求身份稳定。
     /// @author kongweiguang
     pub(super) fn refuse_host_editor_replacement(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.plugin_forms.write_blocked() {
+            self.status = Some(
+                crate::locale::text(
+                    "插件主机保存仍在处理或等待读回。",
+                    "The plugin host save is active or awaiting readback.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return true;
+        }
         if self.refuse_conflict_reload_mutation(cx) {
             return true;
         }
@@ -3489,6 +3661,17 @@ impl ConnectionsPanel {
     /// 取消编辑时先清空输入框中的短生命周期秘密，再丢弃尚未保存的草稿。
     /// @author kongweiguang
     pub(super) fn cancel_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plugin_forms.write_blocked() {
+            self.status = Some(
+                crate::locale::text(
+                    "插件主机保存结果尚未确认，请先读回核对。",
+                    "The plugin host save is unresolved. Read it back before closing.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         if self.saving || self.local_hosts.saving {
             self.status = Some(
                 crate::locale::text(
@@ -3521,7 +3704,9 @@ impl ConnectionsPanel {
             .as_ref()
             .is_some_and(|editor| editor.is_dirty(cx));
         let local_dirty = self.local_host_is_dirty(cx);
-        if unified_editor_requires_discard(remote_dirty, local_dirty, self.save_outcome_unknown) {
+        if unified_editor_requires_discard(remote_dirty, local_dirty, self.save_outcome_unknown)
+            || self.plugin_forms.is_dirty(cx)
+        {
             self.begin_editor_discard_confirmation(window, cx);
             cx.notify();
             return;
@@ -3600,6 +3785,17 @@ impl ConnectionsPanel {
     /// 结束统一表单时使冲突重读失效并清理所有协议草稿与发现任务，避免迟到快照复活表单。
     /// @author kongweiguang
     pub(super) fn close_unified_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plugin_forms.write_blocked() {
+            self.status = Some(
+                crate::locale::text(
+                    "插件主机保存结果尚未确认，请先读回核对。",
+                    "The plugin host save is unresolved. Read it back before closing.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         if self.save_outcome_unknown || self.pending_host_save_recovery.is_some() {
             self.status = Some(crate::locale::text(
                 "保存结果仍待明确读回；编辑器和秘密保持在当前状态。",
@@ -3618,6 +3814,7 @@ impl ConnectionsPanel {
             editor.clear_secrets(window, cx);
         }
         self.editor = None;
+        self.plugin_forms.clear();
         self.clear_local_host_editor_for_unified_close(window, cx);
         self.pending_editor_discard = false;
         self.editor_discard_return_focus = None;
@@ -3682,7 +3879,7 @@ impl ConnectionsPanel {
         self.serial_ports_loading = false;
     }
 
-    /// 枚举当前串口快照；手工路径始终保留，取消或换表单后丢弃迟到结果。
+    /// 刷新只替换成功快照；扫描期间或失败时保留旧候选和手工路径，避免列表闪空。
     /// @author kongweiguang
     pub(super) fn refresh_serial_ports(&mut self, cx: &mut Context<Self>) {
         if !self
@@ -3695,8 +3892,6 @@ impl ConnectionsPanel {
 
         self.cancel_serial_port_scan();
         let generation = self.serial_port_scan_generation;
-        self.serial_ports.clear();
-        self.serial_ports_loaded = false;
         self.serial_ports_issue = None;
         let Some(service) = self.serial_port_service.clone() else {
             self.serial_ports_issue = Some(SerialPortScanIssue::ServiceUnavailable);
@@ -3730,7 +3925,6 @@ impl ConnectionsPanel {
                     match result {
                         Ok(ports) => panel.serial_ports = ports,
                         Err(error) => {
-                            panel.serial_ports.clear();
                             panel.serial_ports_issue =
                                 Some(if error.public_code() == PublicErrorCode::Cancelled {
                                     SerialPortScanIssue::Cancelled
@@ -3831,7 +4025,7 @@ impl ConnectionsPanel {
         );
     }
 
-    /// 取消当前 probe 世代并保留表单；迟到的网络结果因世代失配而被丢弃。
+    /// 用户取消是中性终态，撤销当前世代并保留表单，迟到结果不能冒充成功或失败。
     /// @author kongweiguang
     pub(super) fn cancel_connection_probe(&mut self, cx: &mut Context<Self>) {
         if !self.probe_running {
@@ -3839,19 +4033,14 @@ impl ConnectionsPanel {
         }
         self.probe_request.cancel();
         self.probe_running = false;
+        self.probe_cancelled = true;
         self.probe_outcome = None;
         self.probe_challenge_draft = None;
-        self.probe_error = Some(
-            crate::locale::text(
-                "连接测试已取消；草稿仍保留。",
-                "Connection test cancelled; the draft is preserved.",
-            )
-            .to_string(),
-        );
+        self.probe_error = None;
         cx.notify();
     }
 
-    /// 构建每次独立的一次性 probe 请求，并以 executor 令牌和本地世代共同约束结果回投。
+    /// 一次性测试保持原输入实体；世代隔离迟到回执，窗口上下文仅用于定位结构化字段错误。
     /// @author kongweiguang
     fn run_connection_probe(
         &mut self,
@@ -3859,6 +4048,11 @@ impl ConnectionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.host_editor_fields_disabled() {
+            return;
+        }
+        self.reset_connection_probe();
+        self.status = None;
         let Some(service) = self.probe_service.clone() else {
             return;
         };
@@ -3888,6 +4082,7 @@ impl ConnectionsPanel {
         self.probe_outcome = None;
         self.probe_error = None;
         self.probe_challenge_draft = None;
+        let window_handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |executor_token| async move {
@@ -3895,7 +4090,7 @@ impl ConnectionsPanel {
                     service.probe(request, cancellation).await
                 })
                 .await;
-            cx.update(|app| {
+            let _ = cx.update_window(window_handle, |_, window, app| {
                 let _ = this.update(app, |panel, cx| {
                     if !panel
                         .probe_request
@@ -3906,6 +4101,23 @@ impl ConnectionsPanel {
                     }
                     panel.probe_running = false;
                     match result {
+                        Ok(ConnectionProbeOutcome::InvalidInput { field, message }) => {
+                            panel.probe_outcome = None;
+                            panel.probe_challenge_draft = None;
+                            let field = match field {
+                                ProbeField::SerialDevice => HostEditorField::Host,
+                                ProbeField::SerialBaud => HostEditorField::SerialBaud,
+                            };
+                            if let Some(editor) = panel.editor.as_mut() {
+                                editor.section = HostEditorSection::Properties;
+                                editor.validation_issue = Some(HostEditorValidationIssue {
+                                    field,
+                                    section: HostEditorSection::Properties,
+                                    message: localized_error(&AppError::invalid(message)),
+                                });
+                            }
+                            panel.focus_editor_validation(window, cx);
+                        }
                         Ok(outcome) => {
                             if matches!(outcome, ConnectionProbeOutcome::RequiresHostKeyTrust(_)) {
                                 panel.probe_challenge_draft = Some(challenge_draft);
@@ -3916,16 +4128,10 @@ impl ConnectionsPanel {
                         Err(error) => {
                             panel.probe_challenge_draft = None;
                             panel.probe_outcome = None;
+                            panel.probe_cancelled =
+                                error.public_code() == PublicErrorCode::Cancelled;
                             panel.probe_error =
-                                Some(if error.public_code() == PublicErrorCode::Cancelled {
-                                    crate::locale::text(
-                                        "连接测试已取消；草稿仍保留。",
-                                        "Connection test cancelled; the draft is preserved.",
-                                    )
-                                    .to_string()
-                                } else {
-                                    localized_error(&error)
-                                });
+                                (!panel.probe_cancelled).then(|| localized_error(&error));
                         }
                     }
                     cx.notify();
@@ -3941,6 +4147,7 @@ impl ConnectionsPanel {
     pub(super) fn reset_connection_probe(&mut self) {
         self.probe_request.cancel();
         self.probe_running = false;
+        self.probe_cancelled = false;
         self.probe_outcome = None;
         self.probe_error = None;
         self.probe_challenge_draft = None;
@@ -4015,9 +4222,12 @@ impl ConnectionsPanel {
         });
     }
 
-    /// 解析表单并由 application 编排凭据 vault、host CAS 和安全清理，不从 UI 访问配置文件。
+    /// 提交只接受一次在途事务，包含键盘重复触发；凭据和 CAS 仍由 application 编排。
     /// @author kongweiguang
     pub(super) fn save_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
         if self.refuse_conflict_reload_mutation(cx) {
             return;
         }
@@ -5139,19 +5349,23 @@ impl ConnectionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.refuse_conflict_reload_mutation(cx) {
+        if self.refuse_conflict_reload_mutation(cx) || self.plugin_forms.write_blocked() {
             return;
         }
+        let returning_from_plugin = self.plugin_forms.has_active();
+        self.plugin_forms.deactivate();
         self.invalidate_host_file_picker();
         self.reset_connection_probe();
         if self.local_hosts.editor.is_some() {
-            let returning_to_local = self.active_editor_kind != Some(ConnectionsEditorKind::Local);
+            let returning_to_local = returning_from_plugin
+                || self.active_editor_kind != Some(ConnectionsEditorKind::Local);
             self.active_editor_kind = Some(ConnectionsEditorKind::Local);
             if returning_to_local {
                 if let Some(editor) = self.local_hosts.editor.as_ref() {
                     editor.scroll_handle.set_offset(Default::default());
                 }
                 self.resume_local_host_default_target(cx);
+                self.resume_local_shell_discovery(cx);
                 self.focus_editor_primary_input(window, cx);
             }
             cx.notify();
@@ -5173,10 +5387,13 @@ impl ConnectionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.refuse_conflict_reload_mutation(cx) {
+        if self.refuse_conflict_reload_mutation(cx) || self.plugin_forms.write_blocked() {
             return;
         }
-        let returning_to_remote = self.active_editor_kind != Some(ConnectionsEditorKind::Remote);
+        let returning_from_plugin = self.plugin_forms.has_active();
+        self.plugin_forms.deactivate();
+        let returning_to_remote =
+            returning_from_plugin || self.active_editor_kind != Some(ConnectionsEditorKind::Remote);
         let pending_local_defaults = self.local_hosts.default_target_request.take();
         self.cancel_local_host_background_requests();
         self.invalidate_host_file_picker();
@@ -5215,7 +5432,7 @@ impl ConnectionsPanel {
         }
     }
 
-    /// 认证字段卸载前交接到新模式的输入；Agent 没有秘密字段时保留表单按键路径。
+    /// 认证字段卸载前交接到新模式的可见来源；Agent 没有秘密字段时保留表单按键路径。
     /// @author kongweiguang
     pub(super) fn set_authentication_mode(
         &mut self,
@@ -5234,9 +5451,7 @@ impl ConnectionsPanel {
             editor.authentication_mode = mode;
             let focus = match mode {
                 HostAuthenticationMode::Password => editor.inputs.secret.read(cx).focus_handle(cx),
-                HostAuthenticationMode::PrivateKey => {
-                    editor.inputs.key_path.read(cx).focus_handle(cx)
-                }
+                HostAuthenticationMode::PrivateKey => editor.private_key_focus_handle(cx),
                 HostAuthenticationMode::Agent => self.editor_fields_focus.clone(),
             };
             window.focus(&focus, cx);
@@ -5259,9 +5474,12 @@ impl ConnectionsPanel {
         self.reset_connection_probe();
     }
 
-    /// 添加/移除有序跳板会改变凭据作用域索引，只有点击保存才经 CAS 发布新路由。
+    /// 新跳板输入同样订阅测试失效；只有显式保存才经 CAS 发布路由及凭据作用域。
     /// @author kongweiguang
     pub(super) fn add_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host_editor_fields_disabled() {
+            return;
+        }
         if let Some(editor) = self.editor.as_mut() {
             if editor.jumps.len() >= 8 {
                 self.status = Some(
@@ -5275,6 +5493,7 @@ impl ConnectionsPanel {
                 editor
                     .jumps
                     .push(super::form::JumpInputs::empty(window, cx));
+                editor.subscribe_probe_invalidations(window, cx);
             }
             cx.notify();
         }
@@ -5289,11 +5508,15 @@ impl ConnectionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.host_editor_fields_disabled() {
+            return;
+        }
         if let Some(editor) = self.editor.as_mut()
             && index < editor.jumps.len()
         {
             let jump = editor.jumps.remove(index);
             jump.clear_secrets(window, cx);
+            editor.subscribe_probe_invalidations(window, cx);
             let focus = editor
                 .jumps
                 .get(index)
@@ -5306,27 +5529,45 @@ impl ConnectionsPanel {
         self.reset_connection_probe();
     }
 
-    /// 所有远程字段共享同一门禁，标题栏收藏不能绕过只读、测试或结果待核对状态。
+    /// 顺序调整移动原实体及其凭据，不克隆秘密；焦点跟随被移动项，旧测试随路由变化失效。
+    /// @author kongweiguang
+    pub(super) fn move_jump(
+        &mut self,
+        index: usize,
+        up: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.host_editor_fields_disabled() {
+            return;
+        }
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        let target = if up {
+            index.checked_sub(1)
+        } else {
+            index.checked_add(1)
+        };
+        let Some(target) =
+            target.filter(|target| index < editor.jumps.len() && *target < editor.jumps.len())
+        else {
+            return;
+        };
+        editor.jumps.swap(index, target);
+        editor.subscribe_probe_invalidations(window, cx);
+        window.focus(&editor.jumps[target].host.read(cx).focus_handle(cx), cx);
+        self.reset_connection_probe();
+        cx.notify();
+    }
+
+    /// 测试不锁住整张表单；修改输入会取消旧测试，仅持久化和恢复事务需要禁用编辑。
     /// @author kongweiguang
     pub(super) fn host_editor_fields_disabled(&self) -> bool {
         self.recovery.mode == ConfigurationMode::ReadOnlyRecovery
             || self.saving
             || self.conflicted_host_editor_reload_in_progress()
-            || self.probe_running
             || self.save_outcome_unknown
-    }
-
-    /// 收藏遵循与其它字段相同的门禁；取消测试释放门禁后仍可修改草稿。
-    /// @author kongweiguang
-    pub(super) fn toggle_favorite(&mut self, cx: &mut Context<Self>) {
-        if self.host_editor_fields_disabled() {
-            return;
-        }
-        if let Some(editor) = self.editor.as_mut() {
-            editor.favorite = !editor.favorite;
-            cx.notify();
-        }
-        self.reset_connection_probe();
     }
 
     /// 把已验证的目标事件交给 Root，并随传输目标保留其 HostId；SFTP 工作台和传输标签共用首轮
@@ -5568,6 +5809,7 @@ pub(super) fn localized_error(error: &AppError) -> String {
             "Serial target must use a device path without a network port or username"
         }
         "串口设备路径必须能编码为 UTF-8" => "Serial device path must be valid UTF-8",
+        "串口设备路径不能为空" => "Serial device path is required",
         "SSH 超时必须为 1 到 600 秒" => "SSH timeout must be between 1 and 600 seconds",
         "SSH 心跳必须为 0 到 600 秒" => "SSH keepalive must be between 0 and 600 seconds",
         "SSH 超时和心跳间隔必须在 1 到 600 秒之间" => {
@@ -5598,6 +5840,9 @@ pub(super) fn localized_error(error: &AppError) -> String {
             "Jump host name, authentication mode, or endpoint is invalid"
         }
         "主机标签不能包含控制字符" => "Host tags cannot contain control characters",
+        "标签格式无效；含逗号的标签请用双引号包裹，项内双引号写成两个" => {
+            "Invalid tag quotes. Quote tags containing commas and double quotes inside each tag"
+        }
         "串口参数必须填写在串口设置中，不能作为主机标签" => {
             "Serial line settings belong in serial options, not host tags"
         }
@@ -5707,6 +5952,33 @@ pub(super) fn host_rows_contain_protocol<'a>(
         .any(|(row_id, protocol)| row_id == host_id && protocol == expected_protocol)
 }
 
+/// 仅接收原目标和协议的内置意图，扩展类型不能冒充已经解析的内置主机。
+fn builtin_host_intent_matches(
+    intent: &PluginHostOpenIntent,
+    host_id: &HostId,
+    protocol: RemoteProtocol,
+) -> bool {
+    let expected_type = match protocol {
+        RemoteProtocol::Ssh => "ssh",
+        RemoteProtocol::Sftp => "sftp",
+        RemoteProtocol::Telnet => "telnet",
+        RemoteProtocol::Serial => "serial",
+        RemoteProtocol::Rdp => "rdp",
+    };
+    matches!(intent, PluginHostOpenIntent::Builtin(intent)
+        if &intent.host_id == host_id && intent.configuration_type == expected_type)
+}
+
+/// 目录快照必须仍是请求开始时的版本，防止旧路由参与信任预检。
+fn builtin_host_snapshot_matches(
+    host: &ManagedHost,
+    host_id: &HostId,
+    protocol: RemoteProtocol,
+    revision: &ConfigRevision,
+) -> bool {
+    &host.id == host_id && host.protocol == protocol && &host.revision == revision
+}
+
 /// 统一编辑器只要任一缓存表单仍 dirty 或远程保存结果未知，就必须先经过丢弃确认。
 /// @author kongweiguang
 pub(super) fn unified_editor_requires_discard(
@@ -5726,11 +5998,11 @@ pub(super) fn should_continue_local_host_action_after_discard(
     local_editor_active && pending_local_action
 }
 
-/// 只有已启用 SFTP 的 SSH 或 SFTP-only 主机能成为工作台/传输标签目标。
+/// SFTP-only 的文件能力由协议保证；SSH 才受可选开关约束，与配置和队列共用同一规则。
 ///
 /// @author kongweiguang
 pub(super) fn host_sftp_capable(protocol: RemoteProtocol, enabled: bool) -> bool {
-    enabled && matches!(protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp)
+    kerminal_application::connections::management::HostSftpOptions::enabled_for(protocol, enabled)
 }
 
 /// 仅 picker 专用创建流程回传保存成功；通用侧栏新增主机不会隐式绑定文件工作台。
@@ -5767,4 +6039,4 @@ mod connections_panel_tests;
 
 #[cfg(test)]
 #[path = "../../../tests/unit/connections_editor_dirty.rs"]
-mod connections_editor_dirty_tests;
+pub(super) mod connections_editor_dirty_tests;

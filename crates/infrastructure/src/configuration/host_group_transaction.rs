@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use kerminal_application::connections::host_types::HostConfigurationCatalog;
 use kerminal_application::connections::management::HostDocumentRevision;
 use kerminal_application::{AppError, AppResult, PublicErrorCode};
 use kerminal_domain::preferences::{ConfigDocument, ConfigDocumentPath, ConfigRevision};
@@ -73,8 +74,12 @@ impl ConfigurationStore {
         else {
             return Ok(false);
         };
-        super::validation::validate_document(&document_path, &source)
-            .map_err(|source| AppError::configuration_corrupt("主机配置").with_source(source))?;
+        super::validation::validate_document_with_host_types(
+            &document_path,
+            &source,
+            &self.inner.host_types,
+        )
+        .map_err(|source| AppError::configuration_corrupt("主机配置").with_source(source))?;
         if expected_revision != &revision_for(&source) {
             return Err(AppError::conflict(
                 "主机配置已被其它操作修改，请重新读取后删除",
@@ -142,7 +147,7 @@ impl ConfigurationStore {
             return Err(AppError::not_found("目标主机分组不存在"));
         }
 
-        let hosts = read_host_documents(&self.inner.root, &group_ids)?;
+        let hosts = read_host_documents(&self.inner.root, &group_ids, &self.inner.host_types)?;
         validate_complete_host_revision_set(&hosts, &expected_hosts)?;
         let mut entries = Vec::new();
         let mut reassigned_hosts = 0usize;
@@ -153,9 +158,12 @@ impl ConfigurationStore {
             let path = ConfigDocumentPath::Host(host_id.clone());
             let relative = relative_path(&path)?;
             let after_source = rewrite_host_group(&host.source, destination_group_id.as_deref())?;
-            super::validation::validate_document(&path, &after_source).map_err(|source| {
-                AppError::configuration_corrupt("主机配置").with_source(source)
-            })?;
+            super::validation::validate_document_with_host_types(
+                &path,
+                &after_source,
+                &self.inner.host_types,
+            )
+            .map_err(|source| AppError::configuration_corrupt("主机配置").with_source(source))?;
             entries.push(HostGroupJournalEntry {
                 relative_path: portable_relative(&relative),
                 before_revision: host.revision.as_str().to_owned(),
@@ -188,14 +196,16 @@ impl ConfigurationStore {
             return Err(error);
         }
 
-        match apply_host_group_journal_locked(&self.inner.root) {
+        match apply_host_group_journal_locked(&self.inner.root, &self.inner.host_types) {
             Ok(()) => {}
             Err(original) if original.public_code() == PublicErrorCode::OutcomeUnknown => {
                 mark_recovery_required(self, HOST_GROUP_JOURNAL);
                 return Err(original);
             }
             Err(original) => {
-                if let Err(recovery) = apply_host_group_journal_locked(&self.inner.root) {
+                if let Err(recovery) =
+                    apply_host_group_journal_locked(&self.inner.root, &self.inner.host_types)
+                {
                     mark_recovery_required(self, HOST_GROUP_JOURNAL);
                     return Err(AppError::outcome_unknown_with_source(
                         "主机分组事务恢复结果未知，请保留恢复文件并重新读取",
@@ -224,14 +234,15 @@ impl ConfigurationStore {
 pub(super) fn recover_host_group_transaction(
     root: &Path,
     storage: &StorageCoordinator,
+    host_types: &HostConfigurationCatalog,
 ) -> AppResult<()> {
     let _lock = storage
         .lock()
         .map_err(|source| AppError::infrastructure_with_source("无法锁定配置存储", source))?;
-    if read_host_group_journal(root)?.is_none() {
+    if read_host_group_journal(root, host_types)?.is_none() {
         return Ok(());
     }
-    apply_host_group_journal_locked(root)?;
+    apply_host_group_journal_locked(root, host_types)?;
     remove_host_group_journal(root)
 }
 
@@ -345,6 +356,7 @@ fn parse_group_ids(source: &str) -> AppResult<BTreeSet<String>> {
 fn read_host_documents(
     root: &Path,
     group_ids: &BTreeSet<String>,
+    host_types: &HostConfigurationCatalog,
 ) -> AppResult<BTreeMap<String, HostDocumentSnapshot>> {
     if !hosts_directory_exists(root)? {
         return Ok(BTreeMap::new());
@@ -399,7 +411,7 @@ fn read_host_documents(
         else {
             return Err(AppError::conflict("主机配置在事务快照期间已变化"));
         };
-        super::validation::validate_document(&document_path, &source)
+        super::validation::validate_document_with_host_types(&document_path, &source, host_types)
             .map_err(|source| AppError::configuration_corrupt("主机配置").with_source(source))?;
         let value: toml::Value = toml::from_str(&source)
             .map_err(|source| AppError::configuration_corrupt("主机配置").with_source(source))?;
@@ -573,7 +585,10 @@ fn write_host_group_journal(root: &Path, journal: &HostGroupJournal) -> AppResul
 }
 
 /// 校验 journal 版本、操作、白名单路径与 after 文档，再允许幂等重放。
-fn read_host_group_journal(root: &Path) -> AppResult<Option<HostGroupJournal>> {
+fn read_host_group_journal(
+    root: &Path,
+    host_types: &HostConfigurationCatalog,
+) -> AppResult<Option<HostGroupJournal>> {
     let transaction_directory = root.join(".storage-transactions");
     match fs::symlink_metadata(&transaction_directory) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -621,12 +636,15 @@ fn read_host_group_journal(root: &Path) -> AppResult<Option<HostGroupJournal>> {
     let journal: HostGroupJournal = serde_json::from_slice(&bytes).map_err(|source| {
         AppError::configuration_corrupt("主机分组事务文件无效").with_source(source)
     })?;
-    validate_host_group_journal(&journal)?;
+    validate_host_group_journal(&journal, host_types)?;
     Ok(Some(journal))
 }
 
 /// 校验 journal 的每个路径只落在 hosts 白名单，groups 必须最后提交。
-fn validate_host_group_journal(journal: &HostGroupJournal) -> AppResult<()> {
+fn validate_host_group_journal(
+    journal: &HostGroupJournal,
+    host_types: &HostConfigurationCatalog,
+) -> AppResult<()> {
     if journal.schema_version != 1
         || !is_safe_group_id(&journal.operation.deleted_group_id)
         || journal
@@ -647,9 +665,14 @@ fn validate_host_group_journal(journal: &HostGroupJournal) -> AppResult<()> {
             return Err(invalid_journal());
         }
         let (relative, document_path) = journal_entry_path(&entry.relative_path)?;
-        super::validation::validate_document(&document_path, &entry.after_source).map_err(
-            |source| AppError::configuration_corrupt("主机分组事务文件无效").with_source(source),
-        )?;
+        super::validation::validate_document_with_host_types(
+            &document_path,
+            &entry.after_source,
+            host_types,
+        )
+        .map_err(|source| {
+            AppError::configuration_corrupt("主机分组事务文件无效").with_source(source)
+        })?;
         match &document_path {
             ConfigDocumentPath::Host(id) => {
                 if index + 1 == journal.entries.len() {
@@ -713,8 +736,11 @@ fn journal_entry_path(relative: &str) -> AppResult<(PathBuf, ConfigDocumentPath)
 }
 
 /// 对每个条目比较 before/after revision，提交尚未完成的文件并保留可重放 journal。
-fn apply_host_group_journal_locked(root: &Path) -> AppResult<()> {
-    let Some(journal) = read_host_group_journal(root)? else {
+fn apply_host_group_journal_locked(
+    root: &Path,
+    host_types: &HostConfigurationCatalog,
+) -> AppResult<()> {
+    let Some(journal) = read_host_group_journal(root, host_types)? else {
         return Ok(());
     };
     if !hosts_directory_exists(root)? {
@@ -744,13 +770,19 @@ fn apply_host_group_journal_locked(root: &Path) -> AppResult<()> {
         if current_revision.as_str() != entry.before_revision {
             return Err(AppError::conflict("主机配置在分组事务期间被外部修改"));
         }
-        super::validation::validate_document(&document_path, &current).map_err(|source| {
-            AppError::configuration_corrupt("主机分组事务目标无效").with_source(source)
-        })?;
+        super::validation::validate_document_with_host_types(&document_path, &current, host_types)
+            .map_err(|source| {
+                AppError::configuration_corrupt("主机分组事务目标无效").with_source(source)
+            })?;
         validate_journal_before_source(&journal.operation, &document_path, &current)?;
-        super::validation::validate_document(&document_path, &entry.after_source).map_err(
-            |source| AppError::configuration_corrupt("主机分组事务文件无效").with_source(source),
-        )?;
+        super::validation::validate_document_with_host_types(
+            &document_path,
+            &entry.after_source,
+            host_types,
+        )
+        .map_err(|source| {
+            AppError::configuration_corrupt("主机分组事务文件无效").with_source(source)
+        })?;
         atomic_replace(root, &relative, entry.after_source.as_bytes(), || {
             if final_path_is_symlink(&path).map_err(|source| {
                 AppError::infrastructure_with_source("检查主机分组事务目标失败", source)

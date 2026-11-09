@@ -1005,6 +1005,7 @@ impl RootView {
     }
 
     /// 延迟创建资源时仅由当前主导航决定活动缓冲；后台恢复不抢导航，失败保留原 descriptor。
+    /// 扩展内容由独立内容宿主管理，不能被文件恢复路径重复实例化。
     pub(super) fn ensure_workspace_file_tab(
         &mut self,
         tab_id: &TabId,
@@ -1117,7 +1118,7 @@ impl RootView {
                     cx,
                 );
             }
-            WorkspaceSessionTab::Terminal { .. } => {}
+            WorkspaceSessionTab::Terminal { .. } | WorkspaceSessionTab::Extension { .. } => {}
         }
     }
 

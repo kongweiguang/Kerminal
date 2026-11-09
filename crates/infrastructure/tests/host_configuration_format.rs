@@ -189,6 +189,74 @@ async fn omitted_sftp_options_read_as_current_defaults() {
     assert_eq!(host.note, None);
 }
 
+/// SFTP-only 旧配置即使写着 enabled=false 仍可用；显式保存时规范化配置字段。
+/// @author kongweiguang
+#[tokio::test]
+async fn sftp_only_legacy_disabled_flag_is_normalized_on_read_and_explicit_save() {
+    let root = tempdir().expect("隔离配置根");
+    let store = ConfigurationStore::initialize(root.path()).expect("初始化当前配置");
+    let repository = HostConfigurationRepository::new(store);
+    let service = HostManagementService::new(Arc::new(repository.clone()));
+    let host_id = HostId::parse("sftp-legacy-disabled").expect("合成主机 ID 合法");
+    let mut draft = serial_draft(host_id.clone(), Vec::new());
+    draft.name = "SFTP only host".to_owned();
+    draft.protocol = RemoteProtocol::Sftp;
+    draft.serial = None;
+    draft.endpoint = HostEndpoint {
+        host: "sftp.example.invalid".to_owned(),
+        port: 22,
+        username: "user".to_owned(),
+    };
+    let created = service
+        .save_host(draft.clone(), None)
+        .await
+        .expect("save SFTP-only host");
+    assert!(created.sftp_options.enabled);
+    drop(service);
+    drop(repository);
+
+    let path = root.path().join("hosts/sftp-legacy-disabled.toml");
+    let source = fs::read_to_string(&path).expect("read saved host");
+    let mut document: toml::Value = toml::from_str(&source).expect("parse saved host");
+    document["ssh_options"]["sftp"]["enabled"] = toml::Value::Boolean(false);
+    let legacy_source = toml::to_string(&document).expect("serialize legacy host");
+    fs::write(&path, &legacy_source).expect("write legacy configuration flag");
+
+    let reopened = ConfigurationStore::initialize(root.path()).expect("legacy config is readable");
+    let repository = HostConfigurationRepository::new(reopened);
+    let service = HostManagementService::new(Arc::new(repository.clone()));
+    let loaded = repository
+        .load_host(&host_id)
+        .await
+        .expect("load legacy SFTP-only host")
+        .expect("host exists");
+    assert!(HostSftpOptions::enabled_for(
+        loaded.protocol,
+        loaded.sftp_options.enabled
+    ));
+    let on_disk = fs::read_to_string(&path).expect("read source without automatic rewrite");
+    assert_eq!(
+        toml::from_str::<toml::Value>(&on_disk).expect("valid legacy TOML")["ssh_options"]["sftp"]
+            ["enabled"]
+            .as_bool(),
+        Some(false)
+    );
+
+    draft.id = Some(host_id);
+    draft.sftp_options.enabled = false;
+    let updated = service
+        .save_host(draft, Some(loaded.revision))
+        .await
+        .expect("explicit save normalizes SFTP-only capability");
+    assert!(updated.sftp_options.enabled);
+    let saved = fs::read_to_string(path).expect("read normalized host");
+    assert_eq!(
+        toml::from_str::<toml::Value>(&saved).expect("valid normalized TOML")["ssh_options"]["sftp"]["enabled"]
+            .as_bool(),
+        Some(true)
+    );
+}
+
 /// 验证可选备注经创建、编辑与回读保留多行，并拒绝非法配置而保留源文件。
 ///
 /// @author kongweiguang
@@ -293,7 +361,6 @@ fn serial_draft(id: HostId, tags: Vec<String>) -> HostDraft {
             flow_control: SerialFlowControl::Software,
         }),
         tags,
-        is_favorite: false,
         sort_order: 3,
         connect_timeout_ms: 30_000,
         keepalive_interval_ms: Some(60_000),
@@ -303,7 +370,7 @@ fn serial_draft(id: HostId, tags: Vec<String>) -> HostDraft {
     }
 }
 
-/// 真实主机用例拒绝串口保留 tag，并在成功写入后通过配置仓储读回 typed 表。
+/// 真实主机用例拒绝串口保留 tag，并验证普通标签与 typed 表均能写入和读回。
 ///
 /// @author kongweiguang
 #[tokio::test]
@@ -334,7 +401,17 @@ async fn current_writer_and_reader_keep_serial_data_in_the_typed_table() {
     assert!(!host_path.exists(), "无效 tag 不得留下部分 host 文件");
 
     let saved = service
-        .save_host(serial_draft(host_id.clone(), vec!["lab".to_owned()]), None)
+        .save_host(
+            serial_draft(
+                host_id.clone(),
+                vec![
+                    "lab".to_owned(),
+                    "favorite".to_owned(),
+                    "FAVORITE".to_owned(),
+                ],
+            ),
+            None,
+        )
         .await
         .expect("保存当前 schema-v3 串口主机");
     assert_eq!(saved.protocol, RemoteProtocol::Serial);
@@ -365,7 +442,7 @@ async fn current_writer_and_reader_keep_serial_data_in_the_typed_table() {
             .iter()
             .filter_map(toml::Value::as_str)
             .collect::<Vec<_>>(),
-        ["lab"]
+        ["lab", "favorite", "FAVORITE"]
     );
     let readback = repository
         .load_host(&host_id)
@@ -373,6 +450,7 @@ async fn current_writer_and_reader_keep_serial_data_in_the_typed_table() {
         .expect("通过当前 reader 读取")
         .expect("host 文件存在");
     assert_eq!(readback.serial, saved.serial);
+    assert_eq!(readback.tags, ["lab", "favorite", "FAVORITE"]);
 }
 
 /// 当前 reader 接受专用 serial 表，并把设备值投影到既有领域 endpoint。

@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, FocusHandle, KeyDownEvent, Window, div,
-    prelude::*, px,
+    AnyElement, AnyView, AppContext as _, Context, Entity, FocusHandle, KeyDownEvent, Window,
+    component::WindowExt as _, div, prelude::*, px,
 };
 use kerminal_application::{
     platform::external_launch::ExternalTargetLease,
@@ -20,7 +20,9 @@ use kerminal_domain::{
 };
 
 use crate::{
+    features::commands::SnippetHostMoveRequested,
     features::operations::{OperationsEvent, OperationsSection, OperationsView},
+    plugins::tools::{ToolContext, ToolProjection, ToolScope},
     theme::ThemeTokens,
 };
 
@@ -45,6 +47,16 @@ pub(super) struct ToolRailPlacementFocusIntent {
     tool: ToolRailToolId,
     navigation_generation: u64,
     expected_focus: FocusHandle,
+}
+
+/// 迁移仅暂存原实体的焦点交接，任意新的导航或物理焦点变化都会使其失效。
+struct SnippetHostFocusIntent {
+    target: SnippetHostMoveRequested,
+    commands: Entity<crate::features::commands::CommandsView>,
+    search_focus: FocusHandle,
+    expected_focus: FocusHandle,
+    navigation_generation: u64,
+    focus_generation: u64,
 }
 
 impl RootView {
@@ -247,10 +259,61 @@ impl RootView {
     ///
     /// @author kongweiguang
     pub(super) fn current_tool_rail_settings(&self) -> ToolRailSettings {
-        self.settings_snapshot
+        let mut settings = self
+            .settings_snapshot
             .as_ref()
             .map(|snapshot| snapshot.tool_rail.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for tool in self.plugin_tools.registered_tools() {
+            if !settings.order.contains(&tool) {
+                settings.order.push(tool);
+            }
+        }
+        settings
+    }
+
+    /// 作用域只使用已提交的活动标签和选中主机，不从异步视图猜测目标。
+    ///
+    /// @author kongweiguang
+    pub(super) fn plugin_tool_context(&self, cx: &Context<Self>) -> ToolContext {
+        let tab = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.snapshot().active_tab_id.clone());
+        let binding = self
+            .current_logs_target(cx)
+            .map(|target| target.binding().clone());
+        let selected_host = self
+            .selected_host_id
+            .clone()
+            .or_else(|| self.selected_plugin_host_id.clone());
+        ToolContext::new(tab, selected_host).with_active_terminal(binding)
+    }
+
+    /// 显式打开创建插件实例并重放一次挂载投影；失败保持旧布局，不随重绘自动重试。
+    ///
+    /// @author kongweiguang
+    pub(super) fn prepare_plugin_tool(
+        &mut self,
+        tool: ToolRailToolId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !matches!(tool, ToolRailToolId::Plugin(_)) {
+            return true;
+        }
+        let context = self.plugin_tool_context(cx);
+        match self.plugin_tools.ensure(tool, &context, window, cx) {
+            Ok(()) => {
+                self.plugin_tools.invalidate_projection();
+                true
+            }
+            Err(error) => {
+                self.status = Some(format!("工具 {} 无法打开：{error}", tool.as_str()).into());
+                cx.notify();
+                false
+            }
+        }
     }
 
     /// 切换宿主沿用显式宽度；预演槽位变化以便在 Agent Dock 隐藏前同步撤销搜索定位提交门。
@@ -264,11 +327,27 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sync_tool_rail_active_tab();
         self.pending_tool_rail_placement_focus = None;
         // 明确切换到任意工具代表用户离开当前 Agent 首帧；迟到 Ready 不能再抢回输入焦点。
         self.pending_agent_focus_intent = None;
         let settings = self.current_tool_rail_settings();
         let before = self.tool_rail_state.project(&settings);
+
+        if (!contains_tool(before.panels, tool)
+            || (before.panels.attached == Some(tool) && self.right_dock_collapsed))
+            && !self.prepare_plugin_tool(tool, window, cx)
+        {
+            return;
+        }
+
+        if tool == ToolRailToolId::Snippets
+            && (!contains_tool(before.panels, tool)
+                || (before.panels.attached == Some(tool) && self.right_dock_collapsed))
+            && !self.return_workspace_before_snippets_rail(window, cx)
+        {
+            return;
+        }
 
         // 贴靠右侧的面板在 Dock 折叠时，点击表示重新展开而非误关当前面板。
         if before.panels.attached == Some(tool) && self.right_dock_collapsed {
@@ -657,8 +736,8 @@ impl RootView {
         self.workspace_files.file_browser_target(tab_id)
     }
 
-    /// 优先绑定可信终端，文件 Tab 则只提供父目录及 lease，使连续浏览不依赖来源终端继续活动。
-    /// 文件来源不携带终端 binding；身份与目录一并同步，队列来源使用稳定 pane 或文件 Tab 身份。
+    /// 终端和文件工作区显式分流，文件内容激活不能变成目录跟随；两者都冻结各自真实来源。
+    /// 文件入口只传递原文件系统及 lease，不从无 binding 推断隐式终端能力。
     ///
     /// @author kongweiguang
     pub(super) fn try_bind_files_from_active_terminal(&mut self, cx: &mut Context<Self>) {
@@ -703,7 +782,8 @@ impl RootView {
     /// 配置 CAS 成功后按新设置投影并恢复目标工具的显式宽度，不把重排后的受限布局当用户意图。
     ///
     /// @author kongweiguang
-    pub(super) fn remap_tool_rail_settings(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn remap_tool_rail_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_tool_rail_active_tab();
         let settings = self.current_tool_rail_settings();
         let previous_tool = self.tool_rail_state.attached_tool();
         let layout = self.tool_rail_state.project(&settings);
@@ -716,6 +796,7 @@ impl RootView {
                 .set_attached_tool(layout.panels.attached, next_default);
             self.prepare_attached_dock_width_restore(layout.panels.attached);
         }
+        self.reconcile_snippets_host(window, cx);
         cx.notify();
     }
 
@@ -789,15 +870,10 @@ impl RootView {
         }
     }
 
-    /// 工具打开顺序和内容 Entity 都按活动标签恢复；窄屏抽屉稍后从恢复后的活动工具派生，不重置显隐事实。
+    /// 在事件边界恢复活动标签的工具顺序和折叠状态，避免下一帧之前误用旧标签的槽位。
     ///
     /// @author kongweiguang
-    pub(super) fn workbench_tool_panels(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> WorkbenchToolPanels {
-        let settings = self.current_tool_rail_settings();
+    pub(super) fn sync_tool_rail_active_tab(&mut self) {
         let (active_tab_id, live_tab_ids) = self
             .workspace_controller
             .as_ref()
@@ -820,8 +896,40 @@ impl RootView {
         ) {
             self.right_dock_collapsed = collapsed;
         }
+    }
+
+    /// 工具栏读取当前标签投影；宿主迁移必须已由导航或布局事件完成。
+    /// 扩展创建与生命周期只随投影变化或显式打开执行，同一投影的重绘仅接收内置视图更新。
+    ///
+    /// @author kongweiguang
+    pub(super) fn workbench_tool_panels(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> WorkbenchToolPanels {
+        let settings = self.current_tool_rail_settings();
+        self.sync_tool_rail_active_tab();
         let previous_tool = self.tool_rail_state.attached_tool();
-        let layout = self.tool_rail_state.project(&settings);
+        let mut layout = self.tool_rail_state.project(&settings);
+        let plugin_context = self.plugin_tool_context(cx);
+        layout
+            .entries
+            .main
+            .retain(|tool| self.plugin_tools.is_applicable(*tool, &plugin_context));
+        layout
+            .entries
+            .bottom
+            .retain(|tool| self.plugin_tools.is_applicable(*tool, &plugin_context));
+        for slot in [
+            &mut layout.panels.attached,
+            &mut layout.panels.left,
+            &mut layout.panels.bottom,
+            &mut layout.panels.center,
+        ] {
+            if slot.is_some_and(|tool| !self.plugin_tools.is_applicable(tool, &plugin_context)) {
+                *slot = None;
+            }
+        }
         if previous_tool != layout.panels.attached {
             let next_default = layout
                 .panels
@@ -836,81 +944,299 @@ impl RootView {
         #[cfg(feature = "right-rail-acceptance")]
         let window_active = window_active || self.right_rail_acceptance_active_override;
 
-        let active_operations = self.active_operations_tools(layout.panels);
-        for (tool, section) in active_operations {
-            let _ = self.ensure_operations_panel(tool, section, window, cx);
-        }
-        self.refresh_operations_panel_targets(cx);
-        self.sync_shared_panel_activity(layout.panels, window_active, cx);
-        if let Some(files_pane) = self.sftp_panel.clone() {
-            files_pane.update(cx, |files_pane, cx| {
-                // 此实体始终表示当前终端的单端 SFTP；停靠位置不应把它变成完整双端工作区。
-                files_pane.set_compact_layout(true, cx);
+        let visible = [
+            layout.panels.attached,
+            layout.panels.left,
+            layout.panels.bottom,
+            layout.panels.center,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|tool| {
+            self.plugin_tools.is_applicable(*tool, &plugin_context)
+                && super::workbench::tool_rail_panel_mounted(self, layout.panels, *tool, window, cx)
+        })
+        .collect();
+        let projection = ToolProjection {
+            context: plugin_context.clone(),
+            visible,
+            window_active,
+        };
+        if self.plugin_tools.stage_projection(projection.clone()) {
+            cx.defer_in(window, move |root, window, cx| {
+                root.apply_tool_projection(projection, window, cx);
+            });
+        } else {
+            cx.defer_in(window, move |root, window, cx| {
+                if root.plugin_tools.projection_is_current(&projection) {
+                    let previous_mounts = projection
+                        .visible
+                        .iter()
+                        .map(|tool| {
+                            root.plugin_tools
+                                .view_for_mount(
+                                    *tool,
+                                    &projection.context,
+                                    projection.window_active,
+                                )
+                                .map(|view| view.entity_id())
+                        })
+                        .collect::<Vec<_>>();
+                    let changed = root.refresh_builtin_tool_instances(&projection, window, cx);
+                    root.refresh_operations_panel_targets(cx);
+                    root.sync_shared_panel_activity(
+                        &projection.visible,
+                        projection.window_active,
+                        window,
+                        cx,
+                    );
+                    let mounts_changed = projection
+                        .visible
+                        .iter()
+                        .map(|tool| {
+                            root.plugin_tools
+                                .view_for_mount(
+                                    *tool,
+                                    &projection.context,
+                                    projection.window_active,
+                                )
+                                .map(|view| view.entity_id())
+                        })
+                        .ne(previous_mounts);
+                    if changed || mounts_changed {
+                        cx.notify();
+                    }
+                }
             });
         }
-        if contains_tool(layout.panels, ToolRailToolId::Sftp) {
+
+        let mut renderers = WorkbenchToolPanelRenderers::default();
+        for tool in self.plugin_tools.registered_tools() {
+            let renderer = self
+                .plugin_tools
+                .view_for_mount(tool, &plugin_context, window_active)
+                .map_or_else(
+                    || {
+                        if matches!(tool, ToolRailToolId::Plugin(_)) {
+                            self.render_plugin_tool_recovery(tool, theme, cx)
+                        } else {
+                            tool_unavailable_renderer(tool, theme)
+                        }
+                    },
+                    |view| view.into_any_element(),
+                );
+            renderers.insert(tool, renderer);
+        }
+
+        WorkbenchToolPanels { layout, renderers }
+    }
+
+    /// 暂时不可用的扩展工具在原位置显式重试，普通重绘不申请资源，也不改变停靠布局。
+    /// 关闭中或等待关闭重试的 owner 由原关闭链处理，不在这里重新创建。
+    fn render_plugin_tool_recovery(
+        &self,
+        tool: ToolRailToolId,
+        theme: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let context = self.plugin_tool_context(cx);
+        let can_retry = matches!(
+            self.plugin_tools.phase(tool, &context),
+            None | Some(crate::plugins::tools::ToolPhase::Open)
+        );
+        div()
+            .size_full()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .p_4()
+            .text_color(theme.muted)
+            .child(crate::locale::text(
+                "工具暂时不可用。",
+                "The tool is temporarily unavailable.",
+            ))
+            .children(can_retry.then(|| {
+                gpui_kit::component::button::Button::new(gpui_kit::SharedString::from(format!(
+                    "retry-plugin-tool-{}",
+                    tool.as_str()
+                )))
+                .label(crate::locale::text("重试", "Retry"))
+                .on_click(cx.listener(move |root, _, window, cx| {
+                    if !root.host_shutdown_requested
+                        && !root.tool_panel_overlay_focus_is_blocked(window, cx)
+                    {
+                        root.prepare_plugin_tool(tool, window, cx);
+                        cx.notify();
+                    }
+                }))
+            }))
+            .into_any_element()
+    }
+
+    /// 只应用仍然有效的挂载投影；创建、可见性回调及数据刷新均在 effect 周期运行。
+    ///
+    /// @author kongweiguang
+    fn apply_tool_projection(
+        &mut self,
+        projection: ToolProjection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.plugin_tools.projection_is_current(&projection) {
+            return;
+        }
+        for (tool, section) in [
+            (ToolRailToolId::Containers, OperationsSection::Containers),
+            (ToolRailToolId::Tmux, OperationsSection::Tmux),
+            (ToolRailToolId::Ports, OperationsSection::PortForwards),
+            (ToolRailToolId::System, OperationsSection::ServerInfo),
+        ] {
+            if projection.visible.contains(&tool) {
+                let _ = self.ensure_operations_panel(tool, section, window, cx);
+            }
+        }
+        if projection.visible.contains(&ToolRailToolId::Sftp) {
             self.ensure_sftp_panel(window, cx);
             self.try_bind_files_from_active_terminal(cx);
         }
-        let snippets_compact = contains_tool(layout.panels, ToolRailToolId::Snippets);
-        if let Some(commands_view) = self.commands_view.clone() {
-            commands_view.update(cx, |commands_view, cx| {
-                commands_view.set_compact_layout(snippets_compact, window, cx);
-            });
+        self.refresh_builtin_tool_instances(&projection, window, cx);
+        for tool in &projection.visible {
+            if matches!(tool, ToolRailToolId::Plugin(_))
+                && let Err(error) = self
+                    .plugin_tools
+                    .ensure(*tool, &projection.context, window, cx)
+            {
+                self.status = Some(format!("工具 {} 无法打开：{error}", tool.as_str()).into());
+            }
         }
+        self.refresh_operations_panel_targets(cx);
+        self.sync_shared_panel_activity(&projection.visible, projection.window_active, window, cx);
+        if let Err(error) = self.plugin_tools.sync_visibility(
+            &projection.context,
+            &projection.visible,
+            projection.window_active,
+            cx,
+        ) {
+            self.status = Some(format!("工具状态同步失败：{error}").into());
+        }
+        if self
+            .plugin_tools
+            .projected_tool_active(ToolRailToolId::AgentLauncher)
+        {
+            self.request_agent_snapshot(cx);
+        }
+        cx.notify();
+    }
 
-        let renderers = WorkbenchToolPanelRenderers {
-            agent_launcher: self.agents_panel.clone().map_or_else(
-                || {
-                    unavailable_panel(
-                        "tool-agent-launcher-unavailable",
-                        "Agent 服务尚未装配。",
-                        "The Agent service is unavailable.",
-                        theme,
-                    )
-                },
-                |entity| entity.into_any_element(),
-            ),
-            sftp: self.sftp_panel.clone().map_or_else(
-                || {
-                    unavailable_panel(
-                        "tool-sftp-unavailable",
-                        "文件与传输服务尚未装配。",
-                        "File and transfer services are unavailable.",
-                        theme,
-                    )
-                },
-                |entity| entity.into_any_element(),
-            ),
-            containers: self.operations_panel_renderer(ToolRailToolId::Containers, theme),
-            snippets: self.commands_view.clone().map_or_else(
-                || {
-                    unavailable_panel(
-                        "tool-snippets-unavailable",
-                        "命令服务尚未装配。",
-                        "Command services are unavailable.",
-                        theme,
-                    )
-                },
-                |entity| entity.into_any_element(),
-            ),
-            tmux: self.operations_panel_renderer(ToolRailToolId::Tmux, theme),
-            ports: self.operations_panel_renderer(ToolRailToolId::Ports, theme),
-            system: self.operations_panel_renderer(ToolRailToolId::System, theme),
-            logs: self.logs_view.clone().map_or_else(
-                || {
-                    unavailable_panel(
-                        "tool-logs-unavailable",
-                        "命令历史服务尚未装配。",
-                        "Command history is unavailable.",
-                        theme,
-                    )
-                },
-                |entity| entity.into_any_element(),
-            ),
+    /// 工厂只借当前标签的已保留实体；切换尚未提交时不把旧标签句柄绑定到新标签。
+    /// Agent 服务可独立缺席，只有 Agent 视图需要核对自身标签，其他工具仍按工作区标签投影。
+    ///
+    /// @author kongweiguang
+    fn refresh_builtin_tool_instances(
+        &mut self,
+        projection: &ToolProjection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.tab_tool_contents_are_current()
+            || self.tab_tool_contents_tab_id.as_ref() != projection.context.active_tab()
+        {
+            return false;
+        }
+        let operation = |tool| {
+            self.tool_rail_operations_views
+                .get(&tool)
+                .cloned()
+                .map(AnyView::from)
         };
-
-        WorkbenchToolPanels { layout, renderers }
+        let entries: [(ToolRailToolId, ToolScope, Option<AnyView>); 8] = [
+            (
+                ToolRailToolId::AgentLauncher,
+                ToolScope::Tab,
+                self.agents_panel.clone().map(AnyView::from),
+            ),
+            (
+                ToolRailToolId::Sftp,
+                ToolScope::Tab,
+                self.sftp_panel.clone().map(AnyView::from),
+            ),
+            (
+                ToolRailToolId::Snippets,
+                ToolScope::Tab,
+                self.commands_view.clone().map(AnyView::from),
+            ),
+            (
+                ToolRailToolId::Tmux,
+                ToolScope::Tab,
+                operation(ToolRailToolId::Tmux),
+            ),
+            (
+                ToolRailToolId::Ports,
+                ToolScope::Tab,
+                operation(ToolRailToolId::Ports),
+            ),
+            (
+                ToolRailToolId::System,
+                ToolScope::Tab,
+                operation(ToolRailToolId::System),
+            ),
+            (
+                ToolRailToolId::Logs,
+                ToolScope::Tab,
+                self.logs_view.clone().map(AnyView::from),
+            ),
+            (
+                ToolRailToolId::Containers,
+                ToolScope::Window,
+                operation(ToolRailToolId::Containers),
+            ),
+        ];
+        let mut changed = false;
+        for (tool, scope, view) in entries {
+            if tool == ToolRailToolId::AgentLauncher
+                && self.agent_panel_tab_id.as_ref() != projection.context.active_tab()
+            {
+                continue;
+            }
+            match self
+                .plugin_tools
+                .set_builtin_view(tool, scope, view, &projection.context)
+            {
+                Ok(updated) => changed |= updated,
+                Err(error) => {
+                    self.status = Some(format!("工具 {} 无法装配：{error}", tool.as_str()).into())
+                }
+            }
+            if projection.visible.contains(&tool)
+                && self.plugin_tools.phase(tool, &projection.context).is_none()
+            {
+                match self
+                    .plugin_tools
+                    .ensure(tool, &projection.context, window, cx)
+                {
+                    Ok(()) => changed = true,
+                    Err(error) => {
+                        self.status =
+                            Some(format!("工具 {} 无法打开：{error}", tool.as_str()).into())
+                    }
+                }
+            }
+        }
+        if changed
+            && let Err(error) = self.plugin_tools.sync_visibility(
+                &projection.context,
+                &projection.visible,
+                projection.window_active,
+                cx,
+            )
+        {
+            self.status = Some(format!("工具状态同步失败：{error}").into());
+        }
+        changed
     }
 
     /// SFTP 首次出现时先固定为紧凑面板，避免首帧沿用共享工作台的来源和布局。
@@ -935,21 +1261,309 @@ impl RootView {
         self._sftp_panel_subscriptions = subscriptions;
     }
 
-    /// 供中心内容构造器判断同一 Files/Commands Entity 是否已由 ToolRail 唯一托管。
+    /// 导航前重新投影真实宿主，折叠和窄窗抽屉不会因旧槽位被误认为已经显示。
     ///
     /// @author kongweiguang
-    pub(super) fn tool_rail_owns_center_panel(&mut self) -> bool {
+    pub(super) fn snippets_mounted_in_tool_rail(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let settings = self.current_tool_rail_settings();
         let panels = self.tool_rail_state.project(&settings).panels;
-        let (tool, center_entity_is_shared) = match self.center_panel {
-            CenterPanel::Commands => (Some(ToolRailToolId::Snippets), self.commands_view.is_some()),
-            _ => (None, false),
-        };
-        center_route_uses_tool_rail_entity(
-            self.center_panel,
-            tool.is_some_and(|tool| self.tool_rail_panel_visible(panels, tool)),
-            center_entity_is_shared,
+        super::workbench::tool_rail_panel_mounted(
+            self,
+            panels,
+            ToolRailToolId::Snippets,
+            window,
+            cx,
         )
+    }
+
+    /// 中央宿主持有片段时关闭当前标签的工具槽，防止响应式布局重新挂载同一实体。
+    ///
+    /// @author kongweiguang
+    pub(super) fn release_snippets_tool_rail(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_tool_rail_active_tab();
+        let settings = self.current_tool_rail_settings();
+        let before = self.tool_rail_state.project(&settings).panels;
+        if !self
+            .tool_rail_state
+            .close(&settings, ToolRailToolId::Snippets)
+        {
+            return;
+        }
+        let after = self.tool_rail_state.project(&settings).panels;
+        if before.attached != after.attached {
+            let next_default = after
+                .attached
+                .map(|tool| self.current_attached_default_width(tool));
+            self.tool_rail_state
+                .set_attached_tool(after.attached, next_default);
+            self.prepare_attached_dock_width_restore(after.attached);
+        }
+        if self.compact_tool_drawer_open
+            && self.tool_rail_rendered_compact.1 == Some(ToolRailToolId::Snippets)
+        {
+            self.close_compact_drawer_for_center_navigation(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 设置或窗口变化在绘制前核对宿主；模态拥有焦点时只更新底层路由。
+    ///
+    /// @author kongweiguang
+    pub(super) fn reconcile_snippets_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_tool_rail_active_tab();
+        if self.center_panel != CenterPanel::Commands || self.commands_view.is_none() {
+            return;
+        }
+        let settings = self.current_tool_rail_settings();
+        let panels = self.tool_rail_state.project(&settings).panels;
+        if !contains_tool(panels, ToolRailToolId::Snippets) {
+            return;
+        }
+        if !self.snippet_editor_modal_open
+            && super::workbench::tool_rail_panel_mounted(
+                self,
+                panels,
+                ToolRailToolId::Snippets,
+                window,
+                cx,
+            )
+        {
+            self.restore_workspace_for_snippets_rail(window, cx);
+        } else {
+            self.release_snippets_tool_rail(window, cx);
+        }
+    }
+
+    /// 显式迁移片段时恢复当前标签所属的真实内容，避免同一实体同时占据中央和侧栏。
+    ///
+    /// @author kongweiguang
+    pub(super) fn return_workspace_before_snippets_rail(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.center_panel != CenterPanel::Commands {
+            return true;
+        }
+        if self.preferences_modal_open || self.connections_modal_open {
+            return false;
+        }
+        self.restore_workspace_for_snippets_rail(window, cx);
+        self.center_panel != CenterPanel::Commands
+    }
+
+    /// 恢复底层标签时不请求焦点；空工作区也不能抢走设置或连接模态的输入。
+    ///
+    /// @author kongweiguang
+    fn restore_workspace_for_snippets_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active_tab = self.workspace_controller.as_ref().and_then(|controller| {
+            let snapshot = controller.snapshot();
+            snapshot.active_tab_id.as_ref().and_then(|id| {
+                snapshot
+                    .terminal_tabs
+                    .iter()
+                    .any(|tab| tab.id() == id)
+                    .then(|| id.clone())
+            })
+        });
+        if let Some(tab_id) = active_tab {
+            self.activate_workspace_tab_surface(&tab_id, false, window, cx);
+        } else {
+            self.center_panel = CenterPanel::Terminal;
+            self.clear_pending_pane_focus();
+            self.clear_keybinding_chord();
+            self.pending_key_commits.clear();
+            self.focused_agent_terminal = false;
+            self.set_reported_focus_session(None, cx);
+            self.refresh_commands_session(cx);
+            self.refresh_workspace_views(cx);
+            self.request_visible_workspace_snapshots(cx);
+            self.refresh_proxy_panel(cx);
+            self.refresh_active_suggestion_context(cx);
+            self.cancel_unfocused_pane_compositions(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// 按实际源宿主迁移当前标签的实体，避免迟到点击或上层模态改变其他页面。
+    /// 工具栏使用现有投影和抽屉入口，中央使用既有路由，随后共用普通导航的焦点交接。
+    ///
+    /// @author kongweiguang
+    pub(super) fn move_snippets_host(
+        &mut self,
+        target: SnippetHostMoveRequested,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> kerminal_application::AppResult<()> {
+        use kerminal_application::AppError;
+
+        if !self.tab_tool_contents_are_current() {
+            return Err(AppError::conflict("当前标签的片段视图尚未就绪"));
+        }
+        if self.commands_view.is_none() {
+            return Err(AppError::not_found("命令片段服务尚未配置"));
+        }
+        if self.tool_panel_overlay_focus_is_blocked(window, cx) {
+            return Err(AppError::conflict("请先完成当前操作再移动片段"));
+        }
+        self.sync_tool_rail_active_tab();
+        match target {
+            SnippetHostMoveRequested::ToolRail => {
+                if self.center_panel != CenterPanel::Commands {
+                    return Err(AppError::conflict("片段已不在工作区"));
+                }
+                if !self.return_workspace_before_snippets_rail(window, cx) {
+                    return Err(AppError::conflict("无法恢复当前工作区"));
+                }
+                self.ensure_tool_panel_visible(ToolRailToolId::Snippets, window, cx);
+                if self.tool_rail_rendered_compact.0 && !self.compact_tool_drawer_open {
+                    self.show_compact_tool_panel(ToolRailToolId::Snippets, window, cx);
+                }
+                if self.center_panel == CenterPanel::Commands
+                    || !self.snippets_mounted_in_tool_rail(window, cx)
+                {
+                    return Err(AppError::conflict("片段工具未能移动到工具栏"));
+                }
+            }
+            SnippetHostMoveRequested::Center => {
+                if self.center_panel == CenterPanel::Commands
+                    || !self.snippets_mounted_in_tool_rail(window, cx)
+                {
+                    return Err(AppError::conflict("片段已不在工具栏"));
+                }
+                self.set_center_panel(CenterPanel::Commands, window, cx);
+                if self.center_panel != CenterPanel::Commands {
+                    return Err(AppError::conflict("片段页面未能移动到工作区"));
+                }
+            }
+        }
+        self.open_snippets_content(window, cx);
+        let Some(commands) = self.commands_view.clone() else {
+            return Err(AppError::not_found("命令片段服务尚未配置"));
+        };
+        if commands.update(cx, |commands, cx| commands.focus_snippets(window, cx))
+            && let Some(search_focus) = window.focused(cx)
+        {
+            self.pending_tool_rail_placement_focus = None;
+            self.clear_pending_pane_focus();
+            let expected_focus =
+                if target == SnippetHostMoveRequested::ToolRail && self.compact_tool_drawer_open {
+                    self.compact_drawer_focus_handle.clone()
+                } else {
+                    self.focus_handle.clone()
+                };
+            window.focus(&expected_focus, cx);
+            let intent = SnippetHostFocusIntent {
+                target,
+                commands,
+                search_focus,
+                expected_focus,
+                navigation_generation: self.surface_navigation_generation,
+                focus_generation: self.pane_focus_intent_generation,
+            };
+            // 首帧仍可能是旧宿主；下一帧之后才检查实际绘制树和延后装配的工具实体。
+            cx.on_next_frame(window, move |root, window, cx| {
+                root.complete_snippets_host_focus(intent, 4, false, window, cx);
+            });
+        }
+        Ok(())
+    }
+
+    /// 等待目标实际进入焦点树；限定帧数并逐帧复核来源，防止迟到的装配覆盖新操作。
+    ///
+    /// @author kongweiguang
+    fn complete_snippets_host_focus(
+        &mut self,
+        intent: SnippetHostFocusIntent,
+        remaining_frames: u8,
+        rendered_new_host: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.window_handle() != self.window_handle
+            || self.surface_navigation_generation != intent.navigation_generation
+            || self.pane_focus_intent_generation != intent.focus_generation
+            || window.focused(cx).as_ref() != Some(&intent.expected_focus)
+            || self.commands_view.as_ref() != Some(&intent.commands)
+            || !self.tab_tool_contents_are_current()
+            || self.tool_panel_overlay_focus_is_blocked(window, cx)
+            || window.has_active_dialog(cx)
+        {
+            return;
+        }
+        let target_is_current = match intent.target {
+            SnippetHostMoveRequested::Center => self.center_panel == CenterPanel::Commands,
+            SnippetHostMoveRequested::ToolRail => {
+                self.center_panel != CenterPanel::Commands
+                    && self.snippets_mounted_in_tool_rail(window, cx)
+            }
+        };
+        if !target_is_current {
+            return;
+        }
+        if rendered_new_host && self.focus_handle.contains(&intent.search_focus, window) {
+            window.focus(&intent.search_focus, cx);
+        } else if remaining_frames > 0 {
+            cx.on_next_frame(window, move |root, window, cx| {
+                root.complete_snippets_host_focus(intent, remaining_frames - 1, true, window, cx);
+            });
+        }
+    }
+
+    /// 普通片段导航优先复用实际宿主，避免同一命令实体同时进入中央和工具栏。
+    ///
+    /// @author kongweiguang
+    pub(super) fn open_snippets_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_tool_rail_active_tab();
+        self.reconcile_tab_tool_contents(window, cx);
+        self.reconcile_snippets_host(window, cx);
+        let Some(commands) = self.commands_view.clone() else {
+            self.status = Some(crate::locale::text(
+                "命令片段服务尚未装配。",
+                "The snippet editor is unavailable.",
+            ));
+            cx.notify();
+            return;
+        };
+        let focus_blocked = self.tool_panel_overlay_focus_is_blocked(window, cx);
+        if self.center_panel == CenterPanel::Commands {
+            commands.update(cx, |commands, cx| {
+                commands.select_snippets(cx);
+                if !focus_blocked {
+                    commands.focus_snippets(window, cx);
+                }
+            });
+            return;
+        }
+        let mounted = self.snippets_mounted_in_tool_rail(window, cx);
+        if !mounted {
+            let settings = self.current_tool_rail_settings();
+            let panels = self.tool_rail_state.project(&settings).panels;
+            if contains_tool(panels, ToolRailToolId::Snippets) {
+                self.ensure_tool_panel_visible(ToolRailToolId::Snippets, window, cx);
+            } else {
+                self.set_center_panel(CenterPanel::Commands, window, cx);
+            }
+        }
+        self.cancel_visible_transfer_preparation(cx);
+        self.cancel_file_sftp_selections(cx);
+        self.cancel_plugin_host_open();
+        self.surface_navigation_generation = self.surface_navigation_generation.wrapping_add(1);
+        commands.update(cx, |commands, cx| {
+            commands.select_snippets(cx);
+            if !focus_blocked {
+                commands.focus_snippets(window, cx);
+            }
+        });
+        cx.notify();
     }
 
     /// workspace 或 Agent selection 已稳定变化时更新 Context 投影，避免每帧 set_projection 通知。
@@ -1095,26 +1709,6 @@ impl RootView {
         Some(view)
     }
 
-    /// 把既有运维 Entity 转成固定分区 renderer；服务缺失时给出明确不可用原因。
-    ///
-    /// @author kongweiguang
-    fn operations_panel_renderer(&self, tool: ToolRailToolId, theme: ThemeTokens) -> AnyElement {
-        self.tool_rail_operations_views
-            .get(&tool)
-            .cloned()
-            .map_or_else(
-                || {
-                    unavailable_panel(
-                        operations_unavailable_id(tool),
-                        "运维服务尚未装配。",
-                        "Operations services are unavailable.",
-                        theme,
-                    )
-                },
-                |entity| entity.into_any_element(),
-            )
-    }
-
     /// 容器使用精确 session 上下文，Ports 只借它提示容器目标且阻止宿主回退；侧栏选择不能改写目标。
     /// 同源名称、副标题和 tmux 当前会话只作展示/快捷操作上下文，不覆盖旧标签工具的绑定与草稿。
     ///
@@ -1187,40 +1781,43 @@ impl RootView {
     /// @author kongweiguang
     fn sync_shared_panel_activity(
         &mut self,
-        panels: ToolRailPanelSlots,
+        visible_tools: &[ToolRailToolId],
         window_active: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(files_pane) = self.sftp_panel.clone() {
+            files_pane.update(cx, |files_pane, cx| {
+                files_pane.set_compact_layout(true, cx);
+            });
+        }
+        if !self.snippet_editor_modal_open
+            && let Some(commands_view) = self.commands_view.clone()
+        {
+            let compact = visible_tools.contains(&ToolRailToolId::Snippets);
+            commands_view.update(cx, |commands_view, cx| {
+                commands_view.set_compact_layout(compact, window, cx);
+            });
+        }
         let operation_views = self
             .tool_rail_operations_views
             .iter()
             .map(|(tool, view)| (*tool, view.clone()))
             .collect::<Vec<_>>();
         for (tool, view) in operation_views {
-            let active =
-                tool_rail_panel_is_active(panels, self.right_dock_collapsed, window_active, tool);
+            let active = window_active && visible_tools.contains(&tool);
             view.update(cx, |view, cx| {
                 view.set_compact_layout(true, cx);
                 view.set_active(active, cx);
             });
         }
 
-        let context_active = tool_rail_panel_is_active(
-            panels,
-            self.right_dock_collapsed,
-            window_active,
-            ToolRailToolId::Context,
-        );
+        let context_active = window_active && visible_tools.contains(&ToolRailToolId::Context);
         if let Some(panel) = self.context_panel.clone() {
             panel.update(cx, |panel, cx| panel.set_active(context_active, cx));
         }
 
-        let logs_active = tool_rail_panel_is_active(
-            panels,
-            self.right_dock_collapsed,
-            window_active,
-            ToolRailToolId::Logs,
-        );
+        let logs_active = window_active && visible_tools.contains(&ToolRailToolId::Logs);
         let current_target = self.current_logs_target(cx).map(|target| {
             let Some(controller) = self.workspace_controller.as_ref() else {
                 return target;
@@ -1279,6 +1876,9 @@ impl RootView {
         let settings = self.current_tool_rail_settings();
         let panels = self.tool_rail_state.project(&settings).panels;
         self.tool_rail_panel_visible(panels, ToolRailToolId::AgentLauncher)
+            && self
+                .plugin_tools
+                .projected_tool_visible(ToolRailToolId::AgentLauncher)
     }
 }
 
@@ -1396,19 +1996,6 @@ fn contains_tool(panels: ToolRailPanelSlots, tool: ToolRailToolId) -> bool {
     panels_has_tool(panels, tool)
 }
 
-/// 只有中心和已显示的工具槽会重复消费同一 Entity 时才替换中心 renderer。
-///
-/// @author kongweiguang
-fn center_route_uses_tool_rail_entity(
-    center: CenterPanel,
-    tool_rail_visible: bool,
-    center_entity_is_shared: bool,
-) -> bool {
-    matches!(center, CenterPanel::Commands | CenterPanel::Files)
-        && tool_rail_visible
-        && center_entity_is_shared
-}
-
 /// 仅将真实挂载且未折叠的槽标记为可见，供轮询与读取任务遵守宿主生命周期。
 ///
 /// @author kongweiguang
@@ -1421,40 +2008,6 @@ fn tool_rail_panel_is_visible(
         return !right_dock_collapsed;
     }
     panels.left == Some(tool) || panels.bottom == Some(tool) || panels.center == Some(tool)
-}
-
-/// 只有窗口聚焦且唯一宿主实际显示时才运行工具轮询，后台窗口不会维持前台采样频率。
-///
-/// @author kongweiguang
-fn tool_rail_panel_is_active(
-    panels: ToolRailPanelSlots,
-    right_dock_collapsed: bool,
-    window_active: bool,
-    tool: ToolRailToolId,
-) -> bool {
-    window_active && tool_rail_panel_is_visible(panels, right_dock_collapsed, tool)
-}
-
-impl RootView {
-    /// 活动运维分区分别使用独立 Entity；折叠的右侧宿主不启动隐藏查询。
-    ///
-    /// @author kongweiguang
-    fn active_operations_tools(
-        &self,
-        panels: ToolRailPanelSlots,
-    ) -> Vec<(ToolRailToolId, OperationsSection)> {
-        [
-            (ToolRailToolId::Containers, OperationsSection::Containers),
-            (ToolRailToolId::Tmux, OperationsSection::Tmux),
-            (ToolRailToolId::Ports, OperationsSection::PortForwards),
-            (ToolRailToolId::System, OperationsSection::ServerInfo),
-        ]
-        .into_iter()
-        .filter(|(tool, _)| {
-            panels_has_tool(panels, *tool) && self.tool_rail_panel_visible(panels, *tool)
-        })
-        .collect()
-    }
 }
 
 /// 复用 compact 的临时焦点句柄仅限正常居中宿主；compact_width 必然蕴含 compact_panels，两个抽屉也不会并存。
@@ -1619,6 +2172,48 @@ fn unavailable_panel(
         .text_color(theme.muted)
         .child(crate::locale::text(zh_message, en_message))
         .into_any_element()
+}
+
+/// 工具缺少真实实例时保留原有诊断标识；视图选择始终由注册工厂负责。
+///
+/// @author kongweiguang
+fn tool_unavailable_renderer(tool: ToolRailToolId, theme: ThemeTokens) -> AnyElement {
+    let (id, zh, en) = match tool {
+        ToolRailToolId::AgentLauncher => (
+            "tool-agent-launcher-unavailable",
+            "Agent 服务尚未装配。",
+            "The Agent service is unavailable.",
+        ),
+        ToolRailToolId::Sftp => (
+            "tool-sftp-unavailable",
+            "文件与传输服务尚未装配。",
+            "File and transfer services are unavailable.",
+        ),
+        ToolRailToolId::Snippets => (
+            "tool-snippets-unavailable",
+            "命令服务尚未装配。",
+            "Command services are unavailable.",
+        ),
+        ToolRailToolId::Logs => (
+            "tool-logs-unavailable",
+            "命令历史服务尚未装配。",
+            "Command history is unavailable.",
+        ),
+        ToolRailToolId::Containers
+        | ToolRailToolId::Tmux
+        | ToolRailToolId::Ports
+        | ToolRailToolId::System => (
+            operations_unavailable_id(tool),
+            "运维服务尚未装配。",
+            "Operations services are unavailable.",
+        ),
+        _ => (
+            "tool-plugin-unavailable",
+            "工具尚未就绪，请重新打开。",
+            "The tool is unavailable. Try opening it again.",
+        ),
+    };
+    unavailable_panel(id, zh, en, theme)
 }
 
 /// 固定运维 renderer 的控件 ID 与 ToolId 一一对应，方便原生 UI 验收定位。

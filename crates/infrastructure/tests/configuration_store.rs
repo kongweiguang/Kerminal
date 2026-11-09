@@ -814,37 +814,117 @@ async fn configuration_validator_rejects_future_schema_without_rewriting_it() {
     );
 }
 
-/// 未知工具 ID 必须由严格 settings 解码拒绝，validator 只报告诊断且不改原文件。
+/// 未注册的合法工具 ID 保留所有布局偏好，避免插件恢复后丢失用户配置。
 ///
 /// @author kongweiguang
 #[tokio::test]
-async fn configuration_validator_rejects_unknown_workbench_tool_id_without_rewriting_it() {
+async fn configuration_validator_accepts_unregistered_workbench_tool_id_without_rewriting_it() {
     let temp = TemporaryConfigRoot::new();
     let original = concat!(
         "schema_version = 1\n",
         "[workbenchLayout]\n",
-        "dockPanelWidths = { unknownTool = 320 }\n",
+        "dockPanelWidths = { \"vendor.weather/panel\" = 320 } # preserve\n",
+        "[toolRail]\n",
+        "order = [\"sftp\", \"vendor.weather/panel\"]\n",
+        "hidden = [\"vendor.weather/panel\"]\n",
+        "bottom = [\"vendor.weather/panel\"]\n",
+        "panelPlacements = { \"vendor.weather/panel\" = \"left\" }\n",
     );
-    fs::write(temp.0.join("settings.toml"), original).expect("写入含未知 ToolId 的设置");
+    fs::write(temp.0.join("settings.toml"), original).expect("写入含未注册 ToolId 的设置");
     fs::write(
         temp.0.join(".gitignore"),
         "secrets/vault-key.toml\nsecrets/vault-key.toml.bak.*\n",
     )
     .expect("加入隔离密钥忽略规则");
     let store = ConfigurationStore::initialize(&temp.0).expect("初始化隔离配置仓储");
-    let repository: Arc<dyn ConfigurationValidationRepository> = Arc::new(store);
+    assert_eq!(store.recovery_state().mode, ConfigurationMode::ReadWrite);
+    let repository: Arc<dyn ConfigurationValidationRepository> = Arc::new(store.clone());
     let report = ConfigurationValidationService::new(repository)
         .validate(ConfigurationValidationScope::Settings)
         .await
-        .expect("未知 ToolId 应作为 validator 诊断返回");
+        .expect("校验含未注册 ToolId 的设置");
 
-    assert!(!report.valid);
-    assert_eq!(report.error_count, 1);
-    assert_eq!(report.diagnostics[0].path, "settings.toml");
+    assert!(report.valid, "合法 ToolId 应通过校验: {report:?}");
+    assert_eq!(report.error_count, 0);
+    assert_eq!(report.warning_count, 0);
+    let settings = PreferencesService::new(Arc::new(store))
+        .load_settings()
+        .await
+        .expect("读取含未注册 ToolId 的设置")
+        .settings;
+    let tool = ToolRailToolId::from_id("vendor.weather/panel").expect("插件 ToolId 合法");
     assert_eq!(
-        fs::read(temp.0.join("settings.toml")).expect("读取仍受保护的原件"),
+        settings.workbench_layout.dock_panel_widths.get(&tool),
+        Some(&320)
+    );
+    assert!(settings.tool_rail.order.contains(&tool));
+    assert!(settings.tool_rail.hidden.contains(&tool));
+    assert!(settings.tool_rail.bottom.contains(&tool));
+    assert_eq!(
+        settings.tool_rail.panel_placements.get(&tool),
+        Some(&kerminal_application::preferences::ToolRailPanelPlacement::Left)
+    );
+    assert_eq!(
+        fs::read(temp.0.join("settings.toml")).expect("读取保留的原件"),
         original.as_bytes()
     );
+}
+
+/// 非法工具 ID 不能混入任一布局字段；校验失败时保留用户原始文件以便修复。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn configuration_validator_rejects_invalid_workbench_tool_id_without_rewriting_it() {
+    for (field, original) in [
+        (
+            "dockPanelWidths",
+            "schema_version = 1\n[workbenchLayout]\ndockPanelWidths = { \"vendor.weather/panel/extra\" = 320 } # preserve\n",
+        ),
+        (
+            "order",
+            "schema_version = 1\n[toolRail]\norder = [\"vendor.weather//panel\"] # preserve\n",
+        ),
+        (
+            "hidden",
+            "schema_version = 1\n[toolRail]\nhidden = [\"/panel\"] # preserve\n",
+        ),
+        (
+            "bottom",
+            "schema_version = 1\n[toolRail]\nbottom = [\"vendor/\"] # preserve\n",
+        ),
+        (
+            "panelPlacements",
+            "schema_version = 1\n[toolRail]\npanelPlacements = { \"vendor/invalid\" = \"left\" } # preserve\n",
+        ),
+    ] {
+        toml::from_str::<toml::Value>(original).expect("非法 ID 样本仍须是有效 TOML");
+        let temp = TemporaryConfigRoot::new();
+        fs::write(temp.0.join("settings.toml"), original).expect("写入含非法 ToolId 的设置");
+        let store = ConfigurationStore::initialize(&temp.0).expect("初始化隔离配置仓储");
+        assert_eq!(
+            store.recovery_state().mode,
+            ConfigurationMode::ReadOnlyRecovery
+        );
+        let repository: Arc<dyn ConfigurationValidationRepository> = Arc::new(store);
+        let report = ConfigurationValidationService::new(repository)
+            .validate(ConfigurationValidationScope::Settings)
+            .await
+            .expect("非法 ToolId 应作为 validator 诊断返回");
+
+        assert!(!report.valid, "{field}: {report:?}");
+        assert_eq!(report.error_count, 1, "{field}: {report:?}");
+        assert_eq!(report.warning_count, 0, "{field}: {report:?}");
+        assert_eq!(
+            report.diagnostics[0].severity,
+            ConfigurationValidationSeverity::Error
+        );
+        assert_eq!(report.diagnostics[0].path, "settings.toml");
+        assert_eq!(
+            fs::read(temp.0.join("settings.toml")).expect("读取仍受保护的原件"),
+            original.as_bytes(),
+            "{field} 的配置原文发生变化"
+        );
+    }
 }
 
 /// 未知应用色板必须走既有只读恢复与 validator，原始用户文件不能因回退而被覆盖。

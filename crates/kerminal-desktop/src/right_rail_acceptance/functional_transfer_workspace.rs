@@ -73,7 +73,6 @@ pub(super) async fn prepare_long_fixture_host_names(
             route: host.route,
             serial: host.serial,
             tags: host.tags,
-            is_favorite: host.is_favorite,
             sort_order: host.sort_order,
             connect_timeout_ms: host.connect_timeout_ms,
             keepalive_interval_ms: host.keepalive_interval_ms,

@@ -9,20 +9,22 @@ use std::{
 
 use kerminal_application::{
     AppResult,
+    connections::host_types::HostConfigurationCatalog,
     data_migration::{DataMigrationReport, DataMigrationService},
 };
 use kerminal_infrastructure::data_migration::FileDataMigrationRepository;
 
 use crate::config_root::ConfigRoot;
 
-/// 两入口构造同一用例；旧窗口读取权限与旧实例检查分开，显式根指向正式根仍须保护旧版写入者。
+/// 两入口注入已冻结的 codec 目录；旧窗口读取权限与旧实例检查仍分别判断。
 ///
 /// @author kongweiguang
 pub(crate) fn migration_service(
     root: &Path,
     legacy_window_state: Option<&Path>,
+    host_types: Arc<HostConfigurationCatalog>,
 ) -> DataMigrationService {
-    let repository = FileDataMigrationRepository::new(root);
+    let repository = FileDataMigrationRepository::new(root).with_host_types(host_types);
     let repository = match legacy_window_state {
         Some(path) => repository.with_legacy_window_state(path),
         None => repository,

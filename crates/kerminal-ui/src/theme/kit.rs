@@ -2,6 +2,8 @@
 //!
 //! @author kongweiguang
 
+use std::sync::Arc;
+
 use gpui_kit::component::Theme as KitTheme;
 
 use super::{ThemeTokens, UI_TRANSITION_DURATION};
@@ -11,6 +13,7 @@ use super::{ThemeTokens, UI_TRANSITION_DURATION};
 /// Kit 默认 16px rem，应用仅同步几何角色，不在切换配色时覆盖用户文字缩放；终端字号仍由独立配置控制。
 /// 标准浮层采用与工作台相同的短过渡，减少动态效果仍由 Kit 和系统能力决定。
 /// 统一关闭外扩聚焦光晕，覆盖普通、密码、多行、数字与组合输入；沿用 Kit 的聚焦细边框，兼顾紧凑布局和键盘焦点辨识。
+/// 编辑器保留语法色，只同步阅读面与行号角色，防止独立高亮主题残留旧色板的黑色槽位。
 ///
 /// @author kongweiguang
 pub(super) fn apply_kit_palette(theme: &mut KitTheme, tokens: ThemeTokens) {
@@ -140,6 +143,12 @@ pub(super) fn apply_kit_palette(theme: &mut KitTheme, tokens: ThemeTokens) {
     colors.link = tokens.accent;
     colors.link_hover = tokens.accent;
     colors.link_active = tokens.accent;
+    let editor_style = &mut Arc::make_mut(&mut theme.highlight_theme).style;
+    editor_style.editor_background = Some(tokens.code_surface());
+    editor_style.editor_gutter_background = Some(tokens.code_surface());
+    editor_style.editor_active_line = Some(tokens.surface_hover());
+    editor_style.editor_line_number = Some(tokens.muted);
+    editor_style.editor_active_line_number = Some(tokens.foreground);
     theme.radius = tokens.control_radius;
     theme.radius_lg = tokens.radius_dialog;
     theme.motion.duration_normal = UI_TRANSITION_DURATION;

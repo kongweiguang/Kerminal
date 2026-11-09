@@ -3,9 +3,10 @@
 //! @author kongweiguang
 
 use super::{
-    CUSTOMIZABLE_TOOLS, LegacyContextSettings, ToolRailSections, customizable_settings,
-    customizer_list_max_height, move_before_in_sections, move_to_section_end, split_sections,
+    ToolRailSections, customizable_settings, customizer_list_max_height, merge_registered_order,
+    move_before_in_sections, move_to_section_end, reset_registered_tools, split_sections,
 };
+use crate::plugins::tools::BUILTIN_TOOLS;
 use crate::theme::UiMetrics;
 use gpui_kit::px;
 use kerminal_application::preferences::{
@@ -47,14 +48,7 @@ fn legacy_context_settings_survive_without_becoming_a_customizer_row() {
     settings
         .panel_placements
         .insert(ToolRailToolId::Context, ToolRailPanelPlacement::Center);
-    let legacy = LegacyContextSettings {
-        order_index: Some(0),
-        hidden: true,
-        bottom: true,
-        placement: Some(ToolRailPanelPlacement::Center),
-    };
-
-    let draft = customizable_settings(settings, legacy);
+    let draft = customizable_settings(settings, &BUILTIN_TOOLS);
     assert_eq!(draft.order.first(), Some(&ToolRailToolId::Context));
     assert!(draft.hidden.contains(&ToolRailToolId::Context));
     assert!(draft.bottom.contains(&ToolRailToolId::Context));
@@ -62,7 +56,7 @@ fn legacy_context_settings_survive_without_becoming_a_customizer_row() {
         draft.panel_placements.get(&ToolRailToolId::Context),
         Some(&ToolRailPanelPlacement::Center)
     );
-    let sections = split_sections(&draft);
+    let sections = split_sections(&draft, &BUILTIN_TOOLS);
     assert_eq!(
         sections.main,
         [
@@ -82,21 +76,80 @@ fn legacy_context_settings_survive_without_becoming_a_customizer_row() {
 #[test]
 fn normalizing_all_hidden_tools_restores_the_first_ordered_entry() {
     let settings = ToolRailSettings {
-        hidden: CUSTOMIZABLE_TOOLS.to_vec(),
+        hidden: BUILTIN_TOOLS.to_vec(),
         ..ToolRailSettings::default()
     };
-    let draft = customizable_settings(
-        settings,
-        LegacyContextSettings {
-            order_index: None,
-            hidden: false,
-            bottom: false,
-            placement: None,
-        },
-    );
+    let draft = customizable_settings(settings, &BUILTIN_TOOLS);
 
     assert!(!draft.hidden.contains(&draft.order[0]));
-    assert_eq!(draft.hidden.len(), CUSTOMIZABLE_TOOLS.len() - 1);
+    assert_eq!(draft.hidden.len(), BUILTIN_TOOLS.len() - 1);
+}
+
+/// 已卸载工具穿插在顺序中时，排序和恢复默认都保留其完整配置。
+///
+/// @author kongweiguang
+#[test]
+fn unknown_tool_settings_survive_customization_and_reset() {
+    let unknown = ToolRailToolId::from_id("vendor.weather").expect("valid plugin id");
+    let absent = ToolRailToolId::from_id("vendor.absent").expect("valid plugin id");
+    let mut settings = ToolRailSettings::default();
+    settings.order.insert(1, unknown);
+    settings.hidden.extend([unknown, absent]);
+    settings.bottom.extend([unknown, absent]);
+    settings
+        .panel_placements
+        .insert(unknown, ToolRailPanelPlacement::Left);
+    settings
+        .panel_placements
+        .insert(absent, ToolRailPanelPlacement::Center);
+
+    let mut draft = customizable_settings(settings, &BUILTIN_TOOLS);
+    let mut sections = split_sections(&draft, &BUILTIN_TOOLS);
+    assert!(!sections.main.contains(&unknown));
+    assert!(!sections.bottom.contains(&unknown));
+    assert!(move_before_in_sections(
+        &mut sections,
+        ToolRailToolId::Sftp,
+        ToolRailToolId::AgentLauncher
+    ));
+    let reordered = [sections.main, sections.bottom].concat();
+    draft.order = merge_registered_order(&draft.order, &reordered, &BUILTIN_TOOLS);
+    assert_eq!(draft.order[1], unknown);
+
+    let reset = reset_registered_tools(&draft, &BUILTIN_TOOLS);
+    assert_eq!(reset.order[1], unknown);
+    for tool in [unknown, absent] {
+        assert!(reset.hidden.contains(&tool));
+        assert!(reset.bottom.contains(&tool));
+        assert_eq!(
+            reset.panel_placements.get(&tool),
+            draft.panel_placements.get(&tool)
+        );
+    }
+}
+
+/// 新注册工具可进入编辑分区，既有隐藏和停靠设置继续生效。
+///
+/// @author kongweiguang
+#[test]
+fn registered_plugin_is_available_without_changing_its_saved_preferences() {
+    let plugin = ToolRailToolId::from_id("vendor.weather").expect("valid plugin id");
+    let mut registered = BUILTIN_TOOLS.to_vec();
+    registered.push(plugin);
+    let mut settings = ToolRailSettings::default();
+    settings.hidden.push(plugin);
+    settings.bottom.push(plugin);
+    settings
+        .panel_placements
+        .insert(plugin, ToolRailPanelPlacement::Left);
+    let draft = customizable_settings(settings, &registered);
+    let sections = split_sections(&draft, &registered);
+    assert!(sections.bottom.contains(&plugin));
+    assert!(draft.hidden.contains(&plugin));
+    assert_eq!(
+        draft.effective_panel_placement(plugin),
+        ToolRailPanelPlacement::Left
+    );
 }
 
 /// 拖到另一分区会随目标移动，区尾固定和同项释放保持幂等。

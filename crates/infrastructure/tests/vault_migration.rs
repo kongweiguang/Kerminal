@@ -29,9 +29,13 @@ fn install_vault(root: &Path, vault: &str) {
     fs::write(secrets.join("vault.toml"), vault).expect("写入人工加密 fixture");
 }
 
-/// 将 fixture 变成旧 writer 可能留下的空 AAD，同时加入未知字段与注释保护样本。
+/// 先统一样本副本的换行，避免检出方式影响空 AAD 和未知字段的构造。
+///
+/// @author kongweiguang
 fn fixture_with_empty_aad_and_user_data() -> String {
-    let source = std::str::from_utf8(FIXTURE_VAULT).expect("fixture 为 UTF-8");
+    let source = std::str::from_utf8(FIXTURE_VAULT)
+        .expect("fixture 为 UTF-8")
+        .replace("\r\n", "\n");
     let aad = BASE64.encode(FIXTURE_REFERENCE.as_bytes());
     let source = source
         .replace("[[entries]]\n", "# 用户注释应保留\n[[entries]]\n")
@@ -48,11 +52,13 @@ fn fixture_with_empty_aad_and_user_data() -> String {
     source
 }
 
-/// 生成三条达到单凭据 writer 上限的结构化密文，专门覆盖聚合文件超过 16 MiB 的迁移路径。
+/// 统一样本副本的换行后生成三条大密文，确保跨检出方式覆盖超过 16 MiB 的迁移路径。
 ///
 /// @author kongweiguang
 fn large_synthetic_vault() -> (String, String) {
-    let source = std::str::from_utf8(FIXTURE_VAULT).expect("fixture 为 UTF-8");
+    let source = std::str::from_utf8(FIXTURE_VAULT)
+        .expect("fixture 为 UTF-8")
+        .replace("\r\n", "\n");
     let entry = source
         .split_once("[[entries]]\n")
         .map(|(_, entry)| entry)

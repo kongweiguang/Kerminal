@@ -157,7 +157,7 @@ args = []
 
 SSH/SFTP 高级项使用当前 snake_case 字段：`[ssh_options.terminal]` 的 `connect_timeout_seconds` 为 1–600 秒（默认 30），`keepalive_seconds` 为 0–600 秒（默认 60，0 关闭）；`term` 是无空白/控制字符、最多 128 字节的终端类型，省略时使用 `xterm-256color`；`working_directory` 为非空且不含控制字符的默认目录。显式启动和恢复目录优先，默认目录不覆盖正在浏览或恢复的位置。
 
-`[ssh_options.sftp]` 的 `enabled` 默认 true；可选 `local_start_directory` 必须是当前平台绝对路径，`remote_start_directory` 使用规范远端路径；`preserve_mtime` 默认 true，`follow_source_symlinks` 默认 false。`concurrency` 省略时继承全局每主机并发，填写时为 1–8 且仍受全局总上限约束。禁用 SFTP 只拒绝之后的文件/传输准入，不断开 SSH 终端或强杀在途任务。链接选项仅解引用源端，并检查范围、环路和断链；目标写入和删除不跟随链接。
+`[ssh_options.sftp]` 的 `enabled` 默认 true，仅控制 SSH 主机附带的文件能力；`protocol = "sftp"` 始终提供文件能力，旧文件的 `enabled = false` 不会禁用该类型，下次显式保存时规范化为 true。可选 `local_start_directory` 必须是当前平台绝对路径，`remote_start_directory` 使用规范远端路径；`preserve_mtime` 默认 true，`follow_source_symlinks` 默认 false。`concurrency` 省略时继承全局每主机并发，填写时为 1–8 且仍受全局总上限约束。SSH 关闭附带 SFTP 只拒绝之后的文件/传输准入，不断开 SSH 终端或强杀在途任务。链接选项仅解引用源端，并检查范围、环路和断链；目标写入和删除不跟随链接。
 
 RDP 显示项为 `[rdp_options]` 的 `fullscreen`（默认 true）及可选 `width`、`height`。尺寸必须成对出现，宽为 640–8192，高为 480–8192；窗口模式才使用指定尺寸。旧 camelCase 字段只在一次性迁移入口转换，不在普通读取时作为别名。
 

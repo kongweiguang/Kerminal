@@ -1,7 +1,7 @@
-//! 外部插件的稳定身份，不依赖进程或文件系统。
+//! 外部插件的稳定身份与持久状态，不依赖进程或文件系统。
 //! @author kongweiguang
 
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
@@ -85,4 +85,181 @@ impl<'de> Deserialize<'de> for PluginId {
     {
         Self::parse(String::deserialize(deserializer)?).map_err(de::Error::custom)
     }
+}
+
+/// 版本必须遵守 SemVer，不能让任意文本参与版本目录拼接。
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PluginVersion(semver::Version);
+
+impl PluginVersion {
+    /// 仅接受规范形式，避免同一版本出现多个目录或比较身份。
+    pub fn parse(value: &str) -> Result<Self, InvalidPluginIdentity> {
+        let version = semver::Version::parse(value).map_err(|_| InvalidPluginIdentity)?;
+        if version.to_string() != value {
+            return Err(InvalidPluginIdentity);
+        }
+        Ok(Self(version))
+    }
+
+    /// 暴露 SemVer 规则供兼容性决策使用，不在领域层猜测宿主 API 版本。
+    pub fn as_semver(&self) -> &semver::Version {
+        &self.0
+    }
+}
+
+impl fmt::Display for PluginVersion {
+    /// 输出与解析一致的目录身份，保留预发布与构建元数据。
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for PluginVersion {
+    type Err = InvalidPluginIdentity;
+
+    /// 所有字符串构造路径都接受相同的 SemVer 规范。
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for PluginVersion {
+    /// 持久状态使用标准 SemVer 文本，便于人工审查与协议互通。
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PluginVersion {
+    /// 损坏版本不能成为文件路径，也不能在启动时被静默归一化。
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(&String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+/// 安装来源与运行能力分离；当前仅允许固定市场和本地文件。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginSource {
+    Official,
+    Local,
+}
+
+/// 活动和上一版本始终是已发布的不可变目录，插件数据不跟随回退。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledPlugin {
+    pub active: PluginVersion,
+    pub previous: Option<PluginVersion>,
+    pub enabled: bool,
+    pub source: PluginSource,
+    pub installed_at: String,
+}
+
+/// 待处理操作只描述下一次启动的意图，运行中的快照不会被修改。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PendingPluginChange {
+    Install {
+        id: PluginId,
+        to: PluginVersion,
+        staged: String,
+        source: PluginSource,
+        installed_at: String,
+    },
+    Update {
+        id: PluginId,
+        to: PluginVersion,
+        staged: String,
+    },
+    Enable {
+        id: PluginId,
+    },
+    Disable {
+        id: PluginId,
+    },
+    Uninstall {
+        id: PluginId,
+    },
+    Rollback {
+        id: PluginId,
+        to: PluginVersion,
+    },
+}
+
+impl PendingPluginChange {
+    /// 提取操作所属身份，使顺序应用与错误定位都不依赖字符串解析。
+    pub fn plugin_id(&self) -> &PluginId {
+        match self {
+            Self::Install { id, .. }
+            | Self::Update { id, .. }
+            | Self::Enable { id }
+            | Self::Disable { id }
+            | Self::Uninstall { id }
+            | Self::Rollback { id, .. } => id,
+        }
+    }
+}
+
+/// 启动窗口只记录已冻结到首帧之前的崩溃，避免普通退出触发安全模式。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginBootPhase {
+    #[default]
+    Starting,
+    RegistryFrozen,
+    FirstFrame,
+}
+
+/// 启动身份防止迟到首帧回执清除较新进程留下的崩溃证据。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginBootMarker {
+    pub id: String,
+    pub phase: PluginBootPhase,
+    pub consecutive_early_crashes: u8,
+}
+
+/// 唯一权威文件的内存投影；未知 schema 必须由存储层拒绝而非覆盖。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginStoreState {
+    pub schema: u32,
+    pub revision: u64,
+    pub plugins: BTreeMap<PluginId, InstalledPlugin>,
+    pub pending: Vec<PendingPluginChange>,
+    pub failures: BTreeMap<PluginId, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<PluginBootMarker>,
+}
+
+impl Default for PluginStoreState {
+    /// 缺失状态从空版本开始；损坏文件由存储层单独报告，不能套用此默认值。
+    fn default() -> Self {
+        Self {
+            schema: 1,
+            revision: 0,
+            plugins: BTreeMap::new(),
+            pending: Vec::new(),
+            failures: BTreeMap::new(),
+            boot: None,
+        }
+    }
+}
+
+/// 进程状态与安装状态分开，运行失败不会暗中改写用户的启用选择。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PluginRuntimeState {
+    Idle,
+    Starting,
+    Ready { generation: u64 },
+    Crashed { generation: u64 },
+    Failed,
+    Stopping,
 }

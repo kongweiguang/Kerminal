@@ -773,6 +773,7 @@ impl TransferService {
     }
 
     /// 主机默认值只在准入时捕获，禁用 SFTP 不影响 SSH 终端，也不强杀在途任务。
+    /// @author kongweiguang
     async fn sftp_options_for_endpoint(
         &self,
         endpoint: &kerminal_domain::files::FileEndpoint,
@@ -786,17 +787,16 @@ impl TransferService {
         let Some(management) = &self.inner.host_management else {
             return Ok(None);
         };
-        let options = management
+        let host = management
             .load_host(host_id)
             .await?
-            .ok_or_else(|| AppError::not_found("传输主机不存在"))?
-            .sftp_options;
-        if !options.enabled {
+            .ok_or_else(|| AppError::not_found("传输主机不存在"))?;
+        if !HostSftpOptions::enabled_for(host.protocol, host.sftp_options.enabled) {
             return Err(AppError::unsupported(
                 "此主机已禁用 SFTP，请先在连接设置中启用",
             ));
         }
-        Ok(Some(options))
+        Ok(Some(host.sftp_options))
     }
 
     /// 在持锁状态下提交完整恢复快照，保证实际目标及 owner 先于提交许可落盘，旧进度不会覆盖新状态。

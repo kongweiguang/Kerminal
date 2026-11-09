@@ -8,7 +8,7 @@ use kerminal_application::preferences::{CONFIG_GUIDE, CONFIG_GUIDE_REVISION};
 use tempfile::tempdir;
 
 use super::super::FileEdit;
-use super::plan_configuration_migration;
+use super::plan_configuration_migration_with_host_types;
 use crate::configuration;
 
 const PREVIOUS_GUIDE: &str =
@@ -39,6 +39,15 @@ const HOST_V2_SERIAL: &str =
     include_str!("../../../../tests/fixtures/configuration/host-schema-v2-serial-migration.toml");
 const HOST_V3_SERIAL: &str =
     include_str!("../../../../tests/fixtures/configuration/host-schema-v3-serial.toml");
+
+/// 旧迁移样本没有扩展目录，统一经过与生产相同的规划入口验证。
+///
+/// @author kongweiguang
+fn plan_configuration_migration(
+    root: &std::path::Path,
+) -> kerminal_application::AppResult<Vec<FileEdit>> {
+    plan_configuration_migration_with_host_types(root, None)
+}
 
 /// 写入隔离配置 fixture；父目录只在测试临时根下创建。
 ///

@@ -111,7 +111,7 @@ impl QuickOpenEntry {
 }
 
 /// 从当前 v3 工作区读取有效 tab、pane、打开文件和当前 cwd，不伪称为持久化路径 MRU。
-/// machine ID 只留作检索关键词；空白 cwd 不生成空目录行或多余分隔符。
+/// machine ID 只留作检索关键词；文件宿主检索内部路径但只返回真实顶层身份，不伪造文档导航。
 ///
 /// @author kongweiguang
 pub(super) fn workspace_entries(
@@ -214,6 +214,22 @@ pub(super) fn workspace_entries(
                     detail: path.clone(),
                     keywords: vec![id.to_string(), path.clone()],
                     selection: Some(QuickOpenSelection::WorkspaceFile(id.clone())),
+                    disabled: false,
+                },
+                query,
+            ),
+            WorkspaceSessionTab::Extension {
+                id,
+                title,
+                content_id,
+                ..
+            } => push_matching(
+                &mut entries,
+                QuickOpenEntry {
+                    label: title.clone(),
+                    detail: text("扩展标签", "Extension tab"),
+                    keywords: vec![id.to_string(), content_id.clone()],
+                    selection: Some(QuickOpenSelection::Tab(id.clone())),
                     disabled: false,
                 },
                 query,

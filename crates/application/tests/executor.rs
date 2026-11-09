@@ -14,6 +14,31 @@ use kerminal_application::{AppError, executor::ApplicationTaskExecutor};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+/// 前一层耗尽绝对预算后，下一层不能先轮询 ready future 再将其成功伪报为及时完成。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn exhausted_resource_deadline_does_not_start_the_next_cleanup_stage() {
+    let polled = Arc::new(AtomicBool::new(false));
+    let task_polled = polled.clone();
+    let result = kerminal_application::executor::await_until(
+        std::time::Instant::now() - Duration::from_millis(1),
+        "fixture cleanup",
+        async move {
+            task_polled.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(AppError::Timeout {
+            operation: "fixture cleanup"
+        })
+    ));
+    assert!(!polled.load(Ordering::SeqCst));
+}
+
 /// 使用 Tokio timer 验证被调度 future 在注入的应用 runtime 上执行。
 #[tokio::test]
 async fn run_polls_task_on_application_runtime() {

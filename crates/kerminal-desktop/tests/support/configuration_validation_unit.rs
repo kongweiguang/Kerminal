@@ -4,7 +4,7 @@
 
 use std::{ffi::OsString, path::PathBuf};
 
-use super::{parse_root_argument, run_from_args};
+use super::{parse_root_argument, run_from_args, run_validation};
 
 /// Windows 路径以单个原生参数保留空格，不由 helper 再拼接或拆分。
 ///
@@ -93,4 +93,35 @@ fn validator_command_returns_invalid_status_without_rewriting_the_document() {
 
     assert_eq!(exit_code, Some(1));
     assert_eq!(std::fs::read(settings).unwrap(), source);
+}
+
+/// 样例先满足密钥隔离规则，再验证同一插件文件随目录使用 codec，避免其它诊断掩盖提供方分支。
+///
+/// @author kongweiguang
+#[test]
+fn validator_uses_the_supplied_host_catalog() {
+    use kerminal_application::connections::host_types::HostConfigurationType;
+    use kerminal_infrastructure::configuration::host_configuration_catalog;
+
+    let root = tempfile::tempdir().expect("隔离配置根");
+    std::fs::write(root.path().join(".gitignore"), "secrets/vault-key.toml\n")
+        .expect("验收配置保留密钥忽略规则");
+    let hosts = root.path().join("hosts");
+    std::fs::create_dir(&hosts).expect("创建主机目录");
+    let path = hosts.join("validation-host.toml");
+    let raw = "schema_version = 3\nid = \"validation-host\"\nprotocol = \"example-host\"\nprovider_id = \"example.plugin\"\nname = \"Validation\"\nsort_order = 0\nconfiguration_version = 1\ncreated_at = \"2026-01-01T00:00:00Z\"\nupdated_at = \"2026-01-01T00:00:00Z\"\n\n[configuration]\naddress = \"\"\n";
+    std::fs::write(&path, raw).expect("写入插件主机");
+    let unknown = host_configuration_catalog(Vec::new()).expect("内置目录");
+    let codec = unknown
+        .get("kerminal", "ssh")
+        .expect("内置 codec")
+        .codec
+        .clone();
+    let extension =
+        HostConfigurationType::new("example.plugin", "example-host", codec).expect("扩展类型");
+    let known = host_configuration_catalog(vec![extension]).expect("扩展目录");
+
+    assert_eq!(run_validation(root.path(), &known), 1);
+    assert_eq!(run_validation(root.path(), &unknown), 0);
+    assert_eq!(std::fs::read_to_string(path).expect("原文未改写"), raw);
 }

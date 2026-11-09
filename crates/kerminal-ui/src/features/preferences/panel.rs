@@ -53,6 +53,8 @@ mod connectivity;
 mod custom_agent;
 #[path = "panel/desktop_about.rs"]
 mod desktop_about;
+#[path = "panel/external_plugins.rs"]
+mod external_plugins;
 #[path = "panel/forms.rs"]
 mod forms;
 #[path = "panel/mcp.rs"]
@@ -454,6 +456,7 @@ impl LeaveConfirmationFocus {
 
 /// settings 与 Profile 页面状态只保存 typed 快照和 opaque revision，文件访问由 application 负责。
 pub struct PreferencesPanel {
+    pub(super) external_plugins: external_plugins::ExternalPreferencesState,
     screen_color_sampling: color_sampling::ScreenColorSamplingState,
     settings_autosave: autosave::SettingsAutosaveState,
     pub(super) keyword_editor: terminal::KeywordEditorState,
@@ -685,6 +688,7 @@ impl PreferencesPanel {
             },
         );
         let mut panel = Self {
+            external_plugins: external_plugins::ExternalPreferencesState::default(),
             screen_color_sampling: color_sampling::ScreenColorSamplingState::default(),
             settings_autosave: autosave::SettingsAutosaveState::default(),
             keyword_editor,
@@ -1143,6 +1147,7 @@ impl PreferencesPanel {
     ///
     /// @author kongweiguang
     pub(super) fn select_section(&mut self, section: PreferencesSection, cx: &mut Context<Self>) {
+        self.hide_external_plugin(cx);
         if self.section == section && self.selected_navigation_target.is_none() {
             return;
         }

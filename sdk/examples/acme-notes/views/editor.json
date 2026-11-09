@@ -1,0 +1,36 @@
+{
+  "data": {
+    "text": "",
+    "busy": false
+  },
+  "root": {
+    "gap": "md",
+    "children": [
+      {
+        "bind": "text",
+        "label": "%editor.text%",
+        "placeholder": "%editor.placeholder%",
+        "type": "textarea"
+      },
+      {
+        "children": [
+          {
+            "label": "%editor.save%",
+            "action": "save",
+            "variant": "primary",
+            "type": "button"
+          },
+          {
+            "label": "%editor.check%",
+            "action": "check",
+            "busy": "$busy",
+            "type": "button"
+          }
+        ],
+        "type": "toolbar"
+      }
+    ],
+    "type": "stack"
+  },
+  "schema": 1
+}

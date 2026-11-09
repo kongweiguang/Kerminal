@@ -322,7 +322,6 @@ fn fixture_managed_host(profile: &HostConnectionProfile) -> ManagedHost {
         route: HostRouteSettings::default(),
         serial: None,
         tags: Vec::new(),
-        is_favorite: false,
         sort_order: 0,
         connect_timeout_ms: profile.connect_timeout_ms,
         keepalive_interval_ms: profile.keepalive_interval_ms,

@@ -8,7 +8,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use kerminal_application::preferences::ConfigurationValidationScope;
+use kerminal_application::{
+    connections::host_types::HostConfigurationCatalog, preferences::ConfigurationValidationScope,
+};
 use kerminal_infrastructure::configuration::ConfigurationStore;
 
 const VALIDATE_CONFIG_ARGUMENT: &str = "--validate-config";
@@ -28,7 +30,13 @@ where
             eprintln!("用法：kerminal --validate-config <root>");
             Some(COMMAND_ERROR_EXIT_CODE)
         }
-        Some(Ok(root)) => Some(run_validation(&root)),
+        Some(Ok(root)) => Some(match crate::plugin_catalogs::offline_catalogs(&root) {
+            Ok((_, host_types)) => run_validation(&root, &host_types),
+            Err(error) => {
+                eprintln!("配置校验无法装配插件目录：{}", error.public_message());
+                COMMAND_ERROR_EXIT_CODE
+            }
+        }),
     }
 }
 
@@ -54,11 +62,15 @@ where
     Some(Ok(PathBuf::from(root)))
 }
 
-/// 把无效配置作为 JSON 报告和退出码返回，只有执行失败才写 stderr。
+/// 用冻结目录校验并输出 JSON；无效配置与执行失败保持不同退出码。
 ///
 /// @author kongweiguang
-fn run_validation(root: &Path) -> i32 {
-    let report = match ConfigurationStore::validate_root(root, ConfigurationValidationScope::All) {
+fn run_validation(root: &Path, host_types: &HostConfigurationCatalog) -> i32 {
+    let report = match ConfigurationStore::validate_root_with_host_types(
+        root,
+        ConfigurationValidationScope::All,
+        host_types,
+    ) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("配置校验无法完成：{error}");

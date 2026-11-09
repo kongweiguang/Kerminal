@@ -38,6 +38,25 @@ use crate::features::commands::CommandsConfigurationActions;
 /// 可克隆的界面依赖；桌面组合根持有运行时并统一注入。
 #[derive(Clone)]
 pub struct AppServices {
+    /// 冻结的贡献目录由组合根提供；视图只查询元数据，不在运行中替换配置规则。
+    pub plugins: Arc<kerminal_application::plugins::PluginRegistry>,
+    /// 插件窗口能力通过有界桥接交给所属 Root，后台进程不直接持有 GPUI 对象。
+    pub plugin_ui: Option<Arc<super::PluginUiBridge>>,
+    /// 原生工厂、命令与 WebView 复用同一实例路由和设置用例。
+    pub external_plugin_runtime:
+        Option<Arc<kerminal_application::plugin_runtime::PluginRuntimeService>>,
+    /// 设置页与工具、标签共用同一视图运行适配器和窗口桥接。
+    pub external_plugin_views: Option<crate::plugins::external::factories::ExternalViewServices>,
+    pub external_plugin_settings:
+        Option<kerminal_application::plugin_settings::PluginSettingsService>,
+    pub external_plugins: Vec<Arc<kerminal_application::external_contributions::PreparedPlugin>>,
+    pub plugin_events: Option<Arc<kerminal_application::plugin_host_api::PluginEventSubscriptions>>,
+    /// 工厂只捕获各自需要的应用端口；实例在所属窗口按需创建，不能在装配时挂载视图。
+    pub content_factories: Vec<Arc<dyn crate::plugins::content::ContentFactory>>,
+    /// 工具工厂与运行端口一同注入，视图实例仍只在所属窗口按需创建。
+    pub tool_factories: Vec<Arc<dyn crate::plugins::tools::ToolFactory>>,
+    /// 表单工厂已与冻结配置目录核对；编辑实体由所属窗口按需创建。
+    pub host_form_factories: Arc<crate::plugins::host_forms::HostFormFactories>,
     /// 布局领域规则，不持有视图或会话资源。
     pub workspace: WorkspaceService,
     /// 与 MCP、Agent 共用的唯一会话注册表。
@@ -83,6 +102,8 @@ pub struct AppServices {
     pub configuration_validation: Option<ConfigurationValidationService>,
     /// 主机管理和 SSH 信任预检共用组合根的同一 service instance。
     pub hosts: Option<HostManagementService>,
+    /// 插件主机共享同一仓储与 codec，UI 只接收受控打开意图。
+    pub plugin_hosts: Option<kerminal_application::connections::host_types::PluginHostService>,
     pub remote_connections: Option<Arc<dyn RemoteConnectionService>>,
     /// 未保存连接探测只执行短生命周期用例，不暴露配置或凭据仓储给界面。
     pub connection_probe: Option<Arc<ConnectionProbeService>>,
@@ -108,6 +129,28 @@ pub struct AppServices {
 }
 
 impl AppServices {
+    /// 配置类型先冻结，表单只接收自身需要的服务，避免创建视图时再改变配置解释规则。
+    ///
+    /// @author kongweiguang
+    pub fn with_host_form_factories(
+        mut self,
+        factories: Arc<crate::plugins::host_forms::HostFormFactories>,
+    ) -> Self {
+        self.host_form_factories = factories;
+        self
+    }
+
+    /// 同一冻结声明对应唯一工具实现；重复与缺失声明由组合根及 UI 宿主校验。
+    ///
+    /// @author kongweiguang
+    pub fn with_tool_factories(
+        mut self,
+        factories: Vec<Arc<dyn crate::plugins::tools::ToolFactory>>,
+    ) -> Self {
+        self.tool_factories = factories;
+        self
+    }
+
     /// 注入一次性取色能力，不在 UI 引入平台 API 或持续屏幕采集任务。
     /// @author kongweiguang
     pub fn with_screen_color_sampler(
@@ -129,6 +172,16 @@ impl AppServices {
         profiles: ProfileService,
     ) -> Self {
         Self {
+            plugins: Arc::new(kerminal_application::plugins::PluginRegistry::default()),
+            plugin_ui: None,
+            external_plugin_runtime: None,
+            external_plugin_views: None,
+            external_plugin_settings: None,
+            external_plugins: Vec::new(),
+            plugin_events: None,
+            content_factories: Vec::new(),
+            tool_factories: Vec::new(),
+            host_form_factories: Arc::default(),
             workspace,
             sessions,
             executor,
@@ -152,6 +205,7 @@ impl AppServices {
             snippet_transfer_files: None,
             configuration_validation: None,
             hosts: None,
+            plugin_hosts: None,
             remote_connections: None,
             connection_probe: None,
             serial_ports: None,
@@ -165,6 +219,41 @@ impl AppServices {
             configuration_changes: None,
             system_locale: None,
         }
+    }
+
+    /// 配置扫描和 UI 使用同一目录，避免合法类型在两个入口获得不同的可用性结论。
+    /// 默认空目录便于最小宿主测试，生产组合根必须显式安装已冻结的内置贡献。
+    ///
+    /// @author kongweiguang
+    pub fn with_plugins(
+        mut self,
+        plugins: Arc<kerminal_application::plugins::PluginRegistry>,
+    ) -> Self {
+        self.plugins = plugins;
+        self
+    }
+
+    /// 在窗口创建前提供内容工厂；重复及缺失引用由组合根和内容宿主共同拒绝。
+    /// 工厂捕获窄端口，避免插件通过服务容器间接获得整个应用。
+    ///
+    /// @author kongweiguang
+    pub fn with_content_factories(
+        mut self,
+        factories: Vec<Arc<dyn crate::plugins::content::ContentFactory>>,
+    ) -> Self {
+        self.content_factories = factories;
+        self
+    }
+
+    /// 将组合根的主机插件用例交给目录视图；不让 UI 自建配置目录或运行资源。
+    ///
+    /// @author kongweiguang
+    pub fn with_plugin_hosts(
+        mut self,
+        service: kerminal_application::connections::host_types::PluginHostService,
+    ) -> Self {
+        self.plugin_hosts = Some(service);
+        self
     }
 
     /// 一次装配文件浏览、传输和编辑用例，避免三个入口各自创建不同的文件服务实例。

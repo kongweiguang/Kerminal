@@ -1,0 +1,13 @@
+{
+  "panel.title": "工作区笔记",
+  "panel.saved": "已保存的笔记",
+  "editor.title": "工作区笔记",
+  "editor.text": "笔记",
+  "editor.placeholder": "输入笔记",
+  "editor.save": "保存",
+  "editor.check": "检查 example.com",
+  "editor.copy": "复制笔记",
+  "settings.title": "笔记设置",
+  "settings.preview": "显示笔记预览",
+  "command.check": "笔记：检查 example.com"
+}

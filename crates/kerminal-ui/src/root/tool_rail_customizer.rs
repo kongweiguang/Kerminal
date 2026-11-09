@@ -23,36 +23,18 @@ use kerminal_application::preferences::{ToolRailPanelPlacement, ToolRailSettings
 
 use crate::{
     features::preferences::PreferencesPanel,
+    plugins::tools::ToolPresentation,
     theme::{ThemeTokens, UiMetrics},
 };
 
-use super::{RootView, workbench::tool_rail_icon};
-
-const CUSTOMIZABLE_TOOLS: [ToolRailToolId; 8] = [
-    ToolRailToolId::AgentLauncher,
-    ToolRailToolId::Sftp,
-    ToolRailToolId::Snippets,
-    ToolRailToolId::Tmux,
-    ToolRailToolId::Ports,
-    ToolRailToolId::System,
-    ToolRailToolId::Logs,
-    ToolRailToolId::Containers,
-];
-
-#[derive(Clone, Copy)]
-struct LegacyContextSettings {
-    order_index: Option<usize>,
-    hidden: bool,
-    bottom: bool,
-    placement: Option<ToolRailPanelPlacement>,
-}
+use super::RootView;
 
 /// 唯一工具编辑草稿保留旧 Context 字段作无损回写，但不把退役项显示成入口。
 pub(super) struct ToolRailCustomizer {
     preferences_panel: Entity<PreferencesPanel>,
     draft: ToolRailSettings,
     initial: ToolRailSettings,
-    legacy_context: LegacyContextSettings,
+    tools: Vec<(ToolRailToolId, ToolPresentation)>,
     open: bool,
     busy: bool,
     error: Option<SharedString>,
@@ -65,17 +47,13 @@ impl ToolRailCustomizer {
     pub(super) fn new(
         settings: ToolRailSettings,
         preferences_panel: Entity<PreferencesPanel>,
+        tools: Vec<(ToolRailToolId, ToolPresentation)>,
     ) -> Self {
         let mut customizer = Self {
             preferences_panel,
             draft: ToolRailSettings::default(),
             initial: ToolRailSettings::default(),
-            legacy_context: LegacyContextSettings {
-                order_index: None,
-                hidden: false,
-                bottom: false,
-                placement: None,
-            },
+            tools,
             open: true,
             busy: false,
             error: None,
@@ -87,7 +65,13 @@ impl ToolRailCustomizer {
     /// 每次显式打开都从最新 Root 快照重建草稿，旧配置中的退役 Context 值单独保留。
     ///
     /// @author kongweiguang
-    pub(super) fn prepare(&mut self, settings: ToolRailSettings, cx: &mut Context<Self>) {
+    pub(super) fn prepare(
+        &mut self,
+        settings: ToolRailSettings,
+        tools: Vec<(ToolRailToolId, ToolPresentation)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.tools = tools;
         self.replace_settings(settings);
         self.open = true;
         self.busy = false;
@@ -132,22 +116,19 @@ impl ToolRailCustomizer {
         true
     }
 
-    /// 旧 Context 不是本次可见工具，但它的配置键仍须跨保存和恢复默认完整保留。
+    /// 草稿只补充已注册工具，保留当前不可用工具的全部字段和原位置。
+    ///
+    /// @author kongweiguang
     fn replace_settings(&mut self, settings: ToolRailSettings) {
-        self.legacy_context = LegacyContextSettings {
-            order_index: settings
-                .order
-                .iter()
-                .position(|tool| *tool == ToolRailToolId::Context),
-            hidden: settings.hidden.contains(&ToolRailToolId::Context),
-            bottom: settings.bottom.contains(&ToolRailToolId::Context),
-            placement: settings
-                .panel_placements
-                .get(&ToolRailToolId::Context)
-                .copied(),
-        };
-        self.draft = customizable_settings(settings, self.legacy_context);
+        self.draft = customizable_settings(settings, &self.registered_tools());
         self.initial = self.draft.clone();
+    }
+
+    /// 编辑操作只处理本次弹框拥有真实工厂的工具。
+    ///
+    /// @author kongweiguang
+    fn registered_tools(&self) -> Vec<ToolRailToolId> {
+        self.tools.iter().map(|(tool, _)| *tool).collect()
     }
 
     /// 显示、顺序、分区和停靠位置作为一份 typed settings 快照，仅一次 CAS 提交。
@@ -170,15 +151,16 @@ impl ToolRailCustomizer {
 
     /// 所有 8 项至少留一项可发现；显示开关不改动排序或底部成员关系。
     fn set_visible(&mut self, tool: ToolRailToolId, visible: bool, cx: &mut Context<Self>) {
-        if self.busy || !is_customizable_tool(tool) {
+        if self.busy || !self.registered_tools().contains(&tool) {
             return;
         }
         if visible {
             self.draft.hidden.retain(|candidate| *candidate != tool);
         } else {
-            let visible_count = CUSTOMIZABLE_TOOLS
+            let visible_count = self
+                .tools
                 .iter()
-                .filter(|candidate| !self.draft.hidden.contains(candidate))
+                .filter(|(candidate, _)| !self.draft.hidden.contains(candidate))
                 .count();
             if visible_count <= 1 {
                 return;
@@ -197,7 +179,7 @@ impl ToolRailCustomizer {
         placement: ToolRailPanelPlacement,
         cx: &mut Context<Self>,
     ) {
-        if self.busy || !is_customizable_tool(tool) {
+        if self.busy || !self.registered_tools().contains(&tool) {
             return;
         }
         self.draft.panel_placements.insert(tool, placement);
@@ -206,11 +188,11 @@ impl ToolRailCustomizer {
 
     /// 相邻排序只在同一可见分区内移动，不让拖放改变底部固定语义。
     fn move_by(&mut self, tool: ToolRailToolId, offset: isize, cx: &mut Context<Self>) {
-        if self.busy || !is_customizable_tool(tool) || !matches!(offset, -1 | 1) {
+        if self.busy || !self.registered_tools().contains(&tool) || !matches!(offset, -1 | 1) {
             return;
         }
         let bottom = self.draft.bottom.contains(&tool);
-        let mut sections = split_sections(&self.draft);
+        let mut sections = split_sections(&self.draft, &self.registered_tools());
         let section = if bottom {
             &mut sections.bottom
         } else {
@@ -235,13 +217,13 @@ impl ToolRailCustomizer {
         cx: &mut Context<Self>,
     ) {
         if self.busy
-            || !is_customizable_tool(source)
-            || !is_customizable_tool(target)
+            || !self.registered_tools().contains(&source)
+            || !self.registered_tools().contains(&target)
             || source == target
         {
             return;
         }
-        let mut sections = split_sections(&self.draft);
+        let mut sections = split_sections(&self.draft, &self.registered_tools());
         if !move_before_in_sections(&mut sections, source, target) {
             return;
         }
@@ -250,48 +232,52 @@ impl ToolRailCustomizer {
 
     /// 空分区是可操作的拖放目标；释放在空白處表示将工具追加到该分区末尾。
     fn drop_at_end(&mut self, source: ToolRailToolId, bottom: bool, cx: &mut Context<Self>) {
-        if self.busy || !is_customizable_tool(source) {
+        if self.busy || !self.registered_tools().contains(&source) {
             return;
         }
-        let mut sections = split_sections(&self.draft);
+        let mut sections = split_sections(&self.draft, &self.registered_tools());
         move_to_section_end(&mut sections, source, bottom);
         self.apply_sections(sections, cx);
     }
 
-    /// 恢复 main 的八项缺省值但不删除旧 Context 配置字段。
+    /// 仅恢复已注册工具的缺省值，未知工具和退役工具仍按原配置保留。
+    ///
+    /// @author kongweiguang
     fn reset_defaults(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
-        self.draft = customizable_settings(ToolRailSettings::default(), self.legacy_context);
+        self.draft = reset_registered_tools(&self.draft, &self.registered_tools());
         cx.notify();
     }
 
-    /// 只恢复本轮八项的可见性，保留退役 Context 的隐藏状态和用户已调整的排序、位置。
+    /// 只恢复已注册工具的可见性，未知身份的隐藏设置继续保留。
+    ///
+    /// @author kongweiguang
     fn show_all(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
-        self.draft
-            .hidden
-            .retain(|tool| !is_customizable_tool(*tool));
+        let registered = self.registered_tools();
+        self.draft.hidden.retain(|tool| !registered.contains(tool));
         cx.notify();
     }
 
-    /// section 拆分后重建全局可见顺序，并把 legacy Context 放回原索引附近。
+    /// 重排只替换已注册工具的位置，未注册身份的顺序和分区不受影响。
+    ///
+    /// @author kongweiguang
     fn apply_sections(&mut self, sections: ToolRailSections, cx: &mut Context<Self>) {
         let visible_order = [sections.main, sections.bottom.clone()].concat();
-        self.draft.order = insert_legacy_context(visible_order, self.legacy_context.order_index);
-        self.draft
-            .bottom
-            .retain(|tool| !is_customizable_tool(*tool));
+        let registered = self.registered_tools();
+        self.draft.order = merge_registered_order(&self.draft.order, &visible_order, &registered);
+        self.draft.bottom.retain(|tool| !registered.contains(tool));
         self.draft.bottom.extend(sections.bottom);
         cx.notify();
     }
 
     /// render 的轻量投影不复制用户草稿，避免每帧产生不同的 dirty 结果。
     fn sections(&self) -> ToolRailSections {
-        split_sections(&self.draft)
+        split_sections(&self.draft, &self.registered_tools())
     }
 }
 
@@ -302,12 +288,13 @@ impl Render for ToolRailCustomizer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ThemeTokens::current(window, cx).for_tool_panel();
         let sections = self.sections();
-        let visible_count = CUSTOMIZABLE_TOOLS
+        let visible_count = self
+            .tools
             .iter()
-            .filter(|tool| !self.draft.hidden.contains(tool))
+            .filter(|(tool, _)| !self.draft.hidden.contains(tool))
             .count();
         let at_default =
-            self.draft == customizable_settings(ToolRailSettings::default(), self.legacy_context);
+            self.draft == reset_registered_tools(&self.draft, &self.registered_tools());
         let status = self.error.clone();
         let saving = self.busy;
 
@@ -362,14 +349,8 @@ impl Render for ToolRailCustomizer {
                     .text_size(theme.text_xs)
                     .text_color(theme.muted)
                     .child(crate::locale::text(
-                        format!(
-                            "已显示 {visible_count} / {} 个工具",
-                            CUSTOMIZABLE_TOOLS.len()
-                        ),
-                        format!(
-                            "{visible_count} of {} tools shown",
-                            CUSTOMIZABLE_TOOLS.len()
-                        ),
+                        format!("已显示 {visible_count} / {} 个工具", self.tools.len()),
+                        format!("{visible_count} of {} tools shown", self.tools.len()),
                     ))
                     .child(
                         div()
@@ -382,7 +363,7 @@ impl Render for ToolRailCustomizer {
                                     .ghost()
                                     .icon(IconName::Eye)
                                     .label(crate::locale::text("全部显示", "Show all"))
-                                    .disabled(saving || visible_count == CUSTOMIZABLE_TOOLS.len())
+                                    .disabled(saving || visible_count == self.tools.len())
                                     .on_click(
                                         cx.listener(|customizer, _, _, cx| customizer.show_all(cx)),
                                     ),
@@ -550,9 +531,10 @@ impl ToolRailCustomizer {
         for (index, tool) in tools.iter().copied().enumerate() {
             let visible = !self.draft.hidden.contains(&tool);
             let last_visible = visible
-                && CUSTOMIZABLE_TOOLS
+                && self
+                    .tools
                     .iter()
-                    .filter(|candidate_tool| !self.draft.hidden.contains(candidate_tool))
+                    .filter(|(candidate_tool, _)| !self.draft.hidden.contains(candidate_tool))
                     .count()
                     == 1;
             let placement = self
@@ -567,8 +549,15 @@ impl ToolRailCustomizer {
                 .find(|(_, candidate)| *candidate == placement)
                 .map(|(label, _)| label.clone())
                 .unwrap_or_else(|| crate::locale::text("贴靠右栏", "Attach to right rail"));
-            let label = customizable_tool_label(tool);
-            let description = tool_rail_description(tool);
+            let Some((_, presentation)) =
+                self.tools.iter().find(|(candidate, _)| *candidate == tool)
+            else {
+                continue;
+            };
+            let label = presentation.label();
+            let description = presentation.description();
+            let icon = presentation.icon();
+            let drag_label = label.clone();
             let description_tooltip = description.clone();
             let is_bottom = bottom;
             let pin_tooltip = crate::locale::text(
@@ -610,13 +599,13 @@ impl ToolRailCustomizer {
                 .tooltip(move |window, cx| Tooltip::new(drag_tooltip.clone()).build(window, cx))
                 .child(IconName::GripVertical)
                 .when(!saving, move |this| {
-                    this.on_drag(tool, move |dragged, _, _, app| {
+                    this.on_drag(tool, move |_, _, _, app| {
                         drag_entity.update(app, |customizer, cx| {
                             customizer.error = None;
                             cx.notify();
                         });
                         app.new(|_| ToolRailDragPreview {
-                            label: customizable_tool_label(*dragged),
+                            label: drag_label.clone(),
                             theme,
                         })
                     })
@@ -669,7 +658,7 @@ impl ToolRailCustomizer {
                         .rounded_md()
                         .bg(theme.subtle_background())
                         .text_color(theme.muted)
-                        .child(tool_rail_icon(tool)),
+                        .child(icon),
                 )
                 .child(
                     div()
@@ -892,13 +881,24 @@ impl RootView {
             return;
         }
         let settings = self.current_tool_rail_settings();
+        let tools = self
+            .plugin_tools
+            .registered_tools()
+            .into_iter()
+            .filter_map(|tool| {
+                self.plugin_tools
+                    .presentation(tool)
+                    .map(|presentation| (tool, presentation))
+            })
+            .collect::<Vec<_>>();
         let customizer = if let Some(customizer) = self.tool_rail_customizer.as_ref() {
             let customizer = customizer.clone();
-            customizer.update(cx, |customizer, cx| customizer.prepare(settings, cx));
+            customizer.update(cx, |customizer, cx| customizer.prepare(settings, tools, cx));
             customizer
         } else {
             let preferences_panel = self.preferences_panel.clone();
-            let customizer = cx.new(|_| ToolRailCustomizer::new(settings, preferences_panel));
+            let customizer =
+                cx.new(|_| ToolRailCustomizer::new(settings, preferences_panel, tools));
             self.tool_rail_customizer = Some(customizer.clone());
             customizer
         };
@@ -1012,84 +1012,103 @@ struct ToolRailSections {
     bottom: Vec<ToolRailToolId>,
 }
 
-/// 只允许计划范围内八项进入编辑器；旧版 Context、未知或内部项不会变成新入口。
-fn is_customizable_tool(tool: ToolRailToolId) -> bool {
-    CUSTOMIZABLE_TOOLS.contains(&tool)
-}
-
-/// 合并旧配置与当前八项默认列表，同时保留 Context 的顺序、可见性、分区和位置字段。
+/// 补齐已注册项，同时原样保留未知身份、退役身份及其全部配置。
+///
+/// @author kongweiguang
 fn customizable_settings(
     mut settings: ToolRailSettings,
-    legacy_context: LegacyContextSettings,
+    registered: &[ToolRailToolId],
 ) -> ToolRailSettings {
-    let mut visible_order = settings
-        .order
-        .iter()
-        .copied()
-        .filter(|tool| is_customizable_tool(*tool))
-        .collect::<Vec<_>>();
-    for tool in CUSTOMIZABLE_TOOLS {
-        if !visible_order.contains(&tool) {
-            visible_order.push(tool);
+    for &tool in registered {
+        if !settings.order.contains(&tool) {
+            settings.order.push(tool);
         }
+        settings.panel_placements.entry(tool).or_default();
     }
-    settings.order = insert_legacy_context(visible_order, legacy_context.order_index);
-
-    settings.hidden.retain(|tool| is_customizable_tool(*tool));
-    if settings
-        .hidden
-        .iter()
-        .filter(|tool| is_customizable_tool(**tool))
-        .count()
-        >= CUSTOMIZABLE_TOOLS.len()
+    if !registered.is_empty()
+        && registered.iter().all(|tool| settings.hidden.contains(tool))
         && let Some(first) = settings
             .order
             .iter()
             .copied()
-            .find(|tool| is_customizable_tool(*tool))
+            .find(|tool| registered.contains(tool))
     {
         settings.hidden.retain(|tool| *tool != first);
-    }
-    if legacy_context.hidden {
-        settings.hidden.push(ToolRailToolId::Context);
-    }
-
-    settings.bottom.retain(|tool| is_customizable_tool(*tool));
-    if legacy_context.bottom {
-        settings.bottom.push(ToolRailToolId::Context);
-    }
-    for tool in CUSTOMIZABLE_TOOLS {
-        settings.panel_placements.entry(tool).or_default();
-    }
-    if let Some(placement) = legacy_context.placement {
-        settings
-            .panel_placements
-            .insert(ToolRailToolId::Context, placement);
-    } else {
-        settings.panel_placements.remove(&ToolRailToolId::Context);
     }
     settings
 }
 
-/// 将退役的 Context 恢复到原索引附近，不让八项可见排序重写其旧配置位置。
-fn insert_legacy_context(
-    mut visible_order: Vec<ToolRailToolId>,
-    context_index: Option<usize>,
+/// 仅替换注册项所在槽位；未知项即使交错在注册项之间也保持原始位置。
+///
+/// @author kongweiguang
+fn merge_registered_order(
+    existing: &[ToolRailToolId],
+    ordered: &[ToolRailToolId],
+    registered: &[ToolRailToolId],
 ) -> Vec<ToolRailToolId> {
-    if let Some(index) = context_index {
-        visible_order.insert(index.min(visible_order.len()), ToolRailToolId::Context);
+    let mut replacement = ordered.iter().copied();
+    let mut result = Vec::with_capacity(existing.len().max(ordered.len()));
+    for &tool in existing {
+        if registered.contains(&tool) {
+            if let Some(next) = replacement.next() {
+                result.push(next);
+            }
+        } else {
+            result.push(tool);
+        }
     }
-    visible_order
+    result.extend(replacement);
+    result
 }
 
-/// 根据底部成员集合投影两个拖放分区；排序仍只有一个全局来源。
-fn split_sections(settings: &ToolRailSettings) -> ToolRailSections {
+/// 恢复可编辑项目的缺省值，并保留未安装插件的可见性、位置和相对顺序。
+///
+/// @author kongweiguang
+fn reset_registered_tools(
+    settings: &ToolRailSettings,
+    registered: &[ToolRailToolId],
+) -> ToolRailSettings {
+    let defaults = ToolRailSettings::default();
+    let mut reset = settings.clone();
+    let mut order = defaults
+        .order
+        .iter()
+        .copied()
+        .filter(|tool| registered.contains(tool))
+        .collect::<Vec<_>>();
+    for &tool in registered {
+        if !order.contains(&tool) {
+            order.push(tool);
+        }
+    }
+    reset.order = merge_registered_order(&reset.order, &order, registered);
+    reset.hidden.retain(|tool| !registered.contains(tool));
+    reset.bottom.retain(|tool| !registered.contains(tool));
+    reset.bottom.extend(
+        defaults
+            .bottom
+            .iter()
+            .copied()
+            .filter(|tool| registered.contains(tool)),
+    );
+    for &tool in registered {
+        reset
+            .panel_placements
+            .insert(tool, defaults.effective_panel_placement(tool));
+    }
+    reset
+}
+
+/// 根据底部成员集合投影已注册的拖放分区；排序仍只有一个全局来源。
+///
+/// @author kongweiguang
+fn split_sections(settings: &ToolRailSettings, registered: &[ToolRailToolId]) -> ToolRailSections {
     let mut sections = ToolRailSections::default();
     for tool in settings
         .order
         .iter()
         .copied()
-        .filter(|tool| is_customizable_tool(*tool))
+        .filter(|tool| registered.contains(tool))
     {
         if settings.bottom.contains(&tool) {
             sections.bottom.push(tool);
@@ -1100,13 +1119,18 @@ fn split_sections(settings: &ToolRailSettings) -> ToolRailSections {
     sections
 }
 
-/// 拖到目标项前时跟随目标分区移动，拒绝相同或退役身份以保持排序幂等。
+/// 拖到目标项前时跟随目标分区移动，只接受当前分区中实际存在的来源和目标。
+///
+/// @author kongweiguang
 fn move_before_in_sections(
     sections: &mut ToolRailSections,
     source: ToolRailToolId,
     target: ToolRailToolId,
 ) -> bool {
-    if source == target || !is_customizable_tool(source) || !is_customizable_tool(target) {
+    if source == target
+        || !(sections.main.contains(&source) || sections.bottom.contains(&source))
+        || !(sections.main.contains(&target) || sections.bottom.contains(&target))
+    {
         return false;
     }
     sections.main.retain(|tool| *tool != source);
@@ -1169,11 +1193,6 @@ fn placement_options() -> [(SharedString, ToolRailPanelPlacement); 4] {
     ]
 }
 
-/// 编辑器与工作台共用工具名称，避免同一入口在设置和 Rail 中出现不同叫法。
-fn customizable_tool_label(tool: ToolRailToolId) -> SharedString {
-    super::workbench::tool_rail_label(tool)
-}
-
 /// 为标题、页脚与反馈保留空间；字体放大时仍保留至少一个可滚动的列表槽位。
 ///
 /// @author kongweiguang
@@ -1187,38 +1206,6 @@ fn customizer_list_max_height(viewport_height: Pixels, metrics: UiMetrics) -> Pi
         .max(minimum)
         .min(viewport_height)
         .min(metrics.control_height * 17.5)
-}
-
-/// 为每个 rail 工具提供 main 对应的一行说明，辅助用户确认目标而不暴露内部服务名称。
-fn tool_rail_description(tool: ToolRailToolId) -> SharedString {
-    match tool {
-        ToolRailToolId::Context => crate::locale::text("历史配置项", "Legacy setting"),
-        ToolRailToolId::AgentLauncher => crate::locale::text(
-            "Codex、Claude、自定义 Agent",
-            "Codex, Claude, and custom agents",
-        ),
-        ToolRailToolId::Sftp => crate::locale::text(
-            "SSH/SFTP 与容器文件浏览",
-            "SSH/SFTP and container file browsing",
-        ),
-        ToolRailToolId::Containers => crate::locale::text(
-            "当前 SSH 主机的 Docker、Podman 和 Compose 容器",
-            "Docker, Podman, and Compose containers on the current SSH host",
-        ),
-        ToolRailToolId::Snippets => crate::locale::text("可复用脚本索引", "Reusable script index"),
-        ToolRailToolId::Tmux => crate::locale::text(
-            "session、window 和 pane 管理",
-            "Session, window, and pane management",
-        ),
-        ToolRailToolId::Ports => crate::locale::text("SSH 端口转发", "SSH port forwarding"),
-        ToolRailToolId::System => crate::locale::text(
-            "CPU、内存、网络和磁盘状态",
-            "CPU, memory, network, and disk status",
-        ),
-        ToolRailToolId::Logs => {
-            crate::locale::text("当前终端的最近命令", "Recent commands from this terminal")
-        }
-    }
 }
 
 /// 拖放预览沿用应用色板，不在主题外添加新的高对比硬编码表面。

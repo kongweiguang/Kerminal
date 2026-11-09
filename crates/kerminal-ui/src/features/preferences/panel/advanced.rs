@@ -1359,6 +1359,7 @@ fn tool_rail_label(tool: ToolRailToolId) -> gpui_kit::SharedString {
         ToolRailToolId::Ports => crate::locale::text("端口转发", "Port forwarding"),
         ToolRailToolId::System => crate::locale::text("系统信息", "System information"),
         ToolRailToolId::Logs => crate::locale::text("日志", "Logs"),
+        ToolRailToolId::Plugin(_) => tool.as_str().to_owned().into(),
     }
 }
 

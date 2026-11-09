@@ -192,16 +192,10 @@ pub(super) struct ToolRailLayout {
     pub(super) panels: ToolRailPanelSlots,
 }
 
-/// 配置保留历史 ToolId；Context 已不作为产品面板展示。
+/// 面板按注册身份索引，消费一次 renderer 后不能重复挂载同一 Entity。
+#[derive(Default)]
 pub(super) struct WorkbenchToolPanelRenderers {
-    pub(super) agent_launcher: AnyElement,
-    pub(super) sftp: AnyElement,
-    pub(super) containers: AnyElement,
-    pub(super) snippets: AnyElement,
-    pub(super) tmux: AnyElement,
-    pub(super) ports: AnyElement,
-    pub(super) system: AnyElement,
-    pub(super) logs: AnyElement,
+    renderers: BTreeMap<ToolRailToolId, AnyElement>,
 }
 
 impl WorkbenchToolPanelRenderers {
@@ -209,19 +203,16 @@ impl WorkbenchToolPanelRenderers {
     ///
     /// @author kongweiguang
     fn take_for(&mut self, tool: ToolRailToolId) -> AnyElement {
-        let replacement = repeated_tool_panel_renderer(tool);
-        let renderer = match tool {
-            ToolRailToolId::Context => return replacement,
-            ToolRailToolId::AgentLauncher => &mut self.agent_launcher,
-            ToolRailToolId::Sftp => &mut self.sftp,
-            ToolRailToolId::Containers => &mut self.containers,
-            ToolRailToolId::Snippets => &mut self.snippets,
-            ToolRailToolId::Tmux => &mut self.tmux,
-            ToolRailToolId::Ports => &mut self.ports,
-            ToolRailToolId::System => &mut self.system,
-            ToolRailToolId::Logs => &mut self.logs,
-        };
-        std::mem::replace(renderer, replacement)
+        self.renderers
+            .remove(&tool)
+            .unwrap_or_else(|| repeated_tool_panel_renderer(tool))
+    }
+
+    /// 一帧中由实际业务实体提供 renderer，宿主不持有另一份视图状态。
+    ///
+    /// @author kongweiguang
+    pub(super) fn insert(&mut self, tool: ToolRailToolId, renderer: AnyElement) {
+        self.renderers.insert(tool, renderer);
     }
 }
 
@@ -1030,6 +1021,12 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sync_tool_rail_active_tab();
+        if tool == ToolRailToolId::Snippets
+            && !self.return_workspace_before_snippets_rail(window, cx)
+        {
+            return;
+        }
         let current_tab = self
             .workspace_controller
             .as_ref()
@@ -1124,6 +1121,59 @@ pub(super) fn compact_tool_drawer_should_be_visible(
     compact_panels && active_tool.is_some() && !host_drawer_open
 }
 
+/// 复用当前视口和抽屉门禁判断唯一宿主，避免用尚未显示的槽位误判实体已挂载。
+///
+/// @author kongweiguang
+pub(super) fn tool_rail_panel_mounted(
+    root: &RootView,
+    panels: ToolRailPanelSlots,
+    tool: ToolRailToolId,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+) -> bool {
+    let plan = project_workbench_viewport(root, panels, window, cx).plan;
+    if !plan.compact_panels {
+        return (panels.attached == Some(tool) && !root.right_dock_collapsed)
+            || panels.left == Some(tool)
+            || panels.bottom == Some(tool)
+            || panels.center == Some(tool);
+    }
+
+    let (blocked, focus_blocked, should_show) =
+        compact_tool_drawer_projection(root, plan, window, cx);
+    should_show
+        && plan.compact_active_tool == Some(tool)
+        && !blocked
+        && (root.compact_tool_drawer_open || !focus_blocked)
+}
+
+/// 绘制和导航采用同一抽屉门禁；自动打开只在焦点未被上层界面持有时发生。
+///
+/// @author kongweiguang
+fn compact_tool_drawer_projection(
+    root: &RootView,
+    plan: workbench_layout::WorkbenchLayoutPlan,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+) -> (bool, bool, bool) {
+    let blocked = root.custom_agent_manager.is_some()
+        || root.preferences_modal_open
+        || root.connections_modal_open
+        || super::snippet_editor::is_open(root)
+        || root.pending_quit_intent.is_some()
+        || window.has_active_prompt();
+    let focus_blocked = blocked
+        || root.connection_prompt_modal_open
+        || root.root_confirmation_owner.is_some()
+        || window.has_active_dialog(cx);
+    let should_show = compact_tool_drawer_should_be_visible(
+        plan.compact_panels,
+        plan.compact_active_tool,
+        root.compact_host_drawer_open,
+    ) && !root.tool_rail_state.compact_drawer_is_hidden();
+    (blocked, focus_blocked, should_show)
+}
+
 /// 同一紧凑工具的再次激活只关闭已有抽屉；隐藏抽屉或其它工具不能被旧活动槽误判为关闭请求。
 ///
 /// @author kongweiguang
@@ -1214,6 +1264,7 @@ fn panel_slot_mut(
 /// 隧道表单的状态提示位于其遮罩之上，其余模态继续维持原有层级和计时规则。
 /// 面板布局先切换到最终状态，独立动效只改变透明度，退场不再挂载可交互面板。
 /// 抽屉与浮层使用共享主题度量；终端、窗口及拖动命中区继续使用各自的已测量几何。
+/// 停靠工具和主机侧栏由宿主绘制一次 chrome 材质，导航与页脚不重复合成；浮窗保持独立可读表面。
 ///
 /// @author kongweiguang
 pub(super) fn render_workbench(
@@ -1270,7 +1321,10 @@ pub(super) fn render_workbench(
     let snippet_editor_open = super::snippet_editor::is_open(root);
     if snippet_editor_open {
         // Center Commands 与 Snippets ToolRail 原来共用 Entity；模态期间只让根层挂载它一次。
-        renderers.snippets = super::snippet_editor::suspended_renderer();
+        renderers.insert(
+            ToolRailToolId::Snippets,
+            super::snippet_editor::suspended_renderer(),
+        );
     }
     let center_content = if snippet_editor_open && root.center_panel == CenterPanel::Commands {
         super::snippet_editor::suspended_renderer()
@@ -1317,21 +1371,8 @@ pub(super) fn render_workbench(
     let effective_host_sidebar_collapsed = layout_plan.effective_host_sidebar_collapsed;
     let compact_panels = layout_plan.compact_panels;
     let compact_active_tool = layout_plan.compact_active_tool;
-    let compact_drawer_blocked = root.custom_agent_manager.is_some()
-        || root.preferences_modal_open
-        || root.connections_modal_open
-        || snippet_editor_open
-        || root.pending_quit_intent.is_some()
-        || window.has_active_prompt();
-    let compact_drawer_focus_blocked = compact_drawer_blocked
-        || root.connection_prompt_modal_open
-        || root.root_confirmation_owner.is_some()
-        || window.has_active_dialog(cx);
-    let should_show_active_compact_tool = compact_tool_drawer_should_be_visible(
-        compact_panels,
-        compact_active_tool,
-        root.compact_host_drawer_open,
-    ) && !root.tool_rail_state.compact_drawer_is_hidden();
+    let (compact_drawer_blocked, compact_drawer_focus_blocked, should_show_active_compact_tool) =
+        compact_tool_drawer_projection(root, layout_plan, window, cx);
     // 新挂载时交接焦点；普通重绘不得抢走刚获得焦点但尚未绘制的子菜单或输入控件。
     if !compact_drawer_focus_blocked {
         if should_show_active_compact_tool {
@@ -1518,7 +1559,6 @@ pub(super) fn render_workbench(
                 .flex()
                 .items_center()
                 .gap_1()
-                .bg(sidebar_background)
                 .child(
                     div()
                         .absolute()
@@ -1593,7 +1633,7 @@ pub(super) fn render_workbench(
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .bg(theme.tool_panel_surface)
+                .bg(sidebar_background)
                 .child(workbench_tool_panel_slot(
                     "workbench-tool-panel-left",
                     content,
@@ -1855,7 +1895,7 @@ pub(super) fn render_workbench(
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .bg(theme.tool_panel_surface)
+                .bg(sidebar_background)
                 .child(workbench_tool_panel_slot(
                     "workbench-tool-panel-bottom",
                     content,
@@ -1946,10 +1986,13 @@ pub(super) fn render_workbench(
         } else {
             selected
         };
+        let Some(presentation) = root.plugin_tools.presentation(tool) else {
+            continue;
+        };
         let button = workbench_rail_button(
             tool_rail_button_id(tool),
-            tool_rail_icon(tool),
-            tool_rail_label(tool),
+            presentation.icon(),
+            presentation.label(),
             rail_button_height,
             selected,
             Some(toggled),
@@ -1991,10 +2034,13 @@ pub(super) fn render_workbench(
         } else {
             selected
         };
+        let Some(presentation) = root.plugin_tools.presentation(tool) else {
+            continue;
+        };
         let button = workbench_rail_button(
             tool_rail_button_id(tool),
-            tool_rail_icon(tool),
-            tool_rail_label(tool),
+            presentation.icon(),
+            presentation.label(),
             rail_button_height,
             selected,
             Some(toggled),
@@ -2077,7 +2123,12 @@ pub(super) fn render_workbench(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .bg(theme.tool_panel_surface);
+        .bg(if compact_panels {
+            // 紧凑抽屉已有独立浮层底色，复用的 attached 内容不能再叠加停靠材质。
+            sidebar_background.opacity(0.)
+        } else {
+            sidebar_background
+        });
     if let Some(tool) = panels.attached {
         let content = renderers.take_for(tool);
         let panel_slot = if tool == ToolRailToolId::AgentLauncher {
@@ -2493,7 +2544,7 @@ pub(super) fn render_workbench(
                 .bottom_0()
                 .right(px(TOOL_RAIL_WIDTH + WORKBENCH_PANEL_GUTTER))
                 .w(px(width))
-                .bg(panel_background)
+                .bg(sidebar_background)
                 .opacity(motion.dock),
         );
     }
@@ -2656,7 +2707,7 @@ pub(super) fn render_workbench(
                 .shadow_lg()
                 .border_1()
                 .border_color(theme.tool_panel_border)
-                .bg(theme.tool_panel_surface)
+                .bg(theme.floating_surface)
                 .on_key_down(cx.listener(move |root, event, window, cx| {
                     root.handle_center_tool_panel_key_down(tool, event, window, cx);
                 }))
@@ -2738,7 +2789,12 @@ pub(super) fn render_workbench(
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
-                                        .child(tool_rail_label(tool)),
+                                        .child(
+                                            root.plugin_tools
+                                                .presentation(tool)
+                                                .map(|presentation| presentation.label())
+                                                .unwrap_or_else(|| tool_rail_label(tool)),
+                                        ),
                                 ),
                         )
                         .child(
@@ -3177,7 +3233,9 @@ fn project_workbench_viewport(
                 }
                 CenterPanel::Files
             }
-            WorkspaceSessionTab::Terminal { .. } | WorkspaceSessionTab::Unsupported { .. } => {
+            WorkspaceSessionTab::Terminal { .. }
+            | WorkspaceSessionTab::Extension { .. }
+            | WorkspaceSessionTab::Unsupported { .. } => {
                 return None;
             }
         };
@@ -3561,7 +3619,7 @@ fn workbench_tool_panel_slot(id: &'static str, content: AnyElement) -> impl Into
 /// 将真实 ToolRail 身份映射成稳定控件 ID，保证重排不会重建面板实体。
 ///
 /// @author kongweiguang
-fn tool_rail_button_id(tool: ToolRailToolId) -> &'static str {
+fn tool_rail_button_id(tool: ToolRailToolId) -> gpui_kit::SharedString {
     match tool {
         ToolRailToolId::Context => "workbench-tool-context",
         ToolRailToolId::AgentLauncher => "workbench-tool-agent-launcher",
@@ -3572,7 +3630,11 @@ fn tool_rail_button_id(tool: ToolRailToolId) -> &'static str {
         ToolRailToolId::Ports => "workbench-tool-ports",
         ToolRailToolId::System => "workbench-tool-system",
         ToolRailToolId::Logs => "workbench-tool-logs",
+        ToolRailToolId::Plugin(_) => {
+            return format!("workbench-tool-plugin-{}", tool.as_str()).into();
+        }
     }
+    .into()
 }
 
 /// 设置沿用统一的工具命中尺寸；独立提示触发器不改变终端焦点生命周期。
@@ -3612,19 +3674,9 @@ fn render_settings_button(
 ///
 /// @author kongweiguang
 pub(super) fn tool_rail_label(tool: ToolRailToolId) -> gpui_kit::SharedString {
-    match tool {
-        ToolRailToolId::Context => {
-            crate::locale::text("已移除的上下文工具", "Removed context tool")
-        }
-        ToolRailToolId::AgentLauncher => crate::locale::text("Agent 启动器", "Agent launcher"),
-        ToolRailToolId::Sftp => crate::locale::text("文件", "Files"),
-        ToolRailToolId::Containers => crate::locale::text("容器", "Containers"),
-        ToolRailToolId::Snippets => crate::locale::text("命令片段", "Command snippets"),
-        ToolRailToolId::Tmux => crate::locale::text("tmux 会话", "tmux sessions"),
-        ToolRailToolId::Ports => crate::locale::text("端口转发", "Port forwards"),
-        ToolRailToolId::System => crate::locale::text("服务器信息", "Server information"),
-        ToolRailToolId::Logs => crate::locale::text("命令历史", "Command history"),
-    }
+    crate::plugins::tools::builtin_presentation(tool)
+        .map(|presentation| presentation.label())
+        .unwrap_or_else(|| tool.as_str().to_owned().into())
 }
 
 /// 如果状态错误导致同一工具被两个宿主重复取用，显示可见诊断而不重挂 Entity。
@@ -3650,24 +3702,6 @@ fn repeated_tool_panel_renderer(tool: ToolRailToolId) -> AnyElement {
         .into_any_element()
 }
 
-/// 沿用安装版工具的图形语义，避免 tmux 和命令历史与终端、片段入口混淆。
-/// 图标继续复用同版本 Kit 资源，稳定工具身份仍由屏幕阅读器单独识别。
-///
-/// @author kongweiguang
-pub(super) fn tool_rail_icon(tool: ToolRailToolId) -> IconName {
-    match tool {
-        ToolRailToolId::Context => IconName::Link2,
-        ToolRailToolId::AgentLauncher => IconName::Bot,
-        ToolRailToolId::Sftp => IconName::FolderOpen,
-        ToolRailToolId::Containers => IconName::Container,
-        ToolRailToolId::Snippets => IconName::FileText,
-        ToolRailToolId::Tmux => IconName::PanelsTopLeft,
-        ToolRailToolId::Ports => IconName::Network,
-        ToolRailToolId::System => IconName::Cpu,
-        ToolRailToolId::Logs => IconName::RotateCcwClock,
-    }
-}
-
 /// 活动状态只由唯一挂载槽推导，避免同一工具因 settings 显示在多个方向。
 ///
 /// @author kongweiguang
@@ -3682,7 +3716,7 @@ fn tool_is_in_panel_slots(tool: ToolRailToolId, slots: ToolRailPanelSlots) -> bo
 ///
 /// @author kongweiguang
 fn workbench_rail_button(
-    id: &'static str,
+    id: gpui_kit::SharedString,
     icon: IconName,
     label: gpui_kit::SharedString,
     button_height: f32,

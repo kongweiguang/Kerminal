@@ -9,6 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use kerminal_application::AppResult;
+use kerminal_application::connections::host_types::{HostConfigurationCatalog, valid_host_type_id};
 use kerminal_application::connections::management::{
     host_note_is_valid, is_reserved_serial_host_tag, validate_local_environment_reference,
 };
@@ -32,12 +33,29 @@ const HOST_SCHEMA_VERSION: i64 = 3;
 
 /// 扫描所有用户配置目录；可解析的未知字段不阻断启动，损坏项则固定整个仓储为只读恢复。
 pub(super) fn inspect_startup_configuration(root: &Path) -> ConfigurationRecoveryState {
+    inspect_startup_configuration_inner(root, None)
+}
+
+/// 按启动时冻结的目录检查主机类型，确保 watcher 与首次扫描具有相同的解码规则。
+pub(super) fn inspect_startup_configuration_with_host_types(
+    root: &Path,
+    host_types: &HostConfigurationCatalog,
+) -> ConfigurationRecoveryState {
+    inspect_startup_configuration_inner(root, Some(host_types))
+}
+
+/// 所有目录共用一次安全扫描；未提供目录时只用于不依赖插件实现的旧迁移入口。
+fn inspect_startup_configuration_inner(
+    root: &Path,
+    host_types: Option<&HostConfigurationCatalog>,
+) -> ConfigurationRecoveryState {
     let mut issues = Vec::new();
     inspect_startup_file(
         root,
         Path::new("settings.toml"),
         ConfigDocumentPath::Settings,
         &mut issues,
+        host_types,
     );
 
     inspect_startup_file(
@@ -45,15 +63,35 @@ pub(super) fn inspect_startup_configuration(root: &Path) -> ConfigurationRecover
         Path::new("hosts/groups.toml"),
         ConfigDocumentPath::HostGroups,
         &mut issues,
+        host_types,
     );
-    inspect_startup_directory(root, "profiles", ConfigDirectoryKind::Profiles, &mut issues);
-    inspect_startup_directory(root, "hosts", ConfigDirectoryKind::Hosts, &mut issues);
-    inspect_startup_directory(root, "snippets", ConfigDirectoryKind::Snippets, &mut issues);
+    inspect_startup_directory(
+        root,
+        "profiles",
+        ConfigDirectoryKind::Profiles,
+        &mut issues,
+        host_types,
+    );
+    inspect_startup_directory(
+        root,
+        "hosts",
+        ConfigDirectoryKind::Hosts,
+        &mut issues,
+        host_types,
+    );
+    inspect_startup_directory(
+        root,
+        "snippets",
+        ConfigDirectoryKind::Snippets,
+        &mut issues,
+        host_types,
+    );
     inspect_startup_directory(
         root,
         "workflows",
         ConfigDirectoryKind::Workflows,
         &mut issues,
+        host_types,
     );
     issues.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
@@ -71,6 +109,7 @@ fn inspect_startup_directory(
     relative_directory: &str,
     kind: ConfigDirectoryKind,
     issues: &mut Vec<ConfigurationIssue>,
+    host_types: Option<&HostConfigurationCatalog>,
 ) {
     let directory = root.join(relative_directory);
     let entry_metadata = match fs::symlink_metadata(&directory) {
@@ -139,7 +178,7 @@ fn inspect_startup_directory(
             issues.push(unreadable_issue(display_path));
             continue;
         };
-        inspect_startup_file(root, &relative, kind.document_path(id), issues);
+        inspect_startup_file(root, &relative, kind.document_path(id), issues, host_types);
     }
 }
 
@@ -177,6 +216,7 @@ struct ValidationFile {
 pub(super) fn validate_configuration_root(
     root: &Path,
     requested: ConfigurationValidationScope,
+    host_types: &HostConfigurationCatalog,
 ) -> AppResult<ConfigurationValidationReport> {
     let mut report = ConfigurationValidationReport::new(requested);
     let needs_groups = requested.includes(ConfigurationValidationScope::Profiles)
@@ -188,6 +228,7 @@ pub(super) fn validate_configuration_root(
             Path::new("hosts/groups.toml"),
             ConfigurationValidationScope::Hosts,
             &mut report,
+            host_types,
         )
     });
     let group_entries = groups_value
@@ -211,6 +252,7 @@ pub(super) fn validate_configuration_root(
             Path::new("settings.toml"),
             ConfigurationValidationScope::Settings,
             &mut report,
+            host_types,
         );
         report.record_checked(
             ConfigurationValidationScope::Settings,
@@ -238,6 +280,7 @@ pub(super) fn validate_configuration_root(
                 &file.relative,
                 ConfigurationValidationScope::Profiles,
                 &mut report,
+                host_types,
             ) else {
                 continue;
             };
@@ -306,10 +349,27 @@ pub(super) fn validate_configuration_root(
                 &file.relative,
                 ConfigurationValidationScope::Hosts,
                 &mut report,
+                host_types,
             ) else {
                 continue;
             };
             loaded += 1;
+            if let (Some(provider_id), Some(type_id)) = (
+                value.get("provider_id").and_then(toml::Value::as_str),
+                value.get("protocol").and_then(toml::Value::as_str),
+            ) && host_types.get(provider_id, type_id).is_none()
+            {
+                report.record(ConfigurationValidationDiagnostic {
+                    severity: ConfigurationValidationSeverity::Warning,
+                    scope: ConfigurationValidationScope::Hosts,
+                    path: file.label.clone(),
+                    message: "主机提供方不可用，原始配置已保留".into(),
+                    line: None,
+                    column: None,
+                    key: Some("provider_id".into()),
+                    recovery: Some("启用对应提供方后重新加载配置。".into()),
+                });
+            }
             if value
                 .get("group_id")
                 .and_then(toml::Value::as_str)
@@ -351,6 +411,7 @@ pub(super) fn validate_configuration_root(
                 &file.relative,
                 ConfigurationValidationScope::Snippets,
                 &mut report,
+                host_types,
             )
             .is_some()
             {
@@ -380,6 +441,7 @@ pub(super) fn validate_configuration_root(
                 &file.relative,
                 ConfigurationValidationScope::Workflows,
                 &mut report,
+                host_types,
             ) else {
                 continue;
             };
@@ -423,6 +485,7 @@ fn read_validation_document(
     relative: &Path,
     scope: ConfigurationValidationScope,
     report: &mut ConfigurationValidationReport,
+    host_types: &HostConfigurationCatalog,
 ) -> Option<toml::Value> {
     let label = safe_relative_path(relative);
     let absolute = root.join(relative);
@@ -443,7 +506,7 @@ fn read_validation_document(
             return None;
         }
     };
-    if let Err(failure) = validate_document(&document_path, &source) {
+    if let Err(failure) = validate_document_with_host_types(&document_path, &source, host_types) {
         report.record(ConfigurationValidationDiagnostic {
             severity: ConfigurationValidationSeverity::Error,
             scope,
@@ -728,6 +791,7 @@ fn inspect_startup_file(
     relative: &Path,
     document_path: ConfigDocumentPath,
     issues: &mut Vec<ConfigurationIssue>,
+    host_types: Option<&HostConfigurationCatalog>,
 ) {
     let display_path = safe_relative_path(relative);
     let absolute = root.join(relative);
@@ -739,7 +803,7 @@ fn inspect_startup_file(
             return;
         }
     };
-    if let Err(error) = validate_document(&document_path, &source) {
+    if let Err(error) = validate_document_inner(&document_path, &source, host_types) {
         issues.push(ConfigurationIssue {
             relative_path: display_path,
             kind: error.kind,
@@ -755,6 +819,24 @@ fn inspect_startup_file(
 pub(super) fn validate_document(
     path: &ConfigDocumentPath,
     source: &str,
+) -> Result<(), ValidationFailure> {
+    validate_document_inner(path, source, None)
+}
+
+/// 带目录的入口供读取、写入与迁移使用，扩展 codec 失败进入现有恢复流程。
+pub(super) fn validate_document_with_host_types(
+    path: &ConfigDocumentPath,
+    source: &str,
+    host_types: &HostConfigurationCatalog,
+) -> Result<(), ValidationFailure> {
+    validate_document_inner(path, source, Some(host_types))
+}
+
+/// TOML 基础契约始终由宿主校验，只有已注册提供方才能解释自己的业务字段。
+fn validate_document_inner(
+    path: &ConfigDocumentPath,
+    source: &str,
+    host_types: Option<&HostConfigurationCatalog>,
 ) -> Result<(), ValidationFailure> {
     let value = toml::from_str::<toml::Value>(source).map_err(|error| {
         let (line, column) = error
@@ -830,21 +912,23 @@ pub(super) fn validate_document(
                         "主机必须显式声明 protocol",
                     )
                 })?;
-            if !matches!(
+            if matches!(
                 protocol,
                 "ssh" | "sftp" | "rdp" | "telnet" | "serial" | "local"
             ) {
-                return Err(ValidationFailure::plain(
-                    ConfigurationIssueKind::MalformedToml,
-                    Some(1),
-                    Some(1),
-                    "主机 protocol 不受支持",
-                ));
-            }
-            if protocol == "local" {
-                validate_local_host_fields(table)?;
+                if let Some(catalog) = host_types {
+                    let host_type = catalog
+                        .get("kerminal", protocol)
+                        .ok_or_else(|| invalid_configuration_shape("缺少内置主机类型"))?;
+                    host_type
+                        .codec
+                        .decode(HOST_SCHEMA_VERSION as u32, &value)
+                        .map_err(|_| invalid_configuration_shape("内置主机配置无效"))?;
+                } else {
+                    validate_builtin_host_configuration(protocol, &value)?;
+                }
             } else {
-                validate_host_fields(table, protocol)?;
+                validate_extension_host_configuration(table, protocol, host_types)?;
             }
             if contains_inline_secret(&value) {
                 return Err(ValidationFailure::plain(
@@ -861,8 +945,78 @@ pub(super) fn validate_document(
     Ok(())
 }
 
-/// 启动时按应用同一 typed 设置投影验证已知字段，未知旧版键继续由原文仓储保留。
+/// 内置 codec 继续检查原始 schema v3 字段，不改写已存在的六类主机。
+pub(super) fn validate_builtin_host_configuration(
+    protocol: &str,
+    value: &toml::Value,
+) -> Result<(), ValidationFailure> {
+    let table = value
+        .as_table()
+        .ok_or_else(|| invalid_configuration_shape("主机配置必须是表"))?;
+    if table.get("protocol").and_then(toml::Value::as_str) != Some(protocol) {
+        return Err(invalid_configuration_shape("主机类型与 codec 不匹配"));
+    }
+    if protocol == "local" {
+        validate_local_host_fields(table)
+    } else {
+        validate_host_fields(table, protocol)
+    }
+}
+
+/// 未安装的提供方只校验公共包络；已安装实现还须成功解码其专有字段。
+fn validate_extension_host_configuration(
+    table: &toml::map::Map<String, toml::Value>,
+    type_id: &str,
+    host_types: Option<&HostConfigurationCatalog>,
+) -> Result<(), ValidationFailure> {
+    validate_required_fields(
+        table,
+        &[
+            ("name", ValueKind::String),
+            ("provider_id", ValueKind::String),
+            ("configuration_version", ValueKind::Integer),
+            ("configuration", ValueKind::Table),
+            ("sort_order", ValueKind::Integer),
+            ("created_at", ValueKind::String),
+            ("updated_at", ValueKind::String),
+        ],
+        "插件主机字段缺失或类型无效",
+    )?;
+    validate_optional_fields(
+        table,
+        &[("group_id", ValueKind::String)],
+        "插件主机分组无效",
+    )?;
+    let provider_id = table
+        .get("provider_id")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| invalid_configuration_shape("主机提供方无效"))?;
+    let version = table
+        .get("configuration_version")
+        .and_then(toml::Value::as_integer)
+        .and_then(|version| u32::try_from(version).ok())
+        .filter(|version| *version > 0)
+        .ok_or_else(|| invalid_configuration_shape("插件主机版本无效"))?;
+    if !valid_host_type_id(type_id) || !valid_host_type_id(provider_id) || provider_id == "kerminal"
+    {
+        return Err(invalid_configuration_shape("主机类型或提供方标识无效"));
+    }
+    if let Some(host_type) = host_types.and_then(|catalog| catalog.get(provider_id, type_id)) {
+        let configuration = table
+            .get("configuration")
+            .ok_or_else(|| invalid_configuration_shape("插件主机配置缺失"))?;
+        host_type
+            .codec
+            .decode(version, configuration)
+            .map_err(|_| invalid_configuration_shape("插件主机配置无效"))?;
+    }
+    Ok(())
+}
+
+/// 启动时按应用同一 typed 投影验证已知字段，插件节只验证命名空间以保留缺失插件的数据。
 fn validate_settings_fields(source: &str) -> Result<(), ValidationFailure> {
+    super::plugin_settings::validate_namespaces(source)
+        .map_err(|_| invalid_configuration_shape("插件设置命名空间无效"))?;
     let settings = super::settings::decode_settings(source).map_err(|error| {
         let (line, column) = error
             .span()

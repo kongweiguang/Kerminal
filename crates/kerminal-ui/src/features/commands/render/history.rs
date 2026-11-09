@@ -56,7 +56,7 @@ impl CommandsView {
                 .items_center()
                 .gap_2()
                 .rounded_md()
-                .bg(theme.panel)
+                .hover(|style| style.bg(theme.surface_hover()))
                 .cursor_pointer()
                 .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
                     view.use_history_command(command.clone(), window, cx);
@@ -178,7 +178,7 @@ impl CommandsView {
                     .w_full()
                     .p_3()
                     .rounded_md()
-                    .bg(theme.panel)
+                    .bg(theme.content_surface())
                     .text_color(theme.error)
                     .text_size(px(12.))
                     .child(message),

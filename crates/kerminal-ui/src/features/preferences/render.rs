@@ -448,39 +448,50 @@ impl Render for PreferencesPanel {
             window.on_next_frame(move |_, _| scroll.scroll_to_top_of_item(index));
         }
         let theme = ThemeTokens::current(window, cx).for_settings();
-        let content = match self.section {
-            PreferencesSection::Appearance => {
-                self.render_appearance(theme, window, cx).into_any_element()
-            }
-            PreferencesSection::Terminal => {
-                self.render_terminal(theme, window, cx).into_any_element()
-            }
-            PreferencesSection::KeywordHighlights => self
-                .render_keyword_highlights(theme, window, cx)
-                .into_any_element(),
-            PreferencesSection::CommandSuggestions => self
-                .render_command_suggestions(theme, window, cx)
-                .into_any_element(),
-            PreferencesSection::Sftp => self.render_sftp(theme, window, cx).into_any_element(),
-            PreferencesSection::ExternalLaunch => self
-                .render_external_launch(theme, window, cx)
-                .into_any_element(),
-            PreferencesSection::Mcp => self.render_mcp_settings(theme, cx).into_any_element(),
-            PreferencesSection::Desktop => {
-                self.render_desktop_settings(theme, cx).into_any_element()
-            }
-            PreferencesSection::About => self.render_about_settings(theme, cx).into_any_element(),
-            PreferencesSection::Shortcuts => self
-                .render_keybindings_settings(theme, cx)
-                .into_any_element(),
-            PreferencesSection::Profiles => {
-                self.render_profiles(theme, window, cx).into_any_element()
-            }
-            PreferencesSection::Integrations => {
-                self.render_integrations(theme, cx).into_any_element()
-            }
-            PreferencesSection::ConfigurationSync => {
-                self.render_configuration_sync(theme, cx).into_any_element()
+        let content = if let Some(page) = self
+            .external_plugins
+            .selected
+            .as_ref()
+            .and_then(|id| self.external_plugins.pages.page(id))
+        {
+            page.into_any_element()
+        } else {
+            match self.section {
+                PreferencesSection::Appearance => {
+                    self.render_appearance(theme, window, cx).into_any_element()
+                }
+                PreferencesSection::Terminal => {
+                    self.render_terminal(theme, window, cx).into_any_element()
+                }
+                PreferencesSection::KeywordHighlights => self
+                    .render_keyword_highlights(theme, window, cx)
+                    .into_any_element(),
+                PreferencesSection::CommandSuggestions => self
+                    .render_command_suggestions(theme, window, cx)
+                    .into_any_element(),
+                PreferencesSection::Sftp => self.render_sftp(theme, window, cx).into_any_element(),
+                PreferencesSection::ExternalLaunch => self
+                    .render_external_launch(theme, window, cx)
+                    .into_any_element(),
+                PreferencesSection::Mcp => self.render_mcp_settings(theme, cx).into_any_element(),
+                PreferencesSection::Desktop => {
+                    self.render_desktop_settings(theme, cx).into_any_element()
+                }
+                PreferencesSection::About => {
+                    self.render_about_settings(theme, cx).into_any_element()
+                }
+                PreferencesSection::Shortcuts => self
+                    .render_keybindings_settings(theme, cx)
+                    .into_any_element(),
+                PreferencesSection::Profiles => {
+                    self.render_profiles(theme, window, cx).into_any_element()
+                }
+                PreferencesSection::Integrations => {
+                    self.render_integrations(theme, cx).into_any_element()
+                }
+                PreferencesSection::ConfigurationSync => {
+                    self.render_configuration_sync(theme, cx).into_any_element()
+                }
             }
         };
 
@@ -629,7 +640,37 @@ impl PreferencesPanel {
         } else {
             matches
         };
-        let no_matches = !query.is_empty() && matches.is_empty();
+        let query_lower = query.to_lowercase();
+        let locale = match crate::locale::current_language() {
+            crate::locale::UiLanguage::ZhCn => "zh-CN",
+            crate::locale::UiLanguage::EnUs => "en-US",
+        };
+        let plugin_matches: Vec<_> = self
+            .external_plugins
+            .plugins
+            .iter()
+            .filter(|plugin| {
+                query.is_empty()
+                    || plugin.id.as_str().to_lowercase().contains(&query_lower)
+                    || plugin
+                        .package
+                        .manifest
+                        .name
+                        .values()
+                        .any(|name| name.to_lowercase().contains(&query_lower))
+            })
+            .map(|plugin| {
+                let names = &plugin.package.manifest.name;
+                let label = names
+                    .get(locale)
+                    .or_else(|| names.get("en"))
+                    .or_else(|| names.values().next())
+                    .cloned()
+                    .unwrap_or_else(|| plugin.id.to_string());
+                (plugin.id.clone(), label)
+            })
+            .collect();
+        let no_matches = !query.is_empty() && matches.is_empty() && plugin_matches.is_empty();
         let mut sidebar = div()
             .w(px(190.))
             .flex_shrink_0()
@@ -683,6 +724,24 @@ impl PreferencesPanel {
             .into_iter()
             .map(|target| self.nav_button(target, theme, cx).into_any_element())
             .collect::<Vec<_>>();
+        for (id, label) in plugin_matches {
+            let selected = self.external_plugins.selected.as_ref() == Some(&id);
+            let button_id = format!("preferences-plugin-{id}");
+            nav_rows.push(
+                Button::new(button_id)
+                    .w_full()
+                    .min_h(px(40.))
+                    .compact()
+                    .custom(super::render_settings::settings_ghost_variant(theme, cx))
+                    .selected(selected)
+                    .when(selected, |button| button.bg(theme.surface_selected()))
+                    .child(label)
+                    .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
+                        panel.open_external_plugin(&id, window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
         if no_matches {
             nav_rows.push(
                 div()
@@ -720,7 +779,9 @@ impl PreferencesPanel {
         theme: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let selected = if self.navigation_search_query.trim().is_empty() {
+        let selected = if self.external_plugins.selected.is_some() {
+            false
+        } else if self.navigation_search_query.trim().is_empty() {
             target.category && self.section == target.section
         } else {
             self.selected_navigation_target.as_deref() == Some(target.id.as_str())
@@ -852,6 +913,7 @@ impl PreferencesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.hide_external_plugin(cx);
         let changed = self.section != section
             || self.selected_navigation_target.as_deref() != Some(id.as_str());
         if self.section != section {

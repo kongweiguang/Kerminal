@@ -110,6 +110,9 @@ fn git(root: &PathBuf, arguments: &[&str]) -> Output {
 
 /// 端到端确认提交保留用户 ignore，并排除密钥、运行态及即使 force-add 的本地迁移材料。
 /// 提交后读取真实根目录状态，覆盖 Git show-prefix 返回换行时仍应识别仓库的边界。
+/// 未知配置提交的暂存即使被强制加入索引，也必须保留在本地，不能进入同步提交。
+///
+/// @author kongweiguang
 #[tokio::test]
 async fn commit_includes_sync_assets_and_excludes_local_only_state() {
     if Command::new("git").arg("--version").output().is_err() {
@@ -181,6 +184,9 @@ async fn commit_includes_sync_assets_and_excludes_local_only_state() {
     )
     .expect("写入本地格式标记");
     let migration = temp.0.join(".kerminal-migration");
+    let recovery_stage = "settings.toml.43d212a5-e07d-4918-9f6a-4c1cdeaf7a22.tmp";
+    fs::write(temp.0.join(recovery_stage), "synthetic pending settings")
+        .expect("保留合成未知提交材料");
     fs::create_dir_all(migration.join("before")).expect("创建迁移前备份目录");
     fs::create_dir_all(migration.join("staged")).expect("创建迁移暂存目录");
     fs::write(migration.join("active.json"), "synthetic migration marker")
@@ -208,6 +214,7 @@ async fn commit_includes_sync_assets_and_excludes_local_only_state() {
             "--",
             ".kerminal-format.toml",
             ".kerminal-migration/",
+            recovery_stage,
         ],
     );
     assert!(force_add.status.success(), "force-add 本地迁移材料失败");
@@ -244,6 +251,7 @@ async fn commit_includes_sync_assets_and_excludes_local_only_state() {
     assert!(!committed_paths.contains("workspace/session.json"));
     assert!(!committed_paths.contains("local-only.txt"));
     assert!(!committed_paths.contains(".kerminal-format.toml"));
+    assert!(!committed_paths.contains(recovery_stage));
     for migration_path in [
         ".kerminal-migration/active.json",
         ".kerminal-migration/journal.json",
@@ -260,6 +268,7 @@ async fn commit_includes_sync_assets_and_excludes_local_only_state() {
     assert!(staged.status.success(), "读取剩余暂存路径失败");
     let staged_paths = String::from_utf8_lossy(&staged.stdout);
     assert!(staged_paths.contains(".kerminal-format.toml"));
+    assert!(staged_paths.contains(recovery_stage));
     for migration_path in [
         ".kerminal-migration/active.json",
         ".kerminal-migration/journal.json",

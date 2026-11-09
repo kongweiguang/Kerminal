@@ -10,16 +10,26 @@ mod command_line_projection;
 mod command_suggestions;
 mod connections;
 mod container_panel;
+mod content;
+mod content_recovery;
+mod content_render;
 mod context_projection;
 mod cursor_blink;
 mod custom_agent_manager;
 mod external_auth;
+#[cfg(feature = "right-rail-acceptance")]
+mod external_plugin_acceptance;
 mod keybinding_actions;
 mod keybinding_focus;
 mod keybindings;
 mod operations;
 pub(crate) mod pane_input;
 mod pane_input_runtime;
+#[cfg(feature = "right-rail-acceptance")]
+mod plugin_acceptance;
+mod plugin_host_api;
+mod plugin_hosts;
+mod plugin_tab_close;
 mod preferences;
 mod proxy_runtime;
 mod quick_open;
@@ -98,6 +108,7 @@ mod workspace_sessions;
 mod workspace_tab_creation;
 mod workspace_transient;
 
+pub use self::plugin_host_api::{PluginUiBridge, PluginUiRegistration};
 pub use self::quit::{QuitIntent, RootHostLifecycle, RootViewEvent};
 #[cfg(feature = "right-rail-acceptance")]
 pub use self::right_rail_acceptance_agent::AgentAcceptanceSetup;
@@ -355,6 +366,8 @@ enum CenterPanel {
     Commands,
     Connections,
     Agents,
+    /// 所有注册内容共用一个导航入口；具体身份留在实例宿主而不是扩充核心枚举。
+    Contributed,
 }
 
 /// 将会话目标投影为 v3 可恢复意图；Telnet/Serial 的运行目标不含 HostId，必须由连接请求补入，
@@ -755,6 +768,7 @@ pub struct RootView {
     _snippet_editor_visibility_subscription: Option<gpui_kit::Subscription>,
     _snippet_terminal_fill_subscription: Option<gpui_kit::Subscription>,
     _snippet_current_command_subscription: Option<gpui_kit::Subscription>,
+    _snippet_host_move_subscription: Option<gpui_kit::Subscription>,
     connections_panel: Option<Entity<crate::features::connections::ConnectionsPanel>>,
     operations_view: Option<Entity<crate::features::operations::OperationsView>>,
     _operations_event_subscription: Option<gpui_kit::Subscription>,
@@ -784,6 +798,8 @@ pub struct RootView {
     quick_open_view: Option<Entity<crate::features::quick_open::QuickOpenView>>,
     /// Quick Open 在子 Entity 事件回调期间不可安全 read；Root 用镜像状态阻断迟到的终端输入。
     quick_open_modal_open: bool,
+    /// 非终端发起控件独立于命令目标；终端焦点仍通过 session incarnation 门禁恢复。
+    quick_open_return_focus: Option<FocusHandle>,
     _quick_open_event_subscription: Option<gpui_kit::Subscription>,
     /// MCP panel only observes and controls the desktop composition root's shared runtime owner.
     mcp_runtime_panel: Option<Entity<crate::features::mcp_runtime::McpRuntimePanel>>,
@@ -806,6 +822,8 @@ pub struct RootView {
     agent_watch_cancellation: CancellationToken,
     agent_needs_snapshot: bool,
     selected_host_id: Option<HostId>,
+    /// 扩展主机选择不进入只支持内置 SSH 的运维投影，工具贡献仍可读取其稳定身份。
+    selected_plugin_host_id: Option<HostId>,
     _files_pane_subscriptions: Option<workspace_files::FilesPaneSubscriptions>,
     _sftp_panel_subscriptions: Option<workspace_files::FilesPaneSubscriptions>,
     _editor_event_subscription: Option<gpui_kit::Subscription>,
@@ -842,6 +860,7 @@ pub struct RootView {
     /// 仅在侧栏显式请求后保留 host 与 pane 身份；导航变化或请求替换立即失效。
     pending_sidebar_container: Option<sidebar_containers::SidebarContainerRequest>,
     pending_sftp_navigation: Option<connections::SftpNavigationRequest>,
+    pending_plugin_host_open: Option<plugin_hosts::PendingPluginHostOpen>,
     /// 共享打开与独立传输共用最新意图身份，旧预检不得覆盖后续请求状态。
     latest_sftp_request_id: Option<String>,
     pending_sftp_transfer_navigation: Option<connections::SftpNavigationRequest>,
@@ -909,6 +928,15 @@ pub struct RootView {
     /// 手动终端重连按 pane incarnation 持有尝试和迟到回执门禁。
     session_reconnect: session_reconnect::SessionReconnectController,
     workspace_renders: HashMap<TabId, Entity<workspace_render::WorkspaceRender>>,
+    /// 内容视图按 Page/Tab 身份保活，关闭失败仍由此宿主持有资源。
+    content_host: crate::plugins::content::ContentHost,
+    plugin_tools: crate::plugins::tools::PluginTools,
+    plugin_tab_close_deadlines: BTreeMap<TabId, std::time::Instant>,
+    active_content_scope: Option<crate::plugins::content::ContentScope>,
+    content_window_active: bool,
+    content_failures: BTreeMap<crate::plugins::content::ContentScope, SharedString>,
+    // Page 没有标签控制器的恢复回执，必须独立确认激活、显示与焦点后才能挂载。
+    ready_content_pages: HashSet<String>,
     workspace_render_subscriptions: HashMap<TabId, gpui_kit::Subscription>,
     /// 每个真实 pane 使用自己的工具视图，避免拖选/链接事件借用活动 Tab 的临时状态。
     workspace_tools: HashMap<SessionId, Entity<crate::features::terminal_tools::TerminalToolsView>>,
@@ -961,6 +989,8 @@ pub struct RootView {
     cursor_blink_phase_visible: bool,
     /// 唯一窗口级时钟随 Root 释放，失焦时保持可见且不触发无效重绘。
     cursor_blink_task: Option<gpui_kit::Task<()>>,
+    /// 窗口释放时取消插件 UI 接收循环，防止后台请求等待已关闭窗口。
+    plugin_ui_task: Option<gpui_kit::Task<()>>,
     pending_palette_update: Option<(TerminalPalette, usize, u64)>,
     palette_update_running: bool,
     /// 只让最新设置请求发布错误状态，旧重配失败不能覆盖后来成功的用户操作。
@@ -968,6 +998,8 @@ pub struct RootView {
     _appearance_subscription: gpui_kit::Subscription,
     /// 原生窗口失活立即结束拖选和组合，不依赖下一次鼠标事件或重绘才能停止后台手势。
     _terminal_activation_subscription: gpui_kit::Subscription,
+    /// 窗口几何改变时在下一帧之前核对共享片段实体的宿主。
+    _window_bounds_subscription: gpui_kit::Subscription,
 }
 
 impl RootView {
@@ -2222,19 +2254,21 @@ impl RootView {
                 if acceptance.activation
                     == kerminal_domain::commands::CommandSuggestionActivation::OpenSnippetPanel
                 {
-                    if let Some(commands) = self.commands_view.as_ref() {
-                        commands.update(cx, |view, cx| view.select_snippets(cx));
-                        self.cancel_visible_transfer_preparation(cx);
-                        self.cancel_file_sftp_selections(cx);
-                        self.surface_navigation_generation =
-                            self.surface_navigation_generation.wrapping_add(1);
-                        self.center_panel = CenterPanel::Commands;
-                        self.focused_agent_terminal = false;
-                        self.set_reported_focus_session(None, cx);
-                        self.refresh_commands_session(cx);
-                        self.refresh_active_suggestion_context(cx);
-                        cx.notify();
-                    }
+                    let navigation_generation = self.surface_navigation_generation;
+                    let window_handle = self.window_handle;
+                    cx.spawn(async move |this, cx| {
+                        let _ = cx.update_window(window_handle, move |_, window, app| {
+                            let _ = this.update(app, |root, cx| {
+                                if root.surface_navigation_generation == navigation_generation
+                                    && !root.host_shutdown_requested
+                                    && root.is_active_suggestion_binding(&binding)
+                                {
+                                    root.open_snippets_content(window, cx);
+                                }
+                            });
+                        });
+                    })
+                    .detach();
                     return;
                 }
                 if acceptance.shell_snapshot.is_none() {
@@ -2658,6 +2692,7 @@ impl RootView {
         let Some(tab) = tab else {
             return;
         };
+        self.sync_tool_rail_active_tab();
         let retains_visible_files = matches!(
             (&tab, &self.files_workspace_selection),
             (WorkspaceSessionTab::SftpTransfer { id, .. }, workspace_files::FilesWorkspaceSelection::TransferTab(current)) if id == current
@@ -2666,6 +2701,7 @@ impl RootView {
             self.cancel_visible_transfer_preparation(cx);
         }
         self.cancel_file_sftp_selections(cx);
+        self.cancel_plugin_host_open();
         self.surface_navigation_generation = self.surface_navigation_generation.wrapping_add(1);
         self.clear_pending_pane_focus();
         self.clear_keybinding_chord();
@@ -2725,6 +2761,28 @@ impl RootView {
                 self.ensure_workspace_file_tab(tab_id, window, cx);
                 self.activate_workspace_file_tab(tab_id, cx);
                 self.set_reported_focus_session(None, cx);
+            }
+            WorkspaceSessionTab::Extension {
+                content_id,
+                state_version,
+                state,
+                ..
+            } => {
+                let scope = crate::plugins::content::ContentScope::Tab(tab_id.clone());
+                self.center_panel = CenterPanel::Contributed;
+                self.active_content_scope = Some(scope.clone());
+                self.set_reported_focus_session(None, cx);
+                if let Err(error) = self.activate_plugin_tab_instance(
+                    scope,
+                    &content_id,
+                    state_version,
+                    state,
+                    request_focus,
+                    window,
+                    cx,
+                ) {
+                    self.status = Some(error.public_message().to_owned().into());
+                }
             }
             WorkspaceSessionTab::Unsupported { .. } => {
                 self.center_panel = CenterPanel::Terminal;
@@ -3099,10 +3157,37 @@ impl RootView {
     /// SFTP 导航与创建回投从空身份开始，持久工作区不能恢复已经失效的异步用户意图。
     /// 隐藏设置中的退出确认须重新打开其模态入口，不能只保留不可见的脏稿门禁。
     /// 确认显隐事件使父容器同步切换焦点陷阱，不能只重绘面板子树。
+    /// 窗口重新激活时补取实际显示的 Agent 快照，避免普通重绘隐式启动读取。
     ///
     /// @author kongweiguang
     pub fn new(services: AppServices, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut content_host = crate::plugins::content::ContentHost::default();
+        let mut plugin_tools = crate::plugins::tools::PluginTools::default();
+        let mut content_registration_error = None;
+        for factory in &services.content_factories {
+            let result = if services
+                .plugins
+                .content_type(factory.content_id())
+                .is_none()
+            {
+                Err(kerminal_application::AppError::invalid(
+                    "内容工厂缺少贡献声明",
+                ))
+            } else {
+                content_host.register(factory.clone())
+            };
+            if let Err(error) = result {
+                content_registration_error
+                    .get_or_insert_with(|| error.public_message().to_owned().into());
+            }
+        }
         let initial_appearance = window.appearance();
+        for factory in &services.tool_factories {
+            if let Err(error) = plugin_tools.register(&services.plugins, factory.clone()) {
+                content_registration_error
+                    .get_or_insert_with(|| error.public_message().to_owned().into());
+            }
+        }
         let initial_theme_mode = ThemeMode::Dark;
         apply_theme_mode(initial_theme_mode, initial_appearance, cx);
         let appearance_subscription = cx.observe_window_appearance(window, |view, window, cx| {
@@ -3162,6 +3247,9 @@ impl RootView {
             let external_protocol = services.external_protocol.clone();
             let mcp_runtime_available = services.mcp_runtime.is_some();
             let executor = services.executor.clone();
+            let external_plugins = services.external_plugins.clone();
+            let external_plugin_settings = services.external_plugin_settings.clone();
+            let external_plugin_views = services.external_plugin_views.clone();
             cx.new(|cx| {
                 let services = PreferencesPanelServices {
                     preferences,
@@ -3175,7 +3263,12 @@ impl RootView {
                     mcp_runtime: services.mcp_runtime.clone(),
                     executor,
                 };
-                let panel = PreferencesPanel::new(services, window, cx);
+                let panel = PreferencesPanel::new(services, window, cx)
+                    .with_external_plugin_settings(
+                        external_plugins,
+                        external_plugin_settings,
+                        external_plugin_views,
+                    );
                 match hosts {
                     Some(hosts) => panel.with_host_management_service(hosts),
                     None => panel,
@@ -3306,6 +3399,7 @@ impl RootView {
             snippet_editor_visibility_subscription,
             snippet_terminal_fill_subscription,
             snippet_current_command_subscription,
+            snippet_host_move_subscription,
         ) = Self::subscribe_commands_view(commands_view.as_ref(), window, cx);
         let connections_panel = services
             .hosts
@@ -3325,7 +3419,12 @@ impl RootView {
                     let panel = crate::features::connections::ConnectionsPanel::new(
                         hosts, remote, rdp, executor, recovery, window, cx,
                     )
-                    .with_profiles(profiles, cx);
+                    .with_profiles(profiles, cx)
+                    .with_host_form_factories(services.host_form_factories.clone());
+                    let panel = match services.plugin_hosts.clone() {
+                        Some(service) => panel.with_plugin_hosts(service),
+                        None => panel,
+                    };
                     let panel = match external_launch {
                         Some(service) => panel.with_external_launch_service(service),
                         None => panel,
@@ -3661,13 +3760,20 @@ impl RootView {
         });
         let terminal_activation_subscription =
             cx.observe_window_activation(window, |root, window, cx| {
+                root.content_window_active = window.is_window_active();
+                root.sync_plugin_content_visibility(cx);
                 if !window.is_window_active() {
                     // 应用失活时提前停止组件拥有的拖动与边缘滚动，GPUI 不会替应用清理 active_drag。
                     root.cancel_workbench_drag(window, cx);
+                } else if root.agent_tool_panel_is_visible() {
+                    root.request_agent_snapshot(cx);
                 }
                 root.cancel_unfocused_pane_compositions(window, cx);
                 cx.notify();
             });
+        let window_bounds_subscription = cx.observe_window_bounds(window, |root, window, cx| {
+            root.reconcile_snippets_host(window, cx);
+        });
         let root_entity = cx.entity();
         window.on_window_should_close(cx, move |window, cx| {
             root_entity.update(cx, |root, cx| {
@@ -3714,7 +3820,7 @@ impl RootView {
             tray_owner_installed: false,
             is_creating_session: false,
             pending_terminal_creation_owner: None,
-            status: None,
+            status: content_registration_error,
             status_toast_revision: 0,
             status_toast_observed: None,
             configuration_recovery,
@@ -3801,6 +3907,7 @@ impl RootView {
             _snippet_editor_visibility_subscription: snippet_editor_visibility_subscription,
             _snippet_terminal_fill_subscription: snippet_terminal_fill_subscription,
             _snippet_current_command_subscription: snippet_current_command_subscription,
+            _snippet_host_move_subscription: snippet_host_move_subscription,
             connections_panel,
             operations_view,
             _operations_event_subscription: operations_event_subscription,
@@ -3832,6 +3939,7 @@ impl RootView {
             agent_watch_cancellation: CancellationToken::new(),
             agent_needs_snapshot: false,
             selected_host_id: None,
+            selected_plugin_host_id: None,
             _files_pane_subscriptions: files_pane_subscriptions,
             _sftp_panel_subscriptions: sftp_panel_subscriptions,
             _editor_event_subscription: editor_event_subscription,
@@ -3847,6 +3955,7 @@ impl RootView {
             updates_panel,
             quick_open_view,
             quick_open_modal_open: false,
+            quick_open_return_focus: None,
             _quick_open_event_subscription: quick_open_event_subscription,
             mcp_runtime_panel,
             _updates_event_subscription: updates_event_subscription,
@@ -3863,6 +3972,7 @@ impl RootView {
             surface_navigation_generation: 0,
             pending_sidebar_container: None,
             pending_sftp_navigation: None,
+            pending_plugin_host_open: None,
             latest_sftp_request_id: None,
             pending_sftp_transfer_navigation: None,
             pending_sftp_host_creation: None,
@@ -3903,6 +4013,13 @@ impl RootView {
             retained_tab_tool_contents: HashMap::new(),
             session_reconnect: session_reconnect::SessionReconnectController::default(),
             workspace_renders: HashMap::new(),
+            content_host,
+            plugin_tools,
+            plugin_tab_close_deadlines: BTreeMap::new(),
+            active_content_scope: None,
+            content_window_active: window.is_window_active(),
+            content_failures: BTreeMap::new(),
+            ready_content_pages: HashSet::new(),
             workspace_render_subscriptions: HashMap::new(),
             workspace_tools: HashMap::new(),
             workspace_tool_subscriptions: HashMap::new(),
@@ -3941,11 +4058,13 @@ impl RootView {
             cursor_blink_enabled: TerminalSettings::default().cursor_blink,
             cursor_blink_phase_visible: true,
             cursor_blink_task: None,
+            plugin_ui_task: None,
             pending_palette_update: None,
             palette_update_running: false,
             palette_update_generation: 0,
             _appearance_subscription: appearance_subscription,
             _terminal_activation_subscription: terminal_activation_subscription,
+            _window_bounds_subscription: window_bounds_subscription,
         };
         root.refresh_agent_target_candidate(cx);
         root.refresh_context_panel_projection(cx);
@@ -3953,6 +4072,12 @@ impl RootView {
         root.refresh_workspace_orphan_cleanup(cx);
         root.observe_application_executor(cx);
         root.start_cursor_blink_clock(window, cx);
+        if let Some(bridge) = root.services.plugin_ui.clone() {
+            match root.install_plugin_ui(&bridge, window, cx) {
+                Ok(task) => root.plugin_ui_task = Some(task),
+                Err(error) => root.status = Some(error.public_message().into()),
+            }
+        }
         root
     }
 
@@ -3992,6 +4117,7 @@ impl RootView {
     ) {
         self.application_task_snapshot = snapshot;
         if !snapshot.accepting {
+            self.cancel_plugin_host_open();
             self.host_shutdown_requested = true;
             if self.host_lifecycle == RootHostLifecycle::Running {
                 self.host_lifecycle = RootHostLifecycle::Stopping;
@@ -4336,7 +4462,7 @@ impl RootView {
     }
 
     /// 同一快照驱动工作台与命令建议预览；应用配色只刷新外观，保留输入、会话和建议上下文。
-    /// 布局有未确认手势时只更新持久基线，保存回声不重复执行其它设置副作用。
+    /// 布局变化只同步几何与持久基线，不重配终端或刷新右栏；未确认手势继续由原布局 owner 管理。
     ///
     /// @author kongweiguang
     fn apply_settings_snapshot(
@@ -4345,6 +4471,23 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if preferences::workbench_layout_only_update(self.settings_snapshot.as_ref(), &settings) {
+            let layout = settings.workbench_layout.clone();
+            let restore_layout = workbench::should_restore_workbench_layout(
+                self.settings_snapshot
+                    .as_ref()
+                    .map(|settings| &settings.workbench_layout),
+                &layout,
+                self.workbench_layout_intent.is_some(),
+            );
+            self.settings_snapshot = Some(settings);
+            if restore_layout {
+                self.restore_workbench_layout(&layout, cx);
+            }
+            self.reconcile_snippets_host(window, cx);
+            cx.notify();
+            return;
+        }
         if preferences::app_palette_only_update(self.settings_snapshot.as_ref(), &settings) {
             preferences::apply_snapshot(self, settings, window, cx);
             self.refresh_tool_rail_panel_theme(cx);
@@ -4373,10 +4516,10 @@ impl RootView {
             tabs.set_show_tab_numbers(show_tab_numbers, cx);
             tabs.set_confirm_terminal_close(confirm_terminal_close, cx);
         });
-        self.remap_tool_rail_settings(cx);
         if restore_layout {
             self.restore_workbench_layout(&layout, cx);
         }
+        self.remap_tool_rail_settings(window, cx);
         self.refresh_tool_rail_panel_theme(cx);
         self.refresh_context_panel_projection(cx);
         // 引擎具备 OSC 133 投影能力；子视图仍要求当前会话提供真实命令块才展示轨道。
@@ -4575,10 +4718,14 @@ impl RootView {
         if self.preferences_modal_open || self.connections_modal_open {
             return;
         }
+        if panel == CenterPanel::Commands {
+            self.release_snippets_tool_rail(window, cx);
+        }
         if panel != CenterPanel::Files {
             self.cancel_visible_transfer_preparation(cx);
         }
         self.cancel_file_sftp_selections(cx);
+        self.cancel_plugin_host_open();
         self.surface_navigation_generation = self.surface_navigation_generation.wrapping_add(1);
         if panel == CenterPanel::Files
             && self.files_workspace_selection == workspace_files::FilesWorkspaceSelection::Workbench
@@ -6607,6 +6754,7 @@ impl Render for RootView {
     /// 其它右栏工具也按标签换挂；停用隐藏运维视图，保留其筛选与选择状态。
     /// 群发栏与终端共用左右缩进；发送结果只进弹层，候选与现有 pane 从稳定剩余高度测量 PTY。
     /// 容器只由固定右栏挂载；退出准备失败提示保留在工作台，不伪造服务已停止。
+    /// 中央正文委派给内容宿主，窗口外壳不承担各内容视图的工厂和资源创建。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6618,12 +6766,6 @@ impl Render for RootView {
         self.sync_pending_root_confirmation(window, cx);
         self.restore_workspace_files(window, cx);
         self.ensure_workspace_render_entities(window, cx);
-        if !self.right_dock_collapsed
-            && self.tool_rail_state.attached_tool() == Some(ToolRailToolId::AgentLauncher)
-        {
-            self.request_agent_snapshot(cx);
-        }
-
         let theme = ThemeTokens::current(window, cx);
         let active_workspace_tab = self.workspace_controller.as_ref().and_then(|controller| {
             let snapshot = controller.snapshot();
@@ -6643,155 +6785,7 @@ impl Render for RootView {
             window.focus(&self.focus_handle, cx);
         }
 
-        let center_content: AnyElement = match self.center_panel {
-            CenterPanel::Terminal => match active_workspace_tab.as_ref() {
-                Some(WorkspaceSessionTab::Terminal { id, .. }) => self
-                    .workspace_renders
-                    .get(id)
-                    .cloned()
-                    .map(|render| {
-                        let inset =
-                            preferences::interface_density_metrics(self).terminal_content_inset;
-                        let broadcast_bar = self.render_workspace_broadcast_bar(id, window, cx);
-                        div()
-                            .id("active-terminal-workspace")
-                            .size_full()
-                            .min_w(px(0.))
-                            .min_h(px(0.))
-                            .flex()
-                            .flex_col()
-                            // 终端卡片直接贴住分隔槽：左右再各留一份密度缩进会让中间框两侧
-                            // 变成双倍留白，与 0.3.x 的 6px 参考相比明显偏宽。
-                            .pt(px(if broadcast_bar.is_some() { inset } else { 0. }))
-                            .children(broadcast_bar)
-                            .child(
-                                div()
-                                    .id("terminal-pane-region")
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .min_h(px(0.))
-                                    .py(px(inset))
-                                    .overflow_hidden()
-                                    .child(render),
-                            )
-                            .into_any_element()
-                    })
-                    .unwrap_or_else(|| {
-                        empty_workbench_slot(
-                            "终端工作区正在准备。",
-                            "The terminal workspace is preparing.",
-                            theme.muted,
-                        )
-                    }),
-                Some(WorkspaceSessionTab::Unsupported { kind, .. }) => div()
-                    .id("unsupported-workspace-tab")
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p_4()
-                    .text_color(theme.muted)
-                    .child(format!("当前版本不支持此工作区标签：{kind}"))
-                    .into_any_element(),
-                Some(_) => empty_workbench_slot(
-                    "请使用对应的文件工作区查看此标签。",
-                    "Open this tab in its matching file workspace.",
-                    theme.muted,
-                ),
-                None => empty_workbench_slot(
-                    "从左侧主机导航打开连接，或新建本地终端。",
-                    "Open a connection from host navigation or create a local terminal.",
-                    theme.muted,
-                ),
-            },
-            CenterPanel::Files => {
-                let pane = match &self.files_workspace_selection {
-                    workspace_files::FilesWorkspaceSelection::Workbench => self.files_pane.clone(),
-                    workspace_files::FilesWorkspaceSelection::TransferTab(tab_id) => {
-                        self.workspace_files.files_pane(tab_id)
-                    }
-                };
-                pane.map_or_else(
-                    || {
-                        empty_workbench_slot(
-                            "文件服务尚未配置。",
-                            "File services are unavailable.",
-                            theme.muted,
-                        )
-                    },
-                    |pane| {
-                        div()
-                            .id("files-workspace")
-                            .size_full()
-                            .child(pane)
-                            .into_any_element()
-                    },
-                )
-            }
-            CenterPanel::Editor => self.file_editor_workspace.clone().map_or_else(
-                || {
-                    empty_workbench_slot(
-                        "文件编辑服务尚未配置。",
-                        "The file editor service is unavailable.",
-                        theme.muted,
-                    )
-                },
-                |editor| {
-                    div()
-                        .id("editor-workspace")
-                        .size_full()
-                        .child(editor)
-                        .into_any_element()
-                },
-            ),
-            CenterPanel::Preferences => empty_workbench_slot(
-                "设置当前作为模态窗口显示。",
-                "Settings are shown in a modal window.",
-                theme.muted,
-            ),
-            CenterPanel::Commands => self.commands_view.clone().map_or_else(
-                || {
-                    empty_workbench_slot(
-                        "命令服务尚未配置。",
-                        "Command services are unavailable.",
-                        theme.muted,
-                    )
-                },
-                |commands| {
-                    div()
-                        .id("commands-workspace")
-                        .size_full()
-                        .child(commands)
-                        .into_any_element()
-                },
-            ),
-            CenterPanel::Connections if self.connections_modal_open => empty_workbench_slot(
-                "主机编辑器当前作为模态窗口显示。",
-                "The host editor is currently shown in a modal window.",
-                theme.muted,
-            ),
-            CenterPanel::Connections => self.connections_panel.clone().map_or_else(
-                || {
-                    empty_workbench_slot(
-                        "主机连接服务尚未配置。",
-                        "Host connection services are unavailable.",
-                        theme.muted,
-                    )
-                },
-                |connections| {
-                    div()
-                        .id("connections-workspace")
-                        .size_full()
-                        .child(connections)
-                        .into_any_element()
-                },
-            ),
-            CenterPanel::Agents => empty_workbench_slot(
-                "Agent 会话固定显示在右侧工作区。",
-                "Agent sessions are shown in the right workspace.",
-                theme.muted,
-            ),
-        };
+        let center_content = self.render_center_content(active_workspace_tab.as_ref(), window, cx);
         let center_key_context = if self.center_panel == CenterPanel::Terminal {
             crate::keybindings::KeybindingContext::Terminal.as_gpui_identifier()
         } else {
@@ -6803,15 +6797,6 @@ impl Render for RootView {
             .key_context(center_key_context)
             .child(center_content)
             .into_any_element();
-        let center_content = if self.tool_rail_owns_center_panel() {
-            // 片段的同一业务 Entity 只能进入当前配置的一个宿主；SFTP rail 已使用独立浏览实体。
-            div()
-                .id("tool-rail-owned-center-placeholder")
-                .size_full()
-                .into_any_element()
-        } else {
-            center_content
-        };
 
         let agent_terminal_content = self
             .agent_terminal_session_id
@@ -6942,6 +6927,27 @@ impl Render for RootView {
             .id("workbench-app-key-context")
             .size_full()
             .key_context(crate::keybindings::KeybindingContext::App.as_gpui_identifier())
+            .on_action(cx.listener(
+                |root, action: &crate::plugins::actions::OpenContentPage, window, cx| {
+                    if let Err(error) = root.open_plugin_page(&action.content_id, window, cx) {
+                        root.status = Some(error.public_message().to_owned().into());
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_action(cx.listener(
+                |root, action: &crate::plugins::actions::OpenContentTab, window, cx| {
+                    if let Err(error) = root.open_plugin_tab(action, window, cx) {
+                        root.status = Some(error.public_message().to_owned().into());
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_action(cx.listener(
+                |root, action: &crate::plugins::content::ContentStateChanged, _, cx| {
+                    root.plugin_content_state_changed(action, cx);
+                },
+            ))
             .child(
                 div()
                     .id("workbench-workspace-key-context")

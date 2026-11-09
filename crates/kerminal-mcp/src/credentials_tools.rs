@@ -139,7 +139,6 @@ async fn upsert_host(
         tags: existing
             .as_ref()
             .map_or_else(Vec::new, |host| host.tags.clone()),
-        is_favorite: existing.as_ref().is_some_and(|host| host.is_favorite),
         sort_order: existing.as_ref().map_or(0, |host| host.sort_order),
         connect_timeout_ms: existing
             .as_ref()

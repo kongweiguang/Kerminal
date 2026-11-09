@@ -19,12 +19,12 @@ use kerminal_application::{
         ConnectionProbeBackend, ConnectionProbeOutcome, ConnectionProbeTarget, ProbeCredential,
         ProbeCredentialMaterial, ProbeHostKeyChallenge, ProbeHostKeyChanged,
         ProbeHostKeyConfirmation, ProbeVerificationLevel, RdpClientKind, RdpConnectivityProbe,
-        RdpLocalAvailability, RdpTcpFailure, RdpTcpReachability,
+        RdpLocalAvailability, RdpTcpFailure, RdpTcpReachability, SftpProbeStatus,
     },
     connections::{
         ChannelLane, ConnectionIntent, CredentialResolver, HostConnectionRepository,
         HostKeyIdentity, HostKeyPeer, HostKeyStatus, KnownHostsRepository, OpenSftpRequest,
-        RemoteConnectionService, ResolvedCredential,
+        RemoteConnectionLease, RemoteConnectionService, ResolvedCredential,
     },
     sessions::{
         DEFAULT_SESSION_CLOSE_BUDGET, SessionOpenCleanupOwner, SessionTransportControl,
@@ -424,6 +424,7 @@ impl SystemConnectionProbe {
             service.as_ref(),
             &target.profile,
             target.sftp_remote_start_directory.as_ref(),
+            target.check_optional_sftp,
             &cancellation,
             deadlines,
         )
@@ -818,6 +819,7 @@ async fn connect_and_check_sftp(
     service: &dyn RemoteConnectionService,
     profile: &HostConnectionProfile,
     remote_start_directory: Option<&RemotePath>,
+    check_optional_sftp: bool,
     cancellation: &CancellationToken,
     deadlines: ProbeDeadlines,
 ) -> AppResult<ConnectionProbeOutcome> {
@@ -834,15 +836,59 @@ async fn connect_and_check_sftp(
     )
     .await?;
     if profile.protocol != RemoteProtocol::Sftp {
-        let result = Ok(ConnectionProbeOutcome::Verified(
-            ProbeVerificationLevel::SshAuthenticated,
-        ));
+        let result = if check_optional_sftp {
+            let attempt =
+                probe_sftp_directory(&lease, remote_start_directory, cancellation, deadlines).await;
+            let outcome = match attempt.result {
+                Ok(()) => Ok(ConnectionProbeOutcome::SshAuthenticated {
+                    sftp: SftpProbeStatus::Available,
+                }),
+                Err(error)
+                    if error.public_code() == kerminal_application::PublicErrorCode::Cancelled =>
+                {
+                    Err(error)
+                }
+                Err(error) => Ok(ConnectionProbeOutcome::SshAuthenticated {
+                    sftp: SftpProbeStatus::Failed {
+                        code: error.public_code(),
+                        message: error.public_message(),
+                    },
+                }),
+            };
+            combine_cleanup(outcome, attempt.cleanup)
+        } else {
+            Ok(ConnectionProbeOutcome::Verified(
+                ProbeVerificationLevel::SshAuthenticated,
+            ))
+        };
         let cleanup = lease
             .close_until(deadlines.cleanup, "connection probe complete")
             .await;
         return combine_cleanup(result, cleanup);
     }
 
+    let attempt =
+        probe_sftp_directory(&lease, remote_start_directory, cancellation, deadlines).await;
+    let result = combine_cleanup(
+        attempt.result.map(|_| {
+            ConnectionProbeOutcome::Verified(ProbeVerificationLevel::SftpDirectoryAccessible)
+        }),
+        attempt.cleanup,
+    );
+    let lease_cleanup = lease
+        .close_until(deadlines.cleanup, "connection probe complete")
+        .await;
+    combine_cleanup(result, lease_cleanup)
+}
+
+/// 把 SFTP 子系统检测结果与 session 清理分开，使 SSH 认证成功可保留为主结果。
+/// @author kongweiguang
+async fn probe_sftp_directory(
+    lease: &RemoteConnectionLease,
+    remote_start_directory: Option<&RemotePath>,
+    cancellation: &CancellationToken,
+    deadlines: ProbeDeadlines,
+) -> SftpProbeAttempt {
     let channel = match await_probe_operation(
         lease.open_sftp(
             OpenSftpRequest {
@@ -857,14 +903,7 @@ async fn connect_and_check_sftp(
     .await
     {
         Ok(channel) => channel,
-        Err(error) => {
-            return combine_cleanup(
-                Err(error),
-                lease
-                    .close_until(deadlines.cleanup, "connection probe SFTP setup failed")
-                    .await,
-            );
-        }
+        Err(error) => return SftpProbeAttempt::failed(error),
     };
     let session = match await_probe_operation(
         async {
@@ -879,17 +918,7 @@ async fn connect_and_check_sftp(
     .await
     {
         Ok(session) => session,
-        Err(error) => {
-            return combine_cleanup(
-                Err(error),
-                lease
-                    .close_until(
-                        deadlines.cleanup,
-                        "connection probe SFTP initialization failed",
-                    )
-                    .await,
-            );
-        }
+        Err(error) => return SftpProbeAttempt::failed(error),
     };
     let directory =
         remote_start_directory.map_or_else(|| "/".to_owned(), |path| path.as_str().to_owned());
@@ -898,20 +927,33 @@ async fn connect_and_check_sftp(
             session
                 .read_dir(directory)
                 .await
+                .map(|_| ())
                 .map_err(map_sftp_probe_error)
         },
         cancellation,
         deadlines.operation,
         "SFTP 起始目录读取",
     )
-    .await
-    .map(|_| ConnectionProbeOutcome::Verified(ProbeVerificationLevel::SftpDirectoryAccessible));
-    let session_cleanup = close_probe_sftp_session(&session, deadlines.cleanup).await;
-    let result = combine_cleanup(result, session_cleanup);
-    let lease_cleanup = lease
-        .close_until(deadlines.cleanup, "connection probe complete")
-        .await;
-    combine_cleanup(result, lease_cleanup)
+    .await;
+    let cleanup = close_probe_sftp_session(&session, deadlines.cleanup).await;
+    SftpProbeAttempt { result, cleanup }
+}
+
+/// 一次性 SFTP 检查将操作失败与清理失败分开，不能把资源回收错误伪装成能力不可用。
+struct SftpProbeAttempt {
+    result: AppResult<()>,
+    cleanup: AppResult<()>,
+}
+
+impl SftpProbeAttempt {
+    /// 尚未建立 session 时只保留操作错误，连接 lease 仍由调用方关闭。
+    /// @author kongweiguang
+    fn failed(error: AppError) -> Self {
+        Self {
+            result: Err(error),
+            cleanup: Ok(()),
+        }
+    }
 }
 
 /// 在统一资源回收期限内结束只读探测使用的 SFTP session。

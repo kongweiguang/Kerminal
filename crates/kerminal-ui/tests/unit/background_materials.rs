@@ -89,6 +89,48 @@ fn material_projection_is_idempotent_from_base_palette() {
     assert!(first.image_veil > 0.0);
 }
 
+/// 嵌套内容容器不能累加宿主的透明材质；浮层、字段与正文颜色仍须保持可读。
+///
+/// @author kongweiguang
+#[test]
+fn tool_content_leaves_surface_compositing_to_its_host() {
+    for scheme in AppColorScheme::ALL {
+        for dark in [false, true] {
+            for (image, opacity) in [(false, 100), (false, 35), (true, 100), (true, 74)] {
+                let base = ThemeTokens::for_palette_with_materials(
+                    dark,
+                    scheme,
+                    BackgroundMaterialSettings {
+                        background_enabled: image,
+                        image_path_configured: image,
+                        background_opacity: 100,
+                        window_opacity: opacity,
+                    },
+                );
+                let content = base.for_tool_panel();
+                let repeated = content.for_tool_panel();
+                assert!(base.materials.chrome.a > 0.);
+                assert!(base.materials.chrome.a < 1.);
+                assert_eq!(content.tool_panel_surface.a, 0.);
+                assert_eq!(content.materials.shell.a, 0.);
+                assert_eq!(content.materials.chrome.a, 0.);
+                assert_eq!(content.materials, repeated.materials);
+                assert_eq!(content.panel, base.panel);
+                assert_eq!(content.code_surface(), base.panel);
+                assert_eq!(content.content_surface(), repeated.content_surface());
+                if image || opacity < 100 {
+                    assert!(content.content_surface().a < 0.3);
+                } else {
+                    assert_eq!(content.content_surface(), base.panel);
+                }
+                assert_eq!(content.foreground, base.foreground);
+                assert_eq!(content.field_surface(), base.field_surface());
+                assert_eq!(content.floating_surface, base.floating_surface);
+            }
+        }
+    }
+}
+
 /// 工作台局部配色不能重复降低材质透明度，也不能因跟随系统主题而污染原始令牌。
 ///
 /// @author kongweiguang

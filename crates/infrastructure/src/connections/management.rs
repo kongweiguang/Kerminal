@@ -16,10 +16,11 @@ use kerminal_application::{
     connections::{
         HostConnectionRepository,
         management::{
-            HostAuthenticationMode, HostDocumentRevision, HostDraft, HostGroup,
-            HostGroupDeletionReceipt, HostGroupDraft, HostGroupSnapshot, HostManagementRepository,
-            HostSftpOptions, HostTerminalOptions, ManagedHost, ManagedJumpHost, RdpDisplayOptions,
-            host_note_is_valid, is_reserved_serial_host_tag, normalize_host_note,
+            HostAuthenticationMode, HostCredentialReferenceCoverage, HostDocumentRevision,
+            HostDraft, HostGroup, HostGroupDeletionReceipt, HostGroupDraft, HostGroupSnapshot,
+            HostManagementRepository, HostSftpOptions, HostTerminalOptions, ManagedHost,
+            ManagedJumpHost, RdpDisplayOptions, host_note_is_valid, is_reserved_serial_host_tag,
+            normalize_host_note,
         },
     },
     platform::external_launch::{ExternalTargetIdentity, SavedExternalTargetLookup},
@@ -44,10 +45,12 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
 use crate::configuration::ConfigurationStore;
 
 mod local_hosts;
+mod plugin_hosts;
+
+pub use plugin_hosts::AtomicHostCredentialCleanup;
 
 const HOST_SCHEMA_VERSION: u32 = 3;
 const GROUP_SCHEMA_VERSION: u32 = 1;
-const FAVORITE_TAG: &str = "favorite";
 
 /// 通过同一 ConfigurationStore 提供列表 CRUD 和 SSH runtime 的 HostConnectionRepository。
 #[derive(Clone)]
@@ -243,7 +246,7 @@ impl HostConfigurationRepository {
         }
     }
 
-    /// 让主机管理与 SSH 运行时共用一次 schema 解析，并用原始 TOML revision 保护并发编辑。
+    /// 共用 schema 解析主机字段并保留全部普通标签；原始 TOML revision 用于保护并发编辑。
     ///
     /// @author kongweiguang
     fn decode_host(document: ConfigDocument, requested_id: &HostId) -> AppResult<ManagedHost> {
@@ -286,17 +289,6 @@ impl HostConfigurationRepository {
             return Err(corrupt_host(HostDocumentError::InvalidSerialSettings));
         }
         let (endpoint, serial) = decode_endpoint(protocol, &file)?;
-        let tags = file
-            .tags
-            .iter()
-            .filter(|tag| !tag.eq_ignore_ascii_case(FAVORITE_TAG))
-            .cloned()
-            .collect::<Vec<_>>();
-        let is_favorite = file
-            .tags
-            .iter()
-            .any(|tag| tag.eq_ignore_ascii_case(FAVORITE_TAG));
-
         Ok(ManagedHost {
             id: host_id,
             group_id: file.group_id,
@@ -309,8 +301,7 @@ impl HostConfigurationRepository {
             rdp_password,
             route,
             serial,
-            tags,
-            is_favorite,
+            tags: file.tags,
             sort_order: file.sort_order,
             connect_timeout_ms: u64::from(file.ssh_options.terminal.connect_timeout_seconds) * 1000,
             keepalive_interval_ms: (file.ssh_options.terminal.keepalive_seconds != 0)
@@ -320,7 +311,7 @@ impl HostConfigurationRepository {
                 initial_working_directory: file.ssh_options.terminal.working_directory.clone(),
             },
             sftp_options: HostSftpOptions {
-                enabled: file.ssh_options.sftp.enabled,
+                enabled: HostSftpOptions::enabled_for(protocol, file.ssh_options.sftp.enabled),
                 local_start_directory: file
                     .ssh_options
                     .sftp
@@ -399,8 +390,12 @@ impl HostManagementRepository for HostConfigurationRepository {
                 self.configuration.read(path).await?.ok_or_else(|| {
                     AppError::conflict("主机目录在读取期间发生变化，请刷新后重试")
                 })?;
+            self.store
+                .validate_host_document(id.as_str(), &document.source)?;
             if Self::document_is_local(&document)? {
                 Self::decode_local_host(document, &id)?;
+            } else if Self::document_is_plugin(&document)? {
+                self.decode_plugin_host(document, &id)?;
             } else {
                 hosts.push(Self::decode_host(document, &id)?);
             }
@@ -419,9 +414,51 @@ impl HostManagementRepository for HostConfigurationRepository {
                 Self::decode_local_host(document, host_id)?;
                 Ok(None)
             }
-            Some(document) => Self::decode_host(document, host_id).map(Some),
+            Some(document) => {
+                self.store
+                    .validate_host_document(host_id.as_str(), &document.source)?;
+                if Self::document_is_plugin(&document)? {
+                    self.decode_plugin_host(document, host_id)?;
+                    Ok(None)
+                } else {
+                    Self::decode_host(document, host_id).map(Some)
+                }
+            }
             None => Ok(None),
         }
+    }
+
+    /// 扩展主机与内置主机共享目录，但只返回各自的强类型投影。
+    async fn list_plugin_hosts(
+        &self,
+    ) -> AppResult<Vec<kerminal_application::connections::host_types::PluginHost>> {
+        self.list_plugin_host_records().await
+    }
+
+    /// 清理扫描识别每一种主机并复核目录 revision；未知插件或不可提取引用时拒绝证明。
+    ///
+    /// @author kongweiguang
+    async fn credential_reference_coverage(&self) -> AppResult<HostCredentialReferenceCoverage> {
+        self.scan_credential_reference_coverage().await
+    }
+
+    /// 单条读取区分缺失、内置类型和不可用插件，避免落入错误协议。
+    async fn load_plugin_host(
+        &self,
+        host_id: &HostId,
+    ) -> AppResult<Option<kerminal_application::connections::host_types::PluginHost>> {
+        self.load_plugin_host_record(host_id).await
+    }
+
+    /// 扩展编码后的配置仍经过宿主的事务、密钥和 revision 门禁。
+    async fn save_plugin_host(
+        &self,
+        host_id: HostId,
+        draft: kerminal_application::connections::host_types::PluginHostDraft,
+        expected_revision: Option<ConfigRevision>,
+    ) -> AppResult<kerminal_application::connections::host_types::PluginHost> {
+        self.save_plugin_host_record(host_id, draft, expected_revision)
+            .await
     }
 
     /// 本地和远程文件同目录，使用同一解码入口验证后才提供本地视图。
@@ -542,7 +579,7 @@ impl HostManagementRepository for HostConfigurationRepository {
             .editable_document(&host_id, expected_revision.as_ref())
             .await?;
         if let Some(current) = existing.as_ref()
-            && Self::document_is_local(current)?
+            && (Self::document_is_local(current)? || Self::document_is_plugin(current)?)
         {
             return Err(AppError::conflict("主机标识已被本地主机使用"));
         }
@@ -1214,7 +1251,7 @@ fn decode_serial(file: &SerialOptionsFile) -> AppResult<SerialSessionTarget> {
     })
 }
 
-/// 把类型化主机草稿写回当前 schema；备注只占一个根字段，空白值不产生冗余 TOML。
+/// 把类型化草稿写回当前 schema，保留普通标签；空白备注不产生冗余字段。
 ///
 /// @author kongweiguang
 fn apply_host_draft(
@@ -1276,15 +1313,7 @@ fn apply_host_draft(
             "串口参数必须保存到 serial 表，不能写入 tags",
         ));
     }
-    let mut tags = draft
-        .tags
-        .into_iter()
-        .filter(|tag| !tag.eq_ignore_ascii_case(FAVORITE_TAG))
-        .collect::<Vec<_>>();
-    if draft.is_favorite {
-        tags.push(FAVORITE_TAG.to_owned());
-    }
-    set_string_array(root, "tags", &tags);
+    set_string_array(root, "tags", &draft.tags);
     apply_authentication(
         root,
         host_id,
@@ -1716,12 +1745,36 @@ fn validate_credential_reference(
     Ok(())
 }
 
-/// 只接受既有精确 scope 或带唯一后缀的新 scope，继续读取历史引用并支持 CAS 安全轮换。
+/// 跳板重排会让实体携带旧位置引用；仍校验引用属于同主机的 jump scope，而不依赖当前位置。
+/// 其它凭据保持精确的既有 scope 或带唯一后缀的新 scope，阻止 target/proxy 凭据串位。
+/// @author kongweiguang
 fn scope_matches(expected: &str, actual: &str) -> bool {
+    if expected
+        .strip_prefix("jump-")
+        .is_some_and(|index| index.parse::<u32>().is_ok())
+    {
+        return jump_scope_matches(actual);
+    }
     actual == expected
         || actual
             .strip_prefix(expected)
             .is_some_and(|suffix| suffix.starts_with('-') && suffix.len() > 1)
+}
+
+/// 接受格式化的 legacy 跳板索引及其唯一后缀，引用仍由外围校验绑定 host、kind 和 material。
+/// @author kongweiguang
+fn jump_scope_matches(actual: &str) -> bool {
+    let Some(value) = actual.strip_prefix("jump-") else {
+        return false;
+    };
+    let (index_text, suffix) = match value.split_once('-') {
+        Some((index, suffix)) => (index, Some(suffix)),
+        None => (value, None),
+    };
+    let Ok(index) = index_text.parse::<u32>() else {
+        return false;
+    };
+    index.to_string() == index_text && suffix.is_none_or(|suffix| !suffix.is_empty())
 }
 
 /// 确保当前主机格式的 auth_type 与运行时认证枚举一致，防止 silent downgrade。

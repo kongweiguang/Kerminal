@@ -373,9 +373,9 @@ fn delayed_profiles() -> (ProfileService, Arc<Semaphore>) {
     (service, release_default)
 }
 
-/// 使用独立当前线程 runtime 驱动 ctor 的真实 reload，不读用户目录、不启动 OS 窗口。
+/// 在连接模块内共享真实面板夹具，使用隔离 runtime 驱动 reload，不读用户目录。
 /// @author kongweiguang
-fn fixture(
+pub(in crate::features::connections) fn fixture(
     app: &mut TestAppContext,
     rows: Vec<ManagedHost>,
     groups: Vec<HostGroup>,
@@ -457,9 +457,9 @@ fn draw(visual: &mut VisualTestContext) {
     visual.run_until_parked();
 }
 
-/// 所有动作都修改生产面板实体，避免用复制的 is_dirty 逻辑制造测试结果。
+/// 连接模块内的测试通过生产面板实体执行动作，避免复制状态逻辑造成误判。
 /// @author kongweiguang
-fn update_panel(
+pub(in crate::features::connections) fn update_panel(
     panel: &Entity<ConnectionsPanel>,
     visual: &mut VisualTestContext,
     action: impl FnOnce(&mut ConnectionsPanel, &mut Window, &mut Context<ConnectionsPanel>),
@@ -699,10 +699,10 @@ fn shared_inputs_reverted_after_protocol_switch_close_without_discard(app: &mut 
     }
 }
 
-/// 认证、分组与收藏恢复默认值属于可撤销编辑，比较应反映最终值而非交互次数。
+/// 认证与分组恢复默认值属于可撤销编辑，比较应反映最终值而非交互次数。
 /// @author kongweiguang
 #[gpui_kit::test]
-fn reverted_authentication_group_and_favorite_close_without_discard(app: &mut TestAppContext) {
+fn reverted_authentication_and_group_close_without_discard(app: &mut TestAppContext) {
     let group = HostGroup {
         id: "fixture-group".into(),
         name: "测试分组".into(),
@@ -711,19 +711,17 @@ fn reverted_authentication_group_and_favorite_close_without_discard(app: &mut Te
         updated_at: "1".into(),
     };
     let (_runtime, panel, visual) = fixture(app, Vec::new(), vec![group]);
-    for field in 0..3 {
+    for field in 0..2 {
         update_panel(&panel, visual, |panel, window, cx| {
             panel.begin_create_host(window, cx)
         });
         update_panel(&panel, visual, |panel, window, cx| match field {
             0 => panel.set_authentication_mode(HostAuthenticationMode::Agent, window, cx),
-            1 => panel.select_editor_group(Some("fixture-group".into()), cx),
-            _ => panel.toggle_favorite(cx),
+            _ => panel.select_editor_group(Some("fixture-group".into()), cx),
         });
         update_panel(&panel, visual, |panel, window, cx| match field {
             0 => panel.set_authentication_mode(HostAuthenticationMode::Password, window, cx),
-            1 => panel.select_editor_group(None, cx),
-            _ => panel.toggle_favorite(cx),
+            _ => panel.select_editor_group(None, cx),
         });
         close_clean_editor(&panel, visual);
     }
@@ -749,7 +747,6 @@ fn existing_host() -> ManagedHost {
         route: HostRouteSettings::default(),
         serial: None,
         tags: vec!["fixture".into()],
-        is_favorite: true,
         sort_order: 10,
         connect_timeout_ms: 12_000,
         keepalive_interval_ms: Some(30_000),
@@ -760,6 +757,140 @@ fn existing_host() -> ManagedHost {
         updated_at: "2".into(),
         revision: ConfigRevision::from_sha256("fixture-revision".into()),
     }
+}
+
+struct BuiltinProviderTestCodec;
+
+impl kerminal_application::connections::host_types::HostConfigurationCodec
+    for BuiltinProviderTestCodec
+{
+    /// 本测试只核对运行分派，不转换或持久化配置。
+    fn decode(&self, _: u32, value: &toml::Value) -> AppResult<toml::Value> {
+        Ok(value.clone())
+    }
+
+    /// 保持编解码对称，避免测试目录引入另一种配置语义。
+    fn encode(&self, _: u32, value: &toml::Value) -> AppResult<toml::Value> {
+        Ok(value.clone())
+    }
+}
+
+struct GatedBuiltinProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    cancellations: std::sync::atomic::AtomicUsize,
+    release: Semaphore,
+}
+
+#[async_trait::async_trait]
+impl kerminal_application::connections::host_types::HostTypeProvider for GatedBuiltinProvider {
+    /// 扩展主机不属于本次内置连接回归。
+    async fn test(
+        &self,
+        _: &kerminal_application::connections::host_types::PluginHost,
+        _: CancellationToken,
+    ) -> AppResult<()> {
+        panic!("内置连接不应测试扩展主机")
+    }
+
+    /// 扩展主机不能借测试提供方打开。
+    async fn open(
+        &self,
+        _: &kerminal_application::connections::host_types::PluginHost,
+        _: CancellationToken,
+    ) -> AppResult<kerminal_application::connections::host_types::PluginHostOpenIntent> {
+        panic!("内置连接不应打开扩展主机")
+    }
+
+    /// 保留真实请求在途，以验证目标切换取消和容器续接身份。
+    async fn open_builtin(
+        &self,
+        host: &kerminal_application::connections::host_types::BuiltinHost,
+        cancel: CancellationToken,
+    ) -> AppResult<kerminal_application::connections::host_types::PluginHostOpenIntent> {
+        use kerminal_application::connections::host_types::{
+            BuiltinHostOpenIntent, PluginHostOpenIntent,
+        };
+        use std::sync::atomic::Ordering;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                self.cancellations.fetch_add(1, Ordering::SeqCst);
+                return Err(kerminal_application::AppError::cancelled("测试请求已取消"));
+            }
+            permit = self.release.acquire() => permit.expect("测试门禁保持打开").forget(),
+        }
+        Ok(PluginHostOpenIntent::Builtin(BuiltinHostOpenIntent {
+            host_id: host.id().clone(),
+            configuration_type: host.configuration_type().to_owned(),
+        }))
+    }
+}
+
+/// 提供方等待期间容器续接身份有效；切换目标取消实际任务，后续重试再进入原 SSH 预检。
+#[gpui_kit::test]
+fn builtin_provider_cancellation_and_container_intent_follow_real_panel_requests(
+    app: &mut TestAppContext,
+) {
+    use kerminal_application::connections::host_types::{
+        HostConfigurationCatalog, HostConfigurationType, PluginHostService,
+    };
+    use std::sync::atomic::Ordering;
+
+    let host = existing_host();
+    let id = host.id.clone();
+    let provider = Arc::new(GatedBuiltinProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        cancellations: std::sync::atomic::AtomicUsize::new(0),
+        release: Semaphore::new(0),
+    });
+    let entry = HostConfigurationType::new("kerminal", "ssh", Arc::new(BuiltinProviderTestCodec))
+        .expect("合法测试类型")
+        .with_provider(provider.clone());
+    let catalog = Arc::new(HostConfigurationCatalog::new([entry]).expect("测试目录"));
+    let (runtime, panel, visual) = fixture(app, vec![host], Vec::new());
+    update_panel(&panel, visual, |panel, _, cx| {
+        panel.plugin_hosts = Some(PluginHostService::new(panel.hosts.clone(), catalog));
+        panel.remote = Arc::new(NoRemoteConnections {
+            preflight_fails: true,
+        });
+        assert!(panel.request_connect_host_for_container(&id, "first".to_owned(), cx));
+        assert!(panel.sidebar_container_intent_is_current("first"));
+    });
+    pump_runtime(&runtime, visual);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    update_panel(&panel, visual, |panel, _, cx| {
+        panel.select_host(HostId::new(), cx)
+    });
+    pump_runtime(&runtime, visual);
+    assert_eq!(provider.cancellations.load(Ordering::SeqCst), 1);
+    visual.update(|_, app| assert!(!panel.read(app).sidebar_container_intent_is_current("first")));
+
+    update_panel(&panel, visual, |panel, _, cx| {
+        assert!(panel.request_connect_host_for_container(&id, "second".to_owned(), cx));
+        assert!(panel.sidebar_container_intent_is_current("second"));
+    });
+    pump_runtime(&runtime, visual);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    provider.release.add_permits(1);
+    for _ in 0..8 {
+        pump_runtime(&runtime, visual);
+        if visual.update(|_, app| {
+            panel
+                .read(app)
+                .sidebar_container_failure("second")
+                .is_some()
+        }) {
+            break;
+        }
+    }
+    visual.update(|_, app| {
+        let panel = panel.read(app);
+        assert!(
+            panel.sidebar_container_failure("second").is_some(),
+            "应进入原 SSH 预检并保留失败的意图身份"
+        );
+        assert!(!panel.sidebar_container_intent_is_current("second"));
+    });
 }
 
 /// 既有配置不改动和字段改回原值，都必须关闭且不显示丢弃确认。

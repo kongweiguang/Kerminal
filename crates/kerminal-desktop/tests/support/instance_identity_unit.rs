@@ -18,8 +18,8 @@ use single_application::SingleApplication;
 use tokio::time::Instant;
 
 use super::{
-    APPLICATION_ID, ApplicationRuntime, activate_existing_instance, normalize_path,
-    single_instance_id, spawn_window_state_flush,
+    APPLICATION_ID, ApplicationRuntime, HostCommand, RootViewEvent, activate_existing_instance,
+    host_command_from_root_event, normalize_path, single_instance_id, spawn_window_state_flush,
 };
 
 static NEXT_TEST_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -334,4 +334,49 @@ fn window_state_flush_bridge_accepts_non_tokio_waiter() {
         block_on_without_tokio(receipt).expect("runtime task should return a receipt"),
         None
     );
+}
+
+/// 退出、安装和安装重试都必须复用 Root 的截止时间与原始操作身份。
+///
+/// @author kongweiguang
+#[test]
+fn root_events_preserve_the_shared_shutdown_deadline() {
+    use kerminal_application::updates::DownloadedUpdateId;
+    use kerminal_ui::QuitIntent;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let expected = Instant::from_std(deadline);
+    let (command, flush_deadline) = host_command_from_root_event(&RootViewEvent::QuitReady {
+        intent: QuitIntent::Exit,
+        deadline,
+    });
+    assert_eq!(flush_deadline, expected);
+    assert!(
+        matches!(command, HostCommand::Quit { intent: QuitIntent::Exit, deadline } if deadline == expected)
+    );
+
+    let update_id = DownloadedUpdateId::new();
+    for retry in [false, true] {
+        let event = if retry {
+            RootViewEvent::RetryInstallReady {
+                update_id,
+                version: "1.2.3".into(),
+                deadline,
+            }
+        } else {
+            RootViewEvent::InstallReady {
+                update_id,
+                version: "1.2.3".into(),
+                deadline,
+            }
+        };
+        let (command, flush_deadline) = host_command_from_root_event(&event);
+        assert_eq!(flush_deadline, expected);
+        assert!(matches!(command, HostCommand::Install {
+            update_id: actual_id,
+            version,
+            deadline,
+            retry: actual_retry,
+        } if actual_id == update_id && version == "1.2.3" && deadline == expected && actual_retry == retry));
+    }
 }

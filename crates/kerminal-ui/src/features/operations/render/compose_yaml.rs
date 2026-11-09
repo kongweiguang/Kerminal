@@ -19,6 +19,7 @@ use super::super::container_panel::ContainerPanelActionTicket;
 
 /// 在项目页内预览 YAML；编辑器显式占满正文视口，使长文件由编辑器自身滚动。
 /// 刷新不替换已有正文，也不影响中央工作区。
+/// 正文和 Kit 行号槽使用同一代码阅读面，避免透明正文旁出现独立黑色槽位。
 ///
 /// @author kongweiguang
 pub(super) fn render(
@@ -134,7 +135,7 @@ pub(super) fn render(
                 .rounded_md()
                 .border_1()
                 .border_color(theme.border)
-                .bg(theme.materials.chrome)
+                .bg(theme.code_surface())
                 .child(editor_body),
         )
         .child(footer)

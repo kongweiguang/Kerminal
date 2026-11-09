@@ -184,7 +184,7 @@ impl CommandsView {
                     .flex_col()
                     .gap_1()
                     .rounded_md()
-                    .bg(theme.panel)
+                    .bg(theme.content_surface())
                     .child(div().text_size(px(12.)).child(crate::locale::text(
                         format!("步骤 {}", step.step_id),
                         format!("Step {}", step.step_id),
@@ -243,10 +243,8 @@ impl CommandsView {
                         .w_full()
                         .p_2()
                         .rounded_md()
-                        .bg(if progress.current_step_index == Some(index) {
-                            theme.background
-                        } else {
-                            theme.panel
+                        .when(progress.current_step_index == Some(index), |row| {
+                            row.bg(theme.surface_selected())
                         })
                         .flex()
                         .flex_col()
@@ -269,7 +267,7 @@ impl CommandsView {
                 .w_full()
                 .p_3()
                 .rounded_md()
-                .bg(theme.panel)
+                .bg(theme.content_surface())
                 .flex()
                 .flex_col()
                 .gap_2()
@@ -351,7 +349,7 @@ impl CommandsView {
                     .flex_col()
                     .gap_2()
                     .rounded_md()
-                    .bg(theme.panel)
+                    .bg(theme.content_surface())
                     .child(
                         div()
                             .flex()
@@ -700,7 +698,7 @@ impl CommandsView {
                                 .w_full()
                                 .p_3()
                                 .rounded_md()
-                                .bg(theme.panel)
+                                .bg(theme.content_surface())
                                 .text_size(px(12.))
                                 .child(crate::locale::text(
                                     format!("运行状态：{}{current}", workflow_run_label(state)),

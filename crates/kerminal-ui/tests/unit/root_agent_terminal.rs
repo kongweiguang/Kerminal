@@ -4,6 +4,17 @@
 
 use super::*;
 
+/// 隐藏或重新挂载后的旧快照不能清除新一轮读取所需的脏状态。
+///
+/// @author kongweiguang
+#[test]
+fn agent_snapshot_requires_the_same_active_projection() {
+    assert!(agent_snapshot_projection_is_current(Some(1), Some(1)));
+    assert!(!agent_snapshot_projection_is_current(Some(1), None));
+    assert!(!agent_snapshot_projection_is_current(Some(1), Some(2)));
+    assert!(!agent_snapshot_projection_is_current(None, None));
+}
+
 /// 用户切换 compact 工具或主机时即使共享句柄未变，迟到 Ready 也不能越过已推进的导航代次。
 ///
 /// @author kongweiguang

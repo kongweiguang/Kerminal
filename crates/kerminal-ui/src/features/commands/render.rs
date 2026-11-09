@@ -16,7 +16,7 @@ use gpui_kit::{
 
 use crate::theme::ThemeTokens;
 
-use super::{CommandsSection, CommandsView, SendOperationKind};
+use super::{CommandsSection, CommandsView, SendOperationKind, SnippetHostMoveRequested};
 use kerminal_domain::sessions::SessionTarget;
 
 #[path = "render/composer.rs"]
@@ -108,6 +108,7 @@ impl Render for CommandsView {
 impl CommandsView {
     /// 片段刷新固定在标题栏，用同尺寸旋转图标反馈请求，避免临时文字改变内容区几何。
     /// 其它命令页维持原有目标和反馈，不扩大本次片段面板的改动范围。
+    /// 宿主切换按钮只发送方向，Root 必须复核实际挂载，不能把可能延迟的布局投影当成事实。
     ///
     /// @author kongweiguang
     fn render_header(&self, theme: ThemeTokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -182,7 +183,31 @@ impl CommandsView {
                 )
             })
             .when(self.section == CommandsSection::Snippets, |bar| {
+                let (id, icon, label, target) = if self.compact_layout {
+                    (
+                        "commands-move-to-center",
+                        IconName::Maximize2,
+                        crate::locale::text("移到工作区", "Move to workspace"),
+                        SnippetHostMoveRequested::Center,
+                    )
+                } else {
+                    (
+                        "commands-move-to-rail",
+                        IconName::PanelRight,
+                        crate::locale::text("移到工具栏", "Move to tool rail"),
+                        SnippetHostMoveRequested::ToolRail,
+                    )
+                };
                 bar.child(
+                    Button::new(id)
+                        .compact()
+                        .ghost()
+                        .icon(icon)
+                        .accessibility_label(label.clone())
+                        .tooltip(label)
+                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.emit(target))),
+                )
+                .child(
                     Button::new("snippet-catalog-refresh")
                         .compact()
                         .ghost()

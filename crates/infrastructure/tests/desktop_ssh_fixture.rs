@@ -215,7 +215,6 @@ async fn generate_fixture() -> FixtureResult<FixtureOutput> {
                 route: Default::default(),
                 serial: None,
                 tags: vec!["desktop-acceptance".to_owned()],
-                is_favorite: false,
                 sort_order: 90,
                 connect_timeout_ms: 30_000,
                 keepalive_interval_ms: Some(60_000),

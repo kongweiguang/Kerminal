@@ -4,6 +4,10 @@
 
 use super::*;
 
+// 复用同一内存终端及 Root，检查布局变化期间的右栏绑定与文件读取次数。
+#[path = "root_sidebar_context.rs"]
+mod sidebar_context;
+
 use std::{collections::BTreeMap, ffi::OsString};
 
 use kerminal_application::sessions::{

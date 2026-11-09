@@ -1,0 +1,13 @@
+{
+  "root": {
+    "title": "%settings.title%",
+    "children": [
+      {
+        "schema": "schemas/settings.json",
+        "type": "form"
+      }
+    ],
+    "type": "section"
+  },
+  "schema": 1
+}

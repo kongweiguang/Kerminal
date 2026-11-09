@@ -83,7 +83,6 @@ fn remote_draft(id: HostId, group_id: &str) -> HostDraft {
         route: Default::default(),
         serial: None,
         tags: vec!["release".to_owned()],
-        is_favorite: true,
         sort_order: 17,
         connect_timeout_ms: 45_000,
         keepalive_interval_ms: Some(60_000),

@@ -229,7 +229,7 @@ fn remote_menu_new_connection_uses_clicked_group(app: &mut TestAppContext) {
             Some("group:valid"),
         ),
     ] {
-        let row = super::host("fixture", "fixture.invalid", source_group, false, &[]);
+        let row = super::host("fixture", "fixture.invalid", source_group, &[]);
         let selector = format!("host-navigation-host-{}", row.id.as_str());
         let events = Rc::new(RefCell::new(Vec::new()));
         let (_runtime, _navigation, _subscription, visual) = fixture(
@@ -272,7 +272,7 @@ fn remote_menu_new_connection_uses_clicked_group(app: &mut TestAppContext) {
 fn background_menu_marks_group_not_explicit(app: &mut TestAppContext) {
     init(app);
     let events = Rc::new(RefCell::new(Vec::new()));
-    let row = super::host("fixture", "fixture.invalid", None, false, &[]);
+    let row = super::host("fixture", "fixture.invalid", None, &[]);
     let (_runtime, _navigation, _subscription, visual) = fixture(
         app,
         vec![row],
@@ -322,7 +322,7 @@ fn protocol_menu_omits_containers_and_routes_sftp_copy(app: &mut TestAppContext)
         RemoteProtocol::Sftp,
         RemoteProtocol::Serial,
     ] {
-        let mut row = super::host("fixture", "fixture.invalid", None, false, &[]);
+        let mut row = super::host("fixture", "fixture.invalid", None, &[]);
         row.protocol = protocol;
         let id = row.id.clone();
         let selector = format!("host-navigation-host-{}", id.as_str());
@@ -368,7 +368,7 @@ fn protocol_menu_omits_containers_and_routes_sftp_copy(app: &mut TestAppContext)
 #[gpui_kit::test]
 fn external_host_selection_rejects_stale_snapshot(app: &mut TestAppContext) {
     init(app);
-    let row = super::host("fixture", "fixture.invalid", None, false, &[]);
+    let row = super::host("fixture", "fixture.invalid", None, &[]);
     let host_id = row.id.clone();
     let events = Rc::new(RefCell::new(Vec::new()));
     let (runtime, navigation, _subscription, visual) = fixture(
@@ -421,7 +421,7 @@ fn external_host_selection_rejects_stale_snapshot(app: &mut TestAppContext) {
 #[gpui_kit::test]
 fn readonly_host_menu_hides_configuration_writes(app: &mut TestAppContext) {
     init(app);
-    let row = super::host("fixture", "fixture.invalid", None, false, &[]);
+    let row = super::host("fixture", "fixture.invalid", None, &[]);
     let selector = format!("host-navigation-host-{}", row.id.as_str());
     let events = Rc::new(RefCell::new(Vec::new()));
     let (_runtime, _navigation, _subscription, visual) = fixture(
@@ -494,7 +494,7 @@ fn local_menu_new_connection_uses_its_displayed_group(app: &mut TestAppContext) 
 #[gpui_kit::test]
 fn pinned_container_menu_keeps_details_files_and_remove_on_clicked_pin(app: &mut TestAppContext) {
     init(app);
-    let row = super::host("fixture", "fixture.invalid", None, false, &[]);
+    let row = super::host("fixture", "fixture.invalid", None, &[]);
     let pin = super::WorkspacePinnedContainer {
         target: super::ContainerTarget {
             host_id: Some(row.id.clone()),

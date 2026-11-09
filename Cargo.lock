@@ -4969,6 +4969,7 @@ version = "0.4.0-beta.5"
 dependencies = [
  "async-trait",
  "kerminal-domain",
+ "kerminal-plugin-protocol",
  "kerminal-terminal",
  "percent-encoding",
  "regex",
@@ -5000,6 +5001,7 @@ dependencies = [
  "kerminal-domain",
  "kerminal-infrastructure",
  "kerminal-mcp",
+ "kerminal-plugin-protocol",
  "kerminal-terminal",
  "kerminal-ui",
  "rfd",
@@ -5012,17 +5014,20 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "windows 0.62.2",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
 name = "kerminal-domain"
 version = "0.4.0-beta.5"
 dependencies = [
+ "semver",
  "serde",
  "serde_json",
  "uuid",
@@ -5045,6 +5050,7 @@ dependencies = [
  "justelnet-core",
  "kerminal-application",
  "kerminal-domain",
+ "kerminal-plugin-protocol",
  "kerminal-terminal",
  "keyring",
  "libc",
@@ -5163,6 +5169,7 @@ dependencies = [
  "image",
  "kerminal-application",
  "kerminal-domain",
+ "kerminal-plugin-protocol",
  "kerminal-terminal",
  "linkify",
  "objc2 0.6.5",
@@ -5174,6 +5181,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "unicode-segmentation",
  "unicode-width 0.2.2",

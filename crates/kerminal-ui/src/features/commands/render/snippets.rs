@@ -970,14 +970,16 @@ impl CommandsView {
                 .flex_col()
                 .border_b_1()
                 .border_color(theme.border)
-                .when(selected, |row| row.bg(theme.selected.opacity(0.22)))
+                .when(selected, |row| row.bg(theme.surface_selected()))
                 .child(
                     div()
                         .w_full()
                         .min_w(px(0.))
                         .flex()
                         .items_center()
-                        .hover(|style| style.bg(theme.hover))
+                        .when(!selected, |row| {
+                            row.hover(|style| style.bg(theme.surface_hover()))
+                        })
                         .child(
                             Button::new(format!(
                                 "snippet-favorite-{}-{}",
@@ -1131,7 +1133,7 @@ impl CommandsView {
             .py_2()
             .border_b_1()
             .border_color(theme.border)
-            .when(selected, |row| row.bg(theme.selected.opacity(0.22)))
+            .when(selected, |row| row.bg(theme.surface_selected()))
             .child(
                 div()
                     .w_full()

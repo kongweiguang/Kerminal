@@ -1,7 +1,16 @@
-//! 原生技术探针的 GPUI 边界；业务插件装配留给后续阶段。
+//! 内置插件的 GPUI 工厂边界；数据贡献仍定义在 application。
 //!
 //! @author kongweiguang
 
+pub mod actions;
+pub(crate) mod builtin_content;
+pub mod content;
+pub mod external;
+pub mod external_host_form;
+pub mod external_settings;
+pub(crate) mod host_api;
+pub mod host_forms;
 #[cfg(feature = "acceptance-metrics")]
 pub mod native_probe;
+pub mod tools;
 pub mod webview;

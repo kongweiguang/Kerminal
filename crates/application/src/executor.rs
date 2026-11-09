@@ -17,6 +17,23 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{AppError, AppResult};
 
+/// 在共享执行器任务内部等待已有资源回收；调用者保留超时后的资源 owner 和恢复入口。
+/// 超时实现留在应用层，UI 无需依赖异步运行时或自行创建计时器。
+///
+/// @author kongweiguang
+pub async fn await_until<T>(
+    deadline: std::time::Instant,
+    operation: &'static str,
+    future: impl Future<Output = AppResult<T>>,
+) -> AppResult<T> {
+    if std::time::Instant::now() >= deadline {
+        return Err(AppError::Timeout { operation });
+    }
+    timeout_at(Instant::from_std(deadline), future)
+        .await
+        .map_err(|_| AppError::Timeout { operation })?
+}
+
 /// 可克隆的异步执行入口；提交任务均进入共享 tracker 并支持协作取消。
 #[derive(Clone)]
 pub struct ApplicationTaskExecutor {

@@ -99,8 +99,12 @@ impl HostConfigurationRepository {
                 .read(ConfigDocumentPath::Host(id.as_str().to_owned()))
                 .await?
                 .ok_or_else(|| AppError::conflict("主机目录在读取期间发生变化，请刷新后重试"))?;
+            self.store
+                .validate_host_document(id.as_str(), &document.source)?;
             if Self::document_is_local(&document)? {
                 hosts.push(Self::decode_local_host(document, &id)?);
+            } else if Self::document_is_plugin(&document)? {
+                self.decode_plugin_host(document, &id)?;
             } else {
                 Self::decode_host(document, &id)?;
             }
@@ -124,7 +128,13 @@ impl HostConfigurationRepository {
                 Self::decode_local_host(document, id).map(Some)
             }
             Some(document) => {
-                Self::decode_host(document, id)?;
+                self.store
+                    .validate_host_document(id.as_str(), &document.source)?;
+                if Self::document_is_plugin(&document)? {
+                    self.decode_plugin_host(document, id)?;
+                } else {
+                    Self::decode_host(document, id)?;
+                }
                 Ok(None)
             }
             None => Ok(None),

@@ -446,13 +446,17 @@ pub(super) fn tab_action_menu(
     }
 }
 
-/// 标签类型按真实投影显示，未知 future 类型保留名称且不伪装为可关闭终端。
+/// 插件标签和不可用类型分别标识，避免把已注册内容误称为不支持。
+/// @author kongweiguang
 pub(super) fn tab_kind_label(kind: &WorkspaceTabKind) -> SharedString {
     match kind {
         WorkspaceTabKind::Terminal => crate::locale::text("终端", "Terminal"),
         WorkspaceTabKind::SftpTransfer => crate::locale::text("传输", "Transfer"),
         WorkspaceTabKind::SftpWorkbench => crate::locale::text("SFTP", "SFTP"),
         WorkspaceTabKind::WorkspaceFile => crate::locale::text("文件", "File"),
+        WorkspaceTabKind::Extension(name) => {
+            crate::locale::text(format!("扩展：{name}"), format!("Extension: {name}"))
+        }
         WorkspaceTabKind::Unsupported(name) => {
             crate::locale::text(format!("不支持：{name}"), format!("Unsupported: {name}"))
         }

@@ -446,7 +446,7 @@ enum TerminalStatusTone {
 }
 
 impl Render for AgentsPanel {
-    /// 根容器复用 main 的 Agent 终端表面，并投影局部工具面板色阶供所有子视图共用。
+    /// 根容器透出唯一工具宿主的材质，Agent 终端及卡片继续使用各自的内容表面。
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ThemeTokens::current(window, cx).for_tool_panel();
@@ -458,7 +458,7 @@ impl Render for AgentsPanel {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(theme.agent_surface())
+            .bg(theme.tool_panel_surface)
             .text_color(theme.foreground);
         if terminal_attached {
             panel = panel.child(self.render_header(theme, terminal_attached, cx));
@@ -1693,7 +1693,7 @@ impl AgentsPanel {
                     .overflow_y_scroll()
                     .p_2()
                     .rounded_md()
-                    .bg(theme.secondary)
+                    .bg(theme.content_surface())
                     .flex()
                     .items_center()
                     .justify_between()
@@ -1738,7 +1738,7 @@ impl AgentsPanel {
             .rounded_md()
             .border_1()
             .border_color(theme.border)
-            .bg(theme.panel);
+            .bg(theme.content_surface());
         for view in &self.sessions {
             if self
                 .visible_session_ids
@@ -1966,7 +1966,10 @@ impl AgentsPanel {
             .flex()
             .items_start()
             .gap_2()
-            .when(active, |element| element.bg(theme.hover))
+            .when(active, |element| element.bg(theme.surface_selected()))
+            .when(!active, |element| {
+                element.hover(|style| style.bg(theme.surface_hover()))
+            })
             .child(primary.absolute().inset_0().size_full())
             .child(
                 div()
@@ -2045,7 +2048,7 @@ impl AgentsPanel {
                 .rounded_md()
                 .border_1()
                 .border_color(theme.border)
-                .bg(theme.secondary)
+                .bg(theme.content_surface())
                 .flex()
                 .flex_col()
                 .items_center()
@@ -2059,7 +2062,7 @@ impl AgentsPanel {
                 .rounded_lg()
                 .border_1()
                 .border_color(theme.border)
-                .bg(theme.panel);
+                .bg(theme.content_surface());
         }
         empty_state = empty_state.child(
             div()
@@ -2121,7 +2124,7 @@ impl AgentsPanel {
             .gap_1()
             .rounded_md()
             .overflow_hidden()
-            .bg(theme.secondary)
+            .bg(theme.content_surface())
             .child(
                 div()
                     .w_full()

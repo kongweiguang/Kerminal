@@ -14,7 +14,8 @@ use kerminal_application::{
     AppError, AppResult,
     connections::{
         ChannelLane, ConnectionIntent, OpenSftpRequest, RemoteConnectionLease,
-        RemoteConnectionService, SftpChannelHandle, management::HostManagementService,
+        RemoteConnectionService, SftpChannelHandle,
+        management::{HostManagementService, HostSftpOptions},
     },
     files::FileAccessProvider,
 };
@@ -96,7 +97,9 @@ impl SftpFileProvider {
                 _ = cancellation.cancelled() => return Err(AppError::cancelled("SFTP 文件操作已取消")),
                 host = hosts.load_host(host_id) => host?,
             };
-            if host.is_some_and(|host| !host.sftp_options.enabled) {
+            if host.is_some_and(|host| {
+                !HostSftpOptions::enabled_for(host.protocol, host.sftp_options.enabled)
+            }) {
                 return Err(AppError::unsupported(
                     "此主机已关闭 SFTP，请在连接的传输设置中启用后重试",
                 ));

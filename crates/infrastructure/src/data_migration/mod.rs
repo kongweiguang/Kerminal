@@ -20,10 +20,12 @@ mod workspace;
 use std::{
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use kerminal_application::{
     AppError, AppResult,
+    connections::host_types::HostConfigurationCatalog,
     data_migration::{
         DataMigrationInspection, DataMigrationOutcome, DataMigrationReadiness, DataMigrationReport,
         DataMigrationRepository, ProfileImportPreview,
@@ -72,6 +74,7 @@ pub struct FileDataMigrationRepository {
     storage: StorageCoordinator,
     legacy_window_state: Option<PathBuf>,
     legacy_instance_check: bool,
+    host_types: Option<Arc<HostConfigurationCatalog>>,
 }
 
 impl FileDataMigrationRepository {
@@ -83,6 +86,7 @@ impl FileDataMigrationRepository {
             root,
             legacy_window_state: None,
             legacy_instance_check: false,
+            host_types: None,
         }
     }
 
@@ -97,18 +101,30 @@ impl FileDataMigrationRepository {
         self.legacy_instance_check = true;
         self
     }
+
+    /// 迁移必须在普通配置扫描前拿到同一目录，避免把已安装插件当成未知提供方。
+    pub fn with_host_types(mut self, host_types: Arc<HostConfigurationCatalog>) -> Self {
+        self.host_types = Some(host_types);
+        self
+    }
 }
 
 impl DataMigrationRepository for FileDataMigrationRepository {
     /// 只使用只读 scanner；不会创建根目录、共享锁、事务文件或 SQLite 辅助文件。
     fn inspect(&self) -> AppResult<DataMigrationInspection> {
-        inspection::inspect_root(&self.root, self.legacy_window_state.as_deref())
+        self.ensure_host_types()?;
+        inspection::inspect_root(
+            &self.root,
+            self.legacy_window_state.as_deref(),
+            self.host_types.as_deref(),
+        )
     }
 
     /// apply 先取得共享根锁并重扫；current 根只允许按冻结正文更新指南，不进入业务旧格式 planner。
     ///
     /// @author kongweiguang
     fn migrate(&self) -> AppResult<DataMigrationReport> {
+        self.ensure_host_types()?;
         if let Some(fast) = inspection::inspect_current_fast_path(&self.root)? {
             if fast.readiness == DataMigrationReadiness::Current
                 && !fast.recovery_pending
@@ -120,7 +136,11 @@ impl DataMigrationRepository for FileDataMigrationRepository {
                 return Err(AppError::conflict("用户数据迁移预检存在阻断项"));
             }
         }
-        let initial = inspection::inspect_root(&self.root, self.legacy_window_state.as_deref())?;
+        let initial = inspection::inspect_root(
+            &self.root,
+            self.legacy_window_state.as_deref(),
+            self.host_types.as_deref(),
+        )?;
         if initial.readiness == DataMigrationReadiness::Current
             && !initial.recovery_pending
             && let Some(report) = self.migrate_current_guide_only()?
@@ -134,7 +154,11 @@ impl DataMigrationRepository for FileDataMigrationRepository {
             .storage
             .lock()
             .map_err(|_| AppError::infrastructure("用户数据迁移存储锁不可用"))?;
-        let inspection = inspection::inspect_root(&self.root, self.legacy_window_state.as_deref())?;
+        let inspection = inspection::inspect_root(
+            &self.root,
+            self.legacy_window_state.as_deref(),
+            self.host_types.as_deref(),
+        )?;
         match inspection.readiness {
             DataMigrationReadiness::Current if !inspection.recovery_pending => {
                 Ok(already_current_report())
@@ -150,13 +174,19 @@ impl DataMigrationRepository for FileDataMigrationRepository {
                 {
                     offline_guard::ensure_legacy_instance_stopped()?;
                 }
-                transaction::apply_locked(&self.root, &self.legacy_window_state, inspection)
+                transaction::apply_locked(
+                    &self.root,
+                    &self.legacy_window_state,
+                    inspection,
+                    self.host_types.as_deref(),
+                )
             }
         }
     }
 
     /// 预演仅读取两个指定根并复用实际规划，随机密钥仅在内存中生成并随计划清除。
     fn preview_legacy_profiles(&self, source_root: &Path) -> AppResult<ProfileImportPreview> {
+        self.ensure_host_types()?;
         let source = self.validate_import_roots(source_root)?;
         let plan = profile_import::plan_profile_import(&source, &self.root)?;
         inspection::validate_edits(&self.root, &plan.edits)
@@ -166,6 +196,7 @@ impl DataMigrationRepository for FileDataMigrationRepository {
 
     /// 同时持有来源和目标的协作锁，按目标当前状态重新规划并通过单一事务提交。
     fn import_legacy_profiles(&self, source_root: &Path) -> AppResult<DataMigrationReport> {
+        self.ensure_host_types()?;
         let source = self.validate_import_roots(source_root)?;
         let source_storage = StorageCoordinator::new(source.clone());
         let _source_guard = source_storage
@@ -187,6 +218,14 @@ impl DataMigrationRepository for FileDataMigrationRepository {
 }
 
 impl FileDataMigrationRepository {
+    /// 在任何迁移扫描或写入前验证内置 codec 身份，与配置仓储使用相同门禁。
+    fn ensure_host_types(&self) -> AppResult<()> {
+        if let Some(host_types) = self.host_types.as_deref() {
+            crate::configuration::ensure_builtin_types(host_types)?;
+        }
+        Ok(())
+    }
+
     /// 仅允许旧来源与已完整迁移的目标；来源和目标解析为同一根时直接拒绝。
     fn validate_import_roots(&self, source_root: &Path) -> AppResult<PathBuf> {
         let source_metadata = std::fs::symlink_metadata(source_root)
@@ -210,7 +249,8 @@ impl FileDataMigrationRepository {
                 return Err(AppError::invalid("导入来源的数据格式不受支持"));
             }
         }
-        let source_inspection = inspection::inspect_root(&source, None)?;
+        let source_inspection =
+            inspection::inspect_root(&source, None, self.host_types.as_deref())?;
         if source_inspection.readiness == DataMigrationReadiness::Blocked
             || source_inspection.recovery_pending
         {
@@ -221,9 +261,15 @@ impl FileDataMigrationRepository {
         if current.readiness != DataMigrationReadiness::Current || current.recovery_pending {
             return Err(AppError::conflict("导入目标需要先完成现有迁移或恢复"));
         }
-        if crate::configuration::inspect_current_configuration(&self.root).mode
-            != kerminal_domain::preferences::ConfigurationMode::ReadWrite
-        {
+        let target_recovery = match self.host_types.as_deref() {
+            Some(host_types) => {
+                crate::configuration::inspect_current_configuration_with_host_types(
+                    &self.root, host_types,
+                )
+            }
+            None => crate::configuration::inspect_current_configuration(&self.root),
+        };
+        if target_recovery.mode != kerminal_domain::preferences::ConfigurationMode::ReadWrite {
             return Err(AppError::conflict("导入目标配置需要先恢复"));
         }
         Ok(source)

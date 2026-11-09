@@ -130,7 +130,7 @@ impl RootView {
     }
 }
 
-/// 首次载入时投影持久活动文件标签；只在既有用户导航/焦点代次仍为初值时使用默认终端页。
+/// 首次载入时投影持久活动的非终端标签；扩展类型交由窗口内容宿主恢复，不推断终端能力。
 /// 这避免异步恢复覆盖启动期间的显式导航；资源仍由原 TabId 的文件恢复流程拥有，不创建会话或猜目标。
 ///
 /// @author kongweiguang
@@ -150,6 +150,7 @@ fn initial_workspace_file_center_panel(
     match active_tab? {
         WorkspaceSessionTab::SftpTransfer { .. } => Some(CenterPanel::Files),
         WorkspaceSessionTab::WorkspaceFile { .. } => Some(CenterPanel::Editor),
+        WorkspaceSessionTab::Extension { .. } => Some(CenterPanel::Contributed),
         WorkspaceSessionTab::Terminal { .. } | WorkspaceSessionTab::Unsupported { .. } => None,
     }
 }
@@ -158,6 +159,7 @@ fn initial_workspace_file_center_panel(
 impl RootView {
     /// 保留仓储分类并只为有效 v3 创建恢复状态；活跃 pane 首次获得真实画布尺寸后才启动恢复 PTY。
     /// 活动文件标签仅恢复既有中央投影，启动期间的显式导航优先，不在此另建文件资源或改绑目标。
+    /// 扩展标签只排入所属窗口的恢复回调，未激活标签继续保留纯数据状态。
     ///
     /// @author kongweiguang
     pub(super) fn install_workspace_load(
@@ -248,6 +250,7 @@ impl RootView {
         self.refresh_workspace_views(cx);
 
         // 只有活动 tab 的 Restoring 画布首帧测量会进入恢复；隐藏 pane 保持无资源的 RestorePending。
+        self.restore_active_plugin_tab(cx);
     }
 
     /// 仅在首次工作区载入后且窗口仍由启动焦点拥有时提交既有 pane 焦点意图；不创建或重连 session。

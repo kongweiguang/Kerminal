@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kerminal_application::configuration_changes::{
     ConfigurationChangeEvent, ConfigurationChangeRepository,
 };
+use kerminal_application::connections::host_types::HostConfigurationCatalog;
 use kerminal_application::preferences::{
     CONFIG_GUIDE, CONFIG_GUIDE_REVISION, ConfigurationGuideStatus, ConfigurationRepository,
     ConfigurationValidationReport, ConfigurationValidationRepository, ConfigurationValidationScope,
@@ -30,13 +31,20 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio::task;
 
-use crate::storage::{AtomicCommitError, CommitMode, StorageCoordinator, commit_staged_file};
+use crate::storage::{
+    AtomicCommitError, CommitMode, StorageCoordinator, StorageLock, commit_staged_file,
+};
 
 mod host_group_transaction;
+mod host_types;
 mod local_host_recovery;
+mod plugin_settings;
 mod profile_default_transaction;
 mod settings;
 mod validation;
+
+pub(crate) use host_types::ensure_builtin_types;
+pub use host_types::host_configuration_catalog;
 
 pub(crate) const CONFIG_GUIDE_MARKER_PREFIX: &str =
     "<!-- kerminal-generated-config-guide revision=";
@@ -53,6 +61,7 @@ struct ConfigurationStoreInner {
     changes: broadcast::Sender<ConfigurationChangeEvent>,
     guide_status: ConfigurationGuideStatus,
     storage: StorageCoordinator,
+    host_types: Arc<HostConfigurationCatalog>,
 }
 
 /// 用户数据根不可用时返回启动错误；源错误保留给桌面启动诊断，文案不含绝对路径。
@@ -70,8 +79,36 @@ impl ConfigurationStore {
             .map_err(|source| AppError::configuration_corrupt("本地主机配置").with_source(source))
     }
 
+    /// 外部编辑可能先于 watcher 被读取，主机投影必须再次使用同一冻结目录校验。
+    pub(crate) fn validate_host_document(&self, id: &str, source: &str) -> AppResult<()> {
+        validation::validate_document_with_host_types(
+            &ConfigDocumentPath::Host(id.to_owned()),
+            source,
+            &self.inner.host_types,
+        )
+        .map_err(|source| AppError::configuration_corrupt("主机配置").with_source(source))
+    }
+
     /// 创建用户数据根并恢复 profile、host/group journal；损坏文件保留原文并阻断写入。
     pub fn initialize(root: impl AsRef<Path>) -> Result<Self, ConfigurationStoreInitError> {
+        let host_types = host_configuration_catalog(Vec::new()).map_err(|source| {
+            ConfigurationStoreInitError {
+                source: io::Error::other(source.to_string()),
+            }
+        })?;
+        Self::initialize_with_host_types(root, host_types)
+    }
+
+    /// 在恢复 journal 和扫描文件之前冻结全部 codec，避免首次读取与后续校验使用不同规则。
+    pub fn initialize_with_host_types(
+        root: impl AsRef<Path>,
+        host_types: Arc<HostConfigurationCatalog>,
+    ) -> Result<Self, ConfigurationStoreInitError> {
+        host_types::ensure_builtin_types(&host_types).map_err(|source| {
+            ConfigurationStoreInitError {
+                source: io::Error::other(source.to_string()),
+            }
+        })?;
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|source| ConfigurationStoreInitError { source })?;
         let storage = StorageCoordinator::new(root.clone());
@@ -79,8 +116,9 @@ impl ConfigurationStore {
         let profile_transaction_recovery =
             profile_default_transaction::recover_profile_default_transaction(&root, &storage);
         let host_group_transaction_recovery =
-            host_group_transaction::recover_host_group_transaction(&root, &storage);
-        let mut recovery = validation::inspect_startup_configuration(&root);
+            host_group_transaction::recover_host_group_transaction(&root, &storage, &host_types);
+        let mut recovery =
+            validation::inspect_startup_configuration_with_host_types(&root, &host_types);
         if profile_transaction_recovery.is_err() {
             recovery.issues.push(unreadable_issue(
                 ".storage-transactions/profile-default.json".to_owned(),
@@ -105,6 +143,7 @@ impl ConfigurationStore {
                 changes,
                 guide_status,
                 storage,
+                host_types,
             }),
         })
     }
@@ -118,11 +157,27 @@ impl ConfigurationStore {
         root: impl AsRef<Path>,
         scope: ConfigurationValidationScope,
     ) -> AppResult<ConfigurationValidationReport> {
+        let host_types = host_configuration_catalog(Vec::new())?;
+        Self::validate_root_with_host_types(root, scope, &host_types)
+    }
+
+    /// 离线校验复用组合根冻结的目录，读取扩展字段时与正常启动保持同样判定。
+    pub fn validate_root_with_host_types(
+        root: impl AsRef<Path>,
+        scope: ConfigurationValidationScope,
+        host_types: &HostConfigurationCatalog,
+    ) -> AppResult<ConfigurationValidationReport> {
+        host_types::ensure_builtin_types(host_types)?;
         let root = root.as_ref();
         if root.as_os_str().is_empty() {
             return Err(AppError::invalid("配置根目录不能为空"));
         }
-        validate_configuration_root_read_only(root, scope)
+        validate_configuration_root_read_only(root, scope, host_types)
+    }
+
+    /// 暴露不可变目录给仓储投影，避免为同一个配置根重新注册 codec。
+    pub fn host_types(&self) -> &Arc<HostConfigurationCatalog> {
+        &self.inner.host_types
     }
 
     /// 暴露同一个已解析根目录，供 vault、SQLite 与其它文件 adapter 共用路径布局。
@@ -148,7 +203,10 @@ impl ConfigurationStore {
             self.inner.storage.lock().map_err(|source| {
                 AppError::infrastructure_with_source("无法锁定配置存储", source)
             })?;
-        let mut recovery = validation::inspect_startup_configuration(&self.inner.root);
+        let mut recovery = validation::inspect_startup_configuration_with_host_types(
+            &self.inner.root,
+            &self.inner.host_types,
+        );
         match fs::symlink_metadata(
             self.inner
                 .root
@@ -247,6 +305,29 @@ impl ConfigurationStore {
         self.read_document_unlocked(path)
     }
 
+    /// 凭据清理持有同一存储锁时复用读取与事务门禁，避免再次加锁造成死锁。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn read_host_document_locked(
+        &self,
+        lock: &StorageLock<'_>,
+        host_id: &str,
+    ) -> AppResult<Option<ConfigDocument>> {
+        self.ensure_host_documents_readable_locked(lock)?;
+        self.read_document_unlocked(ConfigDocumentPath::Host(host_id.to_owned()))
+    }
+
+    /// 空主机目录也必须检查配置事务，不能把未完成事务误认为不存在引用。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn ensure_host_documents_readable_locked(
+        &self,
+        _lock: &StorageLock<'_>,
+    ) -> AppResult<()> {
+        self.ensure_configuration_transactions_absent()?;
+        Ok(())
+    }
+
     /// 在共享锁内执行只读配置 validator；坏文档作为报告返回，不触发写入或恢复覆盖。
     fn validate_configuration_document(
         &self,
@@ -256,7 +337,7 @@ impl ConfigurationStore {
             self.inner.storage.lock().map_err(|source| {
                 AppError::infrastructure_with_source("无法锁定配置存储", source)
             })?;
-        validate_configuration_root_read_only(&self.inner.root, scope)
+        validate_configuration_root_read_only(&self.inner.root, scope, &self.inner.host_types)
     }
 
     /// 调用方已持有共享存储锁时读取单份原始文档，避免递归取得同一把锁。
@@ -576,7 +657,7 @@ impl ConfigurationStore {
         expected_revision: Option<ConfigRevision>,
     ) -> AppResult<ConfigRevision> {
         self.ensure_writable()?;
-        validation::validate_document(&path, &source)
+        validation::validate_document_with_host_types(&path, &source, &self.inner.host_types)
             .map_err(|error| AppError::configuration_corrupt("配置文档").with_source(error))?;
         let relative_path = relative_path(&path)?;
         let _lock =
@@ -819,9 +900,10 @@ impl ProfileRepository for ConfigurationStore {
 fn validate_configuration_root_read_only(
     root: &Path,
     scope: ConfigurationValidationScope,
+    host_types: &HostConfigurationCatalog,
 ) -> AppResult<ConfigurationValidationReport> {
     ensure_configuration_transactions_absent_at_root(root)?;
-    validation::validate_configuration_root(root, scope)
+    validation::validate_configuration_root(root, scope, host_types)
 }
 
 /// 以固定路径检查两类未完成配置事务，不创建目录、锁或恢复材料。
@@ -1031,6 +1113,14 @@ pub(crate) fn inspect_current_configuration(root: &Path) -> ConfigurationRecover
     validation::inspect_startup_configuration(root)
 }
 
+/// 迁移预检沿用启动时冻结的类型目录，使已安装插件的损坏配置不能被误判为可迁移。
+pub(crate) fn inspect_current_configuration_with_host_types(
+    root: &Path,
+    host_types: &HostConfigurationCatalog,
+) -> ConfigurationRecoveryState {
+    validation::inspect_startup_configuration_with_host_types(root, host_types)
+}
+
 /// 对 planner 生成的单个文档复用同一 schema validator，避免迁移路径复制字段规则。
 ///
 /// @author kongweiguang
@@ -1039,6 +1129,16 @@ pub(crate) fn validate_current_configuration_document(
     source: &str,
 ) -> AppResult<()> {
     validation::validate_document(path, source)
+        .map_err(|_| AppError::invalid("配置迁移结果不符合当前文档格式"))
+}
+
+/// 迁移输出与普通配置写入共用插件 codec，避免迁移阶段放过损坏的已安装类型。
+pub(crate) fn validate_current_configuration_document_with_host_types(
+    path: &ConfigDocumentPath,
+    source: &str,
+    host_types: &HostConfigurationCatalog,
+) -> AppResult<()> {
+    validation::validate_document_with_host_types(path, source, host_types)
         .map_err(|_| AppError::invalid("配置迁移结果不符合当前文档格式"))
 }
 
@@ -1118,6 +1218,9 @@ fn unix_millis_string() -> String {
 }
 
 /// 同目录 staging 后二次验证 revision，再以 no-clobber 或替换原语提交完整文件。
+/// 未知提交保留仍存在的暂存字节供核对；只清理确定未提交的失败，不把未知写入自动重放。
+///
+/// @author kongweiguang
 fn atomic_replace(
     root: &Path,
     relative: &Path,
@@ -1186,7 +1289,9 @@ fn atomic_replace(
         })?;
         Ok(())
     })();
-    if write_result.is_err() {
+    if write_result.as_ref().is_err_and(|error| {
+        error.public_code() != kerminal_application::PublicErrorCode::OutcomeUnknown
+    }) {
         let _ = fs::remove_file(&temp_path);
     }
     write_result

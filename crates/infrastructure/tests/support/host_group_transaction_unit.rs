@@ -268,7 +268,7 @@ fn startup_replays_partially_applied_group_journal() {
     )
     .expect("模拟崩溃前已提交第一个 host");
 
-    recover_host_group_transaction(temp.path(), &store.inner.storage)
+    recover_host_group_transaction(temp.path(), &store.inner.storage, &store.inner.host_types)
         .expect("启动恢复补完 groups 并清理 journal");
 
     assert_eq!(

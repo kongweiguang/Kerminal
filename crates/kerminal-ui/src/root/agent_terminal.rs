@@ -7,6 +7,7 @@ use std::sync::Arc;
 use gpui_kit::{AppContext as _, Context, FocusHandle, Window};
 use kerminal_application::{
     AppError, AppResult, PublicErrorCode, SessionService,
+    preferences::ToolRailToolId,
     sessions::{SessionChangeKind, SessionFilter, TerminalCommandContext, UiSessionBinding},
 };
 use kerminal_domain::{
@@ -131,6 +132,13 @@ fn agent_frame_acceptance(
     }
 }
 
+/// 画布结果只属于发起读取时的可见投影，隐藏再显示后必须重新读取。
+///
+/// @author kongweiguang
+fn agent_snapshot_projection_is_current(captured: Option<u64>, current: Option<u64>) -> bool {
+    captured.is_some() && captured == current
+}
+
 /// 按 theme revision 去重配色写入；新 watcher 和主题变更仍各自同步一次。
 ///
 /// @author kongweiguang
@@ -163,7 +171,7 @@ async fn read_agent_terminal_frame(
     sessions: Arc<dyn SessionService>,
     agent_session_id: AgentSessionId,
     session_id: SessionId,
-    request: RenderSnapshotRequest,
+    request: Option<RenderSnapshotRequest>,
     refresh_lifecycle: bool,
     palette: Option<TerminalPalette>,
 ) -> AppResult<AgentTerminalFrame> {
@@ -202,13 +210,15 @@ async fn read_agent_terminal_frame(
             Err(error) => return Err(error),
         }
     }
-    match sessions.render_snapshot(session_id.clone(), request).await {
-        Ok(snapshot) => frame.snapshot = Some(snapshot),
-        Err(error) if error.public_code() == PublicErrorCode::NotFound => {
-            frame.lifecycle = Some(SessionLifecycle::Closed);
-            return Ok(frame);
+    if let Some(request) = request {
+        match sessions.render_snapshot(session_id.clone(), request).await {
+            Ok(snapshot) => frame.snapshot = Some(snapshot),
+            Err(error) if error.public_code() == PublicErrorCode::NotFound => {
+                frame.lifecycle = Some(SessionLifecycle::Closed);
+                return Ok(frame);
+            }
+            Err(error) => frame.failure = Some(error),
         }
-        Err(error) => frame.failure = Some(error),
     }
     if lifecycle.is_some_and(agent_lifecycle_allows_input) {
         match sessions.terminal_command_context(session_id.clone()).await {
@@ -723,7 +733,14 @@ impl RootView {
                 }
             };
             let mut refresh_lifecycle = true;
-            let mut request = Some(RenderSnapshotRequest::default());
+            let mut request = this
+                .update(cx, |root, _| {
+                    root.plugin_tools
+                        .projected_tool_active(ToolRailToolId::AgentLauncher)
+                        .then(RenderSnapshotRequest::default)
+                })
+                .ok()
+                .flatten();
             let mut applied_palette_generation = None;
             loop {
                 if refresh_lifecycle || request.is_some() {
@@ -748,7 +765,17 @@ impl RootView {
                     let frame_services = services.clone();
                     let frame_agent = agent_session_id.clone();
                     let frame_id = session_id.clone();
-                    let frame_request = request.take().unwrap_or_default();
+                    let frame_projection_generation = request.as_ref().and_then(|_| {
+                        this.update(cx, |root, _| {
+                            root.plugin_tools
+                                .active_projection_generation(ToolRailToolId::AgentLauncher)
+                        })
+                        .ok()
+                        .flatten()
+                    });
+                    let frame_request = request
+                        .take()
+                        .filter(|_| frame_projection_generation.is_some());
                     let frame_palette = apply_palette.then_some(palette_target.palette);
                     let frame = executor
                         .run(move |_| async move {
@@ -803,11 +830,17 @@ impl RootView {
                                 }
                                 match frame {
                                     Ok(frame) => {
-                                        if let Some(snapshot) = frame.snapshot
-                                            && root.agent_terminal_snapshot.as_ref().is_none_or(
+                                        if let Some(snapshot) = frame.snapshot {
+                                            if !agent_snapshot_projection_is_current(
+                                                frame_projection_generation,
+                                                root.plugin_tools.active_projection_generation(
+                                                    ToolRailToolId::AgentLauncher,
+                                                ),
+                                            ) {
+                                                root.agent_needs_snapshot = true;
+                                            } else if root.agent_terminal_snapshot.as_ref().is_none_or(
                                                 |current| snapshot.revision >= current.revision,
-                                            )
-                                        {
+                                            ) {
                                             let view_grid_changed = root
                                                 .agent_terminal_snapshot
                                                 .as_ref()
@@ -823,6 +856,7 @@ impl RootView {
                                                     &session_id,
                                                     cx,
                                                 );
+                                            }
                                             }
                                         }
                                         if let Some(lifecycle) = frame.lifecycle {
@@ -874,7 +908,10 @@ impl RootView {
                                         return AgentWatchProgress::Stop;
                                     }
                                 }
-                                if !root.right_dock_collapsed
+                                root.request_agent_snapshot(cx);
+                                if root
+                                    .plugin_tools
+                                    .projected_tool_active(ToolRailToolId::AgentLauncher)
                                     && preferences::interaction_policy(root).is_some_and(|policy| {
                                         policy.command_block_rail_visible(true)
                                     })
@@ -899,7 +936,14 @@ impl RootView {
                         AgentWatchProgress::RetryWithCurrentPalette => {
                             applied_palette_generation = None;
                             refresh_lifecycle = true;
-                            request = Some(RenderSnapshotRequest::default());
+                            request = this
+                                .update(cx, |root, _| {
+                                    root.plugin_tools
+                                        .projected_tool_active(ToolRailToolId::AgentLauncher)
+                                        .then(RenderSnapshotRequest::default)
+                                })
+                                .ok()
+                                .flatten();
                             continue;
                         }
                         AgentWatchProgress::Continue => {}
@@ -1034,7 +1078,7 @@ impl RootView {
                         return None;
                     }
                     root.agent_needs_snapshot = true;
-                    Some((!root.right_dock_collapsed).then(|| {
+                    Some(root.plugin_tools.projected_tool_active(ToolRailToolId::AgentLauncher).then(|| {
                         let current = root.agent_terminal_snapshot.as_ref();
                         RenderSnapshotRequest {
                             since_revision: current.map(|snapshot| snapshot.revision),
@@ -1061,7 +1105,9 @@ impl RootView {
         ) else {
             return;
         };
-        if self.right_dock_collapsed
+        if !self
+            .plugin_tools
+            .projected_tool_active(ToolRailToolId::AgentLauncher)
             || !self.agent_needs_snapshot
             || self
                 .agent_terminal_lifecycle
@@ -1069,6 +1115,12 @@ impl RootView {
         {
             return;
         }
+        let Some(projection_generation) = self
+            .plugin_tools
+            .active_projection_generation(ToolRailToolId::AgentLauncher)
+        else {
+            return;
+        };
         self.agent_needs_snapshot = false;
         let palette_target = AgentTerminalPaletteTarget {
             palette: self.current_terminal_palette(),
@@ -1119,6 +1171,17 @@ impl RootView {
                             return;
                         }
                         AgentFrameAcceptance::Accept => {}
+                    }
+                    if result.is_ok()
+                        && !agent_snapshot_projection_is_current(
+                            Some(projection_generation),
+                            root.plugin_tools
+                                .active_projection_generation(ToolRailToolId::AgentLauncher),
+                        )
+                    {
+                        root.agent_needs_snapshot = true;
+                        root.request_agent_snapshot(cx);
+                        return;
                     }
                     match result {
                         Ok(snapshot)

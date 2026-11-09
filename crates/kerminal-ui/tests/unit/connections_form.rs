@@ -5,14 +5,17 @@
 use super::super::form_render::{endpoint_port_column_min_width_px, network_field_widths_px};
 use super::{
     HostCredentialChange, HostCredentialSlot, HostEditorField, HostEditorSection,
-    HostEditorValidationIssue, append_proxy_credential_change, default_authentication,
-    has_unsaved_protocol_draft, initial_host_editor_protocol, optional_option_text,
-    parse_option_number, private_key_file_source_selected, project_rdp_password,
-    proxy_password_matches_route, serial_data_bits_options, serial_flow_options,
-    serial_parity_options, serial_stop_bits_options,
+    HostEditorValidationIssue, append_clearable_credential_change, append_proxy_credential_change,
+    clear_requested_after_input, default_authentication, has_unsaved_protocol_draft,
+    initial_host_editor_protocol, optional_option_text, parse_option_number,
+    private_key_file_source_selected, project_rdp_password, proxy_password_matches_route,
+    serial_data_bits_options, serial_flow_options, serial_parity_options, serial_stop_bits_options,
     should_clear_saved_private_key_for_file_source,
 };
-use kerminal_application::{AppError, connections::management::HostAuthenticationMode};
+use kerminal_application::{
+    AppError,
+    connections::management::{HostAuthenticationMode, HostSftpOptions},
+};
 use kerminal_domain::connections::{
     CredentialRef, HostEndpoint, ProxyProfile, ProxyProtocol, RemoteProtocol,
 };
@@ -64,20 +67,20 @@ fn private_key_file_source_clears_only_an_existing_key_for_a_nonempty_path() {
     ));
 }
 
-/// 端口列同时容纳通用标签与至少 80px 输入，防止默认端口值在窄布局中被裁切。
+/// 端口列同时容纳内联标签、间距与至少 80px 输入，防止默认端口值在窄布局中被裁切。
 /// @author kongweiguang
 #[test]
 fn endpoint_port_column_reserves_readable_input_width() {
     assert!(endpoint_port_column_min_width_px() >= 184.0);
 }
 
-/// 网络标签复用 6rem 对齐轴，范围说明移至输入下方，数字控件仍保留可读上限。
+/// 网络标签复用 8rem 对齐轴，范围说明移至输入下方，数字控件仍保留可读上限。
 /// @author kongweiguang
 #[test]
 fn network_numeric_fields_keep_readable_labels_and_bounded_controls() {
     let (label_width, control_max_width) = network_field_widths_px();
 
-    assert_eq!(label_width, 96.0);
+    assert_eq!(label_width, 128.0);
     assert!((144.0..=224.0).contains(&control_max_width));
 }
 
@@ -115,6 +118,57 @@ fn explicit_clear_removes_the_proxy_slot() {
         changes.as_slice(),
         [HostCredentialChange::Clear {
             slot: HostCredentialSlot::ProxyPassword
+        }]
+    ));
+}
+
+/// 清除已选中后输入新密码应立刻撤销清除状态，空值时仍保留待删标记。
+/// @author kongweiguang
+#[test]
+fn nonempty_secret_input_cancels_pending_clear_state() {
+    assert!(!clear_requested_after_input(true, true));
+    assert!(clear_requested_after_input(true, false));
+    assert!(!clear_requested_after_input(false, true));
+}
+
+/// 新值覆盖待清除状态，所有可替换口令字段都提交 Replace 而非静默 Clear。
+/// @author kongweiguang
+#[test]
+fn entered_secret_replaces_even_when_clear_was_requested() {
+    for slot in [
+        HostCredentialSlot::TargetPassword,
+        HostCredentialSlot::TargetKeyPassphrase,
+        HostCredentialSlot::RdpPassword,
+        HostCredentialSlot::ProxyPassword,
+        HostCredentialSlot::JumpPassword(0),
+        HostCredentialSlot::JumpKeyPassphrase(0),
+    ] {
+        let mut changes = Vec::new();
+        append_clearable_credential_change(
+            &mut changes,
+            slot,
+            true,
+            "replacement secret".to_owned(),
+        );
+        assert!(matches!(
+            changes.as_slice(),
+            [HostCredentialChange::Replace { slot: actual, .. }] if *actual == slot
+        ));
+    }
+}
+
+/// 代理清除后输入新密码应替换旧凭据，按钮状态与保存行为采用同一优先级。
+/// @author kongweiguang
+#[test]
+fn entered_proxy_password_overrides_pending_clear() {
+    let mut changes = Vec::new();
+    append_proxy_credential_change(&mut changes, true, "replacement proxy password".to_owned());
+
+    assert!(matches!(
+        changes.as_slice(),
+        [HostCredentialChange::Replace {
+            slot: HostCredentialSlot::ProxyPassword,
+            ..
         }]
     ));
 }
@@ -206,6 +260,64 @@ fn editor_sections_follow_protocol_capabilities() {
         HostEditorSection::normalize(RemoteProtocol::Ssh, HostEditorSection::Proxy),
         HostEditorSection::Proxy
     );
+}
+
+/// SFTP-only 协议始终可打开文件面板，只有 SSH 服从可选 SFTP 开关。
+/// @author kongweiguang
+#[test]
+fn sftp_capability_uses_protocol_and_optional_ssh_flag() {
+    assert!(HostSftpOptions::enabled_for(RemoteProtocol::Sftp, false));
+    assert!(HostSftpOptions::enabled_for(RemoteProtocol::Ssh, true));
+    assert!(!HostSftpOptions::enabled_for(RemoteProtocol::Ssh, false));
+}
+
+/// Serial 的设备和波特率错误定位到常规页，确保测试错误能与新布局对应。
+/// @author kongweiguang
+#[test]
+fn serial_connection_errors_point_to_general_fields() {
+    for (error, field) in [
+        (
+            AppError::invalid("串口设备路径必须能编码为 UTF-8"),
+            HostEditorField::Host,
+        ),
+        (
+            AppError::invalid("串口波特率必须大于零"),
+            HostEditorField::SerialBaud,
+        ),
+    ] {
+        let issue = HostEditorValidationIssue::from_error(&error, "test".to_owned())
+            .expect("serial error should map to a visible field");
+        assert_eq!(issue.field, field);
+        assert_eq!(issue.section, HostEditorSection::Properties);
+    }
+}
+
+/// RDP 尺寸分别落到宽、高输入，SFTP 目录错误落到传输分区的远端目录字段。
+/// @author kongweiguang
+#[test]
+fn display_and_sftp_directory_errors_map_to_precise_fields() {
+    for (error, field, section) in [
+        (
+            AppError::invalid("RDP 宽度必须为 640 到 8192"),
+            HostEditorField::RdpWidth,
+            HostEditorSection::Display,
+        ),
+        (
+            AppError::invalid("RDP 高度必须为 480 到 8192"),
+            HostEditorField::RdpHeight,
+            HostEditorSection::Display,
+        ),
+        (
+            AppError::invalid("SFTP 起始目录无效"),
+            HostEditorField::SftpRemoteDirectory,
+            HostEditorSection::Transfer,
+        ),
+    ] {
+        let issue = HostEditorValidationIssue::from_error(&error, "test".to_owned())
+            .expect("known field error should be localizable");
+        assert_eq!(issue.field, field);
+        assert_eq!(issue.section, section);
+    }
 }
 
 /// 已知校验错误定位到真实输入或高级分区；未知错误继续由通用状态反馈承接。
@@ -371,10 +483,10 @@ fn new_ssh_and_sftp_default_to_password_authentication() {
     }
 }
 
-/// 序列设备路径由串口分区承载，领域校验回投必须切换到该分区并定位设备字段。
+/// 设备路径已位于常规首屏，领域校验不得再把用户跳到只含线制的串口页。
 /// @author kongweiguang
 #[test]
-fn serial_device_validation_targets_the_serial_section() {
+fn serial_device_validation_targets_general_section() {
     let issue = HostEditorValidationIssue::from_error(
         &AppError::invalid("串口设备路径必须能编码为 UTF-8"),
         "设备路径无效".to_owned(),
@@ -382,5 +494,5 @@ fn serial_device_validation_targets_the_serial_section() {
     .expect("serial device errors are mapped locally");
 
     assert_eq!(issue.field, HostEditorField::Host);
-    assert_eq!(issue.section, HostEditorSection::Terminal);
+    assert_eq!(issue.section, HostEditorSection::Properties);
 }

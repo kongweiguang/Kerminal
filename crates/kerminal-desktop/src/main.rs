@@ -18,13 +18,21 @@ mod composition;
 mod config_root;
 mod configuration_validation;
 mod external_activation;
+#[cfg(feature = "right-rail-acceptance")]
+mod external_plugin_acceptance;
 #[cfg(target_os = "linux")]
 mod fonts;
 mod host_coordinator;
+#[cfg(feature = "right-rail-acceptance")]
+mod host_editor_acceptance;
 mod logging;
 #[cfg(feature = "acceptance-metrics")]
 mod native_list_probe;
 mod platform_lifecycle;
+#[cfg(feature = "right-rail-acceptance")]
+mod plugin_acceptance;
+mod plugin_catalogs;
+mod plugins;
 mod profile_import;
 #[cfg(feature = "right-rail-acceptance")]
 mod right_rail_acceptance;
@@ -102,7 +110,7 @@ type StartupError = Arc<Mutex<Option<String>>>;
 #[action(name = "kerminal.requestQuit", no_json, no_register)]
 struct MacApplicationQuit;
 
-/// 探针参数缺少编译能力时明确拒绝，普通启动仍先经过迁移门禁再装配服务。
+/// 验收参数缺少编译能力时明确拒绝，不能意外落入用户桌面启动；普通启动仍受迁移门禁保护。
 ///
 /// @author kongweiguang
 fn main() {
@@ -144,6 +152,60 @@ fn main() {
     // 导入只接收显式来源、目标与执行模式，不能让普通启动触及旧版真实数据。
     if let Some(exit_code) = profile_import::run_from_args(std::env::args_os().skip(1)) {
         std::process::exit(exit_code);
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--external-plugin-acceptance")
+    {
+        #[cfg(feature = "right-rail-acceptance")]
+        {
+            if let Err(error) = external_plugin_acceptance::run() {
+                eprintln!("外部插件验收运行失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "right-rail-acceptance"))]
+        {
+            eprintln!("外部插件验收入口未编译；请使用 --features right-rail-acceptance 构建。");
+            std::process::exit(2);
+        }
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--plugin-acceptance")
+    {
+        #[cfg(feature = "right-rail-acceptance")]
+        {
+            if let Err(error) = plugin_acceptance::run() {
+                eprintln!("插件验收运行失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "right-rail-acceptance"))]
+        {
+            eprintln!("插件验收入口未编译；请使用 --features right-rail-acceptance 构建。");
+            std::process::exit(2);
+        }
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--host-editor-acceptance")
+    {
+        #[cfg(feature = "right-rail-acceptance")]
+        {
+            if let Err(error) = host_editor_acceptance::run() {
+                eprintln!("主机编辑器验收运行失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "right-rail-acceptance"))]
+        {
+            eprintln!("主机编辑器验收入口未编译；请使用 --features right-rail-acceptance 构建。");
+            std::process::exit(2);
+        }
     }
     if std::env::args_os()
         .nth(1)
@@ -210,19 +272,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let legacy_window_state = bootstrap::legacy_window_state_path(false);
-    let migration =
-        bootstrap::migration_service(config_root.as_path(), legacy_window_state.as_deref());
-    if let Err(error) = bootstrap::run_after_migration(&migration, |_| run_desktop(config_root)) {
-        report_fatal_startup_error(&format!(
-            "Kerminal 数据迁移未完成：{}\n\n请保持旧版 Kerminal 关闭，先运行安装包内的 migration 脚本做只读预检（Windows 用 -DryRun，macOS/Linux 用 --dry-run）；按报告处理并保留备份与恢复材料。",
-            error.public_message()
-        ));
-        std::process::exit(1);
-    }
+    run_desktop(config_root);
 }
 
-/// 只有迁移门禁成功后才创建共享 runtime；静态阶段回执区分宿主、UI 事件循环与 runtime 收尾。
+/// 共享 runtime 仅用于取得单实例身份；迁移和插件状态写入都留给确认后的主实例。
+/// 这避免第二次启动在现有窗口运行时应用待重启变更，业务服务仍受迁移门禁保护。
 ///
 /// @author kongweiguang
 fn run_desktop(config_root: config_root::ConfigRoot) {
@@ -309,7 +363,7 @@ fn source_raw_os_error(error: &(dyn Error + 'static)) -> Option<i32> {
     None
 }
 
-/// 仅主实例初始化共享滚动日志并装配服务，避免二次实例并发写同一个活动日志文件。
+/// 主实例独占启动事务，先准备冻结目录和迁移，再装配业务服务；次实例只发送激活请求。
 /// @author kongweiguang
 fn run_application(
     runtime: &ApplicationRuntime,
@@ -324,17 +378,37 @@ fn run_application(
             Ok(())
         }
         SingleApplication::PrimaryInstance(primary) => {
-            *log_guard = Some(logging::initialize(config_root.as_path()).map_err(|error| {
-                io::Error::other(format!("Kerminal 无法初始化诊断日志：{error}"))
-            })?);
-            run_primary_instance(runtime, instance_id, primary, config_root, activation)
+            let (options, _) = plugins::arguments::PluginStartupOptions::current()?;
+            let startup_plugins = Arc::new(plugins::startup::StartupPlugins::load(
+                config_root.as_path(),
+                options,
+            )?);
+            let catalogs = startup_plugins.catalogs("zh-CN")?;
+            let legacy_window_state = bootstrap::legacy_window_state_path(false);
+            let migration = bootstrap::migration_service(
+                config_root.as_path(),
+                legacy_window_state.as_deref(),
+                catalogs.1.clone(),
+            );
+            bootstrap::run_after_migration(&migration, |_| {
+                // 先建立已验证的数据格式，避免新建日志目录让干净根变成未知非空根。
+                *log_guard = Some(logging::initialize(config_root.as_path()).map_err(|error| {
+                    io::Error::other(format!("Kerminal 无法初始化诊断日志：{error}"))
+                })?);
+                run_primary_instance(runtime, instance_id, primary, config_root, activation, catalogs, startup_plugins)
+            })
+            .map_err(|error| io::Error::other(format!(
+                "Kerminal 数据迁移未完成：{}。请运行安装包内 migration 脚本做只读预检并保留恢复材料。",
+                error.public_message()
+            )))?
         }
     }
 }
 
-/// 仅由进程入口读取原生 argv 与 cwd；解析规则仍复用共享 activation codec。
+/// 插件开关只影响启动快照，不能经单实例转发误变成文件打开请求。
+/// 其余原生 argv 与 cwd 仍复用既有 activation codec，保留原有外部启动语义。
 fn current_process_external_activation() -> AppResult<Option<ExternalActivation>> {
-    let arguments = std::env::args_os().collect::<Vec<_>>();
+    let (_, arguments) = plugins::arguments::PluginStartupOptions::current()?;
     let working_directory = if arguments.len() > 1 {
         Some(
             std::env::current_dir()
@@ -419,7 +493,7 @@ fn activate_existing_instance(
     Ok(())
 }
 
-/// 迁移完成后主实例只绑定当前窗口文件；运行中恢复故障保持可见，不再回读旧来源或阻断终端启动。
+/// 主实例沿用迁移目录并只绑定当前窗口文件；运行中恢复故障保持可见。
 ///
 /// @author kongweiguang
 fn run_primary_instance(
@@ -428,11 +502,29 @@ fn run_primary_instance(
     primary: PrimaryInstance<String>,
     config_root: config_root::ConfigRoot,
     initial_activation: Option<ExternalActivation>,
+    catalogs: plugin_catalogs::PluginCatalogs,
+    startup_plugins: Arc<plugins::startup::StartupPlugins>,
 ) -> Result<(), Box<dyn Error>> {
-    let composition = runtime.block_on(DesktopComposition::build(
+    let mut composition = runtime.block_on(DesktopComposition::build_with_plugin_catalogs(
         runtime.handle(),
         config_root.as_path(),
+        None,
+        catalogs.0,
+        catalogs.1,
     ))?;
+    if let Err(error) =
+        runtime.block_on(composition.install_external_plugins(startup_plugins.clone()))
+    {
+        let cleanup =
+            runtime.block_on(composition.shutdown_until(TokioInstant::now() + SHUTDOWN_TIMEOUT));
+        if let Err(cleanup) = cleanup {
+            tracing::error!(
+                event = "PLUGIN_STARTUP_CLEANUP_FAILED",
+                code = cleanup.public_code().as_str()
+            );
+        }
+        return Err(error.into());
+    }
     let mcp_snapshot = composition.mcp_runtime_snapshot();
     let mcp_state_event = match mcp_snapshot.state {
         kerminal_application::mcp_runtime::McpRuntimeState::Unavailable => {
@@ -504,6 +596,7 @@ fn run_primary_instance(
             window_state_repository,
             window_state_load,
             startup_error.clone(),
+            startup_plugins,
         );
     }));
     tracing::info!(event = "DESKTOP_NATIVE_UI_RETURNED");
@@ -557,7 +650,7 @@ fn first_run_window_bounds(cx: &App) -> Option<WindowBounds> {
 /// 验收配置错误仅输出固定原因码，预热时长错误也不能回显原始环境值。
 /// macOS 额外持有 activation 发送端，平台条件参数导致计数超过默认上限；组合根仍保留显式注入。
 /// @author kongweiguang
-#[cfg_attr(target_os = "macos", allow(clippy::too_many_arguments))]
+#[allow(clippy::too_many_arguments)]
 fn run_native_ui(
     services: AppServices,
     #[cfg(target_os = "macos")] activation_sender: ActivationQueueSender,
@@ -567,6 +660,7 @@ fn run_native_ui(
     window_state_repository: Arc<dyn WindowStateRepository>,
     window_state_load: WindowStateLoad,
     startup_error: StartupError,
+    startup_plugins: Arc<plugins::startup::StartupPlugins>,
 ) {
     #[cfg(all(target_os = "windows", feature = "acceptance-metrics"))]
     set_diagnostic_process_identity();
@@ -627,6 +721,23 @@ fn run_native_ui(
         if let Err(error) = gpui_kit::open_window(window_options, cx, |window, cx| {
             window.set_background_appearance(WindowBackgroundAppearance::Transparent);
             let root = cx.new(|cx| RootView::new(services.clone(), window, cx));
+            // 只有真实窗口完成首轮绘制后才提交健康标记；磁盘提交交给共享后台执行器。
+            let boot = startup_plugins.clone();
+            let executor = services.executor.clone();
+            window.on_next_frame(move |_, app| {
+                app.spawn(async move |_| {
+                    let result = executor.run(move |_| async move {
+                        tokio::task::spawn_blocking(move || {
+                            boot.store.mark_boot_phase(&boot.snapshot.boot_id, kerminal_domain::plugins::PluginBootPhase::FirstFrame)
+                                .map_err(|source| AppError::infrastructure_with_source("插件首帧标记失败", source))
+                        }).await.map_err(|source| AppError::infrastructure_with_source("插件首帧标记任务失败", source))??;
+                        Ok(())
+                    }).await;
+                    if let Err(error) = result {
+                        tracing::error!(event = "PLUGIN_FIRST_FRAME_COMMIT_FAILED", code = error.public_code().as_str());
+                    }
+                }).detach();
+            });
             #[cfg(target_os = "macos")]
             {
                 *reopen_window_handle
@@ -715,29 +826,9 @@ fn run_native_ui(
             let completion_signal = host_sender.clone();
             let completion_subscription = cx.subscribe(&root, move |root_entity, event, app| {
                 let event = event.clone();
-                let deadline = TokioInstant::now() + SHUTDOWN_TIMEOUT;
+                let (command, deadline) = host_command_from_root_event(&event);
                 let should_flush_window_state =
                     !matches!(&event, RootViewEvent::RetryInstallReady { .. });
-                let command = match &event {
-                    RootViewEvent::QuitReady { intent } => HostCommand::Quit {
-                        intent: intent.clone(),
-                        deadline,
-                    },
-                    RootViewEvent::InstallReady { update_id, version } => HostCommand::Install {
-                        update_id: *update_id,
-                        version: version.clone(),
-                        deadline,
-                        retry: false,
-                    },
-                    RootViewEvent::RetryInstallReady { update_id, version } => {
-                        HostCommand::Install {
-                            update_id: *update_id,
-                            version: version.clone(),
-                            deadline,
-                            retry: true,
-                        }
-                    }
-                };
                 let root_entity = root_entity.clone();
                 let request_sender = completion_signal.clone();
                 // 每次事件各持有独立句柄，避免把订阅回调借用的 flush future 逃逸到 runtime。
@@ -845,6 +936,40 @@ fn set_diagnostic_process_identity() {
             hresult = result
         );
     }
+}
+
+/// 沿用 Root 启动插件关闭时分配的绝对截止时间，避免桌面收尾重新获得一轮预算。
+///
+/// @author kongweiguang
+fn host_command_from_root_event(event: &RootViewEvent) -> (HostCommand, TokioInstant) {
+    let deadline = TokioInstant::from_std(match event {
+        RootViewEvent::QuitReady { deadline, .. }
+        | RootViewEvent::InstallReady { deadline, .. }
+        | RootViewEvent::RetryInstallReady { deadline, .. } => *deadline,
+    });
+    let command = match event {
+        RootViewEvent::QuitReady { intent, .. } => HostCommand::Quit {
+            intent: intent.clone(),
+            deadline,
+        },
+        RootViewEvent::InstallReady {
+            update_id, version, ..
+        } => HostCommand::Install {
+            update_id: *update_id,
+            version: version.clone(),
+            deadline,
+            retry: false,
+        },
+        RootViewEvent::RetryInstallReady {
+            update_id, version, ..
+        } => HostCommand::Install {
+            update_id: *update_id,
+            version: version.clone(),
+            deadline,
+            retry: true,
+        },
+    };
+    (command, deadline)
 }
 
 /// 将 Tokio timer 与窗口持久化等待放进共享 runtime，GPUI 只接收无 runtime 要求的 oneshot 回执。
@@ -1011,13 +1136,15 @@ fn apply_host_response(
         Err(error) => {
             let message = error.public_message().to_owned();
             root_entity.update(app, |root, cx| match event {
-                RootViewEvent::QuitReady { intent } => {
+                RootViewEvent::QuitReady { intent, .. } => {
                     root.report_quit_failure(intent, message, cx)
                 }
-                RootViewEvent::InstallReady { update_id, version }
-                | RootViewEvent::RetryInstallReady { update_id, version } => {
-                    root.report_update_quiesce_failure(update_id, &version, message, cx)
+                RootViewEvent::InstallReady {
+                    update_id, version, ..
                 }
+                | RootViewEvent::RetryInstallReady {
+                    update_id, version, ..
+                } => root.report_update_quiesce_failure(update_id, &version, message, cx),
             });
         }
     }

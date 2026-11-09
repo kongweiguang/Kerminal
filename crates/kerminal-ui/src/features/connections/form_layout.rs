@@ -13,6 +13,18 @@ const EDITOR_WIDTH_REM: f32 = 64.0;
 const EDITOR_HEIGHT_REM: f32 = 46.0;
 const COMPACT_WINDOW_WIDTH_REM: f32 = 54.0;
 
+/// 标签轴按 8 个全角字符预留，避免“默认目录（可选）”等中文标签在固定列内折行。
+pub(super) const FORM_FIELD_LABEL_WIDTH_REM: f32 = 8.0;
+/// 表单控件保留可读行长，不随宽弹层无限拉伸；单行与多行字段共享同一条右缘。
+pub(super) const FORM_FIELD_CONTROL_MAX_WIDTH_REM: f32 = 34.0;
+/// 标签与控件间距；提示卡复用该值，使正文右缘和输入右缘落在同一条线上。
+pub(super) const FORM_FIELD_GAP_REM: f32 = 0.75;
+
+/// 表单行最大宽度由标签轴、间距和控件上限组成，非字段元素据此共享同一结束线。
+pub(super) fn form_field_row_max_width_rems() -> f32 {
+    FORM_FIELD_LABEL_WIDTH_REM + FORM_FIELD_GAP_REM + FORM_FIELD_CONTROL_MAX_WIDTH_REM
+}
+
 /// 外边距和弹窗随同一 rem 缩放；实际窗口较小时收缩正文，不让 footer 离开可见范围。
 pub(crate) fn host_editor_size(window: &Window) -> Size<Pixels> {
     host_editor_dimensions(window.viewport_size(), window.rem_size())
@@ -85,19 +97,28 @@ impl RenderOnce for EditorField {
         let label = div()
             .text_sm()
             .text_color(self.theme.muted)
-            .when(!compact, |label| label.w(rems(6.0)).flex_shrink_0())
+            .when(!compact, |label| {
+                label.w(rems(FORM_FIELD_LABEL_WIDTH_REM)).flex_shrink_0()
+            })
             .when(!compact && self.multiline, |label| label.pt_2())
             .child(self.label);
+        let content = div()
+            .flex_1()
+            .min_w_0()
+            .max_w(rems(FORM_FIELD_CONTROL_MAX_WIDTH_REM))
+            .child(self.input);
         let row = div()
             .w_full()
             .min_w_0()
             .flex()
             .when(compact, |row| row.flex_col().items_stretch().gap_1())
-            .when(!compact, |row| row.gap_3().min_h(rems(2.25)))
+            .when(!compact, |row| {
+                row.gap(rems(FORM_FIELD_GAP_REM)).min_h(rems(2.25))
+            })
             .when(!compact && self.multiline, |row| row.items_start())
             .when(!compact && !self.multiline, |row| row.items_center())
             .child(label)
-            .child(div().flex_1().min_w_0().child(self.input));
+            .child(content);
         match self.reveal {
             Some((scroll, identity)) => {
                 EditorFocusReveal::new(row, scroll, identity).into_any_element()

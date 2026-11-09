@@ -11,6 +11,7 @@ use std::{
 
 use kerminal_application::{
     AppError, AppResult,
+    connections::host_types::HostConfigurationCatalog,
     data_migration::{
         DataMigrationBlocker, DataMigrationInspection, DataMigrationNotice, DataMigrationReadiness,
     },
@@ -34,6 +35,7 @@ const CURRENT_SQLITE_SCHEMA: u32 = 3;
 pub(super) fn inspect_root(
     root: &Path,
     legacy_window_state: Option<&Path>,
+    host_types: Option<&HostConfigurationCatalog>,
 ) -> AppResult<DataMigrationInspection> {
     if !path_exists_without_following(root)? {
         return Ok(inspection(
@@ -89,7 +91,7 @@ pub(super) fn inspect_root(
                 blockers.push(DataMigrationBlocker::CorruptMigrationJournal);
             }
             if !journal_scan.recovery_pending && blockers.is_empty() {
-                match collect_plan(root, legacy_window_state) {
+                match collect_plan(root, legacy_window_state, host_types) {
                     Ok(edits) => {
                         if let Err(blocker) = validate_edits(root, &edits) {
                             blockers.push(blocker);
@@ -161,7 +163,7 @@ pub(super) fn inspect_root(
 
     let mut notices = Vec::new();
     inspect_legacy_sqlite(root, &mut blockers, &mut notices)?;
-    let mut edits = match collect_plan(root, legacy_window_state) {
+    let mut edits = match collect_plan(root, legacy_window_state, host_types) {
         Ok(edits) => edits,
         Err(blocker) => {
             blockers.push(blocker);
@@ -234,6 +236,7 @@ pub(super) fn inspect_current_fast_path(root: &Path) -> AppResult<Option<DataMig
 pub(super) fn collect_plan(
     root: &Path,
     legacy_window_state: Option<&Path>,
+    host_types: Option<&HostConfigurationCatalog>,
 ) -> Result<Vec<FileEdit>, DataMigrationBlocker> {
     let mut edits = Vec::new();
     let mut vault_edits = vault::plan_vault_migration(root).map_err(|_| {
@@ -245,7 +248,7 @@ pub(super) fn collect_plan(
         super::profile_hosts::plan_profile_hosts(root, root, &mut vault_edits, &Default::default())
             .map_err(|_| DataMigrationBlocker::ConfigurationNotMigratable)?;
     edits.extend(
-        configuration::plan_configuration_migration(root)
+        configuration::plan_configuration_migration_with_host_types(root, host_types)
             .map_err(|_| DataMigrationBlocker::ConfigurationNotMigratable)?,
     );
     edits.extend(
@@ -365,8 +368,12 @@ pub(super) fn validate_edits(root: &Path, edits: &[FileEdit]) -> Result<(), Data
     Ok(())
 }
 
-/// 旧 marker 缺失时只用已知受管文件辨认 Kerminal 根，不依赖 app semver 或猜测来源版本。
+/// 插件目录在主机配置扫描前冻结，因此新根可能先有插件状态，再进入数据格式初始化。
+/// 只有通过同一存储校验的状态才构成签名，不能把任意同名文件当成受管数据放行。
 fn has_kerminal_signature(root: &Path, entries: &[String]) -> AppResult<bool> {
+    if entries == ["plugins"] && is_plugin_bootstrap_root(root)? {
+        return Ok(true);
+    }
     for name in [
         "settings.toml",
         "storage-manifest.toml",
@@ -401,6 +408,29 @@ fn has_kerminal_signature(root: &Path, entries: &[String]) -> AppResult<bool> {
         }
     }
     Ok(false)
+}
+
+/// 新根只允许插件引导状态这一项控制材料；不能让启动新写的状态替未知用户目录洗白。
+fn is_plugin_bootstrap_root(root: &Path) -> AppResult<bool> {
+    let Some(bytes) =
+        read_optional_regular_file(root, Path::new("plugins/state.json"), MAX_DOCUMENT_BYTES)?
+    else {
+        return Ok(false);
+    };
+    let Ok(state) = serde_json::from_slice::<kerminal_domain::plugins::PluginStoreState>(&bytes)
+    else {
+        return Ok(false);
+    };
+    if crate::plugins::store::validate_state(&state).is_err() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(root.join("plugins")).map_err(io_error("读取插件引导目录失败"))?
+    {
+        if entry.map_err(io_error("读取插件引导目录失败"))?.file_name() != "state.json" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// SQLite dry-run 仅检查主库 magic、user_version 与 WAL 是否存在，避免打开连接生成 -shm。

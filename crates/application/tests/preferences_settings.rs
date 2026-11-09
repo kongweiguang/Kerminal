@@ -154,6 +154,53 @@ fn effective_tool_rail_placement_preserves_each_tools_stored_choice() {
     );
 }
 
+/// 未安装的合法工具身份必须跨 TOML 和设置校验保留，重新安装后才能恢复用户偏好。
+///
+/// @author kongweiguang
+#[test]
+fn unknown_tool_ids_survive_toml_round_trip_and_settings_validation() -> AppResult<()> {
+    let present = ToolRailToolId::from_id("vendor.weather/panel").expect("valid tool id");
+    let absent = ToolRailToolId::from_id("vendor.missing/panel").expect("valid tool id");
+    let mut snapshot = SettingsSnapshot::default();
+    snapshot.tool_rail.order.insert(1, present);
+    snapshot.tool_rail.hidden.extend([present, absent]);
+    snapshot.tool_rail.bottom.extend([present, absent]);
+    snapshot
+        .tool_rail
+        .panel_placements
+        .insert(present, ToolRailPanelPlacement::Left);
+    snapshot
+        .tool_rail
+        .panel_placements
+        .insert(absent, ToolRailPanelPlacement::Center);
+    let encoded = toml::to_string(&snapshot).expect("encode settings");
+    let decoded: SettingsSnapshot = toml::from_str(&encoded).expect("decode settings");
+    let restored = decoded.validated()?;
+    assert_eq!(restored.tool_rail.order[1], present);
+    for tool in [present, absent] {
+        assert!(restored.tool_rail.hidden.contains(&tool));
+        assert!(restored.tool_rail.bottom.contains(&tool));
+        assert_eq!(
+            restored.tool_rail.panel_placements.get(&tool),
+            snapshot.tool_rail.panel_placements.get(&tool)
+        );
+    }
+    let encoded_again = toml::to_string(&restored).expect("encode normalized settings");
+    let round_trip: SettingsSnapshot =
+        toml::from_str(&encoded_again).expect("decode normalized settings");
+    assert_eq!(round_trip.tool_rail, restored.tool_rail);
+    for invalid in [
+        "vendor/invalid",
+        "/panel",
+        "vendor.weather/",
+        "vendor.weather//panel",
+        "vendor.weather/panel/extra",
+    ] {
+        assert!(ToolRailToolId::from_id(invalid).is_err(), "{invalid}");
+    }
+    Ok(())
+}
+
 /// 默认顺序与底部 Logs 分区共同决定主区容器末尾的显示位置；旧布局补齐仍保留原顺序。
 ///
 /// @author kongweiguang

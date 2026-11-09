@@ -1439,7 +1439,7 @@ impl OperationsView {
             .rounded_lg()
             .border_1()
             .border_color(theme.border)
-            .bg(theme.panel)
+            .bg(theme.content_surface())
             .child(
                 div()
                     .w_full()
@@ -1584,7 +1584,7 @@ impl OperationsView {
             .rounded_lg()
             .border_1()
             .border_color(theme.border)
-            .bg(theme.panel)
+            .bg(theme.content_surface())
             .child(
                 div()
                     .w_full()
@@ -1783,7 +1783,7 @@ impl OperationsView {
             .rounded_lg()
             .border_1()
             .border_color(theme.border)
-            .bg(theme.panel)
+            .bg(theme.content_surface())
             .child(
                 div()
                     .w_full()
@@ -2017,7 +2017,7 @@ impl OperationsView {
             .rounded_md()
             .border_1()
             .border_color(theme.border)
-            .bg(theme.secondary)
+            .bg(theme.content_surface())
             .child(self.layout_info_row(
                 &localized_text("会话详情", "Session details"),
                 session_name,

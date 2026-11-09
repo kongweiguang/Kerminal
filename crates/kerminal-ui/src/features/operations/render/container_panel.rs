@@ -974,11 +974,7 @@ fn render_host_list(
                     .gap_2()
                     .px(px(10.))
                     .py_2()
-                    .bg(if project_selected {
-                        theme.surface_selected()
-                    } else {
-                        theme.panel.opacity(0.64)
-                    })
+                    .when(project_selected, |row| row.bg(theme.surface_selected()))
                     .when(!project_selected, |row| {
                         row.hover(|style| style.bg(theme.surface_hover()))
                     })
@@ -1008,7 +1004,7 @@ fn render_host_list(
                     .rounded(theme.control_radius)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.panel.opacity(0.64))
+                    .bg(theme.content_surface())
                     .shadow_sm()
                     .child(project_row);
                 if expanded {
@@ -1019,8 +1015,7 @@ fn render_host_list(
                         .flex_col()
                         .border_t_1()
                         .border_color(theme.border)
-                        .p(px(6.))
-                        .bg(theme.subtle_background());
+                        .p(px(6.));
                     for (index, container) in group.containers.into_iter().enumerate() {
                         if index > 0 {
                             project_containers =
@@ -1516,11 +1511,10 @@ fn render_host_container_row(
         } else {
             theme.border
         })
-        .when(selected, |row| row.bg(theme.selected))
-        .when(!compact && !selected, |row| {
-            row.bg(theme.tool_panel_surface.opacity(0.72))
+        .when(selected, |row| row.bg(theme.surface_selected()))
+        .when(!selected, |row| {
+            row.hover(|style| style.bg(theme.surface_hover()))
         })
-        .when(!selected, |row| row.hover(|style| style.bg(theme.hover)))
         .child(info);
     if compact {
         row = row.px_2().py(px(6.)).rounded_xl();
@@ -2594,7 +2588,7 @@ fn project_metric(
         .gap_1()
         .p_2()
         .rounded_md()
-        .bg(theme.sidebar)
+        .bg(theme.content_surface())
         .child(
             div()
                 .text_size(theme.text_xs)
@@ -3002,7 +2996,6 @@ fn render_host_container(
 ///
 /// @author kongweiguang
 fn container_stats_panel(stats: Option<&ContainerStats>, theme: ThemeTokens) -> AnyElement {
-    let inspector_theme = theme.for_inspector();
     let display = container_stats_display(stats);
     let memory_label = crate::locale::text("内存", "Memory").to_string();
     let network_label = crate::locale::text("网络", "Network").to_string();
@@ -3053,7 +3046,7 @@ fn container_stats_panel(stats: Option<&ContainerStats>, theme: ThemeTokens) -> 
                 .min_w_0()
                 .p_2()
                 .rounded_xl()
-                .bg(inspector_theme.secondary)
+                .bg(theme.content_surface())
                 .text_size(px(11.))
                 .font_family("monospace")
                 .whitespace_normal()
@@ -3110,7 +3103,6 @@ struct ContainerStatsDisplay {
 ///
 /// @author kongweiguang
 fn container_stats_metric(label: &str, value: String, theme: ThemeTokens) -> AnyElement {
-    let inspector_theme = theme.for_inspector();
     div()
         .min_w_0()
         .flex()
@@ -3119,7 +3111,7 @@ fn container_stats_metric(label: &str, value: String, theme: ThemeTokens) -> Any
         .px_2p5()
         .py_2()
         .rounded_xl()
-        .bg(inspector_theme.secondary)
+        .bg(theme.content_surface())
         .child(
             div()
                 .text_size(px(11.))

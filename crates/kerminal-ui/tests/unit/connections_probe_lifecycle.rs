@@ -159,6 +159,17 @@ fn configure_ssh_editor(
             panel.begin_create_host(window, cx);
         }
         panel.set_authentication_mode(authentication_mode, window, cx);
+        if private_key.is_some() {
+            panel
+                .editor
+                .as_mut()
+                .unwrap()
+                .select_private_key_input_mode(
+                    super::super::super::form::PrivateKeyInputMode::Paste,
+                    window,
+                    cx,
+                );
+        }
         let editor = panel.editor.as_ref().expect("SSH 编辑器已打开");
         editor
             .inputs
@@ -179,16 +190,33 @@ fn configure_ssh_editor(
     });
 }
 
-/// 由生产按钮对应的 `test_connection` 入口启动后端，并等待确切请求到达受控边界。
+/// 用原按钮身份命中测试或取消，避免绕过控件的禁用、忙碌与点击分发规则。
+/// @author kongweiguang
+fn click_probe_action(visual: &mut VisualTestContext) {
+    let bounds = visual.update(|window, _| {
+        gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .find(|item| {
+                item.path()
+                    .iter()
+                    .any(|id| id == &gpui_kit::ElementId::from("connections-editor-probe"))
+            })
+            .expect("生产测试按钮必须始终使用稳定标识")
+            .bounds()
+    });
+    visual.simulate_click(bounds.center(), Default::default());
+    draw(visual);
+}
+
+/// 点击生产测试按钮启动后端，并等待确切请求到达受控边界。
+/// @author kongweiguang
 fn start_probe(
     runtime: &Runtime,
-    panel: &Entity<ConnectionsPanel>,
+    _panel: &Entity<ConnectionsPanel>,
     visual: &mut VisualTestContext,
     started: &mut mpsc::UnboundedReceiver<ProbeStarted>,
 ) -> ProbeStarted {
-    update_panel(panel, visual, |panel, window, cx| {
-        panel.test_connection(window, cx);
-    });
+    click_probe_action(visual);
     pump_runtime(runtime, visual);
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(2), started.recv())
@@ -196,6 +224,366 @@ fn start_probe(
             .expect("连接测试应到达注入的后端")
             .expect("测试观察通道保持打开")
     })
+}
+
+/// 测试没有平台帧循环，显式交付错误聚焦和 ScrollAnchor 的后继帧，避免只验证到旧焦点。
+/// @author kongweiguang
+fn settle_validation_focus(visual: &mut VisualTestContext) {
+    draw(visual);
+    for _ in 0..2 {
+        visual.update(|window, cx| window.simulate_next_frame(cx));
+        draw(visual);
+    }
+}
+
+/// 明确选择空文件来源不能偷用旧 Vault 私钥；同一校验必须挡住真实测试/保存按钮，切回粘贴仍可保留旧值。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn empty_file_source_blocks_probe_and_save_without_clearing_saved_key(app: &mut TestAppContext) {
+    use super::super::super::form::{HostEditorField, PrivateKeyInputMode};
+    use gpui_kit::Focusable as _;
+    use kerminal_domain::connections::CredentialRef;
+
+    for protocol in [RemoteProtocol::Ssh, RemoteProtocol::Sftp] {
+        let mut host = existing_host();
+        host.protocol = protocol;
+        host.authentication_mode = HostAuthenticationMode::PrivateKey;
+        let saved = SshAuthentication::PrivateKey {
+            path: None,
+            secret: Some(CredentialRef::new("fixture-saved-private-key").unwrap()),
+            passphrase: None,
+        };
+        host.authentication = Some(saved.clone());
+        let id = host.id.clone();
+        let (runtime, panel, visual) = fixture(app, vec![host], Vec::new());
+        let (service, mut started, mut finished, release) = gated_probe_service();
+        install_probe_service(&panel, visual, service);
+        update_panel(&panel, visual, |panel, window, cx| {
+            panel.edit_host(&id, window, cx);
+            panel
+                .editor
+                .as_mut()
+                .unwrap()
+                .select_private_key_input_mode(PrivateKeyInputMode::File, window, cx);
+            let focus = panel
+                .editor
+                .as_ref()
+                .unwrap()
+                .inputs
+                .username
+                .read(cx)
+                .focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        click_probe_action(visual);
+        let save = visual.debug_bounds("connections-editor-save").unwrap();
+        visual.simulate_click(save.center(), Default::default());
+        draw(visual);
+        pump_runtime(&runtime, visual);
+        settle_validation_focus(visual);
+        assert!(matches!(
+            started.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        update_panel(&panel, visual, |panel, window, cx| {
+            assert!(!panel.saving && !panel.probe_running);
+            let editor = panel.editor.as_mut().unwrap();
+            assert_eq!(
+                editor.validation_issue.as_ref().unwrap().field,
+                HostEditorField::PrivateKey
+            );
+            assert!(
+                editor.private_key_focus_handle(cx).is_focused(window),
+                "私钥来源 {:?}：应聚焦 {:?}，实际 {:?}",
+                editor.private_key_input_mode,
+                editor.private_key_focus_handle(cx),
+                window.focused(cx)
+            );
+            assert!(editor.credential_changes(cx).is_empty());
+            assert_eq!(
+                editor.original.as_ref().unwrap().authentication,
+                Some(saved.clone())
+            );
+            editor.select_private_key_input_mode(PrivateKeyInputMode::Paste, window, cx);
+            assert_eq!(
+                editor.to_draft(&[], cx).unwrap().authentication,
+                Some(saved.clone())
+            );
+        });
+        let probe = start_probe(&runtime, &panel, visual, &mut started);
+        assert_eq!(
+            probe.credential_count, 0,
+            "继续使用旧引用，不创建临时替换材料"
+        );
+        assert!(!probe.private_key_reference_is_ephemeral);
+        release_probe(&runtime, visual, &release, &mut finished, probe.id);
+    }
+}
+
+/// 以可访问按钮名称驱动清除/撤销，避免测试直接置位而遗漏实际回调的凭据与探测清理。
+/// @author kongweiguang
+fn click_saved_private_key_action(visual: &mut VisualTestContext, clearing: bool) {
+    let label = if clearing {
+        crate::locale::text("保留原私钥", "Keep existing Private key")
+    } else {
+        crate::locale::text("清除已保存私钥", "Clear saved Private key")
+    };
+    let bounds = visual.update(|window, _| {
+        gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .find(|item| item.label() == Some(label.as_ref()))
+            .expect("私钥应提供清除及撤销按钮")
+            .bounds()
+    });
+    visual.simulate_click(bounds.center(), Default::default());
+    draw(visual);
+}
+
+/// 历史双来源在清除或复制移除 Vault 后必须由用户补正文或改选文件，隐藏路径不能绕过当前来源。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn pasted_key_does_not_fall_back_to_hidden_file_after_clear_or_duplicate(app: &mut TestAppContext) {
+    use super::super::super::form::{HostEditorField, PrivateKeyInputMode};
+    use kerminal_domain::connections::CredentialRef;
+
+    for (protocol, duplicate) in [
+        (RemoteProtocol::Ssh, false),
+        (RemoteProtocol::Sftp, false),
+        (RemoteProtocol::Ssh, true),
+        (RemoteProtocol::Sftp, true),
+    ] {
+        let mut host = existing_host();
+        host.protocol = protocol;
+        host.authentication_mode = HostAuthenticationMode::PrivateKey;
+        let saved = SshAuthentication::PrivateKey {
+            path: Some("historical-private-key".into()),
+            secret: Some(CredentialRef::new("fixture-saved-private-key").unwrap()),
+            passphrase: None,
+        };
+        host.authentication = Some(saved.clone());
+        let id = host.id.clone();
+        let (runtime, panel, visual) = fixture(app, vec![host], Vec::new());
+        visual.simulate_resize(gpui_kit::size(gpui_kit::px(1200.), gpui_kit::px(1200.)));
+        let (service, mut started, mut finished, release) = gated_probe_service();
+        install_probe_service(&panel, visual, service);
+        update_panel(&panel, visual, |panel, window, cx| {
+            if duplicate {
+                panel.duplicate_saved_host(&id, window, cx);
+            } else {
+                panel.edit_host(&id, window, cx);
+            }
+            assert_eq!(
+                panel.editor.as_ref().unwrap().private_key_input_mode,
+                PrivateKeyInputMode::Paste
+            );
+        });
+        if !duplicate {
+            click_saved_private_key_action(visual, false);
+        }
+        click_probe_action(visual);
+        let save = visual.debug_bounds("connections-editor-save").unwrap();
+        visual.simulate_click(save.center(), Default::default());
+        draw(visual);
+        pump_runtime(&runtime, visual);
+        settle_validation_focus(visual);
+        assert!(matches!(
+            started.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        update_panel(&panel, visual, |panel, window, cx| {
+            assert!(!panel.saving && !panel.probe_running);
+            let editor = panel.editor.as_ref().unwrap();
+            assert_eq!(editor.clear_private_key, !duplicate);
+            assert_eq!(
+                editor.validation_issue.as_ref().unwrap().field,
+                HostEditorField::PrivateKey
+            );
+            assert!(
+                editor.private_key_focus_handle(cx).is_focused(window),
+                "私钥来源 {:?}：应聚焦 {:?}，实际 {:?}",
+                editor.private_key_input_mode,
+                editor.private_key_focus_handle(cx),
+                window.focused(cx)
+            );
+            assert_eq!(
+                editor
+                    .original
+                    .as_ref()
+                    .map(|host| host.authentication.clone()),
+                (!duplicate).then(|| Some(saved.clone()))
+            );
+        });
+        if !duplicate {
+            click_saved_private_key_action(visual, true);
+        }
+        update_panel(&panel, visual, |panel, window, cx| {
+            let editor = panel.editor.as_mut().unwrap();
+            if duplicate {
+                editor.select_private_key_input_mode(PrivateKeyInputMode::File, window, cx);
+            }
+            assert!(!editor.clear_private_key);
+            assert!(editor.credential_changes(cx).is_empty());
+            assert_eq!(
+                editor.to_draft(&[], cx).unwrap().authentication,
+                if duplicate {
+                    Some(SshAuthentication::PrivateKey {
+                        path: Some("historical-private-key".into()),
+                        secret: None,
+                        passphrase: None,
+                    })
+                } else {
+                    Some(saved.clone())
+                }
+            );
+        });
+        let probe = start_probe(&runtime, &panel, visual, &mut started);
+        assert_eq!(probe.credential_count, 0);
+        assert!(!probe.private_key_reference_is_ephemeral);
+        release_probe(&runtime, visual, &release, &mut finished, probe.id);
+    }
+}
+
+/// 测试期间只改变局部反馈，保留正文几何与输入实体；编辑会取消旧请求且迟到成功不能复活。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn pending_probe_keeps_form_stable_and_input_edits_cancel_old_result(app: &mut TestAppContext) {
+    let (runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
+    let (service, mut started, mut finished, release) = gated_probe_service();
+    install_probe_service(&panel, visual, service);
+    configure_ssh_editor(
+        &panel,
+        visual,
+        true,
+        "stable",
+        "stable.example.test",
+        HostAuthenticationMode::Agent,
+        None,
+    );
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.select_editor_section(HostEditorSection::Network, window, cx);
+    });
+    let before = visual.update(|_, app| {
+        let editor = panel.read(app).editor.as_ref().unwrap();
+        (
+            editor.inputs.keepalive.entity_id(),
+            editor.scroll_handle.offset(),
+        )
+    });
+    let save_bounds = visual
+        .debug_bounds("connections-editor-save")
+        .expect("保存按钮可见");
+    let viewport_bounds = visual
+        .debug_bounds("connections-editor-viewport")
+        .expect("正文视口可见");
+    let probe = start_probe(&runtime, &panel, visual, &mut started);
+    visual.update(|_, app| {
+        let panel = panel.read(app);
+        let editor = panel.editor.as_ref().unwrap();
+        assert!(panel.probe_running);
+        assert!(
+            !panel.host_editor_fields_disabled(),
+            "测试不应使整张表单变灰"
+        );
+        assert_eq!(editor.section, HostEditorSection::Network);
+        assert_eq!(editor.inputs.keepalive.entity_id(), before.0);
+        assert_eq!(editor.scroll_handle.offset(), before.1);
+    });
+    assert_eq!(
+        visual.debug_bounds("connections-editor-save"),
+        Some(save_bounds)
+    );
+    assert_eq!(
+        visual.debug_bounds("connections-editor-viewport"),
+        Some(viewport_bounds)
+    );
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel
+            .editor
+            .as_ref()
+            .unwrap()
+            .inputs
+            .keepalive
+            .update(cx, |input, cx| input.replace_all("45", window, cx));
+    });
+    assert!(probe.cancellation.is_cancelled());
+    release_probe(&runtime, visual, &release, &mut finished, probe.id);
+    visual.update(|_, app| {
+        let panel = panel.read(app);
+        let editor = panel.editor.as_ref().unwrap();
+        assert_eq!(editor.inputs.keepalive.read(app).value().as_str(), "45");
+        assert!(!panel.probe_running);
+        assert!(panel.probe_outcome.is_none());
+        assert!(panel.probe_error.is_none());
+    });
+    assert_eq!(
+        visual.debug_bounds("connections-editor-save"),
+        Some(save_bounds)
+    );
+    assert_eq!(
+        visual.debug_bounds("connections-editor-viewport"),
+        Some(viewport_bounds)
+    );
+}
+
+/// 后加跳板也必须使测试失效，重排则保持输入实体与凭据所有权一起移动。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn added_jump_input_invalidates_probe_and_reorder_keeps_identity(app: &mut TestAppContext) {
+    let (runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
+    let (service, mut started, mut finished, release) = gated_probe_service();
+    install_probe_service(&panel, visual, service);
+    configure_ssh_editor(
+        &panel,
+        visual,
+        true,
+        "jump draft",
+        "target.example.test",
+        HostAuthenticationMode::Agent,
+        None,
+    );
+    update_panel(&panel, visual, |panel, window, cx| {
+        for index in 0..2 {
+            panel.add_jump(window, cx);
+            let jump = &panel.editor.as_ref().unwrap().jumps[index];
+            jump.host.update(cx, |input, cx| {
+                input.replace_all(format!("jump-{index}.example.test"), window, cx)
+            });
+            jump.username.update(cx, |input, cx| {
+                input.replace_all("fixture-user", window, cx)
+            });
+        }
+    });
+    let first = visual.update(|_, app| {
+        panel.read(app).editor.as_ref().unwrap().jumps[0]
+            .host
+            .entity_id()
+    });
+    let probe = start_probe(&runtime, &panel, visual, &mut started);
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.editor.as_ref().unwrap().jumps[0]
+            .host
+            .update(cx, |input, cx| {
+                input.replace_all("edited.example.test", window, cx)
+            });
+    });
+    assert!(
+        probe.cancellation.is_cancelled(),
+        "新增跳板的输入变化也必须取消旧测试"
+    );
+    release_probe(&runtime, visual, &release, &mut finished, probe.id);
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.move_jump(0, false, window, cx)
+    });
+    visual.update(|_, app| {
+        let panel = panel.read(app);
+        let editor = panel.editor.as_ref().unwrap();
+        assert_eq!(editor.jumps[1].host.entity_id(), first);
+        assert_eq!(
+            editor.jumps[1].host.read(app).value().as_str(),
+            "edited.example.test"
+        );
+        assert!(panel.probe_outcome.is_none());
+    });
 }
 
 /// 等待被明确放行的 adapter 结束，再泵 GPUI 队列以验证实际面板回调。
@@ -234,14 +622,13 @@ fn canceled_closed_probe_receipt_cannot_mutate_reopened_editor(app: &mut TestApp
     );
 
     let cancelled = start_probe(&runtime, &panel, visual, &mut started);
-    update_panel(&panel, visual, |panel, _, cx| {
-        panel.cancel_connection_probe(cx);
-    });
+    click_probe_action(visual);
     assert!(cancelled.cancellation.is_cancelled());
     visual.update(|_, app| {
         let panel = panel.read(app);
         assert!(!panel.probe_running);
-        assert!(panel.probe_error.is_some());
+        assert!(panel.probe_cancelled);
+        assert!(panel.probe_error.is_none());
         assert!(panel.probe_outcome.is_none());
     });
     update_panel(&panel, visual, |panel, window, cx| {

@@ -773,7 +773,7 @@ fn section(
         .when(compact, |section| section.gap_1().p_2())
         .when(!compact, |section| section.p_3())
         .rounded_md()
-        .bg(theme.panel)
+        .bg(theme.content_surface())
         .child(
             div()
                 .text_size(px(14.))
@@ -797,12 +797,13 @@ fn section_page(
 }
 
 /// YAML 预览需要明确的高度链；其它运维列表继续按内容高度滚动。
+/// 外壳仅约束几何，阅读底色由内部内容区域绘制，避免嵌套透明度累加。
 ///
 /// @author kongweiguang
 fn section_page_with_fill(
     title: impl Into<SharedString>,
     content: impl IntoElement,
-    theme: ThemeTokens,
+    _theme: ThemeTokens,
     compact: bool,
     fixed: bool,
     fill_height: bool,
@@ -819,8 +820,7 @@ fn section_page_with_fill(
         page = page
             .when(compact, |page| page.gap_1().p_2())
             .when(!compact, |page| page.p_3())
-            .rounded_md()
-            .bg(theme.panel);
+            .rounded_md();
     }
     if !fixed {
         page = page.child(

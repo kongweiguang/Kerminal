@@ -2,6 +2,7 @@
 //!
 //! @author kongweiguang
 
+use kerminal_application::connections::host_types::{BuiltinHostOpenIntent, PluginHostOpenIntent};
 use kerminal_application::connections::management::{
     HostAuthenticationMode, HostGroup, HostGroupSnapshot, HostRouteSettings, HostSftpOptions,
     HostTerminalOptions, ManagedHost, RdpDisplayOptions,
@@ -17,7 +18,8 @@ use super::{
     ConflictReloadTarget, ConnectionsEvent, ConnectionsPanel, ConnectionsPresentation,
     GroupSaveReconciliation, HostCredentialRecoveryAction, HostSaveReadback,
     HostSaveReadbackDecision, HostSnapshotReadGeneration, PendingAction, PendingHostSaveRecovery,
-    SavedSelectionTarget, apply_host_snapshot_read_if_current, conflict_editor_reload_enabled,
+    SavedSelectionTarget, apply_host_snapshot_read_if_current, builtin_host_intent_matches,
+    builtin_host_snapshot_matches, conflict_editor_reload_enabled,
     conflict_reload_blocks_editor_mutation, conflict_reload_response_matches,
     group_save_reconciliation_after_acknowledgement, group_save_reconciliation_after_readback,
     group_save_review_facts, host_draft_from_managed_host, host_editor_replacement_blocked,
@@ -122,7 +124,6 @@ fn managed_host_snapshot(id: HostId, name: &str, revision: &str) -> ManagedHost 
         route: HostRouteSettings::default(),
         serial: None,
         tags: Vec::new(),
-        is_favorite: false,
         sort_order: 0,
         connect_timeout_ms: 30_000,
         keepalive_interval_ms: None,
@@ -133,6 +134,57 @@ fn managed_host_snapshot(id: HostId, name: &str, revision: &str) -> ManagedHost 
         updated_at: "1".to_owned(),
         revision: ConfigRevision::from_sha256(revision.to_owned()),
     }
+}
+
+/// 提供方返回必须对应同一主机和协议，异步目录版本变化不能借旧快照继续连接。
+#[test]
+fn builtin_provider_intent_and_snapshot_require_original_identity() {
+    let id = HostId::new();
+    let host = managed_host_snapshot(id.clone(), "fixture", "revision");
+    let intent = PluginHostOpenIntent::Builtin(BuiltinHostOpenIntent {
+        host_id: id.clone(),
+        configuration_type: "ssh".to_owned(),
+    });
+    assert!(builtin_host_intent_matches(
+        &intent,
+        &id,
+        RemoteProtocol::Ssh
+    ));
+    assert!(!builtin_host_intent_matches(
+        &intent,
+        &HostId::new(),
+        RemoteProtocol::Ssh
+    ));
+    assert!(!builtin_host_intent_matches(
+        &intent,
+        &id,
+        RemoteProtocol::Sftp
+    ));
+    assert!(!builtin_host_intent_matches(
+        &PluginHostOpenIntent::Rdp {
+            host_id: id.clone()
+        },
+        &id,
+        RemoteProtocol::Ssh,
+    ));
+    assert!(builtin_host_snapshot_matches(
+        &host,
+        &id,
+        RemoteProtocol::Ssh,
+        &host.revision
+    ));
+    assert!(!builtin_host_snapshot_matches(
+        &host,
+        &id,
+        RemoteProtocol::Sftp,
+        &host.revision
+    ));
+    assert!(!builtin_host_snapshot_matches(
+        &host,
+        &id,
+        RemoteProtocol::Ssh,
+        &ConfigRevision::from_sha256("other".into()),
+    ));
 }
 
 /// 驱动与面板回调相同的代次门禁：保存注入行后旧回执被丢弃，新读取才可替换目录快照。
@@ -304,7 +356,7 @@ fn sftp_transfer_tab_started_event_preserves_request_id() {
     );
 }
 
-/// 只有本次 SFTP picker 新建流程发成功回执；协议能力区分 SSH/SFTP 与其它保存结果。
+/// picker 回执绑定原流程；独立 SFTP 不受历史可选开关影响，SSH 仍尊重用户禁用意图。
 /// @author kongweiguang
 #[test]
 fn sftp_host_creation_receipt_is_scoped_and_capability_checked() {
@@ -327,7 +379,8 @@ fn sftp_host_creation_receipt_is_scoped_and_capability_checked() {
             can_open_sftp: true,
         })
     );
-    assert!(!host_sftp_capable(RemoteProtocol::Sftp, false));
+    assert!(host_sftp_capable(RemoteProtocol::Sftp, false));
+    assert!(!host_sftp_capable(RemoteProtocol::Ssh, false));
     assert!(!host_sftp_capable(RemoteProtocol::Rdp, true));
     assert!(host_sftp_capable(RemoteProtocol::Ssh, true));
 }

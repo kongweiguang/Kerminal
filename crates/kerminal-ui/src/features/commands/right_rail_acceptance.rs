@@ -4,7 +4,7 @@
 
 use std::future::Future;
 
-use gpui_kit::{Context, Window};
+use gpui_kit::{App, Context, Focusable as _, Window};
 use kerminal_application::commands::SnippetCatalogSection;
 use kerminal_application::sessions::UiSessionBinding;
 use kerminal_domain::commands::{SnippetCatalogOrigin, SnippetPreferenceKey};
@@ -15,6 +15,23 @@ const CANCELLED_RUN_SNIPPET_ID: &str = "snippet.builtin.core.find_large_files";
 const PING_SNIPPET_ID: &str = "snippet.builtin.core.ping_host";
 
 impl CommandsView {
+    /// 仅供原生验收读取当前实体的布局与真实搜索焦点，不改变用户视图状态。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn plugin_acceptance_layout_and_focus(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> (bool, bool) {
+        (
+            self.compact_layout,
+            self.snippet_query
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window),
+        )
+    }
+
     /// 原生验收只读取精确来源的预览阶段，不以选中项存在冒充加载完成或取消成功。
     ///
     /// @author kongweiguang

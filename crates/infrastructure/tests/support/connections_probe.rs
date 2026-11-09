@@ -396,6 +396,7 @@ fn transient_target(protocol: RemoteProtocol) -> ConnectionProbeTarget {
         },
         sftp_remote_start_directory: (protocol == RemoteProtocol::Sftp)
             .then(|| RemotePath::parse("/").expect("static SFTP root path")),
+        check_optional_sftp: false,
         serial,
         timeout: Duration::from_secs(5),
         host_key_confirmation: None,
@@ -1092,6 +1093,7 @@ async fn sftp_probe_requires_listable_start_directory_and_releases_resources() {
         service.as_ref(),
         &target.profile,
         Some(&path),
+        false,
         &CancellationToken::new(),
         ProbeDeadlines::from_timeout(Duration::from_secs(2)),
     )
@@ -1114,6 +1116,68 @@ async fn sftp_probe_requires_listable_start_directory_and_releases_resources() {
     wait_for_sftp_fixture_channel_close(&state).await;
 }
 
+/// SSH 主认证成功后报告独立 SFTP 结果，成功附加检查仍回收 session 与 lease。
+/// @author kongweiguang
+#[tokio::test]
+async fn ssh_probe_reports_optional_sftp_success_separately() {
+    let path = RemotePath::parse("/srv/ssh-files").expect("valid fixture path");
+    let (service, state) =
+        sftp_directory_fixture(SftpDirectoryFixtureMode::Accessible, path.as_str());
+    let target = transient_target(RemoteProtocol::Ssh);
+    let result = connect_and_check_sftp(
+        service.as_ref(),
+        &target.profile,
+        Some(&path),
+        true,
+        &CancellationToken::new(),
+        ProbeDeadlines::from_timeout(Duration::from_secs(2)),
+    )
+    .await
+    .expect("SSH authentication result remains successful");
+
+    assert_eq!(
+        result,
+        ConnectionProbeOutcome::SshAuthenticated {
+            sftp: SftpProbeStatus::Available,
+        }
+    );
+    assert_eq!(state.read_directory_calls.load(Ordering::Acquire), 1);
+    assert_eq!(state.lease_close_count.load(Ordering::Acquire), 1);
+    wait_for_sftp_fixture_channel_close(&state).await;
+}
+
+/// SSH 认证成功仍是主结果；SFTP 子系统不可用作为附加失败返回且关闭所有资源。
+/// @author kongweiguang
+#[tokio::test]
+async fn ssh_probe_keeps_authentication_success_when_optional_sftp_fails() {
+    let path = RemotePath::parse("/srv/private").expect("valid fixture path");
+    let (service, state) =
+        sftp_directory_fixture(SftpDirectoryFixtureMode::Inaccessible, path.as_str());
+    let target = transient_target(RemoteProtocol::Ssh);
+    let result = connect_and_check_sftp(
+        service.as_ref(),
+        &target.profile,
+        Some(&path),
+        true,
+        &CancellationToken::new(),
+        ProbeDeadlines::from_timeout(Duration::from_secs(2)),
+    )
+    .await
+    .expect("optional SFTP failure must not fail SSH authentication");
+
+    assert_eq!(
+        result,
+        ConnectionProbeOutcome::SshAuthenticated {
+            sftp: SftpProbeStatus::Failed {
+                code: kerminal_application::PublicErrorCode::Conflict,
+                message: "SFTP 起始目录不可访问",
+            },
+        }
+    );
+    assert_eq!(state.lease_close_count.load(Ordering::Acquire), 1);
+    wait_for_sftp_fixture_channel_close(&state).await;
+}
+
 /// 远端拒绝打开起始目录时返回失败，并且仍关闭 SFTP session 与连接 lease。
 ///
 /// @author kongweiguang
@@ -1127,6 +1191,7 @@ async fn sftp_probe_rejects_inaccessible_start_directory_and_releases_resources(
         service.as_ref(),
         &target.profile,
         Some(&path),
+        false,
         &CancellationToken::new(),
         ProbeDeadlines::from_timeout(Duration::from_secs(2)),
     )
@@ -1159,6 +1224,7 @@ async fn sftp_probe_cancellation_closes_session_and_lease() {
             service.as_ref(),
             &target.profile,
             Some(&worker_path),
+            false,
             &worker_cancellation,
             ProbeDeadlines::from_timeout(Duration::from_secs(3)),
         )

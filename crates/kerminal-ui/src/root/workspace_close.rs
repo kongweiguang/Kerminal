@@ -116,7 +116,9 @@ fn transfer_close_targets_for_tab(tab: &WorkspaceSessionTab) -> Vec<TransferClos
             origin: TransferOrigin::WorkspaceFile(tab.id().clone()),
             descriptor: TransferCloseDescriptor::Tab(tab.clone()),
         }],
-        WorkspaceSessionTab::Unsupported { .. } => Vec::new(),
+        WorkspaceSessionTab::Extension { .. } | WorkspaceSessionTab::Unsupported { .. } => {
+            Vec::new()
+        }
     }
 }
 
@@ -2201,6 +2203,7 @@ impl RootView {
         }
         if close_workbench_after_batch {
             self.pending_sftp_navigation = None;
+            self.cancel_plugin_host_open();
             self.surface_navigation_generation = self.surface_navigation_generation.wrapping_add(1);
         }
         if let WorkspaceTabEvent::CloseBatch(intent) = &effective_event {
@@ -2317,6 +2320,7 @@ impl RootView {
         self.sftp_workbench_tab_open = false;
         self.sftp_workbench_close_after_batch = None;
         self.pending_sftp_navigation = None;
+        self.cancel_plugin_host_open();
         self.surface_navigation_generation = self.surface_navigation_generation.wrapping_add(1);
         if was_selected {
             let fallback_tab_id = self.workspace_controller.as_ref().and_then(|controller| {
@@ -2405,10 +2409,11 @@ impl RootView {
         );
     }
 
-    /// 传输核对完成后继续原 controller 操作，避免从通用入口重复创建资源 owner。
+    /// 传输与可取消的文件草稿门禁先完成，再开始不可逆的工具和内容资源关闭。
+    /// 扩展标签先交还其内容 owner 收尾，不能误用文件标签的空资源关闭路径。
     ///
     /// @author kongweiguang
-    fn apply_workspace_resource_operation_with_focus(
+    pub(super) fn apply_workspace_resource_operation_with_focus(
         &mut self,
         operation: WorkspaceResourceOperation,
         close_focus: Option<CloseSurvivorFocusIntent>,
@@ -2418,9 +2423,28 @@ impl RootView {
         if let WorkspaceResourceOperation::CloseTab {
             operation_id, tab, ..
         } = &operation
-            && !matches!(tab.as_ref(), WorkspaceSessionTab::Terminal { .. })
+            && !matches!(
+                tab.as_ref(),
+                WorkspaceSessionTab::Terminal { .. } | WorkspaceSessionTab::Extension { .. }
+            )
         {
             self.begin_workspace_file_tab_close(operation_id.clone(), tab.as_ref().clone(), cx);
+            return;
+        }
+        if self.defer_plugin_tool_tab_close(
+            &operation,
+            close_focus.clone(),
+            close_tab_focus.clone(),
+            cx,
+        ) {
+            return;
+        }
+        if let WorkspaceResourceOperation::CloseTab {
+            operation_id, tab, ..
+        } = &operation
+            && matches!(tab.as_ref(), WorkspaceSessionTab::Extension { .. })
+        {
+            self.begin_plugin_tab_close(operation_id.clone(), tab.id().clone(), cx);
             return;
         }
         let (operation_id, tab_id, pane_ids, remove_tab_layout_on_success) = match operation {
@@ -2737,7 +2761,11 @@ impl RootView {
         let services = self.services.clone();
         let executor = services.executor.clone();
         let session_service = services.sessions.clone();
-        let close_deadline = SessionDeadline::now() + DEFAULT_SESSION_CLOSE_BUDGET;
+        let close_deadline = if remove_tab_layout_on_success {
+            SessionDeadline::from_std(self.plugin_tab_close_deadline(&tab_id))
+        } else {
+            SessionDeadline::now() + DEFAULT_SESSION_CLOSE_BUDGET
+        };
         let completion_targets = sessions_to_close.clone();
         let operation_id_for_task = operation_id.clone();
         let cancelled_work_for_task = cancelled_work;
@@ -3060,11 +3088,11 @@ impl RootView {
             });
             return;
         }
-        self.complete_nonterminal_workspace_tab_close(operation_id, tab_id, cx);
+        self.close_guarded_nonterminal_tab(operation_id, tab_id, cx);
     }
 
     /// 编辑器明确未关闭时撤销候选并保留文档/lease，不能把用户取消留成阻断后续导航的资源失败。
-    /// 真正关闭才提交工作区；未知写入仍由编辑器自身的保存门禁持有。
+    /// 草稿确认后才回收工具并提交工作区；未知写入仍由编辑器自身的保存门禁持有。
     pub(super) fn handle_workspace_file_close_result(
         &mut self,
         operation_id: String,
@@ -3093,6 +3121,7 @@ impl RootView {
             return;
         }
         if !closed {
+            self.plugin_tab_close_deadlines.remove(tab.id());
             if let Some(controller) = self.workspace_controller.as_mut() {
                 cancel_unclosed_file_tab_operation(controller, &operation_id, tab.id());
             }
@@ -3107,7 +3136,7 @@ impl RootView {
             return;
         }
         let was_active = self.nonterminal_workspace_tab_is_visible(tab.id());
-        self.complete_nonterminal_workspace_tab_close(operation_id, tab.id().clone(), cx);
+        self.close_guarded_nonterminal_tab(operation_id, tab.id().clone(), cx);
         if was_active {
             self.activate_current_workspace_surface_after_close(window, cx);
         }
@@ -3707,6 +3736,11 @@ impl RootView {
                                     tab_id.clone(),
                                 )
                     }
+                    WorkspaceSessionTab::Extension { .. } => {
+                        self.center_panel == CenterPanel::Contributed
+                            && self.active_content_scope.as_ref()
+                                == Some(&crate::plugins::content::ContentScope::Tab(tab_id.clone()))
+                    }
                     _ => false,
                 }
         })
@@ -3714,9 +3748,10 @@ impl RootView {
 
     /// 非终端标签经 editor guard 后提交关闭，再释放独立实体；后继页面读取 reducer 的最新选择。
     /// 无窗口回调只延后一轮同步，导航代次变化时让位于用户较新的选择。
+    /// 扩展实例只有在资源关闭和 controller 提交都成功后才能移除。
     ///
     /// @author kongweiguang
-    fn complete_nonterminal_workspace_tab_close(
+    pub(super) fn complete_nonterminal_workspace_tab_close(
         &mut self,
         operation_id: String,
         tab_id: TabId,
@@ -3730,6 +3765,16 @@ impl RootView {
             .map(|controller| controller.complete_resource_operation(&operation_id, Ok(())));
         match result {
             Some(Ok(_)) => {
+                let scope = crate::plugins::content::ContentScope::Tab(tab_id.clone());
+                self.content_failures.remove(&scope);
+                if self.content_host.phase(&scope)
+                    == Some(crate::plugins::content::ContentPhase::Closed)
+                    && let Err(error) = self.content_host.finalize_close(&scope)
+                {
+                    self.status = Some(error.public_message().to_owned().into());
+                    cx.notify();
+                    return;
+                }
                 self.cancel_file_sftp_selections_for_tab(&tab_id, cx);
                 self.remove_workspace_file_tab_after_close(&tab_id);
                 self.update_runtime_layout_after_close(&tab_id, true);
@@ -3762,12 +3807,24 @@ impl RootView {
     }
 
     /// 资源关闭失败时保留 controller 的失败候选，供用户显式重试。
-    fn complete_workspace_resource_failure(
+    pub(super) fn complete_workspace_resource_failure(
         &mut self,
         operation_id: &str,
         message: SharedString,
         cx: &mut Context<RootView>,
     ) {
+        if let Some(WorkspaceResourceOperation::CloseTab {
+            operation_id: current,
+            tab_id,
+            ..
+        }) = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.pending_resource_operation())
+            && current == operation_id
+        {
+            self.plugin_tab_close_deadlines.remove(tab_id);
+        }
         let completion_error = self.workspace_controller.as_mut().and_then(|controller| {
             controller
                 .complete_resource_operation(
@@ -3883,9 +3940,10 @@ impl RootView {
         }
     }
 
-    /// 关闭提交后按 reducer 的真实布局同步运行态 pane 布局索引。
+    /// 关闭提交后按 reducer 的真实布局同步运行态 pane 布局索引，并释放已完成回收的标签工具。
     fn update_runtime_layout_after_close(&mut self, tab_id: &TabId, remove_tab: bool) {
         if remove_tab {
+            self.finalize_plugin_tab_tools(tab_id);
             self.workspace_runtime.remove_tab_layout(tab_id);
             return;
         }

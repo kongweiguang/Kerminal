@@ -252,7 +252,6 @@ async fn generate_real_legacy_readback_fixture() {
                 route: Default::default(),
                 serial: None,
                 tags: vec!["legacy-readback".to_owned()],
-                is_favorite: false,
                 sort_order: 4,
                 connect_timeout_ms: 30_000,
                 keepalive_interval_ms: Some(60_000),

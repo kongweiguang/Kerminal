@@ -1586,7 +1586,7 @@ impl Render for LogsView {
                     .rounded(theme.radius)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.panel)
+                    .bg(theme.content_surface())
                     .overflow_hidden()
                     .child(card_measurement)
                     .child(
@@ -1751,7 +1751,7 @@ impl Render for LogsView {
                     .w_full()
                     .p_2()
                     .rounded_md()
-                    .bg(theme.panel)
+                    .bg(theme.content_surface())
                     .text_color(theme.error)
                     .text_size(theme.text_xs)
                     .child(error),
@@ -1770,7 +1770,7 @@ impl Render for LogsView {
                     .w_full()
                     .p_2()
                     .rounded_md()
-                    .bg(theme.panel)
+                    .bg(theme.content_surface())
                     .text_color(theme.error)
                     .text_size(theme.text_xs)
                     .child(message),

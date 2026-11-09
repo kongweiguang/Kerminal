@@ -18,6 +18,7 @@ use kerminal_application::{
         CredentialCleanupStatus, HostDeletionReceipt, LocalHostDraft, LocalHostSaveRecoveryToken,
         ManagedLocalHost, RecoverableLocalHostSaveOutcome,
     },
+    local_shells::LocalShellCandidate,
     preferences::{ProfileDraft, VersionedProfile},
 };
 use kerminal_domain::{
@@ -25,8 +26,10 @@ use kerminal_domain::{
     preferences::{ConfigRevision, ConfigurationMode, TerminalProfile},
     sessions::LocalSessionTarget,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{
+    editor_text::{ListSeparator, format_list, parse_list},
     form::create_input,
     panel::{
         ConnectionsEditorKind, ConnectionsEvent, ConnectionsPanel, HostFilePickerTarget,
@@ -56,6 +59,68 @@ pub(super) fn local_host_projection(
         },
         revision: host.revision,
     }
+}
+
+/// 候选程序和 argv 需保持 OS 字符串无损；特殊参数用引用行表示，不改变实际 argv。
+/// @author kongweiguang
+fn local_shell_candidate_fields(
+    candidate: &LocalShellCandidate,
+) -> Result<(String, String), String> {
+    let shell = candidate
+        .program()
+        .to_os_string()
+        .into_string()
+        .map_err(|_| {
+            crate::locale::text(
+                "此 Shell 路径无法无损表示为文本，请手动填写路径。",
+                "This Shell path cannot be represented as text. Enter the path manually.",
+            )
+            .to_string()
+        })?;
+    if shell.contains('\0') || shell.contains('\r') || shell.contains('\n') {
+        return Err(crate::locale::text(
+            "此 Shell 路径无法用于单行字段，请手动填写路径。",
+            "This Shell path cannot be represented in a single line. Enter the path manually.",
+        )
+        .to_string());
+    }
+    let mut arguments = Vec::with_capacity(candidate.args().len());
+    for argument in candidate.args() {
+        let argument = argument.to_os_string().into_string().map_err(|_| {
+            crate::locale::text(
+                "此 Shell 的启动参数无法无损表示，请手动填写。",
+                "These Shell arguments cannot be represented without loss. Enter them manually.",
+            )
+            .to_string()
+        })?;
+        if argument.contains('\0') {
+            return Err(crate::locale::text(
+                "此 Shell 的启动参数包含空字符，请手动填写。",
+                "These Shell arguments contain a null character. Enter them manually.",
+            )
+            .to_string());
+        }
+        arguments.push(argument);
+    }
+    Ok((shell, format_list(&arguments, ListSeparator::Lines)))
+}
+
+/// 同一可执行文件可对应普通 Shell 或开发者启动环境，选中状态必须连同 argv 精确匹配。
+/// @author kongweiguang
+pub(super) fn local_shell_candidate_matches(
+    candidate: &LocalShellCandidate,
+    program: &str,
+    args: &str,
+) -> bool {
+    let Ok(arguments) = parse_profile_arguments(args) else {
+        return false;
+    };
+    candidate.program() == std::ffi::OsStr::new(program)
+        && candidate
+            .args()
+            .iter()
+            .map(|arg| arg.as_os_str())
+            .eq(arguments.iter().map(std::ffi::OsStr::new))
 }
 
 /// 校验 UI 携带的稳定标识后才访问主机仓储，不以默认模板替代无效目标。
@@ -269,16 +334,18 @@ struct LocalHostDefaultProjection {
     baseline: LocalHostInputBaseline,
 }
 
-/// 只投影仍等于打开时基线的字段，迟到的默认目标回执不能覆盖用户编辑。
+/// Shell 与 argv 必须成对投影，避免手动选择程序后混入迟到的其它 Shell 参数；目录和环境独立保护。
+/// @author kongweiguang
 fn project_untouched_local_defaults(
     baseline: &LocalHostInputBaseline,
     current: &LocalHostInputBaseline,
     defaults: LocalHostDefaultValues,
 ) -> LocalHostDefaultProjection {
     let mut next_baseline = baseline.clone();
-    let shell = (current.shell == baseline.shell).then_some(defaults.shell);
+    let command_untouched = current.shell == baseline.shell && current.args == baseline.args;
+    let shell = command_untouched.then_some(defaults.shell);
     let cwd = (current.cwd == baseline.cwd).then_some(defaults.cwd);
-    let args = (current.args == baseline.args).then_some(defaults.args);
+    let args = command_untouched.then_some(defaults.args);
     let env = (current.env == baseline.env).then_some(defaults.env);
     if let Some(value) = &shell {
         next_baseline.shell = value.clone();
@@ -301,7 +368,7 @@ fn project_untouched_local_defaults(
     }
 }
 
-/// 用户主动恢复 Profile 时可覆盖点击时已有值，但异步期间新输入始终优先。
+/// 主动恢复 Profile 也把 Shell 与 argv 作为整体，异步期间修改任一项都保留当前命令。
 /// @author kongweiguang
 fn project_explicit_local_defaults(
     expected: &LocalHostInputBaseline,
@@ -309,10 +376,11 @@ fn project_explicit_local_defaults(
     defaults: LocalHostDefaultValues,
     baseline: &LocalHostInputBaseline,
 ) -> LocalHostDefaultProjection {
+    let command_untouched = current.shell == expected.shell && current.args == expected.args;
     LocalHostDefaultProjection {
-        shell: (current.shell == expected.shell).then_some(defaults.shell),
+        shell: command_untouched.then_some(defaults.shell),
         cwd: (current.cwd == expected.cwd).then_some(defaults.cwd),
-        args: (current.args == expected.args).then_some(defaults.args),
+        args: command_untouched.then_some(defaults.args),
         env: (current.env == expected.env).then_some(defaults.env),
         baseline: baseline.clone(),
     }
@@ -334,17 +402,22 @@ impl LocalHostEditor {
         local_host_needs_save(self.revision.as_ref(), self.is_dirty(cx))
     }
 
-    /// 仅在提交边界把多行编辑文本转成应用 ProfileDraft；ProfileService 仍是最终校验者。
-    fn draft(&self, cx: &Context<ConnectionsPanel>) -> Result<ProfileDraft, String> {
+    /// 提交时才解析列表；错误保留字段身份，不能将参数格式错误错误地定位到环境变量。
+    fn draft(
+        &self,
+        cx: &Context<ConnectionsPanel>,
+    ) -> Result<ProfileDraft, (LocalHostValidationField, String)> {
         let args_text = self.args.read(cx).value().to_string();
         let env_text = self.env.read(cx).value().to_string();
         Ok(ProfileDraft {
             id: Some(self.profile_id.clone()),
             name: self.name.read(cx).value().to_string(),
             shell: self.shell.read(cx).value().to_string(),
-            args: parse_profile_arguments(&args_text),
+            args: parse_profile_arguments(&args_text)
+                .map_err(|message| (LocalHostValidationField::Arguments, message))?,
             cwd: optional_path(self.cwd.read(cx).value().as_ref()),
-            env: parse_profile_environment(&env_text)?,
+            env: parse_profile_environment(&env_text)
+                .map_err(|message| (LocalHostValidationField::Environment, message))?,
             sidebar_group_id: self.group_id.clone(),
             sort_order: self.sort_order,
         })
@@ -393,9 +466,11 @@ pub(super) fn local_host_validation_field(
             if working_directory.len() > 4096 || working_directory.contains('\0') {
                 return Some(LocalHostValidationField::WorkingDirectory);
             }
-            let arguments_exceed_limit = parse_profile_arguments(arguments_text)
-                .iter()
-                .any(|argument| argument.len() > 16 * 1024 || argument.contains('\0'));
+            let arguments_exceed_limit =
+                parse_profile_arguments(arguments_text).map_or(true, |args| {
+                    args.iter()
+                        .any(|argument| argument.len() > 16 * 1024 || argument.contains('\0'))
+                });
             Some(if arguments_exceed_limit {
                 LocalHostValidationField::Arguments
             } else {
@@ -409,6 +484,13 @@ pub(super) fn local_host_validation_field(
 /// 本地主机和模板各持一份投影，写入未知与凭据清理由同一门禁管理。
 pub(super) struct LocalHostState {
     pub(super) service: Option<ProfileService>,
+    /// Shell 候选只作为表单建议，不会自动写入或覆盖手动输入。
+    pub(super) shell_candidates: Vec<LocalShellCandidate>,
+    pub(super) shell_discovery_loading: bool,
+    pub(super) shell_discovery_loaded: bool,
+    pub(super) shell_discovery_error: Option<String>,
+    shell_discovery_generation: u64,
+    shell_discovery_cancellation: Option<CancellationToken>,
     /// 模板只供启动参数选择，本地主机的 CRUD 始终使用 rows 和主机服务。
     pub(super) templates: Vec<VersionedProfile>,
     pub(super) rows: Vec<VersionedProfile>,
@@ -453,6 +535,12 @@ impl Default for LocalHostState {
     fn default() -> Self {
         Self {
             service: None,
+            shell_candidates: Vec::new(),
+            shell_discovery_loading: false,
+            shell_discovery_loaded: false,
+            shell_discovery_error: None,
+            shell_discovery_generation: 0,
+            shell_discovery_cancellation: None,
             templates: Vec::new(),
             rows: Vec::new(),
             selected_id: None,
@@ -489,6 +577,49 @@ impl LocalHostState {
     /// 面板构造后注入既有服务；状态本身不创建仓储或独立文件路径。
     pub(super) fn set_service(&mut self, service: ProfileService) {
         self.service = Some(service);
+    }
+
+    /// 用户明确选择 Shell 后废弃默认目标投影，避免旧系统默认值补入不匹配的 argv 等字段。
+    /// @author kongweiguang
+    fn invalidate_default_target_resolution(&mut self) {
+        self.default_target_generation = self.default_target_generation.wrapping_add(1);
+        self.default_target_request = None;
+    }
+
+    /// 异步默认目标回执必须仍持有发起时 generation，显式用户选择会撤销该资格。
+    /// @author kongweiguang
+    fn accepts_default_target_generation(&self, generation: u64) -> bool {
+        self.default_target_generation == generation
+    }
+
+    /// 终结一次仍属当前编辑器的扫描；失败保留上一批候选，取消不伪装成空结果。
+    /// @author kongweiguang
+    fn complete_shell_discovery(&mut self, result: Result<Vec<LocalShellCandidate>, AppError>) {
+        self.shell_discovery_cancellation = None;
+        self.shell_discovery_loading = false;
+        match result {
+            Ok(candidates) => {
+                self.shell_candidates = candidates;
+                self.shell_discovery_loaded = true;
+                self.shell_discovery_error = None;
+            }
+            Err(error) if error.public_code() == PublicErrorCode::Cancelled => {
+                self.shell_discovery_error = None;
+            }
+            Err(error) => {
+                self.shell_discovery_error = Some(super::panel::localized_error(&error));
+            }
+        }
+    }
+
+    /// 递增扫描代次并发出协作取消，旧任务的迟到回执不能改变新状态。
+    /// @author kongweiguang
+    fn cancel_shell_discovery(&mut self) {
+        self.shell_discovery_generation = self.shell_discovery_generation.wrapping_add(1);
+        if let Some(cancellation) = self.shell_discovery_cancellation.take() {
+            cancellation.cancel();
+        }
+        self.shell_discovery_loading = false;
     }
 
     /// 任何仍未核对的持久化结果都禁止再次写入，避免把未知提交重放成重复操作。
@@ -595,7 +726,7 @@ impl ConnectionsPanel {
         let mut matches = self.local_hosts.templates.iter().filter(|row| {
             row.profile.shell == current.shell
                 && row.profile.cwd.as_deref().unwrap_or_default() == current.cwd
-                && row.profile.args.join("\n") == current.args
+                && format_list(&row.profile.args, ListSeparator::Lines) == current.args
                 && format_environment(&row.profile.env) == current.env
         });
         let first = matches.next()?;
@@ -624,7 +755,7 @@ impl ConnectionsPanel {
         true
     }
 
-    /// 自动填充与显式选择共用异步回执门禁；成功由表单值反馈，避免状态提示挤动字段。
+    /// 自动填充与显式选择共用回执门禁；读取只在原入口反馈，持久化冻结后不再投影或清理状态。
     /// @author kongweiguang
     fn resolve_local_profile_target(
         &mut self,
@@ -632,6 +763,9 @@ impl ConnectionsPanel {
         explicit_override: Option<LocalHostInputBaseline>,
         cx: &mut Context<Self>,
     ) {
+        if self.local_hosts.mutation_blocked() || self.saving || self.save_outcome_unknown {
+            return;
+        }
         let Some(service) = self.local_hosts.service.clone() else {
             self.status = Some(
                 crate::locale::text(
@@ -660,6 +794,7 @@ impl ConnectionsPanel {
         let default_generation = self.local_hosts.default_target_generation;
         let editor_generation = self.local_hosts.editor_generation;
         let executor = self.executor.clone();
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |_| async move {
@@ -673,7 +808,9 @@ impl ConnectionsPanel {
                 })
                 .await;
             let _ = this.update_in(cx, move |panel, window, cx| {
-                if panel.local_hosts.default_target_generation != default_generation
+                if !panel
+                    .local_hosts
+                    .accepts_default_target_generation(default_generation)
                     || panel.local_hosts.editor_generation != editor_generation
                     || panel
                         .local_hosts
@@ -686,6 +823,13 @@ impl ConnectionsPanel {
                     return;
                 }
                 panel.local_hosts.default_target_request = None;
+                if panel.local_hosts.mutation_blocked()
+                    || panel.saving
+                    || panel.save_outcome_unknown
+                {
+                    cx.notify();
+                    return;
+                }
                 match result {
                     Ok(target) => match local_target_to_profile_fields(target) {
                         Ok((shell, args, cwd, env)) => {
@@ -699,7 +843,7 @@ impl ConnectionsPanel {
                                         LocalHostDefaultValues {
                                             shell,
                                             cwd: cwd.unwrap_or_default(),
-                                            args: args.join("\n"),
+                                            args: format_list(&args, ListSeparator::Lines),
                                             env: format_environment(&env),
                                         },
                                         &editor.baseline,
@@ -711,7 +855,7 @@ impl ConnectionsPanel {
                                         LocalHostDefaultValues {
                                             shell,
                                             cwd: cwd.unwrap_or_default(),
-                                            args: args.join("\n"),
+                                            args: format_list(&args, ListSeparator::Lines),
                                             env: format_environment(&env),
                                         },
                                     )
@@ -755,9 +899,8 @@ impl ConnectionsPanel {
     /// 关闭或替换表单会同时丢弃默认目标意图，避免以后打开另一表单时重放旧请求。
     /// @author kongweiguang
     pub(super) fn cancel_local_host_background_requests(&mut self) {
-        self.local_hosts.default_target_generation =
-            self.local_hosts.default_target_generation.wrapping_add(1);
-        self.local_hosts.default_target_request = None;
+        self.local_hosts.invalidate_default_target_resolution();
+        self.cancel_local_shell_discovery();
     }
 
     /// 仅恢复切协议留下的在途意图；已完成、失败或被关闭的请求不会反复覆盖初值。
@@ -766,6 +909,114 @@ impl ConnectionsPanel {
         if let Some(request) = self.local_hosts.default_target_request.take() {
             self.resolve_local_profile_target(request.profile_id, request.explicit_override, cx);
         }
+    }
+
+    /// 返回 Local 表单时检查新安装的 Shell；旧候选保留到新扫描成功，避免刷新时选择器闪空。
+    /// @author kongweiguang
+    pub(super) fn resume_local_shell_discovery(&mut self, cx: &mut Context<Self>) {
+        if self.local_hosts.editor.is_some()
+            && self.active_editor_kind == Some(ConnectionsEditorKind::Local)
+            && !self.local_hosts.shell_discovery_loading
+        {
+            self.refresh_local_shell_candidates(cx);
+        }
+    }
+
+    /// 首次扫描和用户刷新共用应用执行器；编辑器代次拒收切换或关闭后的迟到结果。
+    /// @author kongweiguang
+    pub(super) fn refresh_local_shell_candidates(&mut self, cx: &mut Context<Self>) {
+        if self.local_hosts.editor.is_none()
+            || self.active_editor_kind != Some(ConnectionsEditorKind::Local)
+        {
+            return;
+        }
+        let Some(service) = self.local_hosts.service.clone() else {
+            self.local_hosts.shell_discovery_loading = false;
+            self.local_hosts.shell_discovery_error = Some(
+                crate::locale::text(
+                    "Shell 扫描服务尚未就绪，可手动填写程序路径。",
+                    "Shell discovery is unavailable. Enter a program path manually.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+
+        self.cancel_local_shell_discovery();
+        let generation = self.local_hosts.shell_discovery_generation;
+        let editor_generation = self.local_hosts.editor_generation;
+        let cancellation = CancellationToken::new();
+        self.local_hosts.shell_discovery_cancellation = Some(cancellation.clone());
+        self.local_hosts.shell_discovery_loading = true;
+        self.local_hosts.shell_discovery_error = None;
+        let executor = self.executor.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .run_cancellable(cancellation, move |task_cancellation| async move {
+                    service.discover_local_shells(task_cancellation).await
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.local_hosts.shell_discovery_generation != generation
+                    || panel.local_hosts.editor_generation != editor_generation
+                    || panel.local_hosts.editor.is_none()
+                {
+                    return;
+                }
+                panel.local_hosts.complete_shell_discovery(result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 只读发现按 token 协作取消；增加代次后即使 adapter 迟回也不能更新当前表单。
+    /// @author kongweiguang
+    pub(super) fn cancel_local_shell_discovery(&mut self) {
+        self.local_hosts.cancel_shell_discovery();
+    }
+
+    /// 候选只改 Shell 路径和参数；不能无损映射的 OS 字符串保持原草稿并提示手动输入。
+    /// @author kongweiguang
+    pub(super) fn select_local_shell_candidate(
+        &mut self,
+        candidate_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(candidate) = self
+            .local_hosts
+            .shell_candidates
+            .iter()
+            .find(|candidate| candidate.id() == candidate_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let (shell, arguments) = match local_shell_candidate_fields(&candidate) {
+            Ok(fields) => fields,
+            Err(message) => {
+                self.local_hosts.shell_discovery_error = Some(message);
+                cx.notify();
+                return false;
+            }
+        };
+        let Some((shell_input, args_input)) = self
+            .local_hosts
+            .editor
+            .as_ref()
+            .map(|editor| (editor.shell.clone(), editor.args.clone()))
+        else {
+            return false;
+        };
+        self.local_hosts.invalidate_default_target_resolution();
+        shell_input.update(cx, |state, cx| state.set_value(shell, window, cx));
+        args_input.update(cx, |state, cx| state.set_value(arguments, window, cx));
+        self.local_hosts.shell_discovery_error = None;
+        self.refresh_local_host_dirty(cx);
+        true
     }
 
     /// 新建分组返回时刷新分组选项并选择刚创建的稳定 ID，保留当前本地主机表单基线。
@@ -857,6 +1108,8 @@ impl ConnectionsPanel {
                     window,
                     cx,
                 ));
+                self.active_editor_kind = Some(ConnectionsEditorKind::Local);
+                self.refresh_local_shell_candidates(cx);
                 self.local_hosts.selected_id = Some(snapshot.profile.id.clone());
                 let mut visible_snapshot = snapshot.clone();
                 visible_snapshot.profile.env.clear();
@@ -1094,7 +1347,7 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 保存前检查恢复模式和组 revision；主机与加密环境作为同一可恢复操作提交。
+    /// 保存须等待所选启动配置完成投影，再冻结同一草稿；主机与加密环境共用 revision 和恢复门禁。
     /// @author kongweiguang
     pub(super) fn save_local_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.refuse_conflict_reload_mutation(cx) {
@@ -1154,16 +1407,23 @@ impl ConnectionsPanel {
                     let editor = self.local_hosts.editor.as_ref().unwrap();
                     (draft, editor.revision.clone(), editor.profile_id.clone())
                 }
-                Err(message) => {
-                    self.set_local_host_validation(
-                        message,
-                        Some(LocalHostValidationField::Environment),
-                        window,
-                        cx,
-                    );
+                Err((field, message)) => {
+                    self.set_local_host_validation(message, Some(field), window, cx);
                     return;
                 }
             };
+        if self.local_hosts.default_target_request.is_some() {
+            self.local_hosts.status = Some(
+                crate::locale::text(
+                    "正在读取启动配置，请稍后保存。",
+                    "The launch configuration is loading. Wait before saving.",
+                )
+                .to_string(),
+            );
+            self.status = self.local_hosts.status.clone();
+            cx.notify();
+            return;
+        }
         if self
             .local_hosts
             .editor
@@ -1188,6 +1448,7 @@ impl ConnectionsPanel {
         let service = self.hosts.clone();
         let executor = self.executor.clone();
         let id = profile_id.clone();
+        self.local_hosts.invalidate_default_target_resolution();
         self.local_hosts.saving = true;
         self.local_hosts.status =
             Some(crate::locale::text("正在保存本地主机…", "Saving local host…").to_string());
@@ -1987,6 +2248,7 @@ impl ConnectionsPanel {
                     cx,
                 ));
                 self.active_editor_kind = Some(ConnectionsEditorKind::Local);
+                self.refresh_local_shell_candidates(cx);
                 self.status = None;
                 self.start_default_local_target_resolution(cx);
             }
@@ -2112,6 +2374,7 @@ impl ConnectionsPanel {
                         panel.invalidate_host_file_picker();
                         panel.local_hosts.editor = Some(editor);
                         panel.active_editor_kind = Some(ConnectionsEditorKind::Local);
+                        panel.refresh_local_shell_candidates(cx);
                         panel.local_hosts.selected_id = Some(snapshot.profile.id.clone());
                         let mut visible_snapshot = snapshot;
                         visible_snapshot.profile.env.clear();
@@ -2228,7 +2491,7 @@ impl ConnectionsPanel {
             name: draft.name.clone(),
             shell: draft.shell.clone(),
             cwd: draft.cwd.clone().unwrap_or_default(),
-            args: draft.args.join("\n"),
+            args: format_list(&draft.args, ListSeparator::Lines),
             env: format_environment(&draft.env),
             group_id: draft.sidebar_group_id.clone(),
         };
@@ -2406,40 +2669,46 @@ fn profile_to_draft(profile: &TerminalProfile) -> ProfileDraft {
     }
 }
 
-/// 按现有 Profile UI 语义逐行保存参数；空编辑区表示零参数，显式空行仍是空参数。
-fn parse_profile_arguments(source: &str) -> Vec<String> {
-    if source.is_empty() {
-        Vec::new()
-    } else {
-        source.split('\n').map(str::to_owned).collect()
-    }
+/// 保留逐行输入习惯，以引用项表示空值和多行参数；不把引号内的 Windows 路径做转义。
+fn parse_profile_arguments(source: &str) -> Result<Vec<String>, String> {
+    parse_list(source, ListSeparator::Lines).map_err(|_| {
+        crate::locale::text(
+            "启动参数的双引号未配对或末尾有多余内容；项内双引号请写成两个。",
+            "Argument quotes are incomplete or followed by extra text. Double any quote inside an item.",
+        ).to_string()
+    })
 }
 
-/// 环境变量沿用既有表单约定：空行忽略、首个等号分割、重复键与非法键要求用户修正。
+/// 整条 KEY=VALUE 可被引用以保留多行值；仅首个等号分割，重复键与非法键要求用户修正。
 fn parse_profile_environment(source: &str) -> Result<BTreeMap<String, String>, String> {
     let mut values = BTreeMap::new();
-    for (index, raw_line) in source.lines().enumerate() {
+    let records = parse_list(source, ListSeparator::Lines).map_err(|_| {
+        crate::locale::text(
+            "环境变量的双引号未配对或末尾有多余内容；请引用完整的 KEY=VALUE 项。",
+            "Environment quotes are incomplete or followed by extra text. Quote the whole KEY=VALUE item.",
+        ).to_string()
+    })?;
+    for (index, raw_line) in records.iter().enumerate() {
         if raw_line.trim().is_empty() {
             continue;
         }
         let Some((key, value)) = raw_line.split_once('=') else {
             return Err(crate::locale::text(
-                format!("第 {} 行需要使用 KEY=VALUE 格式。", index + 1),
-                format!("Line {} must use KEY=VALUE format.", index + 1),
+                format!("第 {} 项需要使用 KEY=VALUE 格式。", index + 1),
+                format!("Item {} must use KEY=VALUE format.", index + 1),
             )
             .to_string());
         };
-        let key = key.trim();
         if key.is_empty() || key.contains('\0') || value.contains('\0') {
             return Err(crate::locale::text(
-                format!("第 {} 行包含无效环境变量名或不可表示字符。", index + 1),
-                format!("Line {} contains an invalid environment variable name or unsupported character.", index + 1),
+                format!("第 {} 项包含无效环境变量名或不可表示字符。", index + 1),
+                format!("Item {} contains an invalid environment variable name or unsupported character.", index + 1),
             ).to_string());
         }
         if values.insert(key.to_owned(), value.to_owned()).is_some() {
             return Err(crate::locale::text(
-                format!("第 {} 行重复定义环境变量“{}”。", index + 1, key),
-                format!("Line {} repeats environment variable “{}”.", index + 1, key),
+                format!("第 {} 项重复定义环境变量“{}”。", index + 1, key),
+                format!("Item {} repeats environment variable “{}”.", index + 1, key),
             )
             .to_string());
         }
@@ -2452,13 +2721,13 @@ fn optional_path(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_owned())
 }
 
-/// 保持环境变量格式稳定，供 Profile 编辑 baseline 与默认目标预填共用。
+/// 引用完整记录而非单独转义值，使多行值和等号都可无损回填到同一编辑格式。
 fn format_environment(values: &BTreeMap<String, String>) -> String {
-    values
+    let records = values
         .iter()
         .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Vec<_>>();
+    format_list(&records, ListSeparator::Lines)
 }
 
 /// 读取当前输入作为基线，仅在 ProfileService 明确返回有效默认目标后调用。

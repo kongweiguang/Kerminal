@@ -148,6 +148,9 @@ impl RootView {
             ToolRailToolId::Context => {
                 Err("Current Context is outside right-rail acceptance scope".to_owned())
             }
+            ToolRailToolId::Plugin(_) => {
+                Err("Plugin tools require their provider acceptance contract".to_owned())
+            }
         }
     }
 

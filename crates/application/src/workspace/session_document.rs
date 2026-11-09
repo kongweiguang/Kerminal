@@ -196,6 +196,16 @@ pub enum WorkspaceSessionTab {
         access: WorkspaceFileAccess,
         source: WorkspaceFileSource,
     },
+    /// 内容身份由注册工厂解析；状态及未知字段必须在提供者缺席时继续保留。
+    Extension {
+        id: TabId,
+        tab_group_id: Option<WorkspaceTabGroupId>,
+        title: String,
+        content_id: String,
+        state_version: u32,
+        state: Value,
+        extra_fields: Map<String, Value>,
+    },
     Unsupported {
         id: TabId,
         tab_group_id: Option<WorkspaceTabGroupId>,
@@ -207,31 +217,37 @@ pub enum WorkspaceSessionTab {
 
 impl WorkspaceSessionTab {
     /// 让 controller 在不解构每种 tab 私有字段时统一处理顺序、选中和分组。
+    /// @author kongweiguang
     pub fn id(&self) -> &TabId {
         match self {
             Self::Terminal { id, .. }
             | Self::SftpTransfer { id, .. }
             | Self::WorkspaceFile { id, .. }
+            | Self::Extension { id, .. }
             | Self::Unsupported { id, .. } => id,
         }
     }
 
     /// 标签栏标题来自保存快照，空标题在 codec 入口直接拒绝。
+    /// @author kongweiguang
     pub fn title(&self) -> &str {
         match self {
             Self::Terminal { title, .. }
             | Self::SftpTransfer { title, .. }
             | Self::WorkspaceFile { title, .. }
+            | Self::Extension { title, .. }
             | Self::Unsupported { title, .. } => title,
         }
     }
 
     /// 未知 tab 仍保留已有组关联，Root 不会通过类型 fallback 改变其排序。
+    /// @author kongweiguang
     pub fn tab_group_id(&self) -> Option<&WorkspaceTabGroupId> {
         match self {
             Self::Terminal { tab_group_id, .. }
             | Self::SftpTransfer { tab_group_id, .. }
             | Self::WorkspaceFile { tab_group_id, .. }
+            | Self::Extension { tab_group_id, .. }
             | Self::Unsupported { tab_group_id, .. } => tab_group_id.as_ref(),
         }
     }
@@ -346,6 +362,11 @@ impl WorkspaceSessionSnapshot {
 
         let mut referenced_panes = BTreeSet::new();
         for tab in &self.terminal_tabs {
+            if let WorkspaceSessionTab::Extension { content_id, .. } = tab
+                && (content_id.trim().is_empty() || content_id.chars().any(char::is_control))
+            {
+                return Err(WorkspaceSessionInvalidReason::InvalidSchema);
+            }
             if tab
                 .tab_group_id()
                 .is_some_and(|group_id| !self.tab_groups.contains_key(group_id))
@@ -954,7 +975,8 @@ fn unavailable_target(
     }
 }
 
-/// 解码 terminal/sftp/file tab；缺失的初始本地目录按旧版语义留空，未知 kind 保持 opaque。
+/// 已知内容保留插件状态，损坏的扩展描述符退回 opaque，避免启动时覆盖原文。
+/// @author kongweiguang
 fn decode_tab(value: &Value) -> Result<WorkspaceSessionTab, WorkspaceSessionInvalidReason> {
     let object = value
         .as_object()
@@ -966,10 +988,10 @@ fn decode_tab(value: &Value) -> Result<WorkspaceSessionTab, WorkspaceSessionInva
         .filter(|value| !value.is_null())
         .map(parse_group_id_value)
         .transpose()?;
-    let machine_id = optional_string(object.get("machineId"))?;
     match object.get("kind").and_then(Value::as_str) {
         None | Some("terminal") => {
-            let machine_id = machine_id.ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?;
+            let machine_id = optional_string(object.get("machineId"))?
+                .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?;
             let layout = object
                 .get("layout")
                 .cloned()
@@ -991,7 +1013,8 @@ fn decode_tab(value: &Value) -> Result<WorkspaceSessionTab, WorkspaceSessionInva
             id,
             tab_group_id,
             title,
-            machine_id: machine_id.ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?,
+            machine_id: optional_string(object.get("machineId"))?
+                .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?,
             left_host_id: optional_host_id(object.get("leftHostId"))?,
             locked_left_host_id: optional_host_id(object.get("lockedLeftHostId"))?,
             right_host_id: optional_host_id(object.get("rightHostId"))?,
@@ -1004,7 +1027,8 @@ fn decode_tab(value: &Value) -> Result<WorkspaceSessionTab, WorkspaceSessionInva
             id,
             tab_group_id,
             title,
-            machine_id: machine_id.ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?,
+            machine_id: optional_string(object.get("machineId"))?
+                .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?,
             target: object
                 .get("target")
                 .map(decode_target)
@@ -1017,6 +1041,51 @@ fn decode_tab(value: &Value) -> Result<WorkspaceSessionTab, WorkspaceSessionInva
             access: decode_file_access(object.get("access"))?,
             source: decode_file_source(object.get("source"))?,
         }),
+        Some("extension")
+            if object
+                .get("contentId")
+                .and_then(Value::as_str)
+                .is_some_and(|content_id| {
+                    !content_id.trim().is_empty() && !content_id.chars().any(char::is_control)
+                })
+                && object
+                    .get("stateVersion")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|version| u32::try_from(version).is_ok())
+                && object.contains_key("state") =>
+        {
+            let content_id = required_string(object.get("contentId"))?;
+            let state_version = object
+                .get("stateVersion")
+                .and_then(Value::as_u64)
+                .and_then(|version| u32::try_from(version).ok())
+                .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?;
+            let state = object
+                .get("state")
+                .cloned()
+                .ok_or(WorkspaceSessionInvalidReason::InvalidSchema)?;
+            let mut extra_fields = object.clone();
+            for name in [
+                "id",
+                "tabGroupId",
+                "title",
+                "kind",
+                "contentId",
+                "stateVersion",
+                "state",
+            ] {
+                extra_fields.remove(name);
+            }
+            Ok(WorkspaceSessionTab::Extension {
+                id,
+                tab_group_id,
+                title,
+                content_id,
+                state_version,
+                state,
+                extra_fields,
+            })
+        }
         Some(kind) => Ok(WorkspaceSessionTab::Unsupported {
             id,
             tab_group_id,
@@ -1287,7 +1356,8 @@ fn index_rows(
     Ok(indexed)
 }
 
-/// 复用已存在 tab 的原始对象，只改 v3 已知标签字段和终端 layout；可选目录不擦除未知扩展。
+/// 按稳定 ID 合并宿主已知字段，插件未识别的状态和额外字段保留原样。
+/// @author kongweiguang
 fn merge_tab(
     existing: Option<&Value>,
     tab: &WorkspaceSessionTab,
@@ -1393,6 +1463,36 @@ fn merge_tab(
                 "source".to_owned(),
                 Value::String(file_source_str(*source).to_owned()),
             );
+        }
+        WorkspaceSessionTab::Extension {
+            id,
+            tab_group_id,
+            title,
+            content_id,
+            state_version,
+            state,
+            extra_fields,
+        } => {
+            for (key, value) in extra_fields {
+                object.insert(key.clone(), value.clone());
+            }
+            object.insert("id".to_owned(), Value::String(id.as_str().to_owned()));
+            object.insert("title".to_owned(), Value::String(title.clone()));
+            if let Some(group_id) = tab_group_id {
+                object.insert(
+                    "tabGroupId".to_owned(),
+                    Value::String(group_id.as_str().to_owned()),
+                );
+            } else if object
+                .get("tabGroupId")
+                .is_some_and(|value| !value.is_null())
+            {
+                object.remove("tabGroupId");
+            }
+            object.insert("kind".to_owned(), Value::String("extension".to_owned()));
+            object.insert("contentId".to_owned(), Value::String(content_id.clone()));
+            object.insert("stateVersion".to_owned(), json!(state_version));
+            object.insert("state".to_owned(), state.clone());
         }
         WorkspaceSessionTab::Unsupported { raw, .. } => return Ok(raw.clone()),
     }

@@ -22,6 +22,7 @@ use crate::{
     connections::{
         CredentialResolver,
         credentials::{CredentialService, SaveCredentialRequest, SecretValue},
+        host_types::{PluginHost, PluginHostDraft, valid_host_type_id},
     },
 };
 
@@ -96,6 +97,18 @@ impl Default for HostSftpOptions {
     }
 }
 
+impl HostSftpOptions {
+    /// SFTP-only 主机无条件具备文件能力；该开关只控制 SSH 上的可选子系统。
+    /// @author kongweiguang
+    pub const fn enabled_for(protocol: RemoteProtocol, configured: bool) -> bool {
+        match protocol {
+            RemoteProtocol::Sftp => true,
+            RemoteProtocol::Ssh => configured,
+            RemoteProtocol::Rdp | RemoteProtocol::Telnet | RemoteProtocol::Serial => false,
+        }
+    }
+}
+
 /// RDP 显示选项以同一配置快照驱动平台启动，不让客户端 adapter 猜测用户选择。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RdpDisplayOptions {
@@ -150,7 +163,6 @@ pub struct ManagedHost {
     pub route: HostRouteSettings,
     pub serial: Option<SerialSessionTarget>,
     pub tags: Vec<String>,
-    pub is_favorite: bool,
     pub sort_order: i64,
     pub connect_timeout_ms: u64,
     pub keepalive_interval_ms: Option<u64>,
@@ -338,7 +350,6 @@ pub struct HostDraft {
     pub route: HostRouteSettings,
     pub serial: Option<SerialSessionTarget>,
     pub tags: Vec<String>,
-    pub is_favorite: bool,
     pub sort_order: i64,
     pub connect_timeout_ms: u64,
     pub keepalive_interval_ms: Option<u64>,
@@ -457,6 +468,45 @@ pub enum CredentialCleanupStatus {
     Deferred { remaining: usize },
 }
 
+/// 汇总无法清理的候选，避免格式错误的引用被已有清理结果掩盖。
+///
+/// @author kongweiguang
+fn add_deferred(status: CredentialCleanupStatus, additional: usize) -> CredentialCleanupStatus {
+    let remaining = match status {
+        CredentialCleanupStatus::Complete => additional,
+        CredentialCleanupStatus::Deferred { remaining } => remaining.saturating_add(additional),
+    };
+    if remaining == 0 {
+        CredentialCleanupStatus::Complete
+    } else {
+        CredentialCleanupStatus::Deferred { remaining }
+    }
+}
+
+/// 已引用候选的处理取决于调用方是否还需保留恢复材料。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferencedCredentialBehavior {
+    Preserve,
+    Defer,
+}
+
+/// 同一存储事务内判断主机引用并清理凭据，避免扫描后并发发布新引用。
+///
+/// @author kongweiguang
+#[async_trait]
+pub trait HostCredentialCleanup: Send + Sync + 'static {
+    /// 未能证明全部引用或删除结果未知时返回待清理状态，不能报告伪成功。
+    ///
+    /// @author kongweiguang
+    async fn cleanup(
+        &self,
+        candidates: &[CredentialRef],
+        referenced: ReferencedCredentialBehavior,
+    ) -> AppResult<CredentialCleanupStatus>;
+}
+
 /// 主机分组摘要；revision 属于 groups.toml 整份文件，而不是单个分组。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostGroup {
@@ -502,6 +552,61 @@ pub struct HostDeletionReceipt {
     pub credential_cleanup: CredentialCleanupStatus,
 }
 
+/// 只有仓储确认全部主机类型的引用均可解释时，调用方才能清理候选凭据。
+///
+/// @author kongweiguang
+pub enum HostCredentialReferenceCoverage {
+    Complete {
+        remote_hosts: Vec<ManagedHost>,
+        additional_references: Vec<CredentialRef>,
+    },
+    Unproven,
+}
+
+impl HostCredentialReferenceCoverage {
+    /// 保留引用类型边界，仅在完整覆盖时回答候选是否仍被任一主机使用。
+    ///
+    /// @author kongweiguang
+    pub fn contains_reference(&self, reference: &CredentialRef) -> Option<bool> {
+        match self {
+            Self::Complete {
+                remote_hosts,
+                additional_references,
+            } => Some(
+                additional_references.contains(reference)
+                    || remote_hosts
+                        .iter()
+                        .any(|host| collect_host_references(host).contains(reference.as_str())),
+            ),
+            Self::Unproven => None,
+        }
+    }
+
+    /// 统一合并内置路由、本地环境和插件引用，避免清理路径遗漏某类主机。
+    ///
+    /// @author kongweiguang
+    fn into_reference_set(self) -> Option<std::collections::HashSet<String>> {
+        match self {
+            Self::Complete {
+                remote_hosts,
+                additional_references,
+            } => {
+                let mut references = remote_hosts
+                    .iter()
+                    .flat_map(collect_host_references)
+                    .collect::<std::collections::HashSet<_>>();
+                references.extend(
+                    additional_references
+                        .into_iter()
+                        .map(|reference| reference.as_str().to_owned()),
+                );
+                Some(references)
+            }
+            Self::Unproven => None,
+        }
+    }
+}
+
 /// 连接配置仓储端口；实现层负责 schema v3 校验、未知字段保留与原子 CAS。
 #[async_trait]
 pub trait HostManagementRepository: Send + Sync + 'static {
@@ -513,6 +618,46 @@ pub trait HostManagementRepository: Send + Sync + 'static {
 
     /// 按稳定主机 ID 读取配置；缺失以 None 表达，不创建默认主机。
     async fn load_host(&self, host_id: &HostId) -> AppResult<Option<ManagedHost>>;
+
+    /// 独立投影扩展主机，缺少提供方的记录仍需进入目录而不能伪装成内置协议。
+    async fn list_plugin_hosts(&self) -> AppResult<Vec<PluginHost>> {
+        Ok(Vec::new())
+    }
+
+    /// 默认实现仅在不存在插件主机时证明覆盖；支持插件的仓储须覆盖并解释所有类型。
+    ///
+    /// @author kongweiguang
+    async fn credential_reference_coverage(&self) -> AppResult<HostCredentialReferenceCoverage> {
+        if !self.list_plugin_hosts().await?.is_empty() {
+            return Ok(HostCredentialReferenceCoverage::Unproven);
+        }
+        let remote_hosts = self.list_hosts().await?;
+        let additional_references = self
+            .list_local_hosts()
+            .await?
+            .into_iter()
+            .filter_map(|host| host.environment_ref)
+            .collect();
+        Ok(HostCredentialReferenceCoverage::Complete {
+            remote_hosts,
+            additional_references,
+        })
+    }
+
+    /// 按稳定身份重读扩展主机，避免打开动作使用过期草稿。
+    async fn load_plugin_host(&self, _host_id: &HostId) -> AppResult<Option<PluginHost>> {
+        Ok(None)
+    }
+
+    /// 仓储负责 codec、原始 TOML 保留与最终 revision CAS。
+    async fn save_plugin_host(
+        &self,
+        _host_id: HostId,
+        _draft: PluginHostDraft,
+        _expected_revision: Option<ConfigRevision>,
+    ) -> AppResult<PluginHost> {
+        Err(AppError::unsupported("插件主机保存不可用"))
+    }
 
     /// 本地变体与远程主机共用目录；旧测试仓储未实现时保持无本地主机。
     ///
@@ -638,22 +783,28 @@ pub trait HostManagementRepository: Send + Sync + 'static {
 pub struct HostManagementService {
     repository: Arc<dyn HostManagementRepository>,
     credentials: Option<CredentialService>,
+    credential_cleanup: Option<Arc<dyn HostCredentialCleanup>>,
     local_environment_resolver: Option<Arc<dyn CredentialResolver>>,
     local_host_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl HostManagementService {
-    /// 由 composition root 注入与运行时连接读取共用的配置仓储。
+    /// 只读用例不默认装配凭据写入，避免测试或只读场景触碰 Vault。
+    ///
+    /// @author kongweiguang
     pub fn new(repository: Arc<dyn HostManagementRepository>) -> Self {
         Self {
             repository,
             credentials: None,
+            credential_cleanup: None,
             local_environment_resolver: None,
             local_host_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    /// 注入 vault 用例供 UI/MCP 使用同一先密封、再 CAS、后清理流程。
+    /// 默认保留可注入 Vault 的测试路径；生产组合根另行注入原子清理端口。
+    ///
+    /// @author kongweiguang
     pub fn with_credentials(
         repository: Arc<dyn HostManagementRepository>,
         credentials: CredentialService,
@@ -661,9 +812,18 @@ impl HostManagementService {
         Self {
             repository,
             credentials: Some(credentials),
+            credential_cleanup: None,
             local_environment_resolver: None,
             local_host_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// 生产仓储和 Vault 必须共享同一锁域，避免配置引用与密文删除交错。
+    ///
+    /// @author kongweiguang
+    pub fn with_credential_cleanup(mut self, cleanup: Arc<dyn HostCredentialCleanup>) -> Self {
+        self.credential_cleanup = Some(cleanup);
+        self
     }
 
     /// 本地环境仅在编辑或启动时解密，目录与普通远程连接仍无需读取秘密。
@@ -692,6 +852,58 @@ impl HostManagementService {
     /// 在编辑前按稳定 ID 刷新单条主机，供外部文件变更后的安全重载使用。
     pub async fn load_host(&self, host_id: &HostId) -> AppResult<Option<ManagedHost>> {
         self.repository.load_host(host_id).await
+    }
+
+    /// 扩展主机按现有目录排序语义返回，包括保留原文的不可用提供方。
+    pub async fn list_plugin_hosts(&self) -> AppResult<Vec<PluginHost>> {
+        let mut hosts = self.repository.list_plugin_hosts().await?;
+        hosts.sort_by(|left, right| {
+            left.sort_order
+                .cmp(&right.sort_order)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
+        Ok(hosts)
+    }
+
+    /// 执行前重读同一主机，确保外部配置变更不会被旧视图覆盖。
+    pub async fn load_plugin_host(&self, host_id: &HostId) -> AppResult<Option<PluginHost>> {
+        self.repository.load_plugin_host(host_id).await
+    }
+
+    /// 公共字段和分组先在用例层核对，配置 codec 与最终 CAS 由仓储负责。
+    pub async fn save_plugin_host(
+        &self,
+        mut draft: PluginHostDraft,
+        expected_revision: Option<ConfigRevision>,
+    ) -> AppResult<PluginHost> {
+        if !valid_host_type_id(&draft.provider_id)
+            || !valid_host_type_id(&draft.type_id)
+            || draft.provider_id == "kerminal"
+            || draft.configuration_version == 0
+            || draft.name.trim().is_empty()
+            || draft.name.chars().any(char::is_control)
+        {
+            return Err(AppError::invalid("插件主机字段无效"));
+        }
+        draft.name = draft.name.trim().to_owned();
+        let host_id = draft.id.take().unwrap_or_default();
+        if ConfigDocumentPath::Host(host_id.as_str().to_owned())
+            .relative_path()
+            .is_err()
+        {
+            return Err(AppError::invalid("主机标识不能用于配置文件名"));
+        }
+        if let Some(group_id) = draft.group_id.as_deref() {
+            let groups = self.repository.load_groups().await?;
+            if !groups.groups.iter().any(|group| group.id == group_id) {
+                return Err(AppError::not_found("主机所属分组不存在"));
+            }
+        }
+        self.repository.ensure_host_writable().await?;
+        self.repository
+            .save_plugin_host(host_id, draft, expected_revision)
+            .await
     }
 
     /// 安全复制只重用非秘密连接与显示选项，同时复制有效主机默认值以免意外改变操作习惯。
@@ -723,7 +935,6 @@ impl HostManagementService {
             route,
             serial: source.serial,
             tags: source.tags,
-            is_favorite: source.is_favorite,
             sort_order: source.sort_order,
             connect_timeout_ms: source.connect_timeout_ms,
             keepalive_interval_ms: source.keepalive_interval_ms,
@@ -760,7 +971,7 @@ impl HostManagementService {
         })
     }
 
-    /// 先归一化空白备注并校验草稿，再以调用方 revision 执行 host CAS，避免存入无意义字段。
+    /// 先归一化备注与协议能力，再校验并执行 host CAS，保持 SFTP-only 配置与运行语义一致。
     ///
     /// @author kongweiguang
     pub async fn save_host(
@@ -769,6 +980,7 @@ impl HostManagementService {
         expected_revision: Option<ConfigRevision>,
     ) -> AppResult<ManagedHost> {
         draft.note = normalize_host_note(draft.note);
+        normalize_protocol_host_options(&mut draft);
         validate_host_draft(&draft)?;
         // 新建表单允许先分配稳定 ID，以便先把秘密写入以该 ID 派生的 vault 引用。
         let host_id = draft.id.take().unwrap_or_default();
@@ -825,7 +1037,7 @@ impl HostManagementService {
         }
     }
 
-    /// 归一化备注后复核写门禁并执行凭据与 host CAS；host 结果未知时封存清理候选供显式读回。
+    /// 归一化备注与协议能力后复核写门禁并执行凭据 CAS；未知结果保留显式读回材料。
     ///
     /// @author kongweiguang
     pub async fn save_host_with_credentials_recoverable(
@@ -843,6 +1055,7 @@ impl HostManagementService {
         let host_id = draft.id.clone().unwrap_or_default();
         draft.id = Some(host_id.clone());
         draft.note = normalize_host_note(draft.note);
+        normalize_protocol_host_options(&mut draft);
         validate_host_draft(&draft)?;
         if kerminal_domain::preferences::ConfigDocumentPath::Host(host_id.as_str().to_owned())
             .relative_path()
@@ -1092,38 +1305,30 @@ impl HostManagementService {
         if candidates.is_empty() {
             return CredentialCleanupStatus::Complete;
         }
-        let Ok(hosts) = self.repository.list_hosts().await else {
-            return CredentialCleanupStatus::Deferred {
-                remaining: candidates.len(),
-            };
-        };
-        let referenced = hosts
-            .iter()
-            .flat_map(collect_host_references)
-            .collect::<std::collections::HashSet<_>>();
         let mut remaining = 0;
+        let mut valid = Vec::new();
         for reference in candidates {
             let belongs_to_host = CredentialReference::parse(reference.clone())
                 .is_ok_and(|parsed| parsed.host_id() == host_id);
             if !belongs_to_host {
                 remaining += 1;
-                continue;
-            }
-            if referenced.contains(reference.as_str()) {
-                continue;
-            }
-            if credentials.remove(&reference).await.is_err() {
-                remaining += 1;
+            } else {
+                valid.push(reference);
             }
         }
-        if remaining == 0 {
-            CredentialCleanupStatus::Complete
-        } else {
-            CredentialCleanupStatus::Deferred { remaining }
-        }
+        let cleanup = self
+            .cleanup_credential_candidates(
+                credentials,
+                &valid,
+                ReferencedCredentialBehavior::Preserve,
+            )
+            .await;
+        add_deferred(cleanup, remaining)
     }
 
-    /// CAS 已提交后再读全量主机目录，确认旧 ref 没有被任何主机引用才清理。
+    /// CAS 已提交后确认所有主机引用均有覆盖，未知插件或读取失败时保留旧凭据。
+    ///
+    /// @author kongweiguang
     async fn cleanup_old(
         &self,
         credentials: &CredentialService,
@@ -1134,34 +1339,64 @@ impl HostManagementService {
         if obsolete.is_empty() {
             return CredentialCleanupStatus::Complete;
         }
-        let Ok(hosts) = self.repository.list_hosts().await else {
-            return CredentialCleanupStatus::Deferred {
-                remaining: obsolete.len(),
-            };
-        };
-        let referenced = hosts
-            .iter()
-            .flat_map(collect_host_references)
-            .collect::<std::collections::HashSet<_>>();
         let mut remaining = 0;
+        let mut valid = Vec::new();
         for reference in obsolete {
-            if referenced.contains(&reference) {
-                remaining += 1;
-                continue;
-            }
             let Ok(reference) = CredentialRef::new(reference) else {
                 remaining += 1;
                 continue;
             };
-            if credentials.remove(&reference).await.is_err() {
+            if CredentialReference::parse(reference.clone()).is_err() {
+                remaining += 1;
+            } else {
+                valid.push(reference);
+            }
+        }
+        let cleanup = self
+            .cleanup_credential_candidates(credentials, &valid, ReferencedCredentialBehavior::Defer)
+            .await;
+        add_deferred(cleanup, remaining)
+    }
+
+    /// 生产使用原子端口；内存及故障注入仓储保留独立 Vault 路径以验证失败传播。
+    ///
+    /// @author kongweiguang
+    async fn cleanup_credential_candidates(
+        &self,
+        credentials: &CredentialService,
+        candidates: &[CredentialRef],
+        behavior: ReferencedCredentialBehavior,
+    ) -> CredentialCleanupStatus {
+        if candidates.is_empty() {
+            return CredentialCleanupStatus::Complete;
+        }
+        if let Some(cleanup) = self.credential_cleanup.as_ref() {
+            return cleanup.cleanup(candidates, behavior).await.unwrap_or(
+                CredentialCleanupStatus::Deferred {
+                    remaining: candidates.len(),
+                },
+            );
+        }
+        let referenced = match self.repository.credential_reference_coverage().await {
+            Ok(coverage) => coverage.into_reference_set(),
+            Err(_) => None,
+        };
+        let Some(referenced) = referenced else {
+            return CredentialCleanupStatus::Deferred {
+                remaining: candidates.len(),
+            };
+        };
+        let mut remaining = 0;
+        for reference in candidates {
+            if referenced.contains(reference.as_str()) {
+                if behavior == ReferencedCredentialBehavior::Defer {
+                    remaining += 1;
+                }
+            } else if credentials.remove(reference).await.is_err() {
                 remaining += 1;
             }
         }
-        if remaining == 0 {
-            CredentialCleanupStatus::Complete
-        } else {
-            CredentialCleanupStatus::Deferred { remaining }
-        }
+        add_deferred(CredentialCleanupStatus::Complete, remaining)
     }
 
     /// 返回分组与整文件 revision，供分组弹窗按 CAS 保存。
@@ -1248,6 +1483,16 @@ impl HostManagementService {
                     revision: host.revision,
                 }),
         );
+        expected_hosts.extend(
+            self.repository
+                .list_plugin_hosts()
+                .await?
+                .into_iter()
+                .map(|host| HostDocumentRevision {
+                    host_id: host.id,
+                    revision: host.revision,
+                }),
+        );
         self.repository
             .delete_group_and_reassign(
                 group_id,
@@ -1273,6 +1518,70 @@ fn authentication_without_credentials(
         Some(SshAuthentication::Agent) => Some(SshAuthentication::Agent),
         None => None,
     }
+}
+
+/// 隐藏选项保留有效历史值；失效草稿投影为规范默认，避免保存不可重读的配置。
+/// SFTP-only 的旧 enabled=false 仅在显式保存时归一化，RDP 全屏尺寸不参与窗口校验。
+/// @author kongweiguang
+fn normalize_protocol_host_options(draft: &mut HostDraft) {
+    if draft.protocol == RemoteProtocol::Sftp {
+        draft.sftp_options.enabled = true;
+    } else if draft.protocol == RemoteProtocol::Ssh
+        && !draft.sftp_options.enabled
+        && !sftp_options_are_valid(&draft.sftp_options)
+    {
+        draft.sftp_options = HostSftpOptions {
+            enabled: false,
+            ..HostSftpOptions::default()
+        };
+    }
+    if draft.protocol == RemoteProtocol::Rdp
+        && draft.rdp_display.fullscreen
+        && draft.rdp_display.validate().is_err()
+    {
+        draft.rdp_display.width = None;
+        draft.rdp_display.height = None;
+    } else if draft.protocol != RemoteProtocol::Rdp && draft.rdp_display.validate().is_err() {
+        draft.rdp_display = RdpDisplayOptions::default();
+    }
+    if draft.protocol != RemoteProtocol::Ssh && !terminal_options_are_valid(&draft.terminal_options)
+    {
+        draft.terminal_options = HostTerminalOptions::default();
+    }
+}
+
+/// 只校验 SFTP 的持久字段形状；关闭 SSH 文件能力时可用它判断是否沿用旧值。
+/// @author kongweiguang
+fn sftp_options_are_valid(options: &HostSftpOptions) -> bool {
+    options.local_start_directory.as_ref().is_none_or(|path| {
+        path.to_str().is_some_and(|value| {
+            !value.trim().is_empty() && !value.chars().any(char::is_control) && path.is_absolute()
+        })
+    }) && options
+        .remote_start_directory
+        .as_deref()
+        .is_none_or(valid_remote_start_directory)
+        && options
+            .concurrency
+            .is_none_or(|concurrency| (1..=8).contains(&concurrency))
+}
+
+/// SSH 专属终端值只在 SSH 主机启用，其他协议无效的隐藏值投影为空配置。
+/// @author kongweiguang
+fn terminal_options_are_valid(options: &HostTerminalOptions) -> bool {
+    options.term.as_ref().is_none_or(|term| {
+        !term.trim().is_empty()
+            && term.trim() == term
+            && term.len() <= 128
+            && !term
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+    }) && options
+        .initial_working_directory
+        .as_ref()
+        .is_none_or(|directory| {
+            !directory.trim().is_empty() && !directory.chars().any(char::is_control)
+        })
 }
 
 /// 校验连接与协议专属高级选项，避免保存后由不同平台以不一致的默认值解释配置。
@@ -1372,47 +1681,18 @@ fn validate_host_draft(draft: &HostDraft) -> AppResult<()> {
             "SSH 超时和心跳间隔必须在 1 到 600 秒之间",
         ));
     }
-    if draft.terminal_options.term.as_ref().is_some_and(|term| {
-        term.trim().is_empty()
-            || term.trim() != term
-            || term.len() > 128
-            || term
-                .chars()
-                .any(|character| character.is_whitespace() || character.is_control())
-    }) || draft
-        .terminal_options
-        .initial_working_directory
-        .as_ref()
-        .is_some_and(|directory| {
-            directory.trim().is_empty() || directory.chars().any(char::is_control)
-        })
+    if draft.protocol == RemoteProtocol::Ssh && !terminal_options_are_valid(&draft.terminal_options)
     {
         return Err(AppError::invalid("SSH 终端类型或默认目录无效"));
     }
-    if draft
-        .sftp_options
-        .local_start_directory
-        .as_ref()
-        .is_some_and(|path| {
-            path.to_str().is_none_or(|value| {
-                value.trim().is_empty()
-                    || value.chars().any(char::is_control)
-                    || !path.is_absolute()
-            })
-        })
-        || draft
-            .sftp_options
-            .remote_start_directory
-            .as_ref()
-            .is_some_and(|path| !valid_remote_start_directory(path))
-        || draft
-            .sftp_options
-            .concurrency
-            .is_some_and(|concurrency| !(1..=8).contains(&concurrency))
+    if HostSftpOptions::enabled_for(draft.protocol, draft.sftp_options.enabled)
+        && !sftp_options_are_valid(&draft.sftp_options)
     {
         return Err(AppError::invalid("SFTP 起始目录或主机并发数无效"));
     }
-    draft.rdp_display.validate()?;
+    if draft.protocol == RemoteProtocol::Rdp && !draft.rdp_display.fullscreen {
+        draft.rdp_display.validate()?;
+    }
     if let Some(proxy) = &draft.route.proxy
         && (proxy.endpoint.host.trim().is_empty()
             || proxy.endpoint.port == 0

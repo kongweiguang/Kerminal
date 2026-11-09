@@ -6,6 +6,10 @@
 #[path = "root_preferences_quit.rs"]
 mod preferences_quit;
 
+// Quick Open 焦点回归复用真实 Root 与内存服务，避免另造模态事件桥接。
+#[path = "root_quick_open_focus.rs"]
+mod quick_open_focus;
+
 // 分屏目录回归复用隔离 Root，确保真实事件入口读取运行态而不是旧的工作区启动目录。
 #[path = "root_split_directory.rs"]
 mod split_directory;
@@ -16,6 +20,17 @@ mod split_lifecycle;
 
 #[path = "root_external_username.rs"]
 mod username;
+
+// 文件关闭回归在 Root 创建前注入内存编辑器，保留生产确认订阅和关闭回执。
+#[path = "root_plugin_file_close.rs"]
+mod plugin_file_close;
+
+// 复用隔离 Root 验证工厂已创建但生命周期失败后的实际恢复按钮。
+#[path = "root_plugin_content_recovery.rs"]
+mod plugin_content_recovery;
+
+#[path = "root_plugin_tool_recovery.rs"]
+mod plugin_tool_recovery;
 
 use super::*;
 
@@ -405,9 +420,27 @@ impl SessionService for CapturingSessions {
     ) -> AppResult<TerminalCommandContext> {
         unavailable()
     }
-    /// 不调整真实终端尺寸。
-    async fn resize(&self, _: SessionId, _: TerminalSize) -> AppResult<()> {
-        unavailable()
+    /// 只有显式安装的内存终端参与尺寸回执，确保布局回归经过真实网格重排和 watcher。
+    ///
+    /// @author kongweiguang
+    async fn resize(&self, session_id: SessionId, size: TerminalSize) -> AppResult<()> {
+        let mut live = self.live.lock().unwrap();
+        let Some(live) = live
+            .as_mut()
+            .filter(|live| live.info.session_id == session_id)
+        else {
+            return unavailable();
+        };
+        live.engine
+            .resize(size)
+            .map_err(|_| AppError::infrastructure("fixture terminal resize"))?;
+        live.info.size = size;
+        live.changes
+            .send_replace(kerminal_application::sessions::SessionChange {
+                revision: live.engine.revision(),
+                kind: kerminal_application::sessions::SessionChangeKind::Resized,
+            });
+        Ok(())
     }
     /// 只读取内存引擎快照，使生命周期与 Output 回归经过实际快照接受链路。
     async fn render_snapshot(
@@ -545,6 +578,39 @@ fn fixture(
     Arc<TemporaryTargets>,
     &mut VisualTestContext,
 ) {
+    fixture_with_configuration(app, Arc::new(EmptyConfiguration))
+}
+
+/// 只替换设置端口以检查布局保存回执，其余 Root 资源与认证测试共用同一隔离边界。
+///
+/// @author kongweiguang
+fn fixture_with_configuration(
+    app: &mut TestAppContext,
+    preferences: Arc<dyn ConfigurationRepository>,
+) -> (
+    Runtime,
+    Entity<RootView>,
+    Arc<CapturingSessions>,
+    Arc<TemporaryTargets>,
+    &mut VisualTestContext,
+) {
+    fixture_with_configuration_and_services(app, preferences, |services| services)
+}
+
+/// 创建前注入窄服务，让依赖编辑器的回归使用 Root 自己建立的订阅，避免测试重写事件桥接。
+///
+/// @author kongweiguang
+fn fixture_with_configuration_and_services(
+    app: &mut TestAppContext,
+    preferences: Arc<dyn ConfigurationRepository>,
+    configure: impl FnOnce(AppServices) -> AppServices,
+) -> (
+    Runtime,
+    Entity<RootView>,
+    Arc<CapturingSessions>,
+    Arc<TemporaryTargets>,
+    &mut VisualTestContext,
+) {
     let runtime = Builder::new_current_thread().enable_all().build().unwrap();
     let sessions = Arc::new(CapturingSessions::default());
     let temporary = Arc::new(TemporaryTargets::default());
@@ -553,7 +619,7 @@ fn fixture(
         WorkspaceService::new(),
         sessions.clone(),
         ApplicationTaskExecutor::new(runtime.handle().clone()),
-        PreferencesService::new(config.clone()),
+        PreferencesService::new(preferences),
         ProfileService::new(config.clone(), config),
     )
     .with_connections(
@@ -566,6 +632,7 @@ fn fixture(
         temporary.clone(),
         ExternalLaunchSettings::default(),
     ));
+    let services = configure(services);
     app.update(|app| {
         crate::init(app);
         app.set_reduce_motion(true);
@@ -2232,30 +2299,60 @@ fn wide_sftp_file_navigation_keeps_the_docked_tool(app: &mut TestAppContext) {
 }
 
 /// 真实 Root 的窄窗文件菜单必须先取得焦点，第一次 Escape 关闭菜单，第二次才关闭抽屉。
+/// 远端清单由已激活文件标签提供目标，避免无来源时被生产绑定逻辑撤销。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]
 fn compact_sftp_context_menu_escape_preserves_drawer_until_second_press(app: &mut TestAppContext) {
+    use crate::features::editor::FileEditorWorkspace;
     use gpui_kit::{Modifiers, MouseButton, px, size};
-    use kerminal_application::preferences::ToolRailToolId;
+    use kerminal_application::{files::editor::FileEditorService, preferences::ToolRailToolId};
     use kerminal_domain::files::FileEntryKind;
 
     let (runtime, _file_runtime, root, pane, visual) = file_queue_fixture(app);
+    settle(&runtime, visual);
     let endpoint = file_support::remote_endpoint(&HostId::new(), "/fixture");
     let entry = file_support::remote_entry(&endpoint, "fixture.txt", FileEntryKind::File);
+    let opened = file_support::remote_entry(&endpoint, "open.txt", FileEntryKind::File).endpoint;
     visual.simulate_resize(size(px(800.), px(700.)));
     visual.update(|window, _| window.activate_window());
+    visual.run_until_parked();
     visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            assert!(!root.workspace_load_pending);
+            root.active_file_sftp_selection = None;
+            let service = FileEditorService::new(root.services.files.clone().unwrap());
+            let executor = root.services.executor.clone();
+            root.file_editor_workspace = Some(cx.new(|cx| {
+                FileEditorWorkspace::new(
+                    service,
+                    executor,
+                    FileTargetNameLookup::default(),
+                    window,
+                    cx,
+                )
+            }));
+            let controller = WorkspaceController::from_missing().unwrap();
+            root.workspace_files = WorkspaceFileRuntime::from_snapshot(controller.snapshot());
+            root.workspace_controller = Some(controller);
+            assert!(root.open_file_endpoint_with_lease(opened, None, window, cx));
+            root.reconcile_tab_tool_contents(window, cx);
+            root.files_pane = None;
+            root.sftp_panel = Some(pane.clone());
+            root._sftp_panel_subscriptions = root._files_pane_subscriptions.take();
+            root.sftp_workbench_tab_open = false;
+            assert_eq!(
+                root.active_file_browser_target().map(|(target, _)| target),
+                Some(endpoint.clone()),
+                "the active remote file must own the seeded directory"
+            );
+        });
         pane.update(app, |pane, cx| {
             pane.set_host_picker_enabled(false, cx);
             pane.set_compact_layout(true, cx);
-            file_support::seed_compact_listing(pane, endpoint, vec![entry]);
+            file_support::seed_compact_listing(pane, endpoint.clone(), vec![entry]);
         });
         root.update(app, |root, cx| {
-            root.center_panel = CenterPanel::Terminal;
-            root.sftp_workbench_tab_open = false;
-            root.tab_tool_contents_tab_id = Some(TabId::new());
-            root.sftp_panel = Some(pane.clone());
             root.show_compact_tool_panel(ToolRailToolId::Sftp, window, cx);
         });
     });
@@ -2294,6 +2391,7 @@ fn compact_sftp_context_menu_escape_preserves_drawer_until_second_press(app: &mu
         );
         assert!(root.compact_drawer_focus_handle.is_focused(window));
     });
+    file_support::draw(visual);
     let row = visual
         .debug_bounds("files-row-1-fixture.txt")
         .expect("fixture file row is rendered in the SFTP drawer");
@@ -2484,7 +2582,6 @@ fn saved_sftp_host(id: HostId) -> ManagedHost {
         route: HostRouteSettings::default(),
         serial: None,
         tags: Vec::new(),
-        is_favorite: false,
         sort_order: 0,
         connect_timeout_ms: 30_000,
         keepalive_interval_ms: None,
@@ -2862,7 +2959,7 @@ fn assert_compact_files_placement_keeps_rows(
                 .panel_placements
                 .insert(ToolRailToolId::Sftp, placement);
             root.settings_snapshot = Some(settings);
-            root.remap_tool_rail_settings(cx);
+            root.remap_tool_rail_settings(window, cx);
         });
         window.draw(app).clear(app);
     });

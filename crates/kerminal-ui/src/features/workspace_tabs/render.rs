@@ -417,6 +417,7 @@ impl WorkspaceTabs {
     /// 外框统一使用 main 的高度、圆角和内距，关闭命中区独立保留 22px，末项不会贴右缘。
     /// 拖放边界绑定到完整标签外框，关闭按钮仍独立接收点击。
     /// 标签本身不叠加组内横向留白；分隔线到首项的距离由工作台唯一外层提供。
+    /// 插件内容沿用提供方给出的对象标题，不让内部类型身份挤占窄标签的阅读空间。
     ///
     /// @author kongweiguang
     fn render_tab(
@@ -544,15 +545,21 @@ impl WorkspaceTabs {
                     .text_size(theme.text_sm)
                     .child(title),
             )
-            .when(tab_kind != WorkspaceTabKind::Terminal, |label| {
-                label.child(
-                    div()
-                        .flex_none()
-                        .text_size(theme.text_xs)
-                        .text_color(theme.muted)
-                        .child(tab_kind_label(&tab_kind)),
-                )
-            });
+            .when(
+                !matches!(
+                    tab_kind,
+                    WorkspaceTabKind::Terminal | WorkspaceTabKind::Extension(_)
+                ),
+                |label| {
+                    label.child(
+                        div()
+                            .flex_none()
+                            .text_size(theme.text_xs)
+                            .text_color(theme.muted)
+                            .child(tab_kind_label(&tab_kind)),
+                    )
+                },
+            );
 
         let close_tab_id = tab_id.clone();
         let close_label = crate::locale::text("关闭标签", "Close tab");
@@ -1054,6 +1061,7 @@ impl Render for WorkspaceTabs {
     /// 列表打开时读取完整投影，折叠组和屏外标签仍可按稳定 ID 激活，长列表沿用原生菜单滚动。
     /// Kit Input 没有 description builder，完整错误仍并入可访问名称和保存按钮提示。
     /// 空白未分组区域只在活动拖拽时扩张到组列末尾剩余空间；静止布局不显示独立未分组标题。
+    /// 标题栏宿主统一绘制材质，轨道与根容器不重复刷底，避免透明背景被遮住。
     /// 普通态也按可见组头与固定标签预算轨道宽度，确保 ScrollHandle 测得完整内容；拖拽态仅额外计入末尾 72px 投放区。
     /// 拖放反馈只在 GPUI payload 与当前稳定 ID 投影均有效时显示；边缘滚动任务仅暂存来源和代次。
     ///
@@ -1323,7 +1331,6 @@ impl Render for WorkspaceTabs {
                 .flex()
                 .items_center()
                 .gap_2()
-                .bg(theme.materials.chrome)
                 .child(input)
                 .when_some(self.name_error.clone(), |row, error| {
                     row.child(
@@ -1515,7 +1522,6 @@ impl Render for WorkspaceTabs {
                     .items_center()
                     .gap_1()
                     .overflow_hidden()
-                    .bg(theme.materials.chrome)
                     .child(viewport.child(track))
                     .child(picker)
                     .child(create_terminal_button)
@@ -1576,7 +1582,6 @@ impl Render for WorkspaceTabs {
                     .items_center()
                     .gap_1()
                     .overflow_hidden()
-                    .bg(theme.materials.chrome)
                     .child(viewport.child(track))
             };
             tab_bar.into_any_element()
@@ -1590,7 +1595,6 @@ impl Render for WorkspaceTabs {
             .flex()
             .flex_col()
             .gap_0()
-            .bg(theme.background)
             .text_color(theme.foreground)
             .child(tab_bar)
             .into_any_element()

@@ -4,6 +4,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -21,7 +22,8 @@ use kerminal_application::{
             CredentialCleanupStatus, HostAuthenticationMode, HostCredentialChange,
             HostCredentialSlot, HostDocumentRevision, HostDraft, HostGroup,
             HostGroupDeletionReceipt, HostGroupDraft, HostGroupSnapshot, HostManagementRepository,
-            HostManagementService, HostRouteSettings, ManagedHost, RecoverableHostSaveOutcome,
+            HostManagementService, HostRouteSettings, HostSftpOptions, ManagedHost,
+            RdpDisplayOptions, RecoverableHostSaveOutcome,
         },
     },
 };
@@ -354,7 +356,6 @@ fn password_host() -> ManagedHost {
         route: HostRouteSettings::default(),
         serial: None,
         tags: Vec::new(),
-        is_favorite: false,
         sort_order: 0,
         connect_timeout_ms: 30_000,
         keepalive_interval_ms: Some(60_000),
@@ -436,7 +437,6 @@ fn host_from_draft(draft: HostDraft, id: HostId, revision: ConfigRevision) -> Ma
         route: draft.route,
         serial: draft.serial,
         tags: draft.tags,
-        is_favorite: draft.is_favorite,
         sort_order: draft.sort_order,
         connect_timeout_ms: draft.connect_timeout_ms,
         keepalive_interval_ms: draft.keepalive_interval_ms,
@@ -466,7 +466,6 @@ fn draft_for(host: &ManagedHost, name: &str) -> HostDraft {
         route: host.route.clone(),
         serial: host.serial.clone(),
         tags: host.tags.clone(),
-        is_favorite: host.is_favorite,
         sort_order: host.sort_order,
         connect_timeout_ms: host.connect_timeout_ms,
         keepalive_interval_ms: host.keepalive_interval_ms,
@@ -498,6 +497,86 @@ async fn fixture(
         host,
         vault,
     )
+}
+
+/// 关闭 SSH 文件能力时丢弃失效隐藏值，不能让无关字段阻止主机保存。
+/// @author kongweiguang
+#[tokio::test]
+async fn disabled_ssh_sftp_settings_do_not_block_save_and_normalize() {
+    let host = password_host();
+    let service = HostManagementService::new(Arc::new(MemoryHosts::new(
+        host.clone(),
+        SaveDisposition::Commit,
+    )));
+    let mut draft = draft_for(&host, "ssh without sftp");
+    draft.sftp_options = HostSftpOptions {
+        enabled: false,
+        local_start_directory: Some(PathBuf::from("relative/path")),
+        remote_start_directory: Some("relative/path".to_owned()),
+        concurrency: Some(99),
+        ..host.sftp_options.clone()
+    };
+
+    let saved = service
+        .save_host(draft, Some(host.revision.clone()))
+        .await
+        .expect("disabled SFTP draft fields are not validated");
+
+    assert!(!saved.sftp_options.enabled);
+    assert!(saved.sftp_options.local_start_directory.is_none());
+    assert!(saved.sftp_options.remote_start_directory.is_none());
+    assert!(saved.sftp_options.concurrency.is_none());
+}
+
+/// 全屏模式忽略尺寸草稿并将其清空，避免保存不可重读或之后意外生效的窗口尺寸。
+/// @author kongweiguang
+#[tokio::test]
+async fn fullscreen_rdp_ignores_and_clears_invalid_window_dimensions() {
+    let host = password_host();
+    let service = HostManagementService::new(Arc::new(MemoryHosts::new(
+        host.clone(),
+        SaveDisposition::Commit,
+    )));
+    let mut draft = draft_for(&host, "fullscreen rdp");
+    draft.protocol = RemoteProtocol::Rdp;
+    draft.endpoint.port = 3389;
+    draft.authentication = None;
+    draft.rdp_display = RdpDisplayOptions {
+        fullscreen: true,
+        width: Some(1),
+        height: Some(1),
+    };
+
+    let saved = service
+        .save_host(draft, Some(host.revision.clone()))
+        .await
+        .expect("fullscreen ignores inactive custom dimensions");
+
+    assert!(saved.rdp_display.fullscreen);
+    assert!(saved.rdp_display.width.is_none());
+    assert!(saved.rdp_display.height.is_none());
+}
+
+/// 独立 SFTP 即使来自旧 false 配置，显式保存也始终恢复其必需的文件能力。
+/// @author kongweiguang
+#[tokio::test]
+async fn sftp_only_host_is_enabled_after_explicit_save() {
+    let host = password_host();
+    let service = HostManagementService::new(Arc::new(MemoryHosts::new(
+        host.clone(),
+        SaveDisposition::Commit,
+    )));
+    let mut draft = draft_for(&host, "standalone sftp");
+    draft.protocol = RemoteProtocol::Sftp;
+    draft.endpoint.port = 22;
+    draft.sftp_options.enabled = false;
+
+    let saved = service
+        .save_host(draft, Some(host.revision.clone()))
+        .await
+        .expect("SFTP-only host remains valid when normalizing legacy state");
+
+    assert!(saved.sftp_options.enabled);
 }
 
 /// 建立同时包含目标密码和代理密码的隔离 vault，确保清理只影响被替换的引用。

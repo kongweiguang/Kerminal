@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "id": "acme.notes",
+  "name": {"en": "Workspace Notes", "zh-CN": "工作区笔记"},
+  "description": {"en": "Keep a small workspace note", "zh-CN": "记录工作区笔记"},
+  "version": "1.0.0",
+  "api": "^1.0",
+  "publisher": "acme",
+  "license": "MIT",
+  "categories": ["productivity"],
+  "runtime": {"kind": "script", "main": "dist/main.js", "activation": "on-demand"},
+  "permissions": ["ui.notify", "network:example.com"],
+  "contributes": {
+    "tools": [{"id": "notes-panel", "title": "%panel.title%", "view": "notes.panel", "scope": "tab"}],
+    "tabs": [{"id": "notes-editor", "title": "%editor.title%", "view": "notes.editor", "state_version": 1}],
+    "settings": {"schema": "schemas/settings.json", "view": "notes.settings"},
+    "commands": [{"id": "check-service", "title": "%command.check%", "keybinding": "ctrl+alt+n"}]
+  },
+  "views": {
+    "notes.panel": {"kind": "native", "file": "views/panel.json"},
+    "notes.editor": {"kind": "native", "file": "views/editor.json"},
+    "notes.settings": {"kind": "native", "file": "views/settings.json"}
+  },
+  "l10n": "l10n"
+}

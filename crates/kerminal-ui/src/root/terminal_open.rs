@@ -1419,9 +1419,11 @@ impl RootView {
 
     /// 更新只读投影且先安装组拓扑再安装标签，避免同批组变化撤销新 active 标签的测量请求。
     /// 无窗口的恢复回调不创建 GPUI Entity，真实会话和布局所有权仍留在 controller；隐藏搜索先撤销计时和提交门。
+    /// 内容插件的显隐在此生命周期同步，避免在 render 中启动读取。
     ///
     /// @author kongweiguang
     pub(super) fn refresh_workspace_views(&mut self, cx: &mut Context<RootView>) {
+        self.sync_plugin_content_visibility(cx);
         // 仅在原持久化门禁解除后提交仍属于现存标签的最新文件端点；未知结果继续等待显式处理。
         if self.flush_pending_sftp_transfer_endpoints(cx) {
             self.persist_workspace_snapshot(cx);
@@ -1546,12 +1548,21 @@ impl RootView {
     }
 
     /// 以唯一 CAS 保存口回报退出门控；保存期间新同步的快照在旧回执后仍为 Dirty 时再排一次 CAS。
+    /// 插件实例提取失败保留可恢复状态，不以旧的持久快照代替用户草稿。
     pub(super) fn persist_workspace_snapshot_with_completion(
         &mut self,
         completion: impl FnOnce(&mut RootView, WorkspaceSnapshotSaveCompletion, &mut Context<RootView>)
         + 'static,
         cx: &mut Context<RootView>,
     ) {
+        if let Err(error) = self.capture_plugin_tab_states(cx) {
+            completion(
+                self,
+                WorkspaceSnapshotSaveCompletion::Failed(error.public_message().to_owned().into()),
+                cx,
+            );
+            return;
+        }
         let Some(workspace_service) = self.services.workspace_sessions.clone() else {
             completion(
                 self,

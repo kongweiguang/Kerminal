@@ -1019,7 +1019,7 @@ impl OperationsView {
                             .px_2()
                             .py_1()
                             .rounded_sm()
-                            .bg(theme.secondary)
+                            .bg(theme.content_surface())
                             .text_size(theme.text_xs)
                             .font_family("monospace")
                             .text_color(theme.muted)

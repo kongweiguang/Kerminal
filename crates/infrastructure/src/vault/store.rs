@@ -20,6 +20,8 @@ use tokio::task;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+use crate::storage::StorageLock;
+
 use super::{
     error::{VaultError, to_app_error},
     format::{self, VaultFile, VaultKeyFile},
@@ -121,12 +123,25 @@ impl super::VaultStore {
             .any(|entry| entry.id == reference.as_str()))
     }
 
-    /// 原子移除单条密文；key 文件保留以兼容其它主机或后续新增凭据。
+    /// 独立入口先取得共享锁，避免与配置和其他 Vault 事务交错。
+    ///
+    /// @author kongweiguang
     pub(super) fn remove_sync(&self, reference: &CredentialRef) -> Result<bool, VaultError> {
-        let _guard = self
+        let guard = self
             .storage
             .lock()
             .map_err(|_| VaultError::LockUnavailable)?;
+        self.remove_with_storage_lock(&guard, reference)
+    }
+
+    /// 调用方已持有同根共享锁；复用 Vault 日志恢复和原子提交，避免嵌套锁。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn remove_with_storage_lock(
+        &self,
+        _guard: &StorageLock<'_>,
+        reference: &CredentialRef,
+    ) -> Result<bool, VaultError> {
         transaction::recover_pending(&self.storage)?;
         let (key_source, vault_source) = read_pair(&self.storage)?;
         let mut vault = parse_vault_bytes(vault_source.as_ref().map(|source| source.as_slice()))?;

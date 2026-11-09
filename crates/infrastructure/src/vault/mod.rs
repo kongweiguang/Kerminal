@@ -6,6 +6,7 @@ mod error;
 mod format;
 mod key_management;
 mod mcp_token;
+mod plugin_credentials;
 pub(crate) mod profile_migration;
 mod store;
 mod transaction;

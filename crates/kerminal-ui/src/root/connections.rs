@@ -697,6 +697,7 @@ pub(super) fn handle_connections_event(
         ConnectionsEvent::HostSelected { host_id } => {
             root.group_rename_return_surface = None;
             root.selected_host_id = Some(host_id.clone());
+            root.selected_plugin_host_id = None;
             root.refresh_operations_panel_targets(cx);
             cx.notify();
             true
@@ -704,6 +705,7 @@ pub(super) fn handle_connections_event(
         ConnectionsEvent::HostSaved { host_id } => {
             root.group_rename_return_surface = None;
             root.selected_host_id = Some(host_id.clone());
+            root.selected_plugin_host_id = None;
             root.refresh_operations_panel_targets(cx);
             if let Some(navigation) = root.host_navigation.clone() {
                 navigation.update(cx, |navigation, cx| {
@@ -713,9 +715,23 @@ pub(super) fn handle_connections_event(
             cx.notify();
             true
         }
+        ConnectionsEvent::PluginHostSaved { host_id } => {
+            root.group_rename_return_surface = None;
+            root.selected_host_id = None;
+            root.selected_plugin_host_id = Some(host_id.clone());
+            root.refresh_operations_panel_targets(cx);
+            if let Some(navigation) = root.host_navigation.clone() {
+                navigation.update(cx, |navigation, cx| {
+                    navigation.select_saved_plugin_host(host_id.clone(), cx);
+                });
+            }
+            cx.notify();
+            true
+        }
         ConnectionsEvent::LocalProfileSaved { profile_id } => {
             root.group_rename_return_surface = None;
             root.selected_host_id = None;
+            root.selected_plugin_host_id = None;
             root.refresh_operations_panel_targets(cx);
             if let Some(navigation) = root.host_navigation.clone() {
                 navigation.update(cx, |navigation, cx| {
@@ -750,8 +766,9 @@ pub(super) fn handle_connections_event(
         ConnectionsEvent::ConnectLocalProfileRequested { profile_id } => {
             // 历史字段名继续携带本地主机 ID；模板只供无显式 ID 的默认终端使用。
             root.selected_host_id = None;
+            root.selected_plugin_host_id = None;
             root.refresh_operations_panel_targets(cx);
-            root.create_terminal_for_target(local_profile_target_request(profile_id), window, cx);
+            root.open_saved_local_host(profile_id, window, cx);
             true
         }
         ConnectionsEvent::CreateSftpTransferTabRequested {
@@ -2017,6 +2034,7 @@ fn open_pinned_container(
 /// 每次显式终端连接意图都会交给连接面板预检并创建独立会话，不因同主机已有 pane 而改为激活旧标签。
 /// 顶部工作台和折叠直接路由现有 Root 状态，不要求选中主机或先创建终端。
 /// 新建事件保留可空分组，背景/未分组与已保存分组复用同一编辑器门禁。
+/// 扩展主机通过冻结提供方打开，不转入只理解内置协议的编辑面板。
 /// @author kongweiguang
 pub(super) fn handle_host_navigation_event(
     root: &mut RootView,
@@ -2026,7 +2044,12 @@ pub(super) fn handle_host_navigation_event(
 ) {
     // 后来的侧栏操作优先；信任预检或终端就绪的迟到结果不能重开容器工具。
     root.pending_sidebar_container = None;
+    root.cancel_plugin_host_open();
     match event {
+        HostNavigationEvent::PluginHostOpenRequested { host_id } => {
+            root.open_plugin_host(host_id.clone(), window, cx);
+            return;
+        }
         HostNavigationEvent::PinnedContainerDetailsRequested { stable_id } => {
             super::sidebar_containers::open_pinned_details(root, stable_id, window, cx);
             return;
@@ -2076,26 +2099,38 @@ pub(super) fn handle_host_navigation_event(
             return;
         }
         HostNavigationEvent::LocalProfileConnectRequested { profile_id } => {
-            root.create_terminal_for_target(local_profile_target_request(profile_id), window, cx);
+            root.open_saved_local_host(profile_id, window, cx);
             return;
         }
         HostNavigationEvent::LocalProfileSelected { .. } => {
             // 目录选择不启动隐藏详情读取，也不改变终端布局或 Agent 的冻结目标。
             root.selected_host_id = None;
+            root.selected_plugin_host_id = None;
             root.refresh_operations_panel_targets(cx);
             cx.notify();
             return;
         }
         HostNavigationEvent::HostSelected { host_id } => {
             root.selected_host_id = Some(host_id.clone());
+            root.selected_plugin_host_id = None;
+            root.refresh_operations_panel_targets(cx);
+            cx.notify();
+            return;
+        }
+        HostNavigationEvent::PluginHostSelected { host_id } => {
+            // 扩展选择不能沿用上一个 SSH 主机作为运维目标，也不重绑正在运行的任务。
+            root.selected_host_id = None;
+            root.selected_plugin_host_id = Some(host_id.clone());
             root.refresh_operations_panel_targets(cx);
             cx.notify();
             return;
         }
         HostNavigationEvent::ConnectRequested { .. }
         | HostNavigationEvent::OpenSftpRequested { .. } => {}
-        HostNavigationEvent::CreateSftpTransferTabRequested { .. } => {}
+        HostNavigationEvent::CreateSftpTransferTabRequested { .. }
+        | HostNavigationEvent::PluginHostOpenRequested { .. } => {}
         HostNavigationEvent::EditHostRequested { .. }
+        | HostNavigationEvent::PluginHostEditRequested { .. }
         | HostNavigationEvent::CopyHostRequested { .. }
         | HostNavigationEvent::CopyHostAsSshRequested { .. }
         | HostNavigationEvent::CreateHostRequested { .. }
@@ -2146,7 +2181,9 @@ pub(super) fn handle_host_navigation_event(
     let mut group_editor_failed = false;
     panel.update(cx, |panel, cx| match event {
         HostNavigationEvent::OpenSftpWorkbenchRequested
+        | HostNavigationEvent::PluginHostOpenRequested { .. }
         | HostNavigationEvent::HostSelected { .. }
+        | HostNavigationEvent::PluginHostSelected { .. }
         | HostNavigationEvent::LocalProfileSelected { .. }
         | HostNavigationEvent::LocalProfileConnectRequested { .. }
         | HostNavigationEvent::PinnedContainerSelected { .. }
@@ -2165,6 +2202,9 @@ pub(super) fn handle_host_navigation_event(
         }
         HostNavigationEvent::EditHostRequested { host_id } => {
             panel.edit_saved_host(host_id, window, cx)
+        }
+        HostNavigationEvent::PluginHostEditRequested { host_id } => {
+            panel.begin_edit_plugin_host(host_id.clone(), window, cx)
         }
         HostNavigationEvent::CopyHostRequested { host_id } => {
             panel.duplicate_saved_host(host_id, window, cx)
@@ -2228,7 +2268,7 @@ pub(super) fn handle_host_navigation_event(
 /// 将本地主机连接意图保留为 Profile 目标，防止统一列表导航时重解释其身份。
 ///
 /// @author kongweiguang
-fn local_profile_target_request(profile_id: &str) -> TerminalTargetRequest {
+pub(super) fn local_profile_target_request(profile_id: &str) -> TerminalTargetRequest {
     TerminalTargetRequest::ProfileLocal {
         profile_id: profile_id.to_owned(),
     }

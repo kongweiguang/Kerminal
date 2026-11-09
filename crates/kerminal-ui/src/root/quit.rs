@@ -2,6 +2,8 @@
 //!
 //! @author kongweiguang
 
+use std::time::{Duration, Instant};
+
 use gpui_kit::{
     AnyElement, ClickEvent, Context, IntoElement, SharedString, Window,
     component::{Disableable as _, button::Button},
@@ -17,6 +19,12 @@ use kerminal_application::{
 use super::updates::{GuardRequestResult, UpdateInstallRequest};
 use super::{RootView, terminal_open};
 
+#[path = "plugin_shutdown.rs"]
+mod plugin_shutdown;
+
+/// 内容与桌面服务共享一次退出的总预算；显式重试再分配新的绝对截止时间。
+const HOST_SHUTDOWN_BUDGET: Duration = Duration::from_secs(12);
+
 /// 桌面退出或更新重启的意图；RootView 统一完成草稿和编辑文件的脏状态保护。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QuitIntent {
@@ -29,14 +37,17 @@ pub enum QuitIntent {
 pub enum RootViewEvent {
     QuitReady {
         intent: QuitIntent,
+        deadline: Instant,
     },
     InstallReady {
         update_id: DownloadedUpdateId,
         version: String,
+        deadline: Instant,
     },
     RetryInstallReady {
         update_id: DownloadedUpdateId,
         version: String,
+        deadline: Instant,
     },
 }
 
@@ -251,6 +262,7 @@ impl RootView {
         if self.cancel_quit_for_connection_changes(cx) {
             return false;
         }
+        self.cancel_plugin_host_open();
         self.pending_quit_intent = Some(intent);
         let preferences = self.preferences_panel.clone();
         if preferences.read(cx).is_workbench_layout_save_in_flight() {
@@ -298,12 +310,32 @@ impl RootView {
         if self.host_lifecycle != RootHostLifecycle::StopFailed {
             return false;
         }
+        if !self.content_host.scopes().is_empty()
+            || !self.plugin_tools.all_instance_contexts().is_empty()
+        {
+            let Some(intent) = self.failed_quit_intent.clone() else {
+                return false;
+            };
+            self.begin_content_shutdown(intent, Instant::now() + HOST_SHUTDOWN_BUDGET, cx);
+            return true;
+        }
         if let Some(update) = self.pending_update_install.clone() {
+            if self.update_install_guard.pending().is_some() {
+                self.finish_quit_after_content_shutdown(
+                    QuitIntent::RestartForUpdate {
+                        version: update.version,
+                    },
+                    Instant::now() + HOST_SHUTDOWN_BUDGET,
+                    cx,
+                );
+                return true;
+            }
             self.host_lifecycle = RootHostLifecycle::Stopping;
             self.host_shutdown_requested = true;
             cx.emit(RootViewEvent::InstallReady {
                 update_id: update.update_id,
                 version: update.version,
+                deadline: Instant::now() + HOST_SHUTDOWN_BUDGET,
             });
             cx.notify();
             return true;
@@ -471,11 +503,34 @@ impl RootView {
                 }
                 match self.host_lifecycle {
                     RootHostLifecycle::StopFailed => {
+                        if !self.content_host.scopes().is_empty()
+                            || !self.plugin_tools.all_instance_contexts().is_empty()
+                        {
+                            self.begin_content_shutdown(
+                                QuitIntent::RestartForUpdate {
+                                    version: version.clone(),
+                                },
+                                Instant::now() + HOST_SHUTDOWN_BUDGET,
+                                cx,
+                            );
+                            return;
+                        }
+                        if self.update_install_guard.pending().is_some() {
+                            self.finish_quit_after_content_shutdown(
+                                QuitIntent::RestartForUpdate {
+                                    version: version.clone(),
+                                },
+                                Instant::now() + HOST_SHUTDOWN_BUDGET,
+                                cx,
+                            );
+                            return;
+                        }
                         self.host_lifecycle = RootHostLifecycle::Stopping;
                         self.host_shutdown_requested = true;
                         cx.emit(RootViewEvent::InstallReady {
                             update_id: *update_id,
                             version: version.clone(),
+                            deadline: Instant::now() + HOST_SHUTDOWN_BUDGET,
                         });
                     }
                     RootHostLifecycle::StoppedUpdateFailed => {
@@ -484,6 +539,7 @@ impl RootView {
                         cx.emit(RootViewEvent::RetryInstallReady {
                             update_id: *update_id,
                             version: version.clone(),
+                            deadline: Instant::now() + HOST_SHUTDOWN_BUDGET,
                         });
                     }
                     _ => return,
@@ -610,25 +666,61 @@ impl RootView {
             QuitIntent::Exit => None,
         };
         if matches!(&intent, QuitIntent::RestartForUpdate { .. }) && update_request.is_none() {
-            self.pending_quit_intent = None;
-            self.host_lifecycle = RootHostLifecycle::Running;
-            self.status = Some(crate::locale::text(
+            let message = crate::locale::text(
                 "更新请求已失效，请重新发起更新。",
                 "The update request is no longer valid. Start the update again.",
-            ));
-            self.cancel_pending_update_install(cx);
-            cx.notify();
+            );
+            if self.host_shutdown_requested {
+                self.fail_content_shutdown(intent, message, cx);
+            } else {
+                self.host_lifecycle = RootHostLifecycle::Running;
+                self.status = Some(message);
+                self.cancel_pending_update_install(cx);
+                cx.notify();
+            }
             return;
         }
 
         // Desktop retries after a failed/partial shutdown must not call application services again.
         if self.host_lifecycle != RootHostLifecycle::Running {
-            self.emit_quit_ready_event(intent, cx);
+            let deadline = Instant::now() + HOST_SHUTDOWN_BUDGET;
+            if self.content_host.scopes().is_empty()
+                && self.plugin_tools.all_instance_contexts().is_empty()
+            {
+                self.emit_quit_ready_event(intent, deadline, cx);
+            } else {
+                self.begin_content_shutdown(intent, deadline, cx);
+            }
             return;
         }
         // CAS 准备期间保留原退出意图；布局失败/明确取消可以撤销它，迟到成功不能复活退出。
         self.pending_quit_intent = Some(intent.clone());
         if self.services.workspace_sessions.is_none() {
+            let has_extension_tab =
+                self.workspace_controller
+                    .as_ref()
+                    .is_some_and(|controller| {
+                        controller.snapshot().terminal_tabs.iter().any(|tab| {
+                        matches!(
+                            tab,
+                            kerminal_application::workspace::WorkspaceSessionTab::Extension { .. }
+                        )
+                    })
+                    })
+                    || self.content_host.scopes().iter().any(|scope| {
+                        matches!(scope, crate::plugins::content::ContentScope::Tab(_))
+                    });
+            if has_extension_tab {
+                self.finish_quit_after_workspace_save(
+                    intent,
+                    terminal_open::WorkspaceSnapshotSaveCompletion::Failed(crate::locale::text(
+                        "扩展标签尚未保存，工作区持久化服务不可用。",
+                        "Extension tabs are unsaved because workspace persistence is unavailable.",
+                    )),
+                    cx,
+                );
+                return;
+            }
             self.finish_quit_after_workspace_save(
                 intent,
                 terminal_open::WorkspaceSnapshotSaveCompletion::NoChanges,
@@ -694,56 +786,7 @@ impl RootView {
                     return;
                 }
                 self.pending_quit_intent = None;
-                if let QuitIntent::RestartForUpdate { version } = &intent {
-                    let Some(request) = self
-                        .pending_update_install
-                        .clone()
-                        .filter(|request| &request.version == version)
-                    else {
-                        self.cancel_pending_update_install(cx);
-                        self.status = Some(crate::locale::text(
-                            "更新请求已失效，请重新发起更新。",
-                            "The update request is no longer valid. Start the update again.",
-                        ));
-                        cx.notify();
-                        return;
-                    };
-                    let Some(approved) = self.update_install_guard.approve(request.update_id)
-                    else {
-                        self.cancel_pending_update_install(cx);
-                        return;
-                    };
-                    if approved != request {
-                        self.cancel_pending_update_install(cx);
-                        return;
-                    }
-                    let started = self.updates_panel.update(cx, |panel, cx| {
-                        panel.begin_host_install(request.update_id, cx)
-                    });
-                    if !started {
-                        self.pending_update_install = Some(request.clone());
-                        self.cancel_pending_update_install(cx);
-                        self.status = Some(crate::locale::text(
-                            "更新面板已无法接管安装，请重新发起更新。",
-                            "The update panel could not take over installation. Start the update again.",
-                        ));
-                        cx.notify();
-                        return;
-                    }
-                    self.pending_update_install = Some(request.clone());
-                    self.quit_ready_emitted = false;
-                    self.quit_ready_intent = None;
-                    self.host_lifecycle = RootHostLifecycle::Stopping;
-                    self.host_shutdown_requested = true;
-                    self.quit_preparation_failure = None;
-                    cx.emit(RootViewEvent::InstallReady {
-                        update_id: request.update_id,
-                        version: request.version,
-                    });
-                    cx.notify();
-                    return;
-                }
-                self.emit_quit_ready_event(intent, cx);
+                self.begin_content_shutdown(intent, Instant::now() + HOST_SHUTDOWN_BUDGET, cx);
             }
             result => {
                 let is_update = matches!(&intent, QuitIntent::RestartForUpdate { .. });
@@ -764,16 +807,91 @@ impl RootView {
         }
     }
 
+    /// 内容 owner 全部确认后才消费更新句柄，并把同一截止时间交给桌面收尾。
+    ///
+    /// @author kongweiguang
+    fn finish_quit_after_content_shutdown(
+        &mut self,
+        intent: QuitIntent,
+        deadline: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        if let QuitIntent::RestartForUpdate { version } = &intent {
+            let Some(request) = self
+                .pending_update_install
+                .clone()
+                .filter(|request| &request.version == version)
+            else {
+                self.fail_update_after_content_shutdown(intent, cx);
+                return;
+            };
+            if let Some(pending) = self.update_install_guard.pending() {
+                if pending != &request {
+                    self.fail_update_after_content_shutdown(intent, cx);
+                    return;
+                }
+                let started = self.updates_panel.update(cx, |panel, cx| {
+                    panel.begin_host_install(request.update_id, cx)
+                });
+                if !started {
+                    self.fail_update_after_content_shutdown(intent, cx);
+                    return;
+                }
+                if self.update_install_guard.approve(request.update_id) != Some(request.clone()) {
+                    self.fail_update_after_content_shutdown(intent, cx);
+                    return;
+                }
+            }
+            self.pending_update_install = Some(request.clone());
+            self.quit_ready_emitted = false;
+            self.quit_ready_intent = None;
+            self.host_lifecycle = RootHostLifecycle::Stopping;
+            self.host_shutdown_requested = true;
+            self.quit_preparation_failure = None;
+            cx.emit(RootViewEvent::InstallReady {
+                update_id: request.update_id,
+                version: request.version,
+                deadline,
+            });
+            cx.notify();
+            return;
+        }
+        self.emit_quit_ready_event(intent, deadline, cx);
+    }
+
+    /// 收尾前可撤销更新请求；内容已关闭时保留停止失败态，不能假装应用仍完整运行。
+    ///
+    /// @author kongweiguang
+    fn fail_update_after_content_shutdown(&mut self, intent: QuitIntent, cx: &mut Context<Self>) {
+        let message = crate::locale::text(
+            "更新请求已失效，请退出后重新发起更新。",
+            "The update request is no longer valid. Quit and start the update again.",
+        );
+        if self.host_shutdown_requested {
+            self.fail_content_shutdown(intent, message, cx);
+        } else {
+            self.cancel_pending_update_install(cx);
+            self.host_lifecycle = RootHostLifecycle::Running;
+            self.status = Some(message);
+            cx.notify();
+        }
+    }
+
     /// 派发时单调记录已交给宿主的事实；即使收尾失败，也不能重新使用已取消的服务。
     ///
     /// @author kongweiguang
-    fn emit_quit_ready_event(&mut self, intent: QuitIntent, cx: &mut Context<Self>) {
+    fn emit_quit_ready_event(
+        &mut self,
+        intent: QuitIntent,
+        deadline: Instant,
+        cx: &mut Context<Self>,
+    ) {
         self.quit_preparation_failure = None;
         self.host_lifecycle = RootHostLifecycle::Stopping;
         self.host_shutdown_requested = true;
         self.quit_ready_emitted = true;
         self.quit_ready_intent = Some(intent.clone());
-        cx.emit(RootViewEvent::QuitReady { intent });
+        cx.emit(RootViewEvent::QuitReady { intent, deadline });
     }
 
     /// 隐藏面板仍可能持有失败后的草稿，退出确认必须可见且保留原退出身份。
@@ -988,8 +1106,18 @@ impl RootView {
                         {
                             return;
                         }
-                        root.updates_panel
-                            .update(cx, |panel, cx| panel.retry_host_install(cx));
+                        if root.update_install_guard.pending().is_some() {
+                            root.begin_content_shutdown(
+                                QuitIntent::RestartForUpdate {
+                                    version: request.version.clone(),
+                                },
+                                Instant::now() + HOST_SHUTDOWN_BUDGET,
+                                cx,
+                            );
+                        } else {
+                            root.updates_panel
+                                .update(cx, |panel, cx| panel.retry_host_install(cx));
+                        }
                     })),
             );
         }

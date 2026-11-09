@@ -108,10 +108,14 @@ impl ThemeTokens {
         self.success
     }
 
-    /// 右栏与工作台共享同一色板；保留入口以避免各面板各自重建主题。
+    /// 工具宿主独占大面积材质；内容层不再叠加底色，避免透明度随内部容器数量变深。
+    /// 只清除容器角色，字段、数据卡片和浮层仍保留原色板以保证可读性。
     ///
     /// @author kongweiguang
-    pub(crate) fn for_tool_panel(self) -> Self {
+    pub(crate) fn for_tool_panel(mut self) -> Self {
+        self.tool_panel_surface = self.sidebar.opacity(0.);
+        self.materials.shell = self.materials.shell.opacity(0.);
+        self.materials.chrome = self.materials.chrome.opacity(0.);
         self
     }
 
@@ -141,13 +145,6 @@ impl ThemeTokens {
         self.success
     }
 
-    /// Agent 外壳采用应用面板色与现有透明系数，内部终端仍使用其独立色盘。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn agent_surface(self) -> Hsla {
-        self.panel.opacity(self.materials.terminal_body_opacity)
-    }
-
     /// 选择卡的文字根据选中状态使用正文或次要角色，不依赖固定品牌色。
     ///
     /// @author kongweiguang
@@ -172,6 +169,26 @@ impl ThemeTokens {
     pub(crate) fn muted_surface(self) -> Hsla {
         self.foreground
             .opacity(if self.dark { 0.06 } else { 0.035 })
+    }
+
+    /// 透明窗口或壁纸下只为数据区域提供轻衬底，避免嵌套卡片遮住宿主材质。
+    /// 普通不透明窗口保留原面板层级；调用方应只在区域外层绘制一次。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn content_surface(self) -> Hsla {
+        if self.materials.image_visible || !self.materials.compositing_is_opaque {
+            self.panel.opacity(if self.dark { 0.16 } else { 0.24 })
+        } else {
+            self.panel
+        }
+    }
+
+    /// 代码正文与行号槽共用稳定阅读面，保证横向滚动和补全遮盖不会透出底层文字。
+    /// 仅代码区域使用实色，避免行号槽和活动行形成与正文不同源的色带。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn code_surface(self) -> Hsla {
+        self.panel
     }
 
     /// 字段使用稳定实色，避免复杂表单的字形和边框随底层终端或壁纸变化。

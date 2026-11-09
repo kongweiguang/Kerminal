@@ -435,7 +435,8 @@ fn workspace_target_summary(target: &WorkspaceTargetRef) -> ContextTargetSummary
     }
 }
 
-/// 文件和 SFTP tab 按其明确目标投影；未解析 target 不回退到已选主机。
+/// 文件宿主和 SFTP tab 按其冻结目标投影；后台终端或侧栏选择不能充当文件连接身份。
+/// @author kongweiguang
 fn tab_target_summary(tab: &WorkspaceSessionTab) -> Option<ContextTargetSummary> {
     match tab {
         WorkspaceSessionTab::WorkspaceFile { target, .. } => Some(workspace_target_summary(target)),
@@ -457,18 +458,23 @@ fn tab_target_summary(tab: &WorkspaceSessionTab) -> Option<ContextTargetSummary>
                 Some(format!("sftp:{}", host.as_str())),
             ))
         }
-        WorkspaceSessionTab::Terminal { .. } | WorkspaceSessionTab::Unsupported { .. } => None,
+        WorkspaceSessionTab::Terminal { .. }
+        | WorkspaceSessionTab::Extension { .. }
+        | WorkspaceSessionTab::Unsupported { .. } => None,
     }
 }
 
-/// 只暴露当前 tab 的 kind 和机器 ID；unsupported 只显示冻结的 kind 标签。
+/// 文件工作区不产生终端能力；分类依据宿主类型，不因活动项是目录或文档而漂移。
+/// @author kongweiguang
 fn tab_kind(tab: &WorkspaceSessionTab) -> ContextConnectionKind {
     match tab {
         WorkspaceSessionTab::Terminal { .. } => ContextConnectionKind::Terminal,
         WorkspaceSessionTab::SftpTransfer { .. } | WorkspaceSessionTab::WorkspaceFile { .. } => {
             ContextConnectionKind::FileWorkspace
         }
-        WorkspaceSessionTab::Unsupported { .. } => ContextConnectionKind::Unsupported,
+        WorkspaceSessionTab::Extension { .. } | WorkspaceSessionTab::Unsupported { .. } => {
+            ContextConnectionKind::Unsupported
+        }
     }
 }
 
@@ -484,13 +490,14 @@ fn pane_mode_kind(mode: WorkspacePaneMode) -> ContextConnectionKind {
     }
 }
 
-/// 从 typed tab 取显示用 machine identity，不触碰其 raw JSON 或传输状态。
+/// 文件宿主与终端分别保留自身 machine identity；路径、raw JSON 或侧栏选择不能冒充来源。
+/// @author kongweiguang
 fn tab_machine_id(tab: &WorkspaceSessionTab) -> Option<&str> {
     match tab {
         WorkspaceSessionTab::Terminal { machine_id, .. }
         | WorkspaceSessionTab::SftpTransfer { machine_id, .. }
         | WorkspaceSessionTab::WorkspaceFile { machine_id, .. } => Some(machine_id),
-        WorkspaceSessionTab::Unsupported { .. } => None,
+        WorkspaceSessionTab::Extension { .. } | WorkspaceSessionTab::Unsupported { .. } => None,
     }
 }
 
@@ -545,9 +552,20 @@ fn persisted_shell(pane: &WorkspaceSessionPane) -> Option<String> {
         })
 }
 
-/// 文件 tab 的路径来源明确是 workspace 文档，不把它误标成终端实时目录。
+/// 文件宿主只读活动项路径；没有活动项时取首目录，不借用后台文档或终端目录。
+/// @author kongweiguang
 fn active_tab_location(tab: Option<&WorkspaceSessionTab>) -> ContextLocationSummary {
-    if let Some(WorkspaceSessionTab::WorkspaceFile { path, .. }) = tab {
+    let path = match tab {
+        Some(WorkspaceSessionTab::WorkspaceFile { path, .. }) => Some(path.as_str()),
+        Some(
+            WorkspaceSessionTab::Terminal { .. }
+            | WorkspaceSessionTab::SftpTransfer { .. }
+            | WorkspaceSessionTab::Extension { .. }
+            | WorkspaceSessionTab::Unsupported { .. },
+        )
+        | None => None,
+    };
+    if let Some(path) = path {
         return ContextLocationSummary {
             path: Some(safe_display_text(path)),
             source: ContextLocationSource::WorkspaceFile,

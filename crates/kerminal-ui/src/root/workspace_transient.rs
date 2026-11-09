@@ -145,20 +145,25 @@ fn normalize_selection(snapshot: &mut WorkspaceSessionSnapshot) {
     }
 }
 
-/// 读取文件类标签的 machine ID；未知 tab 没有该字段时保持无选择。
+/// 文件宿主保留自身 machine ID，临时项剥离后的选择不能回退到其它主机。
+/// @author kongweiguang
 fn tab_machine_id(tab: &WorkspaceSessionTab) -> Option<&str> {
     match tab {
         WorkspaceSessionTab::SftpTransfer { machine_id, .. }
         | WorkspaceSessionTab::WorkspaceFile { machine_id, .. } => Some(machine_id),
-        WorkspaceSessionTab::Terminal { .. } | WorkspaceSessionTab::Unsupported { .. } => None,
+        WorkspaceSessionTab::Terminal { .. }
+        | WorkspaceSessionTab::Extension { .. }
+        | WorkspaceSessionTab::Unsupported { .. } => None,
     }
 }
 
-/// 识别文件标签中的临时外部启动身份；该 opaque ID 不保证采用 external HostId 前缀。
+/// 文件宿主按明确 target 判断 external，运行态 transient IDs 另由 owner 标记，不能靠 machine 文案猜测。
+/// @author kongweiguang
 fn tab_has_external_target(tab: &WorkspaceSessionTab) -> bool {
     match tab {
         WorkspaceSessionTab::Terminal { machine_id, .. } => machine_id.starts_with("external:"),
         WorkspaceSessionTab::Unsupported { raw, .. } => raw_contains_external_host_reference(raw),
+        WorkspaceSessionTab::Extension { state, .. } => raw_contains_external_host_reference(state),
         WorkspaceSessionTab::SftpTransfer {
             left_host_id,
             locked_left_host_id,

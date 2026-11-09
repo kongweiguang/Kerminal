@@ -88,6 +88,16 @@ impl PreferencesPanel {
         if self.has_leave_confirmation() {
             return;
         }
+        use crate::plugins::external_settings::ExternalSettingsCloseState;
+        let external_state = self.external_close_state(cx);
+        if !matches!(
+            external_state,
+            ExternalSettingsCloseState::Ready | ExternalSettingsCloseState::UnsavedChanges
+        ) {
+            self.status = Some("插件设置正在操作或需要重新读取，暂时不能离开。".into());
+            cx.notify();
+            return;
+        }
         self.cancel_profile_scan();
         self.cancel_shortcut_capture(cx);
         self.screen_color_sampling.cancel();
@@ -100,7 +110,8 @@ impl PreferencesPanel {
         match close_gate_action(
             CloseRequest::CloseNow,
             profile_close,
-            self.keyword_editor.has_unsaved_drafts(),
+            self.keyword_editor.has_unsaved_drafts()
+                || external_state == ExternalSettingsCloseState::UnsavedChanges,
         ) {
             CloseGateAction::Wait => {
                 let outcome_unknown = self
@@ -131,7 +142,7 @@ impl PreferencesPanel {
                     self.schedule_leave_confirmation_focus(LeaveConfirmation::Close, cx);
                 }
             }
-            CloseGateAction::Proceed => self.emit_leave_event(cx),
+            CloseGateAction::Proceed => self.close_external_pages(false, false, cx),
         }
         cx.notify();
     }
@@ -151,7 +162,7 @@ impl PreferencesPanel {
     /// 离开时释放窗口按键拦截并通知 Root；已提交 CAS 不受影响。
     ///
     /// @author kongweiguang
-    fn emit_leave_event(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn emit_leave_event(&mut self, cx: &mut Context<Self>) {
         self.cancel_shortcut_capture(cx);
         self.discard_pending_keyword_rule();
         cx.emit(PreferencesEvent::CloseRequested);
@@ -204,13 +215,25 @@ impl PreferencesPanel {
             }
         }
         self.restore_form_inputs(window, cx);
-        self.emit_leave_event(cx);
+        self.close_external_pages(true, false, cx);
     }
 
     /// 退出前请求取消扫描并等待实际回执，结果未知时仍需先核对目录。
     ///
     /// @author kongweiguang
     pub fn request_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        use crate::plugins::external_settings::ExternalSettingsCloseState;
+        let external_state = self.external_close_state(cx);
+        if !matches!(
+            external_state,
+            ExternalSettingsCloseState::Ready | ExternalSettingsCloseState::UnsavedChanges
+        ) {
+            let message = "插件设置正在操作或需要重新读取，暂时不能退出。".to_string();
+            self.status = Some(message.clone());
+            cx.emit(PreferencesEvent::QuitDeferred { message });
+            cx.notify();
+            return false;
+        }
         self.cancel_profile_scan();
         self.cancel_shortcut_capture(cx);
         self.screen_color_sampling.cancel();
@@ -296,6 +319,7 @@ impl PreferencesPanel {
             || profile_close == CloseRequest::ConfirmDiscard
             || self.has_unadded_inputs()
             || self.keyword_editor.has_unsaved_drafts()
+            || external_state == ExternalSettingsCloseState::UnsavedChanges
         {
             if !self.quit_confirmation {
                 self.quit_confirmation = true;
@@ -303,6 +327,10 @@ impl PreferencesPanel {
             }
             cx.emit(PreferencesEvent::QuitConfirmationRequested);
             cx.notify();
+            return false;
+        }
+        if !self.external_plugins.pages.mounted_plugins().is_empty() {
+            self.close_external_pages(false, true, cx);
             return false;
         }
         true
@@ -329,7 +357,7 @@ impl PreferencesPanel {
         cx.emit(PreferencesEvent::LeaveConfirmationChanged);
         self.discard_settings_and_profile_drafts();
         self.restore_form_inputs(window, cx);
-        cx.emit(PreferencesEvent::QuitConfirmed);
+        self.close_external_pages(true, true, cx);
         cx.notify();
     }
 

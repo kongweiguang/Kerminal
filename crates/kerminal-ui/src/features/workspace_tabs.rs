@@ -46,6 +46,7 @@ pub enum WorkspaceTabKind {
     SftpTransfer,
     SftpWorkbench,
     WorkspaceFile,
+    Extension(SharedString),
     Unsupported(SharedString),
 }
 

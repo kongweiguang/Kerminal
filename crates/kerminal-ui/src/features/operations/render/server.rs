@@ -309,6 +309,7 @@ impl OperationsView {
     }
 
     /// 概览先展示六项趋势，再用系统卡补齐内核、主机身份与根分区摘要。
+    /// 稳定 ID 供原生验收等待真实内容后截图，避免把读取空态当作内容基线。
     ///
     /// @author kongweiguang
     fn render_server_overview(
@@ -317,6 +318,8 @@ impl OperationsView {
         theme: ThemeTokens,
     ) -> impl IntoElement {
         div()
+            .id("operations-server-overview-content")
+            .debug_selector(|| "operations-server-overview-content".to_owned())
             .w_full()
             .flex()
             .flex_col()
@@ -1060,7 +1063,7 @@ impl OperationsView {
             .overflow_hidden()
             .border_1()
             .border_color(theme.tool_panel_border)
-            .bg(theme.panel)
+            .bg(theme.content_surface())
             .child(server_metric_pair(cpu, memory, theme, false))
             .child(server_metric_pair(receive, transmit, theme, false))
             .child(server_metric_pair(disk, gpu, theme, true));
@@ -1193,7 +1196,7 @@ fn server_system_details(
         .rounded(theme.radius)
         .border_1()
         .border_color(theme.tool_panel_border)
-        .bg(theme.panel)
+        .bg(theme.content_surface())
         .child(
             div()
                 .w_full()
@@ -1332,7 +1335,7 @@ fn server_resource_card(
         .rounded(theme.radius)
         .border_1()
         .border_color(theme.tool_panel_border)
-        .bg(theme.panel)
+        .bg(theme.content_surface())
         .child(
             div()
                 .w_full()
@@ -1731,12 +1734,12 @@ fn server_sampling_color(
     }
 }
 
-/// 服务器页已有完整专属页头，复用公共页面的材质与窄栏摊平规则但省去重复标题。
+/// 服务器页只负责页面几何和窄栏摊平，阅读底色由内部卡片绘制，避免外壳再次叠色。
 ///
 /// @author kongweiguang
 fn server_section_page(
     content: impl IntoElement,
-    theme: ThemeTokens,
+    _theme: ThemeTokens,
     compact: bool,
     fixed: bool,
 ) -> impl IntoElement {
@@ -1746,8 +1749,7 @@ fn server_section_page(
         page = page
             .when(compact, |page| page.gap_1().p_2())
             .when(!compact, |page| page.p_3())
-            .rounded_md()
-            .bg(theme.panel);
+            .rounded_md();
     }
     page.child(content)
 }

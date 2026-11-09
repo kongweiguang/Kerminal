@@ -12,12 +12,38 @@ use crate::{
     root::preferences::{
         InterfaceDensityMetrics, RuntimePreferences, app_palette_only_update,
         background_settings_from_snapshot, interaction_policy_from_snapshot,
-        interface_density_metrics_from_snapshot,
+        interface_density_metrics_from_snapshot, workbench_layout_only_update,
     },
     terminal_background::TerminalBackgroundSettings,
     terminal_interaction::TerminalInteractionPolicy,
     theme::BackgroundMaterialSettings,
 };
+
+/// 折叠和拖动共用布局保存，快照回传不能重新配置终端或把右栏当成新目标。
+///
+/// @author kongweiguang
+#[test]
+fn workbench_layout_changes_and_save_echoes_do_not_reapply_runtime_settings() {
+    use kerminal_application::preferences::ToolRailToolId;
+
+    let baseline = SettingsSnapshot::default();
+    assert!(!workbench_layout_only_update(None, &baseline));
+    assert!(workbench_layout_only_update(Some(&baseline), &baseline));
+    let mut next = baseline.clone();
+    next.workbench_layout.host_sidebar_collapsed = true;
+    next.workbench_layout.host_sidebar_width = 260;
+    next.workbench_layout.bottom_panel_height = 300;
+    next.workbench_layout
+        .dock_panel_widths
+        .insert(ToolRailToolId::Sftp, 400);
+    assert!(workbench_layout_only_update(Some(&baseline), &next));
+
+    next.terminal.font_size += 1;
+    assert!(!workbench_layout_only_update(Some(&baseline), &next));
+    next.terminal = baseline.terminal.clone();
+    next.tool_rail.hidden.push(ToolRailToolId::Sftp);
+    assert!(!workbench_layout_only_update(Some(&baseline), &next));
+}
 
 /// 真实设置入口据此跳过终端副作用；独立配色和确认保存的回声均不能让终端失效。
 ///

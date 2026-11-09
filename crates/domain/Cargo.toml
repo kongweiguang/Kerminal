@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+semver.workspace = true
 serde.workspace = true
 uuid.workspace = true
 

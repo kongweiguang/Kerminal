@@ -6,13 +6,12 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 use super::super::CenterPanel;
 use super::{
-    center_preserves_terminal_file_context, center_route_uses_tool_rail_entity,
-    center_tool_panel_close_is_current, center_tool_panel_escape_target,
-    center_tool_panel_focus_on_open, center_tool_placement_focus_is_current,
-    compact_drawer_close_is_current, compact_drawer_escape_is_current, contains_tool,
-    docked_tool_panel_escape_target, expanded_center_tool_panel, local_files_endpoint,
-    ssh_files_endpoint, tool_rail_panel_is_active, tool_rail_panel_is_visible,
-    ui_binding_matches_pane,
+    center_preserves_terminal_file_context, center_tool_panel_close_is_current,
+    center_tool_panel_escape_target, center_tool_panel_focus_on_open,
+    center_tool_placement_focus_is_current, compact_drawer_close_is_current,
+    compact_drawer_escape_is_current, contains_tool, docked_tool_panel_escape_target,
+    expanded_center_tool_panel, local_files_endpoint, ssh_files_endpoint,
+    tool_rail_panel_is_visible, ui_binding_matches_pane,
 };
 use crate::root::{
     keybinding_focus::classify_focus_scope,
@@ -913,38 +912,6 @@ fn center_and_compact_drawers_have_mutually_exclusive_focus_hosts() {
     assert!(saw_expanded && saw_compact);
 }
 
-/// 中心内容仅在可见 ToolRail 实际复用同一业务 Entity 时让出唯一宿主。
-///
-/// @author kongweiguang
-#[test]
-fn center_route_yields_only_to_visible_shared_tool_entity() {
-    assert!(center_route_uses_tool_rail_entity(
-        CenterPanel::Commands,
-        true,
-        true,
-    ));
-    assert!(!center_route_uses_tool_rail_entity(
-        CenterPanel::Commands,
-        true,
-        false,
-    ));
-    assert!(center_route_uses_tool_rail_entity(
-        CenterPanel::Files,
-        true,
-        true,
-    ));
-    assert!(!center_route_uses_tool_rail_entity(
-        CenterPanel::Files,
-        false,
-        true,
-    ));
-    assert!(!center_route_uses_tool_rail_entity(
-        CenterPanel::Terminal,
-        true,
-        true,
-    ));
-}
-
 /// 中央编辑器切换不释放其来源 terminal pane；其余中心内容不凭旧焦点延续文件目标。
 ///
 /// @author kongweiguang
@@ -1014,33 +981,26 @@ fn activity_tracks_the_actual_unique_panel_slot() {
     ));
 }
 
-/// 窗口失焦时所有宿主暂停采样，恢复聚焦后仅激活真实挂载的工具。
+/// 窗口失焦或工具未挂载时，实际插件投影不得将工具标记为活动。
 ///
 /// @author kongweiguang
 #[test]
 fn activity_requires_window_focus_and_a_visible_host() {
-    let panels = ToolRailPanelSlots {
-        bottom: Some(ToolRailToolId::System),
-        ..ToolRailPanelSlots::default()
+    use crate::plugins::tools::{PluginTools, ToolContext, ToolProjection};
+
+    let mut tools = PluginTools::default();
+    let mut projection = ToolProjection {
+        context: ToolContext::default(),
+        visible: vec![ToolRailToolId::System],
+        window_active: false,
     };
-    assert!(!tool_rail_panel_is_active(
-        panels,
-        false,
-        false,
-        ToolRailToolId::System,
-    ));
-    assert!(tool_rail_panel_is_active(
-        panels,
-        false,
-        true,
-        ToolRailToolId::System,
-    ));
-    assert!(!tool_rail_panel_is_active(
-        panels,
-        false,
-        true,
-        ToolRailToolId::Ports,
-    ));
+    tools.stage_projection(projection.clone());
+    assert!(!tools.projected_tool_active(ToolRailToolId::System));
+
+    projection.window_active = true;
+    tools.stage_projection(projection);
+    assert!(tools.projected_tool_active(ToolRailToolId::System));
+    assert!(!tools.projected_tool_active(ToolRailToolId::Ports));
 }
 
 /// 活动 UI-owned SSH 目标按当前目录优先生成远端 endpoint，目标不一致时拒绝绑定。
