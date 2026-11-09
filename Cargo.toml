@@ -10,6 +10,7 @@ members = [
     "crates/kerminal-mcp",
     "crates/kerminal-desktop",
     "xtask",
+    "sdk/protocol",
 ]
 exclude = [
     "vendor/alacritty_terminal",
@@ -32,6 +33,9 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/kongweiguang/Kerminal.git"
 
 [workspace.dependencies]
+kerminal-plugin-protocol = { path = "sdk/protocol", version = "1.0.0" }
+schemars = "=1.2.3"
+jsonschema = { version = "=0.37.4", default-features = false }
 kerminal-domain = { path = "crates/domain", version = "0.4.0-beta.5" }
 kerminal-application = { path = "crates/application", version = "0.4.0-beta.5" }
 kerminal-terminal = { path = "crates/terminal", version = "0.4.0-beta.5" }

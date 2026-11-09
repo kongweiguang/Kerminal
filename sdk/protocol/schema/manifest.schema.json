@@ -1,0 +1,1013 @@
+{
+  "$defs": {
+    "Activation": {
+      "enum": [
+        "on-demand",
+        "startup"
+      ],
+      "type": "string"
+    },
+    "CommandContribution": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "id": {
+          "maxLength": 63,
+          "minLength": 1,
+          "not": {
+            "pattern": "[^A-Za-z0-9._-]"
+          },
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "keybinding": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "not": {
+                "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+              },
+              "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title"
+      ],
+      "type": "object"
+    },
+    "Contributions": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "commands": {
+          "items": {
+            "$ref": "#/$defs/CommandContribution"
+          },
+          "type": "array"
+        },
+        "host_types": {
+          "items": {
+            "$ref": "#/$defs/HostTypeContribution"
+          },
+          "type": "array"
+        },
+        "settings": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SettingsContribution"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tabs": {
+          "items": {
+            "$ref": "#/$defs/TabContribution"
+          },
+          "type": "array"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ToolContribution"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "HostTypeContribution": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "id": {
+          "maxLength": 63,
+          "minLength": 1,
+          "not": {
+            "pattern": "[^A-Za-z0-9._-]"
+          },
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "schema": {
+          "allOf": [
+            {
+              "not": {
+                "pattern": "(^/|/$|//)"
+              }
+            },
+            {
+              "not": {
+                "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+              }
+            },
+            {
+              "not": {
+                "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+              }
+            },
+            {
+              "not": {
+                "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+              }
+            }
+          ],
+          "minLength": 1,
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+          "type": "string"
+        },
+        "view": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "schema"
+      ],
+      "type": "object"
+    },
+    "Permission": {
+      "anyOf": [
+        {
+          "enum": [
+            "ui.notify",
+            "ui.dialog",
+            "ui.file-picker",
+            "clipboard.read",
+            "clipboard.write",
+            "open-external",
+            "hosts.read",
+            "terminal.write",
+            "events.subscribe",
+            "secrets",
+            "full-access"
+          ]
+        },
+        {
+          "maxLength": 261,
+          "not": {
+            "pattern": "[^A-Za-z0-9:.-]"
+          },
+          "pattern": "^network:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+        },
+        {
+          "maxLength": 263,
+          "not": {
+            "pattern": "[^A-Za-z0-9:.*-]"
+          },
+          "pattern": "^network:\\*\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+        }
+      ],
+      "type": "string"
+    },
+    "PluginRuntime": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "kind": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "activation": {
+              "$ref": "#/$defs/Activation",
+              "default": "on-demand"
+            },
+            "kind": {
+              "const": "script",
+              "type": "string"
+            },
+            "main": {
+              "allOf": [
+                {
+                  "not": {
+                    "pattern": "(^/|/$|//)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                  }
+                }
+              ],
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "main"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "activation": {
+              "$ref": "#/$defs/Activation",
+              "default": "on-demand"
+            },
+            "kind": {
+              "const": "sidecar",
+              "type": "string"
+            },
+            "main": {
+              "additionalProperties": false,
+              "minProperties": 1,
+              "properties": {
+                "linux-aarch64": {
+                  "allOf": [
+                    {
+                      "not": {
+                        "pattern": "(^/|/$|//)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                      }
+                    }
+                  ],
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "linux-x86_64": {
+                  "allOf": [
+                    {
+                      "not": {
+                        "pattern": "(^/|/$|//)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                      }
+                    }
+                  ],
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "macos-aarch64": {
+                  "allOf": [
+                    {
+                      "not": {
+                        "pattern": "(^/|/$|//)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                      }
+                    }
+                  ],
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "macos-x86_64": {
+                  "allOf": [
+                    {
+                      "not": {
+                        "pattern": "(^/|/$|//)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                      }
+                    }
+                  ],
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "windows-aarch64": {
+                  "allOf": [
+                    {
+                      "not": {
+                        "pattern": "(^/|/$|//)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                      }
+                    }
+                  ],
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "windows-x86_64": {
+                  "allOf": [
+                    {
+                      "not": {
+                        "pattern": "(^/|/$|//)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                      }
+                    }
+                  ],
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "main"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SettingsContribution": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "schema": {
+          "allOf": [
+            {
+              "not": {
+                "pattern": "(^/|/$|//)"
+              }
+            },
+            {
+              "not": {
+                "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+              }
+            },
+            {
+              "not": {
+                "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+              }
+            },
+            {
+              "not": {
+                "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+              }
+            }
+          ],
+          "minLength": 1,
+          "type": "string"
+        },
+        "view": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "schema"
+      ],
+      "type": "object"
+    },
+    "TabContribution": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "id": {
+          "maxLength": 63,
+          "minLength": 1,
+          "not": {
+            "pattern": "[^A-Za-z0-9._-]"
+          },
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "state_version": {
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+          "type": "string"
+        },
+        "view": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "view",
+        "state_version"
+      ],
+      "type": "object"
+    },
+    "ToolContribution": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "icon": {
+          "anyOf": [
+            {
+              "allOf": [
+                {
+                  "not": {
+                    "pattern": "(^/|/$|//)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                  }
+                }
+              ],
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "maxLength": 63,
+          "minLength": 1,
+          "not": {
+            "pattern": "[^A-Za-z0-9._-]"
+          },
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/ToolScope"
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+          "type": "string"
+        },
+        "view": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "view",
+        "scope"
+      ],
+      "type": "object"
+    },
+    "ToolScope": {
+      "enum": [
+        "window",
+        "tab"
+      ],
+      "type": "string"
+    },
+    "ViewDefinition": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "file": {
+              "allOf": [
+                {
+                  "not": {
+                    "pattern": "(^/|/$|//)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                  }
+                }
+              ],
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "native",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "file"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "csp": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+                  },
+                  "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "entry": {
+              "allOf": [
+                {
+                  "not": {
+                    "pattern": "(^/|/$|//)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                  }
+                }
+              ],
+              "minLength": 1,
+              "type": "string"
+            },
+            "kind": {
+              "const": "webview",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "entry"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "runtime": {
+            "properties": {
+              "activation": {
+                "const": "startup"
+              },
+              "kind": {
+                "const": "script"
+              }
+            },
+            "required": [
+              "kind",
+              "activation"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "permissions": {
+            "contains": {
+              "const": "events.subscribe"
+            }
+          }
+        },
+        "required": [
+          "permissions"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "permissions": {
+            "contains": {
+              "const": "full-access"
+            }
+          }
+        },
+        "required": [
+          "permissions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "runtime": {
+            "properties": {
+              "kind": {
+                "const": "sidecar"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "patternProperties": {
+    "^x-[\\s\\S]+": {}
+  },
+  "properties": {
+    "api": {
+      "maxLength": 256,
+      "type": "string"
+    },
+    "categories": {
+      "items": {
+        "maxLength": 128,
+        "minLength": 1,
+        "not": {
+          "pattern": "[^A-Za-z0-9._-]"
+        },
+        "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "contributes": {
+      "$ref": "#/$defs/Contributions",
+      "default": {}
+    },
+    "description": {
+      "additionalProperties": {
+        "maxLength": 4096,
+        "minLength": 1,
+        "not": {
+          "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+        },
+        "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+        "type": "string"
+      },
+      "maxProperties": 128,
+      "propertyNames": {
+        "maxLength": 64,
+        "minLength": 1,
+        "not": {
+          "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+        },
+        "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+        "type": "string"
+      },
+      "required": [
+        "en"
+      ],
+      "type": "object"
+    },
+    "icon": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "not": {
+                "pattern": "(^/|/$|//)"
+              }
+            },
+            {
+              "not": {
+                "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+              }
+            },
+            {
+              "not": {
+                "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+              }
+            },
+            {
+              "not": {
+                "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+              }
+            }
+          ],
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "id": {
+      "not": {
+        "pattern": "[^a-z0-9.-]"
+      },
+      "pattern": "^[a-z0-9][a-z0-9-]{1,38}\\.[a-z0-9][a-z0-9-]{1,62}$",
+      "type": "string"
+    },
+    "l10n": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "not": {
+                "pattern": "(^/|/$|//)"
+              }
+            },
+            {
+              "not": {
+                "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+              }
+            },
+            {
+              "not": {
+                "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+              }
+            },
+            {
+              "not": {
+                "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+              }
+            }
+          ],
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "license": {
+      "anyOf": [
+        {
+          "maxLength": 256,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "name": {
+      "additionalProperties": {
+        "maxLength": 4096,
+        "minLength": 1,
+        "not": {
+          "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+        },
+        "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+        "type": "string"
+      },
+      "maxProperties": 128,
+      "propertyNames": {
+        "maxLength": 64,
+        "minLength": 1,
+        "not": {
+          "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+        },
+        "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+        "type": "string"
+      },
+      "required": [
+        "en"
+      ],
+      "type": "object"
+    },
+    "permissions": {
+      "items": {
+        "$ref": "#/$defs/Permission"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "publisher": {
+      "not": {
+        "pattern": "[^a-z0-9-]"
+      },
+      "pattern": "^[a-z0-9][a-z0-9-]{1,38}$",
+      "type": "string"
+    },
+    "repository": {
+      "anyOf": [
+        {
+          "maxLength": 2048,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "^https://",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "runtime": {
+      "$ref": "#/$defs/PluginRuntime"
+    },
+    "schema": {
+      "const": 1,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    },
+    "views": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ViewDefinition"
+      },
+      "default": {},
+      "propertyNames": {
+        "maxLength": 128,
+        "minLength": 1,
+        "not": {
+          "pattern": "[^A-Za-z0-9._-]"
+        },
+        "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+        "type": "string"
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "id",
+    "name",
+    "description",
+    "version",
+    "api",
+    "publisher",
+    "runtime"
+  ],
+  "title": "PluginManifest",
+  "type": "object"
+}

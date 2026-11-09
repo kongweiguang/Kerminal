@@ -1,0 +1,56 @@
+/* @author kongweiguang */
+
+html {
+  color-scheme: light dark;
+  background: var(--k-bg, Canvas);
+  color: var(--k-fg, CanvasText);
+  font: var(--k-font, 1rem system-ui, sans-serif);
+}
+
+body {
+  margin: 0;
+}
+
+a {
+  color: var(--k-accent, LinkText);
+}
+
+button,
+input,
+select,
+textarea {
+  color: inherit;
+  font: inherit;
+  accent-color: var(--k-accent, AccentColor);
+}
+
+button,
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+  background: var(--k-surface, Field);
+  border: 1px solid var(--k-border, GrayText);
+  border-radius: var(--k-radius, 0.375rem);
+  padding: 0.375rem 0.625rem;
+}
+
+button {
+  background: var(--k-button, ButtonFace);
+  color: var(--k-button-fg, ButtonText);
+}
+
+button:not(:disabled):hover {
+  background: var(--k-hover, ButtonFace);
+}
+
+button:disabled,
+input:disabled,
+select:disabled,
+textarea:disabled {
+  color: var(--k-disabled-fg, GrayText);
+}
+
+:focus-visible {
+  outline: 2px solid var(--k-focus, Highlight);
+  outline-offset: 2px;
+}

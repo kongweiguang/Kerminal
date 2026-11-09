@@ -26,6 +26,13 @@ const EXPECTED_WORKSPACE_PACKAGES: [&str; 8] = [
     "xtask",
 ];
 
+const SDK_WORKSPACE_PACKAGES: &[&str] = &[
+    "kerminal-plugin-protocol",
+    "kerminal-plugin-host",
+    "kerminal-plugin-sdk",
+    "kerminal-plugin-cli",
+];
+
 const UI_FORBIDDEN_RESOURCE_DEPENDENCIES: &[&str] = &[
     "arboard",
     "axum",
@@ -174,7 +181,7 @@ fn validate_packages(root: &Path, packages: &BTreeMap<String, Value>) -> Vec<Str
     violations
 }
 
-/// 比较完整包名集合而非逐项检查，新增的未分层 crate 也必须经过架构评审。
+/// 产品集合保持固定；SDK 按阶段加入，但只能使用已评审的独立工具包名。
 fn validate_workspace_package_set(names: &BTreeSet<String>, violations: &mut Vec<String>) {
     let expected = EXPECTED_WORKSPACE_PACKAGES
         .iter()
@@ -184,7 +191,9 @@ fn validate_workspace_package_set(names: &BTreeSet<String>, violations: &mut Vec
         violations.push(format!("missing workspace package: {missing}"));
     }
     for unexpected in names.difference(&expected) {
-        violations.push(format!("unexpected workspace package: {unexpected}"));
+        if !SDK_WORKSPACE_PACKAGES.contains(&unexpected.as_str()) {
+            violations.push(format!("unexpected workspace package: {unexpected}"));
+        }
     }
 }
 
@@ -247,7 +256,7 @@ fn is_pinned_legacy_workspace_decoder(root: &Path, candidate: &Path) -> bool {
         && runner.contains("& $nodeExe $nodeTest")
 }
 
-/// 按文件名和源码扩展名识别前端构建入口，不扫描文件内容中的普通文本。
+/// 旧 Web 前端仍禁止回流；独立 SDK 的脚本与网页属于进程外插件资源。
 fn collect_legacy_web_inputs(directory: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
     const EXCLUDED_DIRECTORIES: &[&str] = &[
         ".agents",
@@ -272,6 +281,7 @@ fn collect_legacy_web_inputs(directory: &Path, found: &mut Vec<PathBuf>) -> std:
         "third_party",
         "thirdparty",
         "vendor",
+        "sdk",
     ];
 
     for entry in fs::read_dir(directory)? {
@@ -664,8 +674,26 @@ fn is_explicit_composition_root_dependency_allowed(package: &str, dependency: &s
     COMPOSITION_ROOT_ALLOWED_DEPENDENCIES.contains(&(package, dependency))
 }
 
-/// 按 DDD 层次限制内部依赖，并把 UI 资源访问留在 application 端口之后。
+/// SDK 与产品只共享协议契约，防止工具实现反向耦合宿主服务或 UI。
+/// 原有 DDD 边界继续覆盖产品依赖，SDK 不能通过改名绕过产品包名检查。
 fn validate_internal_edges(name: &str, deps: &BTreeSet<String>, violations: &mut Vec<String>) {
+    if SDK_WORKSPACE_PACKAGES.contains(&name) {
+        for dependency in EXPECTED_WORKSPACE_PACKAGES {
+            if deps.contains(dependency) {
+                violations.push(format!(
+                    "{name} must not depend on product package {dependency}"
+                ));
+            }
+        }
+    } else {
+        for dependency in SDK_WORKSPACE_PACKAGES {
+            if *dependency != "kerminal-plugin-protocol" && deps.contains(*dependency) {
+                violations.push(format!(
+                    "{name} may only depend on sdk/protocol, not {dependency}"
+                ));
+            }
+        }
+    }
     let forbidden = match name {
         "kerminal-domain" => &[
             "kerminal-application",

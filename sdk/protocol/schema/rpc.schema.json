@@ -1,0 +1,589 @@
+{
+  "$defs": {
+    "CancelParams": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "CommandContext": {
+      "additionalProperties": false,
+      "properties": {
+        "host": true,
+        "tab": true
+      },
+      "type": "object"
+    },
+    "CommandRunParams": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "context": {
+          "$ref": "#/$defs/CommandContext"
+        }
+      },
+      "required": [
+        "command",
+        "context"
+      ],
+      "type": "object"
+    },
+    "EventParams": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "payload": true
+      },
+      "required": [
+        "name",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "HostOpenResult": {
+      "additionalProperties": false,
+      "properties": {
+        "state": true,
+        "tab": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab",
+        "state"
+      ],
+      "type": "object"
+    },
+    "HostOperationParams": {
+      "additionalProperties": false,
+      "properties": {
+        "config": true,
+        "host_type": {
+          "type": "string"
+        },
+        "secrets": true
+      },
+      "required": [
+        "host_type",
+        "config",
+        "secrets"
+      ],
+      "type": "object"
+    },
+    "HostTestResult": {
+      "additionalProperties": false,
+      "properties": {
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "type": "object"
+    },
+    "InitializeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "data_dir": {
+          "type": "string"
+        },
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "host_api": {
+          "type": "string"
+        },
+        "locale": {
+          "type": "string"
+        },
+        "plugin": {
+          "$ref": "#/$defs/PluginIdentity"
+        },
+        "protocol": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "theme": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol",
+        "host_api",
+        "plugin",
+        "locale",
+        "theme",
+        "data_dir",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "InitializeResult": {
+      "additionalProperties": false,
+      "properties": {
+        "plugin": {
+          "$ref": "#/$defs/PluginIdentity"
+        },
+        "protocol": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocol",
+        "plugin"
+      ],
+      "type": "object"
+    },
+    "PluginIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "type": "object"
+    },
+    "ProgressParams": {
+      "additionalProperties": false,
+      "properties": {
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "percent": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "token"
+      ],
+      "type": "object"
+    },
+    "RpcError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "data": true,
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "RpcNotification": {
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0",
+          "type": "string"
+        },
+        "method": {
+          "maxLength": 128,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "type": "string"
+        },
+        "params": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "items": true,
+              "type": "array"
+            }
+          ]
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method"
+      ],
+      "type": "object"
+    },
+    "RpcRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 3,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "^(?:h:|p:)",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0",
+          "type": "string"
+        },
+        "method": {
+          "maxLength": 128,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "type": "string"
+        },
+        "params": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "items": true,
+              "type": "array"
+            }
+          ]
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ],
+      "type": "object"
+    },
+    "RpcResponse": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "not": {
+            "required": [
+              "error"
+            ]
+          },
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "result"
+          ]
+        },
+        {
+          "not": {
+            "required": [
+              "result"
+            ]
+          },
+          "required": [
+            "error"
+          ]
+        }
+      ],
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 3,
+              "not": {
+                "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+              },
+              "pattern": "^(?:h:|p:)",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "jsonrpc": {
+          "const": "2.0",
+          "type": "string"
+        },
+        "result": true
+      },
+      "required": [
+        "jsonrpc",
+        "id"
+      ],
+      "type": "object"
+    },
+    "ViewActionParams": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "data": true,
+        "instance": {
+          "type": "string"
+        },
+        "item_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "view": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "instance",
+        "action",
+        "data"
+      ],
+      "type": "object"
+    },
+    "ViewActionResult": {
+      "additionalProperties": false,
+      "properties": {
+        "patch": true,
+        "toast": true
+      },
+      "type": "object"
+    },
+    "ViewFetchParams": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "type": "string"
+        },
+        "node": {
+          "type": "string"
+        },
+        "parent_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "range": {
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "sort": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ViewFetchSort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "view": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "instance",
+        "node",
+        "range"
+      ],
+      "type": "object"
+    },
+    "ViewFetchResult": {
+      "additionalProperties": false,
+      "properties": {
+        "rows": {
+          "items": true,
+          "type": "array"
+        },
+        "total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "ViewFetchSort": {
+      "additionalProperties": false,
+      "description": "表格排序只传递列键和方向，宿主与插件使用同一份线协议类型。",
+      "properties": {
+        "column": {
+          "type": "string"
+        },
+        "direction": {
+          "$ref": "#/$defs/ViewSortDirection"
+        }
+      },
+      "required": [
+        "column",
+        "direction"
+      ],
+      "type": "object"
+    },
+    "ViewInstanceParams": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "instance"
+      ],
+      "type": "object"
+    },
+    "ViewOpenParams": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "type": "string"
+        },
+        "scope": true,
+        "state": true,
+        "view": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "view",
+        "instance",
+        "scope"
+      ],
+      "type": "object"
+    },
+    "ViewOpenResult": {
+      "additionalProperties": false,
+      "properties": {
+        "data": true
+      },
+      "type": "object"
+    },
+    "ViewSortDirection": {
+      "description": "明确方向枚举，避免宿主与插件对不同字符串作出不一致的解释。",
+      "enum": [
+        "asc",
+        "desc"
+      ],
+      "type": "string"
+    },
+    "ViewStateResult": {
+      "additionalProperties": false,
+      "properties": {
+        "state": true,
+        "state_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ViewUpdateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "type": "string"
+        },
+        "patch": true
+      },
+      "required": [
+        "instance",
+        "patch"
+      ],
+      "type": "object"
+    },
+    "ViewVisibilityParams": {
+      "additionalProperties": false,
+      "properties": {
+        "focused": {
+          "type": "boolean"
+        },
+        "instance": {
+          "type": "string"
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "instance",
+        "visible",
+        "focused"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/RpcRequest"
+    },
+    {
+      "$ref": "#/$defs/RpcNotification"
+    },
+    {
+      "$ref": "#/$defs/RpcResponse"
+    }
+  ],
+  "title": "RpcMessage"
+}

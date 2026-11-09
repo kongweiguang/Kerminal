@@ -1,0 +1,2440 @@
+{
+  "$defs": {
+    "ButtonVariant": {
+      "enum": [
+        "primary",
+        "secondary",
+        "ghost",
+        "danger"
+      ],
+      "type": "string"
+    },
+    "CollectionSource": {
+      "enum": [
+        "rpc"
+      ],
+      "type": "string"
+    },
+    "EmptyState": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "icon": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    },
+    "Gap": {
+      "enum": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "type": "string"
+    },
+    "MenuItem": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "action": {
+          "maxLength": 128,
+          "minLength": 1,
+          "not": {
+            "pattern": "[^A-Za-z0-9._-]"
+          },
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "danger": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "label": {
+          "maxLength": 512,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "action"
+      ],
+      "type": "object"
+    },
+    "NativeNode": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "children": {
+              "items": {
+                "$ref": "#/$defs/NativeNode"
+              },
+              "type": "array"
+            },
+            "gap": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Gap"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "stack",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "children"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "children": {
+              "items": {
+                "$ref": "#/$defs/NativeNode"
+              },
+              "type": "array"
+            },
+            "gap": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Gap"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "row",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "children"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "children": {
+              "items": {
+                "$ref": "#/$defs/NativeNode"
+              },
+              "type": "array"
+            },
+            "gap": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Gap"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "const": "section",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "title",
+            "children"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "child": {
+              "$ref": "#/$defs/NativeNode"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "scroll",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "child"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "children": {
+              "items": {
+                "$ref": "#/$defs/NativeNode"
+              },
+              "minItems": 2,
+              "type": "array"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "split",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "children"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "tabs": {
+              "items": {
+                "$ref": "#/$defs/TabPane"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "tabs",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "tabs"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "tone": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Tone"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "markdown",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "tone": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Tone"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "badge",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "icon": {
+              "type": "string"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "icon",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "icon"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "language": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "code",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "code"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "progress",
+              "type": "string"
+            },
+            "value": true,
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "icon": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "const": "empty",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "title"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "tone": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Tone"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "notice",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "bind": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "on_submit": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "placeholder": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "input",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "bind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "bind": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "placeholder": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "textarea",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "bind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "bind": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "min": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "step": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "number",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "bind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "bind": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "options": {
+              "items": {
+                "$ref": "#/$defs/SelectOption"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "select",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "bind",
+            "options"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "bind": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "switch",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "bind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "bind": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "checkbox",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "bind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "bind": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PickerMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "path",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "bind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "bind": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "secret",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "bind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "anyOf": [
+                {
+                  "properties": {
+                    "label": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "label"
+                  ]
+                },
+                {
+                  "properties": {
+                    "icon": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "icon"
+                  ]
+                }
+              ]
+            }
+          ],
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "action": {
+              "maxLength": 128,
+              "minLength": 1,
+              "not": {
+                "pattern": "[^A-Za-z0-9._-]"
+              },
+              "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+              "type": "string"
+            },
+            "busy": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "icon": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "button",
+              "type": "string"
+            },
+            "variant": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ButtonVariant"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "children": {
+              "items": {
+                "$ref": "#/$defs/NativeNode"
+              },
+              "type": "array"
+            },
+            "gap": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Gap"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "toolbar",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "children"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "items": {
+              "items": {
+                "$ref": "#/$defs/MenuItem"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "menu",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "items"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "oneOf": [
+                {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "items": {
+                      "type": "null"
+                    },
+                    "source": {
+                      "const": "rpc"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "source"
+                  ]
+                },
+                {
+                  "properties": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "source": {
+                      "type": "null"
+                    }
+                  },
+                  "required": [
+                    "items"
+                  ]
+                }
+              ]
+            }
+          ],
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "empty": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/EmptyState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "items": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "key": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "menu": {
+              "items": {
+                "$ref": "#/$defs/MenuItem"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "on_activate": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CollectionSource"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "subtitle": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "type": {
+              "const": "list",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "key",
+            "title"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "oneOf": [
+                {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "items": {
+                      "type": "null"
+                    },
+                    "source": {
+                      "const": "rpc"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "source"
+                  ]
+                },
+                {
+                  "properties": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "source": {
+                      "type": "null"
+                    }
+                  },
+                  "required": [
+                    "items"
+                  ]
+                }
+              ]
+            }
+          ],
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "columns": {
+              "items": {
+                "$ref": "#/$defs/TableColumn"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "empty": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/EmptyState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "items": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "key": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "menu": {
+              "items": {
+                "$ref": "#/$defs/MenuItem"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "on_activate": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CollectionSource"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "table",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "key",
+            "columns"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "oneOf": [
+                {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "items": {
+                      "type": "null"
+                    },
+                    "source": {
+                      "const": "rpc"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "source"
+                  ]
+                },
+                {
+                  "properties": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "source": {
+                      "type": "null"
+                    }
+                  },
+                  "required": [
+                    "items"
+                  ]
+                }
+              ]
+            }
+          ],
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "empty": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/EmptyState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "items": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "key": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "menu": {
+              "items": {
+                "$ref": "#/$defs/MenuItem"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "on_activate": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CollectionSource"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": {
+              "maxLength": 256,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.-]"
+              },
+              "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "type": {
+              "const": "tree",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "key",
+            "title"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
+            "bind": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.-]"
+                  },
+                  "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "schema": {
+              "allOf": [
+                {
+                  "not": {
+                    "pattern": "(^/|/$|//)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                  }
+                }
+              ],
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "form",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "schema"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "visible": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PickerMode": {
+      "enum": [
+        "open",
+        "save"
+      ],
+      "type": "string"
+    },
+    "SelectOption": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "label": {
+          "maxLength": 512,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+          "type": "string"
+        },
+        "value": true
+      },
+      "required": [
+        "label",
+        "value"
+      ],
+      "type": "object"
+    },
+    "TabPane": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/NativeNode"
+        },
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "not": {
+            "pattern": "[^A-Za-z0-9._-]"
+          },
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "content"
+      ],
+      "type": "object"
+    },
+    "TableColumn": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^x-[\\s\\S]+": {}
+      },
+      "properties": {
+        "key": {
+          "maxLength": 256,
+          "not": {
+            "pattern": "[^A-Za-z0-9_.-]"
+          },
+          "pattern": "^[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+          "type": "string"
+        },
+        "sortable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+          },
+          "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "title"
+      ],
+      "type": "object"
+    },
+    "Tone": {
+      "enum": [
+        "default",
+        "muted",
+        "success",
+        "warning",
+        "danger"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "patternProperties": {
+    "^x-[\\s\\S]+": {}
+  },
+  "properties": {
+    "data": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "root": {
+      "$ref": "#/$defs/NativeNode"
+    },
+    "schema": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "root"
+  ],
+  "title": "NativeView",
+  "type": "object"
+}

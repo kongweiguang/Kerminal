@@ -1,0 +1,1 @@
+{"schema":1,"id":"acme.notes","name":{"en":"Notes"},"description":{"en":"Notes"},"version":"1.2.0","api":"^1.0","publisher":"acme","runtime":{"kind":"none"},"unknown":true,"contributes":{},"views":{}}

@@ -4,3 +4,6 @@
 # 冻结的配置指南与历史 fixture 按字节比较摘要，检出必须保持 LF。
 /crates/application/resources/config-guide.md text eol=lf
 /tests/fixtures/configuration/* text eol=lf
+# Schema 与 SDK 生成检查按字节比较，Windows 检出也保留生成器的 LF。
+/sdk/protocol/schema/*.json text eol=lf
+/sdk/ts/src/generated/*.ts text eol=lf

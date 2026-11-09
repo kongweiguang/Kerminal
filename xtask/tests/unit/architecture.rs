@@ -20,6 +20,39 @@ use super::{
 
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
+/// 插件进程与开发工具不得链接产品实现，宿主也只能消费独立协议。
+#[test]
+fn plugin_sdk_and_product_dependency_directions_remain_separate() {
+    for sdk in [
+        "kerminal-plugin-protocol",
+        "kerminal-plugin-host",
+        "kerminal-plugin-sdk",
+        "kerminal-plugin-cli",
+    ] {
+        let mut violations = Vec::new();
+        validate_internal_edges(
+            sdk,
+            &BTreeSet::from(["kerminal-application".into()]),
+            &mut violations,
+        );
+        assert!(!violations.is_empty(), "{sdk}");
+    }
+    let mut violations = Vec::new();
+    validate_internal_edges(
+        "kerminal-ui",
+        &BTreeSet::from(["kerminal-plugin-host".into()]),
+        &mut violations,
+    );
+    assert!(!violations.is_empty());
+    let mut violations = Vec::new();
+    validate_internal_edges(
+        "kerminal-application",
+        &BTreeSet::from(["kerminal-plugin-protocol".into()]),
+        &mut violations,
+    );
+    assert!(violations.is_empty());
+}
+
 /// 为文件系统架构规则创建并行安全的临时样本目录，不依赖额外测试 crate。
 fn fixture_root(label: &str) -> PathBuf {
     let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
