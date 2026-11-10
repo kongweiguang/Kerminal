@@ -42,6 +42,9 @@ mod wgc;
 
 const CONTENT: &str = "kerminal.file-search/search-tab";
 const WAIT: Duration = Duration::from_secs(45);
+// 生产内容关闭预算固定 5s，正常关闭约 1–2s；验收在重载下曾出现一次 45s 未收到关闭回执。
+// 关闭阶段给 120s 只放宽验收等待，不放宽生产预算，也不把超时当成功。
+const CLOSE_WAIT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(70);
 
 thread_local! {
@@ -880,7 +883,13 @@ async fn wait(
     stage: &str,
     mut predicate: impl FnMut(&Value) -> bool,
 ) -> Result<Value, Box<dyn Error>> {
-    let deadline = Instant::now() + WAIT;
+    // 关闭阶段等待回执可能被重载推迟；其他阶段仍保持更短的失败发现时间。
+    let deadline = Instant::now()
+        + if stage == "关闭正式内容实例" {
+            CLOSE_WAIT
+        } else {
+            WAIT
+        };
     loop {
         background_safety(stage)?;
         let snapshot = window.update(cx, |_, window, app| {
