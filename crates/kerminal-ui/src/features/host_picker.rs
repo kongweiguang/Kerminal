@@ -764,11 +764,12 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
                 };
                 let tooltip = if count > 0 {
                     SharedString::from(format!(
-                        "{}{}{}{}",
+                        "{}{}{}{}{}",
                         crate::locale::text("一起打开已勾选的 ", "Open the "),
                         count,
                         crate::locale::text(" 个分屏目标", " selected split targets"),
                         crate::locale::text("；Ctrl+Enter 亦可", "; Ctrl+Enter also works"),
+                        crate::locale::text("；单击行继续勾选", "; clicking a row keeps selecting"),
                     ))
                 } else {
                     crate::locale::text(
