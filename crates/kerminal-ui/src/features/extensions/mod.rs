@@ -501,7 +501,7 @@ impl ExtensionsPage {
         self.writing
     }
 
-    /// 页面关闭时只取消可以取消的后台任务；应用层负责实际收尾。
+    /// 用户取消安装时只取消可取消的后台任务，已提交结果仍由应用层回读与收尾。
     pub fn cancel(&mut self) {
         if let Some(token) = &self.cancel {
             token.cancel();
