@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use gpui_kit::{App, Context, Window};
 use kerminal_application::{
-    AppError, AppResult, PublicErrorCode,
+    AppError, PublicErrorCode,
     connections::host_types::{PluginHost, PluginHostDraft},
 };
 use kerminal_domain::{identity::HostId, preferences::ConfigRevision};
@@ -727,7 +727,7 @@ impl ConnectionsPanel {
         value: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AppResult<()> {
+    ) -> kerminal_application::AppResult<()> {
         let Some(type_id) = self.plugin_forms.active.clone() else {
             return Err(AppError::not_found("插件主机表单未打开"));
         };
