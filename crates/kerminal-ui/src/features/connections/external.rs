@@ -24,12 +24,109 @@ use crate::theme::ThemeTokens;
 use super::panel::{ConnectionsEvent, ConnectionsPanel, PendingAction};
 
 impl ConnectionsPanel {
+    /// 凭据卡片的失败/进度只写专用字段；普通面板 status 在 prompt-only 模式下不可见。
+    ///
+    /// @author kongweiguang
+    fn set_external_prompt_error(&mut self, text: impl Into<gpui_kit::SharedString>) {
+        self.external_prompt_message = Some(super::panel::ExternalPromptMessage {
+            text: text.into(),
+            is_error: true,
+        });
+    }
+
+    /// 进行中消息使用普通文本色，避免用户把“正在验证”误读成失败。
+    ///
+    /// @author kongweiguang
+    fn set_external_prompt_progress(&mut self, text: impl Into<gpui_kit::SharedString>) {
+        self.external_prompt_message = Some(super::panel::ExternalPromptMessage {
+            text: text.into(),
+            is_error: false,
+        });
+    }
+
+    /// 打开、取消、成功移交或关闭提示时清空，避免下一条请求继承上一条错误。
+    ///
+    /// @author kongweiguang
+    fn clear_external_prompt_message(&mut self) {
+        self.external_prompt_message = None;
+    }
+
+    /// Root 级回归读取卡片专用消息，验证 prompt-only 下错误/进度真实发布而不是只写普通 status。
+    ///
+    /// @author kongweiguang
+    #[cfg(test)]
+    pub(crate) fn external_prompt_message(&self) -> Option<(gpui_kit::SharedString, bool)> {
+        self.external_prompt_message
+            .as_ref()
+            .map(|message| (message.text.clone(), message.is_error))
+    }
+
+    /// 测试直接填充密码输入，避免依赖无障碍快照是否暴露 mask 后的值。
+    ///
+    /// @author kongweiguang
+    #[cfg(test)]
+    pub(crate) fn seed_external_password_for_test(
+        &mut self,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_password_input
+            .update(cx, |state, cx| state.set_value(value, window, cx));
+    }
+
+    /// 读取认证中布尔值，验证密码输入禁用与取消门禁使用同一状态。
+    ///
+    /// @author kongweiguang
+    #[cfg(test)]
+    pub(crate) fn external_authenticating_for_test(&self) -> bool {
+        self.external_authenticating
+    }
+
+    /// 诊断测试断言失败时的提示归属，不暴露给生产界面。
+    ///
+    /// @author kongweiguang
+    #[cfg(test)]
+    pub(crate) fn debug_external_prompt_state(&self) -> (bool, bool, Option<String>) {
+        (
+            self.pending_external_username.is_some(),
+            self.pending_external_password.is_some(),
+            self.status.clone(),
+        )
+    }
+
+    /// Root 级测试需要直接触发提交以观察同帧进度状态，不改变生产可见性。
+    ///
+    /// @author kongweiguang
+    #[cfg(test)]
+    pub(crate) fn submit_external_username_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.submit_external_username(window, cx);
+    }
+
+    /// 密码提交测试入口与用户名入口同一约束。
+    ///
+    /// @author kongweiguang
+    #[cfg(test)]
+    pub(crate) fn submit_external_password_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.submit_external_password(window, cx);
+    }
+
     /// Root 观察同一面板的待确认事实，把一次性认证和本地主机删除提升到全工作区 modal。
     ///
     /// @author kongweiguang
     pub(crate) fn root_confirmation_active(&self) -> bool {
         self.pending_external_username.is_some()
             || self.pending_external_password.is_some()
+            || self.pending_host_deletion.is_some()
+            || self.pending_group_deletion.is_some()
             || self.local_hosts.pending_delete.is_some()
     }
 
@@ -59,6 +156,30 @@ impl ConnectionsPanel {
             self.cancel_external_username(window, cx);
         } else if self.pending_external_password.is_some() {
             self.cancel_external_password(window, cx);
+        } else if self.pending_host_deletion.is_some() {
+            self.cancel_host_deletion(cx);
+            if self.pending_host_deletion.is_none() {
+                self.status = Some(
+                    crate::locale::text(
+                        "已取消删除主机，配置未改变。",
+                        "Host deletion was cancelled; configuration is unchanged.",
+                    )
+                    .to_string(),
+                );
+            }
+            cx.notify();
+        } else if self.pending_group_deletion.is_some() {
+            self.cancel_group_deletion(cx);
+            if self.pending_group_deletion.is_none() {
+                self.status = Some(
+                    crate::locale::text(
+                        "已取消删除分组，配置未改变。",
+                        "Group deletion was cancelled; configuration is unchanged.",
+                    )
+                    .to_string(),
+                );
+            }
+            cx.notify();
         } else if self.local_hosts.pending_delete.is_some()
             && !self.local_hosts.saving
             && !self.local_hosts.save_outcome_unknown
@@ -129,6 +250,7 @@ impl ConnectionsPanel {
         self.cancel_connection_request(cx);
         self.pending_external_username = Some(request);
         self.external_username_submitting = false;
+        self.clear_external_prompt_message();
         self.status = Some(
             crate::locale::text(
                 "请输入本次连接的登录用户名；系统不会猜测当前账户。",
@@ -154,6 +276,10 @@ impl ConnectionsPanel {
             return;
         };
         let Some(service) = self.external_launch.clone() else {
+            self.set_external_prompt_error(crate::locale::text(
+                "外部启动服务不可用；尚未创建连接目标。",
+                "The external launch service is unavailable; no connection target was created.",
+            ));
             self.status = Some(
                 crate::locale::text(
                     "外部启动服务不可用；尚未创建连接目标。",
@@ -170,7 +296,9 @@ impl ConnectionsPanel {
         )) {
             Ok(username) => username,
             Err(error) => {
-                self.status = Some(super::panel::localized_error(&error));
+                let message = super::panel::localized_error(&error);
+                self.set_external_prompt_error(message.clone());
+                self.status = Some(message);
                 cx.notify();
                 return;
             }
@@ -179,6 +307,10 @@ impl ConnectionsPanel {
         self.external_username_generation = self.external_username_generation.wrapping_add(1);
         let generation = self.external_username_generation;
         self.external_username_submitting = true;
+        self.set_external_prompt_progress(crate::locale::text(
+            "正在解析目标…",
+            "Resolving the target…",
+        ));
         let executor = self.executor.clone();
         let worker_request = request.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -215,19 +347,23 @@ impl ConnectionsPanel {
                         | Ok(ExternalLaunchOutcome::PasswordRequired { target }) => {
                             super::form::clear_input(&panel.external_username_input, window, cx);
                             panel.pending_external_username.take();
+                            panel.clear_external_prompt_message();
                             panel.request_external_target(target, cx);
                         }
                         Ok(ExternalLaunchOutcome::UsernameRequired { request }) => {
                             panel.pending_external_username = Some(request);
-                            panel.status = Some(crate::locale::text(
+                            let message = crate::locale::text(
                                 "目标仍缺少有效用户名，请检查输入后重试。",
                                 "The target still needs a valid username; review the input and try again.",
-                            ).to_string());
+                            );
+                            panel.set_external_prompt_error(message.clone());
+                            panel.status = Some(message.to_string());
                             cx.notify();
                         }
                         Ok(ExternalLaunchOutcome::Ignored) => {
                             super::form::clear_input(&panel.external_username_input, window, cx);
                             panel.pending_external_username.take();
+                            panel.clear_external_prompt_message();
                             panel.status = Some(crate::locale::text(
                                 "外部请求未解析为 SSH/SFTP 连接，未创建目标。",
                                 "The external request did not resolve to an SSH/SFTP connection; no target was created.",
@@ -236,7 +372,9 @@ impl ConnectionsPanel {
                         }
                         Err(error) => {
                             panel.pending_external_username = Some(worker_request);
-                            panel.status = Some(super::panel::localized_error(&error));
+                            let message = super::panel::localized_error(&error);
+                            panel.set_external_prompt_error(message.clone());
+                            panel.status = Some(message);
                             cx.notify();
                         }
                     }
@@ -264,6 +402,7 @@ impl ConnectionsPanel {
         self.external_username_generation = self.external_username_generation.wrapping_add(1);
         self.external_username_submitting = false;
         self.pending_external_username.take();
+        self.clear_external_prompt_message();
         super::form::clear_input(&self.external_username_input, window, cx);
         self.status = Some(
             crate::locale::text(
@@ -306,6 +445,10 @@ impl ConnectionsPanel {
         self.cancel_connection_request(cx);
         if target.authentication_required {
             if self.external_launch.is_none() {
+                self.set_external_prompt_error(crate::locale::text(
+                    "外部密码服务不可用；未启动连接。",
+                    "The external password service is unavailable; no connection was started.",
+                ));
                 self.status = Some(
                     crate::locale::text(
                         "外部密码服务不可用；未启动连接。",
@@ -318,6 +461,7 @@ impl ConnectionsPanel {
             }
             self.pending_external_password = Some(target);
             self.external_authenticating = false;
+            self.clear_external_prompt_message();
             self.status = Some(
                 crate::locale::text(
                     "请输入本次外部连接密码。密码只保存在临时内存目标中。",
@@ -328,6 +472,7 @@ impl ConnectionsPanel {
             cx.notify();
             return;
         }
+        self.clear_external_prompt_message();
         self.emit_action(PendingAction::External(target), cx);
     }
 
@@ -375,6 +520,10 @@ impl ConnectionsPanel {
             return;
         };
         let Some(service) = self.external_launch.clone() else {
+            self.set_external_prompt_error(crate::locale::text(
+                "外部密码服务不可用；未启动连接。",
+                "The external password service is unavailable; no connection was started.",
+            ));
             self.status = Some(
                 crate::locale::text(
                     "外部密码服务不可用；未启动连接。",
@@ -388,13 +537,12 @@ impl ConnectionsPanel {
 
         let password = super::form::read_input(&self.external_password_input, cx);
         if password.is_empty() || password.chars().any(char::is_control) {
-            self.status = Some(
-                crate::locale::text(
-                    "密码不能为空，也不能包含控制字符。",
-                    "Password cannot be empty or contain control characters.",
-                )
-                .to_string(),
+            let message = crate::locale::text(
+                "密码不能为空，也不能包含控制字符。",
+                "Password cannot be empty or contain control characters.",
             );
+            self.set_external_prompt_error(message.clone());
+            self.status = Some(message.to_string());
             cx.notify();
             return;
         }
@@ -403,6 +551,10 @@ impl ConnectionsPanel {
         self.external_auth_generation = self.external_auth_generation.wrapping_add(1);
         let generation = self.external_auth_generation;
         self.external_authenticating = true;
+        self.set_external_prompt_progress(crate::locale::text(
+            "正在验证凭据…",
+            "Verifying credentials…",
+        ));
         let executor = self.executor.clone();
         let worker_lease = target.lease.clone();
         cx.spawn(async move |this, cx| {
@@ -425,6 +577,7 @@ impl ConnectionsPanel {
                     match result {
                         Ok(()) => {
                             panel.pending_external_password.take();
+                            panel.clear_external_prompt_message();
                             panel.status = Some(crate::locale::text(
                                 "临时凭据已保存到内存目标，正在移交外部连接…",
                                 "Temporary credentials are ready in memory; handing off the external connection…",
@@ -432,7 +585,9 @@ impl ConnectionsPanel {
                             panel.emit_action(PendingAction::External(target), cx);
                         }
                         Err(error) => {
-                            panel.status = Some(super::panel::localized_error(&error));
+                            let message = super::panel::localized_error(&error);
+                            panel.set_external_prompt_error(message.clone());
+                            panel.status = Some(message);
                             cx.notify();
                         }
                     }
@@ -469,6 +624,7 @@ impl ConnectionsPanel {
             .take()
             .map(|target| target.host_id().clone());
         super::form::clear_input(&self.external_password_input, window, cx);
+        self.clear_external_prompt_message();
         self.status = Some(
             crate::locale::text(
                 "已取消外部连接请求，临时目标将随最后一个引用释放。",
@@ -528,6 +684,7 @@ pub(super) fn render_external_username_prompt(
     cx: &mut Context<ConnectionsPanel>,
 ) -> Option<impl IntoElement> {
     let request = panel.pending_external_username.as_ref()?;
+    let prompt_message = panel.external_prompt_message.clone();
     let address = format!("{}:{}", request.target.host, request.target.port);
     let protocol = match request.target.protocol {
         RemoteProtocol::Ssh => "SSH",
@@ -585,6 +742,19 @@ pub(super) fn render_external_username_prompt(
                                 "Enter the remote login username. The current account is never guessed; no temporary target exists before submission.",
                             )),
                     )
+                    .children(prompt_message.map(|message| {
+                        div()
+                            .debug_selector(|| {
+                                "connections-external-username-message".to_owned()
+                            })
+                            .text_size(theme.text_xs)
+                            .text_color(if message.is_error {
+                                theme.error
+                            } else {
+                                theme.muted
+                            })
+                            .child(message.text)
+                    }))
                     .child(
                         div()
                             .w_full()
@@ -628,6 +798,7 @@ pub(super) fn render_external_password_prompt(
     cx: &mut Context<ConnectionsPanel>,
 ) -> Option<impl IntoElement> {
     let target = panel.pending_external_password.as_ref()?;
+    let prompt_message = panel.external_prompt_message.clone();
     let endpoint = &target.identity.endpoint;
     let address = format!("{}@{}:{}", endpoint.username, endpoint.host, endpoint.port);
     let classification = external_classification_text(&target.classification);
@@ -674,7 +845,24 @@ pub(super) fn render_external_password_prompt(
                             .text_color(theme.muted)
                             .child(classification),
                     )
-                    .child(Input::new(&panel.external_password_input).w_full())
+                    .child(
+                        Input::new(&panel.external_password_input)
+                            .disabled(panel.external_authenticating)
+                            .w_full(),
+                    )
+                    .children(prompt_message.map(|message| {
+                        div()
+                            .debug_selector(|| {
+                                "connections-external-password-message".to_owned()
+                            })
+                            .text_size(theme.text_xs)
+                            .text_color(if message.is_error {
+                                theme.error
+                            } else {
+                                theme.muted
+                            })
+                            .child(message.text)
+                    }))
                     .child(
                         div()
                             .text_size(theme.text_xs)

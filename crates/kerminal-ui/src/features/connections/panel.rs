@@ -9,7 +9,7 @@ use std::{
 };
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Window,
+    AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Window,
     component::input::InputState,
 };
 use kerminal_application::{
@@ -978,6 +978,16 @@ impl ConnectionRequestEpoch {
     }
 }
 
+/// 外部凭据提示卡内的独立消息，避免 root prompt-only 只绘制确认层时普通面板 status 被遮住。
+/// 错误与进行中文案共用同一字段但区分样式，提交结束后只由本次提示世代清理。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ExternalPromptMessage {
+    pub(super) text: SharedString,
+    pub(super) is_error: bool,
+}
+
 /// 主机目录和分组快照通过 application 读取；UI 状态只含可安全展示的类型数据。
 pub struct ConnectionsPanel {
     pub(super) hosts: HostManagementService,
@@ -1039,6 +1049,8 @@ pub struct ConnectionsPanel {
     pub(super) pending_external_password: Option<ExternalRoutedTarget>,
     pub(super) external_authenticating: bool,
     pub(super) external_auth_generation: u64,
+    /// Root prompt-only 仅渲染确认层，凭据失败/进度必须随卡片自己的专用字段发布。
+    pub(super) external_prompt_message: Option<ExternalPromptMessage>,
     pub(super) loading: bool,
     pub(super) saving: bool,
     pub(super) status: Option<String>,
@@ -1155,6 +1167,7 @@ impl ConnectionsPanel {
             pending_external_password: None,
             external_authenticating: false,
             external_auth_generation: 0,
+            external_prompt_message: None,
             loading: false,
             saving: false,
             status: None,
