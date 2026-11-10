@@ -2,9 +2,12 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, FocusHandle, PathPromptOptions, Subscription,
-    Window,
-    component::input::{InputEvent, InputState},
+    AnyWindowHandle, AppContext as _, Context, Entity, EventEmitter, PathPromptOptions,
+    ScrollHandle, Subscription, Window,
+    component::{
+        WindowExt as _,
+        input::{InputEvent, InputState},
+    },
 };
 use kerminal_application::{
     ApplicationTaskExecutor, PublicErrorCode,
@@ -47,24 +50,6 @@ enum Confirmation {
     DeleteData(PluginId),
 }
 
-/// 确认弹层需要稳定的容器与按钮焦点身份，Tab 循环和默认确认都靠它维持。
-struct ConfirmationFocus {
-    container: FocusHandle,
-    confirm: FocusHandle,
-    cancel: FocusHandle,
-}
-
-impl ConfirmationFocus {
-    /// 焦点句柄生命周期跟随页面，弹层每次重建仍复用同一身份，避免迟到回调抢走焦点。
-    fn new(cx: &mut Context<ExtensionsPage>) -> Self {
-        Self {
-            container: cx.focus_handle(),
-            confirm: cx.focus_handle().tab_stop(true),
-            cancel: cx.focus_handle().tab_stop(true),
-        }
-    }
-}
-
 /// 实例拥有搜索焦点与异步代次；服务和 executor 由组合根注入。
 pub struct ExtensionsPage {
     service: Arc<ExtensionsService>,
@@ -92,11 +77,17 @@ pub struct ExtensionsPage {
     generation: u64,
     progress: Option<InstallProgress>,
     active_install: Option<PluginId>,
+    /// 本地包预检与目录安装共用取消门禁，页面级活动条据此显示校验状态。
+    inspecting: bool,
     retry_operation: Option<Operation>,
     confirmation: Option<Confirmation>,
-    confirmation_focus: ConfirmationFocus,
-    /// 确认弹层首次绘制后再聚焦，避免焦点先落在遮罩下方的原页面控件。
-    confirmation_focus_pending: bool,
+    /// Kit 窗口级确认只允许一个实例；标记防止重建页面或连续点击重复打开。
+    dialog_open: bool,
+    /// 延迟打开时核对代次，避免连续确认让旧 defer 打开新弹层。
+    dialog_generation: u64,
+    window_handle: AnyWindowHandle,
+    list_scroll: ScrollHandle,
+    detail_scroll: ScrollHandle,
 }
 impl EventEmitter<ExtensionsEvent> for ExtensionsPage {}
 
@@ -109,14 +100,16 @@ impl ExtensionsPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("搜索扩展 / Search extensions"));
+        let search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::locale::text("搜索扩展", "Search extensions"))
+        });
         let subscription = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
         });
-        let confirmation_focus = ConfirmationFocus::new(cx);
+        let window_handle = window.window_handle();
         Self {
             service,
             executor,
@@ -140,15 +133,22 @@ impl ExtensionsPage {
             generation: 0,
             progress: None,
             active_install: None,
+            inspecting: false,
             retry_operation: None,
             confirmation: None,
-            confirmation_focus,
-            confirmation_focus_pending: false,
+            dialog_open: false,
+            dialog_generation: 0,
+            window_handle,
+            list_scroll: ScrollHandle::new(),
+            detail_scroll: ScrollHandle::new(),
         }
     }
 
     /// 首次进入先读可信缓存与权威状态；失败保留现有展示并提供重试。
     pub fn activate(&mut self, cx: &mut Context<Self>) {
+        // 切回设置或重新进入时，遗留的窗口级确认必须先关闭，不能让它覆盖新页面状态。
+        self.close_open_confirmation(cx);
+        self.retry_operation = None;
         if self.busy {
             return;
         }
@@ -186,6 +186,7 @@ impl ExtensionsPage {
                     Err(error) => {
                         // 取消属于页面的正常空闲路径，不留下错误文案、离线标记或重试入口。
                         if error.public_code() != PublicErrorCode::Cancelled {
+                            page.retry_operation = None;
                             page.status = Some(error.public_message().to_owned());
                             page.status_is_warning = false;
                         }
@@ -213,6 +214,7 @@ impl ExtensionsPage {
         if self.busy {
             return;
         }
+        self.retry_operation = None;
         self.busy = true;
         self.refreshing = true;
         self.generation = self.generation.wrapping_add(1);
@@ -267,6 +269,7 @@ impl ExtensionsPage {
         if self.busy {
             return;
         }
+        self.retry_operation = None;
         let selected = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -287,6 +290,7 @@ impl ExtensionsPage {
                     }
                     Ok(Ok(None)) => {}
                     _ => {
+                        page.retry_operation = None;
                         page.status = Some(
                             crate::locale::text(
                                 "无法读取所选路径",
@@ -309,10 +313,12 @@ impl ExtensionsPage {
             return;
         }
         self.busy = true;
+        self.inspecting = true;
+        self.retry_operation = None;
         self.status = None;
         self.status_is_warning = false;
         self.confirmation = None;
-        self.confirmation_focus_pending = false;
+        self.dialog_open = false;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let cancellation = CancellationToken::new();
@@ -333,6 +339,7 @@ impl ExtensionsPage {
                     return;
                 }
                 page.busy = false;
+                page.inspecting = false;
                 page.cancel = None;
                 match result {
                     Ok((path, inspection)) => {
@@ -340,6 +347,7 @@ impl ExtensionsPage {
                     }
                     Err(error) if error.public_code() == PublicErrorCode::Cancelled => {}
                     Err(error) => {
+                        page.retry_operation = None;
                         page.status = Some(error.public_message().to_owned());
                         page.status_is_warning = false;
                     }
@@ -408,18 +416,35 @@ impl ExtensionsPage {
 
     /// 所有写操作完成后回读权威状态；失败保留明确错误，禁止自动重放。
     fn run_operation(&mut self, operation: Operation, cx: &mut Context<Self>) {
+        // 预览示例没有可信安装来源；即使调用方绕过列表，也必须在状态机入口拒绝。
+        if let Operation::Install(selection) = &operation
+            && sample::is_preview_entry(self.catalog.is_some(), &selection.id)
+        {
+            self.confirmation = None;
+            self.dialog_open = false;
+            self.retry_operation = None;
+            self.status = Some(
+                crate::locale::text("示例条目不可安装。", "Sample entries are not installable.")
+                    .to_string(),
+            );
+            self.status_is_warning = false;
+            cx.notify();
+            return;
+        }
         if self.busy {
             return;
         }
         self.busy = true;
+        self.inspecting = false;
         // 写操作尚未收到权威回读时退出会丢失提交结果，只有这一阶段需要阻止退出。
         self.writing = true;
         self.status = None;
         self.status_is_warning = false;
         self.retry_operation = None;
-        self.confirmation_focus_pending = false;
+        self.dialog_open = false;
         self.active_install = match &operation {
             Operation::Install(selection) => Some(selection.id.clone()),
+            Operation::File(_, inspection) => Some(inspection.id.clone()),
             _ => None,
         };
         self.confirmation = None;
@@ -498,6 +523,7 @@ impl ExtensionsPage {
                     }
                     Err(error) => {
                         if error.public_code() != PublicErrorCode::Cancelled {
+                            page.retry_operation = None;
                             page.status = Some(error.public_message().to_owned());
                             page.status_is_warning = false;
                         }
@@ -579,18 +605,73 @@ impl ExtensionsPage {
         }
     }
 
-    /// 打开确认的唯一入口：所有安装、文件和删除确认都在同一处绑定焦点与状态。
+    /// 打开确认的唯一入口：先记录待执行意图，再交给窗口级 Kit Dialog，页面本身不绘制遮罩。
     fn open_confirmation(&mut self, confirmation: Confirmation, cx: &mut Context<Self>) {
+        // 示例只有展示元数据；在打开确认前拒绝，避免弹层承诺一个不可执行的安装。
+        if let Confirmation::Install(selection) = &confirmation
+            && sample::is_preview_entry(self.catalog.is_some(), &selection.id)
+        {
+            self.close_open_confirmation(cx);
+            self.retry_operation = None;
+            self.status = Some(
+                crate::locale::text("示例条目不可安装。", "Sample entries are not installable.")
+                    .to_string(),
+            );
+            self.status_is_warning = false;
+            cx.notify();
+            return;
+        }
+        if self.dialog_open {
+            self.close_open_confirmation(cx);
+        }
         self.confirmation = Some(confirmation);
-        self.confirmation_focus_pending = true;
+        self.dialog_open = true;
+        self.dialog_generation = self.dialog_generation.wrapping_add(1);
+        let generation = self.dialog_generation;
+        let owner = cx.entity().downgrade();
+        let window_handle = self.window_handle;
+        // 延迟到下一个应用循环再打开，保证设置窗口与页面实体都已处于稳定状态。
+        cx.defer(move |app| {
+            let _ = window_handle.update(app, |_, window, app| {
+                if let Some(page) = owner.upgrade() {
+                    page.update(app, |page, cx| {
+                        if page.dialog_open && page.dialog_generation == generation {
+                            page.present_confirmation(window, cx);
+                        }
+                    });
+                }
+            });
+        });
         cx.notify();
     }
 
-    /// 关闭确认只恢复页面状态，不触发任何业务操作；焦点在下一帧回到页面控件。
-    fn dismiss_confirmation(&mut self, cx: &mut Context<Self>) {
+    /// 关闭确认只清理页面状态，业务操作由调用方另行决定；焦点恢复由 Kit Dialog 负责。
+    fn clear_confirmation(&mut self, cx: &mut Context<Self>) {
         self.confirmation = None;
-        self.confirmation_focus_pending = false;
+        self.dialog_open = false;
         cx.notify();
+    }
+
+    /// 按钮确认先关闭窗口级弹层再执行同一操作，避免页面状态与弹层生命周期分叉。
+    fn finish_confirmation(&mut self, operation: Option<Operation>, cx: &mut Context<Self>) {
+        self.confirmation = None;
+        self.dialog_open = false;
+        if let Some(operation) = operation {
+            self.run_operation(operation, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// 页面重新激活时关闭可能遗留的确认；Kit 负责把焦点还给原控件。
+    fn close_open_confirmation(&mut self, cx: &mut Context<Self>) {
+        let was_open = self.dialog_open;
+        self.confirmation = None;
+        self.dialog_open = false;
+        if was_open {
+            let window_handle = self.window_handle;
+            let _ = window_handle.update(cx, |_, window, cx| window.close_dialog(cx));
+        }
     }
 
     /// 目录替换后留下的选择会展示另一份目录的旧详情，必须按当前目录与安装集合重新核对。

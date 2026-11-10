@@ -1,7 +1,7 @@
 //! 正式市场目录不可用时的只读示例预览。
 //!
-//! 示例只提供名称、描述、权限与仓库等展示元数据，不包含可下载资产，也永远不会进入
-//! 安装、下载或 README 读取路径，因此不需要伪造签名或改变市场信任边界。
+//! 示例只提供名称、描述、权限与仓库等展示元数据；占位资产仅供展示可用版本，
+//! 安装由页面状态机拒绝，因此不需要伪造签名或改变市场信任边界。
 //!
 //! @author kongweiguang
 
@@ -132,4 +132,10 @@ pub(super) fn catalog() -> &'static PluginCatalog {
 /// 识别当前选择是否属于示例，避免为示例发起 README 网络读取或安装确认。
 pub(super) fn contains(id: &PluginId) -> bool {
     catalog().plugins.iter().any(|plugin| &plugin.id == id)
+}
+
+/// 只有真实目录缺席且 id 属于示例时才按预览处理；真实目录存在时同 id 仍是普通目录条目。
+/// 安装入口和运行状态机共用此判定，避免界面隐藏按钮却留下另一条可执行路径。
+pub(super) fn is_preview_entry(catalog_present: bool, id: &PluginId) -> bool {
+    !catalog_present && contains(id)
 }

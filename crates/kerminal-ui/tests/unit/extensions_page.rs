@@ -2,6 +2,7 @@
 //! @author kongweiguang
 
 use super::{CatalogPlugin, sample, selection};
+use kerminal_domain::plugins::PluginId;
 use kerminal_plugin_protocol::Platform;
 use serde_json::json;
 
@@ -84,4 +85,15 @@ fn sample_catalog_matches_preview_contract() {
         // API 范围必须真实生效，示例不能绕过宿主版本约束。
         assert!(selection(plugin, "2.0.0").is_none());
     }
+}
+
+/// 示例身份只在真实目录缺席时成立；真实目录即使包含同 id 也必须走普通目录路径。
+#[test]
+fn preview_guard_requires_missing_catalog_and_sample_id() {
+    let sample_id = PluginId::parse("example.notes").unwrap();
+    assert!(sample::is_preview_entry(false, &sample_id));
+    assert!(!sample::is_preview_entry(true, &sample_id));
+
+    let other = PluginId::parse("acme.notes").unwrap();
+    assert!(!sample::is_preview_entry(false, &other));
 }
