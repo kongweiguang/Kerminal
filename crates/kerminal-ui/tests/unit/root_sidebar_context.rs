@@ -5,6 +5,7 @@
 use super::*;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{cell::RefCell, rc::Rc};
 
 use gpui_kit::{px, size};
 use kerminal_application::preferences::{ThemeMode, ToolRailPanelPlacement, ToolRailToolId};
@@ -24,21 +25,63 @@ fn fixture_with_commands(
     Arc<CapturingSessions>,
     Arc<TemporaryTargets>,
     &mut VisualTestContext,
+    Arc<root_commands_service::CatalogCalls>,
 ) {
-    fixture_with_configuration_and_services(
+    let calls = Rc::new(RefCell::new(None));
+    let calls_slot = calls.clone();
+    let fixture = fixture_with_configuration_and_services(
         app,
         Arc::new(SidebarConfiguration::default()),
-        |services| {
-            let commands = Arc::new(root_commands_service::empty_commands_service(
-                services.sessions.clone(),
-            ));
+        move |services| {
+            let (commands, catalog_calls) =
+                root_commands_service::empty_commands_service_with_calls(services.sessions.clone());
+            *calls_slot.borrow_mut() = Some(catalog_calls);
             services
                 .with_plugins(Arc::new(
                     kerminal_application::plugins::PluginRegistry::builtin().unwrap(),
                 ))
-                .with_commands(commands)
+                .with_commands(Arc::new(commands))
         },
-    )
+    );
+    let calls = calls
+        .borrow_mut()
+        .take()
+        .expect("commands fixture attaches catalog counters");
+    let (runtime, root, sessions, temporary, visual) = fixture;
+    (runtime, root, sessions, temporary, visual, calls)
+}
+
+/// 片段目录与终端会话无关；切换终端只重读会话相关数据，不得重启全局目录。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn switching_terminal_does_not_reload_snippet_catalog(app: &mut TestAppContext) {
+    let (runtime, root, _, _, visual, calls) = fixture_with_commands(app);
+    // 初始构造已发起片段目录读取；等待真实回执后再记录基线，避免把首次加载误算到切换动作。
+    for _ in 0..10 {
+        if calls.snippet_lists.load(Ordering::Acquire) > 0 {
+            break;
+        }
+        settle(&runtime, visual);
+    }
+    let before = calls.snippet_lists.load(Ordering::Acquire);
+    assert!(
+        before > 0,
+        "fixture must load the snippet catalog before switching terminals"
+    );
+
+    visual.update(|_, app| {
+        root.update(app, |root, cx| {
+            let commands = root.commands_view.clone().expect("commands view");
+            commands.update(cx, |view, cx| view.set_session(Some(SessionId::new()), cx));
+        });
+    });
+    settle(&runtime, visual);
+    assert_eq!(
+        calls.snippet_lists.load(Ordering::Acquire),
+        before,
+        "switching terminal must not reread the session-independent snippet catalog"
+    );
 }
 
 /// 页面动作等待测试平台提交窗口激活回调，再从已绘制的主工作区焦点发起。
@@ -97,7 +140,7 @@ fn settle_snippets_host_frames(runtime: &Runtime, visual: &mut VisualTestContext
 /// @author kongweiguang
 #[gpui_kit::test]
 fn snippets_navigation_keeps_one_entity_across_hosts_and_resize(app: &mut TestAppContext) {
-    let (runtime, root, sessions, _, visual) = fixture_with_commands(app);
+    let (runtime, root, sessions, _, visual, _) = fixture_with_commands(app);
     settle(&runtime, visual);
     visual.simulate_resize(size(px(1500.), px(900.)));
     activate_commands_surface(&root, visual);
@@ -214,7 +257,7 @@ fn snippets_navigation_keeps_one_entity_across_hosts_and_resize(app: &mut TestAp
 fn snippet_host_buttons_preserve_view_and_respect_modal(app: &mut TestAppContext) {
     use crate::features::commands::SnippetHostMoveRequested;
 
-    let (runtime, root, _, _, visual) = fixture_with_commands(app);
+    let (runtime, root, _, _, visual, _) = fixture_with_commands(app);
     settle(&runtime, visual);
     visual.simulate_resize(size(px(1500.), px(900.)));
     activate_commands_surface(&root, visual);
@@ -290,7 +333,7 @@ fn snippet_host_buttons_preserve_view_and_respect_modal(app: &mut TestAppContext
 /// @author kongweiguang
 #[gpui_kit::test]
 fn snippets_settings_remap_preserves_modal_focus(app: &mut TestAppContext) {
-    let (runtime, root, _, _, visual) = fixture_with_commands(app);
+    let (runtime, root, _, _, visual, _) = fixture_with_commands(app);
     settle(&runtime, visual);
     visual.simulate_resize(size(px(1500.), px(900.)));
     activate_commands_surface(&root, visual);

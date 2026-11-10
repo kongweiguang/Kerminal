@@ -2,7 +2,10 @@
 //!
 //! @author kongweiguang
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use async_trait::async_trait;
 use kerminal_application::{
@@ -26,18 +29,39 @@ use kerminal_domain::{
 use tokio_util::sync::CancellationToken;
 
 struct UnusedHistoryRepository;
-struct UnusedCommandCatalog;
+struct UnusedCommandCatalog {
+    calls: Arc<CatalogCalls>,
+}
 struct UnusedSuggestions;
+
+/// 片段目录读取计数；只统计 `SnippetRepository::list`，工作流仓储读取不计入。
+#[derive(Default)]
+pub struct CatalogCalls {
+    pub snippet_lists: AtomicUsize,
+}
 
 /// 构造不访问磁盘的 CommandsService；fake session 不提供可信 prompt，历史仓储不会被调用。
 pub fn empty_commands_service(sessions: Arc<dyn SessionService>) -> CommandsService {
-    CommandsService::new(
+    empty_commands_service_with_calls(sessions).0
+}
+
+/// 暴露片段目录读取次数，供宿主测试确认切换终端不重启全局目录；原入口保持签名不变。
+pub fn empty_commands_service_with_calls(
+    sessions: Arc<dyn SessionService>,
+) -> (CommandsService, Arc<CatalogCalls>) {
+    let calls = Arc::new(CatalogCalls::default());
+    let service = CommandsService::new(
         Arc::new(UnusedHistoryRepository),
-        Arc::new(UnusedCommandCatalog),
-        Arc::new(UnusedCommandCatalog),
+        Arc::new(UnusedCommandCatalog {
+            calls: calls.clone(),
+        }),
+        Arc::new(UnusedCommandCatalog {
+            calls: calls.clone(),
+        }),
         Arc::new(UnusedSuggestions),
         sessions,
-    )
+    );
+    (service, calls)
 }
 
 #[async_trait]
@@ -84,6 +108,7 @@ impl SnippetRepository for UnusedCommandCatalog {
         &self,
         _request: SnippetCatalogListRequest,
     ) -> AppResult<Vec<SnippetCatalogItem>> {
+        self.calls.snippet_lists.fetch_add(1, Ordering::AcqRel);
         Ok(Vec::new())
     }
 

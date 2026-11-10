@@ -425,7 +425,8 @@ fn record_snippet_page_failure(
 
 /// 收藏由 origin+id 定位，避免同名内置与用户片段产生跨来源写入。
 impl CommandsView {
-    /// 配置变更或导入完成时统一重置游标并替换当前查询，防止旧页回调覆盖新目录。
+    /// 配置变更、导入、片段保存/删除与内置副本确认等写入完成后统一重置游标并替换当前查询，
+    /// 防止旧页回调覆盖新目录；普通切换终端不经过这里，避免重读与 session 无关的目录。
     ///
     /// @author kongweiguang
     pub(super) fn refresh_snippet_page(&mut self, cx: &mut Context<Self>) {
