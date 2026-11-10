@@ -20,7 +20,8 @@ use std::collections::BTreeSet;
 impl Render for ExtensionsPage {
     /// 三列分别承载筛选、稳定行高的结果和所选条目详情；写操作由共享服务执行。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = ThemeTokens::current(window, cx);
+        // 页面现在由设置弹框承载，使用设置语义色才能与弹框内其它页面一致。
+        let theme = ThemeTokens::current(window, cx).for_settings();
         let query = self.search.read(cx).value().trim().to_lowercase();
         let mut categories = BTreeSet::new();
         if let Some(catalog) = &self.catalog {

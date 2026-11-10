@@ -107,6 +107,7 @@ impl PreferencesPanel {
             PreferencesSection::Shortcuts => "shortcuts",
             PreferencesSection::About => "about",
             PreferencesSection::Profiles => "profiles",
+            PreferencesSection::Extensions => "extensions",
             PreferencesSection::Integrations => "integrations",
         }
     }

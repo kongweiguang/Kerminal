@@ -193,6 +193,14 @@ fn navigation_targets(
             IconName::Clipboard,
         ),
         (
+            "extensions",
+            PreferencesSection::Extensions,
+            "扩展",
+            "Extensions",
+            "扩展 extensions plugins market 插件 市场 安装 更新 启用 禁用 卸载",
+            IconName::Puzzle,
+        ),
+        (
             "sftp",
             PreferencesSection::Sftp,
             "SFTP",
@@ -351,6 +359,13 @@ fn navigation_targets(
             0,
         ),
         (
+            "settings-extensions-panel",
+            PreferencesSection::Extensions,
+            "扩展市场",
+            "浏览、安装、更新、启用、禁用和卸载扩展。 extensions plugins market 插件 市场 安装 更新 启用 禁用 卸载",
+            0,
+        ),
+        (
             "settings-external-launch-compatibility",
             PreferencesSection::ExternalLaunch,
             "外部 SSH 启动",
@@ -470,6 +485,17 @@ impl Render for PreferencesPanel {
                     .render_command_suggestions(theme, window, cx)
                     .into_any_element(),
                 PreferencesSection::Sftp => self.render_sftp(theme, window, cx).into_any_element(),
+                PreferencesSection::Extensions => match self.extensions_page(window, cx) {
+                    Some(page) => page.into_any_element(),
+                    None => div()
+                        .p_4()
+                        .text_color(theme.muted)
+                        .child(crate::locale::text(
+                            "扩展服务不可用。",
+                            "The extensions service is unavailable.",
+                        ))
+                        .into_any_element(),
+                },
                 PreferencesSection::ExternalLaunch => self
                     .render_external_launch(theme, window, cx)
                     .into_any_element(),
@@ -670,7 +696,6 @@ impl PreferencesPanel {
                 (plugin.id.clone(), label)
             })
             .collect();
-        let no_matches = !query.is_empty() && matches.is_empty() && plugin_matches.is_empty();
         let mut sidebar = div()
             .w(px(190.))
             .flex_shrink_0()
@@ -739,33 +764,6 @@ impl PreferencesPanel {
                     .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
                         panel.open_external_plugin(&id, window, cx);
                     }))
-                    .into_any_element(),
-            );
-        }
-        if query.is_empty() || "扩展 extensions plugins".contains(&query.to_lowercase()) {
-            nav_rows.push(
-                Button::new("preferences-open-extensions")
-                    .w_full()
-                    .min_h(px(40.))
-                    .compact()
-                    .custom(super::render_settings::settings_ghost_variant(theme, cx))
-                    .child(crate::locale::text("扩展", "Extensions"))
-                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                        cx.emit(super::panel::PreferencesEvent::ExtensionsRequested)
-                    }))
-                    .into_any_element(),
-            );
-        }
-        if no_matches && !"扩展 extensions plugins".contains(&query.to_lowercase()) {
-            nav_rows.push(
-                div()
-                    .px_2()
-                    .text_size(theme.text_sm)
-                    .text_color(theme.muted)
-                    .child(crate::locale::text(
-                        "没有找到匹配设置。",
-                        "No matching settings found.",
-                    ))
                     .into_any_element(),
             );
         }
@@ -935,6 +933,10 @@ impl PreferencesPanel {
             self.reset_page_disclosures();
         }
         self.section = section;
+        // 扩展页自带独立滚动，切入时直接由面板创建或复用页面并重新读取目录。
+        if section == PreferencesSection::Extensions {
+            self.extensions.activate(window, cx);
+        }
         match id.as_str() {
             "settings-external-launch-compatibility" => {
                 self.reveal_connectivity_target("external-sources", cx)
@@ -967,6 +969,7 @@ impl PreferencesPanel {
             cx.notify();
         }
         if section != PreferencesSection::Profiles
+            && section != PreferencesSection::Extensions
             && let Some(index) = scroll_index
         {
             let scroll = self.content_scroll.clone();

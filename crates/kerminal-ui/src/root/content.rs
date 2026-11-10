@@ -478,9 +478,6 @@ impl RootView {
                     .open(scope.clone(), content_id, None, window, cx)?;
             }
             self.content_host.activate(&scope, window, cx)?;
-            if content_id == super::extensions::EXTENSIONS_CONTENT_ID {
-                self.subscribe_extensions(window, cx)?;
-            }
             self.active_content_scope = Some(scope.clone());
             self.set_center_panel(CenterPanel::Contributed, window, cx);
             self.content_host

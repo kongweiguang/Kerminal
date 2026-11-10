@@ -53,6 +53,8 @@ mod connectivity;
 mod custom_agent;
 #[path = "panel/desktop_about.rs"]
 mod desktop_about;
+#[path = "panel/extensions.rs"]
+mod extensions;
 #[path = "panel/external_plugins.rs"]
 mod external_plugins;
 #[path = "panel/forms.rs"]
@@ -122,10 +124,8 @@ pub enum PreferencesEvent {
     },
     /// 用户完成 dirty-close 选择后请求 Root 恢复打开设置前的工作区页面。
     CloseRequested,
-    /// 请求经设置离开门禁后打开扩展中心。
-    ExtensionsRequested,
-    /// 取消离开时清除扩展导航意图，避免后续关闭误跳转。
-    ExtensionsNavigationCancelled,
+    /// 扩展页请求重启；设置弹框保留，Root 负责会话确认与退出收尾。
+    ExtensionsRestartRequested,
     /// 确认层显隐变化时更新 Root 焦点陷阱，避免同时注册父子陷阱。
     LeaveConfirmationChanged,
     /// 未保存草稿需要退出确认；Root 确保设置窗口可见并保留当前退出意图。
@@ -282,6 +282,7 @@ pub(super) enum PreferencesSection {
     About,
     Shortcuts,
     Profiles,
+    Extensions,
     Integrations,
     ConfigurationSync,
 }
@@ -461,6 +462,8 @@ impl LeaveConfirmationFocus {
 /// settings 与 Profile 页面状态只保存 typed 快照和 opaque revision，文件访问由 application 负责。
 pub struct PreferencesPanel {
     pub(super) external_plugins: external_plugins::ExternalPreferencesState,
+    /// 扩展中心直接内嵌设置正文，不再经中央内容宿主持有独立页面。
+    pub(super) extensions: extensions::ExtensionsPreferencesState,
     screen_color_sampling: color_sampling::ScreenColorSamplingState,
     settings_autosave: autosave::SettingsAutosaveState,
     pub(super) keyword_editor: terminal::KeywordEditorState,
@@ -693,6 +696,7 @@ impl PreferencesPanel {
         );
         let mut panel = Self {
             external_plugins: external_plugins::ExternalPreferencesState::default(),
+            extensions: extensions::ExtensionsPreferencesState::default(),
             screen_color_sampling: color_sampling::ScreenColorSamplingState::default(),
             settings_autosave: autosave::SettingsAutosaveState::default(),
             keyword_editor,
@@ -1160,6 +1164,10 @@ impl PreferencesPanel {
         }
         self.section = section;
         self.selected_navigation_target = None;
+        // Extensions 页面需要窗口才能创建输入状态；这里只登记进入意图，正文绘制时创建并激活。
+        if section == PreferencesSection::Extensions {
+            self.extensions.request_activation();
+        }
         cx.notify();
     }
 

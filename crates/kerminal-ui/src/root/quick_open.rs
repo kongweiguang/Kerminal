@@ -158,12 +158,21 @@ impl RootView {
                     );
                 }
                 QuickOpenSelection::Extensions => {
-                    if let Err(error) =
-                        self.open_plugin_page(super::extensions::EXTENSIONS_CONTENT_ID, window, cx)
-                    {
-                        self.status = Some(error.public_message().to_owned().into());
+                    // 扩展页已收回设置弹框：命令面板入口必须定位到弹框内的扩展分类。
+                    self.open_preferences_modal(window, cx);
+                    if !self.preferences_modal_open {
+                        self.status = Some(
+                            crate::locale::text(
+                                "请先关闭当前对话框，再打开扩展设置。",
+                                "Close the current dialog before opening extension settings.",
+                            )
+                            .into(),
+                        );
                         cx.notify();
+                        return;
                     }
+                    self.preferences_panel
+                        .update(cx, |panel, cx| panel.open_extensions_section(window, cx));
                 }
                 QuickOpenSelection::Action(action) => {
                     if *action == crate::keybindings::KeybindingAction::TerminalSearch {

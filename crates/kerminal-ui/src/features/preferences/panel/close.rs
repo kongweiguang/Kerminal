@@ -88,6 +88,18 @@ impl PreferencesPanel {
         if self.has_leave_confirmation() {
             return;
         }
+        // 扩展写入和待重启集合提交尚未结束时关闭会丢失回执，先等待页面报告空闲。
+        if self.extensions_is_busy(cx) {
+            self.status = Some(
+                crate::locale::text(
+                    "扩展操作尚未结束，请稍后重试关闭。",
+                    "An extension operation is still running. Try closing again when it finishes.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         use crate::plugins::external_settings::ExternalSettingsCloseState;
         let external_state = self.external_close_state(cx);
         if !matches!(
@@ -172,7 +184,6 @@ impl PreferencesPanel {
     ///
     /// @author kongweiguang
     pub(in crate::features::preferences) fn cancel_close(&mut self, cx: &mut Context<Self>) {
-        cx.emit(PreferencesEvent::ExtensionsNavigationCancelled);
         let was_open = self.close_confirmation;
         self.close_confirmation = false;
         if let Some(draft) = self.settings.as_mut()
@@ -223,6 +234,18 @@ impl PreferencesPanel {
     ///
     /// @author kongweiguang
     pub fn request_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        // 扩展安装、更新或取消回执未结束就退出会把未提交写入丢给进程收尾。
+        if self.extensions_is_busy(cx) {
+            let message = crate::locale::text(
+                "扩展操作尚未结束，请稍后重试退出。",
+                "An extension operation is still running. Try quitting again when it finishes.",
+            )
+            .to_string();
+            self.status = Some(message.clone());
+            cx.emit(PreferencesEvent::QuitDeferred { message });
+            cx.notify();
+            return false;
+        }
         use crate::plugins::external_settings::ExternalSettingsCloseState;
         let external_state = self.external_close_state(cx);
         if !matches!(

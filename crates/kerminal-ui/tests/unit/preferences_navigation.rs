@@ -37,6 +37,7 @@ fn navigation_exposes_profile_and_existing_pages_in_order() {
             "profiles",
             "keywords",
             "suggestions",
+            "extensions",
             "sftp",
             "external-launch",
             "mcp",
@@ -58,7 +59,7 @@ fn main_search_targets_cover_each_settings_page() {
         .filter(|target| !target.category)
         .collect::<Vec<_>>();
 
-    assert_eq!(entries.len(), 18);
+    assert_eq!(entries.len(), 19);
     for (id, section) in [
         (
             "settings-interface-appearance-panel",
@@ -96,6 +97,7 @@ fn main_search_targets_cover_each_settings_page() {
             PreferencesSection::CommandSuggestions,
         ),
         ("settings-sftp-panel", PreferencesSection::Sftp),
+        ("settings-extensions-panel", PreferencesSection::Extensions),
         (
             "settings-external-launch-compatibility",
             PreferencesSection::ExternalLaunch,
@@ -166,7 +168,6 @@ fn mcp_and_about_search_stay_inside_the_settings_pages() {
             PreferencesSection::Mcp,
         ),
         ("about", "settings-about-panel", PreferencesSection::About),
-        ("更新", "settings-about-panel", PreferencesSection::About),
     ] {
         let results = matching_navigation_targets(None, false, query);
         assert!(
@@ -186,6 +187,40 @@ fn mcp_and_about_search_stay_inside_the_settings_pages() {
         assert_eq!(
             selection.selected_target.as_deref(),
             Some(expected_id),
+            "{query}"
+        );
+    }
+}
+
+/// 扩展分类收回设置弹框后，常用中英文关键词都应定位到同一内嵌页面。
+/// @author kongweiguang
+#[test]
+fn extension_search_locates_the_settings_page() {
+    for query in [
+        "扩展",
+        "extensions",
+        "plugins",
+        "market",
+        "插件",
+        "市场",
+        "安装",
+        "更新",
+        "启用",
+        "禁用",
+        "卸载",
+    ] {
+        let selection = resolve_navigation_search_selection(
+            query,
+            PreferencesSection::Appearance,
+            None,
+            None,
+            false,
+        );
+        assert!(selection.has_matches, "{query}");
+        assert_eq!(selection.section, PreferencesSection::Extensions, "{query}");
+        assert_eq!(
+            selection.selected_target.as_deref(),
+            Some("settings-extensions-panel"),
             "{query}"
         );
     }
@@ -220,7 +255,7 @@ fn clearing_search_restores_page_navigation_with_profiles() {
         .into_iter()
         .filter(|target| target.category)
         .collect::<Vec<_>>();
-    assert_eq!(categories.len(), 12);
+    assert_eq!(categories.len(), 13);
     assert_eq!(
         categories
             .iter()
