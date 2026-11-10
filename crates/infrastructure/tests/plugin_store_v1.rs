@@ -415,3 +415,26 @@ fn cleanup_preserves_case_folded_active_version() {
             .exists()
     );
 }
+
+#[test]
+/// 伪造绑定缺少 failure 或 pending 时整份状态必须拒绝，避免撤销凭据漂移。
+fn forged_failure_binding_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    fs::create_dir_all(root.path().join("plugins")).unwrap();
+    let path = root.path().join("plugins/state.json");
+    for state in [
+        // 绑定 id 既没有 failure 也没有 pending。
+        r#"{"schema":1,"revision":0,"plugins":{},"pending":[],"failures":{},"pending_failures":["acme.notes"]}"#.to_owned(),
+        // 有失败记录但已无 pending，绑定不能再声称可撤销。
+        r#"{"schema":1,"revision":0,"plugins":{},"pending":[],"failures":{"acme.notes":"安装失败"},"pending_failures":["acme.notes"]}"#.to_owned(),
+        // 有 pending 但缺少失败记录，绑定不能凭空生成撤销入口。
+        r#"{"schema":1,"revision":0,"plugins":{},"pending":[{"op":"uninstall","id":"acme.notes"}],"failures":{},"pending_failures":["acme.notes"]}"#.to_owned(),
+    ] {
+        fs::write(&path, state).unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(PluginStoreError::InvalidState)
+        ));
+    }
+}
