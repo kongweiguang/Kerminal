@@ -395,62 +395,90 @@ async fn native_flags_and_restricted_json_preserve_validated_identity() {
     }
 }
 
-/// 外部启动已移除 `--host-key`/`--hostkey`：Kerminal CLI 携带 pin 参数必须失败，
-/// 且不得注册临时目标，避免调用方误以为 pin 仍被接受。
+/// 已移除的 `--host-key`/`--hostkey` 仅为兼容旧脚本而忽略：携带 pin 时仍注册目标，
+/// pin 值不参与连接；缺失值也只告警，不中断启动。
 /// @author kongweiguang
 #[tokio::test]
-async fn kerminal_cli_rejects_host_key_pin_without_registration() {
-    for pin_option in ["--host-key", "--hostkey"] {
+async fn kerminal_cli_ignores_host_key_pin_and_still_registers_target() {
+    for pin_arguments in [
+        vec!["--host-key", "SHA256:fixture"],
+        vec!["--hostkey", "SHA256:fixture"],
+        vec!["--host-key"],
+    ] {
         let (service, registry) = service(None);
-        let error = service
-            .handle_activation(activation(&[
-                "kerminal.exe",
-                "--external-ssh",
-                "--host",
-                "host.example",
-                pin_option,
-                "SHA256:fixture",
-            ]))
+        let mut arguments = vec![
+            "kerminal.exe",
+            "--external-ssh",
+            "--host",
+            "host.example",
+            "--user",
+            "alice",
+        ];
+        arguments.extend(pin_arguments);
+        let outcome = service
+            .handle_activation(activation(&arguments))
             .await
-            .expect_err("host key pin must fail closed");
-        assert_eq!(error.public_code(), PublicErrorCode::Invalid);
-        assert!(
-            registry
-                .state
-                .lock()
-                .expect("test mutex poisoned")
-                .registered
-                .is_empty(),
-            "rejected pin must not create a temporary target"
-        );
+            .expect("removed host key pin is ignored");
+        let target = match outcome {
+            ExternalLaunchOutcome::Ready { target }
+            | ExternalLaunchOutcome::PasswordRequired { target } => target,
+            other => panic!("explicit username must route despite removed pin: {other:?}"),
+        };
+        assert_eq!(target.identity.endpoint.host, "host.example");
+        assert_eq!(target.identity.endpoint.username, "alice");
+        let state = registry.state.lock().expect("test mutex poisoned");
+        assert_eq!(state.registered.len(), 1);
+        assert_eq!(state.registered[0].identity.endpoint.username, "alice");
     }
+
+    let (service, registry) = service(None);
+    let error = service
+        .handle_activation(activation(&[
+            "kerminal.exe",
+            "--external-ssh",
+            "--host",
+            "host.example",
+            "--host-key-unknown",
+            "fixture",
+        ]))
+        .await
+        .expect_err("unknown options are still rejected");
+    assert_eq!(error.public_code(), PublicErrorCode::Invalid);
+    assert!(
+        registry
+            .state
+            .lock()
+            .expect("test mutex poisoned")
+            .registered
+            .is_empty()
+    );
 }
 
-/// SFTP 客户端入口同样硬拒绝 `/hostkey` 与 `--host-key`，失败发生在注册目标之前。
+/// SFTP 客户端入口同样兼容忽略 `/hostkey` 与 `--host-key`，目标仍会注册；
+/// pin 值缺失时也只告警并继续解析 URL。
 /// @author kongweiguang
 #[tokio::test]
-async fn sftp_client_rejects_host_key_pin_without_registration() {
-    for pin_option in ["/hostkey", "--host-key"] {
+async fn sftp_client_ignores_host_key_pin_and_still_registers_target() {
+    for pin_arguments in [
+        vec!["/hostkey", "SHA256:fixture"],
+        vec!["--host-key", "SHA256:fixture"],
+        vec!["/hostkey"],
+    ] {
         let (service, registry) = service(None);
-        let error = service
-            .handle_activation(activation(&[
-                "sftp.exe",
-                "sftp://host.example/",
-                pin_option,
-                "SHA256:fixture",
-            ]))
+        let mut arguments = vec!["sftp.exe", "sftp://alice@host.example/"];
+        arguments.extend(pin_arguments);
+        let outcome = service
+            .handle_activation(activation(&arguments))
             .await
-            .expect_err("host key pin must fail closed");
-        assert_eq!(error.public_code(), PublicErrorCode::Invalid);
-        assert!(
-            registry
-                .state
-                .lock()
-                .expect("test mutex poisoned")
-                .registered
-                .is_empty(),
-            "rejected pin must not create a temporary target"
-        );
+            .expect("removed SFTP host key pin is ignored");
+        let target = match outcome {
+            ExternalLaunchOutcome::Ready { target }
+            | ExternalLaunchOutcome::PasswordRequired { target } => target,
+            other => panic!("explicit SFTP username must route: {other:?}"),
+        };
+        assert_eq!(target.identity.endpoint.host, "host.example");
+        let state = registry.state.lock().expect("test mutex poisoned");
+        assert_eq!(state.registered.len(), 1);
     }
 }
 

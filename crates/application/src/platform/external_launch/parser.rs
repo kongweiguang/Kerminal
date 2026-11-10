@@ -343,6 +343,11 @@ fn parse_kerminal_cli(arguments: &[String]) -> AppResult<ExternalLaunchRequest> 
                 )?)?);
                 continue;
             }
+            // 旧调用方仍可能携带已移除的 pin；兼容消费并可忽略其值，避免整次外部启动失败。
+            "--host-key" | "--hostkey" => {
+                ignore_removed_host_key_pin(arguments, &mut index, inline, name);
+                continue;
+            }
             _ => return Err(AppError::invalid("Kerminal 外部启动参数不受支持")),
         };
         host = Some(validated_host(&value)?);
@@ -698,6 +703,16 @@ fn parse_sftp_client(arguments: &[String]) -> AppResult<ExternalLaunchRequest> {
             username = Some(validated_username(&plain_next_value(
                 arguments, &mut index, token,
             )?)?);
+        } else if lower == "/hostkey"
+            || lower == "--host-key"
+            || lower == "--hostkey"
+            || lower.starts_with("/hostkey=")
+            || lower.starts_with("--host-key=")
+            || lower.starts_with("--hostkey=")
+        {
+            // 兼容旧 SFTP 脚本中的 pin；当前实现对每个 peer 自动信任并尽力记录 known_hosts。
+            let inline = token.split_once('=').map(|(_, value)| value);
+            ignore_removed_host_key_pin(arguments, &mut index, inline, token);
         } else if lower == "/password"
             || lower == "/passphrase"
             || lower == "--password"
@@ -1027,6 +1042,42 @@ fn has_named_option(arguments: &[String], options: &[&str]) -> bool {
             .iter()
             .any(|option| name.eq_ignore_ascii_case(option))
     })
+}
+
+/// host key pin 已退出连接准入；旧脚本仍可能传值。消费可选的下一项并告警，
+/// 但不校验、不保存，也不因缺失值中断启动，让连接继续使用统一自动信任策略。
+///
+/// @author kongweiguang
+fn ignore_removed_host_key_pin(
+    arguments: &[String],
+    index: &mut usize,
+    inline: Option<&str>,
+    name: &str,
+) {
+    let value = if let Some(value) = inline {
+        *index += 1;
+        Some(value.to_owned())
+    } else if let Some(value) = arguments
+        .get(*index + 1)
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+    {
+        *index += 2;
+        Some(value.clone())
+    } else {
+        *index += 1;
+        None
+    };
+    match value {
+        Some(value) => tracing::warn!(
+            option = name,
+            value = %value,
+            "忽略已移除的 SSH host key pin；连接将自动信任并尽力记录主机密钥"
+        ),
+        None => tracing::warn!(
+            option = name,
+            "忽略缺少值的 SSH host key pin；连接将自动信任并尽力记录主机密钥"
+        ),
+    }
 }
 
 /// 取下一项位置的可选参数，支持 --name=value 并拒绝空值。

@@ -602,7 +602,7 @@ enum TestSecret {
     PrivateKey(Vec<u8>),
 }
 
-/// 隔离凭据解析器，记录调用次数以验证能力门禁和 host-key 校验先于取密。
+/// 隔离凭据解析器，记录调用次数以验证能力门禁；host key 自动信任后认证阶段才解析凭据。
 #[derive(Default)]
 pub struct TestCredentialResolver {
     secrets: StdMutex<HashMap<String, TestSecret>>,

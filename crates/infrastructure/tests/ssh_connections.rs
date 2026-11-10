@@ -1212,7 +1212,7 @@ async fn password_and_private_key_authentication_complete_over_russh() {
     server.shutdown().await;
 }
 
-/// 单跳路由必须经已认证跳板的 direct-tcpip channel 到达目标并保留独立 host-key 校验。
+/// 单跳路由必须经已认证跳板的 direct-tcpip channel 到达目标；目标 host key 自动信任并尽力记录，不单独阻断。
 #[tokio::test]
 async fn jump_host_routes_exec_over_authenticated_direct_tcpip_channel() {
     let jump_server = SshServerFixture::spawn(SshServerOptions {
