@@ -133,8 +133,8 @@ fn confirmation_layers(
         .is_some_and(|pending| selected_host.is_some_and(|host| host.id == pending.host_id));
     let plan = if root_only {
         root_confirmation_layer_plan(
-            panel.pending_host_deletion.is_some(),
-            panel.pending_group_deletion.is_some(),
+            panel.host_deletion_confirmation_visible(),
+            panel.group_deletion_confirmation_visible(),
             panel.local_hosts.pending_delete.is_some(),
             panel.pending_external_password.is_some(),
             panel.pending_external_username.is_some(),

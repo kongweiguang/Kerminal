@@ -119,14 +119,32 @@ impl ConnectionsPanel {
         self.submit_external_password(window, cx);
     }
 
+    /// 远端主机删除只在目标行仍可见时提升为模态；配置重载移除该行后不能留下不可见 modal。
+    ///
+    /// @author kongweiguang
+    pub(super) fn host_deletion_confirmation_visible(&self) -> bool {
+        self.pending_host_deletion
+            .as_ref()
+            .is_some_and(|pending| self.rows.iter().any(|host| host.id == pending.host_id))
+    }
+
+    /// 分组删除同样需要当前分组快照仍包含目标，避免被替换后的确认层保持不可见。
+    ///
+    /// @author kongweiguang
+    pub(super) fn group_deletion_confirmation_visible(&self) -> bool {
+        self.pending_group_deletion
+            .as_ref()
+            .is_some_and(|pending| self.groups.iter().any(|group| group.id == pending.group_id))
+    }
+
     /// Root 观察同一面板的待确认事实，把一次性认证和本地主机删除提升到全工作区 modal。
     ///
     /// @author kongweiguang
     pub(crate) fn root_confirmation_active(&self) -> bool {
         self.pending_external_username.is_some()
             || self.pending_external_password.is_some()
-            || self.pending_host_deletion.is_some()
-            || self.pending_group_deletion.is_some()
+            || self.host_deletion_confirmation_visible()
+            || self.group_deletion_confirmation_visible()
             || self.local_hosts.pending_delete.is_some()
     }
 
