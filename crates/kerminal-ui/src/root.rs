@@ -2671,6 +2671,7 @@ impl RootView {
             controller.apply_pane_event(&tab_id, WorkspacePaneEvent::Activate(pane_id.clone()))
         });
         self.clear_pending_pane_focus();
+        let focus_changed = matches!(&result, Some(Ok(WorkspaceControllerEffect::Changed { .. })));
         match result {
             Some(Ok(WorkspaceControllerEffect::Changed { .. })) => {
                 self.focused_agent_terminal = false;
@@ -2699,7 +2700,11 @@ impl RootView {
         self.cancel_unfocused_pane_compositions(window, cx);
         self.refresh_commands_session(cx);
         self.refresh_active_suggestion_context(cx);
-        self.refresh_proxy_panel(cx);
+        // 同一 pane 的重复 Activate 不改变代理目标，重读只会让面板无谓进入 busy；
+        // 焦点真正切换到另一个 pane/session 时目标可能变化，仍需刷新。
+        if focus_changed {
+            self.refresh_proxy_panel(cx);
+        }
         if self.workspace_runtime.pane(&pane_id).is_some() {
             self.request_workspace_pane_snapshot(tab_id, pane_id, cx);
         }
