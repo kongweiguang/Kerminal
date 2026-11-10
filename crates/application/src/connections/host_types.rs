@@ -934,7 +934,7 @@ impl HostTypeProvider for BuiltinHostProvider {
         self.probe.probe(request, cancel).await
     }
 
-    /// 只传递配置身份，后续 owner 负责读取凭据、信任预检和实际打开。
+    /// 只传递配置身份，后续 owner 负责读取凭据、尽力记录主机密钥和实际打开。
     async fn open_builtin(
         &self,
         host: &BuiltinHost,

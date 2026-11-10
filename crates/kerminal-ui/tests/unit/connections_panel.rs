@@ -14,6 +14,9 @@ use kerminal_domain::{
     preferences::ConfigRevision,
 };
 
+use gpui_kit::TestAppContext;
+
+use super::super::render::{ConnectionsConfirmationLayer, confirmation_layer_plan};
 use super::{
     ConflictReloadTarget, ConnectionsEvent, ConnectionsPanel, ConnectionsPresentation,
     GroupSaveReconciliation, HostCredentialRecoveryAction, HostSaveReadback,
@@ -101,6 +104,97 @@ fn discard_continues_only_an_active_local_navigation_action() {
     assert!(!should_continue_local_host_action_after_discard(
         false, true
     ));
+}
+
+/// 远端、分组、本地删除与两类外部凭据共用同一层列表；顺序固定，
+/// 无编辑器 overlay 和面板 Render 因此不会分叉。真实 workbench prompt-only
+/// DOM 断言仍需 Root harness，见交付说明中的未覆盖项。
+/// @author kongweiguang
+#[test]
+fn confirmation_layer_plan_matches_panel_and_overlay_order() {
+    use ConnectionsConfirmationLayer::{
+        ExternalPassword, ExternalUsername, GroupDeletion, HostDeletion, LocalHostDeletion,
+    };
+    assert_eq!(
+        confirmation_layer_plan(true, true, true, true, true),
+        vec![
+            HostDeletion,
+            GroupDeletion,
+            LocalHostDeletion,
+            ExternalPassword,
+            ExternalUsername,
+        ]
+    );
+    assert!(confirmation_layer_plan(false, false, false, false, false).is_empty());
+    assert_eq!(
+        confirmation_layer_plan(false, true, false, false, true),
+        vec![GroupDeletion, ExternalUsername]
+    );
+}
+
+/// 在途插件主机校验持有旧请求世代；容器入口必须取消旧回调和令牌，
+/// 只发出容器连接动作一次，并保留侧栏容器意图供 Root 绑定结果。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn container_entry_invalidates_inflight_host_validation_and_opens_once(app: &mut TestAppContext) {
+    let host = managed_host_snapshot(HostId::new(), "container-fixture", "revision");
+    let host_id = host.id.clone();
+    let (runtime, panel, visual) =
+        super::connections_editor_dirty_tests::fixture(app, vec![host], Vec::new());
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let subscription = visual.update(|_, app| {
+        app.subscribe(&panel, move |_, event: &ConnectionsEvent, _| {
+            recorded.borrow_mut().push(event.clone());
+        })
+    });
+    // 模拟插件主机校验已经开始时捕获的世代与令牌。
+    let (generation, request) =
+        visual.update(|_, app| panel.update(app, |panel, _| panel.begin_connection_request()));
+    visual.update(|_, app| {
+        panel.update(app, |panel, cx| {
+            assert!(panel.request_connect_host_for_container(
+                &host_id,
+                "container-intent".to_owned(),
+                cx,
+            ));
+            assert!(request.is_cancelled(), "容器入口必须取消在途校验令牌");
+            assert!(
+                !panel.connection_request.is_current(generation, &request),
+                "旧回调世代必须失效"
+            );
+            // 重复执行生产回调门禁：只有仍 current 时才允许再发一次连接。
+            if panel.connection_request.is_current(generation, &request) {
+                panel.connect_selected_with_destination_direct(
+                    false,
+                    false,
+                    Some("container-intent".to_owned()),
+                    cx,
+                );
+            }
+            assert_eq!(
+                panel.sidebar_container_intent.as_deref(),
+                Some("container-intent"),
+                "容器意图不能被取消或吞掉"
+            );
+        });
+    });
+    visual.run_until_parked();
+    let connect_intents = events
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            ConnectionsEvent::ConnectRequested { intent_id, .. } => Some(intent_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        connect_intents,
+        vec![Some("container-intent".to_owned())],
+        "旧校验被取消后只能保留容器入口的一次连接"
+    );
+    drop(subscription);
+    runtime.block_on(tokio::task::yield_now());
 }
 
 /// 构造有稳定 ID/revision 的主机快照，覆盖真实目录替换与新建两种回执形态。
@@ -338,7 +432,7 @@ fn sftp_started_event_preserves_request_id_when_pending_action_is_resumed() {
     assert_eq!(resumed_action.sftp_started_event(), expected);
 }
 
-/// TransferTab 的 host-key 重试沿用同一请求身份，便于 Root 在用户切页后仅后台插入结果。
+/// TransferTab 的外部凭据重试沿用同一请求身份，便于 Root 在用户切页后仅后台插入结果。
 /// @author kongweiguang
 #[test]
 fn sftp_transfer_tab_started_event_preserves_request_id() {

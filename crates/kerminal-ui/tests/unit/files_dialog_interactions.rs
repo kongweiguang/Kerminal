@@ -558,10 +558,6 @@ fn directory_error_renders_single_inline_failure_with_retry(app: &mut TestAppCon
             "the inline error card keeps the retry entry"
         );
         assert!(
-            !visible("files-trust-host-key"),
-            "a TCP failure must not offer host-key trust"
-        );
-        assert!(
             !visible("files-retry-directory"),
             "the bottom bar must not repeat the same directory error"
         );

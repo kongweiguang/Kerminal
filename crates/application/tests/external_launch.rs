@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use kerminal_application::{
-    AppResult,
+    AppResult, PublicErrorCode,
     platform::external_launch::{
         ExternalActivation, ExternalAuthenticationHint, ExternalLaunchIntent,
         ExternalLaunchOutcome, ExternalLaunchService, ExternalTargetClassification,
@@ -391,6 +391,65 @@ async fn native_flags_and_restricted_json_preserve_validated_identity() {
                 .expect("test mutex poisoned")
                 .registered
                 .is_empty()
+        );
+    }
+}
+
+/// 外部启动已移除 `--host-key`/`--hostkey`：Kerminal CLI 携带 pin 参数必须失败，
+/// 且不得注册临时目标，避免调用方误以为 pin 仍被接受。
+/// @author kongweiguang
+#[tokio::test]
+async fn kerminal_cli_rejects_host_key_pin_without_registration() {
+    for pin_option in ["--host-key", "--hostkey"] {
+        let (service, registry) = service(None);
+        let error = service
+            .handle_activation(activation(&[
+                "kerminal.exe",
+                "--external-ssh",
+                "--host",
+                "host.example",
+                pin_option,
+                "SHA256:fixture",
+            ]))
+            .await
+            .expect_err("host key pin must fail closed");
+        assert_eq!(error.public_code(), PublicErrorCode::Invalid);
+        assert!(
+            registry
+                .state
+                .lock()
+                .expect("test mutex poisoned")
+                .registered
+                .is_empty(),
+            "rejected pin must not create a temporary target"
+        );
+    }
+}
+
+/// SFTP 客户端入口同样硬拒绝 `/hostkey` 与 `--host-key`，失败发生在注册目标之前。
+/// @author kongweiguang
+#[tokio::test]
+async fn sftp_client_rejects_host_key_pin_without_registration() {
+    for pin_option in ["/hostkey", "--host-key"] {
+        let (service, registry) = service(None);
+        let error = service
+            .handle_activation(activation(&[
+                "sftp.exe",
+                "sftp://host.example/",
+                pin_option,
+                "SHA256:fixture",
+            ]))
+            .await
+            .expect_err("host key pin must fail closed");
+        assert_eq!(error.public_code(), PublicErrorCode::Invalid);
+        assert!(
+            registry
+                .state
+                .lock()
+                .expect("test mutex poisoned")
+                .registered
+                .is_empty(),
+            "rejected pin must not create a temporary target"
         );
     }
 }

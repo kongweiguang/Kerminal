@@ -42,7 +42,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Result<bool, &'static str> {
         if self.connection_prompt_modal_open {
-            return Err("fixture SSH host-key confirmation is pending");
+            return Err("fixture external credential prompt is pending");
         }
         let Some(panel) = self.connections_panel.clone() else {
             return Err("host connection panel is unavailable");
@@ -53,7 +53,7 @@ impl RootView {
     }
 
     /// Accepts readiness only when the active pane targets this SSH host and has a live UI snapshot.
-    /// Unexpected host-key confirmation fails closed so acceptance never trusts an unknown key.
+    /// An unexpected external credential prompt means the connection is not ready yet; acceptance must wait for it.
     ///
     /// @author kongweiguang
     pub fn right_rail_acceptance_fixture_ready(
@@ -61,7 +61,9 @@ impl RootView {
         host_id: &HostId,
     ) -> Result<bool, &'static str> {
         if self.connection_prompt_modal_open {
-            return Err("fixture SSH host-key confirmation is pending; refusing automatic trust");
+            return Err(
+                "fixture external credential prompt is pending; connection is not confirmed",
+            );
         }
         let Some(session_id) = self.active_session_id() else {
             return Ok(false);
@@ -462,7 +464,7 @@ impl RootView {
         host_id: &HostId,
     ) -> Result<Option<UiSessionBinding>, String> {
         if self.connection_prompt_modal_open {
-            return Err("fixture SSH host-key confirmation is pending".to_owned());
+            return Err("fixture external credential prompt is pending".to_owned());
         }
         let Some(session_id) = self.active_session_id() else {
             return Ok(None);

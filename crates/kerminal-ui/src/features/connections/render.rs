@@ -28,9 +28,9 @@ use super::{
 };
 
 impl ConnectionsPanel {
-    /// 无编辑器时 Root 只需要确认层本身：外部凭据和本地删除确认都是独立居中模态，
+    /// 无编辑器时 Root 只需要确认层本身：外部凭据、本地/远端主机与分组删除确认都是独立居中模态，
     /// 再画一整块空主机面板会在弹层背后留下无意义的暗色大框。
-    /// 层顺序与面板内 Render 保持一致，最外层拦截点击并保持焦点陷阱稳定。
+    /// 层顺序与面板内 Render 共用 confirmation_layers，最外层拦截点击并保持焦点陷阱稳定。
     /// @author kongweiguang
     pub(crate) fn render_root_confirmation_overlay(
         &mut self,
@@ -38,21 +38,8 @@ impl ConnectionsPanel {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = ThemeTokens::current(window, cx);
-        let mut layers = Vec::new();
-        if let Some(pending_delete) = self.local_hosts.pending_delete.clone() {
-            layers.push(render_local_host_deletion_confirmation(
-                self,
-                &pending_delete,
-                theme,
-                cx,
-            ));
-        }
-        if let Some(password) = render_external_password_prompt(self, theme, cx) {
-            layers.push(password.into_any_element());
-        }
-        if let Some(username) = render_external_username_prompt(self, theme, cx) {
-            layers.push(username.into_any_element());
-        }
+        let selected_host = self.selected_host_snapshot();
+        let layers = confirmation_layers(self, selected_host.as_ref(), theme, cx);
         (!layers.is_empty()).then(|| {
             div()
                 .id("workbench-connections-confirmation-layer")
@@ -65,6 +52,96 @@ impl ConnectionsPanel {
                 .into_any_element()
         })
     }
+}
+
+/// 确认层类型以固定顺序集中定义；Root 无编辑器 overlay 与面板 Render 都从这里取层，
+/// 避免新增远端/分组删除确认时只改一处而漏掉 prompt-only 分支。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConnectionsConfirmationLayer {
+    HostDeletion,
+    GroupDeletion,
+    LocalHostDeletion,
+    ExternalPassword,
+    ExternalUsername,
+}
+
+/// 按固定顺序返回当前应显示的全部确认层；条件与渲染 helper 保持同一来源。
+///
+/// @author kongweiguang
+pub(super) fn confirmation_layer_plan(
+    host_deletion: bool,
+    group_deletion: bool,
+    local_host_deletion: bool,
+    external_password: bool,
+    external_username: bool,
+) -> Vec<ConnectionsConfirmationLayer> {
+    let mut layers = Vec::new();
+    if host_deletion {
+        layers.push(ConnectionsConfirmationLayer::HostDeletion);
+    }
+    if group_deletion {
+        layers.push(ConnectionsConfirmationLayer::GroupDeletion);
+    }
+    if local_host_deletion {
+        layers.push(ConnectionsConfirmationLayer::LocalHostDeletion);
+    }
+    if external_password {
+        layers.push(ConnectionsConfirmationLayer::ExternalPassword);
+    }
+    if external_username {
+        layers.push(ConnectionsConfirmationLayer::ExternalUsername);
+    }
+    layers
+}
+
+/// 确认层只在选中主机仍匹配待删主机时出现；顺序与面板原 Render 一致。
+///
+/// @author kongweiguang
+fn confirmation_layers(
+    panel: &mut ConnectionsPanel,
+    selected_host: Option<&ManagedHost>,
+    theme: ThemeTokens,
+    cx: &mut Context<ConnectionsPanel>,
+) -> Vec<AnyElement> {
+    let host_deletion = panel
+        .pending_host_deletion
+        .clone()
+        .is_some_and(|pending| selected_host.is_some_and(|host| host.id == pending.host_id));
+    let plan = confirmation_layer_plan(
+        host_deletion,
+        panel.pending_group_deletion.is_some(),
+        panel.local_hosts.pending_delete.is_some(),
+        panel.pending_external_password.is_some(),
+        panel.pending_external_username.is_some(),
+    );
+    let pending_host_deletion = panel.pending_host_deletion.clone();
+    let pending_local_delete = panel.local_hosts.pending_delete.clone();
+    plan.into_iter()
+        .filter_map(|layer| match layer {
+            ConnectionsConfirmationLayer::HostDeletion => {
+                let pending = pending_host_deletion.as_ref()?;
+                let host = selected_host.filter(|host| host.id == pending.host_id)?;
+                Some(render_host_deletion_confirmation(panel, host, theme, cx))
+            }
+            ConnectionsConfirmationLayer::GroupDeletion => {
+                Some(render_group_deletion_confirmation(panel, theme, cx))
+            }
+            ConnectionsConfirmationLayer::LocalHostDeletion => {
+                let pending = pending_local_delete.as_ref()?;
+                Some(render_local_host_deletion_confirmation(
+                    panel, pending, theme, cx,
+                ))
+            }
+            ConnectionsConfirmationLayer::ExternalPassword => {
+                render_external_password_prompt(panel, theme, cx).map(IntoElement::into_any_element)
+            }
+            ConnectionsConfirmationLayer::ExternalUsername => {
+                render_external_username_prompt(panel, theme, cx).map(IntoElement::into_any_element)
+            }
+        })
+        .collect()
 }
 
 impl Render for ConnectionsPanel {
@@ -175,29 +252,11 @@ impl Render for ConnectionsPanel {
         }
 
         // 删除确认统一挂在面板最上层的居中弹层里，确认卡不再参与内容流排版，
-        // 避免在主机空状态下把整块工作区拉成横跨窗口的大弹框。
-        if let Some(pending_deletion) = self.pending_host_deletion.clone()
-            && let Some(host) = selected_host
-                .as_ref()
-                .filter(|host| host.id == pending_deletion.host_id)
-        {
-            panel = panel.child(render_host_deletion_confirmation(self, host, theme, cx));
-        }
-        if self.pending_group_deletion.is_some() {
-            panel = panel.child(render_group_deletion_confirmation(self, theme, cx));
-        }
-        if let Some(pending_delete) = self.local_hosts.pending_delete.clone() {
-            panel = panel.child(render_local_host_deletion_confirmation(
-                self,
-                &pending_delete,
-                theme,
-                cx,
-            ));
-        }
+        // 避免在主机空状态下把整块工作区拉成横跨窗口的大弹框。远端/分组/本地
+        // 与外部凭据共用同一层列表，prompt-only overlay 不会漏画其中任何一类。
+        panel = panel.children(confirmation_layers(self, selected_host.as_ref(), theme, cx));
 
         panel
-            .children(render_external_password_prompt(self, theme, cx))
-            .children(render_external_username_prompt(self, theme, cx))
     }
 }
 

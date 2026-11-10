@@ -378,7 +378,7 @@ impl AppServices {
         self
     }
 
-    /// 让连接面板复用已建立的 host/configuration、SSH trust 与可用 RDP 用例。
+    /// 让连接面板复用已建立的 host/configuration、SSH 连接与可用 RDP 用例。
     pub fn with_connections(
         mut self,
         hosts: HostManagementService,
