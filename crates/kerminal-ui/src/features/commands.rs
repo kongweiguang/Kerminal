@@ -3062,7 +3062,9 @@ impl CommandsView {
                     }
                     Ok(false) => {
                         view.status =
-                            Some(command_message("片段已不存在", "Snippet no longer exists"))
+                            Some(command_message("片段已不存在", "Snippet no longer exists"));
+                        // 回执确认目录已变化，列表必须去掉已不存在的条目。
+                        view.refresh_snippet_page(cx);
                     }
                     Err(error) => view.status = Some(error.public_message().to_owned()),
                 }

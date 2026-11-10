@@ -1041,6 +1041,10 @@ impl CommandsView {
                             view.refresh_snippet_page(cx);
                         }
                         Err(error) => {
+                            if error.public_code() == PublicErrorCode::OutcomeUnknown {
+                                // 副本可能已创建但暂未读到，目录需显示真实状态；确定性失败和取消不重读。
+                                view.refresh_snippet_page(cx);
+                            }
                             // 读回失败或暂未出现都不能证明原提交失败，因此继续保留 ID。
                             view.status = Some(error.public_message().to_owned());
                         }
