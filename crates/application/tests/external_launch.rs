@@ -482,6 +482,73 @@ async fn sftp_client_ignores_host_key_pin_and_still_registers_target() {
     }
 }
 
+/// SFTP 客户端的 pin 只能消费独立值：紧随其后的 URL、空串和 `-`/`/` 选项都不能被误吞；
+/// 空值按缺失处理，后续 URL 仍能正常解析并注册目标。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn sftp_client_host_key_pin_does_not_swallow_following_url_or_empty_value() {
+    for arguments in [
+        vec!["sftp.exe", "/hostkey", "sftp://alice@host.example/"],
+        vec!["sftp.exe", "/hostkey", "", "sftp://alice@host.example/"],
+        vec!["sftp.exe", "/hostkey=", "sftp://alice@host.example/"],
+        vec![
+            "sftp.exe",
+            "--hostkey=SHA256:fixture",
+            "sftp://alice@host.example/",
+        ],
+    ] {
+        let (service, registry) = service(None);
+        let outcome = service
+            .handle_activation(activation(&arguments))
+            .await
+            .expect("pin must not consume the following SFTP URL");
+        let target = match outcome {
+            ExternalLaunchOutcome::Ready { target }
+            | ExternalLaunchOutcome::PasswordRequired { target } => target,
+            other => panic!("explicit SFTP username must route: {other:?}"),
+        };
+        assert_eq!(target.identity.endpoint.host, "host.example");
+        let state = registry.state.lock().expect("test mutex poisoned");
+        assert_eq!(state.registered.len(), 1);
+    }
+}
+
+/// Kerminal CLI 的 pin 缺少值时不能吞掉紧随其后的选项；未知参数仍保持拒绝。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn kerminal_cli_host_key_pin_does_not_swallow_following_option() {
+    let (service, registry) = service(None);
+    let outcome = service
+        .handle_activation(activation(&[
+            "kerminal.exe",
+            "--external-ssh",
+            "--host",
+            "host.example",
+            "--host-key",
+            "--user",
+            "alice",
+        ]))
+        .await
+        .expect("missing pin value must not consume the following option");
+    let target = match outcome {
+        ExternalLaunchOutcome::Ready { target }
+        | ExternalLaunchOutcome::PasswordRequired { target } => target,
+        other => panic!("explicit username must still route: {other:?}"),
+    };
+    assert_eq!(target.identity.endpoint.username, "alice");
+    assert_eq!(
+        registry
+            .state
+            .lock()
+            .expect("test mutex poisoned")
+            .registered
+            .len(),
+        1
+    );
+}
+
 /// URL 的附加 SFTP 意图跨用户名补齐保留，SSH 仍为主连接动作。
 ///
 /// @author kongweiguang

@@ -711,8 +711,16 @@ fn parse_sftp_client(arguments: &[String]) -> AppResult<ExternalLaunchRequest> {
             || lower.starts_with("--hostkey=")
         {
             // 兼容旧 SFTP 脚本中的 pin；当前实现对每个 peer 自动信任并尽力记录 known_hosts。
+            // 日志只允许记录规范化选项名，绝不把 pin 原值写入日志。
+            let option_name = if lower.starts_with("/hostkey") {
+                "/hostkey"
+            } else if lower.starts_with("--host-key") {
+                "--host-key"
+            } else {
+                "--hostkey"
+            };
             let inline = token.split_once('=').map(|(_, value)| value);
-            ignore_removed_host_key_pin(arguments, &mut index, inline, token);
+            ignore_removed_host_key_pin(arguments, &mut index, inline, option_name);
         } else if lower == "/password"
             || lower == "/passphrase"
             || lower == "--password"
@@ -1046,6 +1054,8 @@ fn has_named_option(arguments: &[String], options: &[&str]) -> bool {
 
 /// host key pin 已退出连接准入；旧脚本仍可能传值。消费可选的下一项并告警，
 /// 但不校验、不保存，也不因缺失值中断启动，让连接继续使用统一自动信任策略。
+/// 下一项只按“独立值”候选消费：空串、以 `-`/`/` 开头以及 `sftp://`/`ssh://` URL
+/// 都属于后续选项或目标，不能误吞。日志只记录选项名和是否有值，绝不复制 pin 原值。
 ///
 /// @author kongweiguang
 fn ignore_removed_host_key_pin(
@@ -1054,30 +1064,49 @@ fn ignore_removed_host_key_pin(
     inline: Option<&str>,
     name: &str,
 ) {
-    let value = if let Some(value) = inline {
+    let has_value = if let Some(value) = inline {
         *index += 1;
-        Some(value.to_owned())
-    } else if let Some(value) = arguments
-        .get(*index + 1)
-        .filter(|value| !value.is_empty() && !value.starts_with('-'))
-    {
-        *index += 2;
-        Some(value.clone())
+        !value.trim().is_empty()
     } else {
-        *index += 1;
-        None
+        match arguments.get(*index + 1) {
+            // 空串按缺失处理，但要跨过去，避免后续循环把它当成非法位置参数。
+            Some(value) if value.is_empty() => {
+                *index += 2;
+                false
+            }
+            Some(value) if is_removed_host_key_value_candidate(value) => {
+                *index += 2;
+                true
+            }
+            _ => {
+                *index += 1;
+                false
+            }
+        }
     };
-    match value {
-        Some(value) => tracing::warn!(
+    match has_value {
+        true => tracing::warn!(
             option = name,
-            value = %value,
+            value_present = true,
             "忽略已移除的 SSH host key pin；连接将自动信任并尽力记录主机密钥"
         ),
-        None => tracing::warn!(
+        false => tracing::warn!(
             option = name,
+            value_present = false,
             "忽略缺少值的 SSH host key pin；连接将自动信任并尽力记录主机密钥"
         ),
     }
+}
+
+/// 独立 pin 值必须不是选项、路径前缀或下一个连接 URL；pin 值本身不需要继续解释。
+///
+/// @author kongweiguang
+fn is_removed_host_key_value_candidate(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && !value.starts_with('/')
+        && !starts_with_scheme(value, "sftp://")
+        && !starts_with_scheme(value, "ssh://")
 }
 
 /// 取下一项位置的可选参数，支持 --name=value 并拒绝空值。
