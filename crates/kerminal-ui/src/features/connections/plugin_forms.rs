@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use gpui_kit::{App, Context, Window};
 use kerminal_application::{
-    AppError, PublicErrorCode,
+    AppError, AppResult, PublicErrorCode,
     connections::host_types::{PluginHost, PluginHostDraft},
 };
 use kerminal_domain::{identity::HostId, preferences::ConfigRevision};
@@ -685,4 +685,67 @@ fn plugin_readback_matches(
         && host.configuration_version == draft.configuration_version
         && host.configuration.as_ref() == Some(&draft.configuration)
         && baseline != Some(&host.revision)
+}
+
+#[cfg(feature = "right-rail-acceptance")]
+impl ConnectionsPanel {
+    /// 原生验收选择插件主机类型；沿用协议栏的生产入口，不直接构造表单项。
+    pub fn acceptance_activate_plugin_form(
+        &mut self,
+        type_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_plugin_form(type_id, window, cx);
+    }
+
+    /// 返回活动表单身份、阶段、控件值与面板文案；未打开时明确返回空。
+    pub fn acceptance_plugin_form_snapshot(&self, cx: &App) -> Option<serde_json::Value> {
+        let type_id = self.plugin_forms.active.as_ref()?;
+        let form = self.plugin_forms.forms.get(type_id)?;
+        let phase = match form.phase {
+            Phase::Idle => "idle",
+            Phase::Testing => "testing",
+            Phase::Saving => "saving",
+            Phase::Unknown => "unknown",
+            Phase::Reading => "reading",
+        };
+        Some(serde_json::json!({
+            "typeId": type_id,
+            "hostId": form.host_id.as_str(),
+            "phase": phase,
+            "writeBlocked": self.plugin_forms.write_blocked(),
+            "status": self.status,
+            "form": form.instance.acceptance_snapshot(cx).unwrap_or(serde_json::Value::Null),
+        }))
+    }
+
+    /// 按 schema 指针写入活动表单；生产默认实现拒绝，只有支持验收的表单接受。
+    pub fn acceptance_plugin_form_set_field(
+        &mut self,
+        path: &str,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AppResult<()> {
+        let Some(type_id) = self.plugin_forms.active.clone() else {
+            return Err(AppError::not_found("插件主机表单未打开"));
+        };
+        let form = self
+            .plugin_forms
+            .forms
+            .get_mut(&type_id)
+            .ok_or_else(|| AppError::not_found("插件主机表单实例不存在"))?;
+        form.instance.acceptance_set_field(path, value, window, cx)
+    }
+
+    /// 走生产测试按钮同一入口，异步回执由面板状态和被冻结控件证明。
+    pub fn acceptance_plugin_form_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.test_plugin_form(window, cx);
+    }
+
+    /// 走生产保存按钮同一入口，Vault 准备和 CAS 仍由正式服务完成。
+    pub fn acceptance_plugin_form_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_plugin_form(window, cx);
+    }
 }

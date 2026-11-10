@@ -490,6 +490,66 @@ impl HostFormInstance for ExternalHostForm {
             cx.notify();
         });
     }
+
+    /// 验收写入复用真实 InputState；`$name` 表示名称，其余为 schema 指针。
+    #[cfg(feature = "right-rail-acceptance")]
+    fn acceptance_set_field(
+        &mut self,
+        path: &str,
+        value: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AppResult<()> {
+        let target = self.view.read(cx);
+        let input = if path == "$name" {
+            target.name.clone()
+        } else {
+            target
+                .controls
+                .get(path)
+                .cloned()
+                .ok_or_else(|| AppError::not_found("主机表单字段不存在"))?
+        };
+        input.update(cx, |input, cx| {
+            input.set_value(value.to_owned(), window, cx)
+        });
+        self.view.update(cx, |_, cx| cx.notify());
+        Ok(())
+    }
+
+    /// 验收读取名称、字段类型和当前控件值；秘密字段只报告是否已填写，不回显明文。
+    #[cfg(feature = "right-rail-acceptance")]
+    fn acceptance_snapshot(&self, cx: &App) -> AppResult<Value> {
+        let view = self.view.read(cx);
+        let fields = view
+            .fields
+            .iter()
+            .map(|field| {
+                let value = view
+                    .controls
+                    .get(&field.pointer)
+                    .map(|input| input.read(cx).value().to_string());
+                let kind = match field.kind {
+                    FieldKind::Text => "text",
+                    FieldKind::Number { .. } => "number",
+                    FieldKind::Boolean => "boolean",
+                    FieldKind::Choice(_) => "choice",
+                    FieldKind::Secret => "secret",
+                };
+                json!({
+                    "path": field.pointer,
+                    "kind": kind,
+                    "filled": value.as_deref().is_some_and(|text| !text.is_empty()),
+                    "value": if matches!(field.kind, FieldKind::Secret) { Value::Null } else { Value::String(value.unwrap_or_default()) },
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "name": view.name.read(cx).value().to_string(),
+            "enabled": view.enabled,
+            "fields": fields,
+        }))
+    }
 }
 
 #[cfg(test)]

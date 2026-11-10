@@ -34,6 +34,8 @@ mod plugin_acceptance;
 mod plugin_catalogs;
 #[cfg(all(feature = "acceptance", feature = "right-rail-acceptance"))]
 mod plugin_extensions_acceptance;
+#[cfg(all(windows, feature = "right-rail-acceptance"))]
+mod plugin_host_form_acceptance;
 #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
 mod plugin_list_performance_acceptance;
 #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
@@ -271,6 +273,24 @@ fn main() {
         #[cfg(not(feature = "right-rail-acceptance"))]
         {
             eprintln!("主机编辑器验收入口未编译；请使用 --features right-rail-acceptance 构建。");
+            std::process::exit(2);
+        }
+    }
+    // 主机类型表单验收由隔离启动器的环境变量触发，普通启动不注册该入口。
+    if std::env::var_os("KERMINAL_PLUGIN_HOST_FORM_OUTPUT").is_some() {
+        #[cfg(all(windows, feature = "right-rail-acceptance"))]
+        {
+            if let Err(error) = plugin_host_form_acceptance::run() {
+                eprintln!("主机类型表单验收运行失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(all(windows, feature = "right-rail-acceptance")))]
+        {
+            eprintln!(
+                "主机类型表单验收入口未编译；需要 Windows 与 right-rail-acceptance features。"
+            );
             std::process::exit(2);
         }
     }

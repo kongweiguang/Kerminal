@@ -162,4 +162,91 @@ impl RootView {
     ) {
         self.open_plugin_host(host_id, window, cx);
     }
+
+    /// 原生验收选择插件主机类型后打开同一连接编辑器模态；表单实例仍由生产面板创建。
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn plugin_host_form_acceptance_activate(
+        &mut self,
+        type_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> kerminal_application::AppResult<()> {
+        let panel = self
+            .connections_panel
+            .clone()
+            .ok_or_else(|| kerminal_application::AppError::not_found("连接面板不可用"))?;
+        panel.update(cx, |panel, cx| {
+            panel.acceptance_activate_plugin_form(type_id, window, cx)
+        });
+        if !self.prepare_connection_editor_modal(window, cx) {
+            return Err(kerminal_application::AppError::conflict("连接编辑器未打开"));
+        }
+        Ok(())
+    }
+
+    /// 只读回活动插件表单的身份、阶段、控件与面板文案，供验收断言真实 UI 状态。
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn plugin_host_form_acceptance_snapshot(&self, cx: &gpui_kit::App) -> serde_json::Value {
+        let panel = self
+            .connections_panel
+            .as_ref()
+            .and_then(|panel| panel.read(cx).acceptance_plugin_form_snapshot(cx));
+        serde_json::json!({
+            "modalOpen": self.connections_modal_open,
+            "panel": panel,
+            "rootStatus": self.status.as_ref().map(ToString::to_string),
+        })
+    }
+
+    /// 验收写入活动表单的真实输入控件；不支持验收的表单由 trait 默认实现拒绝。
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn plugin_host_form_acceptance_set_field(
+        &mut self,
+        path: &str,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> kerminal_application::AppResult<()> {
+        let panel = self
+            .connections_panel
+            .clone()
+            .ok_or_else(|| kerminal_application::AppError::not_found("连接面板不可用"))?;
+        panel.update(cx, |panel, cx| {
+            panel.acceptance_plugin_form_set_field(path, value, window, cx)
+        })
+    }
+
+    /// 测试走生产按钮同一入口，不绕过取消、控冻结与回执状态。
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn plugin_host_form_acceptance_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> kerminal_application::AppResult<()> {
+        let panel = self
+            .connections_panel
+            .clone()
+            .ok_or_else(|| kerminal_application::AppError::not_found("连接面板不可用"))?;
+        panel.update(cx, |panel, cx| {
+            panel.acceptance_plugin_form_test(window, cx)
+        });
+        Ok(())
+    }
+
+    /// 保存走生产保存按钮同一入口，Vault 准备与 CAS 仍由正式服务完成。
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn plugin_host_form_acceptance_save(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> kerminal_application::AppResult<()> {
+        let panel = self
+            .connections_panel
+            .clone()
+            .ok_or_else(|| kerminal_application::AppError::not_found("连接面板不可用"))?;
+        panel.update(cx, |panel, cx| {
+            panel.acceptance_plugin_form_save(window, cx)
+        });
+        Ok(())
+    }
 }

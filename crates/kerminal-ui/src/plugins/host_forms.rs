@@ -80,6 +80,24 @@ pub trait HostFormInstance {
 
     /// 只在显式切换或恢复焦点时调用，普通重绘不抢占焦点。
     fn focus(&mut self, _window: &mut Window, _cx: &mut App) {}
+
+    /// 原生验收按字段路径写入真实输入控件；生产表单默认拒绝，避免绕过用户输入。
+    #[cfg(feature = "right-rail-acceptance")]
+    fn acceptance_set_field(
+        &mut self,
+        _path: &str,
+        _value: &str,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> AppResult<()> {
+        Err(AppError::unsupported("主机表单不支持验收写入"))
+    }
+
+    /// 原生验收读取控件与草稿；只返回已挂载字段，不伪造未提供的值。
+    #[cfg(feature = "right-rail-acceptance")]
+    fn acceptance_snapshot(&self, _cx: &App) -> AppResult<serde_json::Value> {
+        Err(AppError::unsupported("主机表单不支持验收读取"))
+    }
 }
 
 /// 注册表仅保存工厂；表单实体由各窗口和编辑任务独立持有。
