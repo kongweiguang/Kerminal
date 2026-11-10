@@ -695,12 +695,14 @@ fn render_pane_projection(
         });
         if let Some(scope) = projection.close_operation_failure {
             return render_close_failure_placeholder(
-                pane_id,
-                message,
-                scope,
-                tab_id,
-                retry_emitter,
-                reconnect_emitter,
+                PlaceholderCloseFailure {
+                    pane_id,
+                    message,
+                    scope,
+                    tab_id,
+                    retry_emitter,
+                    event_emitter: reconnect_emitter,
+                },
                 window,
                 cx,
             );
@@ -1051,20 +1053,33 @@ fn render_placeholder_with_probe(
     body.into_any_element()
 }
 
+/// 失败关闭占位的一组不可变输入，避免渲染函数参数过多并与测量占位保持同构。
+struct PlaceholderCloseFailure<'a> {
+    pane_id: &'a PaneId,
+    message: SharedString,
+    scope: CloseOperationFailureScope,
+    tab_id: &'a TabId,
+    retry_emitter: &'a Rc<RetryEmitter>,
+    event_emitter: &'a Rc<ReconnectEmitter>,
+}
+
 /// 失败关闭占位必须同时给出“重试关闭”和真实的保留出口；用户不能被持续失败锁在无法保存/新建的状态。
 /// 保留动作只发事件，不在这里触碰 controller 或 session。
 ///
 /// @author kongweiguang
 fn render_close_failure_placeholder(
-    pane_id: &PaneId,
-    message: SharedString,
-    scope: CloseOperationFailureScope,
-    tab_id: &TabId,
-    retry_emitter: &Rc<RetryEmitter>,
-    event_emitter: &Rc<ReconnectEmitter>,
+    presentation: PlaceholderCloseFailure<'_>,
     window: &mut Window,
     cx: &mut Context<WorkspacePanes>,
 ) -> AnyElement {
+    let PlaceholderCloseFailure {
+        pane_id,
+        message,
+        scope,
+        tab_id,
+        retry_emitter,
+        event_emitter,
+    } = presentation;
     let theme = ThemeTokens::current(window, cx);
     let retry_tab = tab_id.clone();
     let retry_pane = pane_id.clone();

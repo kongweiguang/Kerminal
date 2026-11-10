@@ -201,13 +201,12 @@ fn two_pane_terminal_with_live_second(
                 sizes: None,
             };
             for tab in &mut snapshot.terminal_tabs {
-                if tab.id() == &tab_id {
-                    if let WorkspaceSessionTab::Terminal {
+                if tab.id() == &tab_id
+                    && let WorkspaceSessionTab::Terminal {
                         layout: tab_layout, ..
                     } = tab
-                    {
-                        *tab_layout = layout.clone();
-                    }
+                {
+                    *tab_layout = layout.clone();
                 }
             }
             controller.synchronize_snapshot(snapshot).unwrap();
