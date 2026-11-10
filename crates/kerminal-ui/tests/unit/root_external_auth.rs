@@ -319,6 +319,7 @@ impl SavedExternalTargetLookup for TemporaryTargets {
 struct CapturingSessions {
     creates: Mutex<Vec<CreateSessionRequest>>,
     live: Mutex<Option<split_lifecycle::LiveSession>>,
+    closed: Mutex<Vec<SessionId>>,
 }
 
 #[async_trait]
@@ -506,12 +507,14 @@ impl SessionService for CapturingSessions {
         }
         unavailable()
     }
-    /// 没有已建立的 session 可关闭。
-    async fn close(&self, _: SessionId) -> AppResult<()> {
+    /// 记录关闭尝试供 split 收尾回归断言；仍返回不可用以保留清理 owner 重试路径。
+    async fn close(&self, session_id: SessionId) -> AppResult<()> {
+        self.closed.lock().unwrap().push(session_id);
         unavailable()
     }
-    /// 没有已建立的 session 可按时限关闭。
-    async fn close_until(&self, _: SessionId, _: SessionDeadline) -> AppResult<()> {
+    /// 记录按时限关闭尝试；真实关闭失败由调用方降级为可重试清理。
+    async fn close_until(&self, session_id: SessionId, _: SessionDeadline) -> AppResult<()> {
+        self.closed.lock().unwrap().push(session_id);
         unavailable()
     }
     /// 不操作进程外的会话。

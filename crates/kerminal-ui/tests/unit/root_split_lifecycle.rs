@@ -26,6 +26,7 @@ use crate::{
     features::{
         workspace_controller::{WorkspaceResourceOperation, WorkspaceRestoreFailure},
         workspace_panes::WorkspacePaneEvent,
+        workspace_tabs::WorkspaceTabEvent,
     },
     root::{
         workspace_close::{WorkspaceDeferredCloseIntent, WorkspaceResourceOperationEntry},
@@ -532,8 +533,190 @@ fn in_flight_split_close_still_waits_for_receipt(app: &mut TestAppContext) {
     });
 }
 
-/// 准入失败后必须精确丢弃本次 pending 并移除空候选；恢复的资源槽要允许后续新建终端，
-/// 同时不能删除任何仍有 session/orphan 的资源。
+/// Ready 收尾失败必须写回 failed CreatePane：候选仍可重试、标签切换不被锁死。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn ready_writeback_failure_stays_retryable_and_activation_is_allowed(app: &mut TestAppContext) {
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (tab_id, _, operation) = ready_split_candidate(&root, visual, &runtime, &sessions);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            let WorkspaceResourceOperation::CreatePane { pane, .. } = &operation else {
+                panic!("split must create a pane");
+            };
+            let candidate = pane.id.clone();
+            root.workspace_runtime
+                .mark_restore_failed(&candidate)
+                .unwrap();
+            root.fail_workspace_split_after_ready(&tab_id, &candidate, cx);
+            assert!(
+                matches!(
+                    root.workspace_controller
+                        .as_ref()
+                        .unwrap()
+                        .retry_pending_resource_operation(),
+                    Some(WorkspaceResourceOperation::CreatePane { .. })
+                ),
+                "Ready 收尾失败必须留下可重试失败项"
+            );
+            assert!(
+                root.handle_workspace_tab_event(
+                    &WorkspaceTabEvent::Activate(tab_id.clone()),
+                    window,
+                    cx,
+                ),
+                "失败候选不能阻止标签激活"
+            );
+            assert_eq!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .snapshot()
+                    .active_tab_id
+                    .as_ref(),
+                Some(&tab_id)
+            );
+        });
+    });
+}
+
+/// 带 retained session 的失败候选关闭时必须走 CloseSession，而不是等待创建回执。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn closing_failed_split_with_session_launches_close_session(app: &mut TestAppContext) {
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (tab_id, _, operation) = ready_split_candidate(&root, visual, &runtime, &sessions);
+    let session_id = SessionId::new();
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            let WorkspaceResourceOperation::CreatePane {
+                operation_id, pane, ..
+            } = &operation
+            else {
+                panic!("split must create a pane");
+            };
+            let candidate = pane.id.clone();
+            let target = SessionTarget::Local(LocalSessionTarget {
+                program: OsString::from("fixture-cleanup"),
+                args: Vec::new(),
+                working_directory: None,
+                environment: BTreeMap::new(),
+            });
+            root.workspace_runtime
+                .retain_cleanup_session(
+                    &candidate,
+                    session_id.clone(),
+                    target,
+                    TerminalSize::default(),
+                    None,
+                    "fixture retained session".into(),
+                )
+                .unwrap();
+            root.workspace_controller
+                .as_mut()
+                .unwrap()
+                .fail_pending_create_pane(
+                    &tab_id,
+                    &candidate,
+                    WorkspaceRestoreFailure::ResourceFailure,
+                );
+            root.workspace_resource_operations
+                .get_mut(&candidate)
+                .expect("split resource entry")
+                .try_admit_split_measurement(operation_id, 1);
+            assert!(root.defer_workspace_split_close_intent(
+                WorkspaceDeferredCloseIntent::Pane {
+                    tab_id: tab_id.clone(),
+                    pane_id: candidate.clone(),
+                },
+                true,
+                None,
+                None,
+                window,
+                cx,
+            ));
+            assert!(
+                matches!(
+                    root.workspace_controller
+                        .as_ref()
+                        .unwrap()
+                        .pending_resource_operation(),
+                    Some(WorkspaceResourceOperation::ClosePane { pane_id, .. })
+                        if *pane_id == candidate
+                ),
+                "失败候选必须替换为 ClosePane，而不是继续等待 CreatePane ACK"
+            );
+        });
+    });
+    settle(&runtime, visual);
+    assert!(
+        sessions.closed.lock().unwrap().contains(&session_id),
+        "带 session 的失败候选必须实际启动关闭"
+    );
+}
+
+/// 无 session/orphan 的失败候选在新建终端前被精确丢弃，不删除其它资源记录。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn reserve_new_terminal_discards_failed_empty_split(app: &mut TestAppContext) {
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (tab_id, source_pane, operation) =
+        ready_split_candidate(&root, visual, &runtime, &sessions);
+    visual.update(|_, app| {
+        root.update(app, |root, cx| {
+            let WorkspaceResourceOperation::CreatePane { pane, .. } = &operation else {
+                panic!("split must create a pane");
+            };
+            let candidate = pane.id.clone();
+            root.workspace_runtime
+                .mark_restore_failed(&candidate)
+                .unwrap();
+            root.workspace_controller
+                .as_mut()
+                .unwrap()
+                .fail_pending_create_pane(
+                    &tab_id,
+                    &candidate,
+                    WorkspaceRestoreFailure::ResourceFailure,
+                );
+            root.workspace_resource_operations.insert(
+                source_pane.clone(),
+                WorkspaceResourceOperationEntry::new("unrelated-operation".into()),
+            );
+            let (new_pane, _) =
+                workspace_pane_for_terminal_target(None, "after-failed-split", None);
+            assert!(
+                root.reserve_new_workspace_terminal_tab(
+                    new_pane,
+                    "After failed split".into(),
+                    TerminalSize::default(),
+                    false,
+                    cx,
+                )
+                .is_ok(),
+                "无资源的失败候选不能阻塞新终端"
+            );
+            assert!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .pending_resource_operation()
+                    .is_none()
+            );
+            assert!(root.workspace_runtime.pane(&candidate).is_none());
+            assert!(!root.workspace_resource_operations.contains_key(&candidate));
+            assert_eq!(
+                root.workspace_resource_operations
+                    .get(&source_pane)
+                    .expect("unrelated entry remains")
+                    .operation_id(),
+                "unrelated-operation"
+            );
+        });
+    });
+}
+
+/// 失败候选的准入失败仍会精确清理，且不影响其它资源 owner。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]

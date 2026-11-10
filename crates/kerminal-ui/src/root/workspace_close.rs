@@ -369,6 +369,26 @@ impl WorkspaceResourceOperationEntry {
         }
     }
 
+    /// 失败分屏转入 ClosePane 时继承原关闭意图与焦点票据：只有真实资源关闭成功后才交出票据，
+    /// 关闭失败仍由同一 entry 保留重试入口，期间 cancel_requested 禁止重新准入。
+    ///
+    /// @author kongweiguang
+    pub(super) fn new_deferred_close(
+        operation_id: String,
+        intent: WorkspaceDeferredCloseIntent,
+        close_focus: Option<CloseSurvivorFocusIntent>,
+        close_tab_focus: Option<CloseTabFocusIntent>,
+    ) -> Self {
+        Self {
+            operation_id,
+            cancel_requested: true,
+            deferred_close: Some(intent),
+            split_measured_layout_generation: None,
+            close_focus,
+            close_tab_focus,
+        }
+    }
+
     /// 只读暴露操作身份，供 controller 与异步回执做精确匹配。
     ///
     /// @author kongweiguang
@@ -2095,6 +2115,11 @@ impl RootView {
         if self.defer_transfer_close_until_clear(event, window, cx) {
             return false;
         }
+        // 已结束失败且无真实资源的候选不应阻塞其它标签的关闭或结构操作；
+        // 激活仍保留失败项可见，由用户显式选择是否丢弃。
+        if !matches!(event, WorkspaceTabEvent::Activate(_)) {
+            self.discard_unresourced_failed_split_candidate(cx);
+        }
         self.apply_workspace_tab_event(event, window, cx)
     }
 
@@ -2770,6 +2795,9 @@ impl RootView {
                     self.complete_close_survivor_focus(close_focus, cx);
                     self.complete_close_tab_focus(close_tab_focus, cx);
                     self.persist_workspace_snapshot(cx);
+                    if let Some(pane_id) = pane_ids.first() {
+                        self.replay_failed_split_close_after_success(pane_id, &operation_id, cx);
+                    }
                     self.advance_workspace_tab_close_batch(cx);
                 }
                 Some(Err(error)) => self.status = Some(error.public_message().to_owned().into()),
@@ -3051,6 +3079,13 @@ impl RootView {
                         root.complete_close_survivor_focus(close_focus, cx);
                         root.complete_close_tab_focus(close_tab_focus, cx);
                         root.persist_workspace_snapshot(cx);
+                        if let Some(pane_id) = pane_ids.first() {
+                            root.replay_failed_split_close_after_success(
+                                pane_id,
+                                &operation_id_for_task,
+                                cx,
+                            );
+                        }
                         root.advance_workspace_tab_close_batch(cx);
                     }
                     Some(Err(error)) => {
@@ -3260,20 +3295,13 @@ impl RootView {
             pane_phase,
             Some(RuntimePanePhase::RestorePending | RuntimePanePhase::RestoreFailed)
         );
-        let has_session_owner = self
+        let has_no_resources = self
             .workspace_runtime
-            .session_for_pane(&preview.pane_id)
-            .is_some();
-        let has_orphan_owner = self
-            .workspace_runtime
-            .orphan_cleanup_for_pane(&preview.pane_id)
-            .next()
-            .is_some();
+            .has_no_session_or_orphan(&preview.pane_id);
         // open 任务已经失败结束时不会再有清理回执；此时允许用户取消空白候选。
         // 仍在途的测量/恢复必须继续等待真实 ACK，不能把“已放行”误当成资源已回收。
-        let completed_failure = pane_phase == Some(RuntimePanePhase::RestoreFailed)
-            && !has_session_owner
-            && !has_orphan_owner;
+        let completed_failure =
+            pane_phase == Some(RuntimePanePhase::RestoreFailed) && has_no_resources;
         if owner.split_measurement_started() && !completed_failure {
             self.status = Some(crate::locale::text(
                 "分屏恢复已经开始，不能撤销正在等待的资源操作。",
@@ -3290,7 +3318,7 @@ impl RootView {
             cx.notify();
             return true;
         }
-        if !pane_is_empty_candidate || has_session_owner || has_orphan_owner {
+        if !pane_is_empty_candidate || !has_no_resources {
             self.status = Some(crate::locale::text(
                 "分屏资源已进入恢复或清理阶段，不能直接取消；请等待状态回执。",
                 "Split resources are restoring or cleaning up and cannot be discarded; wait for their status receipt.",
@@ -3344,12 +3372,222 @@ impl RootView {
     fn failed_split_candidate_without_resources(&self, pane_id: &PaneId) -> bool {
         self.workspace_runtime.pane(pane_id).is_some_and(|pane| {
             pane.phase == RuntimePanePhase::RestoreFailed && pane.session_id.is_none()
-        }) && self.workspace_runtime.session_for_pane(pane_id).is_none()
-            && self
-                .workspace_runtime
-                .orphan_cleanup_for_pane(pane_id)
-                .next()
-                .is_none()
+        }) && self.workspace_runtime.has_no_session_or_orphan(pane_id)
+    }
+
+    /// Ready 后的收尾失败已经结束 CreatePane 的资源创建，不会再产生清理 ACK。
+    /// 写回 controller 失败并停止批量队列，让候选显示可关闭/可重试状态而不是锁住宿主。
+    ///
+    /// @author kongweiguang
+    pub(super) fn fail_workspace_split_after_ready(
+        &mut self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+        cx: &mut Context<RootView>,
+    ) {
+        if let Some(controller) = self.workspace_controller.as_mut() {
+            controller.fail_pending_create_pane(
+                tab_id,
+                pane_id,
+                WorkspaceRestoreFailure::ResourceFailure,
+            );
+        }
+        self.abort_split_batch_for_pane(pane_id, self.status.clone(), cx);
+        self.refresh_workspace_views(cx);
+        cx.notify();
+    }
+
+    /// 已结束失败的 CreatePane 候选若只剩界面占位，就不再以“未完成资源”阻塞其它结构操作。
+    /// 只有精确 pending、匹配 entry 且运行态确实无 session/orphan 时才丢弃。
+    ///
+    /// @author kongweiguang
+    pub(super) fn discard_unresourced_failed_split_candidate(
+        &mut self,
+        cx: &mut Context<RootView>,
+    ) -> bool {
+        let Some((operation_id, tab_id, pane_id)) = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.retry_pending_resource_operation())
+            .and_then(|operation| match operation {
+                WorkspaceResourceOperation::CreatePane {
+                    operation_id,
+                    tab_id,
+                    pane,
+                    ..
+                } => Some((operation_id, tab_id, pane.id)),
+                WorkspaceResourceOperation::ClosePane { .. }
+                | WorkspaceResourceOperation::CloseTab { .. } => None,
+            })
+        else {
+            return false;
+        };
+        if !self.workspace_runtime.has_no_session_or_orphan(&pane_id) {
+            return false;
+        }
+        if let Some(entry) = self.workspace_resource_operations.get(&pane_id) {
+            // 已有关闭意图的候选由 deferred close 自己收尾，自动丢弃不能抢走焦点票据。
+            if entry.operation_id() != operation_id || entry.cancel_requested() {
+                return false;
+            }
+        }
+        let pane_is_failed_candidate = match self.workspace_runtime.pane(&pane_id) {
+            None => false,
+            Some(pane)
+                if pane.tab_id == tab_id && pane.phase == RuntimePanePhase::RestoreFailed =>
+            {
+                true
+            }
+            Some(_) => return false,
+        };
+
+        self.cancel_workspace_restore(&pane_id);
+        if pane_is_failed_candidate
+            && !matches!(self.workspace_runtime.remove_empty_pane(&pane_id), Ok(true))
+        {
+            return false;
+        }
+        let discarded = self
+            .workspace_controller
+            .as_mut()
+            .is_some_and(|controller| {
+                controller.discard_pending_resource_operation_if(&operation_id);
+                controller.pending_resource_operation().is_none()
+            });
+        if !discarded {
+            return false;
+        }
+        if self
+            .workspace_resource_operations
+            .get(&pane_id)
+            .is_some_and(|entry| entry.operation_id() == operation_id)
+        {
+            self.workspace_resource_operations.remove(&pane_id);
+        }
+        self.discard_split_batch_for_pane(&pane_id, cx);
+        self.refresh_workspace_views(cx);
+        cx.notify();
+        true
+    }
+
+    /// 只读核对失败 CreatePane 的完整身份；Ready 收尾失败与 deferred close 共用同一判定，
+    /// 在途候选不会被误当成已结束失败而提前关闭资源。
+    fn failed_split_pending_matches(
+        &self,
+        operation_id: &str,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+    ) -> bool {
+        self.workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.retry_pending_resource_operation())
+            .is_some_and(|operation| {
+                matches!(
+                    operation,
+                    WorkspaceResourceOperation::CreatePane {
+                        operation_id: pending_id,
+                        tab_id: pending_tab,
+                        pane,
+                        ..
+                    } if pending_id == operation_id
+                        && pending_tab == *tab_id
+                        && pane.id == *pane_id
+                )
+            })
+    }
+
+    /// 失败候选仍有 retained session/orphan 时，把原 CreatePane 精确替换为 ClosePane，
+    /// 让真实资源走既有 CloseSession 生命周期；关闭成功后再重放原关闭意图。
+    /// 任一身份不匹配都保留原状态，避免误关其它代次资源。
+    ///
+    /// @author kongweiguang
+    fn abandon_failed_split_with_resources(
+        &mut self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+        operation_id: &str,
+        cx: &mut Context<RootView>,
+    ) -> bool {
+        let pending_matches = self.failed_split_pending_matches(operation_id, tab_id, pane_id);
+        let entry_matches = self
+            .workspace_resource_operations
+            .get(pane_id)
+            .is_some_and(|entry| entry.operation_id() == operation_id && entry.cancel_requested());
+        if !pending_matches || !entry_matches {
+            return false;
+        }
+        let Some((intent, close_focus, close_tab_focus)) = self
+            .workspace_resource_operations
+            .get_mut(pane_id)
+            .and_then(|entry| {
+                entry.take_deferred_close_after_cleanup_with_focus(operation_id, true)
+            })
+        else {
+            return false;
+        };
+        let Some(operation) = self.workspace_controller.as_mut().and_then(|controller| {
+            controller.replace_failed_create_pane_with_close(tab_id, pane_id, operation_id)
+        }) else {
+            // 控制器状态已经换代时不能丢失用户关闭意图，把票据放回原 entry 等待重试。
+            self.workspace_resource_operations.insert(
+                pane_id.clone(),
+                WorkspaceResourceOperationEntry::new_deferred_close(
+                    operation_id.to_owned(),
+                    intent,
+                    close_focus,
+                    close_tab_focus,
+                ),
+            );
+            return false;
+        };
+        self.workspace_resource_operations.insert(
+            pane_id.clone(),
+            WorkspaceResourceOperationEntry::new_deferred_close(
+                operation.operation_id().to_owned(),
+                intent,
+                close_focus,
+                close_tab_focus,
+            ),
+        );
+        self.apply_workspace_resource_operation_with_focus(operation, None, None, cx);
+        true
+    }
+
+    /// ClosePane 成功后重放失败分屏的原始关闭意图；票据只从精确 entry 取一次，
+    /// 迟到或重复成功回执不能再次关闭其它 pane。
+    ///
+    /// @author kongweiguang
+    fn replay_failed_split_close_after_success(
+        &mut self,
+        pane_id: &PaneId,
+        operation_id: &str,
+        cx: &mut Context<RootView>,
+    ) {
+        let Some((intent, close_focus, close_tab_focus)) = self
+            .workspace_resource_operations
+            .get_mut(pane_id)
+            .and_then(|entry| {
+                entry.take_deferred_close_after_cleanup_with_focus(operation_id, true)
+            })
+        else {
+            return;
+        };
+        self.workspace_resource_operations.remove(pane_id);
+        let window_handle = self.window_handle;
+        cx.spawn(async move |this, cx| {
+            let _ = cx.update_window(window_handle, move |_, window, app| {
+                let _ = this.update(app, |root, cx| {
+                    root.replay_deferred_workspace_close(
+                        intent,
+                        close_focus,
+                        close_tab_focus,
+                        window,
+                        cx,
+                    );
+                });
+            });
+        })
+        .detach();
     }
 
     /// Split 独占 reducer 资源槽时先保留关闭意图与原始焦点代次；仅首个请求捕获，重复请求不能升级或替换来源。
@@ -3471,6 +3709,26 @@ impl RootView {
                         window,
                         cx,
                     );
+                } else if self.failed_split_pending_matches(
+                    &operation_id,
+                    &split_tab_id,
+                    &split_pane_id,
+                ) {
+                    // Ready 收尾失败仍可能保留 session/orphan；改走 ClosePane，不能等待
+                    // 一个已经结束的创建任务回执。仍有在途资源但未写回失败时继续等待。
+                    if !self.abandon_failed_split_with_resources(
+                        &split_tab_id,
+                        &split_pane_id,
+                        &operation_id,
+                        cx,
+                    ) {
+                        self.status = Some(crate::locale::text(
+                            "分屏资源归属或关闭状态未能核对；保留原记录，请稍后重试关闭。",
+                            "Split resource ownership or close state could not be verified; the record was retained. Retry close shortly.",
+                        ));
+                        self.refresh_workspace_views(cx);
+                        cx.notify();
+                    }
                 } else {
                     self.status = Some(crate::locale::text(
                         "正在取消分屏创建；收到资源清理回执后继续关闭。",
@@ -3529,13 +3787,7 @@ impl RootView {
         if !pending_matches || entry.operation_id() != operation_id || !entry.cancel_requested() {
             return;
         }
-        if self.workspace_runtime.session_for_pane(pane_id).is_some()
-            || self
-                .workspace_runtime
-                .orphan_cleanup_for_pane(pane_id)
-                .next()
-                .is_some()
-        {
+        if !self.workspace_runtime.has_no_session_or_orphan(pane_id) {
             self.status = Some(crate::locale::text(
                 "分屏资源仍待清理；原关闭操作会在核对完成后继续。",
                 "Split resources still need cleanup; the original close will continue after confirmation.",
@@ -3718,13 +3970,7 @@ impl RootView {
         if !matches || entry.operation_id() != operation_id || !entry.cancel_requested() {
             return;
         }
-        if self.workspace_runtime.session_for_pane(pane_id).is_some()
-            || self
-                .workspace_runtime
-                .orphan_cleanup_for_pane(pane_id)
-                .next()
-                .is_some()
-        {
+        if !self.workspace_runtime.has_no_session_or_orphan(pane_id) {
             return;
         }
         let window_handle = self.window_handle;

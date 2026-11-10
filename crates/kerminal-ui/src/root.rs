@@ -1510,7 +1510,7 @@ impl RootView {
                 .then(|| (tab_id.clone(), pane.as_ref().clone()))
         });
         if let Some(controller) = self.workspace_controller.as_mut() {
-            let _ = controller.discard_pending_resource_operation_if(operation_id);
+            controller.discard_pending_resource_operation_if(operation_id);
         }
         if let Some((tab_id, pane)) = candidate {
             let no_other_owner = self
@@ -1522,12 +1522,7 @@ impl RootView {
                     && runtime.persisted == pane
                     && runtime.session_id.is_none()
             });
-            let no_resources = self.workspace_runtime.session_for_pane(pane_id).is_none()
-                && self
-                    .workspace_runtime
-                    .orphan_cleanup_for_pane(pane_id)
-                    .next()
-                    .is_none();
+            let no_resources = self.workspace_runtime.has_no_session_or_orphan(pane_id);
             if no_other_owner && runtime_matches && no_resources {
                 self.cancel_workspace_restore(pane_id);
                 if matches!(self.workspace_runtime.remove_empty_pane(pane_id), Ok(true)) {
@@ -3032,6 +3027,16 @@ impl RootView {
                 self.cancel_unadmitted_workspace_split(&preview, cx);
             }
             workspace_render::WorkspaceRenderEvent::Pane { tab_id, event } => {
+                // 失败且没有 session/orphan 的候选只剩占位；其它 pane 的关闭或分屏
+                // 不应被一个不存在清理回执的失败项挡住。激活等其他事件保持候选可见。
+                if matches!(
+                    &event,
+                    WorkspacePaneEvent::Close(_)
+                        | WorkspacePaneEvent::CloseFromKeyboard { .. }
+                        | WorkspacePaneEvent::Split { .. }
+                ) {
+                    self.discard_unresourced_failed_split_candidate(cx);
+                }
                 if let WorkspacePaneEvent::CancelSplitTarget {
                     pane_id,
                     direction,

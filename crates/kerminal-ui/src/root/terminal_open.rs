@@ -36,21 +36,12 @@ use tokio_util::sync::CancellationToken;
 use super::{
     RootView, WorkspaceTerminalOpenKind,
     workspace_runtime::{OrphanCleanupInput, RuntimePanePhase, WorkspaceRuntime},
+    workspace_sessions::workspace_restore_failure_for_code,
 };
 use crate::features::workspace_controller::{
     WorkspacePersistenceState, WorkspaceRestoreFailure, WorkspaceRestoreItemId,
 };
 use crate::features::workspace_tabs::append_shared_sftp_workbench_projection;
-
-/// 打开结果只保留稳定错误类别；取消要映射为可取消重试项，其余失败保留真实资源失败语义。
-/// @author kongweiguang
-fn workspace_restore_failure_for_code(code: PublicErrorCode) -> WorkspaceRestoreFailure {
-    if code == PublicErrorCode::Cancelled {
-        WorkspaceRestoreFailure::Cancelled
-    } else {
-        WorkspaceRestoreFailure::ResourceFailure
-    }
-}
 
 /// 工作区 CAS 回执供 Root 的退出门控使用，未知提交与回读确认必须保持不同结果。
 pub(super) enum WorkspaceSnapshotSaveCompletion {
@@ -712,6 +703,7 @@ impl RootView {
                                     "The terminal's first frame does not match its session identity or size; the resource is retained for cleanup.",
                                 ),
                             ));
+                            root.fail_workspace_split_after_ready(&tab_id, &pane_id, cx);
                             return true;
                         }
                         if root.workspace_runtime.install_session(
@@ -728,6 +720,7 @@ impl RootView {
                                     "The terminal started, but the pane is occupied by another session.",
                                 ),
                             ));
+                            root.fail_workspace_split_after_ready(&tab_id, &pane_id, cx);
                             return true;
                         }
                         let accepted_snapshot = root.workspace_runtime.accept_initial_snapshot(
@@ -768,7 +761,7 @@ impl RootView {
                             } else {
                                 root.status = Some(message);
                             }
-                            root.refresh_workspace_views(cx);
+                            root.fail_workspace_split_after_ready(&tab_id, &pane_id, cx);
                             return true;
                         }
 
@@ -777,6 +770,7 @@ impl RootView {
                                 "终端已就绪，但无法更新 pane 状态。",
                                 "The terminal is ready, but pane state could not be updated.",
                             ));
+                            root.fail_workspace_split_after_ready(&tab_id, &pane_id, cx);
                             return true;
                         }
                         let Some(_layout) = root.workspace_runtime.tab_layout(&tab_id).cloned() else {
@@ -812,7 +806,7 @@ impl RootView {
                             } else {
                                 root.status = Some(message);
                             }
-                            root.refresh_workspace_views(cx);
+                            root.fail_workspace_split_after_ready(&tab_id, &pane_id, cx);
                             return true;
                         };
 

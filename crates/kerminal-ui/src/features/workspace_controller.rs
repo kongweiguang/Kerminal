@@ -682,13 +682,14 @@ impl WorkspaceController {
 
     /// 分屏打开任务已结束并失败时必须写回候选；否则重试入口拿不到失败项，
     /// 资源槽也会永久拒绝后续标签与新建终端。只匹配同一 tab 与候选 pane。
+    /// 返回值不再暴露“是否命中”，生产调用方只关心候选最终状态。
     /// @author kongweiguang
     pub fn fail_pending_create_pane(
         &mut self,
         tab_id: &TabId,
         pane_id: &PaneId,
         failure: WorkspaceRestoreFailure,
-    ) -> bool {
+    ) {
         let Some(operation_id) = self.pending_resource.as_ref().and_then(|pending| {
             let WorkspaceResourceOperation::CreatePane {
                 operation_id,
@@ -701,24 +702,63 @@ impl WorkspaceController {
             };
             (pending_tab == tab_id && pane.id == *pane_id).then(|| operation_id.clone())
         }) else {
-            return false;
+            return;
         };
-        self.complete_resource_operation(&operation_id, Err(failure))
-            .is_ok()
+        let _ = self.complete_resource_operation(&operation_id, Err(failure));
+    }
+
+    /// Ready 收尾失败后 CreatePane 不会再产生资源 ACK；把精确失败候选替换为 ClosePane，
+    /// 让 retained session/orphan 走既有关闭生命周期，避免 deferred close 等待不存在的回执。
+    /// 所有身份字段必须同时匹配，防止替换掉并发的另一项资源操作。
+    /// @author kongweiguang
+    pub fn replace_failed_create_pane_with_close(
+        &mut self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+        operation_id: &str,
+    ) -> Option<WorkspaceResourceOperation> {
+        let matches = self.pending_resource.as_ref().is_some_and(|pending| {
+            pending.failed.is_some()
+                && matches!(
+                    &pending.operation,
+                    WorkspaceResourceOperation::CreatePane {
+                        operation_id: pending_id,
+                        tab_id: pending_tab,
+                        pane,
+                        ..
+                    } if pending_id == operation_id
+                        && pending_tab == tab_id
+                        && pane.id == *pane_id
+                )
+        });
+        if !matches {
+            return None;
+        }
+        let operation = WorkspaceResourceOperation::ClosePane {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            tab_id: tab_id.clone(),
+            pane_id: pane_id.clone(),
+        };
+        self.pending_resource = Some(PendingResourceChange {
+            operation: operation.clone(),
+            candidate: self.snapshot.clone(),
+            failed: None,
+        });
+        Some(operation)
     }
 
     /// 准入失败没有可重试的真实资源；只有精确 operation 的候选可以被丢弃，
-    /// 避免误清后来的资源操作或批量关闭状态。返回是否实际丢弃。
+    /// 避免误清后来的资源操作或批量关闭状态。
     /// @author kongweiguang
-    pub fn discard_pending_resource_operation_if(&mut self, operation_id: &str) -> bool {
+    pub fn discard_pending_resource_operation_if(&mut self, operation_id: &str) {
         if !self
             .pending_resource
             .as_ref()
             .is_some_and(|pending| pending.operation.operation_id() == operation_id)
         {
-            return false;
+            return;
         }
-        self.discard_pending_resource_operation()
+        self.discard_pending_resource_operation();
     }
 
     /// 再次返回原资源请求；Root 可在用户确认后重试，不会悄悄换 target 或重新生成 ID。
@@ -2131,17 +2171,12 @@ impl WorkspaceController {
     /// 用户切走失败候选后，重试成功应提交用户当前所在位置，而不是把视图拉回失败发生时的标签；
     /// 只镜像三个选择字段，布局与候选 pane 仍由原操作独占。
     fn mirror_selection_into_failed_split_candidate(&mut self) {
+        if !self.failed_create_pane_pending() {
+            return;
+        }
         let Some(pending) = self.pending_resource.as_mut() else {
             return;
         };
-        if pending.failed.is_none()
-            || !matches!(
-                &pending.operation,
-                WorkspaceResourceOperation::CreatePane { .. }
-            )
-        {
-            return;
-        }
         pending.candidate.active_tab_id = self.snapshot.active_tab_id.clone();
         pending.candidate.focused_pane_id = self.snapshot.focused_pane_id.clone();
         pending.candidate.selected_machine_id = self.snapshot.selected_machine_id.clone();

@@ -398,6 +398,15 @@ impl WorkspaceRuntime {
         Ok(())
     }
 
+    /// 失败空白候选只有在没有 session 与 orphan owner 时才能直接丢弃。
+    /// 关闭、取消与新建终端都会做同一判断，集中到这里避免各自漏掉一种资源所有者。
+    ///
+    /// @author kongweiguang
+    pub fn has_no_session_or_orphan(&self, pane_id: &PaneId) -> bool {
+        self.session_for_pane(pane_id).is_none()
+            && self.orphan_cleanup_for_pane(pane_id).next().is_none()
+    }
+
     /// 在 pane 已被替换或移除时仍保留真实 owner；按值接收 DTO 保留 lease 与状态字段原有所有权。
     ///
     /// @author kongweiguang

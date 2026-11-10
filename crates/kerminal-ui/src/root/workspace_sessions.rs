@@ -68,6 +68,9 @@ impl RootView {
                 "The workspace is still loading. Try creating a terminal again shortly.",
             ));
         }
+        // 已结束失败且没有 session/orphan 的分屏候选只剩界面占位；先精确丢弃，
+        // 否则一个不存在资源回执的失败项会永久拒绝新终端。
+        self.discard_unresourced_failed_split_candidate(cx);
         let Some(controller) = self.workspace_controller.as_ref() else {
             return Err(crate::locale::text(
                 "工作区处于只读恢复状态；请先解决配置问题或显式迁移后再创建终端。",
@@ -495,7 +498,7 @@ impl RootView {
                         root.mark_workspace_pane_restore_failed(
                             &pane_id,
                             generation,
-                            failure_for_error(&error),
+                            workspace_restore_failure_for_code(error.public_code()),
                             None,
                             error.public_message().to_owned().into(),
                             cx,
@@ -1094,9 +1097,12 @@ fn record_workspace_restore_failure(
     visible_message
 }
 
-/// 将应用错误压缩为工作区恢复状态机的稳定失败类别。
-fn failure_for_error(error: &AppError) -> WorkspaceRestoreFailure {
-    if error.public_code() == kerminal_application::PublicErrorCode::Cancelled {
+/// 将应用错误压缩为工作区恢复状态机的稳定失败类别；取消保留可重试取消语义。
+/// 打开与恢复两条路径共用同一映射，避免错误码到失败类别的理解出现分叉。
+///
+/// @author kongweiguang
+pub(super) fn workspace_restore_failure_for_code(code: PublicErrorCode) -> WorkspaceRestoreFailure {
+    if code == PublicErrorCode::Cancelled {
         WorkspaceRestoreFailure::Cancelled
     } else {
         WorkspaceRestoreFailure::ResourceFailure
@@ -1139,8 +1145,12 @@ async fn resolve_workspace_open_target(
             WorkspaceContainerRuntime::Docker => ContainerRuntime::Docker,
             WorkspaceContainerRuntime::Podman => ContainerRuntime::Podman,
         };
-        let command = container_exec_command(pane, workdir.as_deref())
-            .map_err(|error| (failure_for_error(&error), error))?;
+        let command = container_exec_command(pane, workdir.as_deref()).map_err(|error| {
+            (
+                workspace_restore_failure_for_code(error.public_code()),
+                error,
+            )
+        })?;
         let target = ContainerTarget {
             host_id: Some(host_id.clone()),
             runtime,
@@ -1307,7 +1317,12 @@ async fn resolve_workspace_target(
                     })?
                     .local_session_target(&host_id, cancel)
                     .await
-                    .map_err(|error| (failure_for_error(&error), error))?
+                    .map_err(|error| {
+                        (
+                            workspace_restore_failure_for_code(error.public_code()),
+                            error,
+                        )
+                    })?
                     .ok_or_else(|| {
                         (
                             WorkspaceRestoreFailure::MissingTarget,
@@ -1315,13 +1330,22 @@ async fn resolve_workspace_target(
                         )
                     })?
             } else if let Some(shell) = pane.shell.as_deref() {
-                local_target_from_pane(pane, shell)
-                    .map_err(|error| (failure_for_error(&error), error))?
+                local_target_from_pane(pane, shell).map_err(|error| {
+                    (
+                        workspace_restore_failure_for_code(error.public_code()),
+                        error,
+                    )
+                })?
             } else {
                 profiles
                     .default_local_session_target()
                     .await
-                    .map_err(|error| (failure_for_error(&error), error))?
+                    .map_err(|error| {
+                        (
+                            workspace_restore_failure_for_code(error.public_code()),
+                            error,
+                        )
+                    })?
             };
             if let Some(working_directory) = pane.current_cwd.as_ref().or(pane.cwd.as_ref()) {
                 target.working_directory = Some(PathBuf::from(working_directory));
@@ -1396,7 +1420,12 @@ async fn load_workspace_host(
     hosts
         .load_host(host_id)
         .await
-        .map_err(|error| (failure_for_error(&error), error))?
+        .map_err(|error| {
+            (
+                workspace_restore_failure_for_code(error.public_code()),
+                error,
+            )
+        })?
         .ok_or_else(|| {
             (
                 WorkspaceRestoreFailure::MissingTarget,

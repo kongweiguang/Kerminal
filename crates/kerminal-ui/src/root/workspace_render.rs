@@ -858,6 +858,8 @@ fn candidate_retry_pane(
 ) -> Option<PaneId> {
     (projection.pane_id == *candidate_pane_id
         && !projection.close_operation_pending
+        // 已保留 session/orphan 的候选只能关闭回收，重试恢复会绕过真实资源状态。
+        && projection.session_id.is_none()
         && pane_surface_state(projection) == PaneSurfaceState::Failed)
         .then(|| candidate_pane_id.clone())
 }
