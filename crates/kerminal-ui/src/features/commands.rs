@@ -3061,9 +3061,15 @@ impl CommandsView {
                         view.refresh_snippet_page(cx);
                     }
                     Ok(false) => {
+                        view.snippet_inline_preview =
+                            snippet_browser::SnippetInlinePreview::Collapsed;
+                        view.selected_snippet = None;
+                        view.snippet_variables.clear();
+                        view.snippet_context_bindings.clear();
+                        view.snippet_is_new = false;
                         view.status =
                             Some(command_message("片段已不存在", "Snippet no longer exists"));
-                        // 回执确认目录已变化，列表必须去掉已不存在的条目。
+                        // 目录与详情都要收敛到“已不存在”；保留失效详情会允许继续 Fill/Copy。
                         view.refresh_snippet_page(cx);
                     }
                     Err(error) => view.status = Some(error.public_message().to_owned()),

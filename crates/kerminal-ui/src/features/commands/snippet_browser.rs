@@ -1041,8 +1041,8 @@ impl CommandsView {
                             view.refresh_snippet_page(cx);
                         }
                         Err(error) => {
-                            if error.public_code() == PublicErrorCode::OutcomeUnknown {
-                                // 副本可能已创建但暂未读到，目录需显示真实状态；确定性失败和取消不重读。
+                            if builtin_copy_failure_may_have_created_item(error.public_code()) {
+                                // 副本可能已创建但暂未读到，目录需显示真实状态；取消/确定性失败不重读。
                                 view.refresh_snippet_page(cx);
                             }
                             // 读回失败或暂未出现都不能证明原提交失败，因此继续保留 ID。
@@ -1085,6 +1085,8 @@ impl CommandsView {
                     "保存回执与预留的副本不一致；原 ID 已保留待核对",
                     "The save receipt does not match the reserved copy; its original ID is retained for reconciliation",
                 ));
+                // 回执表明已存在一个副本，目录以真实状态为准。
+                self.refresh_snippet_page(cx);
                 cx.notify();
             }
             Err(error) if error.public_code() == PublicErrorCode::OutcomeUnknown => {
@@ -1093,12 +1095,18 @@ impl CommandsView {
                     "另存结果未知。再次点击“查询保存结果”只核对原 ID，不会重新创建",
                     "The copy result is unknown. Clicking “Check save result” again only checks the original ID and will not create another copy",
                 ));
+                // 结果未知时副本可能已写入，目录需回读真实状态。
+                self.refresh_snippet_page(cx);
                 cx.notify();
             }
             Err(error) => {
                 self.pending_builtin_copy = None;
                 self.snippet_saving = false;
                 self.status = Some(error.public_message().to_owned());
+                if builtin_copy_failure_may_have_created_item(error.public_code()) {
+                    // 基础设施/超时同样可能已写入副本；只回读目录，不重放创建。
+                    self.refresh_snippet_page(cx);
+                }
                 cx.notify();
             }
         }
@@ -1642,6 +1650,19 @@ fn is_exact_user_snippet_copy(
     saved: &VersionedCommandDefinition<SnippetDefinition>,
 ) -> bool {
     saved.revision.is_some() && &saved.definition == expected
+}
+
+/// 只有可能已写入远端副本的失败才需要回读目录；取消和确定性拒绝不会产生条目，
+/// 未知、基础设施与超时都可能在请求中断前留下副本，目录应以真实状态为准。
+///
+/// @author kongweiguang
+fn builtin_copy_failure_may_have_created_item(code: PublicErrorCode) -> bool {
+    matches!(
+        code,
+        PublicErrorCode::OutcomeUnknown
+            | PublicErrorCode::Infrastructure
+            | PublicErrorCode::Timeout
+    )
 }
 
 /// 面板释放时协作取消唯一目录页请求；应用 executor 仍负责跟踪后台任务直到完成。

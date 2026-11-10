@@ -4,11 +4,11 @@
 
 use std::collections::HashSet;
 
-use kerminal_application::AppError;
 use kerminal_application::commands::{
     SnippetCatalogCursor, SnippetCatalogRevision, SnippetCatalogSection,
     SnippetExecutionCatalogSnapshot,
 };
+use kerminal_application::{AppError, PublicErrorCode};
 use kerminal_domain::commands::{
     SnippetCatalogItem, SnippetCatalogOrigin, SnippetContextBinding, SnippetContextBindingKind,
     SnippetDefaultAction, SnippetDefinition, SnippetPreference, SnippetPreferenceKey, SnippetRisk,
@@ -19,9 +19,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     PendingBuiltinSnippetCopy, SnippetInlinePreview, SnippetPreviewToggleAction,
-    clear_snippet_favorite_error, copy_builtin_definition_to_user, finish_snippet_favorite_request,
-    is_exact_user_snippet_copy, is_snippet_search_shortcut, pending_builtin_copy_matches_source,
-    record_snippet_favorite_error, snippet_copy_snapshot_matches, snippet_preview_copy_is_allowed,
+    builtin_copy_failure_may_have_created_item, clear_snippet_favorite_error,
+    copy_builtin_definition_to_user, finish_snippet_favorite_request, is_exact_user_snippet_copy,
+    is_snippet_search_shortcut, pending_builtin_copy_matches_source, record_snippet_favorite_error,
+    snippet_copy_snapshot_matches, snippet_preview_copy_is_allowed,
 };
 use crate::features::commands::SnippetDraftValues;
 use crate::features::commands::snippet_browser::{
@@ -751,4 +752,32 @@ fn saving_builtin_as_user_preserves_source_and_sanitizes_sensitive_defaults() {
             revision: Some(ConfigRevision::from_sha256("other-revision".to_owned())),
         }
     ));
+}
+
+/// 只有可能已写入远端副本的失败才需要回读目录；取消和确定性拒绝不会产生条目。
+///
+/// @author kongweiguang
+#[test]
+fn builtin_copy_failure_refreshes_only_when_copy_may_exist() {
+    for code in [
+        PublicErrorCode::OutcomeUnknown,
+        PublicErrorCode::Infrastructure,
+        PublicErrorCode::Timeout,
+    ] {
+        assert!(
+            builtin_copy_failure_may_have_created_item(code),
+            "{code:?} may leave a copy behind"
+        );
+    }
+    for code in [
+        PublicErrorCode::Cancelled,
+        PublicErrorCode::NotFound,
+        PublicErrorCode::Conflict,
+        PublicErrorCode::Invalid,
+    ] {
+        assert!(
+            !builtin_copy_failure_may_have_created_item(code),
+            "{code:?} cannot create a catalog item"
+        );
+    }
 }
