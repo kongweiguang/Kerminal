@@ -2616,6 +2616,78 @@ fn saved_sftp_host(id: HostId) -> ManagedHost {
     }
 }
 
+/// 远端主机删除确认属于 Root 模态：切到其它页面仍可见，Escape 可取消并清除 pending。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn remote_host_deletion_confirmation_is_root_modal_and_cancellable(app: &mut TestAppContext) {
+    let host_id = HostId::new();
+    let saved = saved_sftp_host(host_id.clone());
+    let (runtime, root, _, _, visual) = fixture_with_configuration_and_services(
+        app,
+        Arc::new(EmptyConfiguration),
+        move |services| {
+            services.with_connections(
+                HostManagementService::new(Arc::new(EmptyHosts { saved: vec![saved] })),
+                Arc::new(NoRemote),
+                None,
+            )
+        },
+    );
+    settle(&runtime, visual);
+    visual.update(|window, app| {
+        window.activate_window();
+        root.update(app, |root, cx| {
+            let panel = root.connections_panel.as_ref().unwrap().clone();
+            panel.update(cx, |panel, cx| {
+                panel.request_delete_host(&host_id, cx);
+                panel.focus_root_confirmation(window, cx);
+            });
+        });
+    });
+    settle(&runtime, visual);
+    visual.update(|window, app| {
+        assert!(root.read(app).connection_prompt_modal_open);
+        assert!(
+            root.read(app)
+                .connections_panel
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .root_confirmation_active()
+        );
+        window.draw(app).clear(app);
+        let id: gpui_kit::ElementId = "workbench-connections-confirmation-layer".into();
+        assert!(
+            gpui_kit::base::test_support::snapshots(window)
+                .into_iter()
+                .any(|node| node.visible() && node.path().contains(&id)),
+            "deletion confirmation must be mounted in the root overlay"
+        );
+        root.update(app, |root, cx| {
+            // 切到其它中央页面不能把确认层留在不可见的连接面板里。
+            root.center_panel = CenterPanel::Terminal;
+            cx.notify();
+        });
+        window.draw(app).clear(app);
+        assert!(
+            gpui_kit::base::test_support::snapshots(window)
+                .into_iter()
+                .any(|node| node.visible() && node.path().contains(&id)),
+            "confirmation remains visible after switching pages"
+        );
+    });
+    visual.simulate_keystrokes("escape");
+    settle(&runtime, visual);
+    visual.update(|_, cx| {
+        let root = root.read(cx);
+        assert!(!root.connection_prompt_modal_open);
+        let panel = root.connections_panel.as_ref().unwrap().read(cx);
+        assert!(!panel.root_confirmation_active());
+        assert!(!panel.has_pending_deletion_confirmation());
+    });
+}
+
 /// 两侧真实事件各自排队；同侧新意图替换旧项，取消首项后继续原来的另一侧。
 ///
 /// @author kongweiguang

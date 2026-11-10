@@ -133,13 +133,19 @@ fn confirmation_layer_plan_matches_panel_and_overlay_order() {
         vec![GroupDeletion, ExternalUsername]
     );
     assert_eq!(
-        root_confirmation_layer_plan(true, true, true),
-        vec![LocalHostDeletion, ExternalPassword, ExternalUsername]
+        root_confirmation_layer_plan(true, true, true, true, true),
+        vec![
+            HostDeletion,
+            GroupDeletion,
+            LocalHostDeletion,
+            ExternalPassword,
+            ExternalUsername,
+        ]
     );
-    assert!(root_confirmation_layer_plan(false, false, false).is_empty());
+    assert!(root_confirmation_layer_plan(false, false, false, false, false).is_empty());
     assert_eq!(
-        root_confirmation_layer_plan(true, false, false),
-        vec![LocalHostDeletion]
+        root_confirmation_layer_plan(true, false, false, false, false),
+        vec![HostDeletion]
     );
 }
 

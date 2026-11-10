@@ -97,18 +97,20 @@ pub(super) fn confirmation_layer_plan(
     layers
 }
 
-/// Root prompt-only overlay 只承载会设置 `root_confirmation_active` 的层；
-/// 远端主机/分组删除没有 Root 模态与取消路径，必须留在面板 Render 内。
+/// Root prompt-only overlay 承载所有已提升为 Root 模态的确认层：本地/远端主机、分组删除
+/// 与两类外部凭据。切到其它页面时确认仍可见，Escape 由面板统一取消。
 ///
 /// @author kongweiguang
 pub(super) fn root_confirmation_layer_plan(
+    host_deletion: bool,
+    group_deletion: bool,
     local_host_deletion: bool,
     external_password: bool,
     external_username: bool,
 ) -> Vec<ConnectionsConfirmationLayer> {
     confirmation_layer_plan(
-        false,
-        false,
+        host_deletion,
+        group_deletion,
         local_host_deletion,
         external_password,
         external_username,
@@ -131,6 +133,8 @@ fn confirmation_layers(
         .is_some_and(|pending| selected_host.is_some_and(|host| host.id == pending.host_id));
     let plan = if root_only {
         root_confirmation_layer_plan(
+            panel.pending_host_deletion.is_some(),
+            panel.pending_group_deletion.is_some(),
             panel.local_hosts.pending_delete.is_some(),
             panel.pending_external_password.is_some(),
             panel.pending_external_username.is_some(),
