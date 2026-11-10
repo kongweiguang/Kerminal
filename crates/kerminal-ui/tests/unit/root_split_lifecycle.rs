@@ -2,6 +2,445 @@
 //!
 //! @author kongweiguang
 
+/// 失败标签关闭提供“保留标签”出口：只释放 controller/entry 门禁，保留 session 和布局；
+/// 保存恢复可用，用户之后仍可再次普通关闭并成功。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn failed_tab_close_can_keep_session_and_reclose_later(app: &mut TestAppContext) {
+    use std::sync::atomic::Ordering;
+
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    settle(&runtime, visual);
+    let target = SessionTarget::Local(LocalSessionTarget {
+        program: OsString::from("fixture-shell"),
+        args: Vec::new(),
+        working_directory: None,
+        environment: BTreeMap::new(),
+    });
+    let live = LiveSession::new(target.clone());
+    let session_id = live.info.session_id.clone();
+    *sessions.live.lock().unwrap() = Some(live);
+    let pane_id = open_live_terminal(&root, visual, target);
+    settle(&runtime, visual);
+    let tab_id = visual.update(|_, app| {
+        root.update(app, |root, _| {
+            root.workspace_controller
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .terminal_tabs
+                .first()
+                .map(|tab| tab.id().clone())
+        })
+    });
+    let tab_id = tab_id.expect("opened terminal tab");
+    // 默认 close 服务返回失败，模拟持续无法回收的真实 session。
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_tab_event(&WorkspaceTabEvent::Close(tab_id.clone()), window, cx);
+        });
+    });
+    settle(&runtime, visual);
+    visual.update(|window, app| {
+        let root = root.read(app);
+        assert!(
+            matches!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .retry_pending_resource_operation(),
+                Some(WorkspaceResourceOperation::CloseTab { tab_id: pending, .. })
+                    if pending == tab_id
+            ),
+            "tab close failure must remain retryable"
+        );
+        let pane = root
+            .workspace_runtime
+            .pane(&pane_id)
+            .expect("session retained");
+        assert_eq!(pane.phase, RuntimePanePhase::CloseFailed);
+        assert_eq!(pane.session_id.as_ref(), Some(&session_id));
+        window.draw(app).clear(app);
+        for selector in [
+            format!("workspace-pane-retry-close-{}", pane_id.as_str()),
+            format!("workspace-pane-keep-{}", pane_id.as_str()),
+        ] {
+            let id: gpui_kit::ElementId = selector.into();
+            assert!(
+                gpui_kit::base::test_support::snapshots(window)
+                    .into_iter()
+                    .any(|node| node.visible() && node.path().contains(&id)),
+                "close failure placeholder must expose {id:?}"
+            );
+        }
+    });
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_render_event(
+                WorkspaceRenderEvent::KeepTab {
+                    tab_id: tab_id.clone(),
+                    pane_id: pane_id.clone(),
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    settle(&runtime, visual);
+    visual.update(|_, app| {
+        root.update(app, |root, cx| {
+            assert!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .pending_resource_operation()
+                    .is_none()
+            );
+            assert!(root.workspace_resource_operations.is_empty());
+            let pane = root
+                .workspace_runtime
+                .pane(&pane_id)
+                .expect("kept pane remains");
+            assert_eq!(pane.phase, RuntimePanePhase::Ready);
+            assert_eq!(pane.session_id.as_ref(), Some(&session_id));
+            assert!(
+                root.workspace_controller
+                    .as_mut()
+                    .unwrap()
+                    .begin_save()
+                    .is_ok(),
+                "keep must release the workspace save gate"
+            );
+            cx.notify();
+        });
+    });
+    sessions.close_succeeds.store(true, Ordering::Relaxed);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_tab_event(&WorkspaceTabEvent::Close(tab_id.clone()), window, cx);
+        });
+    });
+    settle(&runtime, visual);
+    visual.update(|_, app| {
+        let root = root.read(app);
+        assert!(
+            root.workspace_controller
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .terminal_tabs
+                .is_empty(),
+            "kept terminal can still be closed normally"
+        );
+        assert!(root.workspace_runtime.pane(&pane_id).is_none());
+    });
+    assert!(
+        sessions
+            .closed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|closed| closed == &session_id),
+        "no other session may be closed"
+    );
+    assert!(!sessions.closed.lock().unwrap().is_empty());
+}
+
+/// 两 pane 终端标签：第二个 pane 持有可关闭内存 session，第一个 pane 只占布局。
+/// 关闭失败/重放回归共用这一装配，避免复制控制器与运行态投影。
+fn two_pane_terminal_with_live_second(
+    root: &Entity<RootView>,
+    visual: &mut VisualTestContext,
+    runtime: &Runtime,
+    sessions: &Arc<CapturingSessions>,
+) -> (TabId, PaneId, PaneId, SessionId) {
+    settle(runtime, visual);
+    let target = SessionTarget::Local(LocalSessionTarget {
+        program: OsString::from("fixture-shell"),
+        args: Vec::new(),
+        working_directory: None,
+        environment: BTreeMap::new(),
+    });
+    let live = LiveSession::new(target.clone());
+    let session_id = live.info.session_id.clone();
+    *sessions.live.lock().unwrap() = Some(live);
+    let pane_b = open_live_terminal(root, visual, target);
+    settle(runtime, visual);
+    let (tab_id, pane_a) = visual.update(|_, app| {
+        root.update(app, |root, cx| {
+            let controller = root.workspace_controller.as_mut().unwrap();
+            let mut snapshot = controller.snapshot().clone();
+            let tab_id = snapshot
+                .terminal_tabs
+                .first()
+                .map(|tab| tab.id().clone())
+                .expect("terminal tab");
+            let pane_b_persisted = snapshot
+                .terminal_panes
+                .iter()
+                .find(|pane| pane.id == pane_b)
+                .cloned()
+                .expect("persisted pane");
+            let mut pane_a_persisted = pane_b_persisted.clone();
+            pane_a_persisted.id = PaneId::new();
+            pane_a_persisted.title = "second".to_owned();
+            let pane_a = pane_a_persisted.id.clone();
+            snapshot.terminal_panes.push(pane_a_persisted);
+            let layout = kerminal_domain::workspace::TerminalLayoutNode::Split {
+                id: "tab-close-retry-split".to_owned(),
+                direction: SplitDirection::Horizontal,
+                children: vec![
+                    kerminal_domain::workspace::TerminalLayoutNode::Pane {
+                        pane_id: pane_b.clone(),
+                    },
+                    kerminal_domain::workspace::TerminalLayoutNode::Pane {
+                        pane_id: pane_a.clone(),
+                    },
+                ],
+                sizes: None,
+            };
+            for tab in &mut snapshot.terminal_tabs {
+                if tab.id() == &tab_id {
+                    if let WorkspaceSessionTab::Terminal {
+                        layout: tab_layout, ..
+                    } = tab
+                    {
+                        *tab_layout = layout.clone();
+                    }
+                }
+            }
+            controller.synchronize_snapshot(snapshot).unwrap();
+            root.workspace_runtime
+                .register_pending_pane(
+                    tab_id.clone(),
+                    controller
+                        .snapshot()
+                        .terminal_panes
+                        .iter()
+                        .find(|pane| pane.id == pane_a)
+                        .cloned()
+                        .unwrap(),
+                )
+                .unwrap();
+            // 余下 pane 只承担布局占位；RestoreFailed 让重放关闭按无资源空 pane 收尾，
+            // 避免测试必须伪造一次真实恢复准入。
+            root.workspace_runtime.mark_restore_failed(&pane_a).unwrap();
+            root.workspace_runtime
+                .register_tab_layout(tab_id.clone(), layout);
+            root.refresh_workspace_views(cx);
+            (tab_id, pane_a)
+        })
+    });
+    (tab_id, pane_a, pane_b, session_id)
+}
+
+/// 多 pane 标签内已有失败 ClosePane 时，标签关闭只重试该 pane 并保留 Tab 意图；
+/// 成功后按既有 replay 关闭余下 pane，再次失败仍保留意图可继续重试。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn tab_close_retries_failed_pane_and_replays_remaining_panes(app: &mut TestAppContext) {
+    use std::sync::atomic::Ordering;
+
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (tab_id, pane_a, pane_b, session_id) =
+        two_pane_terminal_with_live_second(&root, visual, &runtime, &sessions);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_render_event(
+                WorkspaceRenderEvent::Pane {
+                    tab_id: tab_id.clone(),
+                    event: WorkspacePaneEvent::Close(pane_b.clone()),
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    settle(&runtime, visual);
+    visual.update(|_, app| {
+        let root = root.read(app);
+        assert!(
+            matches!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .retry_pending_resource_operation(),
+                Some(WorkspaceResourceOperation::ClosePane { pane_id, .. }) if pane_id == pane_b
+            ),
+            "pane close must fail as a retryable ClosePane"
+        );
+        assert_eq!(
+            root.workspace_runtime.pane(&pane_b).unwrap().phase,
+            RuntimePanePhase::CloseFailed
+        );
+    });
+    // 第一次标签关闭重试仍失败：Tab 意图必须保留在同一 pane entry 上。
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_tab_event(&WorkspaceTabEvent::Close(tab_id.clone()), window, cx);
+        });
+    });
+    settle(&runtime, visual);
+    visual.update(|_, app| {
+        let root = root.read(app);
+        assert!(
+            matches!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .retry_pending_resource_operation(),
+                Some(WorkspaceResourceOperation::ClosePane { pane_id, .. }) if pane_id == pane_b
+            ),
+            "repeated failure keeps the same ClosePane retry"
+        );
+        assert!(
+            root.workspace_resource_operations.contains_key(&pane_b),
+            "failed retry keeps the entry that owns the Tab intent"
+        );
+        assert_eq!(
+            root.workspace_controller
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .terminal_tabs
+                .len(),
+            1,
+            "no pane or tab may be removed before the close succeeds"
+        );
+    });
+    sessions.close_succeeds.store(true, Ordering::Relaxed);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_tab_event(&WorkspaceTabEvent::Close(tab_id.clone()), window, cx);
+        });
+    });
+    settle(&runtime, visual);
+    visual.update(|_, app| {
+        let root = root.read(app);
+        assert!(
+            root.workspace_controller
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .terminal_tabs
+                .is_empty(),
+            "successful pane retry must replay the tab close for the remaining pane; pending={:?}; entries={:?}; status={:?}",
+            root.workspace_controller
+                .as_ref()
+                .unwrap()
+                .pending_resource_operation(),
+            root.workspace_resource_operations.keys().collect::<Vec<_>>(),
+            root.status
+        );
+        assert!(root.workspace_runtime.pane(&pane_b).is_none());
+        assert!(root.workspace_runtime.pane(&pane_a).is_none());
+        assert!(
+            root.workspace_controller
+                .as_ref()
+                .unwrap()
+                .pending_resource_operation()
+                .is_none()
+        );
+    });
+    assert!(
+        sessions
+            .closed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|closed| closed == &session_id),
+        "no other session may be closed"
+    );
+    assert!(!sessions.closed.lock().unwrap().is_empty());
+}
+
+/// 失败 ClosePane 的“保留终端”只释放该关闭门禁，保留同一 session 与另一 pane；
+/// 保存恢复可用，之后仍可再次普通关闭。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn failed_pane_close_can_keep_terminal(app: &mut TestAppContext) {
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (tab_id, pane_a, pane_b, session_id) =
+        two_pane_terminal_with_live_second(&root, visual, &runtime, &sessions);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_render_event(
+                WorkspaceRenderEvent::Pane {
+                    tab_id: tab_id.clone(),
+                    event: WorkspacePaneEvent::Close(pane_b.clone()),
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    settle(&runtime, visual);
+    visual.update(|_, app| {
+        let root = root.read(app);
+        assert!(matches!(
+            root.workspace_controller
+                .as_ref()
+                .unwrap()
+                .retry_pending_resource_operation(),
+            Some(WorkspaceResourceOperation::ClosePane { pane_id, .. }) if pane_id == pane_b
+        ));
+        assert_eq!(
+            root.workspace_runtime.pane(&pane_b).unwrap().phase,
+            RuntimePanePhase::CloseFailed
+        );
+    });
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_render_event(
+                WorkspaceRenderEvent::KeepPane {
+                    tab_id: tab_id.clone(),
+                    pane_id: pane_b.clone(),
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    settle(&runtime, visual);
+    visual.update(|_, app| {
+        root.update(app, |root, cx| {
+            assert!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .pending_resource_operation()
+                    .is_none()
+            );
+            assert!(root.workspace_resource_operations.is_empty());
+            let pane = root.workspace_runtime.pane(&pane_b).expect("kept pane");
+            assert_eq!(pane.phase, RuntimePanePhase::Ready);
+            assert_eq!(pane.session_id.as_ref(), Some(&session_id));
+            assert!(root.workspace_runtime.pane(&pane_a).is_some());
+            assert!(
+                root.workspace_controller
+                    .as_mut()
+                    .unwrap()
+                    .begin_save()
+                    .is_ok(),
+                "keep must release the workspace save gate"
+            );
+            cx.notify();
+        });
+    });
+    assert!(
+        sessions
+            .closed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|closed| closed == &session_id),
+        "keep must not close the retained session"
+    );
+}
+
 use super::*;
 
 // 复用同一内存终端及 Root，检查布局变化期间的右栏绑定与文件读取次数。
@@ -486,6 +925,68 @@ fn completed_split_failure_closes_without_waiting_for_receipt(app: &mut TestAppC
             assert!(root.workspace_runtime.pane(&candidate).is_none());
             assert!(!root.workspace_resource_operations.contains_key(&candidate));
             assert!(root.workspace_runtime.pane(&source_pane).is_some());
+        });
+    });
+}
+
+/// 右键“另选分屏目标”必须与左键分屏一样先丢弃无资源的失败候选，
+/// 否则残留失败项会继续挡住新的分屏入口。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn choose_split_target_discards_unresourced_failed_candidate(app: &mut TestAppContext) {
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (tab_id, source_pane, operation) =
+        ready_split_candidate(&root, visual, &runtime, &sessions);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            let WorkspaceResourceOperation::CreatePane {
+                operation_id, pane, ..
+            } = &operation
+            else {
+                panic!("split must create a pane");
+            };
+            let candidate = pane.id.clone();
+            root.workspace_controller
+                .as_mut()
+                .expect("workspace controller")
+                .complete_resource_operation(
+                    operation_id,
+                    Err(WorkspaceRestoreFailure::ResourceFailure),
+                )
+                .unwrap();
+            root.workspace_runtime
+                .mark_restore_failed(&candidate)
+                .unwrap();
+            assert!(root.workspace_runtime.has_no_session_or_orphan(&candidate));
+
+            root.handle_workspace_render_event(
+                WorkspaceRenderEvent::Pane {
+                    tab_id: tab_id.clone(),
+                    event: WorkspacePaneEvent::ChooseSplitTarget {
+                        pane_id: source_pane.clone(),
+                        direction: SplitDirection::Vertical,
+                        before: false,
+                    },
+                },
+                window,
+                cx,
+            );
+
+            assert!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .pending_resource_operation()
+                    .is_none(),
+                "right-click split must discard the unresourced failed candidate"
+            );
+            assert!(root.workspace_runtime.pane(&candidate).is_none());
+            assert!(!root.workspace_resource_operations.contains_key(&candidate));
+            assert!(
+                root.split_target_picker.read(cx).is_open(),
+                "right-click split target picker must open after cleanup"
+            );
         });
     });
 }
