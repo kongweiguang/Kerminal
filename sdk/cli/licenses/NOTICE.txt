@@ -1,0 +1,19 @@
+@author kongweiguang
+
+The kerminal-plugin CLI embeds esbuild 0.28.2, Copyright (c) 2020 Evan Wallace,
+licensed under MIT. The complete license is retained in esbuild-LICENSE.md and
+is included in the executable; run `kerminal-plugin --licenses` to display it.
+
+Source: https://github.com/evanw/esbuild/tree/v0.28.2
+License: https://github.com/evanw/esbuild/blob/v0.28.2/LICENSE.md
+Official platform archives: https://registry.npmjs.org/@esbuild/<platform>/-/<platform>-0.28.2.tgz
+The pinned SHA-256 values below were computed from the official archives after
+checking their SHA-512 integrity against the corresponding npm registry metadata:
+
+win32-x64    7286c3611b6f1f4c4d9ec90adcbc478407ff0d28ead96567f361d53e67613e19
+linux-x64    9573bb2233aab0f9ea7647d5cca9726113cc1768de61d66b17267f4db84488f6
+darwin-x64   abb6a7a895aaf2cc0df36fecc3bf0042479ffec51a643a056d54e9109f27db55
+darwin-arm64 1980cde09749094452b20d36ff267585ccb3f72749c7bc97291cd9996ccf5a2a
+
+For offline builds, KERMINAL_ESBUILD_ARCHIVE may point at the appropriate
+unchanged official archive. The build always verifies its pinned SHA-256.

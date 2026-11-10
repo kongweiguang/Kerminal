@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "id": "__PLUGIN_ID__",
+  "name": {"en": "Example plugin"},
+  "description": {"en": "A native Kerminal plugin"},
+  "version": "0.1.0",
+  "api": "^1.0",
+  "publisher": "__PUBLISHER__",
+  "runtime": {"kind": "script", "main": "dist/main.js"},
+  "permissions": [],
+  "contributes": {"tools": [{"id": "panel", "title": "%panel.title%", "view": "panel", "scope": "tab"}]},
+  "views": {"panel": {"kind": "native", "file": "views/panel.json"}},
+  "l10n": "l10n"
+}

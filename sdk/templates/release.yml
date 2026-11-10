@@ -1,0 +1,349 @@
+# @author kongweiguang
+# 推送前将仓库变量 KERMINAL_SDK_REF 设为包含 CLI 的 40 位提交 SHA。
+# 可选变量：KERMINAL_SDK_REPOSITORY（默认 kongweiguang/Kerminal）、
+# KERMINAL_PLUGIN_OFFICIAL（官方保留 ID 使用 true）。私有 SDK 仓库可配置 Secret KERMINAL_SDK_TOKEN。
+# macOS 签名 Secret：APPLE_CERTIFICATE_BASE64、APPLE_CERTIFICATE_PASSWORD、APPLE_SIGNING_IDENTITY。
+# 公证另需 Secret：APPLE_ID、APPLE_TEAM_ID、APPLE_APP_SPECIFIC_PASSWORD。
+name: Release Kerminal plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kerminal-plugin-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Validate tag and choose platforms
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      sdk_repository: ${{ steps.plan.outputs.sdk_repository }}
+      sdk_ref: ${{ steps.plan.outputs.sdk_ref }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Validate release input
+        id: plan
+        shell: bash
+        env:
+          SDK_REPOSITORY: ${{ vars.KERMINAL_SDK_REPOSITORY || 'kongweiguang/Kerminal' }}
+          SDK_REF: ${{ vars.KERMINAL_SDK_REF }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          with open('kerminal-plugin.json', encoding='utf-8') as source:
+              manifest = json.load(source)
+          version = manifest.get('version')
+          if not isinstance(version, str) or not re.fullmatch(r'[0-9A-Za-z.+-]+', version):
+              raise SystemExit('清单 version 无效')
+          if os.environ['GITHUB_REF_NAME'] != 'v' + version:
+              raise SystemExit('tag 必须严格等于清单版本前加 v')
+          runtime = manifest.get('runtime', {}).get('kind')
+          if runtime == 'sidecar':
+              include = [
+                  {'platform': 'windows-x86_64', 'runner': 'windows-latest', 'target': 'x86_64-pc-windows-msvc'},
+                  {'platform': 'linux-x86_64', 'runner': 'ubuntu-22.04', 'target': 'x86_64-unknown-linux-gnu'},
+                  {'platform': 'macos-x86_64', 'runner': 'macos-15-intel', 'target': 'x86_64-apple-darwin'},
+                  {'platform': 'macos-aarch64', 'runner': 'macos-15', 'target': 'aarch64-apple-darwin'},
+              ]
+          elif runtime in ('script', 'none'):
+              include = [{'platform': 'any', 'runner': 'ubuntu-22.04', 'target': ''}]
+          else:
+              raise SystemExit('未知 runtime.kind；支持 sidecar、script 和 none')
+          repository = os.environ['SDK_REPOSITORY']
+          revision = os.environ['SDK_REF']
+          if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+              raise SystemExit('KERMINAL_SDK_REPOSITORY 必须是 GitHub owner/repository')
+          if not re.fullmatch(r'[0-9a-fA-F]{40}', revision):
+              raise SystemExit('请将仓库变量 KERMINAL_SDK_REF 设置为包含 CLI 的 40 位提交 SHA')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              print('matrix=' + json.dumps({'include': include}, separators=(',', ':')), file=output)
+              print('sdk_repository=' + repository, file=output)
+              print('sdk_ref=' + revision, file=output)
+          PY
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      PLUGIN_PLATFORM: ${{ matrix.platform }}
+      PLUGIN_TARGET: ${{ matrix.target }}
+      PLUGIN_OFFICIAL: ${{ vars.KERMINAL_PLUGIN_OFFICIAL }}
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Checkout pinned Kerminal SDK
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.plan.outputs.sdk_repository }}
+          ref: ${{ needs.plan.outputs.sdk_ref }}
+          token: ${{ secrets.KERMINAL_SDK_TOKEN || github.token }}
+          path: .kerminal-sdk
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Install CLI from the selected SDK commit
+        shell: pwsh
+        working-directory: .kerminal-sdk
+        run: |
+          if (-not (Test-Path -LiteralPath 'sdk/cli/Cargo.toml')) {
+            throw '指定的 SDK 提交不包含 sdk/cli，请选择包含 CLI 的提交。'
+          }
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'kerminal-plugin-tools'
+          cargo install --path sdk/cli --locked --root $toolRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Join-Path $toolRoot 'bin' | Add-Content -LiteralPath $env:GITHUB_PATH -Encoding utf8
+      - name: Install plugin dependencies
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath 'package.json') {
+            $package = Get-Content -LiteralPath 'package.json' -Raw | ConvertFrom-Json
+            if ($package.devDependencies.'@kerminal/sdk' -eq 'file:.kerminal-sdk/sdk/ts') {
+              # 独立示例使用与 CLI 相同提交的 SDK，避免尚未发布的 npm 版本漂移。
+              npm ci --prefix .kerminal-sdk/sdk/ts --no-audit --no-fund
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              npm run build --prefix .kerminal-sdk/sdk/ts
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
+          if (Test-Path -LiteralPath 'package-lock.json') {
+            npm ci
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } elseif (Test-Path -LiteralPath 'package.json') {
+            npm install --no-audit --no-fund
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          if ($env:PLUGIN_TARGET) {
+            rustup target add $env:PLUGIN_TARGET
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Build and validate plugin
+        shell: pwsh
+        run: |
+          $policy = @()
+          if ($env:PLUGIN_OFFICIAL -eq 'true') { $policy += '--official' }
+          & kerminal-plugin build --platform $env:PLUGIN_PLATFORM @policy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & kerminal-plugin check .kerminal/build --platform $env:PLUGIN_PLATFORM @policy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $manifest = Get-Content -LiteralPath 'kerminal-plugin.json' -Raw | ConvertFrom-Json
+          if ($manifest.runtime.kind -eq 'sidecar') {
+            # 每个平台执行其真实二进制；常规一致性检查不声称验证 fixture 专用的取消和背压探针。
+            $main = $manifest.runtime.main.($env:PLUGIN_PLATFORM)
+            $executable = Join-Path (Join-Path $PWD '.kerminal/build') $main
+            & kerminal-plugin conformance $executable
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Sign and notarize macOS Sidecar when configured
+        if: runner.os == 'macOS' && matrix.platform != 'any'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          binary="$(python3 - <<'PY'
+          import json
+          import os
+          with open('.kerminal/build/kerminal-plugin.json', encoding='utf-8') as source:
+              manifest = json.load(source)
+          relative = manifest['runtime']['main'][os.environ['PLUGIN_PLATFORM']]
+          print(os.path.join(os.getcwd(), '.kerminal', 'build', *relative.split('/')))
+          PY
+          )"
+          test -f "$binary"
+          if [[ -z "$APPLE_CERTIFICATE_BASE64" || -z "$APPLE_CERTIFICATE_PASSWORD" || -z "$APPLE_SIGNING_IDENTITY" ]]; then
+            echo '::warning::未配置完整的 Apple 签名 Secret；该 macOS Sidecar 未签名，也无法公证。'
+            exit 0
+          fi
+          signing_dir="$(mktemp -d "${RUNNER_TEMP}/kerminal-sign.XXXXXXXX")"
+          keychain="${signing_dir}/signing.keychain-db"
+          # 临时钥匙串及证书即使在签名或公证失败时也会清除。
+          cleanup() {
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            rm -rf "$signing_dir"
+          }
+          trap cleanup EXIT
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::${keychain_password}"
+          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 -D > "${signing_dir}/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "${signing_dir}/certificate.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
+          codesign --force --options runtime --timestamp --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+          if [[ -z "$APPLE_ID" || -z "$APPLE_TEAM_ID" || -z "$APPLE_APP_SPECIFIC_PASSWORD" ]]; then
+            echo '::warning::未配置完整的 Apple 公证 Secret；该 macOS Sidecar 已签名但未公证。'
+            exit 0
+          fi
+          # notarytool 接受包含已签名独立可执行文件的 ZIP；提交结束后再生成 kplugin。
+          ditto -c -k --keepParent "$binary" "${signing_dir}/sidecar.zip"
+          xcrun notarytool submit "${signing_dir}/sidecar.zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait --output-format json > "${signing_dir}/notarization.json"
+          python3 - "${signing_dir}/notarization.json" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding='utf-8') as source:
+              result = json.load(source)
+          if result.get('status') != 'Accepted':
+              raise SystemExit('Apple 公证未接受该 Sidecar：' + str(result.get('status')))
+          PY
+      - name: Package and check archive
+        shell: pwsh
+        run: |
+          $policy = @()
+          if ($env:PLUGIN_OFFICIAL -eq 'true') { $policy += '--official' }
+          & kerminal-plugin package --platform $env:PLUGIN_PLATFORM @policy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $packages = @(Get-ChildItem -Path '.kerminal/packages/*.kplugin' -File)
+          if ($packages.Count -ne 1) { throw '每个平台必须恰好生成一个插件包。' }
+          & kerminal-plugin check $packages[0].FullName --platform $env:PLUGIN_PLATFORM @policy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-${{ matrix.platform }}
+          path: .kerminal/packages/*.kplugin
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish release
+    needs: [plan, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: plugin-*
+          path: dist
+          merge-multiple: true
+      - name: Verify complete candidate set
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          with open('kerminal-plugin.json', encoding='utf-8') as source:
+              manifest = json.load(source)
+          platform = manifest['runtime']['kind']
+          targets = (['windows-x86_64', 'linux-x86_64', 'macos-x86_64', 'macos-aarch64']
+                     if platform == 'sidecar' else ['any'])
+          expected = {f"{manifest['id']}-{manifest['version']}-{target}.kplugin" for target in targets}
+          actual = {path.name for path in Path('dist').glob('*.kplugin') if path.is_file()}
+          if actual != expected:
+              raise SystemExit(f'插件资产集合不完整或包含多余文件：expected={expected}, actual={actual}')
+          if os.environ['GITHUB_REF_NAME'] != 'v' + manifest['version']:
+              raise SystemExit('tag 与清单版本不一致')
+          PY
+      - name: Create draft and upload verified assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            prerelease=()
+            version="${RELEASE_TAG#v}"
+            if [[ "${version%%+*}" == *-* ]]; then prerelease=(--prerelease); fi
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --notes "Kerminal plugin ${RELEASE_TAG}" "${prerelease[@]}"
+          fi
+          gh release view "$RELEASE_TAG" --json isDraft,assets > "${RUNNER_TEMP}/release.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          with open(Path(os.environ['RUNNER_TEMP']) / 'release.json', encoding='utf-8') as source:
+              release = json.load(source)
+          expected = {path.name for path in Path('dist').glob('*.kplugin')}
+          existing = {asset['name'] for asset in release['assets']}
+          if any(name.endswith('.kplugin') and name not in expected for name in existing):
+              raise SystemExit('已有 Release 包含不属于本次发布的插件包')
+          with open(Path(os.environ['RUNNER_TEMP']) / 'existing-assets.txt', 'w', encoding='utf-8') as output:
+              output.write('\n'.join(sorted(existing)) + '\n')
+          with open(Path(os.environ['RUNNER_TEMP']) / 'release-is-draft.txt', 'w', encoding='utf-8') as output:
+              output.write('true' if release['isDraft'] else 'false')
+          PY
+          mkdir -p "${RUNNER_TEMP}/existing-plugin-assets"
+          for asset in dist/*.kplugin; do
+            name="$(basename "$asset")"
+            if grep -Fxq -- "$name" "${RUNNER_TEMP}/existing-assets.txt"; then
+              gh release download "$RELEASE_TAG" --pattern "$name" --dir "${RUNNER_TEMP}/existing-plugin-assets"
+              cmp "$asset" "${RUNNER_TEMP}/existing-plugin-assets/${name}" || { echo '已有同名 Release 资产内容不同，拒绝覆盖。' >&2; exit 1; }
+            else
+              if [[ "$(cat "${RUNNER_TEMP}/release-is-draft.txt")" != 'true' ]]; then
+                echo '已有公开 Release 缺少资产，请先人工处理。' >&2
+                exit 1
+              fi
+              gh release upload "$RELEASE_TAG" "$asset"
+            fi
+          done
+          # 发布前回读全部资产，避免部分上传被当成完整 Release。
+          mkdir -p "${RUNNER_TEMP}/verified-plugin-assets"
+          for asset in dist/*.kplugin; do
+            name="$(basename "$asset")"
+            gh release download "$RELEASE_TAG" --pattern "$name" --dir "${RUNNER_TEMP}/verified-plugin-assets"
+            cmp "$asset" "${RUNNER_TEMP}/verified-plugin-assets/${name}"
+          done
+          if [[ "$(cat "${RUNNER_TEMP}/release-is-draft.txt")" == 'true' ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false
+          fi
+      - name: Show marketplace entry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          with open('kerminal-plugin.json', encoding='utf-8') as source:
+              manifest = json.load(source)
+          categories = manifest.get('categories', [])
+          if not isinstance(categories, list) or not all(isinstance(category, str) for category in categories):
+              raise SystemExit('清单 categories 必须是字符串数组')
+          entry = '\n'.join([
+              'repository = ' + json.dumps('https://github.com/' + os.environ['GITHUB_REPOSITORY'], ensure_ascii=False),
+              'categories = ' + json.dumps(categories, ensure_ascii=False),
+              '',
+              '[[versions]]',
+              'version = ' + json.dumps(manifest['version'], ensure_ascii=False),
+              'tag = ' + json.dumps(os.environ['GITHUB_REF_NAME'], ensure_ascii=False),
+          ])
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              print('### 市场条目：plugins/' + manifest['id'] + '.toml', file=summary)
+              print('\n```toml\n' + entry + '\n```', file=summary)
+          PY

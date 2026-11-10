@@ -1,0 +1,9 @@
+/* @author kongweiguang */
+body { background: var(--k-bg, Canvas); color: var(--k-fg, CanvasText); font: 14px system-ui; margin: 0; }
+main { padding: 24px; }
+form { display: grid; gap: 12px; max-width: 640px; }
+textarea, button { color: inherit; background: var(--k-bg, Canvas); font: inherit; border: 1px solid var(--k-border, GrayText); border-radius: 6px; padding: 8px 12px; }
+textarea { resize: vertical; min-height: 96px; }
+button { justify-self: start; cursor: pointer; }
+button:disabled { opacity: .6; cursor: default; }
+#status { min-height: 1.5em; margin: 0; }

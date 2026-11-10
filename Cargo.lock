@@ -5111,6 +5111,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kerminal-plugin-cli"
+version = "1.0.0"
+dependencies = [
+ "flate2",
+ "kerminal-plugin-protocol",
+ "notify",
+ "process-wrap",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "kerminal-plugin-host"
 version = "1.0.0"
 dependencies = [
@@ -5141,6 +5158,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "kerminal-plugin-sdk"
+version = "1.0.0"
+dependencies = [
+ "kerminal-plugin-protocol",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
