@@ -274,6 +274,22 @@ impl WorkspaceService {
             .map_err(map_layout_error)
     }
 
+    /// 多目标分屏优先平铺为同方向兄弟；没有可复用父 split 时由调用方退回普通分屏。
+    ///
+    /// @author kongweiguang
+    pub fn add_sibling_pane(
+        &self,
+        layout: &TerminalLayoutNode,
+        target: &PaneId,
+        new_pane: PaneId,
+        direction: SplitDirection,
+        before: bool,
+    ) -> AppResult<Option<TerminalLayoutNode>> {
+        layout
+            .add_sibling_pane(target, new_pane, direction, before)
+            .map_err(map_layout_error)
+    }
+
     /// 只有权重键与 split 的直接子节点完全匹配时才接受拖拽尺寸更新。
     pub fn resize_split(
         &self,

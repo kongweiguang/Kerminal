@@ -269,3 +269,90 @@ fn removing_leaf_rekeys_weight_after_nested_split_collapses() {
     assert_eq!(sizes.get("p2"), Some(&0.6));
     assert_eq!(sizes.get("p3"), Some(&0.4));
 }
+
+/// 平铺追加必须复用同方向父 split 并保留既有比例，新 pane 获得平均值权重。
+#[test]
+fn appending_sibling_keeps_flat_split_and_average_weight() {
+    let p1 = pane_id("p1");
+    let p2 = pane_id("p2");
+    let root = split(
+        "root",
+        vec![
+            TerminalLayoutNode::pane(p1.clone()),
+            TerminalLayoutNode::pane(p2.clone()),
+        ],
+        Some(BTreeMap::from([
+            ("p1".to_owned(), 0.25),
+            ("p2".to_owned(), 0.75),
+        ])),
+    );
+
+    let p3 = pane_id("p3");
+    let next = root
+        .add_sibling_pane(&p1, p3.clone(), SplitDirection::Horizontal, false)
+        .expect("append should succeed")
+        .expect("matching parent split exists");
+    next.validate().expect("flat sibling layout stays valid");
+    let TerminalLayoutNode::Split {
+        children, sizes, ..
+    } = next
+    else {
+        panic!("root should remain a split");
+    };
+    assert_eq!(
+        children,
+        vec![
+            TerminalLayoutNode::pane(p1),
+            TerminalLayoutNode::pane(p3.clone()),
+            TerminalLayoutNode::pane(p2),
+        ]
+    );
+    let sizes = sizes.expect("explicit weights are preserved");
+    assert_eq!(sizes.get("p1"), Some(&0.25));
+    assert_eq!(sizes.get("p2"), Some(&0.75));
+    assert_eq!(sizes.get(&p3.to_string()), Some(&0.5));
+}
+
+/// 父 split 方向不一致时只能由调用方退回普通分屏，避免跨方向拼接改变几何语义。
+#[test]
+fn appending_sibling_requires_matching_parent_direction() {
+    let p1 = pane_id("p1");
+    let p2 = pane_id("p2");
+    let nested = TerminalLayoutNode::Split {
+        id: "inner".to_owned(),
+        direction: SplitDirection::Vertical,
+        children: vec![
+            TerminalLayoutNode::pane(p1.clone()),
+            TerminalLayoutNode::pane(p2),
+        ],
+        sizes: None,
+    };
+    let root = split(
+        "root",
+        vec![nested, TerminalLayoutNode::pane(pane_id("p3"))],
+        None,
+    );
+
+    assert_eq!(
+        root.add_sibling_pane(&p1, pane_id("p4"), SplitDirection::Horizontal, false)
+            .expect("validation passes"),
+        None
+    );
+    assert!(
+        root.add_sibling_pane(&p1, pane_id("p4"), SplitDirection::Vertical, true)
+            .expect("validation passes")
+            .is_some()
+    );
+}
+
+/// 根节点只有单个 pane 时没有可复用的父 split。
+#[test]
+fn appending_sibling_from_single_pane_returns_none() {
+    let p1 = pane_id("p1");
+    let root = TerminalLayoutNode::pane(p1.clone());
+    assert_eq!(
+        root.add_sibling_pane(&p1, pane_id("p2"), SplitDirection::Horizontal, false)
+            .expect("validation passes"),
+        None
+    );
+}

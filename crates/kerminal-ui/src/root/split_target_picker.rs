@@ -2,6 +2,11 @@
 //!
 //! @author kongweiguang
 
+use std::{
+    collections::{BTreeSet, VecDeque},
+    rc::Rc,
+};
+
 use gpui_kit::{
     AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
     IntoElement, Render, SharedString, Subscription, Window,
@@ -16,8 +21,9 @@ use kerminal_domain::identity::{PaneId, SessionId, TabId};
 use crate::features::{
     connections::HostNavigation,
     host_picker::{
-        HostPickerGroup, HostPickerList, HostPickerListMessage, HostPickerOption,
-        HostPickerPopoverProjection, HostPickerPopoverRequest,
+        HostPickerGroup, HostPickerList, HostPickerListMessage, HostPickerMultiSelect,
+        HostPickerOption, HostPickerPopoverProjection, HostPickerPopoverRequest,
+        HostPickerRowSelection, toggled_host_keys,
     },
     workspace_controller::WorkspaceSplitTargetOption,
 };
@@ -60,6 +66,11 @@ pub(super) enum SplitTargetPickerEvent {
         request: SplitTargetPickerRequest,
         target: WorkspaceSplitTargetOption,
     },
+    /// 多选批量打开；Root 在每个会话 ACK 后串行启动下一个目标。
+    ConfirmMany {
+        request: SplitTargetPickerRequest,
+        targets: Vec<WorkspaceSplitTargetOption>,
+    },
 }
 
 /// 选择弹层不持有连接配置正文，目标由 HostNavigation 的当前分组投影即时重算。
@@ -71,6 +82,10 @@ pub(super) struct SplitTargetPicker {
     request: Option<SplitTargetPickerRequest>,
     status: Option<SharedString>,
     return_focus: Option<FocusHandle>,
+    /// 勾选按主机 target key 保存；分组行只展开为组内主机，打开时无需再区分“目录还是主机”。
+    selected_keys: BTreeSet<String>,
+    /// Shift 连选锚点使用稳定行 key；搜索隐藏锚点后由下一行重新建立。
+    selection_anchor: Option<String>,
 }
 
 impl EventEmitter<SplitTargetPickerEvent> for SplitTargetPicker {}
@@ -105,6 +120,8 @@ impl SplitTargetPicker {
             request: None,
             status: None,
             return_focus: None,
+            selected_keys: BTreeSet::new(),
+            selection_anchor: None,
         }
     }
 
@@ -124,6 +141,8 @@ impl SplitTargetPicker {
         self.request = Some(request);
         self.query.clear();
         self.status = None;
+        self.selected_keys.clear();
+        self.selection_anchor = None;
         self.search.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
             input.focus(window, cx);
@@ -143,6 +162,8 @@ impl SplitTargetPicker {
         self.request = None;
         self.query.clear();
         self.status = None;
+        self.selected_keys.clear();
+        self.selection_anchor = None;
         self.search
             .update(cx, |input, cx| input.set_value(String::new(), window, cx));
         cx.notify();
@@ -205,6 +226,75 @@ impl SplitTargetPicker {
         cx.emit(SplitTargetPickerEvent::Confirm { request, target });
     }
 
+    /// 勾选一行或整组：整组已选时取消，否则补齐；单个主机行因此就是标准勾选切换。
+    ///
+    /// 勾选集只保存主机 key，分组行不会被单独持久化，打开时自然展开为组内主机。
+    ///
+    /// @author kongweiguang
+    fn toggle_selected_row(&mut self, row: HostPickerRowSelection, cx: &mut Context<Self>) {
+        self.selected_keys = toggled_host_keys(&self.selected_keys, &row.host_keys);
+        if row.adopt_anchor {
+            self.selection_anchor = Some(row.row_key);
+        }
+        self.status = None;
+        cx.notify();
+    }
+
+    /// Shift 连选只追加不取消，保持文件列表的多选直觉；锚点仍指向上一次主动勾选。
+    ///
+    /// @author kongweiguang
+    fn extend_selection(&mut self, row: HostPickerRowSelection, cx: &mut Context<Self>) {
+        self.selected_keys.extend(row.host_keys);
+        if row.adopt_anchor {
+            self.selection_anchor = Some(row.row_key);
+        }
+        self.status = None;
+        cx.notify();
+    }
+
+    /// 按当前目录重核已勾选目标，配置重载后消失的主机不会进入批量启动。
+    ///
+    /// @author kongweiguang
+    fn selected_options(&mut self, cx: &Context<Self>) -> Vec<WorkspaceSplitTargetOption> {
+        let options = self.options(cx);
+        let current_keys = options
+            .iter()
+            .map(|option| target_option_key(&option.target))
+            .collect::<BTreeSet<_>>();
+        self.selected_keys.retain(|key| current_keys.contains(key));
+        options
+            .into_iter()
+            .filter(|option| {
+                self.selected_keys
+                    .contains(&target_option_key(&option.target))
+            })
+            .collect()
+    }
+
+    /// 一次打开全部已勾选目标；单个选择仍走既有单次确认，批量由 Root 串行创建。
+    ///
+    /// @author kongweiguang
+    fn open_selected_targets(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.request.clone() else {
+            return;
+        };
+        let targets = self.selected_options(cx);
+        match targets.len() {
+            0 => {
+                self.status = Some(crate::locale::text(
+                    "所选目标已不在当前目录，请重新勾选。",
+                    "The selected targets are no longer in the current directory; select them again.",
+                ));
+                cx.notify();
+            }
+            1 => cx.emit(SplitTargetPickerEvent::Confirm {
+                request,
+                target: targets[0].clone(),
+            }),
+            _ => cx.emit(SplitTargetPickerEvent::ConfirmMany { request, targets }),
+        }
+    }
+
     /// 每次 render 从导航最新目录投影候选，不在 picker 保存完整连接配置或凭据。
     ///
     /// @author kongweiguang
@@ -213,6 +303,28 @@ impl SplitTargetPicker {
             .as_ref()
             .map(|navigation| navigation.read(cx).split_target_options(""))
             .unwrap_or_default()
+    }
+
+    /// 把勾选集、锚点和三个动作打包给通用列表；列表不反向持有选择器业务状态。
+    ///
+    /// @author kongweiguang
+    fn multi_select_projection(&self, cx: &Context<Self>) -> HostPickerMultiSelect {
+        let toggle_picker = cx.entity();
+        let range_picker = cx.entity();
+        let open_picker = cx.entity();
+        HostPickerMultiSelect {
+            selected_keys: self.selected_keys.clone(),
+            anchor: self.selection_anchor.clone(),
+            on_toggle: Rc::new(move |row, _window, app| {
+                toggle_picker.update(app, |picker, cx| picker.toggle_selected_row(row, cx));
+            }),
+            on_range: Rc::new(move |row, _window, app| {
+                range_picker.update(app, |picker, cx| picker.extend_selection(row, cx));
+            }),
+            on_open_selected: Rc::new(move |_window, app| {
+                open_picker.update(app, |picker, cx| picker.open_selected_targets(cx));
+            }),
+        }
     }
 
     /// 分组标题和 loading/error 状态只读既有导航快照，不触发额外请求或回退目标。
@@ -269,6 +381,7 @@ impl SplitTargetPicker {
         .search_input(self.search.clone())
         .query(self.query.clone())
         .groups(list_groups)
+        .multi_select(self.multi_select_projection(cx))
         .theme(theme);
 
         let has_directory_error = directory_status.is_some();
@@ -626,6 +739,7 @@ impl RootView {
     }
 
     /// Picker 关闭先恢复打开前焦点；之后新 pane 绑定成功才可在用户未改焦点时接管输入。
+    /// 多选确认沿用同一来源校验，批量由 Root 串行启动，选择器本身不持有资源生命周期。
     ///
     /// @author kongweiguang
     pub(super) fn handle_split_target_picker_event(
@@ -634,7 +748,10 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<RootView>,
     ) {
-        let SplitTargetPickerEvent::Confirm { request, target } = event;
+        let (request, mut targets) = match event {
+            SplitTargetPickerEvent::Confirm { request, target } => (request, vec![target]),
+            SplitTargetPickerEvent::ConfirmMany { request, targets } => (request, targets),
+        };
         if !self.split_target_picker.read(cx).matches_request(&request) {
             return;
         }
@@ -645,6 +762,9 @@ impl RootView {
             window.focus(&focus, cx);
         }
 
+        if targets.is_empty() {
+            return;
+        }
         if !self.split_target_source_is_current(&request) {
             self.status = Some(crate::locale::text(
                 "分屏来源已变化；没有创建终端，请重新发起操作。",
@@ -653,6 +773,25 @@ impl RootView {
             cx.notify();
             return;
         }
+        if targets.len() == 1 {
+            if let Some(target) = targets.pop() {
+                self.start_split_target(request, target, window, cx);
+            }
+            return;
+        }
+        self.start_split_target_batch(request, targets, window, cx);
+    }
+
+    /// 单击分屏保持既有单一 CreatePane 路径，不与批量共享额外的队列状态。
+    ///
+    /// @author kongweiguang
+    fn start_split_target(
+        &mut self,
+        request: SplitTargetPickerRequest,
+        target: WorkspaceSplitTargetOption,
+        window: &mut Window,
+        cx: &mut Context<RootView>,
+    ) {
         let Some(controller) = self.workspace_controller.as_mut() else {
             self.status = Some(crate::locale::text(
                 "工作区尚未就绪，无法创建分屏。",
@@ -687,6 +826,321 @@ impl RootView {
                 cx.notify();
             }
         }
+    }
+
+    /// 多选分屏先启动首个目标，其余按会话 ACK 顺序排队，避免 controller 并发候选互相覆盖。
+    ///
+    /// @author kongweiguang
+    fn start_split_target_batch(
+        &mut self,
+        request: SplitTargetPickerRequest,
+        mut targets: Vec<WorkspaceSplitTargetOption>,
+        window: &mut Window,
+        cx: &mut Context<RootView>,
+    ) {
+        let Some(first) = targets.first().cloned() else {
+            return;
+        };
+        let remaining = targets
+            .drain(1..)
+            .map(|target| (target.target, target.title))
+            .collect::<VecDeque<_>>();
+        let total = remaining.len() + 1;
+        let Some(controller) = self.workspace_controller.as_mut() else {
+            self.status = Some(crate::locale::text(
+                "工作区尚未就绪，无法创建分屏。",
+                "The workspace is not ready to create a split.",
+            ));
+            cx.notify();
+            return;
+        };
+        let result = controller.begin_split_for_target(
+            &request.tab_id,
+            &request.pane_id,
+            first.target,
+            first.title,
+            request.direction,
+            request.before,
+        );
+        match result {
+            Ok(
+                crate::features::workspace_controller::WorkspaceControllerEffect::ResourceOperation(
+                    operation,
+                ),
+            ) => {
+                let Some(pane_id) = created_split_pane_id(&operation) else {
+                    self.status = Some(crate::locale::text(
+                        "未能确认分屏操作身份，已停止批量打开。",
+                        "The split operation identity could not be confirmed; batch opening stopped.",
+                    ));
+                    cx.notify();
+                    return;
+                };
+                let label = split_batch_progress_label(1, total);
+                self.split_open_batch = Some(PendingSplitBatch {
+                    tab_id: request.tab_id,
+                    source_pane_id: request.pane_id,
+                    direction: request.direction,
+                    before: request.before,
+                    total,
+                    opened: 0,
+                    current_pane: Some(pane_id),
+                    last_added_pane: None,
+                    remaining,
+                    last_status: Some(label.clone()),
+                });
+                self.status = Some(label);
+                self.dispatch_split_resource_operation(operation, window, cx);
+            }
+            Ok(_) => {
+                self.status = Some(crate::locale::text(
+                    "未能生成分屏操作，请重试。",
+                    "No split operation was produced. Please retry.",
+                ));
+                cx.notify();
+            }
+            Err(error) => {
+                self.status = Some(error.public_message().to_owned().into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// 只有当前批次的候选会话真正 Ready 后才推进下一个；迟到或重复 ACK 不重复启动。
+    ///
+    /// @author kongweiguang
+    pub(super) fn note_split_batch_pane_opened(
+        &mut self,
+        pane_id: &PaneId,
+        cx: &mut Context<RootView>,
+    ) {
+        let (finished, last_status) = {
+            let Some(batch) = self.split_open_batch.as_mut() else {
+                return;
+            };
+            if batch.current_pane.as_ref() != Some(pane_id) {
+                return;
+            }
+            batch.current_pane = None;
+            batch.opened += 1;
+            batch.last_added_pane = Some(pane_id.clone());
+            (batch.remaining.is_empty(), batch.last_status.clone())
+        };
+        if finished {
+            self.split_open_batch = None;
+            if self.status.is_some() && self.status == last_status {
+                self.status = None;
+                cx.notify();
+            }
+            return;
+        }
+        self.schedule_split_batch_continuation(cx);
+    }
+
+    /// 续跑放到下一次窗口更新，复用异步 ACK 回调既有的窗口上下文与 Dialog 门禁。
+    ///
+    /// @author kongweiguang
+    fn schedule_split_batch_continuation(&mut self, cx: &mut Context<RootView>) {
+        let window_handle = self.window_handle;
+        cx.spawn(async move |this, cx| {
+            let _ = cx.update_window(window_handle, move |_, window, app| {
+                let _ = this.update(app, |root, cx| root.continue_split_batch(window, cx));
+            });
+        })
+        .detach();
+    }
+
+    /// 批次续跑前重新核对来源、插入位置与 controller 空闲；任一失效都收尾并告知已打开数量。
+    ///
+    /// @author kongweiguang
+    pub(super) fn continue_split_batch(&mut self, window: &mut Window, cx: &mut Context<RootView>) {
+        let Some((tab_id, source_pane_id, direction, before, insert_neighbor, next_index, total)) =
+            self.split_open_batch.as_ref().and_then(|batch| {
+                if batch.remaining.is_empty() || batch.current_pane.is_some() {
+                    return None;
+                }
+                let insert_neighbor = if batch.before {
+                    batch.source_pane_id.clone()
+                } else {
+                    batch
+                        .last_added_pane
+                        .clone()
+                        .unwrap_or_else(|| batch.source_pane_id.clone())
+                };
+                Some((
+                    batch.tab_id.clone(),
+                    batch.source_pane_id.clone(),
+                    batch.direction,
+                    batch.before,
+                    insert_neighbor,
+                    batch.opened + 1,
+                    batch.total,
+                ))
+            })
+        else {
+            return;
+        };
+        let source_is_current = self
+            .workspace_runtime
+            .pane(&source_pane_id)
+            .is_some_and(|pane| {
+                pane.tab_id == tab_id
+                    && pane.phase == super::workspace_runtime::RuntimePanePhase::Ready
+                    && pane.session_id.is_some()
+            })
+            && self
+                .workspace_controller
+                .as_ref()
+                .is_some_and(|controller| {
+                    controller.snapshot().terminal_tabs.iter().any(|tab| {
+                        tab.id() == &tab_id
+                            && tab.terminal_layout().is_some_and(|layout| {
+                                layout.contains_pane(&source_pane_id)
+                                    && layout.contains_pane(&insert_neighbor)
+                            })
+                    })
+                });
+        if !source_is_current {
+            self.abort_split_batch(
+                Some(crate::locale::text(
+                    "分屏来源或插入位置已变化。",
+                    "The split source or insertion position changed.",
+                )),
+                cx,
+            );
+            return;
+        }
+        let Some((target, title)) = self
+            .split_open_batch
+            .as_mut()
+            .and_then(|batch| batch.remaining.pop_front())
+        else {
+            return;
+        };
+        let Some(controller) = self.workspace_controller.as_mut() else {
+            self.abort_split_batch(
+                Some(crate::locale::text(
+                    "工作区尚未就绪。",
+                    "The workspace is not ready.",
+                )),
+                cx,
+            );
+            return;
+        };
+        let result = controller.append_split_for_target(
+            &tab_id,
+            &source_pane_id,
+            crate::features::workspace_controller::WorkspaceSplitInsertion {
+                neighbor_pane_id: insert_neighbor,
+                target,
+                title,
+                direction,
+                before,
+            },
+        );
+        match result {
+            Ok(
+                crate::features::workspace_controller::WorkspaceControllerEffect::ResourceOperation(
+                    operation,
+                ),
+            ) => {
+                let Some(pane_id) = created_split_pane_id(&operation) else {
+                    self.abort_split_batch(
+                        Some(crate::locale::text(
+                            "未能确认分屏操作身份。",
+                            "The split operation identity could not be confirmed.",
+                        )),
+                        cx,
+                    );
+                    return;
+                };
+                let label = split_batch_progress_label(next_index, total);
+                if let Some(batch) = self.split_open_batch.as_mut() {
+                    batch.current_pane = Some(pane_id);
+                    batch.last_status = Some(label.clone());
+                }
+                self.status = Some(label);
+                self.dispatch_split_resource_operation(operation, window, cx);
+            }
+            Ok(_) => {
+                self.abort_split_batch(
+                    Some(crate::locale::text(
+                        "未能生成分屏操作。",
+                        "No split operation was produced.",
+                    )),
+                    cx,
+                );
+            }
+            Err(error) => {
+                self.abort_split_batch(Some(SharedString::from(error.public_message())), cx);
+            }
+        }
+    }
+
+    /// 当前候选失败时收起整批；已打开数量和失败原因一次告知，剩余目标不再自动启动。
+    ///
+    /// @author kongweiguang
+    pub(super) fn abort_split_batch_for_pane(
+        &mut self,
+        pane_id: &PaneId,
+        reason: Option<SharedString>,
+        cx: &mut Context<RootView>,
+    ) -> bool {
+        let matches = self
+            .split_open_batch
+            .as_ref()
+            .is_some_and(|batch| batch.current_pane.as_ref() == Some(pane_id));
+        if !matches {
+            return false;
+        }
+        self.abort_split_batch(reason, cx);
+        true
+    }
+
+    /// 用户主动取消或关闭当前分屏时静默收起批次，只保留用户动作自己的结果文案。
+    ///
+    /// @author kongweiguang
+    pub(super) fn discard_split_batch_for_pane(
+        &mut self,
+        pane_id: &PaneId,
+        cx: &mut Context<RootView>,
+    ) {
+        let matches = self.split_open_batch.as_ref().is_some_and(|batch| {
+            batch.current_pane.as_ref() == Some(pane_id) || batch.source_pane_id == *pane_id
+        });
+        if !matches {
+            return;
+        }
+        if let Some(batch) = self.split_open_batch.take()
+            && self.status.is_some()
+            && self.status == batch.last_status
+        {
+            self.status = None;
+        }
+        cx.notify();
+    }
+
+    /// 失败收尾把“已打开/总数/剩余取消”合并成一条可见状态，避免残留进行中文案。
+    ///
+    /// @author kongweiguang
+    fn abort_split_batch(
+        &mut self,
+        reason: Option<SharedString>,
+        cx: &mut Context<RootView>,
+    ) -> bool {
+        let Some(batch) = self.split_open_batch.take() else {
+            return false;
+        };
+        let cancelled = usize::from(batch.current_pane.is_some()) + batch.remaining.len();
+        self.status = Some(split_batch_failure_label(
+            batch.opened,
+            batch.total,
+            cancelled,
+            reason.as_deref(),
+        ));
+        self.refresh_workspace_views(cx);
+        cx.notify();
+        true
     }
 
     /// 新 pane 的会话输入 handler 异步绑定；保留当前焦点快照，只有新 pane Ready 且用户未改焦点才转交。
@@ -731,6 +1185,91 @@ fn target_option_key(target: &WorkspaceTargetRef) -> String {
             ..
         } => format!("container:{runtime:?}:{}:{container_id}", host_id.as_str()),
         WorkspaceTargetRef::Unavailable { raw, .. } => format!("unavailable:{raw}"),
+    }
+}
+
+/// 多选分屏批次：一次只占用 controller 的单个候选资源槽位，每个 ACK 后串行启动下一个。
+///
+/// @author kongweiguang
+pub(super) struct PendingSplitBatch {
+    pub(super) tab_id: TabId,
+    pub(super) source_pane_id: PaneId,
+    pub(super) direction: kerminal_domain::workspace::SplitDirection,
+    pub(super) before: bool,
+    pub(super) total: usize,
+    pub(super) opened: usize,
+    /// 当前已派发但尚未 ACK 的候选；旧回执或迟到取消按此精确匹配。
+    pub(super) current_pane: Option<PaneId>,
+    /// before=false 时紧邻上次新 pane 追加，保持选择顺序；before=true 始终贴着来源。
+    pub(super) last_added_pane: Option<PaneId>,
+    pub(super) remaining: VecDeque<(WorkspaceTargetRef, String)>,
+    pub(super) last_status: Option<SharedString>,
+}
+
+/// 只接受 CreatePane 作为批次候选，避免把其它资源操作误塞进队列。
+///
+/// @author kongweiguang
+fn created_split_pane_id(
+    operation: &crate::features::workspace_controller::WorkspaceResourceOperation,
+) -> Option<PaneId> {
+    match operation {
+        crate::features::workspace_controller::WorkspaceResourceOperation::CreatePane {
+            pane,
+            ..
+        } => Some(pane.id.clone()),
+        crate::features::workspace_controller::WorkspaceResourceOperation::ClosePane { .. }
+        | crate::features::workspace_controller::WorkspaceResourceOperation::CloseTab { .. } => {
+            None
+        }
+    }
+}
+
+/// 进度文案只报告真实 ACK 序号，避免把排队目标提前算成已打开。
+///
+/// @author kongweiguang
+fn split_batch_progress_label(next: usize, total: usize) -> SharedString {
+    match crate::locale::current_language() {
+        crate::locale::UiLanguage::ZhCn => {
+            SharedString::from(format!("正在打开分屏 {next}/{total}…"))
+        }
+        crate::locale::UiLanguage::EnUs => {
+            SharedString::from(format!("Opening split {next}/{total}…"))
+        }
+    }
+}
+
+/// 失败摘要保留已打开数量和取消数量，让用户知道哪些目标没有启动。
+///
+/// @author kongweiguang
+fn split_batch_failure_label(
+    opened: usize,
+    total: usize,
+    cancelled: usize,
+    reason: Option<&str>,
+) -> SharedString {
+    let base = match crate::locale::current_language() {
+        crate::locale::UiLanguage::ZhCn => {
+            if opened == 0 {
+                "未能打开分屏。".to_owned()
+            } else if cancelled > 0 {
+                format!("已打开 {opened}/{total} 个分屏；其余目标已取消。")
+            } else {
+                format!("已打开 {opened}/{total} 个分屏。")
+            }
+        }
+        crate::locale::UiLanguage::EnUs => {
+            if opened == 0 {
+                "No splits were opened.".to_owned()
+            } else if cancelled > 0 {
+                format!("Opened {opened} of {total} splits; the remaining targets were cancelled.")
+            } else {
+                format!("Opened {opened} of {total} splits.")
+            }
+        }
+    };
+    match reason {
+        Some(reason) if !reason.trim().is_empty() => SharedString::from(format!("{base} {reason}")),
+        _ => SharedString::from(base),
     }
 }
 

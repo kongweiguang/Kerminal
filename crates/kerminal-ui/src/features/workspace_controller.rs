@@ -115,6 +115,18 @@ pub struct WorkspaceSplitTargetOption {
     pub group_id: Option<String>,
 }
 
+/// 多目标分屏的一次追加：位置、方向和目标成组传递，避免资源入口参数膨胀。
+///
+/// @author kongweiguang
+pub struct WorkspaceSplitInsertion {
+    /// 新 pane 的相邻兄弟；before=false 时通常是上一次创建的新 pane。
+    pub neighbor_pane_id: PaneId,
+    pub target: WorkspaceTargetRef,
+    pub title: String,
+    pub direction: SplitDirection,
+    pub before: bool,
+}
+
 impl WorkspaceResourceOperation {
     /// 所有异步资源结果都以唯一操作 ID 关联，防止迟到完成提交另一项候选工作区。
     pub fn operation_id(&self) -> &str {
@@ -1061,7 +1073,7 @@ impl WorkspaceController {
         {
             source.current_cwd = Some(directory.to_owned());
         }
-        self.begin_split_with_pane(tab_id, source_pane_id, source, direction, before)
+        self.begin_split_with_pane(tab_id, source_pane_id, source, direction, before, None)
     }
 
     /// 分屏目标由 Root 显式确认；仅接受当前恢复管线能无歧义解析的本地 Profile 或终端主机。
@@ -1086,7 +1098,50 @@ impl WorkspaceController {
         }
         let source = self.pane(source_pane_id)?.clone();
         let pane = Self::pane_for_explicit_split_target(source, target, title)?;
-        self.begin_split_with_pane(tab_id, source_pane_id, pane, direction, before)
+        self.begin_split_with_pane(tab_id, source_pane_id, pane, direction, before, None)
+    }
+
+    /// 多目标分屏沿用同一 CreatePane ACK；新 pane 作为现有同方向 split 的兄弟平铺，
+    /// 避免反复二分来源导致后续 pane 越开越窄。
+    ///
+    /// `insert_neighbor` 由 Root 按批次位置给出：目标已在来源右侧时取最近一次创建的 pane，
+    /// 保证视觉顺序与选择顺序一致；找不到可复用 split 时自动退回普通二分。
+    ///
+    /// @author kongweiguang
+    pub fn append_split_for_target(
+        &mut self,
+        tab_id: &TabId,
+        source_pane_id: &PaneId,
+        insertion: WorkspaceSplitInsertion,
+    ) -> AppResult<WorkspaceControllerEffect> {
+        self.ensure_no_pending_resource()?;
+        let WorkspaceSplitInsertion {
+            neighbor_pane_id,
+            target,
+            title,
+            direction,
+            before,
+        } = insertion;
+        let tab = self.terminal_tab(tab_id)?.clone();
+        let layout = tab
+            .terminal_layout()
+            .ok_or_else(|| AppError::invalid("非终端标签不支持分屏"))?;
+        if !layout.contains_pane(source_pane_id) {
+            return Err(AppError::not_found("终端 pane 不属于当前标签"));
+        }
+        if !layout.contains_pane(&neighbor_pane_id) {
+            return Err(AppError::not_found("分屏插入位置已不在当前标签"));
+        }
+        let source = self.pane(source_pane_id)?.clone();
+        let pane = Self::pane_for_explicit_split_target(source, target, title)?;
+        self.begin_split_with_pane(
+            tab_id,
+            source_pane_id,
+            pane,
+            direction,
+            before,
+            Some(&neighbor_pane_id),
+        )
     }
 
     /// 两种分屏意图共用相同的 stable ID、布局候选和 CreatePane ACK 门禁，避免重复资源状态机。
@@ -1099,6 +1154,7 @@ impl WorkspaceController {
         mut new_pane: WorkspaceSessionPane,
         direction: SplitDirection,
         before: bool,
+        insert_neighbor: Option<&PaneId>,
     ) -> AppResult<WorkspaceControllerEffect> {
         let tab = self.terminal_tab(tab_id)?.clone();
         let layout = tab
@@ -1107,16 +1163,42 @@ impl WorkspaceController {
         if !layout.contains_pane(source_pane_id) {
             return Err(AppError::not_found("终端 pane 不属于当前标签"));
         }
+        if let Some(neighbor) = insert_neighbor
+            && !layout.contains_pane(neighbor)
+        {
+            return Err(AppError::not_found("分屏插入位置已不在当前标签"));
+        }
         let new_pane_id = PaneId::new();
-        let split_id = format!("split-{}", uuid::Uuid::new_v4());
-        let next_layout = self.workspace_service().split_pane(
-            layout,
-            source_pane_id,
-            new_pane_id.clone(),
-            direction,
-            split_id,
-            before,
-        )?;
+        let next_layout = match insert_neighbor {
+            Some(neighbor) => {
+                // 同方向父 split 已存在时平铺兄弟并保留比例；否则退回普通二分，保持与单击分屏一致。
+                match self.workspace_service().add_sibling_pane(
+                    layout,
+                    neighbor,
+                    new_pane_id.clone(),
+                    direction,
+                    before,
+                )? {
+                    Some(next) => next,
+                    None => self.workspace_service().split_pane(
+                        layout,
+                        neighbor,
+                        new_pane_id.clone(),
+                        direction,
+                        format!("split-{}", uuid::Uuid::new_v4()),
+                        before,
+                    )?,
+                }
+            }
+            None => self.workspace_service().split_pane(
+                layout,
+                source_pane_id,
+                new_pane_id.clone(),
+                direction,
+                format!("split-{}", uuid::Uuid::new_v4()),
+                before,
+            )?,
+        };
         let mut candidate = self.snapshot.clone();
         let Some(WorkspaceSessionTab::Terminal { layout, .. }) = candidate
             .terminal_tabs

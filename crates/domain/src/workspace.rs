@@ -124,6 +124,94 @@ impl TerminalLayoutNode {
         Ok(next)
     }
 
+    /// 把新 pane 追加为目标的相邻兄弟，并要求其父 split 方向一致。
+    ///
+    /// 多目标分屏一次打开多个主机时，继续对来源做链式二分会把来源越压越窄；
+    /// 这里复用同一层平铺 split 并保留既有比例，只有找不到同方向父 split 时才返回 None，
+    /// 由调用方退回普通 `split_pane`，保持单目标分屏的既有几何语义。
+    ///
+    /// @author kongweiguang
+    pub fn add_sibling_pane(
+        &self,
+        target: &PaneId,
+        new_pane: PaneId,
+        direction: SplitDirection,
+        before: bool,
+    ) -> Result<Option<Self>, WorkspaceLayoutError> {
+        self.validate()?;
+        if self.contains_pane(&new_pane) {
+            return Err(WorkspaceLayoutError::DuplicatePane(new_pane));
+        }
+        if !self.contains_pane(target) {
+            return Err(WorkspaceLayoutError::PaneNotFound(target.clone()));
+        }
+        let Some(next) = self.add_sibling_pane_inner(target, &new_pane, direction, before) else {
+            return Ok(None);
+        };
+        next.validate()?;
+        Ok(Some(next))
+    }
+
+    /// 只查找直接包含目标的父 split；深层子树方向不同时交给调用方决定，不跨层猜测布局意图。
+    fn add_sibling_pane_inner(
+        &self,
+        target: &PaneId,
+        new_pane: &PaneId,
+        direction: SplitDirection,
+        before: bool,
+    ) -> Option<Self> {
+        let Self::Split {
+            id,
+            direction: current_direction,
+            children,
+            sizes,
+        } = self
+        else {
+            return None;
+        };
+        if let Some(index) = children
+            .iter()
+            .position(|child| matches!(child, Self::Pane { pane_id } if pane_id == target))
+        {
+            if *current_direction != direction {
+                return None;
+            }
+            let insert_at = if before { index } else { index + 1 };
+            let mut next_children = children.clone();
+            next_children.insert(
+                insert_at,
+                Self::Pane {
+                    pane_id: new_pane.clone(),
+                },
+            );
+            let next_sizes = sizes
+                .as_ref()
+                .map(|sizes| extend_sizes_with_average(children, sizes, new_pane));
+            return Some(Self::Split {
+                id: id.clone(),
+                direction: *current_direction,
+                children: next_children,
+                sizes: next_sizes,
+            });
+        }
+        for (index, child) in children.iter().enumerate() {
+            if !child.contains_pane(target) {
+                continue;
+            }
+            let next_child = child.add_sibling_pane_inner(target, new_pane, direction, before)?;
+            let mut next_children = children.clone();
+            next_children[index] = next_child;
+            // 子 split 的 ID 不变，父层比例键不受影响，无需重算。
+            return Some(Self::Split {
+                id: id.clone(),
+                direction: *current_direction,
+                children: next_children,
+                sizes: sizes.clone(),
+            });
+        }
+        None
+    }
+
     /// 更新一个 splitter 的持久化比例；比例键必须与当前子节点完全匹配。
     pub fn resize_split(
         &self,
@@ -327,6 +415,31 @@ fn rekey_sizes(
                 .map(|weight| (layout_child_id(new).to_owned(), *weight))
         })
         .collect()
+}
+
+/// 追加兄弟时以既有权重均值分配新 pane，保持旧分隔位置的比例关系；缺省权重继续均分。
+fn extend_sizes_with_average(
+    old_children: &[TerminalLayoutNode],
+    old_sizes: &SplitLayoutSizes,
+    new_pane: &PaneId,
+) -> SplitLayoutSizes {
+    let mut next = old_children
+        .iter()
+        .filter_map(|child| {
+            old_sizes
+                .get(layout_child_id(child))
+                .map(|weight| (layout_child_id(child).to_owned(), *weight))
+        })
+        .collect::<SplitLayoutSizes>();
+    let count = next.len().max(1) as f64;
+    let average = next.values().copied().sum::<f64>() / count;
+    let weight = if average.is_finite() && average > 0.0 {
+        average
+    } else {
+        1.0
+    };
+    next.insert(new_pane.as_str().to_owned(), weight);
+    next
 }
 
 /// 删除单一叶子后收缩 split，并将 surviving child 的权重键重映射到新树槽位。

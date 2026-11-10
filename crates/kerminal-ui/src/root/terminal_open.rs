@@ -1057,6 +1057,9 @@ impl RootView {
                             }
                             root.refresh_workspace_views(cx);
                         }
+                        // 批量分屏的当前候选失败时停止后续目标；摘要保留已打开数量与本会话的失败原因。
+                        let failure_reason = root.status.clone();
+                        root.abort_split_batch_for_pane(&pane_id, failure_reason, cx);
                         root.finish_workspace_restore(&pane_id, generation, cx);
                         false
                     }

@@ -3319,6 +3319,8 @@ impl RootView {
             return true;
         }
         self.workspace_resource_operations.remove(&preview.pane_id);
+        // 当前候选被用户撤销后，队列中的其余目标也不再启动，避免静默残留进行中状态。
+        self.discard_split_batch_for_pane(&preview.pane_id, cx);
         self.status = Some(crate::locale::text(
             "已取消新分屏，原终端保持不变。",
             "The new split was cancelled; the original terminal is unchanged.",
@@ -3365,6 +3367,10 @@ impl RootView {
         let Some((operation_id, split_tab_id, source_pane_id, split_pane_id)) = pending else {
             return false;
         };
+        if intent.targets_split(&split_tab_id, &source_pane_id, &split_pane_id) {
+            // 用户关闭来源、候选或整个标签时，批量队列无法继续，先收起队列再沿用原关闭门禁。
+            self.discard_split_batch_for_pane(&source_pane_id, cx);
+        }
         if !intent.targets_split(&split_tab_id, &source_pane_id, &split_pane_id) {
             self.status = Some(crate::locale::text(
                 "分屏正在创建；此关闭尚未执行，也没有取消分屏，请稍后重试。",

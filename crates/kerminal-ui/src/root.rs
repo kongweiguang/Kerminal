@@ -847,6 +847,8 @@ pub struct RootView {
     split_target_picker: Entity<split_target_picker::SplitTargetPicker>,
     /// 每次打开使用独立请求身份，旧弹层的关闭和选择不得影响同来源的新请求。
     split_target_picker_generation: u64,
+    /// 多选分屏按 ACK 串行启动；一次只占用 controller 的单个候选资源槽位。
+    split_open_batch: Option<split_target_picker::PendingSplitBatch>,
     _split_target_picker_event_subscription: gpui_kit::Subscription,
     _agent_event_subscription: Option<gpui_kit::Subscription>,
     _updates_event_subscription: gpui_kit::Subscription,
@@ -1484,6 +1486,8 @@ impl RootView {
         self.refresh_workspace_views(cx);
         self.refresh_proxy_panel(cx);
         self.persist_workspace_snapshot(cx);
+        // 会话真正 Ready 后才推进批量队列，失败路径不会误把排队目标算作已打开。
+        self.note_split_batch_pane_opened(pane_id, cx);
         cx.notify();
     }
 
@@ -1508,7 +1512,9 @@ impl RootView {
                 .workspace_runtime
                 .set_status(pane_id, Some(message.clone()));
         }
-        self.status = Some(message);
+        self.status = Some(message.clone());
+        // 当前候选无法准入时整批停止；摘要保留已打开数量并附上本 pane 的具体原因。
+        self.abort_split_batch_for_pane(pane_id, Some(message), cx);
         self.refresh_workspace_views(cx);
         cx.notify();
     }
@@ -1525,7 +1531,8 @@ impl RootView {
                 .workspace_runtime
                 .set_status(pane_id, Some(message.clone()));
         }
-        self.status = Some(message);
+        self.status = Some(message.clone());
+        self.abort_split_batch_for_pane(pane_id, Some(message), cx);
         self.refresh_workspace_views(cx);
         cx.notify();
     }
@@ -4026,6 +4033,7 @@ impl RootView {
             _host_navigation_event_subscription: host_navigation_event_subscription,
             split_target_picker,
             split_target_picker_generation: 0,
+            split_open_batch: None,
             _split_target_picker_event_subscription: split_target_picker_event_subscription,
             _agent_event_subscription: agent_event_subscription,
             updates_panel,

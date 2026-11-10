@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::rc::Rc;
+use std::{collections::BTreeSet, rc::Rc};
 
 use gpui_kit::{
     AnyElement, App, Context, ElementId, FocusHandle, IntoElement, MouseButton, RenderOnce,
@@ -10,7 +10,8 @@ use gpui_kit::{
     assets::IconName,
     base::{Selectable, TestSupportExt},
     component::{
-        Sizable as _,
+        Disableable as _, Sizable as _,
+        button::{Button, ButtonVariants as _},
         input::{Enter, Input, InputState},
         popover::{Popover, PopoverState},
         spinner::Spinner,
@@ -49,6 +50,40 @@ pub(crate) enum HostPickerListMessage {
     Loading(SharedString),
     Error(SharedString),
     Empty(SharedString),
+}
+
+/// 多选列表交给业务 owner 的一行身份：分组行展开为该组当前可见的全部主机 key。
+///
+/// 列表不保存业务勾选集，点击只解释成可应用的主机集合，避免把 SFTP 或标签创建的选择混在一起。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostPickerRowSelection {
+    pub(crate) row_key: String,
+    pub(crate) host_keys: Vec<String>,
+    /// 范围连选找不到旧锚点时，owner 应把当前行设为新锚点。
+    pub(crate) adopt_anchor: bool,
+}
+
+/// 行勾选与连选回调携带解析后的主机集合；类型别名避免多处重复书写闭包签名。
+pub(crate) type HostPickerRowAction = dyn Fn(HostPickerRowSelection, &mut Window, &mut App);
+
+/// “打开所选”回调不携带目标，具体目标由 owner 重新核对。
+pub(crate) type HostPickerOpenSelectedAction = dyn Fn(&mut Window, &mut App);
+
+/// 勾选槽位自己的切换回调，必须与行主体动作隔离，避免勾选时同时打开。
+pub(crate) type HostPickerToggleAction = dyn Fn(&mut Window, &mut App);
+
+/// 多选模式由 owner 提供当前勾选、锚点和三个动作；列表只负责命中与范围计算。
+///
+/// @author kongweiguang
+#[derive(Clone)]
+pub(crate) struct HostPickerMultiSelect {
+    pub(crate) selected_keys: BTreeSet<String>,
+    pub(crate) anchor: Option<String>,
+    pub(crate) on_toggle: Rc<HostPickerRowAction>,
+    pub(crate) on_range: Rc<HostPickerRowAction>,
+    pub(crate) on_open_selected: Rc<HostPickerOpenSelectedAction>,
 }
 
 /// 仅投影 Root 捕获的分屏请求，使相邻方向按钮不会共用错误的弹层状态。
@@ -140,6 +175,7 @@ pub(crate) struct HostPickerList<T: Clone + 'static> {
     message: Option<HostPickerListMessage>,
     footer: Option<AnyElement>,
     theme: Option<ThemeTokens>,
+    multi_select: Option<HostPickerMultiSelect>,
     on_select: HostPickerSelect<T>,
 }
 
@@ -163,6 +199,7 @@ impl<T: Clone + 'static> HostPickerList<T> {
             message: None,
             footer: None,
             theme: None,
+            multi_select: None,
             on_select: Rc::new(on_select),
         }
     }
@@ -229,6 +266,14 @@ impl<T: Clone + 'static> HostPickerList<T> {
         self
     }
 
+    /// 打开多选勾选、分组选择与“打开所选”入口；未设置时保持各入口原有的单击打开行为。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn multi_select(mut self, multi_select: HostPickerMultiSelect) -> Self {
+        self.multi_select = Some(multi_select);
+        self
+    }
+
     /// 保留选项顺序，并将已删除分组安全归入未分组区域。
     ///
     /// @author kongweiguang
@@ -282,6 +327,111 @@ pub(crate) fn grouped_host_picker_options<T: Clone>(
         ));
     }
     result
+}
+
+/// 切换一组主机：整组已选时取消，否则补齐；主机行传入单个 key 即标准勾选切换。
+///
+/// 分组行与主机行共用同一规则，勾选结果始终落在主机 key 上，打开时无需再判断“目录还是主机”。
+///
+/// @author kongweiguang
+pub(crate) fn toggled_host_keys(
+    selected: &BTreeSet<String>,
+    host_keys: &[String],
+) -> BTreeSet<String> {
+    let mut next = selected.clone();
+    let all_selected = !host_keys.is_empty() && host_keys.iter().all(|key| selected.contains(key));
+    if all_selected {
+        for key in host_keys {
+            next.remove(key);
+        }
+    } else {
+        for key in host_keys {
+            next.insert(key.clone());
+        }
+    }
+    next
+}
+
+/// 按可见行顺序计算 Shift 连选；锚点已隐藏时退化为当前行，并让 owner 采用当前行为新锚点。
+///
+/// 行序列由渲染同帧的过滤结果生成，因此搜索变化后不会把不可见主机偷偷加入选择。
+///
+/// @author kongweiguang
+pub(crate) fn host_picker_range_keys(
+    rows: &[(String, Vec<String>)],
+    anchor: Option<&str>,
+    target_row: &str,
+) -> (Vec<String>, bool) {
+    let Some(target_index) = rows.iter().position(|(key, _)| key == target_row) else {
+        return (Vec::new(), false);
+    };
+    let anchor_index = anchor.and_then(|anchor| rows.iter().position(|(key, _)| key == anchor));
+    let start = anchor_index.unwrap_or(target_index);
+    let (low, high) = if start <= target_index {
+        (start, target_index)
+    } else {
+        (target_index, start)
+    };
+    let mut seen = BTreeSet::new();
+    let mut keys = Vec::new();
+    for (_, host_keys) in &rows[low..=high] {
+        for key in host_keys {
+            if seen.insert(key.clone()) {
+                keys.push(key.clone());
+            }
+        }
+    }
+    (keys, anchor_index.is_none())
+}
+
+/// 勾选槽位与行主体共享同一状态：分组部分选中显示减号，避免半选被误读为整组已选。
+///
+/// 槽位自己截断点击冒泡，行主体的“打开”动作不会在勾选时被意外触发。
+///
+/// @author kongweiguang
+fn host_picker_check_slot(
+    id: String,
+    checked: bool,
+    partial: bool,
+    accessible: SharedString,
+    theme: ThemeTokens,
+    on_toggle: Rc<HostPickerToggleAction>,
+) -> AnyElement {
+    let icon = if checked {
+        IconName::SquareCheck
+    } else if partial {
+        IconName::SquareMinus
+    } else {
+        IconName::Square
+    };
+    let color = if checked || partial {
+        theme.accent
+    } else {
+        theme.subtle
+    };
+    let debug_id = id.clone();
+    div()
+        .id(id)
+        .debug_selector(move || debug_id.clone())
+        .w(px(22.))
+        .h(px(22.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .text_color(color)
+        .role(gpui_kit::Role::CheckBox)
+        .aria_label(accessible)
+        .aria_selected(checked || partial)
+        .hover(move |style| style.bg(theme.surface_hover()))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            on_toggle(window, cx);
+        })
+        .child(icon)
+        .into_any_element()
 }
 
 /// 外置输入框只拦截列表导航键；选择结果仍由业务 owner 执行。
@@ -395,6 +545,39 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
             .flat_map(|(_, _, options)| options.iter())
             .cloned()
             .collect::<Vec<_>>();
+        let multi_select = self.multi_select.clone();
+        let selected_keys = multi_select
+            .as_ref()
+            .map(|multi| multi.selected_keys.clone())
+            .unwrap_or_default();
+        let selected_count = visible_options
+            .iter()
+            .filter(|option| selected_keys.contains(option.key.as_ref()))
+            .count();
+        // 与下方绘制同帧生成可见行序列；搜索过滤后的范围连选不会包含已隐藏主机。
+        let mut selection_rows: Vec<(String, Vec<String>)> = Vec::new();
+        for (group_key, _, options) in &grouped {
+            selection_rows.push((
+                group_key.clone(),
+                options
+                    .iter()
+                    .map(|option| option.key.to_string())
+                    .collect(),
+            ));
+            for option in options {
+                selection_rows.push((option.key.to_string(), vec![option.key.to_string()]));
+            }
+        }
+        let multi_open_selected = multi_select
+            .as_ref()
+            .map(|multi| Rc::clone(&multi.on_open_selected));
+        let multi_toggle = multi_select
+            .as_ref()
+            .map(|multi| Rc::clone(&multi.on_toggle));
+        let multi_range = multi_select
+            .as_ref()
+            .map(|multi| Rc::clone(&multi.on_range));
+        let multi_anchor = multi_select.as_ref().and_then(|multi| multi.anchor.clone());
         let loading = matches!(
             self.message.as_ref(),
             Some(HostPickerListMessage::Loading(_))
@@ -432,6 +615,7 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
         }
         let key_active = active_key.clone();
         let key_select = self.on_select.clone();
+        let key_multi_toggle = multi_toggle.clone();
         let key_state = keyboard_state.clone();
         let key_scroll = keyboard_state.read(cx).scroll.clone();
         let search_input_for_keys = self.search_input.clone();
@@ -439,6 +623,8 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
         let confirm_active_key = active_key.clone();
         let confirm_select = self.on_select.clone();
         let confirm_search_input = self.search_input.clone();
+        let confirm_open_selected = multi_open_selected.clone();
+        let confirm_selected_count = selected_count;
         let viewport = window.viewport_size();
         let max_width = px((viewport.width.as_f32() - 24.0).clamp(0.0, 480.0));
         let max_height = px((viewport.height.as_f32() - 32.0).clamp(0.0, 560.0));
@@ -486,6 +672,15 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
 
                 if !is_composing {
                     window.prevent_default();
+                    // 已勾选多个目标时，Ctrl+Enter 执行与搜索栏右侧按钮相同的批量打开。
+                    if window.modifiers().secondary()
+                        && confirm_selected_count > 0
+                        && let Some(open_selected) = confirm_open_selected.as_ref()
+                    {
+                        open_selected(window, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     if let Some(target) = selected {
                         confirm_select(target, window, cx);
                     }
@@ -496,6 +691,29 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
             })
             .capture_key_down(move |event, window, cx| {
                 let key = event.keystroke.key.to_ascii_lowercase();
+                // Ctrl+Space 勾选键盘高亮的主机；普通空格仍属于搜索输入，不能被列表抢走。
+                if event.keystroke.modifiers.secondary()
+                    && key == "space"
+                    && let Some(toggle) = key_multi_toggle.as_ref()
+                    && let Some(option) = key_active.as_deref().and_then(|active| {
+                        key_options
+                            .iter()
+                            .find(|option| option.key.as_ref() == active)
+                    })
+                {
+                    toggle(
+                        HostPickerRowSelection {
+                            row_key: option.key.to_string(),
+                            host_keys: vec![option.key.to_string()],
+                            adopt_anchor: true,
+                        },
+                        window,
+                        cx,
+                    );
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
                 let Some(current_index) = key_options.iter().position(|option| {
                     key_active
                         .as_deref()
@@ -535,6 +753,48 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
             && let Some(search_input) = self.search_input
         {
             let reduce_motion = cx.reduce_motion();
+            // 按钮槽位始终存在，勾选数量变化只改变标签与可用状态，搜索行不横向跳动。
+            let open_selected_button = multi_open_selected.as_ref().map(|open_selected| {
+                let open_selected = Rc::clone(open_selected);
+                let count = selected_count;
+                let label: SharedString = if count > 0 {
+                    SharedString::from(format!("{} {}", crate::locale::text("打开", "Open"), count))
+                } else {
+                    crate::locale::text("打开", "Open")
+                };
+                let tooltip = if count > 0 {
+                    SharedString::from(format!(
+                        "{}{}{}{}",
+                        crate::locale::text("一起打开已勾选的 ", "Open the "),
+                        count,
+                        crate::locale::text(" 个分屏目标", " selected split targets"),
+                        crate::locale::text("；Ctrl+Enter 亦可", "; Ctrl+Enter also works"),
+                    ))
+                } else {
+                    crate::locale::text(
+                        "先勾选要一起打开的分屏目标",
+                        "Select split targets to open together",
+                    )
+                };
+                let mut button = Button::new(format!("{}-open-selected", self.id))
+                    .compact()
+                    .flex_none()
+                    .label(label)
+                    .tab_stop(true)
+                    .tooltip(tooltip)
+                    .disabled(count == 0);
+                button = if count > 0 {
+                    button.primary()
+                } else {
+                    button.ghost()
+                };
+                button.on_click(move |_, window, cx| {
+                    if count > 0 {
+                        open_selected(window, cx);
+                    }
+                    window.prevent_default();
+                })
+            });
             panel = panel.child(
                 div()
                     .id(format!("{}-search", self.id))
@@ -583,7 +843,8 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
                             .min_w(px(0.))
                             .h((theme.metrics.control_height - window.rem_size() * 0.25).max(px(0.)))
                             .text_size(theme.text_sm),
-                    ),
+                    )
+                    .when_some(open_selected_button, |row, button| row.child(button)),
             );
         }
 
@@ -598,7 +859,11 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
             .gap_1()
             .role(gpui_kit::Role::List)
             .aria_label(crate::locale::text("主机列表", "Host list"))
-            .aria_keyshortcuts("ArrowUp ArrowDown Enter")
+            .aria_keyshortcuts(if multi_select.is_some() {
+                "ArrowUp ArrowDown Enter Control-Enter Control-Space"
+            } else {
+                "ArrowUp ArrowDown Enter"
+            })
             .track_scroll(&keyboard_state.read(cx).scroll);
         if has_message && let Some(message) = self.message {
             let (icon, label, color) = match message {
@@ -643,23 +908,128 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
             );
         }
         for (group_key, title, options) in grouped {
-            list = list.child(
-                div()
-                    .id(format!("{}-group-{group_key}", self.id))
-                    .w_full()
-                    .px_2()
-                    .pt_1()
-                    .pb_1()
-                    .text_size(theme.text_xs)
-                    .text_color(theme.subtle)
-                    .child(title),
-            );
+            let group_host_keys = options
+                .iter()
+                .map(|option| option.key.to_string())
+                .collect::<Vec<_>>();
+            let group_all_selected = multi_select.as_ref().is_some_and(|multi| {
+                !group_host_keys.is_empty()
+                    && group_host_keys
+                        .iter()
+                        .all(|key| multi.selected_keys.contains(key))
+            });
+            let group_any_selected = multi_select.as_ref().is_some_and(|multi| {
+                group_host_keys
+                    .iter()
+                    .any(|key| multi.selected_keys.contains(key))
+            });
+            let mut group_row = div()
+                .id(format!("{}-group-{group_key}", self.id))
+                .w_full()
+                .px_2()
+                .pt_1()
+                .pb_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(theme.control_radius)
+                .text_size(theme.text_xs)
+                .text_color(theme.subtle)
+                .child(div().flex_1().min_w(px(0.)).truncate().child(title.clone()));
+            if let Some(multi) = multi_select.as_ref() {
+                // 分组行是可勾选的“目录”：点击选中整组，Shift 连选与主机行共用同一范围规则。
+                let toggle = Rc::clone(&multi.on_toggle);
+                let range = Rc::clone(&multi.on_range);
+                let toggle_key = group_key.clone();
+                let toggle_keys = group_host_keys.clone();
+                let range_key = group_key.clone();
+                let range_rows = selection_rows.clone();
+                let range_anchor = multi_anchor.clone();
+                group_row = group_row
+                    .hover(move |style| style.bg(theme.surface_hover()))
+                    .role(gpui_kit::Role::ListItem)
+                    .aria_label(SharedString::from(format!(
+                        "{}{}{}",
+                        title,
+                        crate::locale::text("，已选 ", ", selected "),
+                        group_host_keys
+                            .iter()
+                            .filter(|key| multi.selected_keys.contains(*key))
+                            .count()
+                    )))
+                    .on_click(move |event, window, cx| {
+                        if event.modifiers().shift {
+                            let (keys, adopt_anchor) = host_picker_range_keys(
+                                &range_rows,
+                                range_anchor.as_deref(),
+                                &range_key,
+                            );
+                            range(
+                                HostPickerRowSelection {
+                                    row_key: range_key.clone(),
+                                    host_keys: keys,
+                                    adopt_anchor,
+                                },
+                                window,
+                                cx,
+                            );
+                            return;
+                        }
+                        toggle(
+                            HostPickerRowSelection {
+                                row_key: toggle_key.clone(),
+                                host_keys: toggle_keys.clone(),
+                                adopt_anchor: true,
+                            },
+                            window,
+                            cx,
+                        );
+                    })
+                    .child(host_picker_check_slot(
+                        format!("{}-group-check-{group_key}", self.id),
+                        group_all_selected,
+                        group_any_selected && !group_all_selected,
+                        {
+                            let label = format!(
+                                "{}{}",
+                                crate::locale::text("选择分组 ", "Select group "),
+                                title
+                            );
+                            SharedString::from(label)
+                        },
+                        theme,
+                        {
+                            let toggle = Rc::clone(&multi.on_toggle);
+                            let toggle = move |window: &mut Window, cx: &mut App| {
+                                toggle(
+                                    HostPickerRowSelection {
+                                        row_key: group_key.clone(),
+                                        host_keys: group_host_keys.clone(),
+                                        adopt_anchor: true,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            };
+                            Rc::new(toggle)
+                        },
+                    ));
+            }
+            list = list.child(group_row);
             for option in options {
                 let option_selector = format!("{}-option-{}", self.id, option.key);
                 let option_debug_selector = option_selector.clone();
                 let target = option.target.clone();
                 let click_select = self.on_select.clone();
                 let click_state = keyboard_state.clone();
+                let option_selected = selected_keys.contains(option.key.as_ref());
+                let any_selected = !selected_keys.is_empty();
+                let click_toggle = multi_toggle.clone();
+                let click_range = multi_range.clone();
+                let click_range_rows = selection_rows.clone();
+                let click_range_anchor = multi_anchor.clone();
+                let row_key = option.key.to_string();
+                let toggle_row_key = row_key.clone();
                 let is_active = active_key
                     .as_deref()
                     .is_some_and(|active| option.key.as_ref() == active);
@@ -680,9 +1050,9 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
                             .truncate()
                             .text_size(theme.text_sm)
                             .text_color(theme.foreground)
-                            .child(option.title),
+                            .child(option.title.clone()),
                     );
-                if let Some(detail) = option.detail {
+                if let Some(detail) = option.detail.clone() {
                     description = description.child(
                         div()
                             .w_full()
@@ -693,50 +1063,111 @@ impl<T: Clone + 'static> RenderOnce for HostPickerList<T> {
                             .child(detail),
                     );
                 }
-                list = list.child(
-                    div()
-                        .id(option_selector)
-                        .debug_selector(move || option_debug_selector.clone())
-                        .w_full()
-                        .min_w(px(0.))
-                        .min_h(theme.metrics.row_height + window.rem_size() * 0.875)
-                        .px_2()
-                        .py_1()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .rounded(theme.control_radius)
-                        .border_1()
-                        .border_color(theme.panel.alpha(0.))
-                        .bg(theme.panel)
-                        .hover(move |style| {
-                            style.bg(if is_active {
-                                theme.surface_selected()
-                            } else {
-                                theme.surface_hover()
-                            })
+                let mut row = div()
+                    .id(option_selector)
+                    .debug_selector(move || option_debug_selector.clone())
+                    .w_full()
+                    .min_w(px(0.))
+                    .min_h(theme.metrics.row_height + window.rem_size() * 0.875)
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(theme.control_radius)
+                    .border_1()
+                    .border_color(theme.panel.alpha(0.))
+                    .bg(theme.panel)
+                    .hover(move |style| {
+                        style.bg(if is_active || option_selected {
+                            theme.surface_selected()
+                        } else {
+                            theme.surface_hover()
                         })
-                        .role(gpui_kit::Role::ListItem)
-                        .aria_label(accessible)
-                        .aria_selected(is_active)
-                        .on_click(move |_, window, cx| {
-                            let selected_key = option.key.to_string();
-                            click_state.update(cx, |state, cx| {
-                                state.active_key = Some(selected_key);
-                                cx.notify();
-                            });
-                            click_select(target.clone(), window, cx);
-                        })
-                        .when(is_active, |row| row.bg(theme.surface_selected()))
-                        .child(description)
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_color(theme.subtle)
-                                .child(IconName::ArrowRight),
-                        )
-                        .test_support(),
-                );
+                    })
+                    .role(gpui_kit::Role::ListItem)
+                    .aria_label(accessible)
+                    .aria_selected(is_active || option_selected)
+                    .on_click(move |event, window, cx| {
+                        let active = toggle_row_key.clone();
+                        click_state.update(cx, |state, cx| {
+                            state.active_key = Some(active);
+                            cx.notify();
+                        });
+                        if let Some(toggle) = click_toggle.as_ref() {
+                            if event.modifiers().shift {
+                                let (keys, adopt_anchor) = host_picker_range_keys(
+                                    &click_range_rows,
+                                    click_range_anchor.as_deref(),
+                                    &toggle_row_key,
+                                );
+                                if let Some(range) = click_range.as_ref() {
+                                    range(
+                                        HostPickerRowSelection {
+                                            row_key: toggle_row_key.clone(),
+                                            host_keys: keys,
+                                            adopt_anchor,
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                }
+                                return;
+                            }
+                            // 已有勾选后单击行等同于勾选切换，避免用户以为在“多开”却只打开了当前行。
+                            if event.modifiers().secondary() || any_selected {
+                                toggle(
+                                    HostPickerRowSelection {
+                                        row_key: toggle_row_key.clone(),
+                                        host_keys: vec![toggle_row_key.clone()],
+                                        adopt_anchor: true,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                                return;
+                            }
+                        }
+                        click_select(target.clone(), window, cx);
+                    })
+                    .when(is_active || option_selected, |row| {
+                        row.bg(theme.surface_selected())
+                    })
+                    .child(description);
+                if let Some(multi) = multi_select.as_ref() {
+                    let check_key = row_key.clone();
+                    let toggle = Rc::clone(&multi.on_toggle);
+                    row = row.child(host_picker_check_slot(
+                        format!("{}-check-{}", self.id, option.key),
+                        option_selected,
+                        false,
+                        SharedString::from(format!(
+                            "{}{}",
+                            crate::locale::text("勾选 ", "Select "),
+                            option.title
+                        )),
+                        theme,
+                        Rc::new(move |window: &mut Window, cx: &mut App| {
+                            toggle(
+                                HostPickerRowSelection {
+                                    row_key: check_key.clone(),
+                                    host_keys: vec![check_key.clone()],
+                                    adopt_anchor: true,
+                                },
+                                window,
+                                cx,
+                            );
+                        }),
+                    ));
+                } else {
+                    row = row.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(theme.subtle)
+                            .child(IconName::ArrowRight),
+                    );
+                }
+                list = list.child(row.test_support());
             }
         }
         panel = panel.child(list);
