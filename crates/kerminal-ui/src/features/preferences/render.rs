@@ -983,6 +983,11 @@ impl PreferencesPanel {
         if self.section != section {
             self.cancel_shortcut_capture(cx);
             self.reset_page_disclosures();
+            if self.section == PreferencesSection::Extensions
+                && section != PreferencesSection::Extensions
+            {
+                self.extensions.deactivate(cx);
+            }
         }
         self.section = section;
         // 扩展页自带独立滚动，切入时直接由面板创建或复用页面并重新读取目录。

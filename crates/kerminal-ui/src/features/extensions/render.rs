@@ -6,7 +6,8 @@
 //! @author kongweiguang
 
 use super::{
-    Confirmation, ExtensionsEvent, ExtensionsPage, Filter, Operation, label, sample, selection,
+    Confirmation, ExtensionsEvent, ExtensionsPage, Filter, Operation, label, pending_only_failure,
+    sample, selection,
 };
 use crate::theme::ThemeTokens;
 use gpui_kit::{
@@ -76,26 +77,40 @@ impl Render for ExtensionsPage {
             pending_count,
             self.offline,
         );
-        // 刷新中把同一位置变成可点击取消：Spinner 只表达真实等待，按钮本身仍可命中。
+        // 刷新中把同一位置变成可点击取消；首轮状态读取没有可取消 token 时只显示读取中。
         let refresh_button = if self.refreshing {
-            Button::new("extensions-refresh")
+            let button = Button::new("extensions-refresh")
                 .compact()
                 .ghost()
                 .w(theme.metrics.control_height)
                 .h(theme.metrics.control_height)
-                .child(Spinner::new().small().color(theme.muted))
-                .accessibility_label(crate::locale::text(
-                    "取消刷新目录",
-                    "Cancel catalog refresh",
-                ))
-                .tooltip(crate::locale::text(
-                    "取消刷新目录",
-                    "Cancel catalog refresh",
-                ))
-                .on_click(cx.listener(|page, _, _, cx| {
-                    page.cancel();
-                    cx.notify();
-                }))
+                .child(Spinner::new().small().color(theme.muted));
+            if self.cancel.is_some() {
+                button
+                    .accessibility_label(crate::locale::text(
+                        "取消刷新目录",
+                        "Cancel catalog refresh",
+                    ))
+                    .tooltip(crate::locale::text(
+                        "取消刷新目录",
+                        "Cancel catalog refresh",
+                    ))
+                    .on_click(cx.listener(|page, _, _, cx| {
+                        page.cancel();
+                        cx.notify();
+                    }))
+            } else {
+                button
+                    .disabled(true)
+                    .accessibility_label(crate::locale::text(
+                        "正在读取扩展状态",
+                        "Reading extension state",
+                    ))
+                    .tooltip(crate::locale::text(
+                        "正在读取扩展状态",
+                        "Reading extension state",
+                    ))
+            }
         } else {
             Button::new("extensions-refresh")
                 .compact()
@@ -628,7 +643,20 @@ impl ExtensionsPage {
                     RowTone::Warning,
                 ));
             } else if preview {
-                row.status = Some((crate::locale::text("示例", "Sample"), RowTone::Muted));
+                // 预览 id 若已在本机安装，仍显示真实启停状态，不能伪装成未安装示例。
+                row.status = Some(current.map_or_else(
+                    || (crate::locale::text("示例", "Sample"), RowTone::Muted),
+                    |current| {
+                        (
+                            if current.enabled {
+                                crate::locale::text("已启用", "Enabled")
+                            } else {
+                                crate::locale::text("已禁用", "Disabled")
+                            },
+                            RowTone::Muted,
+                        )
+                    },
+                ));
             } else if update || current.is_none() {
                 if let Some(available) = available {
                     row.action = Some(ExtensionRowAction {
@@ -676,6 +704,7 @@ impl ExtensionsPage {
                 // 文件更新已安装插件时必须保留该行，否则进度与取消会随筛选条件一起消失。
                 let installing = self.active_install.as_ref() == Some(id);
                 let pending_change = state.pending.iter().any(|change| change.plugin_id() == id);
+                let broken = state.failures.contains_key(id);
                 rows.push(ExtensionRow {
                     id: id.clone(),
                     name: id.as_str().to_owned(),
@@ -693,14 +722,18 @@ impl ExtensionsPage {
                             })
                     }),
                     status: Some((
-                        if pending_change {
+                        if broken {
+                            crate::locale::text("损坏", "Broken")
+                        } else if pending_change {
                             crate::locale::text("重启生效", "Restart required")
                         } else if installed.enabled {
                             crate::locale::text("已启用", "Enabled")
                         } else {
                             crate::locale::text("已禁用", "Disabled")
                         },
-                        if pending_change {
+                        if broken {
+                            RowTone::Error
+                        } else if pending_change {
                             RowTone::Warning
                         } else {
                             RowTone::Muted
@@ -724,18 +757,35 @@ impl ExtensionsPage {
                 {
                     continue;
                 }
+                let failed = pending_only_failure(state, id).is_some();
                 rows.push(ExtensionRow {
                     id: id.clone(),
                     name: id.as_str().to_owned(),
                     description: crate::locale::text(
-                        "安装已排队，重启后生效",
-                        "Installation queued and applied after restart",
+                        if failed {
+                            "安装失败，可在详情中撤销失败的变更"
+                        } else {
+                            "安装已排队，重启后生效"
+                        },
+                        if failed {
+                            "Installation failed; cancel the failed change in the details"
+                        } else {
+                            "Installation queued and applied after restart"
+                        },
                     )
                     .to_string(),
                     progress: None,
                     status: Some((
-                        crate::locale::text("重启生效", "Restart required"),
-                        RowTone::Warning,
+                        if failed {
+                            crate::locale::text("损坏", "Broken")
+                        } else {
+                            crate::locale::text("重启生效", "Restart required")
+                        },
+                        if failed {
+                            RowTone::Error
+                        } else {
+                            RowTone::Warning
+                        },
                     )),
                     action: None,
                     installing: false,
@@ -1168,6 +1218,10 @@ impl ExtensionsPage {
                     && state.pending.iter().any(|change| change.plugin_id() == *id)
             })
         }) {
+            let failed = self
+                .state
+                .as_ref()
+                .is_some_and(|state| pending_only_failure(state, id).is_some());
             detail = detail
                 .child(
                     div()
@@ -1179,12 +1233,22 @@ impl ExtensionsPage {
                 .child(
                     div()
                         .text_size(theme.text_sm)
-                        .text_color(theme.muted)
-                        .child(crate::locale::text(
-                            "安装已排队，重启后生效。",
-                            "The installation is queued and takes effect after restart.",
-                        )),
+                        .text_color(if failed { theme.error } else { theme.muted })
+                        .child(if failed {
+                            crate::locale::text(
+                                "安装失败，可在下方撤销失败的变更。",
+                                "The installation failed. Cancel the failed change below.",
+                            )
+                        } else {
+                            crate::locale::text(
+                                "安装已排队，重启后生效。",
+                                "The installation is queued and takes effect after restart.",
+                            )
+                        }),
                 );
+            if let Some(failure) = self.failure_block(id, theme, cx) {
+                detail = detail.child(failure);
+            }
         } else {
             detail = detail
                 .flex()
@@ -1282,6 +1346,12 @@ impl ExtensionsPage {
 
     /// 使用窗口级 Kit Dialog 呈现确认：焦点、Escape 和关闭后的焦点恢复由 Kit 统一负责。
     pub(super) fn present_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.active {
+            self.confirmation = None;
+            self.dialog_open = false;
+            self.dialog_generation = self.dialog_generation.wrapping_add(1);
+            return;
+        }
         let Some(confirmation) = self.confirmation.clone() else {
             self.dialog_open = false;
             return;
@@ -1653,6 +1723,7 @@ fn render_extension_row(
     } else {
         status.map(|(text, tone)| {
             div()
+                .id(format!("extension-action-{id_text}"))
                 .flex_shrink_0()
                 .text_size(theme.text_sm)
                 .text_color(tone.color(theme))

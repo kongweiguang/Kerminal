@@ -1,8 +1,8 @@
 //! 扩展页选择只使用当前平台的受信资产和语义版本。
 //! @author kongweiguang
 
-use super::{CatalogPlugin, sample, selection};
-use kerminal_domain::plugins::PluginId;
+use super::{CatalogPlugin, pending_only_failure, sample, selection};
+use kerminal_domain::plugins::{PluginId, PluginStoreState};
 use kerminal_plugin_protocol::Platform;
 use serde_json::json;
 
@@ -96,4 +96,44 @@ fn preview_guard_requires_missing_catalog_and_sample_id() {
 
     let other = PluginId::parse("acme.notes").unwrap();
     assert!(!sample::is_preview_entry(false, &other));
+}
+
+/// pending-only 失败仍须保留失败撤销分支；一旦已有 installed 条目则交给 installed 详情。
+#[test]
+fn pending_only_failure_keeps_cancel_path() {
+    let state: PluginStoreState = serde_json::from_value(json!({
+        "schema": 1,
+        "revision": 3,
+        "plugins": {},
+        "pending": [{
+            "op": "install",
+            "id": "acme.file-search",
+            "to": "1.0.0",
+            "staged": "packages/acme.file-search/1.0.0",
+            "source": "local",
+            "installed_at": "2026-11-10"
+        }],
+        "failures": {"acme.file-search": "安装失败"}
+    }))
+    .unwrap();
+    let id = PluginId::parse("acme.file-search").unwrap();
+    assert_eq!(pending_only_failure(&state, &id), Some("安装失败"));
+
+    let installed: PluginStoreState = serde_json::from_value(json!({
+        "schema": 1,
+        "revision": 4,
+        "plugins": {
+            "acme.file-search": {
+                "active": "1.0.0",
+                "previous": null,
+                "enabled": true,
+                "source": "local",
+                "installed_at": "2026-11-10"
+            }
+        },
+        "pending": [],
+        "failures": {"acme.file-search": "安装失败"}
+    }))
+    .unwrap();
+    assert_eq!(pending_only_failure(&installed, &id), None);
 }

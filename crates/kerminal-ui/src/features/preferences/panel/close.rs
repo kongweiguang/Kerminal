@@ -163,6 +163,8 @@ impl PreferencesPanel {
     ///
     /// @author kongweiguang
     pub(super) fn emit_leave_event(&mut self, cx: &mut Context<Self>) {
+        // 设置真正离开后再失效扩展页；迟到的文件预检不得在其它分类弹出确认。
+        self.extensions.deactivate(cx);
         self.cancel_shortcut_capture(cx);
         self.discard_pending_keyword_rule();
         cx.emit(PreferencesEvent::CloseRequested);
@@ -346,6 +348,8 @@ impl PreferencesPanel {
             self.close_external_pages(false, true, cx);
             return false;
         }
+        // 真正退出前先让扩展页失效，避免预检回执在窗口关闭过程中弹出确认。
+        self.extensions.deactivate(cx);
         true
     }
 

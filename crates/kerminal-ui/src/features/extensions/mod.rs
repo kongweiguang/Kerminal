@@ -79,6 +79,8 @@ pub struct ExtensionsPage {
     active_install: Option<PluginId>,
     /// 本地包预检与目录安装共用取消门禁，页面级活动条据此显示校验状态。
     inspecting: bool,
+    /// 页面是否仍属于当前设置分类；离开后迟到的预检不能升级为窗口级确认。
+    active: bool,
     retry_operation: Option<Operation>,
     confirmation: Option<Confirmation>,
     /// Kit 窗口级确认只允许一个实例；标记防止重建页面或连续点击重复打开。
@@ -134,6 +136,7 @@ impl ExtensionsPage {
             progress: None,
             active_install: None,
             inspecting: false,
+            active: false,
             retry_operation: None,
             confirmation: None,
             dialog_open: false,
@@ -146,6 +149,7 @@ impl ExtensionsPage {
 
     /// 首次进入先读可信缓存与权威状态；失败保留现有展示并提供重试。
     pub fn activate(&mut self, cx: &mut Context<Self>) {
+        self.active = true;
         // 切回设置或重新进入时，遗留的窗口级确认必须先关闭，不能让它覆盖新页面状态。
         self.close_open_confirmation(cx);
         self.retry_operation = None;
@@ -174,12 +178,14 @@ impl ExtensionsPage {
                 page.refreshing = false;
                 match result {
                     Ok((state, catalog)) => {
+                        let previous_preview = page.catalog.is_none();
                         page.state = Some(state);
                         page.offline = catalog.as_ref().is_some_and(|snapshot| snapshot.stale);
                         page.catalog = catalog;
                         page.status = None;
                         page.status_is_warning = false;
                         page.prune_selection(cx);
+                        page.reconcile_catalog_change(previous_preview, cx);
                         // 每次进入分类都会 activate；日常刷新按 24 小时缓存判断，不能重复打网络。
                         page.refresh_if_due(cx);
                     }
@@ -197,6 +203,18 @@ impl ExtensionsPage {
         })
         .detach();
         cx.notify();
+    }
+
+    /// 离开扩展分类或关闭设置时立即失去可见性；迟到的文件预检不能弹出窗口级确认。
+    /// 只取消预检 token，安装、刷新和写操作仍按原有回执与退出门禁收尾。
+    pub(crate) fn deactivate(&mut self, cx: &mut Context<Self>) {
+        self.active = false;
+        self.close_open_confirmation(cx);
+        if self.inspecting
+            && let Some(token) = &self.cancel
+        {
+            token.cancel();
+        }
     }
 
     /// 工具栏刷新是用户显式动作，始终重新请求目录并保留旧缓存可见。
@@ -242,11 +260,13 @@ impl ExtensionsPage {
                 page.cancel = None;
                 match result {
                     Ok(catalog) => {
+                        let previous_preview = page.catalog.is_none();
                         page.offline = catalog.stale;
                         page.catalog = Some(catalog);
                         page.status = None;
                         page.status_is_warning = false;
                         page.prune_selection(cx);
+                        page.reconcile_catalog_change(previous_preview, cx);
                     }
                     Err(error) => {
                         // 用户取消刷新时静默回到空闲；只有真实失败才把页面标成离线并保留重试文案。
@@ -607,6 +627,11 @@ impl ExtensionsPage {
 
     /// 打开确认的唯一入口：先记录待执行意图，再交给窗口级 Kit Dialog，页面本身不绘制遮罩。
     fn open_confirmation(&mut self, confirmation: Confirmation, cx: &mut Context<Self>) {
+        // 页面已离开时，迟到的预检结果只能回到后台收尾，不能弹出窗口级确认。
+        if !self.active {
+            self.close_open_confirmation(cx);
+            return;
+        }
         // 示例只有展示元数据；在打开确认前拒绝，避免弹层承诺一个不可执行的安装。
         if let Confirmation::Install(selection) = &confirmation
             && sample::is_preview_entry(self.catalog.is_some(), &selection.id)
@@ -728,6 +753,37 @@ impl ExtensionsPage {
         cx.notify();
     }
 
+    /// 目录替换后分类筛选必须收敛到新目录；从示例预览切到真实目录时补一次 README。
+    /// 只在预览→真实目录的那一次替换触发重读，普通刷新不重复请求正文。
+    fn reconcile_catalog_change(&mut self, previous_preview: bool, cx: &mut Context<Self>) {
+        let Some(catalog) = self.catalog.as_ref() else {
+            return;
+        };
+        let category_removed = matches!(
+            &self.filter,
+            Filter::Category(category)
+                if !catalog
+                    .catalog
+                    .plugins
+                    .iter()
+                    .any(|plugin| plugin.categories.contains(category))
+        );
+        let reselect = previous_preview
+            && self.selected.as_ref().is_some_and(|id| {
+                catalog
+                    .catalog
+                    .plugins
+                    .iter()
+                    .any(|plugin| &plugin.id == id)
+            });
+        if category_removed {
+            self.filter = Filter::All;
+        }
+        if reselect && let Some(id) = self.selected.clone() {
+            self.select(id, cx);
+        }
+    }
+
     /// 列表和详情共用同一受信目录记录，避免使用未校验的界面 URL 作为安装目标。
     /// 仅在真实目录缺席时回退到内嵌示例，示例永远不会成为安装目标。
     fn selected_plugin(&self) -> Option<&CatalogPlugin> {
@@ -742,6 +798,14 @@ impl ExtensionsPage {
             return Some(plugin);
         }
         if self.catalog.is_none() {
+            // 示例 id 若已被本机安装或排队，交给真实存储详情，不能被预览遮蔽管理入口。
+            let in_store = self.state.as_ref().is_some_and(|state| {
+                state.plugins.contains_key(id)
+                    || state.pending.iter().any(|change| change.plugin_id() == id)
+            });
+            if in_store {
+                return None;
+            }
             return sample::catalog()
                 .plugins
                 .iter()
@@ -757,6 +821,18 @@ enum Operation {
     File(PathBuf, LocalPackageInspection),
     Change(ExtensionChange),
     Delete(PluginId),
+}
+
+/// pending-only 条目仍属于可撤销失败分支；已安装条目由 installed 详情接管。
+/// 列表状态与详情撤销入口共用此判定，避免失败提示和撤销按钮各走一套条件。
+fn pending_only_failure<'a>(state: &'a PluginStoreState, id: &PluginId) -> Option<&'a str> {
+    if state.plugins.contains_key(id) {
+        return None;
+    }
+    if !state.pending.iter().any(|change| change.plugin_id() == id) {
+        return None;
+    }
+    state.failures.get(id).map(String::as_str)
 }
 
 /// 已安装版本和目录版本只按语义版本比较，不使用字符串排序。

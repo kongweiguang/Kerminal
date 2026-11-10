@@ -93,6 +93,18 @@ impl ExtensionsPreferencesState {
         }
     }
 
+    /// 离开扩展分类立即失效；迟到的文件预检被取消，已打开的确认由页面延迟关闭。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn deactivate(
+        &mut self,
+        cx: &mut Context<PreferencesPanel>,
+    ) {
+        if let Some(page) = self.page.clone() {
+            page.update(cx, |page, cx| page.deactivate(cx));
+        }
+    }
+
     /// 只读访问已创建页面；未进入扩展分类时保持 None。
     fn page(&self) -> Option<Entity<ExtensionsPage>> {
         self.page.clone()

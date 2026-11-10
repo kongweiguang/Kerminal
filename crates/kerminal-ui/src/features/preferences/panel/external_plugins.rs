@@ -178,6 +178,7 @@ impl PreferencesPanel {
         let ids = self.external_plugins.pages.mounted_plugins();
         if ids.is_empty() {
             if quit {
+                self.extensions.deactivate(cx);
                 cx.emit(PreferencesEvent::QuitConfirmed);
             } else {
                 self.emit_leave_event(cx);
@@ -228,6 +229,7 @@ impl PreferencesPanel {
                 panel.external_plugins.closing = false;
                 if panel.external_plugins.pages.mounted_plugins().is_empty() {
                     if quit {
+                        panel.extensions.deactivate(cx);
                         cx.emit(PreferencesEvent::QuitConfirmed);
                     } else {
                         panel.emit_leave_event(cx);
