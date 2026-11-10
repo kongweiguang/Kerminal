@@ -1,4 +1,4 @@
-//! 外部连接动作与 caller-provided host-key pin 的纯逻辑测试。
+//! 外部连接动作的纯逻辑测试。
 //!
 //! @author kongweiguang
 
@@ -21,8 +21,7 @@ use kerminal_domain::{
 };
 
 use super::{
-    expected_fingerprint_matches, external_intent_supported, take_current_external_username_result,
-    validate_external_username,
+    external_intent_supported, take_current_external_username_result, validate_external_username,
 };
 
 struct CountingLeaseOwner(Arc<AtomicUsize>);
@@ -47,7 +46,6 @@ fn external_intent_requires_its_matching_protocol() {
     };
     let sftp = ExternalLaunchIntent::SftpTransfer {
         remote_path: "/".to_owned(),
-        expected_host_key: None,
     };
 
     assert!(external_intent_supported(RemoteProtocol::Ssh, &ssh));
@@ -55,20 +53,6 @@ fn external_intent_requires_its_matching_protocol() {
     assert!(!external_intent_supported(RemoteProtocol::Sftp, &ssh));
     assert!(!external_intent_supported(RemoteProtocol::Ssh, &sftp));
     assert!(!external_intent_supported(RemoteProtocol::Telnet, &ssh));
-}
-
-/// SHA-256 指纹只去首尾空格、不折叠大小写，以免把不同 Base64 key pin 当成相同值。
-#[test]
-fn expected_host_key_pin_is_trimmed_but_case_sensitive() {
-    assert!(expected_fingerprint_matches(
-        " SHA256:abC+123=\n",
-        "SHA256:abC+123="
-    ));
-    assert!(!expected_fingerprint_matches(
-        "SHA256:abC+123=",
-        "SHA256:abc+123="
-    ));
-    assert!(!expected_fingerprint_matches("", "SHA256:abC+123="));
 }
 
 /// 显式用户名只做首尾清理，保留大小写并拒绝空值和控制字符。

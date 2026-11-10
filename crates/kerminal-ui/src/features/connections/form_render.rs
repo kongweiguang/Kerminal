@@ -20,9 +20,7 @@ use gpui_kit::{
     prelude::*,
     px, rems,
 };
-use kerminal_application::connections::{
-    management::HostAuthenticationMode, probe::ConnectionProbeOutcome,
-};
+use kerminal_application::connections::management::HostAuthenticationMode;
 use kerminal_domain::connections::RemoteProtocol;
 
 use crate::theme::ThemeTokens;
@@ -395,7 +393,7 @@ fn render_remote_host_editor(
                 ))
                 .children(
                     show_probe_status
-                        .then(|| render_probe_status(panel, theme, cx))
+                        .then(|| render_probe_status(panel, theme))
                         .flatten(),
                 ),
         )
@@ -1935,12 +1933,11 @@ fn editor_section_label(
     }
 }
 
-/// 底栏只显示一行真实测试结果；目标和指纹在详情内核对，信任仅续接原草稿的下次测试。
+/// 底栏只显示一行真实测试结果；详情只展开测试消息，不再承载指纹确认。
 /// @author kongweiguang
 fn render_probe_status(
     panel: &ConnectionsPanel,
     theme: ThemeTokens,
-    cx: &mut Context<ConnectionsPanel>,
 ) -> Option<gpui_kit::AnyElement> {
     let outcome = panel.probe_outcome.as_ref();
     let error = panel.probe_error.as_ref();
@@ -1971,11 +1968,6 @@ fn render_probe_status(
         crate::locale::text("测试已取消", "Test cancelled")
     } else if error.is_some() {
         crate::locale::text("连接测试失败", "Connection test failed")
-    } else if matches!(
-        outcome,
-        Some(ConnectionProbeOutcome::RequiresHostKeyTrust(_))
-    ) {
-        crate::locale::text("需要核验主机指纹", "Host fingerprint needs review")
     } else {
         message.clone()
     };
@@ -1983,15 +1975,6 @@ fn render_probe_status(
         .cloned()
         .map(Into::into)
         .unwrap_or_else(|| message.clone());
-    let challenge = outcome.and_then(|outcome| match outcome {
-        ConnectionProbeOutcome::RequiresHostKeyTrust(challenge) => Some(challenge.clone()),
-        _ => None,
-    });
-    let changed = outcome.and_then(|outcome| match outcome {
-        ConnectionProbeOutcome::HostKeyChanged(changed) => Some(changed.clone()),
-        _ => None,
-    });
-    let owner = cx.entity().clone();
     let detail_color = if warning && !cancelled {
         theme.warning
     } else {
@@ -2011,10 +1994,8 @@ fn render_probe_status(
                 ))
                 .tooltip(crate::locale::text("查看详情", "View details")),
         )
-        .content(move |_, _, popover_cx| {
-            let popover_state = popover_cx.entity().clone();
-            let trust_owner = owner.clone();
-            let mut details = div()
+        .content(move |_, _, _| {
+            div()
                 .w(rems(26.0))
                 .max_w(rems(26.0))
                 .max_h(rems(14.0))
@@ -2025,59 +2006,7 @@ fn render_probe_status(
                 .gap_2()
                 .text_size(theme.text_xs)
                 .text_color(detail_color)
-                .child(detail.clone());
-            if let Some(challenge) = challenge.clone() {
-                details = details
-                    .child(format!(
-                        "{}@{}:{}",
-                        challenge.endpoint.username,
-                        challenge.endpoint.host,
-                        challenge.endpoint.port
-                    ))
-                    .child(crate::locale::text(
-                        format!("{} · {}", challenge.algorithm, challenge.fingerprint_sha256),
-                        format!("{} · {}", challenge.algorithm, challenge.fingerprint_sha256),
-                    ))
-                    .child(crate::locale::text(
-                        "确认只对当前表单的下一次测试有效，不会写入 known_hosts。",
-                        "Trust applies only to the next test and does not write known_hosts.",
-                    ))
-                    .child(
-                        Button::new("connections-editor-probe-trust")
-                            .compact()
-                            .primary()
-                            .label(crate::locale::text(
-                                "仅本次信任并重试",
-                                "Trust once and retry",
-                            ))
-                            .on_click(move |_, window, app| {
-                                let state = popover_state.clone();
-                                state.update(app, |state, cx| state.dismiss(window, cx));
-                                trust_owner.update(app, |panel, cx| {
-                                    panel.confirm_probe_host_key(window, cx);
-                                });
-                            }),
-                    );
-            }
-            if let Some(changed) = changed.clone() {
-                details = details
-                    .child(format!(
-                        "{}@{}:{}",
-                        changed.endpoint.username, changed.endpoint.host, changed.endpoint.port
-                    ))
-                    .child(crate::locale::text(
-                        format!("旧指纹：{}", changed.previous_fingerprint_sha256),
-                        format!(
-                            "Previous fingerprint: {}",
-                            changed.previous_fingerprint_sha256
-                        ),
-                    ))
-                    .child(crate::locale::text(
-                        format!("新指纹：{}", changed.fingerprint_sha256),
-                        format!("Current fingerprint: {}", changed.fingerprint_sha256),
-                    ));
-            }
-            details
+                .child(detail.clone())
         });
     Some(
         div()
@@ -2247,20 +2176,6 @@ fn probe_outcome_message(
                 client_warning || remote_warning,
             )
         }
-        ConnectionProbeOutcome::RequiresHostKeyTrust(_) => (
-            crate::locale::text(
-                "此 SSH 主机密钥尚未核验。请检查下方指纹，再选择仅本次信任。",
-                "This SSH host key is unknown. Review the fingerprint below before trusting it once.",
-            ),
-            true,
-        ),
-        ConnectionProbeOutcome::HostKeyChanged(_) => (
-            crate::locale::text(
-                "主机密钥已变化，连接测试已阻止。请通过独立的信任管理流程核验。",
-                "The host key changed, so the test was blocked. Verify it through host trust management.",
-            ),
-            true,
-        ),
     }
 }
 

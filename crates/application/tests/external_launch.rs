@@ -571,7 +571,6 @@ async fn sftp_url_requests_password_without_identity_file() {
         target.intent,
         ExternalLaunchIntent::SftpTransfer {
             remote_path: "/home/alice/My Files".into(),
-            expected_host_key: None,
         }
     );
     assert_eq!(

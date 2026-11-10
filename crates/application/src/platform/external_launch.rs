@@ -319,13 +319,8 @@ impl fmt::Debug for ExternalJumpHostDraft {
 /// 外部调用要求的工作区动作；远程命令保持 argv 结构，禁止拼接成 shell 文本。
 #[derive(Clone, Eq, PartialEq)]
 pub enum ExternalLaunchIntent {
-    SshTerminal {
-        remote_command: Vec<String>,
-    },
-    SftpTransfer {
-        remote_path: String,
-        expected_host_key: Option<String>,
-    },
+    SshTerminal { remote_command: Vec<String> },
+    SftpTransfer { remote_path: String },
 }
 
 impl fmt::Debug for ExternalLaunchIntent {
@@ -336,11 +331,8 @@ impl fmt::Debug for ExternalLaunchIntent {
                 .debug_struct("SshTerminal")
                 .field("remote_command_argument_count", &remote_command.len())
                 .finish(),
-            Self::SftpTransfer {
-                expected_host_key, ..
-            } => formatter
+            Self::SftpTransfer { .. } => formatter
                 .debug_struct("SftpTransfer")
-                .field("expected_host_key_present", &expected_host_key.is_some())
                 .field("remote_path", &"[redacted]")
                 .finish(),
         }

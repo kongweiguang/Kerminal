@@ -1,4 +1,4 @@
-//! 原生主机目录、连接动作与信任确认界面。
+//! 原生主机目录、连接动作与外部凭据确认界面。
 //!
 //! @author kongweiguang
 
@@ -9,7 +9,6 @@ mod form_layout;
 mod form_render;
 #[cfg(feature = "right-rail-acceptance")]
 pub mod host_editor_acceptance;
-mod host_key_mutation;
 mod host_navigation;
 mod keyboard;
 mod local_hosts;
@@ -18,7 +17,6 @@ mod plugin_forms;
 mod render;
 #[cfg(feature = "right-rail-acceptance")]
 mod settings_acceptance;
-mod trust;
 
 pub(crate) use form_layout::host_editor_size;
 pub use host_navigation::{

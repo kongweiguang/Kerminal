@@ -18,7 +18,6 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::{
-    HostKeyPeer,
     host_types::HostConfigurationCatalog,
     management::{
         HostAuthenticationMode, HostCredentialChange, HostCredentialSlot, HostDraft,
@@ -47,34 +46,6 @@ pub struct ConnectionProbeRequest {
     pub draft: HostDraft,
     pub credential_changes: Vec<HostCredentialChange>,
     pub timeout: Duration,
-    pub host_key_confirmation: Option<ProbeHostKeyConfirmation>,
-}
-
-/// 对未知 host key 的一次性确认，精确绑定到 peer、endpoint 和 SHA-256 指纹。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProbeHostKeyConfirmation {
-    pub peer: HostKeyPeer,
-    pub endpoint: HostEndpoint,
-    pub fingerprint_sha256: String,
-}
-
-/// 已知 key 不匹配时返回的安全挑战摘要，不带公钥正文或任何认证材料。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProbeHostKeyChallenge {
-    pub peer: HostKeyPeer,
-    pub endpoint: HostEndpoint,
-    pub algorithm: String,
-    pub fingerprint_sha256: String,
-}
-
-/// host key 已变化时保留新旧摘要，便于 UI 指向正式信任管理流程。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProbeHostKeyChanged {
-    pub peer: HostKeyPeer,
-    pub endpoint: HostEndpoint,
-    pub algorithm: String,
-    pub previous_fingerprint_sha256: String,
-    pub fingerprint_sha256: String,
 }
 
 /// 本机可用的 RDP 客户端；不表达远端连通性或认证状态。
@@ -129,8 +100,6 @@ pub enum ConnectionProbeOutcome {
         message: &'static str,
     },
     RdpConnectivity(RdpConnectivityProbe),
-    RequiresHostKeyTrust(ProbeHostKeyChallenge),
-    HostKeyChanged(ProbeHostKeyChanged),
 }
 
 /// 只对当前 probe 能在拨号前确定的输入字段提供精确定位。
@@ -169,7 +138,6 @@ pub struct ConnectionProbeTarget {
     pub check_optional_sftp: bool,
     pub serial: Option<SerialSessionTarget>,
     pub timeout: Duration,
-    pub host_key_confirmation: Option<ProbeHostKeyConfirmation>,
     pub transient_credentials: Vec<ProbeCredential>,
 }
 
@@ -270,11 +238,7 @@ impl ConnectionProbeService {
 ///
 /// @author kongweiguang
 fn build_probe_target(mut request: ConnectionProbeRequest) -> AppResult<ConnectionProbeTarget> {
-    validate_probe_input(
-        &request.draft,
-        request.timeout,
-        request.host_key_confirmation.as_ref(),
-    )?;
+    validate_probe_input(&request.draft, request.timeout)?;
     let host_id = request.draft.id.take().unwrap_or_default();
     let transient_credentials =
         apply_transient_credentials(&mut request.draft, request.credential_changes)?;
@@ -350,7 +314,6 @@ fn build_probe_target(mut request: ConnectionProbeRequest) -> AppResult<Connecti
         check_optional_sftp,
         serial,
         timeout: request.timeout,
-        host_key_confirmation: request.host_key_confirmation,
         transient_credentials,
     })
 }
@@ -375,11 +338,7 @@ fn serial_probe_input_issue(draft: &HostDraft) -> Option<(ProbeField, &'static s
 /// 保持 probe 与保存用例对远端起始目录采用同一绝对 POSIX 路径约束。
 ///
 /// @author kongweiguang
-fn validate_probe_input(
-    draft: &HostDraft,
-    timeout: Duration,
-    confirmation: Option<&ProbeHostKeyConfirmation>,
-) -> AppResult<()> {
+fn validate_probe_input(draft: &HostDraft, timeout: Duration) -> AppResult<()> {
     if !(MIN_PROBE_TIMEOUT..=MAX_PROBE_TIMEOUT).contains(&timeout) {
         return Err(AppError::invalid("连接测试超时需在 1 到 120 秒之间"));
     }
@@ -450,16 +409,6 @@ fn validate_probe_input(
             .is_some_and(|path| !super::management::valid_remote_start_directory(path))
     {
         return Err(AppError::invalid("SFTP 起始目录无效"));
-    }
-    if let Some(confirmation) = confirmation
-        && (confirmation.fingerprint_sha256.trim().is_empty()
-            || confirmation
-                .fingerprint_sha256
-                .chars()
-                .any(char::is_control)
-            || !matches!(draft.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp))
-    {
-        return Err(AppError::invalid("主机指纹确认不适用于当前目标"));
     }
     Ok(())
 }

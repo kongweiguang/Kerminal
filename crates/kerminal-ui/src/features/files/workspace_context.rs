@@ -353,7 +353,6 @@ impl FilesPane {
             || self.permission_dialog_target.is_some()
             || self.delete_confirmation.is_some()
             || self.pending_transfer_conflict.is_some()
-            || self.pending_host_key_trust.is_some()
             || self.queue.has_pending_retry()
             || self.queue.has_pending_recovery_dismissal()
             || self.queue.is_clearing_history()

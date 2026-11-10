@@ -23,9 +23,7 @@ mod tree;
 mod view_mode;
 mod workspace_context;
 
-pub use host_picker::{
-    CreateSftpHostRequested, FilePaneSide, SftpHostKeyTrustRequested, SftpHostRequested,
-};
+pub use host_picker::{CreateSftpHostRequested, FilePaneSide, SftpHostRequested};
 #[cfg(feature = "right-rail-acceptance")]
 pub use right_rail_acceptance::transfers::{
     RightRailSftpTransferItem, RightRailSftpTransferTarget,
@@ -485,8 +483,6 @@ pub struct FilesPane {
     queue_watch_started: bool,
     delete_confirmation: Option<Vec<FileEntry>>,
     delete_action_busy: bool,
-    next_host_key_trust_request_id: u64,
-    pending_host_key_trust: Option<PendingHostKeyTrust>,
     name_input: Option<Entity<InputState>>,
     _name_subscription: Option<Subscription>,
     name_action: Option<NameAction>,
@@ -502,14 +498,6 @@ pub struct FilesPane {
 enum NameAction {
     CreateDirectory,
     Rename,
-}
-
-/// 固定 trust 发起时的目录和读取代次，回执只可刷新仍然显示该目录的文件栏。
-#[derive(Clone)]
-struct PendingHostKeyTrust {
-    request: SftpHostKeyTrustRequested,
-    endpoint: FileEndpoint,
-    panel_generation: u64,
 }
 
 /// 上传选择器按菜单命令限制系统选择范围。
@@ -911,8 +899,6 @@ impl FilesPane {
             queue_watch_started: false,
             delete_confirmation: None,
             delete_action_busy: false,
-            next_host_key_trust_request_id: 0,
-            pending_host_key_trust: None,
             name_input: None,
             _name_subscription: None,
             name_action: None,
@@ -1258,86 +1244,6 @@ impl FilesPane {
         Ok(())
     }
 
-    /// 将紧凑文件栏的显式信任动作交给 Root 复用连接层的 inspect/trust/readback 状态机。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn request_host_key_trust(&mut self, cx: &mut Context<Self>) {
-        if !self.compact_layout || self.panels[1].directory_error.is_none() {
-            return;
-        }
-        let endpoint = self.panels[1].endpoint.clone();
-        let FileEndpoint::Remote { host_id, .. } = &endpoint else {
-            return;
-        };
-        if self.pending_host_key_trust.as_ref().is_some_and(|pending| {
-            pending.request.host_id == *host_id && pending.endpoint == endpoint
-        }) {
-            return;
-        }
-        self.next_host_key_trust_request_id =
-            self.next_host_key_trust_request_id.wrapping_add(1).max(1);
-        let request = SftpHostKeyTrustRequested {
-            request_id: self.next_host_key_trust_request_id,
-            host_id: host_id.clone(),
-        };
-        self.pending_host_key_trust = Some(PendingHostKeyTrust {
-            request: request.clone(),
-            endpoint,
-            panel_generation: self.panels[1].generation,
-        });
-        cx.emit(request);
-        cx.notify();
-    }
-
-    /// Root 按 request id 与 HostId 查询当前仍有效的 trust 请求，避免处理被新目标取代的事件。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn current_host_key_trust_request(&self) -> Option<SftpHostKeyTrustRequested> {
-        self.pending_host_key_trust
-            .as_ref()
-            .filter(|pending| {
-                self.panels[1].endpoint == pending.endpoint
-                    && self.panels[1].generation == pending.panel_generation
-            })
-            .map(|pending| pending.request.clone())
-    }
-
-    /// 仅接受当前请求回执；成功后只重载发起时仍在显示的目录，不导航或重绑目标。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn report_host_key_trust(
-        &mut self,
-        request_id: u64,
-        host_id: HostId,
-        result: Result<(), String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(current) = self.pending_host_key_trust.as_ref() else {
-            return;
-        };
-        if current.request.request_id != request_id || current.request.host_id != host_id {
-            return;
-        }
-        let Some(pending) = self.pending_host_key_trust.take() else {
-            return;
-        };
-        let current_target_matches = self.panels[1].endpoint == pending.endpoint
-            && self.panels[1].generation == pending.panel_generation
-            && self.panels[1].endpoint.host_id() == Some(&host_id);
-        if !current_target_matches {
-            cx.notify();
-            return;
-        }
-        match result {
-            Ok(()) => {
-                self.status = None;
-                self.load_panel_at(1, pending.endpoint, cx);
-            }
-            Err(error) => self.status = Some(error),
-        }
-        cx.notify();
-    }
-
     /// 清除旧文件系统的清单和表单、取消根 provider，并推进代次拒收迟到回执。
     /// 已提交名称、权限和删除操作继续持有 busy 到真实回执；撤销展示不能假装后台操作已结束。
     ///
@@ -1366,7 +1272,6 @@ impl FilesPane {
         self.bookmark_request_target = None;
         self.bookmark_error = None;
         self.bookmark_error_target = None;
-        self.pending_host_key_trust = None;
         self.delete_confirmation = None;
         self.name_action = None;
         self.name_action_side = None;
@@ -1395,7 +1300,6 @@ impl FilesPane {
             && self.bookmark_request_target.is_none()
             && self.bookmark_error.is_none()
             && self.bookmark_error_target.is_none()
-            && self.pending_host_key_trust.is_none()
             && self.delete_confirmation.is_none()
             && self.name_action.is_none()
             && self.permission_dialog_target.is_none()
@@ -2604,7 +2508,6 @@ impl FilesPane {
         self.bookmark_error = None;
         self.bookmark_error_target = None;
         self.bookmark_generation = self.bookmark_generation.wrapping_add(1);
-        self.pending_host_key_trust = None;
         self.status = None;
         self.delete_confirmation = None;
         self.name_action = None;
@@ -5111,7 +5014,6 @@ impl EventEmitter<FileWorkspaceDirectoryChanged> for FilesPane {}
 impl EventEmitter<FilesPaneEvent> for FilesPane {}
 impl EventEmitter<ActivateEditorFileRequested> for FilesPane {}
 impl EventEmitter<SftpHostRequested> for FilesPane {}
-impl EventEmitter<SftpHostKeyTrustRequested> for FilesPane {}
 impl EventEmitter<CreateSftpHostRequested> for FilesPane {}
 
 /// 按稳定错误类别选择英文安全文案，中文仍使用 application 统一的脱敏消息。

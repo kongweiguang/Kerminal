@@ -16,7 +16,6 @@ use kerminal_application::{
     AppError, ApplicationTaskExecutor, ConfigurationChangeService, ProfileService, PublicErrorCode,
     configuration_changes::{ConfigurationChangeEvent, ConfigurationChangeMessage},
     connections::{
-        HostKeyChallenge, HostKeyPeer, HostKeyRotationRequest, HostKeyStatus, HostKeyTrustRequest,
         RdpClientLifecycle, RdpLaunchId, RdpLaunchReceipt, RdpLaunchRequest, RdpLaunchService,
         RdpLaunchStatus, RdpLaunchStatusService, RemoteConnectionService, SerialPortDescriptor,
         SerialPortService,
@@ -29,12 +28,10 @@ use kerminal_application::{
         },
         probe::{
             ConnectionProbeOutcome, ConnectionProbeRequest, ConnectionProbeService, ProbeField,
-            ProbeHostKeyConfirmation,
         },
     },
     platform::external_launch::{
-        ExternalLaunchIntent, ExternalLaunchRequest, ExternalLaunchService, ExternalRoutedTarget,
-        ExternalTargetClassification,
+        ExternalLaunchRequest, ExternalLaunchService, ExternalRoutedTarget,
     },
 };
 use kerminal_domain::{
@@ -295,7 +292,7 @@ struct GroupEditorReturn {
     editor_kind: ConnectionsEditorKind,
 }
 
-/// 通过面板按钮发起的连接动作，在完成 SSH 信任预检前不进入 Root 或会话注册表。
+/// 通过面板按钮发起的连接动作；完成主机存在性、协议与目标校验后直接交给 Root。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PendingAction {
     Terminal {
@@ -317,18 +314,6 @@ pub(super) enum PendingAction {
         title: String,
     },
     External(ExternalRoutedTarget),
-}
-
-/// SSH peer 尚未可信时暂存明确信任目标与后续连接意图。
-#[derive(Clone)]
-pub(super) struct PendingTrust {
-    pub(super) challenge: HostKeyChallenge,
-    pub(super) action: PendingAction,
-    pub(super) display_host: Option<String>,
-    pub(super) external_classification: Option<ExternalTargetClassification>,
-    pub(super) second_confirmation: bool,
-    pub(super) operation_busy: bool,
-    pub(super) operation_cancellation: Option<CancellationToken>,
 }
 
 /// 仅保存安全、稳定的设备枚举反馈类别，不把底层错误路径透传到面板。
@@ -951,15 +936,6 @@ impl ConnectionRequestCancellation {
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
     }
-
-    /// 区分面板换目标的取消与写入取消产生的 executor 子令牌取消，后者仍须接收提交回执。
-    fn is_cancelled_by_request(&self) -> bool {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.cancelled
-    }
 }
 
 /// 每次新目标或取消都会使旧结果失效，防止慢速 SSH 预检覆盖当前面板状态。
@@ -1000,22 +976,6 @@ impl ConnectionRequestEpoch {
         self.generation == generation
             && Arc::ptr_eq(&self.cancellation.state, &request.state)
             && !request.is_cancelled()
-    }
-
-    /// 用户取消在途写入时允许原世代收取其完成/回读结果，但换目标仍会使回调失效。
-    pub(super) fn is_current_after_user_cancel(
-        &self,
-        generation: u64,
-        request: &ConnectionRequestCancellation,
-    ) -> bool {
-        self.generation == generation
-            && Arc::ptr_eq(&self.cancellation.state, &request.state)
-            && !request.is_cancelled_by_request()
-    }
-
-    /// 共享生命周期只读取当前请求世代与取消句柄，避免跨模块暴露计数器内部状态。
-    pub(super) fn snapshot(&self) -> (u64, ConnectionRequestCancellation) {
-        (self.generation, self.cancellation.clone())
     }
 }
 
@@ -1066,9 +1026,7 @@ pub struct ConnectionsPanel {
     pub(super) probe_cancelled: bool,
     pub(super) probe_outcome: Option<ConnectionProbeOutcome>,
     pub(super) probe_error: Option<String>,
-    probe_challenge_draft: Option<kerminal_application::connections::management::HostDraft>,
     probe_request: ConnectionRequestEpoch,
-    pub(super) pending_trust: Option<PendingTrust>,
     pub(super) connection_request: ConnectionRequestEpoch,
     /// 活动选择必须在被普通连接替换时回报，不能遗留 Root 队列中的悬挂项。
     pub(super) sftp_selection_request_id: Option<String>,
@@ -1187,9 +1145,7 @@ impl ConnectionsPanel {
             probe_cancelled: false,
             probe_outcome: None,
             probe_error: None,
-            probe_challenge_draft: None,
             probe_request: ConnectionRequestEpoch::new(),
-            pending_trust: None,
             connection_request: ConnectionRequestEpoch::new(),
             sftp_selection_request_id: None,
             sidebar_container_intent: None,
@@ -1884,10 +1840,6 @@ impl ConnectionsPanel {
             || self.pending_host_deletion.is_some()
             || self.pending_group_deletion.is_some()
             || self.group_save_reconciliation.is_some()
-            || self
-                .pending_trust
-                .as_ref()
-                .is_some_and(|pending| pending.operation_busy)
             || self.presentation.shows_group_editor()
             || self.pending_host_file_picker.is_some()
             || self.pending_editor_discard
@@ -2241,9 +2193,8 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 新预检独占新的请求世代，旧请求即使稍后返回也不能发布连接或信任结果。
+    /// 新连接独占新的请求世代，旧请求即使稍后返回也不能发布连接结果。
     fn begin_connection_request(&mut self) -> (u64, ConnectionRequestCancellation) {
-        self.pending_trust = None;
         self.connection_request.begin()
     }
 
@@ -2259,7 +2210,6 @@ impl ConnectionsPanel {
     /// @author kongweiguang
     fn cancel_connection_request_with_reason(&mut self, interrupted: bool, cx: &mut Context<Self>) {
         self.connection_request.cancel();
-        self.pending_trust = None;
         self.sidebar_container_intent = None;
         self.sidebar_container_failure = None;
         if let Some(request_id) = self.sftp_selection_request_id.take() {
@@ -2271,30 +2221,7 @@ impl ConnectionsPanel {
         }
     }
 
-    /// 仅结束同一文件选择预检；指纹回读完成前保留原请求以免错误覆盖真实结果。
-    ///
-    /// @author kongweiguang
-    pub(super) fn finish_sftp_selection(
-        &mut self,
-        action: &PendingAction,
-        message: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let PendingAction::SftpSelection { request_id, .. } = action else {
-            return;
-        };
-        if self.sftp_selection_request_id.as_deref() != Some(request_id.as_str()) {
-            return;
-        }
-        self.sftp_selection_request_id = None;
-        cx.emit(ConnectionsEvent::SftpSelectionFinished {
-            request_id: request_id.clone(),
-            message,
-            interrupted: false,
-        });
-    }
-
-    /// 文件选择不改写侧栏选中主机，主机配置和信任校验仍沿用同一连接面板用例。
+    /// 文件选择不改写侧栏选中主机，主机存在性与协议校验通过后直接交给 Root。
     ///
     /// @author kongweiguang
     pub(crate) fn request_sftp_selection(
@@ -2332,8 +2259,7 @@ impl ConnectionsPanel {
             return;
         };
         self.sftp_selection_request_id = Some(request_id.clone());
-        self.preflight_host_keys(
-            host_id.clone(),
+        self.emit_action(
             PendingAction::SftpSelection {
                 endpoint,
                 request_id,
@@ -2342,26 +2268,18 @@ impl ConnectionsPanel {
         );
     }
 
-    /// 取消指定选择时遵循信任写入的回读边界，避免后续请求覆盖尚未确认的指纹变更。
+    /// 取消指定选择只结束同一请求身份，迟到结果不会再进入工作台。
     ///
     /// @author kongweiguang
     pub(crate) fn cancel_sftp_selection(&mut self, request_id: &str, cx: &mut Context<Self>) {
         if self.sftp_selection_request_id.as_deref() != Some(request_id) {
             return;
         }
-        if self
-            .pending_trust
-            .as_ref()
-            .is_some_and(|pending| pending.operation_busy)
-        {
-            self.cancel_pending_trust(cx);
-        } else {
-            self.cancel_connection_request_with_reason(false, cx);
-            cx.notify();
-        }
+        self.cancel_connection_request_with_reason(false, cx);
+        cx.notify();
     }
 
-    /// 由独立主机导航请求连接时复用当前协议映射、host-key 预检与二次信任流程。
+    /// 由独立主机导航请求连接时复用当前协议映射与主机校验流程。
     pub fn request_connect_host(&mut self, host_id: &HostId, cx: &mut Context<Self>) {
         self.select_host(host_id.clone(), cx);
         self.connect_selected(false, cx);
@@ -2386,7 +2304,7 @@ impl ConnectionsPanel {
         true
     }
 
-    /// 保留侧栏容器请求的独立身份穿过多轮指纹预检，防止同主机的后续连接误消费回执。
+    /// 保留侧栏容器请求的独立身份交给 Root；主机存在性与 SSH 协议在此同步校验。
     ///
     /// @author kongweiguang
     pub(crate) fn request_connect_host_for_container(
@@ -2403,11 +2321,25 @@ impl ConnectionsPanel {
             return false;
         }
         self.select_host(host_id.clone(), cx);
-        self.connect_selected_with_destination(false, false, Some(intent_id), cx);
+        // 同步发出后不再有后续预检回执；保留意图让 Root 仍按原 ID 绑定成功/失败结果。
+        self.sidebar_container_failure = None;
+        self.sidebar_container_intent = Some(intent_id.clone());
+        self.emit_action(
+            PendingAction::Terminal {
+                host_id: host_id.clone(),
+                target: SessionTarget::Ssh(SshSessionTarget {
+                    host_id: host_id.clone(),
+                    working_directory: None,
+                    command: None,
+                }),
+                intent_id: Some(intent_id),
+            },
+            cx,
+        );
         true
     }
 
-    /// 组合根只需知道原预检是否仍有效；取消或失败后立即释放续接意图，不给信任确认设置超时。
+    /// 组合根只需知道原请求是否仍有效；取消或失败后立即释放续接意图。
     /// @author kongweiguang
     pub(crate) fn sidebar_container_intent_is_current(&self, intent_id: &str) -> bool {
         self.sidebar_container_intent.as_deref() == Some(intent_id)
@@ -2442,13 +2374,13 @@ impl ConnectionsPanel {
         true
     }
 
-    /// 由独立主机导航请求 SFTP 时仍经过现有 host-key 预检，且不从活动终端推断目标。
+    /// 由独立主机导航请求 SFTP 时复用现有协议与主机校验，且不从活动终端推断目标。
     pub fn request_open_sftp_host(&mut self, host_id: &HostId, cx: &mut Context<Self>) {
         self.select_host(host_id.clone(), cx);
         self.connect_selected(true, cx);
     }
 
-    /// 创建 transfer tab 仍使用同一连接预检和信任事务，只有最终消费端不同于右栏文件面板。
+    /// 创建 transfer tab 仍使用同一连接校验，只有最终消费端不同于右栏文件面板。
     ///
     /// @author kongweiguang
     pub fn request_create_sftp_transfer_tab_host(
@@ -3514,11 +3446,7 @@ impl ConnectionsPanel {
         if let Some(event) = action.sftp_started_event() {
             cx.emit(event);
         }
-        if matches!(host.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp) {
-            self.preflight_host_keys(host.id, action, cx);
-        } else {
-            self.emit_action(action, cx);
-        }
+        self.emit_action(action, cx);
     }
 
     /// 创建一个纯表单草稿；已有凭据只显示关联状态，不从加密 vault 回填。
@@ -3970,59 +3898,7 @@ impl ConnectionsPanel {
         if self.refuse_conflict_reload_mutation(cx) {
             return;
         }
-        self.run_connection_probe(None, window, cx);
-    }
-
-    /// 用户确认未知主机密钥时复用原 peer、endpoint 与指纹，信任只对第二次 probe 有效。
-    /// @author kongweiguang
-    pub(super) fn confirm_probe_host_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(challenge) = self
-            .probe_outcome
-            .as_ref()
-            .and_then(|outcome| match outcome {
-                ConnectionProbeOutcome::RequiresHostKeyTrust(challenge) => Some(challenge.clone()),
-                _ => None,
-            })
-        else {
-            return;
-        };
-        let Some(challenged_draft) = self.probe_challenge_draft.clone() else {
-            return;
-        };
-        let Some(editor) = self.editor.as_ref() else {
-            return;
-        };
-        let current_draft = match editor.to_draft(&self.groups, cx) {
-            Ok(draft) => draft,
-            Err(error) => {
-                self.probe_outcome = None;
-                self.probe_challenge_draft = None;
-                self.set_editor_validation_error(&error, window, cx);
-                return;
-            }
-        };
-        if current_draft != challenged_draft {
-            self.probe_outcome = None;
-            self.probe_challenge_draft = None;
-            self.probe_error = Some(
-                crate::locale::text(
-                    "目标草稿已变化，请重新测试后再确认指纹。",
-                    "The target draft changed. Test it again before confirming the fingerprint.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        self.run_connection_probe(
-            Some(ProbeHostKeyConfirmation {
-                peer: challenge.peer,
-                endpoint: challenge.endpoint,
-                fingerprint_sha256: challenge.fingerprint_sha256,
-            }),
-            window,
-            cx,
-        );
+        self.run_connection_probe(window, cx);
     }
 
     /// 用户取消是中性终态，撤销当前世代并保留表单，迟到结果不能冒充成功或失败。
@@ -4035,19 +3911,13 @@ impl ConnectionsPanel {
         self.probe_running = false;
         self.probe_cancelled = true;
         self.probe_outcome = None;
-        self.probe_challenge_draft = None;
         self.probe_error = None;
         cx.notify();
     }
 
     /// 一次性测试保持原输入实体；世代隔离迟到回执，窗口上下文仅用于定位结构化字段错误。
     /// @author kongweiguang
-    fn run_connection_probe(
-        &mut self,
-        host_key_confirmation: Option<ProbeHostKeyConfirmation>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn run_connection_probe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.host_editor_fields_disabled() {
             return;
         }
@@ -4067,13 +3937,11 @@ impl ConnectionsPanel {
                 return;
             }
         };
-        let challenge_draft = draft.clone();
         let credential_changes = editor.credential_changes(cx);
         let request = ConnectionProbeRequest {
             draft,
             credential_changes,
             timeout: Duration::from_secs(20),
-            host_key_confirmation,
         };
         let executor = self.executor.clone();
         let (generation, request_cancellation) = self.probe_request.begin();
@@ -4081,7 +3949,6 @@ impl ConnectionsPanel {
         self.probe_running = true;
         self.probe_outcome = None;
         self.probe_error = None;
-        self.probe_challenge_draft = None;
         let window_handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let result = executor
@@ -4103,7 +3970,6 @@ impl ConnectionsPanel {
                     match result {
                         Ok(ConnectionProbeOutcome::InvalidInput { field, message }) => {
                             panel.probe_outcome = None;
-                            panel.probe_challenge_draft = None;
                             let field = match field {
                                 ProbeField::SerialDevice => HostEditorField::Host,
                                 ProbeField::SerialBaud => HostEditorField::SerialBaud,
@@ -4119,14 +3985,10 @@ impl ConnectionsPanel {
                             panel.focus_editor_validation(window, cx);
                         }
                         Ok(outcome) => {
-                            if matches!(outcome, ConnectionProbeOutcome::RequiresHostKeyTrust(_)) {
-                                panel.probe_challenge_draft = Some(challenge_draft);
-                            }
                             panel.probe_outcome = Some(outcome);
                             panel.probe_error = None;
                         }
                         Err(error) => {
-                            panel.probe_challenge_draft = None;
                             panel.probe_outcome = None;
                             panel.probe_cancelled =
                                 error.public_code() == PublicErrorCode::Cancelled;
@@ -4150,7 +4012,6 @@ impl ConnectionsPanel {
         self.probe_cancelled = false;
         self.probe_outcome = None;
         self.probe_error = None;
-        self.probe_challenge_draft = None;
         let cleared_validation_issue = self
             .editor
             .as_mut()
@@ -4768,321 +4629,6 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 通过二次确认构造端点绑定请求；共享 mutation 生命周期负责提交、取消与回读。
-    /// @author kongweiguang
-    pub(super) fn confirm_host_key(&mut self, cx: &mut Context<Self>) {
-        let Some(mut pending) = self.pending_trust.clone() else {
-            return;
-        };
-        if pending.operation_busy {
-            return;
-        }
-        if !host_key_trust_allowed(&pending.challenge.status, self.recovery.mode) {
-            self.status = Some(match &pending.challenge.status {
-                HostKeyStatus::Changed { .. } => crate::locale::text(
-                    "主机指纹与已保存值不同，连接已阻止。请先通过独立可信渠道核实新指纹。",
-                    "The host key differs from the saved key, so the connection is blocked. Verify the new key through an independent trusted channel.",
-                )
-                .to_string(),
-                HostKeyStatus::Unknown | HostKeyStatus::Known => crate::locale::text(
-                    "配置处于只读恢复模式，无法保存此主机指纹；连接不会继续。请先恢复配置后重新连接。",
-                    "Configuration is in read-only recovery mode, so this host key cannot be saved and the connection will not continue. Recover configuration before reconnecting.",
-                )
-                .to_string(),
-            });
-            cx.notify();
-            return;
-        }
-        if !pending.second_confirmation {
-            if let Some(current) = self.pending_trust.as_mut() {
-                current.second_confirmation = true;
-            }
-            self.status = Some(crate::locale::text(
-                "已标记指纹已核对；再次点击“信任并继续”才会写入 known_hosts。",
-                "Key marked as verified. Click “Trust key and continue” again to update known_hosts.",
-            ).to_string());
-            cx.notify();
-            return;
-        }
-
-        let challenge = pending.challenge.clone();
-        let request = HostKeyTrustRequest {
-            host_id: challenge.host_id.clone(),
-            peer: challenge.peer.clone(),
-            endpoint: challenge.endpoint.clone(),
-            expected_fingerprint_sha256: challenge.fingerprint_sha256.clone(),
-        };
-        pending.second_confirmation = true;
-        super::host_key_mutation::start_host_key_mutation(
-            self,
-            pending,
-            super::host_key_mutation::HostKeyMutationKind::Trust,
-            "主机指纹信任已取消",
-            move |remote, cancel| async move { remote.trust_host_key(request, cancel).await },
-            cx,
-        );
-    }
-
-    /// 轮换只构造绑定旧/新指纹的请求；提交时序由共享生命周期集中保障。
-    /// @author kongweiguang
-    pub(super) fn confirm_host_key_rotation(&mut self, cx: &mut Context<Self>) {
-        if self.recovery.mode == ConfigurationMode::ReadOnlyRecovery {
-            self.status = Some(
-                crate::locale::text(
-                    "配置处于只读恢复模式，无法替换主机指纹。",
-                    "Configuration is read-only during recovery; the host key cannot be replaced.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        let Some(mut pending) = self.pending_trust.clone() else {
-            return;
-        };
-        if pending.operation_busy {
-            return;
-        }
-        let HostKeyStatus::Changed {
-            previous_fingerprint_sha256,
-        } = &pending.challenge.status
-        else {
-            return;
-        };
-        if previous_fingerprint_sha256 == &pending.challenge.fingerprint_sha256 {
-            self.status = Some(
-                crate::locale::text(
-                    "新指纹被标记为已撤销，不能替换或信任。",
-                    "The observed key is revoked and cannot be replaced or trusted.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
-        }
-        if !pending.second_confirmation {
-            if let Some(current) = self.pending_trust.as_mut() {
-                current.second_confirmation = true;
-            }
-            self.status = Some(crate::locale::text(
-                "请再次确认：只替换当前主机与端口的旧指纹，并在保存成功后重试原连接。",
-                "Confirm once more: replace only the old key for this host and port, then retry the original connection after the save succeeds.",
-            ).to_string());
-            cx.notify();
-            return;
-        }
-
-        let challenge = pending.challenge.clone();
-        let request = HostKeyRotationRequest {
-            host_id: challenge.host_id.clone(),
-            peer: challenge.peer.clone(),
-            endpoint: challenge.endpoint.clone(),
-            expected_previous_fingerprint_sha256: previous_fingerprint_sha256.clone(),
-            expected_fingerprint_sha256: challenge.fingerprint_sha256.clone(),
-        };
-        pending.second_confirmation = true;
-        super::host_key_mutation::start_host_key_mutation(
-            self,
-            pending,
-            super::host_key_mutation::HostKeyMutationKind::Rotation,
-            "主机密钥轮换已取消",
-            move |remote, cancel| async move { remote.replace_host_key(request, cancel).await },
-            cx,
-        );
-    }
-
-    /// 写入前取消同时撤销同一外部认证票据；写入开始后只请求取消并等回执/回读，避免误报信任记录未变。
-    /// @author kongweiguang
-    pub(super) fn cancel_pending_trust(&mut self, cx: &mut Context<Self>) {
-        if let Some(pending) = self.pending_trust.as_ref()
-            && pending.operation_busy
-        {
-            if let Some(cancellation) = &pending.operation_cancellation {
-                cancellation.cancel();
-            }
-            self.status = Some(crate::locale::text(
-                "已请求取消；仍在等待信任写入的真实回执和端点回读，期间不会重复提交。",
-                "Cancellation requested. Waiting for the trust write receipt and endpoint readback; no duplicate write will be started.",
-            ).to_string());
-            cx.notify();
-            return;
-        }
-        let external_host = self.pending_trust.as_ref().and_then(|pending| {
-            if let PendingAction::External(target) = &pending.action {
-                Some(target.host_id().clone())
-            } else {
-                None
-            }
-        });
-        self.cancel_connection_request_with_reason(false, cx);
-        if let Some(host_id) = external_host {
-            cx.emit(ConnectionsEvent::ExternalTargetCancelled { host_id });
-        }
-        self.status = Some(
-            crate::locale::text(
-                "已取消连接请求，不会继续建立终端或文件连接。",
-                "Connection request cancelled. No terminal or file connection will be started.",
-            )
-            .to_string(),
-        );
-        cx.notify();
-    }
-
-    /// 检查固定主机的逐跳指纹；配置消失时通知文件选择的原 owner，避免另一侧一直等待。
-    ///
-    /// @author kongweiguang
-    pub(super) fn preflight_host_keys(
-        &mut self,
-        host_id: HostId,
-        action: PendingAction,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(host) = self.rows.iter().find(|host| host.id == host_id).cloned() else {
-            self.status = Some(
-                crate::locale::text(
-                    "主机已不存在，请刷新列表后重试。",
-                    "The host no longer exists. Refresh the list and try again.",
-                )
-                .to_string(),
-            );
-            self.finish_sftp_selection(&action, self.status.clone(), cx);
-            self.reload(cx);
-            return;
-        };
-        self.preflight_host_key_count(host_id, host.route.jump_hosts.len(), action, cx);
-    }
-
-    /// 保存主机与临时目标复用逐跳检查，失败按原动作回报，不能吞掉双侧选择的队列完成信号。
-    ///
-    /// @author kongweiguang
-    pub(super) fn preflight_host_key_count(
-        &mut self,
-        host_id: HostId,
-        jump_count: usize,
-        action: PendingAction,
-        cx: &mut Context<Self>,
-    ) {
-        self.sidebar_container_failure = None;
-        self.sidebar_container_intent = match &action {
-            PendingAction::Terminal { intent_id, .. } => intent_id.clone(),
-            _ => None,
-        };
-        let (request_generation, request_cancellation) = self.begin_connection_request();
-        let callback_cancellation = request_cancellation.clone();
-        let mut peers = (0..jump_count)
-            .map(|index| HostKeyPeer::Jump { index })
-            .collect::<Vec<_>>();
-        peers.push(HostKeyPeer::Target);
-        let remote = self.remote.clone();
-        let executor = self.executor.clone();
-        let check_host_id = host_id.clone();
-        let expected_host_key = action.expected_host_key().map(str::to_owned);
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(move |executor_cancel| async move {
-                    let cancel = request_cancellation.bind_to(&executor_cancel);
-                    if cancel.is_cancelled() {
-                        return Err(AppError::cancelled("SSH 主机指纹预检已取消"));
-                    }
-                    for peer in peers {
-                        if cancel.is_cancelled() {
-                            return Err(AppError::cancelled("SSH 主机指纹预检已取消"));
-                        }
-                        let challenge = remote
-                            .inspect_host_key(check_host_id.clone(), peer.clone(), cancel.clone())
-                            .await?;
-                        if matches!(peer, HostKeyPeer::Target)
-                            && expected_host_key.as_deref().is_some_and(|expected| {
-                                !super::external::expected_fingerprint_matches(
-                                    expected,
-                                    &challenge.fingerprint_sha256,
-                                )
-                            })
-                        {
-                            return Err(AppError::host_key_changed());
-                        }
-                        if challenge.status != HostKeyStatus::Known {
-                            return Ok(Some(challenge));
-                        }
-                    }
-                    Ok(None)
-                })
-                .await;
-            cx.update(|app| {
-                let _ = this.update(app, |panel, cx| {
-                    if !panel
-                        .connection_request
-                        .is_current(request_generation, &callback_cancellation)
-                    {
-                        return;
-                    }
-                    match result {
-                        Ok(Some(challenge)) => {
-                            let display_host = action.external_peer_label(&challenge.peer);
-                            let external_classification = action.external_classification().cloned();
-                            panel.pending_trust = Some(PendingTrust {
-                                challenge,
-                                action,
-                                display_host,
-                                external_classification,
-                                second_confirmation: false,
-                                operation_busy: false,
-                                operation_cancellation: None,
-                            });
-                            panel.status = Some(
-                                crate::locale::text(
-                                    "请核对远端主机指纹，再决定是否继续连接。",
-                                    "Verify the remote host key before continuing.",
-                                )
-                                .to_string(),
-                            );
-                            cx.notify();
-                        }
-                        Ok(None) => panel.emit_action(action, cx),
-                        Err(error) => {
-                            if let PendingAction::External(target) = &action {
-                                cx.emit(ConnectionsEvent::ExternalTargetCancelled {
-                                    host_id: target.host_id().clone(),
-                                });
-                            }
-                            let message = localized_error(&error);
-                            panel.finish_sftp_selection(&action, Some(message.clone()), cx);
-                            panel.sidebar_container_failure = panel
-                                .sidebar_container_intent
-                                .take()
-                                .map(|id| (id, message.clone()));
-                            panel.status = Some(message);
-                            cx.notify();
-                        }
-                    }
-                });
-            });
-        })
-        .detach();
-        self.status = Some(
-            crate::locale::text(
-                "正在逐跳检查 SSH 主机指纹…",
-                "Checking SSH host keys along the route…",
-            )
-            .to_string(),
-        );
-        cx.notify();
-    }
-
-    /// 信任确认后按 action 中的路由重新预检；外部临时 ID 不从保存主机目录反查。
-    pub(super) fn preflight_pending_action(
-        &mut self,
-        host_id: HostId,
-        action: PendingAction,
-        cx: &mut Context<Self>,
-    ) {
-        if let PendingAction::External(target) = &action {
-            self.preflight_host_key_count(host_id, target.identity.jump_hosts.len(), action, cx);
-        } else {
-            self.preflight_host_keys(host_id, action, cx);
-        }
-    }
-
     /// 创建分组由 application 写入整份 groups.toml 并按 revision CAS，UI 不写配置文件。
     /// 返回结果只有在该编辑器仍可见且草稿未变时才结束视图；隐藏旧编辑器不得继续提交。
     /// @author kongweiguang
@@ -5642,7 +5188,7 @@ impl ConnectionsPanel {
 }
 
 impl PendingAction {
-    /// 两种 SFTP 去向都在首次预检前发布稳定 ID，信任重试不得新建请求身份。
+    /// 两种 SFTP 去向都在交给 Root 前发布稳定 ID，后续流程不得新建请求身份。
     /// @author kongweiguang
     fn sftp_started_event(&self) -> Option<ConnectionsEvent> {
         match self {
@@ -5657,47 +5203,10 @@ impl PendingAction {
             _ => None,
         }
     }
-
-    /// SFTP 调用方提供的指纹作为本次目标的额外固定约束，密码和路径不会进入检查日志。
-    fn expected_host_key(&self) -> Option<&str> {
-        match self {
-            Self::External(ExternalRoutedTarget {
-                intent:
-                    ExternalLaunchIntent::SftpTransfer {
-                        expected_host_key, ..
-                    },
-                ..
-            }) => expected_host_key.as_deref(),
-            _ => None,
-        }
-    }
-
-    /// 信任弹层优先显示外部请求中的真实 peer endpoint，避免只展示一次性 external ID。
-    fn external_peer_label(&self, peer: &HostKeyPeer) -> Option<String> {
-        let Self::External(target) = self else {
-            return None;
-        };
-        let endpoint = match peer {
-            HostKeyPeer::Target => Some(&target.identity.endpoint),
-            HostKeyPeer::Jump { index } => target.identity.jump_hosts.get(*index),
-        }?;
-        Some(format!(
-            "{}@{}:{}",
-            endpoint.username, endpoint.host, endpoint.port
-        ))
-    }
-
-    /// 保存外部目标的安全分类供确认弹层说明；分类仅用于展示，不复用命中主机的凭据。
-    fn external_classification(&self) -> Option<&ExternalTargetClassification> {
-        match self {
-            Self::External(target) => Some(&target.classification),
-            _ => None,
-        }
-    }
 }
 
 impl Drop for ConnectionsPanel {
-    /// 关闭面板时取消观察、远端预检并使迟到的用户名续接结果失效。
+    /// 关闭面板时取消观察、远端请求并使迟到的用户名续接结果失效。
     /// @author kongweiguang
     fn drop(&mut self) {
         self.configuration_watch_cancellation.cancel();
@@ -5888,15 +5397,6 @@ pub(super) fn localized_error(error: &AppError) -> String {
         },
     };
     crate::locale::text(message, english).to_string()
-}
-
-/// 只允许未知指纹在可写模式下进入显式 trust 流程，变化指纹必须保持 fail-closed。
-/// @author kongweiguang
-pub(super) fn host_key_trust_allowed(
-    status: &HostKeyStatus,
-    configuration_mode: ConfigurationMode,
-) -> bool {
-    configuration_mode == ConfigurationMode::ReadWrite && matches!(status, HostKeyStatus::Unknown)
 }
 
 /// 只刷新主机配置对应的目录文档；完整重扫事件始终刷新全部 host/group 快照。

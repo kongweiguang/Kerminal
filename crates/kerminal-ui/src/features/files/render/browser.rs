@@ -964,24 +964,12 @@ pub(super) fn render_browser(
             }
         }));
 
-    let trust_request = pane.current_host_key_trust_request();
-    let host_key_trust_busy = trust_request.as_ref().is_some_and(|request| {
-        endpoint.host_id() == Some(&request.host_id)
-            && matches!(&endpoint, FileEndpoint::Remote { .. })
-    });
     if loading && listing.is_none() {
         // 首次读取没有可信内容时保持列表框架，避免重复加载文案与工具栏争夺空间。
         list = list.child(div().flex_1());
     } else if listing.is_none() {
-        // 错误卡是这一侧唯一的失败说明，也承载原位恢复动作；信任只属于真实主机密钥请求，
-        // 不能用“读取失败”推断用户需要写入 known_hosts。重试始终命中失败目录本身。
+        // 错误卡是这一侧唯一的失败说明，也承载原位恢复动作；重试始终命中失败目录本身。
         let can_retry = panel.directory_error.is_some() && panel.failed_directory.is_some();
-        let can_trust = side == 1
-            && panel.directory_error.is_some()
-            && matches!(&endpoint, FileEndpoint::Remote { .. })
-            && trust_request
-                .as_ref()
-                .is_some_and(|request| endpoint.host_id() == Some(&request.host_id));
         let retry_button = can_retry.then(|| {
             Button::new(format!("files-directory-error-retry-{side}"))
                 .compact()
@@ -994,31 +982,13 @@ pub(super) fn render_browser(
                 }))
                 .into_any_element()
         });
-        let trust_button = can_trust.then(|| {
-            Button::new("files-trust-host-key")
-                .compact()
-                .danger()
-                .icon(IconName::Check)
-                .label(locale::text("信任主机密钥", "Trust host key"))
-                .disabled(host_key_trust_busy)
-                .loading(host_key_trust_busy)
-                .accessibility_label(locale::text(
-                    "信任 SFTP 主机密钥",
-                    "Trust the SFTP host key",
-                ))
-                .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
-                    pane.request_host_key_trust(cx);
-                }))
-                .into_any_element()
-        });
-        let actions = (retry_button.is_some() || trust_button.is_some()).then(|| {
+        let actions = retry_button.is_some().then(|| {
             div()
                 .flex()
                 .flex_wrap()
                 .justify_end()
                 .gap_2()
                 .children(retry_button)
-                .children(trust_button)
                 .into_any_element()
         });
         let (title, detail) = panel.directory_error.as_ref().map_or_else(

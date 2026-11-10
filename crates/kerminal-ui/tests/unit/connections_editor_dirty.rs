@@ -826,9 +826,9 @@ impl kerminal_application::connections::host_types::HostTypeProvider for GatedBu
     }
 }
 
-/// 提供方等待期间容器续接身份有效；切换目标取消实际任务，后续重试再进入原 SSH 预检。
+/// 容器入口只做同步主机校验并发出连接；通用内置连接仍经提供方并可在切换目标时取消。
 #[gpui_kit::test]
-fn builtin_provider_cancellation_and_container_intent_follow_real_panel_requests(
+fn container_intent_is_synchronous_and_builtin_provider_cancellation_still_works(
     app: &mut TestAppContext,
 ) {
     use kerminal_application::connections::host_types::{
@@ -850,47 +850,33 @@ fn builtin_provider_cancellation_and_container_intent_follow_real_panel_requests
     let (runtime, panel, visual) = fixture(app, vec![host], Vec::new());
     update_panel(&panel, visual, |panel, _, cx| {
         panel.plugin_hosts = Some(PluginHostService::new(panel.hosts.clone(), catalog));
-        panel.remote = Arc::new(NoRemoteConnections {
-            preflight_fails: true,
-        });
         assert!(panel.request_connect_host_for_container(&id, "first".to_owned(), cx));
         assert!(panel.sidebar_container_intent_is_current("first"));
     });
     pump_runtime(&runtime, visual);
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        0,
+        "容器请求不再等待提供方预检"
+    );
+    update_panel(&panel, visual, |panel, _, cx| {
+        panel.select_host(HostId::new(), cx);
+    });
+    visual.update(|_, app| {
+        assert!(!panel.read(app).sidebar_container_intent_is_current("first"));
+    });
+
+    update_panel(&panel, visual, |panel, _, cx| {
+        panel.select_host(id.clone(), cx);
+        panel.connect_selected(false, cx);
+    });
+    pump_runtime(&runtime, visual);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     update_panel(&panel, visual, |panel, _, cx| {
-        panel.select_host(HostId::new(), cx)
+        panel.select_host(HostId::new(), cx);
     });
     pump_runtime(&runtime, visual);
     assert_eq!(provider.cancellations.load(Ordering::SeqCst), 1);
-    visual.update(|_, app| assert!(!panel.read(app).sidebar_container_intent_is_current("first")));
-
-    update_panel(&panel, visual, |panel, _, cx| {
-        assert!(panel.request_connect_host_for_container(&id, "second".to_owned(), cx));
-        assert!(panel.sidebar_container_intent_is_current("second"));
-    });
-    pump_runtime(&runtime, visual);
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-    provider.release.add_permits(1);
-    for _ in 0..8 {
-        pump_runtime(&runtime, visual);
-        if visual.update(|_, app| {
-            panel
-                .read(app)
-                .sidebar_container_failure("second")
-                .is_some()
-        }) {
-            break;
-        }
-    }
-    visual.update(|_, app| {
-        let panel = panel.read(app);
-        assert!(
-            panel.sidebar_container_failure("second").is_some(),
-            "应进入原 SSH 预检并保留失败的意图身份"
-        );
-        assert!(!panel.sidebar_container_intent_is_current("second"));
-    });
 }
 
 /// 既有配置不改动和字段改回原值，都必须关闭且不显示丢弃确认。
@@ -1333,16 +1319,16 @@ fn local_host_picker_applies_latest_shared_profile_without_losing_edits(app: &mu
 #[path = "connections_editor_interactions.rs"]
 mod interaction_tests;
 
-/// 容器续接意图复用正式连接取消边界；取消后的预检不探测网络，也不能留下可接受的旧 ID。
+/// 容器入口在主机/协议校验通过后同步发出连接，取消会释放意图而不留下可接受的旧 ID。
 /// @author kongweiguang
 #[gpui_kit::test]
-fn sidebar_container_preflight_cancel_releases_intent(app: &mut TestAppContext) {
+fn sidebar_container_cancel_releases_intent(app: &mut TestAppContext) {
     let host = existing_host();
     let (runtime, panel, visual) = fixture(app, vec![host.clone()], Vec::new());
     update_panel(&panel, visual, |panel, _, cx| {
         assert!(panel.request_connect_host_for_container(&host.id, "container-a".into(), cx));
         assert!(panel.sidebar_container_intent_is_current("container-a"));
-        panel.cancel_pending_trust(cx);
+        panel.cancel_connection_request(cx);
         assert!(!panel.sidebar_container_intent_is_current("container-a"));
         assert!(!panel.request_connect_host_for_container(&HostId::new(), "missing".into(), cx));
     });
@@ -1350,7 +1336,6 @@ fn sidebar_container_preflight_cancel_releases_intent(app: &mut TestAppContext) 
     visual.update(|_, app| {
         let panel = panel.read(app);
         assert!(!panel.sidebar_container_intent_is_current("container-a"));
-        assert!(panel.pending_trust.is_none());
     });
 }
 
@@ -1359,39 +1344,3 @@ mod probe_lifecycle_tests;
 
 #[path = "connections_editor_scroll.rs"]
 mod scroll_tests;
-
-/// 后台预检失败保留原请求的本地化恢复指引；取消与后续请求清理旧反馈。
-/// @author kongweiguang
-#[gpui_kit::test]
-fn sidebar_container_preflight_failure_is_bound_to_its_request(app: &mut TestAppContext) {
-    let host = existing_host();
-    let (runtime, panel, visual) = fixture(app, vec![host.clone()], Vec::new());
-    update_panel(&panel, visual, |panel, _, cx| {
-        panel.remote = Arc::new(NoRemoteConnections {
-            preflight_fails: true,
-        });
-        assert!(panel.request_connect_host_for_container(&host.id, "failed-container".into(), cx));
-    });
-    pump_runtime(&runtime, visual);
-    update_panel(&panel, visual, |panel, _, cx| {
-        assert!(!panel.sidebar_container_intent_is_current("failed-container"));
-        assert_eq!(
-            panel.sidebar_container_failure("failed-container"),
-            panel.status.as_deref()
-        );
-        assert_eq!(
-            panel.sidebar_container_failure("failed-container"),
-            Some(crate::locale::text(
-                "无法连接 SSH 主机，请检查网络、地址和端口后重试。",
-                "Cannot connect to the SSH host. Check the network, address and port, then retry."
-            ).as_ref())
-        );
-        assert!(panel.sidebar_container_failure("other-container").is_none());
-        panel.cancel_pending_trust(cx);
-        assert!(
-            panel
-                .sidebar_container_failure("failed-container")
-                .is_none()
-        );
-    });
-}

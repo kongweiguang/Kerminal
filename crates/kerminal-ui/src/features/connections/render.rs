@@ -25,11 +25,10 @@ use super::{
     external::{render_external_password_prompt, render_external_username_prompt},
     form_render::render_editor,
     panel::ConnectionsPanel,
-    trust::render_trust_confirmation,
 };
 
 impl ConnectionsPanel {
-    /// 无编辑器时 Root 只需要确认层本身：指纹、外部凭据和删除确认都是独立居中模态，
+    /// 无编辑器时 Root 只需要确认层本身：外部凭据和本地删除确认都是独立居中模态，
     /// 再画一整块空主机面板会在弹层背后留下无意义的暗色大框。
     /// 层顺序与面板内 Render 保持一致，最外层拦截点击并保持焦点陷阱稳定。
     /// @author kongweiguang
@@ -47,15 +46,6 @@ impl ConnectionsPanel {
                 theme,
                 cx,
             ));
-        }
-        if let Some(trust) = render_trust_confirmation(
-            self.pending_trust.as_ref(),
-            self.recovery.mode,
-            theme,
-            window,
-            cx,
-        ) {
-            layers.push(trust.into_any_element());
         }
         if let Some(password) = render_external_password_prompt(self, theme, cx) {
             layers.push(password.into_any_element());
@@ -206,13 +196,6 @@ impl Render for ConnectionsPanel {
         }
 
         panel
-            .children(render_trust_confirmation(
-                self.pending_trust.as_ref(),
-                self.recovery.mode,
-                theme,
-                window,
-                cx,
-            ))
             .children(render_external_password_prompt(self, theme, cx))
             .children(render_external_username_prompt(self, theme, cx))
     }

@@ -225,10 +225,7 @@ fn parse_kerminal_url(raw_url: &str, _argument_index: usize) -> AppResult<Extern
             Ok(request(
                 ExternalLaunchSource::Kerminal,
                 target,
-                ExternalLaunchIntent::SftpTransfer {
-                    remote_path: path,
-                    expected_host_key: None,
-                },
+                ExternalLaunchIntent::SftpTransfer { remote_path: path },
                 None,
                 None,
             ))
@@ -292,7 +289,6 @@ fn parse_kerminal_cli(arguments: &[String]) -> AppResult<ExternalLaunchRequest> 
     let mut jumps = Vec::new();
     let mut remote_path = None;
     let mut display_name = None;
-    let mut expected_host_key = None;
     let mut index = 1;
 
     while index < arguments.len() {
@@ -347,10 +343,6 @@ fn parse_kerminal_cli(arguments: &[String]) -> AppResult<ExternalLaunchRequest> 
                 )?)?);
                 continue;
             }
-            "--host-key" => {
-                expected_host_key = Some(take_option_value(arguments, &mut index, inline, name)?);
-                continue;
-            }
             _ => return Err(AppError::invalid("Kerminal 外部启动参数不受支持")),
         };
         host = Some(validated_host(&value)?);
@@ -370,14 +362,8 @@ fn parse_kerminal_cli(arguments: &[String]) -> AppResult<ExternalLaunchRequest> 
     let intent = if protocol == RemoteProtocol::Sftp {
         let path = remote_path.unwrap_or_else(|| "/".to_owned());
         validate_remote_path(&path)?;
-        ExternalLaunchIntent::SftpTransfer {
-            remote_path: path,
-            expected_host_key,
-        }
+        ExternalLaunchIntent::SftpTransfer { remote_path: path }
     } else {
-        if expected_host_key.is_some() {
-            return Err(AppError::invalid("SSH 终端参数不能包含 SFTP 主机密钥声明"));
-        }
         ExternalLaunchIntent::SshTerminal {
             remote_command: Vec::new(),
         }
@@ -692,7 +678,6 @@ fn parse_xshell(arguments: &[String]) -> AppResult<ExternalLaunchRequest> {
 fn parse_sftp_client(arguments: &[String]) -> AppResult<ExternalLaunchRequest> {
     let mut raw_url = None;
     let mut identity_file = None;
-    let mut host_key = None;
     let mut username = None;
     let mut index = 1;
     while index < arguments.len() {
@@ -709,8 +694,6 @@ fn parse_sftp_client(arguments: &[String]) -> AppResult<ExternalLaunchRequest> {
             identity_file = Some(nonempty_path(&plain_next_value(
                 arguments, &mut index, token,
             )?)?);
-        } else if lower == "/hostkey" || lower == "--host-key" {
-            host_key = Some(plain_next_value(arguments, &mut index, token)?);
         } else if lower == "/username" || lower == "--user" {
             username = Some(validated_username(&plain_next_value(
                 arguments, &mut index, token,
@@ -740,12 +723,6 @@ fn parse_sftp_client(arguments: &[String]) -> AppResult<ExternalLaunchRequest> {
         request.target.username = username;
     }
     request.identity_file = identity_file;
-    if let ExternalLaunchIntent::SftpTransfer {
-        expected_host_key, ..
-    } = &mut request.intent
-    {
-        *expected_host_key = host_key;
-    }
     Ok(request)
 }
 
@@ -783,10 +760,7 @@ fn parse_remote_url(
             path
         };
         validate_remote_path(&path)?;
-        ExternalLaunchIntent::SftpTransfer {
-            remote_path: path,
-            expected_host_key: None,
-        }
+        ExternalLaunchIntent::SftpTransfer { remote_path: path }
     } else {
         if !path.is_empty() && path != "/" {
             return Err(AppError::invalid("SSH URL path不能作为远端命令"));

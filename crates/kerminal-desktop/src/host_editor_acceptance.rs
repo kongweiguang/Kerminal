@@ -1684,8 +1684,6 @@ fn outcome_id(outcome: &ConnectionProbeOutcome) -> String {
         }
         ConnectionProbeOutcome::InvalidInput { .. } => "invalid-input".to_owned(),
         ConnectionProbeOutcome::RdpConnectivity(_) => "rdp-connectivity".to_owned(),
-        ConnectionProbeOutcome::RequiresHostKeyTrust(_) => "host-key-trust".to_owned(),
-        ConnectionProbeOutcome::HostKeyChanged(_) => "host-key-changed".to_owned(),
     }
 }
 

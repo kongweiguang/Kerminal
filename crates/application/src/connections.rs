@@ -3,7 +3,6 @@
 //! @author kongweiguang
 
 pub mod credentials;
-pub mod file_host_key;
 pub mod host_types;
 pub mod leased_session_transport;
 pub mod management;

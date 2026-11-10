@@ -1413,7 +1413,7 @@ async fn capture_right_rail(
         config_directory: capture.config_directory.to_string_lossy().into_owned(),
         fixture_config_source: fixture_config_source.to_string_lossy().into_owned(),
         fixture_host_id: FIXTURE_HOST_ID.to_owned(),
-        fixture_host_key_policy: "existing_known_hosts_required_no_automatic_trust",
+        fixture_host_key_policy: "existing_known_hosts_or_automatic_trust_with_best_effort_record",
         window_size_unit: "gpui_logical_pixels",
         window_size_source: if requested_window_width.is_some() || requested_window_height.is_some()
         {

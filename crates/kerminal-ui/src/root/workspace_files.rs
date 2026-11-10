@@ -3,9 +3,8 @@
 //! @author kongweiguang
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
 };
 
 use gpui_kit::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
@@ -28,12 +27,14 @@ use crate::features::{
     editor::EditorWorkspaceProjection,
     files::{
         ActivateEditorFileRequested, CreateSftpHostRequested, FilesPane, FilesPaneEvent,
-        OpenFileRequested, SftpHostKeyTrustRequested, SftpHostRequested,
+        OpenFileRequested, SftpHostRequested,
     },
     workspace_controller::{WorkspaceRestoreFailure, WorkspaceRestoreItemId},
     workspace_tabs::WorkspaceFileTabAction,
 };
-use tokio_util::sync::CancellationToken;
+// 子测试模块经 glob 复用同一取消令牌类型；仅在测试构建中显式 re-export。
+#[cfg(test)]
+pub(super) use tokio_util::sync::CancellationToken;
 
 use super::{CenterPanel, RootView};
 
@@ -140,33 +141,9 @@ pub(super) struct FilesPaneSubscriptions {
     _directory_changed: Subscription,
     _activate_editor_file: Subscription,
     _sftp_host: Subscription,
-    _sftp_host_key_trust: Subscription,
     _create_sftp_host: Subscription,
     _delete_confirmation_observer: Subscription,
     _pane_events: Subscription,
-    host_key_trust_tasks: FilesPaneTaskRegistry,
-}
-
-type FilesPaneTaskRegistry = Arc<Mutex<HashMap<u64, CancellationToken>>>;
-
-impl Drop for FilesPaneSubscriptions {
-    /// 释放桥接时取消该面板的未提交信任；已开始写入仍须等待原端点回读。
-    fn drop(&mut self) {
-        for cancellation in lock_files_pane_tasks(&self.host_key_trust_tasks).values() {
-            cancellation.cancel();
-        }
-    }
-}
-
-/// 短暂锁住每个 pane 的请求表；锁中不等待传输，也从不持有 GPUI 更新回调。
-///
-/// @author kongweiguang
-fn lock_files_pane_tasks(
-    tasks: &FilesPaneTaskRegistry,
-) -> MutexGuard<'_, HashMap<u64, CancellationToken>> {
-    tasks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// 显式区分尚未打开、可用和失败；失败的原始 typed tab 仍留在 runtime/snapshot。
@@ -656,8 +633,6 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> FilesPaneSubscriptions {
-        let host_key_trust_tasks = Arc::new(Mutex::new(HashMap::new()));
-        let event_trust_tasks = host_key_trust_tasks.clone();
         let open_file = cx.subscribe_in(
             pane,
             window,
@@ -738,23 +713,6 @@ impl RootView {
                 );
             },
         );
-        let sftp_host_key_trust = cx.subscribe_in(
-            pane,
-            window,
-            move |root, source, event: &SftpHostKeyTrustRequested, _, cx| {
-                if root.is_cached_sftp_panel(source)
-                    || source.read(cx).current_host_key_trust_request().as_ref() != Some(event)
-                {
-                    return;
-                }
-                root.start_file_host_key_trust(
-                    source.clone(),
-                    event.clone(),
-                    event_trust_tasks.clone(),
-                    cx,
-                );
-            },
-        );
         let delete_confirmation_observer =
             cx.observe_in(pane, window, |root, source, window, cx| {
                 let active = source.read(cx).pending_global_dialog();
@@ -811,11 +769,9 @@ impl RootView {
             _directory_changed: directory_changed,
             _activate_editor_file: activate_editor_file,
             _sftp_host: sftp_host,
-            _sftp_host_key_trust: sftp_host_key_trust,
             _create_sftp_host: create_sftp_host,
             _delete_confirmation_observer: delete_confirmation_observer,
             _pane_events: pane_events,
-            host_key_trust_tasks,
         }
     }
 
@@ -864,68 +820,6 @@ impl RootView {
             }
         }
         cx.notify();
-    }
-
-    /// 只提交文件栏冻结的主机信任意图；应用用例负责逐跳绑定与未知结果回读，回执仍交还原 pane。
-    /// 不导航到连接页或打开新终端，避免信任动作改变用户正在浏览的工作区。
-    ///
-    /// @author kongweiguang
-    fn start_file_host_key_trust(
-        &mut self,
-        source: Entity<FilesPane>,
-        request: SftpHostKeyTrustRequested,
-        tasks: FilesPaneTaskRegistry,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((hosts, remote)) = self
-            .services
-            .hosts
-            .clone()
-            .zip(self.services.remote_connections.clone())
-        else {
-            source.update(cx, |pane, cx| {
-                pane.report_host_key_trust(
-                    request.request_id,
-                    request.host_id,
-                    Err(crate::locale::text(
-                        "主机密钥服务不可用。",
-                        "Host key services are unavailable.",
-                    )
-                    .to_string()),
-                    cx,
-                )
-            });
-            return;
-        };
-        let cancellation = CancellationToken::new();
-        {
-            let mut active = lock_files_pane_tasks(&tasks);
-            for previous in active.values() {
-                previous.cancel();
-            }
-            active.clear();
-            active.insert(request.request_id, cancellation.clone());
-        }
-        let executor = self.services.executor.clone();
-        cx.spawn(async move |_, cx| {
-            let host_id = request.host_id.clone();
-            let result = executor
-                .run_cancellable(cancellation, move |cancel| async move {
-                    kerminal_application::connections::file_host_key::trust_file_host_route_keys(
-                        &hosts, remote, host_id, cancel,
-                    )
-                    .await
-                })
-                .await
-                .map_err(|error| error.public_message().to_owned());
-            cx.update(|app| {
-                source.update(app, |pane, cx| {
-                    pane.report_host_key_trust(request.request_id, request.host_id, result, cx);
-                });
-            });
-            lock_files_pane_tasks(&tasks).remove(&request.request_id);
-        })
-        .detach();
     }
 
     /// 将编辑器的当前投影同步到标签导航；最后一个编辑页关闭后只返回原本选中的终端，不创建或改绑会话。

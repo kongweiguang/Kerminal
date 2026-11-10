@@ -12,11 +12,12 @@ use std::time::Duration;
 use kerminal_application::{
     AppError,
     connections::{
-        CommandStreamHandle, ConnectionIntent, ExecRequest, HostKeyChallenge,
-        HostKeyRotationReceipt, HostKeyRotationRequest, HostKeyTrustReceipt, HostKeyTrustRequest,
-        OpenSftpRequest, RemoteConnectionHandle, RemoteConnectionLease, RemoteConnectionService,
-        RemoteForwardHandle, RemoteForwardRequest, SftpChannelHandle, ShellScriptRequest,
-        TerminalOpenRequest, TunnelChannelHandle, TunnelRequest,
+        CommandStreamHandle, ConnectionIntent, ExecRequest, HostKeyChallenge, HostKeyIdentity,
+        HostKeyPeer, HostKeyRotationReceipt, HostKeyRotationRequest, HostKeyStatus,
+        HostKeyTrustReceipt, HostKeyTrustRequest, OpenSftpRequest, RemoteConnectionHandle,
+        RemoteConnectionLease, RemoteConnectionService, RemoteForwardHandle, RemoteForwardRequest,
+        SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest, TunnelChannelHandle,
+        TunnelRequest,
     },
     sessions::{
         SessionOpenCleanupOwner, SessionTransport, SessionTransportControl,
@@ -67,129 +68,6 @@ impl KnownHostsRepository for FixedKnownHosts {
             "test known_hosts fake does not support key rotation",
         ))
     }
-}
-
-/// 构造精确 endpoint/fingerprint 确认；peer 由调用者绑定到单一路由目标。
-fn confirmation(endpoint: HostEndpoint, fingerprint: &str) -> ProbeHostKeyConfirmation {
-    ProbeHostKeyConfirmation {
-        peer: HostKeyPeer::Target,
-        endpoint,
-        fingerprint_sha256: fingerprint.to_owned(),
-    }
-}
-
-/// 描述 SSH 主机公钥测试值，正文不会出现在测试输出中。
-fn identity(fingerprint: &str) -> HostKeyIdentity {
-    HostKeyIdentity {
-        algorithm: "ssh-ed25519".to_owned(),
-        fingerprint_sha256: fingerprint.to_owned(),
-        public_key_openssh: "ssh-ed25519 AAAATEST".to_owned(),
-    }
-}
-
-#[tokio::test]
-async fn pin_is_exact_single_use_and_never_persisted() {
-    let endpoint = HostEndpoint {
-        host: "example.invalid".to_owned(),
-        port: 22,
-        username: "user".to_owned(),
-    };
-    let saved = Arc::new(FixedKnownHosts {
-        status: HostKeyStatus::Unknown,
-        trust_calls: AtomicUsize::new(0),
-    });
-    let repository = ProbeKnownHostsRepository {
-        saved: saved.clone(),
-        confirmation: confirmation(endpoint.clone(), "SHA256:accepted"),
-        consumed: AtomicBool::new(false),
-    };
-
-    assert_eq!(
-        repository
-            .inspect(&endpoint, &identity("SHA256:accepted"))
-            .await
-            .expect("first exact check"),
-        HostKeyStatus::Known
-    );
-    assert_eq!(
-        repository
-            .inspect(&endpoint, &identity("SHA256:accepted"))
-            .await
-            .expect("pin is consumed"),
-        HostKeyStatus::Unknown
-    );
-    assert_eq!(
-        repository
-            .inspect(&endpoint, &identity("SHA256:different"))
-            .await
-            .expect("different fingerprint remains unknown"),
-        HostKeyStatus::Unknown
-    );
-    assert!(
-        repository
-            .trust(&endpoint, &identity("SHA256:accepted"))
-            .await
-            .is_err()
-    );
-    assert_eq!(saved.trust_calls.load(Ordering::Relaxed), 0);
-}
-
-#[tokio::test]
-async fn changed_key_is_never_overridden_by_temporary_confirmation() {
-    let endpoint = HostEndpoint {
-        host: "example.invalid".to_owned(),
-        port: 22,
-        username: "user".to_owned(),
-    };
-    let changed = HostKeyStatus::Changed {
-        previous_fingerprint_sha256: "SHA256:old".to_owned(),
-    };
-    let repository = ProbeKnownHostsRepository {
-        saved: Arc::new(FixedKnownHosts {
-            status: changed.clone(),
-            trust_calls: AtomicUsize::new(0),
-        }),
-        confirmation: confirmation(endpoint.clone(), "SHA256:new"),
-        consumed: AtomicBool::new(false),
-    };
-
-    assert_eq!(
-        repository
-            .inspect(&endpoint, &identity("SHA256:new"))
-            .await
-            .expect("changed key remains blocked"),
-        changed
-    );
-}
-
-#[tokio::test]
-async fn pin_does_not_apply_to_another_endpoint() {
-    let confirmed = HostEndpoint {
-        host: "first.example.invalid".to_owned(),
-        port: 22,
-        username: "user".to_owned(),
-    };
-    let other = HostEndpoint {
-        host: "second.example.invalid".to_owned(),
-        port: 22,
-        username: "user".to_owned(),
-    };
-    let repository = ProbeKnownHostsRepository {
-        saved: Arc::new(FixedKnownHosts {
-            status: HostKeyStatus::Unknown,
-            trust_calls: AtomicUsize::new(0),
-        }),
-        confirmation: confirmation(confirmed, "SHA256:accepted"),
-        consumed: AtomicBool::new(false),
-    };
-
-    assert_eq!(
-        repository
-            .inspect(&other, &identity("SHA256:accepted"))
-            .await
-            .expect("another endpoint stays unknown"),
-        HostKeyStatus::Unknown
-    );
 }
 
 struct UnusedCredentials;
@@ -399,7 +277,6 @@ fn transient_target(protocol: RemoteProtocol) -> ConnectionProbeTarget {
         check_optional_sftp: false,
         serial,
         timeout: Duration::from_secs(5),
-        host_key_confirmation: None,
         transient_credentials: Vec::new(),
     }
 }

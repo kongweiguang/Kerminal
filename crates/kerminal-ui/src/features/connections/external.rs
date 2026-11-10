@@ -1,4 +1,4 @@
-//! 外部启动目标的用户名续接、密码提示、信任预检与消费者移交。
+//! 外部启动目标的用户名续接、密码提示与消费者移交。
 //!
 //! @author kongweiguang
 
@@ -24,12 +24,11 @@ use crate::theme::ThemeTokens;
 use super::panel::{ConnectionsEvent, ConnectionsPanel, PendingAction};
 
 impl ConnectionsPanel {
-    /// Root 观察同一面板的待确认事实，把 trust、一次性认证和本地主机删除提升到全工作区 modal。
+    /// Root 观察同一面板的待确认事实，把一次性认证和本地主机删除提升到全工作区 modal。
     ///
     /// @author kongweiguang
     pub(crate) fn root_confirmation_active(&self) -> bool {
-        self.pending_trust.is_some()
-            || self.pending_external_username.is_some()
+        self.pending_external_username.is_some()
             || self.pending_external_password.is_some()
             || self.local_hosts.pending_delete.is_some()
     }
@@ -56,9 +55,7 @@ impl ConnectionsPanel {
     ///
     /// @author kongweiguang
     pub(crate) fn cancel_root_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_trust.is_some() {
-            self.cancel_pending_trust(cx);
-        } else if self.pending_external_username.is_some() {
+        if self.pending_external_username.is_some() {
             self.cancel_external_username(window, cx);
         } else if self.pending_external_password.is_some() {
             self.cancel_external_password(window, cx);
@@ -76,10 +73,7 @@ impl ConnectionsPanel {
         request: ExternalLaunchRequest,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_external_username.is_some()
-            || self.pending_external_password.is_some()
-            || self.pending_trust.is_some()
-        {
+        if self.pending_external_username.is_some() || self.pending_external_password.is_some() {
             self.status = Some(
                 crate::locale::text(
                     "请先完成或取消当前连接确认，再处理新的外部请求。",
@@ -145,7 +139,7 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 校验显式账号后用原解析请求续接应用路由，再交给现有密码和 host-key 流程。
+    /// 校验显式账号后用原解析请求续接应用路由，再交给现有密码与移交流程。
     /// 普通账号在受理期间保留且禁止编辑，失败可直接重试；仅成功移交或取消清空，避免丢稿或串到下一请求。
     /// @author kongweiguang
     pub(super) fn submit_external_username(
@@ -281,16 +275,13 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 外部目标沿用现有 SSH trust service；一个未结束请求独占面板提示以免口令串到其他目标。
+    /// 外部目标需要密码时先收齐一次性凭据；一个未结束请求独占面板提示以免口令串到其他目标。
     pub fn request_external_target(
         &mut self,
         target: ExternalRoutedTarget,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_external_username.is_some()
-            || self.pending_external_password.is_some()
-            || self.pending_trust.is_some()
-        {
+        if self.pending_external_username.is_some() || self.pending_external_password.is_some() {
             self.status = Some(
                 crate::locale::text(
                     "请先完成或取消当前连接确认，再处理新的外部请求。",
@@ -337,7 +328,7 @@ impl ConnectionsPanel {
             cx.notify();
             return;
         }
-        self.preflight_external_target(target, cx);
+        self.emit_action(PendingAction::External(target), cx);
     }
 
     /// 只有同一 SSH agent 目标可进入密码重试；面板忙时返回未受理以保留上层待处理请求。
@@ -435,10 +426,10 @@ impl ConnectionsPanel {
                         Ok(()) => {
                             panel.pending_external_password.take();
                             panel.status = Some(crate::locale::text(
-                                "临时凭据已保存到内存目标，正在检查 SSH 指纹…",
-                                "Temporary credentials are ready in memory; checking SSH host keys…",
+                                "临时凭据已保存到内存目标，正在移交外部连接…",
+                                "Temporary credentials are ready in memory; handing off the external connection…",
                             ).to_string());
-                            panel.preflight_external_target(target, cx);
+                            panel.emit_action(PendingAction::External(target), cx);
                         }
                         Err(error) => {
                             panel.status = Some(super::panel::localized_error(&error));
@@ -490,13 +481,6 @@ impl ConnectionsPanel {
         }
         cx.notify();
     }
-
-    /// 将密码已就绪的显式目标送入既有 host-key 流程；每个 jump 和目标都检查同一 lease。
-    fn preflight_external_target(&mut self, target: ExternalRoutedTarget, cx: &mut Context<Self>) {
-        let host_id = target.host_id().clone();
-        let jump_count = target.identity.jump_hosts.len();
-        self.preflight_host_key_count(host_id, jump_count, PendingAction::External(target), cx);
-    }
 }
 
 /// 输入框只接受显式、非空且无控制字符的账号名；应用用例仍重复执行业务校验。
@@ -531,11 +515,6 @@ fn external_intent_supported(protocol: RemoteProtocol, intent: &ExternalLaunchIn
             ExternalLaunchIntent::SftpTransfer { .. }
         )
     )
-}
-
-/// SHA-256 Base64 指纹大小写敏感，只允许去除首尾空白后精确相等。
-pub(super) fn expected_fingerprint_matches(expected: &str, observed: &str) -> bool {
-    expected.trim() == observed.trim()
 }
 
 /// 显示未注册目标的显式用户名步骤；没有默认账户、保存凭据或临时连接目标可继承，卡片宽度受根 modal 视口约束。

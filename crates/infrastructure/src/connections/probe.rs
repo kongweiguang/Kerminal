@@ -5,10 +5,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -17,14 +14,13 @@ use kerminal_application::{
     AppError, AppResult,
     connections::probe::{
         ConnectionProbeBackend, ConnectionProbeOutcome, ConnectionProbeTarget, ProbeCredential,
-        ProbeCredentialMaterial, ProbeHostKeyChallenge, ProbeHostKeyChanged,
-        ProbeHostKeyConfirmation, ProbeVerificationLevel, RdpClientKind, RdpConnectivityProbe,
+        ProbeCredentialMaterial, ProbeVerificationLevel, RdpClientKind, RdpConnectivityProbe,
         RdpLocalAvailability, RdpTcpFailure, RdpTcpReachability, SftpProbeStatus,
     },
     connections::{
         ChannelLane, ConnectionIntent, CredentialResolver, HostConnectionRepository,
-        HostKeyIdentity, HostKeyPeer, HostKeyStatus, KnownHostsRepository, OpenSftpRequest,
-        RemoteConnectionLease, RemoteConnectionService, ResolvedCredential,
+        KnownHostsRepository, OpenSftpRequest, RemoteConnectionLease, RemoteConnectionService,
+        ResolvedCredential,
     },
     sessions::{
         DEFAULT_SESSION_CLOSE_BUDGET, SessionOpenCleanupOwner, SessionTransportControl,
@@ -362,8 +358,8 @@ impl SystemConnectionProbe {
         }
     }
 
-    /// 先对所有 route peer 做只读 key 检查，再以精确的一次性 pin 重建临时 SSH service。
-    /// 对 SSH profile 先查信任再认证，并在两个 service 阶段复用同一组截止时间。
+    /// 连接测试直接使用正式 known_hosts 执行握手，未知主机由默认信任策略自动放行并尽力记录；
+    /// 不再做只读指纹检查或一次性 pin，避免连接前预检与随后真实连接出现两套判定。
     ///
     /// @author kongweiguang
     async fn probe_ssh(
@@ -379,47 +375,7 @@ impl SystemConnectionProbe {
         let hosts: Arc<dyn HostConnectionRepository> = Arc::new(ProbeHostRepository {
             profile: target.profile.clone(),
         });
-        let inspector = create_ssh_service(
-            Arc::clone(&hosts),
-            Arc::clone(&credentials),
-            Arc::clone(&self.known_hosts),
-        );
-        let inspection = await_probe_operation(
-            inspect_route(
-                inspector.as_ref(),
-                &target,
-                &cancellation,
-                deadlines.operation,
-            ),
-            &cancellation,
-            deadlines.operation,
-            "SSH 主机指纹检查",
-        )
-        .await;
-        let inspection_cleanup = self.close_ssh_service(&inspector, deadlines.cleanup).await;
-        let inspection = combine_cleanup(inspection, inspection_cleanup)?;
-        if let Some(outcome) = inspection {
-            return Ok(outcome);
-        }
-        ensure_probe_active(&cancellation, deadlines.operation)?;
-
-        let known_hosts: Arc<dyn KnownHostsRepository> = match target.host_key_confirmation.clone()
-        {
-            Some(confirmation) => {
-                if ssh_peer_endpoint_count(&target.profile, &confirmation.endpoint) != 1 {
-                    return Err(AppError::unsupported(
-                        "同一 SSH endpoint 在路由中重复出现，无法安全限定本次指纹确认",
-                    ));
-                }
-                Arc::new(ProbeKnownHostsRepository {
-                    saved: Arc::clone(&self.known_hosts),
-                    confirmation,
-                    consumed: AtomicBool::new(false),
-                })
-            }
-            None => Arc::clone(&self.known_hosts),
-        };
-        let service = create_ssh_service(hosts, credentials, known_hosts);
+        let service = create_ssh_service(hosts, credentials, Arc::clone(&self.known_hosts));
         let result = connect_and_check_sftp(
             service.as_ref(),
             &target.profile,
@@ -650,51 +606,6 @@ impl CredentialResolver for ProbeCredentialResolver {
     }
 }
 
-/// 把 persisted known_hosts 包装成只对一个已确认 endpoint/fingerprint 生效的单次 pin。
-struct ProbeKnownHostsRepository {
-    saved: Arc<dyn KnownHostsRepository>,
-    confirmation: ProbeHostKeyConfirmation,
-    consumed: AtomicBool,
-}
-
-#[async_trait]
-impl KnownHostsRepository for ProbeKnownHostsRepository {
-    /// 变化指纹始终阻断；仅未知且完全匹配的指纹可以在一次连接握手中临时视为可信。
-    async fn inspect(
-        &self,
-        endpoint: &HostEndpoint,
-        identity: &HostKeyIdentity,
-    ) -> AppResult<HostKeyStatus> {
-        let status = self.saved.inspect(endpoint, identity).await?;
-        if status == HostKeyStatus::Unknown
-            && endpoint == &self.confirmation.endpoint
-            && identity.fingerprint_sha256 == self.confirmation.fingerprint_sha256
-            && !self.consumed.swap(true, Ordering::AcqRel)
-        {
-            Ok(HostKeyStatus::Known)
-        } else {
-            Ok(status)
-        }
-    }
-
-    /// 探测端口不持有持久化信任写权限，任何错误接线都显式失败。
-    async fn trust(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
-        Err(AppError::unsupported("连接测试不会写入 known_hosts"))
-    }
-
-    /// 连通性探测只读取信任状态，不能替用户信任或轮换 known_hosts 中的主机密钥。
-    async fn replace(
-        &self,
-        _endpoint: &HostEndpoint,
-        _expected_previous_fingerprint_sha256: &str,
-        _identity: &HostKeyIdentity,
-    ) -> AppResult<()> {
-        Err(AppError::unsupported(
-            "连接测试不会修改 known_hosts 信任记录",
-        ))
-    }
-}
-
 /// 构造只持有本次 profile 与应用正式 SSH 端口的 russh service。
 fn create_ssh_service(
     hosts: Arc<dyn HostConnectionRepository>,
@@ -708,107 +619,6 @@ fn create_ssh_service(
             known_hosts,
         },
     ))
-}
-
-/// 按 proxy → jumps → target 顺序只读检查 SSH host key；未知指纹需同一 peer 的确认。
-async fn inspect_route(
-    service: &dyn RemoteConnectionService,
-    target: &ConnectionProbeTarget,
-    cancellation: &CancellationToken,
-    operation_deadline: tokio::time::Instant,
-) -> AppResult<Option<ConnectionProbeOutcome>> {
-    let profile = &target.profile;
-    for index in 0..profile.route.jump_hosts.len() {
-        ensure_probe_active(cancellation, operation_deadline)?;
-        if let Some(outcome) = inspect_peer(
-            service,
-            profile,
-            HostKeyPeer::Jump { index },
-            target.host_key_confirmation.as_ref(),
-            cancellation,
-            operation_deadline,
-        )
-        .await?
-        {
-            return Ok(Some(outcome));
-        }
-    }
-    ensure_probe_active(cancellation, operation_deadline)?;
-    inspect_peer(
-        service,
-        profile,
-        HostKeyPeer::Target,
-        target.host_key_confirmation.as_ref(),
-        cancellation,
-        operation_deadline,
-    )
-    .await
-}
-
-/// 对一个 peer 生成安全 challenge，绝不因为用户确认而改写 saved known_hosts。
-async fn inspect_peer(
-    service: &dyn RemoteConnectionService,
-    profile: &HostConnectionProfile,
-    peer: HostKeyPeer,
-    confirmation: Option<&ProbeHostKeyConfirmation>,
-    cancellation: &CancellationToken,
-    operation_deadline: tokio::time::Instant,
-) -> AppResult<Option<ConnectionProbeOutcome>> {
-    ensure_probe_active(cancellation, operation_deadline)?;
-    let challenge = service
-        .inspect_host_key(profile.host_id.clone(), peer.clone(), cancellation.clone())
-        .await?;
-    ensure_probe_active(cancellation, operation_deadline)?;
-    let endpoint = endpoint_for_peer(profile, &peer)?;
-    match challenge.status {
-        HostKeyStatus::Known => Ok(None),
-        HostKeyStatus::Unknown => {
-            let confirmed = confirmation.is_some_and(|confirmed| {
-                confirmed.peer == peer
-                    && confirmed.endpoint == endpoint
-                    && confirmed.fingerprint_sha256 == challenge.fingerprint_sha256
-            });
-            if confirmed {
-                Ok(None)
-            } else {
-                Ok(Some(ConnectionProbeOutcome::RequiresHostKeyTrust(
-                    ProbeHostKeyChallenge {
-                        peer,
-                        endpoint,
-                        algorithm: challenge.algorithm,
-                        fingerprint_sha256: challenge.fingerprint_sha256,
-                    },
-                )))
-            }
-        }
-        HostKeyStatus::Changed {
-            previous_fingerprint_sha256,
-        } => Ok(Some(ConnectionProbeOutcome::HostKeyChanged(
-            ProbeHostKeyChanged {
-                peer,
-                endpoint,
-                algorithm: challenge.algorithm,
-                previous_fingerprint_sha256,
-                fingerprint_sha256: challenge.fingerprint_sha256,
-            },
-        ))),
-    }
-}
-
-/// 解析一个 route peer 的真实 endpoint，用于把用户确认绑定到可展示的具体目标。
-fn endpoint_for_peer(
-    profile: &HostConnectionProfile,
-    peer: &HostKeyPeer,
-) -> AppResult<HostEndpoint> {
-    match peer {
-        HostKeyPeer::Target => Ok(profile.endpoint.clone()),
-        HostKeyPeer::Jump { index } => profile
-            .route
-            .jump_hosts
-            .get(*index)
-            .map(|jump| jump.endpoint.clone())
-            .ok_or_else(|| AppError::not_found("SSH 跳板目标不存在")),
-    }
 }
 
 /// 建立 SSH 认证连接；SFTP-only 目标只读列出配置的起始目录，并逐阶段保留取消与清理 owner。
@@ -1078,17 +888,6 @@ fn classify_rdp_tcp_failure(kind: std::io::ErrorKind) -> RdpTcpFailure {
         std::io::ErrorKind::TimedOut => RdpTcpFailure::TimedOut,
         _ => RdpTcpFailure::NetworkError,
     }
-}
-
-/// 在 SSH 路由中统计相同 endpoint 出现次数，避免缺少 peer 参数的下层 trust port 扩大 pin。
-fn ssh_peer_endpoint_count(profile: &HostConnectionProfile, endpoint: &HostEndpoint) -> usize {
-    profile
-        .route
-        .jump_hosts
-        .iter()
-        .filter(|jump| &jump.endpoint == endpoint)
-        .count()
-        + usize::from(&profile.endpoint == endpoint)
 }
 
 /// 把取消或总 deadline 统一映射为可读错误，避免路由继续启动新的 SSH peer。

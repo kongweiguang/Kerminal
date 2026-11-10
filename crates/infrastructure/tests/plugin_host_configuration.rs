@@ -17,7 +17,7 @@ use kerminal_application::{
     AppError, AppResult, PublicErrorCode,
     configuration_changes::{ConfigurationChangeMessage, ConfigurationChangeService},
     connections::{
-        CredentialResolver, HostKeyPeer, ResolvedCredential,
+        CredentialResolver, ResolvedCredential,
         credentials::{
             CredentialService, CredentialVaultRepository, CredentialVaultSaveMetadata, SecretValue,
         },
@@ -35,8 +35,7 @@ use kerminal_application::{
         },
         probe::{
             ConnectionProbeBackend, ConnectionProbeOutcome, ConnectionProbeRequest,
-            ConnectionProbeService, ConnectionProbeTarget, ProbeHostKeyChallenge,
-            ProbeHostKeyConfirmation,
+            ConnectionProbeService, ConnectionProbeTarget, ProbeVerificationLevel,
         },
     },
     data_migration::{DataMigrationReadiness, DataMigrationRepository},
@@ -67,12 +66,11 @@ struct FixtureCodec;
 struct FixtureProbeBackend {
     calls: AtomicUsize,
     saw_transient: AtomicBool,
-    saw_confirmation: AtomicBool,
 }
 
 #[async_trait]
 impl ConnectionProbeBackend for FixtureProbeBackend {
-    /// 用真实探测目标验证临时凭据和信任确认经过贡献分派后仍然存在。
+    /// 用真实探测目标验证临时凭据经过贡献分派后仍然存在。
     async fn probe(
         &self,
         target: ConnectionProbeTarget,
@@ -84,15 +82,8 @@ impl ConnectionProbeBackend for FixtureProbeBackend {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.saw_transient
             .store(!target.transient_credentials.is_empty(), Ordering::SeqCst);
-        self.saw_confirmation
-            .store(target.host_key_confirmation.is_some(), Ordering::SeqCst);
-        Ok(ConnectionProbeOutcome::RequiresHostKeyTrust(
-            ProbeHostKeyChallenge {
-                peer: HostKeyPeer::Target,
-                endpoint: target.profile.endpoint,
-                algorithm: "ssh-ed25519".to_owned(),
-                fingerprint_sha256: "SHA256:fixture".to_owned(),
-            },
+        Ok(ConnectionProbeOutcome::Verified(
+            ProbeVerificationLevel::SshAuthenticated,
         ))
     }
 }
@@ -492,7 +483,7 @@ async fn builtin_runtime_returns_typed_remote_and_local_intents() {
     }
 }
 
-/// 草稿和已保存主机经同一提供方探测，信任挑战与临时输入不可降级为普通成功。
+/// 草稿和已保存主机经同一提供方探测，临时输入与真实结果不可降级为普通成功。
 #[tokio::test]
 async fn builtin_probe_routes_draft_and_preserves_typed_results() {
     let root = tempfile::tempdir().expect("隔离配置根");
@@ -509,11 +500,6 @@ async fn builtin_probe_routes_draft_and_preserves_typed_results() {
     let id = HostId::parse("probe-host").expect("合法主机 ID");
     let mut draft = builtin_remote_draft(id.clone());
     draft.authentication_mode = HostAuthenticationMode::Password;
-    let confirmation = ProbeHostKeyConfirmation {
-        peer: HostKeyPeer::Target,
-        endpoint: draft.endpoint.clone(),
-        fingerprint_sha256: "SHA256:fixture".to_owned(),
-    };
     let outcome = routed
         .probe(
             ConnectionProbeRequest {
@@ -523,7 +509,6 @@ async fn builtin_probe_routes_draft_and_preserves_typed_results() {
                     secret: SecretValue::new("fixture secret".to_owned()),
                 }],
                 timeout: Duration::from_secs(10),
-                host_key_confirmation: Some(confirmation),
             },
             CancellationToken::new(),
         )
@@ -531,10 +516,9 @@ async fn builtin_probe_routes_draft_and_preserves_typed_results() {
         .expect("草稿探测");
     assert!(matches!(
         outcome,
-        ConnectionProbeOutcome::RequiresHostKeyTrust(_)
+        ConnectionProbeOutcome::Verified(ProbeVerificationLevel::SshAuthenticated)
     ));
     assert!(backend.saw_transient.load(Ordering::SeqCst));
-    assert!(backend.saw_confirmation.load(Ordering::SeqCst));
 
     hosts
         .save_host(builtin_remote_draft(id.clone()), None)
@@ -546,7 +530,9 @@ async fn builtin_probe_routes_draft_and_preserves_typed_results() {
             .test(&id, CancellationToken::new())
             .await
             .expect("保存主机探测"),
-        HostTestOutcome::Builtin(ConnectionProbeOutcome::RequiresHostKeyTrust(_))
+        HostTestOutcome::Builtin(ConnectionProbeOutcome::Verified(
+            ProbeVerificationLevel::SshAuthenticated
+        ))
     ));
     assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
     let cancelled = CancellationToken::new();

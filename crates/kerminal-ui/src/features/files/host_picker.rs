@@ -47,21 +47,12 @@ impl FilePaneSide {
     }
 }
 
-/// Root 负责消费事件并走既有 host key trust/connect 流程，FilesPane 不直接建连。
+/// Root 负责消费事件并走既有主机连接流程，FilesPane 不直接建连。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SftpHostRequested {
     pub host_id: HostId,
     pub side: FilePaneSide,
     pub generation: u64,
-}
-
-/// 紧凑文件栏请求 Root 按已验证的主机密钥流程信任该主机；不在 FilesPane 内建立连接。
-///
-/// @author kongweiguang
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SftpHostKeyTrustRequested {
-    pub request_id: u64,
-    pub host_id: HostId,
 }
 
 /// 请求 Root 打开现有连接管理创建流程，不在文件工作区直接编辑主机配置。

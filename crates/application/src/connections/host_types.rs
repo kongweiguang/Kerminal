@@ -919,7 +919,6 @@ impl HostTypeProvider for BuiltinHostProvider {
                 credential_changes: Vec::new(),
                 timeout: Duration::from_millis(host.connect_timeout_ms)
                     .clamp(MIN_PROBE_TIMEOUT, MAX_PROBE_TIMEOUT),
-                host_key_confirmation: None,
             },
             cancel,
         )

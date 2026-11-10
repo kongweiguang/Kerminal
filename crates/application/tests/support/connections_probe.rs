@@ -45,13 +45,12 @@ fn ssh_draft(mode: HostAuthenticationMode) -> HostDraft {
     }
 }
 
-/// 以 request 构造器减少测试关注点，默认不提供网络确认或凭据。
+/// 以 request 构造器减少测试关注点，默认不提供凭据。
 fn request(draft: HostDraft, changes: Vec<HostCredentialChange>) -> ConnectionProbeRequest {
     ConnectionProbeRequest {
         draft,
         credential_changes: changes,
         timeout: Duration::from_secs(10),
-        host_key_confirmation: None,
     }
 }
 
@@ -248,24 +247,4 @@ fn duplicate_credential_slot_is_rejected_before_probe() {
         ))
         .is_err()
     );
-}
-
-#[test]
-fn confirmation_is_only_allowed_for_network_ssh_protocols() {
-    let mut draft = ssh_draft(HostAuthenticationMode::Agent);
-    draft.protocol = RemoteProtocol::Rdp;
-    draft.endpoint = HostEndpoint {
-        host: "rdp.example.invalid".to_owned(),
-        port: 3389,
-        username: String::new(),
-    };
-    draft.authentication = None;
-    let confirmation = ProbeHostKeyConfirmation {
-        peer: HostKeyPeer::Target,
-        endpoint: draft.endpoint.clone(),
-        fingerprint_sha256: "SHA256:fixture".to_owned(),
-    };
-    let mut request = request(draft, Vec::new());
-    request.host_key_confirmation = Some(confirmation);
-    assert!(build_probe_target(request).is_err());
 }
