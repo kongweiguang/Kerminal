@@ -3007,48 +3007,76 @@ pub(super) fn render_workbench(
     {
         if let Some(connections_panel) = root.connections_panel.clone() {
             let focus_handle = root.connections_modal_focus_handle.clone();
-            let editor_size = crate::features::connections::host_editor_size(window);
-            let nested_editor_open = connections_panel.read(cx).nested_editor_open();
-            let surface = div()
-                .id("workbench-connections-modal-surface")
-                .w(editor_size.width)
-                .h(editor_size.height)
-                .min_w(px(0.))
-                .min_h(px(0.))
-                .occlude()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .rounded(theme.radius_dialog)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.panel)
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .child(connections_panel);
-            // 嵌套任务独占焦点陷阱；同时注册父子容器会让 Kit 的活跃陷阱选择产生歧义。
-            let surface = if nested_editor_open {
-                surface.into_any_element()
+            let editor_open = connections_panel.read(cx).editor_open();
+            if root.connection_prompt_modal_open && !editor_open {
+                // 指纹/凭据确认本身就是居中模态；没有编辑器时不再画主机面板背景，
+                // 否则确认卡背后会出现一块与任务无关的暗色空面板。
+                let overlay = connections_panel.update(cx, |panel, cx| {
+                    panel.render_root_confirmation_overlay(window, cx)
+                });
+                if let Some(overlay) = overlay {
+                    workbench = workbench.child(
+                        div()
+                            .id("workbench-connections-confirmation-overlay")
+                            .debug_selector(|| {
+                                "workbench-connections-confirmation-overlay".to_owned()
+                            })
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .child(
+                                div()
+                                    .id("workbench-connections-confirmation-trap")
+                                    .size_full()
+                                    .focus_trap("workbench-connections-focus-trap", &focus_handle)
+                                    .child(overlay),
+                            ),
+                    );
+                }
             } else {
-                surface
-                    .focus_trap("workbench-connections-focus-trap", &focus_handle)
-                    .into_any_element()
-            };
-            workbench = workbench.child(
-                div()
-                    .id("workbench-connections-modal-overlay")
-                    .absolute()
-                    .inset_0()
+                let editor_size = crate::features::connections::host_editor_size(window);
+                let nested_editor_open = connections_panel.read(cx).nested_editor_open();
+                let surface = div()
+                    .id("workbench-connections-modal-surface")
+                    .w(editor_size.width)
+                    .h(editor_size.height)
+                    .min_w(px(0.))
+                    .min_h(px(0.))
                     .occlude()
-                    .p_4()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(theme.dialog_scrim)
-                    .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
-                        root.request_close_connection_editor(window, cx);
-                    }))
-                    .child(surface),
-            );
+                    .flex_col()
+                    .overflow_hidden()
+                    .rounded(theme.radius_dialog)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.panel)
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(connections_panel);
+                // 嵌套任务独占焦点陷阱；同时注册父子容器会让 Kit 的活跃陷阱选择产生歧义。
+                let surface = if nested_editor_open {
+                    surface.into_any_element()
+                } else {
+                    surface
+                        .focus_trap("workbench-connections-focus-trap", &focus_handle)
+                        .into_any_element()
+                };
+                workbench = workbench.child(
+                    div()
+                        .id("workbench-connections-modal-overlay")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .p_4()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(theme.dialog_scrim)
+                        .on_click(cx.listener(|root, _: &ClickEvent, window, cx| {
+                            root.request_close_connection_editor(window, cx);
+                        }))
+                        .child(surface),
+                );
+            }
         }
     } else if root.root_confirmation_owner.is_none()
         && snippet_editor_open

@@ -28,6 +28,55 @@ use super::{
     trust::render_trust_confirmation,
 };
 
+impl ConnectionsPanel {
+    /// 无编辑器时 Root 只需要确认层本身：指纹、外部凭据和删除确认都是独立居中模态，
+    /// 再画一整块空主机面板会在弹层背后留下无意义的暗色大框。
+    /// 层顺序与面板内 Render 保持一致，最外层拦截点击并保持焦点陷阱稳定。
+    /// @author kongweiguang
+    pub(crate) fn render_root_confirmation_overlay(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = ThemeTokens::current(window, cx);
+        let mut layers = Vec::new();
+        if let Some(pending_delete) = self.local_hosts.pending_delete.clone() {
+            layers.push(render_local_host_deletion_confirmation(
+                self,
+                &pending_delete,
+                theme,
+                cx,
+            ));
+        }
+        if let Some(trust) = render_trust_confirmation(
+            self.pending_trust.as_ref(),
+            self.recovery.mode,
+            theme,
+            window,
+            cx,
+        ) {
+            layers.push(trust.into_any_element());
+        }
+        if let Some(password) = render_external_password_prompt(self, theme, cx) {
+            layers.push(password.into_any_element());
+        }
+        if let Some(username) = render_external_username_prompt(self, theme, cx) {
+            layers.push(username.into_any_element());
+        }
+        (!layers.is_empty()).then(|| {
+            div()
+                .id("workbench-connections-confirmation-layer")
+                .debug_selector(|| "workbench-connections-confirmation-layer".to_owned())
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .children(layers)
+                .into_any_element()
+        })
+    }
+}
+
 impl Render for ConnectionsPanel {
     /// 编辑时表单占用独立工作区；普通模式不绘制远端主机详情页，目录选择留在左侧。
     /// 无编辑器时的未知本地主机写入提示挂在面板层，避免切换选择后丢失唯一核对入口。
