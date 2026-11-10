@@ -66,8 +66,29 @@ namespace Kerminal.WebViewProbe {
         }
         [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode, SetLastError=true)]
         private static extern System.IntPtr CreateJobObjectW(System.IntPtr attributes, string name);
+        // Windows 的指针对齐必须与 JOBOBJECT_EXTENDED_LIMIT_INFORMATION 一致，避免仅设置了表面标志。
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct BasicLimits {
+            public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public System.UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public System.UIntPtr Affinity;
+            public uint PriorityClass, SchedulingClass;
+        }
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct IoCounters {
+            public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+            public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+        }
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct ExtendedLimits {
+            public BasicLimits BasicLimitInformation;
+            public IoCounters IoInfo;
+            public System.UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+        }
         [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
-        private static extern bool AssignProcessToJobObject(System.IntPtr job, System.IntPtr process);
+        private static extern bool SetInformationJobObject(System.IntPtr job, int informationClass, ref ExtendedLimits information, uint length);
         [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
         private static extern bool QueryInformationJobObject(System.IntPtr job, int informationClass, out Accounting information, uint length, out uint written);
         [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
@@ -77,16 +98,21 @@ namespace Kerminal.WebViewProbe {
         [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
         private static extern bool CloseHandle(System.IntPtr handle);
 
-        // 在挂起的首线程运行前完成绑定，使候选创建的所有继承子进程进入同一个 Job。
-        internal static System.IntPtr CreateAndAssign(System.IntPtr process) {
+        // Job 不可继承；创建子进程前设置关闭即终止，配置失败时必须关闭句柄并拒绝启动。
+        internal static System.IntPtr Create() {
             var job=CreateJobObjectW(System.IntPtr.Zero,null);
             if(job==System.IntPtr.Zero) throw new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error(),"创建验收 Job 失败");
-            if(!AssignProcessToJobObject(job,process)) {
-                int error=System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-                if(!CloseHandle(job)) throw new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error(),"验收 Job 绑定失败且句柄未关闭");
-                throw new System.ComponentModel.Win32Exception(error,"候选无法绑定验收 Job");
+            try {
+                var limits=new ExtendedLimits();
+                limits.BasicLimitInformation.LimitFlags=0x00002000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                if(!SetInformationJobObject(job,9,ref limits,(uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(ExtendedLimits))))
+                    throw new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error(),"配置验收 Job 关闭即终止失败");
+                return job;
+            } catch(System.Exception setupError) {
+                if(!CloseHandle(job))
+                    throw new System.AggregateException("验收 Job 配置失败且句柄未关闭",setupError,new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error()));
+                throw;
             }
-            return job;
         }
         // 使用 Job 内核计数而不是重新打开 PID，能够检查已退出父进程留下的后代。
         internal static JobSnapshot Query(System.IntPtr job) {
@@ -100,11 +126,14 @@ namespace Kerminal.WebViewProbe {
         internal static void Terminate(System.IntPtr job,uint code) {
             if(!TerminateJobObject(job,code)) throw new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error(),"终止验收 Job 失败");
         }
-        // 启动失败时仍尝试终止与关闭，并把错误交给调用方而非冒充成功。
-        internal static string Abort(System.IntPtr job) {
-            bool killed=TerminateJobObject(job,1); int killError=System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-            bool closed=CloseHandle(job); int closeError=System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-            return killed && closed ? null : "启动失败后的 Job 清理失败：terminate="+killError+", close="+closeError;
+        // 两步必须独立尝试并保留各自错误；关闭失败也不能遮蔽此前的启动异常。
+        internal static void Abort(System.IntPtr job,System.Collections.Generic.List<System.Exception> errors) {
+            try {
+                if(!TerminateJobObject(job,1)) errors.Add(new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error(),"终止启动失败的验收 Job 失败"));
+            } catch(System.Exception error) { errors.Add(new System.InvalidOperationException("终止启动失败的验收 Job 出错",error)); }
+            try {
+                if(!CloseHandle(job)) errors.Add(new System.ComponentModel.Win32Exception(System.Runtime.InteropServices.Marshal.GetLastWin32Error(),"关闭启动失败的验收 Job 失败"));
+            } catch(System.Exception error) { errors.Add(new System.InvalidOperationException("关闭启动失败的验收 Job 出错",error)); }
         }
     }
 }
@@ -165,6 +194,7 @@ if (-not ('Kerminal.WebViewProbe.NativeDesktopLauncher' -as [type])) {
     $source = Replace-WebViewLauncherPart $source 'private static extern IntPtr CreateDesktop(string desktopName, IntPtr device, IntPtr devmode, uint flags, uint desiredAccess, IntPtr securityAttributes);' 'private static extern IntPtr OpenDesktop(string desktopName, uint flags, bool inherit, uint desiredAccess);'
     $source = Replace-WebViewLauncherPart $source 'CreateDesktop(desktopName, IntPtr.Zero, IntPtr.Zero, 0, desktopAccess, IntPtr.Zero)' 'OpenDesktop(desktopName, 0, false, desktopAccess)'
     $source = Replace-WebViewLauncherPart $source 'startupInfo.StartupInfo.Flags = StartfUseStdHandles;' 'startupInfo.StartupInfo.Flags = StartfUseStdHandles | 1; startupInfo.StartupInfo.ShowWindow = 4;'
+    $source = Replace-WebViewLauncherPart $source '// Keeps the acceptance child on its private desktop and forwards one validated logical viewport to native capture.' ('// 启动器先取得本轮资源、完成局部清理后才转交 owner；失败时保留主错误和全部清理错误。' + "`n" + '// Keeps the acceptance child on its private desktop and forwards one validated logical viewport to native capture.')
     $source = Replace-WebViewLauncherPart $source 'private IntPtr _processHandle;' 'private IntPtr _processHandle; private IntPtr _jobHandle;'
     $source = Replace-WebViewLauncherPart $source 'internal NativeDesktopProcess(IntPtr desktopHandle, IntPtr processHandle, int processId, string desktopName)' 'internal NativeDesktopProcess(IntPtr desktopHandle, IntPtr processHandle, int processId, string desktopName, IntPtr jobHandle)'
     $source = Replace-WebViewLauncherPart $source '_processHandle = processHandle;' '_processHandle = processHandle; _jobHandle = jobHandle;'
@@ -174,16 +204,199 @@ if (-not ('Kerminal.WebViewProbe.NativeDesktopLauncher' -as [type])) {
         // 只终止与候选首线程一起绑定的进程集合。
         public void TerminateJob(uint code) { ProbeJob.Terminate(_jobHandle, code); }
 '@
-    $source = Replace-WebViewLauncherPart $source '// Keeps the private desktop alive until its only child process has exited, then closes both owned handles.' ($jobMethods + "`n" + '// Keeps the private desktop alive until its only child process has exited, then closes both owned handles.')
-    $source = Replace-WebViewLauncherPart $source 'throw new InvalidOperationException("The private desktop cannot close while its acceptance process is running.");' 'throw new InvalidOperationException("The private desktop cannot close while its acceptance process is running."); if (_jobHandle != IntPtr.Zero && ProbeJob.Query(_jobHandle).ActiveProcesses != 0) throw new InvalidOperationException("The acceptance job still has live processes.");'
-    $source = Replace-WebViewLauncherPart $source '_disposed = _processHandle == IntPtr.Zero && _desktopHandle == IntPtr.Zero;' 'if (_jobHandle != IntPtr.Zero) { if (!NativeDesktopLauncher.CloseHandle(_jobHandle)) { if (firstError == 0) firstError = Marshal.GetLastWin32Error(); } else _jobHandle = IntPtr.Zero; } _disposed = _processHandle == IntPtr.Zero && _desktopHandle == IntPtr.Zero && _jobHandle == IntPtr.Zero;'
+    $source = Replace-WebViewLauncherPart $source '// Keeps the private desktop alive until its only child process has exited, then closes both owned handles.' ($jobMethods + "`n" + '// 正常流程先核验后代归零；异常释放仍关闭 Job 并报告错误。')
+    $oldDispose = @'
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            if (_processHandle != IntPtr.Zero && !WaitForExit(0))
+                throw new InvalidOperationException("The private desktop cannot close while its acceptance process is running.");
+
+            int firstError = 0;
+            if (_processHandle != IntPtr.Zero)
+            {
+                if (!NativeDesktopLauncher.CloseHandle(_processHandle))
+                    firstError = Marshal.GetLastWin32Error();
+                else
+                    _processHandle = IntPtr.Zero;
+            }
+            if (_desktopHandle != IntPtr.Zero)
+            {
+                DesktopClosed = NativeDesktopLauncher.CloseDesktop(_desktopHandle);
+                if (!DesktopClosed && firstError == 0)
+                    firstError = Marshal.GetLastWin32Error();
+                if (DesktopClosed)
+                    _desktopHandle = IntPtr.Zero;
+            }
+            _disposed = _processHandle == IntPtr.Zero && _desktopHandle == IntPtr.Zero;
+            if (firstError != 0)
+                throw new Win32Exception(firstError, "Closing the isolated acceptance process or desktop handle failed.");
+        }
+'@
+    $newDispose = @'
+        // 无论查询或正常退出校验是否失败，都先关闭独占 Job 触发最后兜底，不能泄漏给继续运行的 runner。
+        public void Dispose()
+        {
+            if (_disposed) return;
+            var errors = new System.Collections.Generic.List<Exception>();
+            try {
+                if (_processHandle != IntPtr.Zero && !WaitForExit(0))
+                    errors.Add(new InvalidOperationException("The acceptance process was still running during disposal."));
+                if (_jobHandle != IntPtr.Zero && ProbeJob.Query(_jobHandle).ActiveProcesses != 0)
+                    errors.Add(new InvalidOperationException("The acceptance job still had live processes during disposal."));
+            } catch (Exception error) { errors.Add(error); }
+            bool jobClosed = _jobHandle == IntPtr.Zero;
+            if (_jobHandle != IntPtr.Zero) {
+                if (!NativeDesktopLauncher.CloseHandle(_jobHandle))
+                    errors.Add(new Win32Exception(Marshal.GetLastWin32Error(), "Closing the acceptance job failed."));
+                else { _jobHandle = IntPtr.Zero; jobClosed = true; }
+            }
+            if (_processHandle != IntPtr.Zero) {
+                if (jobClosed) {
+                    try { if (!WaitForExit(10000)) errors.Add(new InvalidOperationException("The acceptance process did not exit after closing its job.")); }
+                    catch (Exception error) { errors.Add(error); }
+                }
+                if (!NativeDesktopLauncher.CloseHandle(_processHandle))
+                    errors.Add(new Win32Exception(Marshal.GetLastWin32Error(), "Closing the acceptance process failed."));
+                else _processHandle = IntPtr.Zero;
+            }
+            if (_desktopHandle != IntPtr.Zero) {
+                DesktopClosed = NativeDesktopLauncher.CloseDesktop(_desktopHandle);
+                if (!DesktopClosed) errors.Add(new Win32Exception(Marshal.GetLastWin32Error(), "Closing the acceptance desktop failed."));
+                else _desktopHandle = IntPtr.Zero;
+            }
+            _disposed = _processHandle == IntPtr.Zero && _desktopHandle == IntPtr.Zero && _jobHandle == IntPtr.Zero;
+            if (errors.Count == 1) throw errors[0];
+            if (errors.Count > 1) throw new AggregateException("Acceptance cleanup failed.", errors);
+        }
+'@
+    # 被抽取的设置启动器和本脚本可能使用不同换行，先统一后再做唯一性校验。
+    $source = $source.Replace("`r`n", "`n")
+    $source = Replace-WebViewLauncherPart $source $oldDispose.Replace("`r`n", "`n") $newDispose
+    # Job 放在 CreateProcess 的扩展属性中原子加入，避免 runner 在创建后、绑定前被强杀时留下挂起进程。
+    $source = Replace-WebViewLauncherPart $source 'private static readonly IntPtr ProcThreadAttributeHandleList = new IntPtr(0x00020002);' 'private static readonly IntPtr ProcThreadAttributeHandleList = new IntPtr(0x00020002); private static readonly IntPtr ProcThreadAttributeJobList = new IntPtr(0x0002000D);'
+    $source = Replace-WebViewLauncherPart $source 'IntPtr handles = IntPtr.Zero;' 'IntPtr handles = IntPtr.Zero; IntPtr jobList = IntPtr.Zero;'
+    $source = Replace-WebViewLauncherPart $source 'InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attributeSize)' 'InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref attributeSize)'
+    $source = Replace-WebViewLauncherPart $source 'InitializeProcThreadAttributeList(attributeList, 1, 0, ref attributeSize)' 'InitializeProcThreadAttributeList(attributeList, 2, 0, ref attributeSize)'
+    $source = Replace-WebViewLauncherPart $source 'attributeListInitialized = true;' 'attributeListInitialized = true; job = ProbeJob.Create(); jobList = Marshal.AllocHGlobal(IntPtr.Size); Marshal.WriteIntPtr(jobList, job); if (!UpdateProcThreadAttribute(attributeList, 0, ProcThreadAttributeJobList, jobList, new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception(Marshal.GetLastWin32Error(), "无法将验收 Job 加入进程创建属性");'
+    $source = Replace-WebViewLauncherPart $source 'if (handles != IntPtr.Zero)' 'if (jobList != IntPtr.Zero) Marshal.FreeHGlobal(jobList); if (handles != IntPtr.Zero)'
     $source = Replace-WebViewLauncherPart $source 'ProcessInformation processInformation = new ProcessInformation();' 'ProcessInformation processInformation = new ProcessInformation(); IntPtr job = IntPtr.Zero;'
+    $source = Replace-WebViewLauncherPart $source 'bool attributeListInitialized = false;' 'bool attributeListInitialized = false; NativeDesktopProcess launchResult = null; Exception launchFailure = null; var cleanupErrors = new System.Collections.Generic.List<Exception>();'
     $source = Replace-WebViewLauncherPart $source 'CreateNoWindow | ExtendedStartupInfoPresent | CreateUnicodeEnvironment, environment' 'CreateNoWindow | ExtendedStartupInfoPresent | CreateUnicodeEnvironment | 0x00000004, environment'
-    $source = Replace-WebViewLauncherPart $source 'processInformation = info;' 'processInformation = info; job = ProbeJob.CreateAndAssign(processInformation.Process); if (ProbeJob.ResumeThread(processInformation.Thread) == uint.MaxValue) throw new Win32Exception(Marshal.GetLastWin32Error(), "恢复验收进程失败");'
-    $source = Replace-WebViewLauncherPart $source 'new NativeDesktopProcess(desktop, processInformation.Process, unchecked((int)processInformation.ProcessId), desktopName)' 'new NativeDesktopProcess(desktop, processInformation.Process, unchecked((int)processInformation.ProcessId), desktopName, job)'
-    $source = Replace-WebViewLauncherPart $source 'desktopTransferred = true;' 'desktopTransferred = true; job = IntPtr.Zero;'
-    $source = Replace-WebViewLauncherPart $source 'if (!desktopTransferred)' 'string jobFailure = job == IntPtr.Zero ? null : ProbeJob.Abort(job); if (!desktopTransferred)'
-    $source = Replace-WebViewLauncherPart $source 'CloseDesktop(desktop);' 'CloseDesktop(desktop); if (jobFailure != null) throw new InvalidOperationException(jobFailure);'
+    $source = Replace-WebViewLauncherPart $source 'processInformation = info;' 'processInformation = info; if (ProbeJob.ResumeThread(processInformation.Thread) == uint.MaxValue) throw new Win32Exception(Marshal.GetLastWin32Error(), "恢复验收进程失败");'
+    $oldSuccess = @'
+                NativeDesktopProcess result = new NativeDesktopProcess(desktop, processInformation.Process, unchecked((int)processInformation.ProcessId), desktopName);
+                desktop = IntPtr.Zero;
+                processInformation.Process = IntPtr.Zero;
+                desktopTransferred = true;
+                return result;
+'@
+    $newSuccess = @'
+                launchResult = new NativeDesktopProcess(desktop, processInformation.Process, unchecked((int)processInformation.ProcessId), desktopName, job);
+                desktopTransferred = true;
+'@
+    $source = Replace-WebViewLauncherPart $source $oldSuccess.Replace("`r`n", "`n") $newSuccess
+    # 在交出 owner 之前完成所有局部资源清理；任何步骤出错都仍回收本轮 Job、进程和桌面。
+    $oldFinally = @'
+            finally
+            {
+                if (attributeListInitialized)
+                    DeleteProcThreadAttributeList(attributeList);
+                if (jobList != IntPtr.Zero) Marshal.FreeHGlobal(jobList); if (handles != IntPtr.Zero)
+                    Marshal.FreeHGlobal(handles);
+                if (desktopNamePointer != IntPtr.Zero)
+                    Marshal.FreeHGlobal(desktopNamePointer);
+                if (environment != IntPtr.Zero)
+                    Marshal.FreeHGlobal(environment);
+                CloseQuietly(stdin);
+                CloseQuietly(stdout);
+                CloseQuietly(stderr);
+                if (!desktopTransferred)
+                {
+                    if (processInformation.Thread != IntPtr.Zero)
+                        CloseQuietly(processInformation.Thread);
+                    if (processInformation.Process != IntPtr.Zero)
+                    {
+                        TerminateProcess(processInformation.Process, 1);
+                        WaitForSingleObject(processInformation.Process, 5000);
+                        CloseQuietly(processInformation.Process);
+                    }
+                    if (desktop != IntPtr.Zero)
+                        CloseDesktop(desktop);
+                }
+            }
+'@
+    $newFinally = @'
+            catch (Exception error) { launchFailure = error; }
+            finally
+            {
+                try { if (attributeListInitialized) DeleteProcThreadAttributeList(attributeList); }
+                catch (Exception error) { cleanupErrors.Add(new InvalidOperationException("释放启动属性列表失败", error)); }
+                try { if (jobList != IntPtr.Zero) Marshal.FreeHGlobal(jobList); }
+                catch (Exception error) { cleanupErrors.Add(new InvalidOperationException("释放 Job 属性缓冲区失败", error)); }
+                try { if (handles != IntPtr.Zero) Marshal.FreeHGlobal(handles); }
+                catch (Exception error) { cleanupErrors.Add(new InvalidOperationException("释放句柄属性缓冲区失败", error)); }
+                try { if (desktopNamePointer != IntPtr.Zero) Marshal.FreeHGlobal(desktopNamePointer); }
+                catch (Exception error) { cleanupErrors.Add(new InvalidOperationException("释放桌面名称缓冲区失败", error)); }
+                try { if (environment != IntPtr.Zero) Marshal.FreeHGlobal(environment); }
+                catch (Exception error) { cleanupErrors.Add(new InvalidOperationException("释放环境块失败", error)); }
+                CloseStartupHandle(stdin, "标准输入", cleanupErrors);
+                CloseStartupHandle(stdout, "标准输出", cleanupErrors);
+                CloseStartupHandle(stderr, "标准错误", cleanupErrors);
+                if (!desktopTransferred || launchFailure != null || cleanupErrors.Count != 0)
+                {
+                    if (job != IntPtr.Zero) {
+                        try { ProbeJob.Abort(job, cleanupErrors); }
+                        catch (Exception error) { cleanupErrors.Add(new InvalidOperationException("回收启动失败的验收 Job 出错", error)); }
+                    }
+                    CloseStartupHandle(processInformation.Thread, "进程线程", cleanupErrors);
+                    if (processInformation.Process != IntPtr.Zero)
+                    {
+                        bool stopped = false;
+                        try {
+                            uint wait = WaitForSingleObject(processInformation.Process, 5000);
+                            stopped = wait == WaitObject0;
+                            if (wait == WaitTimeout) cleanupErrors.Add(new TimeoutException("等待启动失败进程退出超时"));
+                            else if (wait == uint.MaxValue) cleanupErrors.Add(new Win32Exception(Marshal.GetLastWin32Error(), "等待启动失败进程失败"));
+                            else if (wait != WaitObject0) cleanupErrors.Add(new InvalidOperationException("等待启动失败进程返回未知状态: " + wait));
+                        } catch (Exception error) { cleanupErrors.Add(new InvalidOperationException("等待启动失败进程出错", error)); }
+                        if (!stopped) {
+                            try {
+                                if (!TerminateProcess(processInformation.Process, 1)) cleanupErrors.Add(new Win32Exception(Marshal.GetLastWin32Error(), "终止启动失败进程失败"));
+                            } catch (Exception error) { cleanupErrors.Add(new InvalidOperationException("终止启动失败进程出错", error)); }
+                            try {
+                                uint wait = WaitForSingleObject(processInformation.Process, 5000);
+                                if (wait == WaitTimeout) cleanupErrors.Add(new TimeoutException("再次等待启动失败进程退出超时"));
+                                else if (wait == uint.MaxValue) cleanupErrors.Add(new Win32Exception(Marshal.GetLastWin32Error(), "再次等待启动失败进程失败"));
+                                else if (wait != WaitObject0) cleanupErrors.Add(new InvalidOperationException("再次等待启动失败进程返回未知状态: " + wait));
+                            } catch (Exception error) { cleanupErrors.Add(new InvalidOperationException("再次等待启动失败进程出错", error)); }
+                        }
+                        CloseStartupHandle(processInformation.Process, "进程", cleanupErrors);
+                    }
+                    try {
+                        if (desktop != IntPtr.Zero && !CloseDesktop(desktop)) cleanupErrors.Add(new Win32Exception(Marshal.GetLastWin32Error(), "关闭启动失败的验收桌面失败"));
+                    } catch (Exception error) { cleanupErrors.Add(new InvalidOperationException("关闭启动失败的验收桌面出错", error)); }
+                }
+            }
+            if (launchFailure != null) cleanupErrors.Insert(0, launchFailure);
+            if (cleanupErrors.Count == 1) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cleanupErrors[0]).Throw();
+            if (cleanupErrors.Count > 1) throw new AggregateException("验收启动或资源清理失败", cleanupErrors);
+            return launchResult;
+'@
+    $source = Replace-WebViewLauncherPart $source $oldFinally.Replace("`r`n", "`n") $newFinally
+    $startupHandleHelper = @'
+        // 每个句柄独立关闭并保留错误，使一个失败不妨碍回收后续资源。
+        private static void CloseStartupHandle(IntPtr handle, string description, System.Collections.Generic.List<Exception> errors)
+        {
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return;
+            try {
+                if (!CloseHandle(handle)) errors.Add(new Win32Exception(Marshal.GetLastWin32Error(), "关闭启动期间的" + description + "句柄失败"));
+            } catch (Exception error) { errors.Add(new InvalidOperationException("关闭启动期间的" + description + "句柄出错", error)); }
+        }
+
+'@
+    $source = Replace-WebViewLauncherPart $source '// Closes optional resources during partial-launch cleanup without masking the original Win32 error.' ($startupHandleHelper + '// Closes optional resources during partial-launch cleanup without masking the original Win32 error.')
     Add-Type -TypeDefinition ($source + "`n" + $jobSource) -Language CSharp
 }
 if (-not ('Kerminal.WebViewProbe.Capture' -as [type])) { Add-Type -TypeDefinition $captureSource -Language CSharp }

@@ -248,6 +248,16 @@ pub struct CompiledKeybindings {
 }
 
 impl CompiledKeybindings {
+    /// Root 在同一解析表追加已验证的插件动作，保留统一焦点、IME 和组合键门禁。
+    pub(crate) fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
+    /// 追加动作前由窗口检查与用户绑定的冲突；不注册到抢先于终端输入的全局 keymap。
+    pub(crate) fn extend_bindings(&mut self, bindings: Vec<KeyBinding>) {
+        self.keymap.add_bindings(bindings);
+    }
+
     /// 使用 GPUI parser 构造当前平台的单一绑定快照，并统一校验冲突。
     ///
     /// @author kongweiguang

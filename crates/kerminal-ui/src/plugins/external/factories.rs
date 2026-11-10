@@ -6,6 +6,7 @@ use super::{
     renderer::{NativeRenderer, NativeRendererConfig},
     runtime::AsyncViewRuntime,
 };
+use crate::plugins::external_webview::renderer::{WebViewRenderer, WebViewRendererConfig};
 use crate::{
     PluginUiBridge, PluginUiRegistration,
     plugins::{
@@ -27,7 +28,7 @@ use kerminal_application::{
 use kerminal_plugin_protocol::{
     TabContribution, ToolContribution, ToolScope as ProtocolToolScope, native::NativeView,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{sync::Arc, time::Instant};
 
 /// 工厂只持有共享应用端口，视图和草稿由各自的窗口线程实例拥有。
@@ -72,6 +73,131 @@ pub(crate) fn native_view(prepared: &PreparedPlugin, id: &str) -> AppResult<Arc<
     view.validate()
         .map_err(|_| AppError::invalid("插件原生视图无效"))?;
     Ok(Arc::new(view))
+}
+
+/// 正式贡献只接受声明与资源一致的视图，网页不会经过原生 JSON 解析器。
+fn validate_view(prepared: &PreparedPlugin, id: &str) -> AppResult<()> {
+    match prepared.package.manifest.views.get(id) {
+        Some(kerminal_plugin_protocol::ViewDefinition::Webview { .. }) => {
+            crate::plugins::webview::PluginWebViewResourceDocument::from_prepared(
+                prepared,
+                id,
+                "validation".into(),
+            )
+            .map(|_| ())
+        }
+        Some(kerminal_plugin_protocol::ViewDefinition::Native { .. }) => {
+            native_view(prepared, id).map(|_| ())
+        }
+        None => Err(AppError::not_found("插件视图")),
+    }
+}
+
+/// 两种整块 renderer 共用工厂生命周期，表单仍明确只接收原生视图。
+struct RendererConfig {
+    prepared: Arc<PreparedPlugin>,
+    identity: PluginViewIdentity,
+    scope: Value,
+    saved_state: Option<PluginViewSavedState>,
+    runtime: Arc<dyn AsyncViewRuntime>,
+    executor: ApplicationTaskExecutor,
+    locale: String,
+    content_identity: Option<ContentInstanceIdentity>,
+}
+
+enum ExternalRenderer {
+    Native(Entity<NativeRenderer>),
+    WebView(Entity<WebViewRenderer>),
+}
+
+impl ExternalRenderer {
+    /// 分派依据当前确认资源快照，开发重载后新实例不会使用过期视图。
+    fn mount(config: RendererConfig, window: &mut Window, cx: &mut App) -> AppResult<Self> {
+        validate_view(&config.prepared, &config.identity.view)?;
+        if matches!(
+            config
+                .prepared
+                .package
+                .manifest
+                .views
+                .get(&config.identity.view),
+            Some(kerminal_plugin_protocol::ViewDefinition::Webview { .. })
+        ) {
+            WebViewRenderer::mount(
+                WebViewRendererConfig {
+                    prepared: config.prepared,
+                    identity: config.identity,
+                    scope: config.scope,
+                    saved_state: config.saved_state,
+                    runtime: config.runtime,
+                    executor: config.executor,
+                    locale: config.locale,
+                    content_identity: config.content_identity,
+                },
+                window,
+                cx,
+            )
+            .map(Self::WebView)
+        } else {
+            let view = native_view(&config.prepared, &config.identity.view)?;
+            NativeRenderer::mount(
+                NativeRendererConfig {
+                    prepared: config.prepared,
+                    view,
+                    identity: config.identity,
+                    scope: config.scope,
+                    saved_state: config.saved_state,
+                    initial_data: None,
+                    runtime: config.runtime,
+                    executor: config.executor,
+                    locale: config.locale,
+                    content_identity: config.content_identity,
+                    embedded_form: None,
+                },
+                window,
+                cx,
+            )
+            .map(Self::Native)
+        }
+    }
+
+    /// 挂载的实体保持自身类型，原有原生验收与网页子窗都能读到真实实体。
+    fn view(&self) -> AnyView {
+        match self {
+            Self::Native(renderer) => renderer.clone().into(),
+            Self::WebView(renderer) => renderer.clone().into(),
+        }
+    }
+
+    /// 各 renderer 独立持有显隐状态，宿主不需要了解页面或原生控件细节。
+    fn visibility_changed(&self, visible: bool, active: bool, cx: &mut App) {
+        match self {
+            Self::Native(renderer) => renderer.update(cx, |renderer, cx| {
+                renderer.visibility_changed(visible, active, cx)
+            }),
+            Self::WebView(renderer) => renderer.update(cx, |renderer, cx| {
+                renderer.visibility_changed(visible, active, cx)
+            }),
+        }
+    }
+
+    /// 原生标签保存宿主草稿信封；网页保持插件原始状态，窗口线程不等待进程。
+    fn cached_state(&self, cx: &App) -> AppResult<Option<PluginViewSavedState>> {
+        match self {
+            Self::Native(renderer) => renderer.read(cx).content_saved_state(),
+            Self::WebView(renderer) => renderer.read(cx).cached_state(),
+        }
+    }
+
+    /// 关闭传递同一绝对截止时间，失败时由内容宿主继续持有实例供恢复。
+    fn close(&self, deadline: Instant, cx: &mut App) -> super::runtime::RuntimeFuture<()> {
+        match self {
+            Self::Native(renderer) => renderer.read(cx).close(deadline),
+            Self::WebView(renderer) => {
+                renderer.update(cx, |renderer, cx| renderer.begin_close(deadline, cx))
+            }
+        }
+    }
 }
 
 /// 运行实例采用随机身份；页面范围和进程代次不能复用作实例身份。
@@ -142,7 +268,7 @@ impl ExternalToolFactory {
         {
             return Err(AppError::invalid("插件工具贡献不属于清单"));
         }
-        native_view(&prepared, &contribution.view)?;
+        validate_view(&prepared, &contribution.view)?;
         let id = format!("{}/{}", prepared.id.as_str(), contribution.id);
         Ok(Self {
             prepared,
@@ -190,23 +316,19 @@ impl ToolFactory for ExternalToolFactory {
             .runtime
             .prepared_plugin(&self.prepared.id)?
             .unwrap_or_else(|| self.prepared.clone());
-        let view = native_view(&prepared, &self.contribution.view)?;
         let identity = identity(&prepared, &self.contribution.view);
         let registration = register(&self.services, &identity)?;
         let scope = json!({"kind":"tool","tool":self.contribution.id,"tab":context.active_tab().map(|tab| tab.as_str()),"host":context.selected_host().map(|host| host.as_str())});
-        let renderer = NativeRenderer::mount(
-            NativeRendererConfig {
+        let renderer = ExternalRenderer::mount(
+            RendererConfig {
                 prepared,
-                view,
                 identity,
                 scope,
                 saved_state: None,
-                initial_data: None,
                 runtime: self.services.runtime.clone(),
                 executor: self.services.executor.clone(),
                 locale: self.services.locale.clone(),
                 content_identity: None,
-                embedded_form: None,
             },
             window,
             cx,
@@ -219,24 +341,23 @@ impl ToolFactory for ExternalToolFactory {
 }
 
 struct ExternalToolInstance {
-    renderer: Entity<NativeRenderer>,
+    renderer: ExternalRenderer,
     _registration: Option<PluginUiRegistration>,
 }
 impl ToolInstance for ExternalToolInstance {
     /// 每帧复用实体，侧栏切换不重建输入和分页缓存。
     fn view(&self) -> AnyView {
-        self.renderer.clone().into()
+        self.renderer.view()
     }
     /// 宿主提供的显隐变化只通知该工具实例。
     fn visibility_changed(&mut self, visible: bool, active: bool, cx: &mut App) -> AppResult<()> {
-        self.renderer.update(cx, |renderer, cx| {
-            renderer.visibility_changed(visible, active && visible, cx)
-        });
+        self.renderer
+            .visibility_changed(visible, active && visible, cx);
         Ok(())
     }
     /// 关闭使用宿主提供的同一个绝对截止时间。
     fn begin_close(&mut self, deadline: Instant, cx: &mut App) -> AppResult<ToolCloseFuture> {
-        Ok(self.renderer.read(cx).close(deadline))
+        Ok(self.renderer.close(deadline, cx))
     }
 }
 
@@ -263,7 +384,7 @@ impl ExternalContentFactory {
         {
             return Err(AppError::invalid("插件标签贡献不属于清单"));
         }
-        native_view(&prepared, &contribution.view)?;
+        validate_view(&prepared, &contribution.view)?;
         let id = format!("{}/{}", prepared.id.as_str(), contribution.id);
         Ok(Self {
             prepared,
@@ -273,7 +394,7 @@ impl ExternalContentFactory {
         })
     }
 
-    /// 原生宿主独占零版本草稿信封，内部插件版本仍须匹配声明；未知材料留给恢复界面。
+    /// 零版本仅为原生宿主草稿信封；先验证内部插件版本，网页仍只接受声明版本。
     fn mount(
         &self,
         scope: &ContentScope,
@@ -285,8 +406,18 @@ impl ExternalContentFactory {
         let ContentScope::Tab(tab) = scope else {
             return Err(AppError::invalid("插件标签需要标签作用域"));
         };
+        let prepared = self
+            .services
+            .runtime
+            .prepared_plugin(&self.prepared.id)?
+            .unwrap_or_else(|| self.prepared.clone());
         if let Some(state) = state {
-            if state.version == 0 {
+            let native_envelope = state.version == 0
+                && matches!(
+                    prepared.package.manifest.views.get(&self.contribution.view),
+                    Some(kerminal_plugin_protocol::ViewDefinition::Native { .. })
+                );
+            if native_envelope {
                 super::renderer::validate_native_content_state(
                     &state.value,
                     &self.contribution.view,
@@ -296,31 +427,22 @@ impl ExternalContentFactory {
                 return Err(AppError::unsupported("插件标签状态版本不受支持"));
             }
         }
-        let prepared = self
-            .services
-            .runtime
-            .prepared_plugin(&self.prepared.id)?
-            .unwrap_or_else(|| self.prepared.clone());
-        let view = native_view(&prepared, &self.contribution.view)?;
         let identity = identity(&prepared, &self.contribution.view);
         let registration = register(&self.services, &identity)?;
         let saved_state = state.map(|state| PluginViewSavedState {
             state_version: state.version,
             state: state.value.clone(),
         });
-        let renderer = NativeRenderer::mount(
-            NativeRendererConfig {
+        let renderer = ExternalRenderer::mount(
+            RendererConfig {
                 prepared,
-                view,
                 identity,
                 scope: json!({"kind":"tab","tab":tab.as_str()}),
                 saved_state,
-                initial_data: None,
                 runtime: self.services.runtime.clone(),
                 executor: self.services.executor.clone(),
                 locale: self.services.locale.clone(),
                 content_identity,
-                embedded_form: None,
             },
             window,
             cx,
@@ -340,9 +462,18 @@ impl ContentFactory for ExternalContentFactory {
     fn supports(&self, kind: ContentKind) -> bool {
         kind == ContentKind::Tab
     }
-    /// 零版本只保留给原生宿主信封，挂载时继续校验信封格式及内部插件版本。
+    /// 原生宿主信封在 mount 再校验，网页不能借零版本跳过清单约束。
     fn supports_state_version(&self, version: u32) -> bool {
-        version == 0 || version == self.contribution.state_version
+        version == self.contribution.state_version
+            || (version == 0
+                && matches!(
+                    self.prepared
+                        .package
+                        .manifest
+                        .views
+                        .get(&self.contribution.view),
+                    Some(kerminal_plugin_protocol::ViewDefinition::Native { .. })
+                ))
     }
     /// 兼容没有变化通知需求的直接调用方，仍保持独立实例。
     fn create(
@@ -366,20 +497,19 @@ impl ContentFactory for ExternalContentFactory {
     }
 }
 struct ExternalContentInstance {
-    renderer: Entity<NativeRenderer>,
+    renderer: ExternalRenderer,
     _registration: Option<PluginUiRegistration>,
 }
 impl ContentInstance for ExternalContentInstance {
     /// 返回同一实体使草稿、焦点和事件订阅跨渲染保留。
     fn view(&self) -> AnyView {
-        self.renderer.clone().into()
+        self.renderer.view()
     }
-    /// 插件状态与本地有效草稿分开保存；快照只读内存，不能为每次按键等待插件进程。
+    /// 只返回已确认快照；无状态时明确失败，不能用空 JSON 冒充持久状态。
     fn snapshot(&self, cx: &App) -> AppResult<ContentSavedState> {
         let state = self
             .renderer
-            .read(cx)
-            .content_saved_state()?
+            .cached_state(cx)?
             .ok_or_else(|| AppError::conflict("插件标签尚未提供状态快照"))?;
         Ok(ContentSavedState {
             version: state.state_version,
@@ -388,13 +518,12 @@ impl ContentInstance for ExternalContentInstance {
     }
     /// 可见性来源于宿主导航与窗口状态，不从当前聚焦控件推断。
     fn visibility_changed(&mut self, visible: bool, active: bool, cx: &mut App) -> AppResult<()> {
-        self.renderer.update(cx, |renderer, cx| {
-            renderer.visibility_changed(visible, visible && active, cx)
-        });
+        self.renderer
+            .visibility_changed(visible, visible && active, cx);
         Ok(())
     }
     /// 宿主保留实例直到关闭任务回执，避免超时被当作资源已回收。
     fn begin_close(&mut self, deadline: Instant, cx: &mut App) -> AppResult<ContentCloseFuture> {
-        Ok(self.renderer.read(cx).close(deadline))
+        Ok(self.renderer.close(deadline, cx))
     }
 }

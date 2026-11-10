@@ -17,8 +17,8 @@ use kerminal_domain::{
 use kerminal_terminal::input::TerminalInputEvent;
 
 use crate::features::quick_open::{
-    QuickOpenEvent, QuickOpenMode, QuickOpenOpenContext, QuickOpenSelection,
-    QuickOpenTerminalTarget,
+    QuickOpenEvent, QuickOpenMode, QuickOpenOpenContext, QuickOpenPluginCommand,
+    QuickOpenSelection, QuickOpenTerminalTarget,
 };
 
 use super::{CenterPanel, RootView, SessionCommand, terminal_keyboard};
@@ -52,7 +52,7 @@ impl RootView {
         self.quick_open_modal_open = true;
     }
 
-    /// 从当前 reducer/runtime 独立捕获动作 binding 和 clean-prompt 上下文，搜索不受 prompt 限制。
+    /// 从当前 reducer/runtime 独立捕获动作 binding 和 clean-prompt 上下文，插件命令也固定此刻的安全目标。
     ///
     /// @author kongweiguang
     fn quick_open_open_context(&self) -> QuickOpenOpenContext {
@@ -89,6 +89,22 @@ impl RootView {
             workspace,
             terminal,
             terminal_binding,
+            plugin_commands: {
+                let context = self.capture_plugin_command_context();
+                super::plugin_commands::plugin_commands(
+                    &self.services.external_plugins,
+                    super::plugin_commands::plugin_command_locale(),
+                )
+                .into_iter()
+                .map(|command| QuickOpenPluginCommand {
+                    plugin: command.id.plugin,
+                    command: command.id.command,
+                    title: command.title,
+                    tab: context.tab.clone(),
+                    host: context.host.clone(),
+                })
+                .collect()
+            },
         }
     }
 
@@ -126,6 +142,21 @@ impl RootView {
                 origin,
                 terminal_binding,
             } => match selection {
+                QuickOpenSelection::PluginCommand(command) => {
+                    self.run_plugin_command(
+                        super::plugin_commands::PluginCommandInvocation {
+                            id: super::plugin_commands::PluginCommandId {
+                                plugin: command.plugin.clone(),
+                                command: command.command.clone(),
+                            },
+                            context: super::plugin_commands::PluginCommandContext {
+                                tab: command.tab.clone(),
+                                host: command.host.clone(),
+                            },
+                        },
+                        cx,
+                    );
+                }
                 QuickOpenSelection::Action(action) => {
                     if *action == crate::keybindings::KeybindingAction::TerminalSearch {
                         let Some(binding) = terminal_binding.as_ref() else {

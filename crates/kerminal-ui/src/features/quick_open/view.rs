@@ -175,6 +175,7 @@ impl QuickOpenView {
             workspace: None,
             terminal: None,
             terminal_binding: None,
+            plugin_commands: Vec::new(),
         });
         let query = self.query.clone();
         let local_entries = self.local_entries(mode, &context, &query);
@@ -440,7 +441,7 @@ pub(super) fn quick_open_overlay_surface(theme: ThemeTokens) -> Stateful<Div> {
         .bg(theme.scrim)
 }
 
-/// 仅展示当前被查询的数据源；Root 通过精确 ID 再次校验目标存在和状态。
+/// 仅展示当前被查询的数据源；插件命令保留打开时捕获的身份和目标，Root 通过精确 ID 再次校验声明。
 ///
 /// @author kongweiguang
 pub(super) fn local_search_entries(
@@ -450,6 +451,19 @@ pub(super) fn local_search_entries(
 ) -> Vec<QuickOpenEntry> {
     let mut entries = Vec::new();
     if mode == QuickOpenMode::CommandPalette {
+        for command in &context.plugin_commands {
+            push_matching(
+                &mut entries,
+                QuickOpenEntry {
+                    label: command.title.clone(),
+                    detail: text("扩展命令", "Extension command"),
+                    keywords: vec![command.plugin.clone(), command.command.clone()],
+                    selection: Some(QuickOpenSelection::PluginCommand(command.clone())),
+                    disabled: false,
+                },
+                query,
+            );
+        }
         for action in KeybindingAction::ALL {
             if matches!(
                 action,

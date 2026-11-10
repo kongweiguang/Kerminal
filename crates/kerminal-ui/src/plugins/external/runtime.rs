@@ -6,7 +6,9 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use kerminal_application::{
     AppResult,
-    plugin_ports::{PluginViewIdentity, PluginViewSavedState, PreparedPlugin},
+    plugin_ports::{
+        PluginViewIdentity, PluginViewSavedState, PluginWebViewEventTarget, PreparedPlugin,
+    },
 };
 use kerminal_domain::plugins::{PluginId, PluginRuntimeState};
 use serde_json::Value;
@@ -15,6 +17,34 @@ use zeroize::Zeroizing;
 
 /// 已提交的异步工作拥有请求数据，允许交给应用共享执行器调度。
 pub type RuntimeFuture<T> = Pin<Box<dyn Future<Output = AppResult<T>> + Send + 'static>>;
+
+/// 宿主权限错误保留协议错误码，不能缩减成通用界面错误。
+pub type WebViewHostFuture = Pin<
+    Box<
+        dyn Future<Output = Result<Value, kerminal_application::plugin_ports::PluginHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// 网页事件流不依赖 UI 运行时；接收 future 由应用端口提供，页面释放时 Drop 撤销。
+pub trait WebViewEvents: Send + 'static {
+    /// None 表示明确取消或替换，异常中断必须返回错误供恢复界面显示。
+    fn recv(&mut self) -> Pin<Box<dyn Future<Output = AppResult<Option<Value>>> + Send + '_>>;
+}
+
+/// 订阅成功必须连同真实接收端交付，不能只回空 JSON 丢失后续事件。
+pub type WebViewEventsFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    Box<dyn WebViewEvents>,
+                    kerminal_application::plugin_ports::PluginHostError,
+                >,
+            > + Send
+            + 'static,
+    >,
+>;
 
 /// 订阅器由单个视图实体独占，接收 future 借用它以维持消息顺序。
 pub type RuntimeEventFuture<'a> =
@@ -95,6 +125,22 @@ pub trait RuntimeSubscription: Send + 'static {
 
 /// 工厂只持有应用适配器；进程、磁盘和传输实现不得依赖 GPUI。
 pub trait AsyncViewRuntime: Send + Sync + 'static {
+    /// 页面事件与插件进程订阅隔离，测试端口不支持时显式失败。
+    fn subscribe_webview_events(
+        &self,
+        _target: PluginWebViewEventTarget,
+        _params: Value,
+        _request_cancellation: CancellationToken,
+        _lifetime: CancellationToken,
+    ) -> WebViewEventsFuture {
+        Box::pin(async {
+            Err(kerminal_application::plugin_ports::PluginHostError {
+                code: kerminal_plugin_protocol::runtime::error_code::METHOD_NOT_FOUND,
+                message: "WebView event subscriptions unavailable".into(),
+            })
+        })
+    }
+
     /// 测试适配器可不提供开发资源；桌面运行时返回最近一次确认的冻结版本。
     fn prepared_plugin(&self, _plugin: &PluginId) -> AppResult<Option<Arc<PreparedPlugin>>> {
         Ok(None)
@@ -111,6 +157,22 @@ pub trait AsyncViewRuntime: Send + Sync + 'static {
             Err(kerminal_application::AppError::unsupported(
                 "插件视图重试不可用",
             ))
+        })
+    }
+
+    /// 页面宿主能力由桌面适配器交给应用层同一权限路由；缺失适配时明确拒绝。
+    fn route_webview(
+        &self,
+        _identity: PluginViewIdentity,
+        _method: String,
+        _params: Value,
+        _cancellation: CancellationToken,
+    ) -> WebViewHostFuture {
+        Box::pin(async {
+            Err(kerminal_application::plugin_ports::PluginHostError {
+                code: kerminal_plugin_protocol::runtime::error_code::METHOD_NOT_FOUND,
+                message: "WebView host routing unavailable".into(),
+            })
         })
     }
 

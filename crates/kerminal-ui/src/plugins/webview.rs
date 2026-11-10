@@ -20,6 +20,7 @@ use serde_json::Value;
 
 mod backdrop;
 mod document;
+mod occlusion;
 mod platform;
 mod resources;
 
@@ -43,6 +44,11 @@ pub enum PluginWebViewEvent {
     },
     Loaded {
         instance_id: String,
+    },
+    /// 外部 URL 不交给原生网页导航，宿主须经 open-external 权限路由处理。
+    ExternalNavigation {
+        instance_id: String,
+        url: String,
     },
     Failed {
         instance_id: String,
@@ -284,7 +290,7 @@ impl PluginWebView {
             backdrop_slow_fallback: false,
             preview_sender,
         }));
-        Ok(cx.new(|cx: &mut Context<Self>| {
+        let view = cx.new(|cx: &mut Context<Self>| {
             let window_bounds_subscription =
                 cx.observe_window_bounds(window, Self::parent_window_bounds_changed);
             let owner_window = window.window_handle();
@@ -325,7 +331,24 @@ impl PluginWebView {
                 message_count: 0,
                 reported_failure: None,
             }
-        }))
+        });
+        occlusion::register(&view, window, cx)?;
+        Ok(view)
+    }
+
+    /// Root 在设置、命令面板等自绘覆盖层改变时传入本窗口合并的遮挡状态。
+    pub fn set_window_occluded(window: &mut Window, cx: &mut App, blocked: bool) -> AppResult<()> {
+        occlusion::set_window_occluded(window, cx, blocked)
+    }
+
+    /// 仅宿主自己投影的前景抽屉可豁免其内部网页，页面不能自行申请越过模态。
+    pub(crate) fn set_window_occluded_except(
+        window: &mut Window,
+        cx: &mut App,
+        blocked: bool,
+        foreground: Option<String>,
+    ) -> AppResult<()> {
+        occlusion::set_window_occluded_except(window, cx, blocked, foreground)
     }
 
     /// Tab/工具生命周期必须显式同步；隐藏保留 DOM、草稿、滚动和同一原生实例。
@@ -374,6 +397,16 @@ impl PluginWebView {
                 "window.dispatchEvent(new CustomEvent('kerminal:message',{{detail:{encoded}}}));"
             ))
             .map_err(|_| AppError::infrastructure("系统 WebView 无法接收宿主回执"))
+    }
+
+    /// 仅隔离验收构建可注入探针脚本；正式网页仍只能使用受验消息桥接。
+    #[cfg(feature = "right-rail-acceptance")]
+    pub(crate) fn evaluate_acceptance_script(&self, script: &str) -> AppResult<()> {
+        self.native
+            .borrow()
+            .webview
+            .evaluate_script(script)
+            .map_err(|_| AppError::infrastructure("网页验收脚本执行失败"))
     }
 
     /// 焦点仅由显式用户导航转交，普通布局和恢复显示不会抢夺终端输入。
@@ -464,7 +497,8 @@ impl PluginWebView {
                 PluginWebViewEvent::Message { .. } => {
                     self.message_count = self.message_count.saturating_add(1)
                 }
-                PluginWebViewEvent::Failed { .. } => {}
+                PluginWebViewEvent::Failed { .. }
+                | PluginWebViewEvent::ExternalNavigation { .. } => {}
             }
             cx.emit(event);
         }
@@ -604,10 +638,11 @@ fn fallback_application_icon() -> Arc<gpui_kit::Image> {
     .clone()
 }
 
-/// 只有本窗口的真实浮层才能撤下原生子视图，避免别的窗口打开菜单时误隐藏网页。
+/// 只检查本窗口浮层；通知保留到退出动画结束，随后恢复同一原生子视图。
 fn native_overlay_visible(window: &mut Window, app: &mut App) -> bool {
     window.has_active_dialog(app)
         || window.has_active_prompt()
+        || !window.notifications(app).is_empty()
         || gpui_kit::base::GlobalState::has_deferred_popover_in_window(
             window.window_handle().window_id(),
             app,

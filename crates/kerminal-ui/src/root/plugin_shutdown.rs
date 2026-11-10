@@ -135,6 +135,7 @@ impl RootView {
     ) {
         self.cancel_plugin_host_open();
         self.host_lifecycle = RootHostLifecycle::Stopping;
+        self.plugin_commands.cancel();
         self.host_shutdown_requested = true;
         self.pending_quit_intent = None;
         let (jobs, first_error) =
@@ -232,6 +233,7 @@ impl RootView {
         self.quit_ready_intent = None;
         self.failed_quit_intent = Some(intent);
         self.host_lifecycle = RootHostLifecycle::StopFailed;
+        self.plugin_commands.cancel();
         self.host_shutdown_requested = true;
         self.host_failure_message = Some(message.clone());
         self.status = Some(message);

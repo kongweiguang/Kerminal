@@ -1265,6 +1265,7 @@ fn panel_slot_mut(
 /// 面板布局先切换到最终状态，独立动效只改变透明度，退场不再挂载可交互面板。
 /// 抽屉与浮层使用共享主题度量；终端、窗口及拖动命中区继续使用各自的已测量几何。
 /// 停靠工具和主机侧栏由宿主绘制一次 chrome 材质，导航与页脚不重复合成；浮窗保持独立可读表面。
+/// 自绘覆盖层合并后只同步本窗口网页遮挡，避免原生子窗口越过 GPUI 模态。
 ///
 /// @author kongweiguang
 pub(super) fn render_workbench(
@@ -1391,6 +1392,37 @@ pub(super) fn render_workbench(
         layout_plan.compact_width && root.compact_host_drawer_open && !compact_drawer_blocked;
     let show_compact_tool_drawer =
         should_show_active_compact_tool && root.compact_tool_drawer_open && !compact_drawer_blocked;
+    // 与下方实际反馈渲染条件保持一致；通知撤下网页，关闭后不重新创建原生实例。
+    let webview_feedback = root.status.is_some()
+        || root.workbench_layout_save_error.is_some()
+        || root.workbench_layout_intent.is_some();
+    let webview_modal = higher_priority_modal
+        || webview_feedback
+        || root.preferences_modal_open
+        || root.connections_modal_open
+        || snippet_editor_open
+        || root.custom_agent_manager.is_some()
+        || root.root_confirmation_owner.is_some();
+    let webview_foreground = (!webview_modal && show_compact_tool_drawer)
+        .then(|| {
+            compact_active_tool
+                .and_then(|tool| root.plugin_tools.view(tool, &root.plugin_tool_context(cx)))
+        })
+        .flatten()
+        .and_then(|view| {
+            view.downcast::<crate::plugins::external_webview::renderer::WebViewRenderer>()
+                .ok()
+        })
+        .map(|view| view.read(cx).native_identity());
+    if let Err(error) = crate::plugins::webview::PluginWebView::set_window_occluded_except(
+        window,
+        cx,
+        webview_modal || show_compact_host_drawer || show_compact_tool_drawer,
+        webview_foreground,
+    ) {
+        // 错误属于本次绘制的可见状态，不在 render 中 notify 触发持续重绘。
+        root.status = Some(error.public_message().to_owned().into());
+    }
     let agent_terminal_host = resolve_agent_terminal_host(
         compact_panels,
         show_compact_tool_drawer,

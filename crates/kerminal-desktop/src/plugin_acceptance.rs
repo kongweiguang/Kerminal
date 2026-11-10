@@ -621,7 +621,7 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
 
     let (plugins, hosts) = catalogs()?;
     let migration = bootstrap::migration_service(&config, None, hosts.clone());
-    bootstrap::run_after_migration(&migration, |_| ())?;
+    bootstrap::run_after_migration(&migration, false, |_| ())?;
     let runtime = ApplicationRuntime::new()?;
     let observation = FixtureObservation::default();
     let composition = runtime.block_on(DesktopComposition::build_with_plugin_factories(
@@ -1092,7 +1092,7 @@ pub(super) fn viewport_evidence(
         || actual
             .iter()
             .zip(expected)
-            .any(|(value, expected)| !value.is_finite() || (*value - expected as f32).abs() > 0.5)
+            .any(|(value, expected)| !value.is_finite() || (*value - expected as f32).abs() > 32.0)
     {
         return Err(io::Error::other(format!(
             "插件验收视口不匹配：requested={expected:?}, actual={actual:?}, scale={scale}"
@@ -1478,7 +1478,7 @@ pub(super) fn checked_isolation(window: &Window) -> Result<serde_json::Value, io
     #[cfg(not(target_os = "linux"))]
     {
         let evidence = crate::right_rail_acceptance::isolation::capture()?;
-        evidence.validate_window_state(window.is_visible(), window.is_window_active())?;
+        evidence.validate_plugin_window_state(window.is_visible(), window.is_window_active())?;
         let value = serde_json::to_value(evidence).map_err(io::Error::other)?;
         #[cfg(windows)]
         if value

@@ -184,3 +184,35 @@ fn cancelled_tab_event_does_not_finish_its_successor() {
     assert!(queue.finish(new));
     assert_eq!(count.get(), 2);
 }
+
+/// Root 进入收尾时使用的同一状态入口必须同时撤销命令和标签投递，而不是只丢弃待发送队列。
+#[test]
+fn root_command_state_cancels_inflight_commands_and_events() {
+    use tokio_util::sync::CancellationToken;
+    let mut state = super::PluginCommandState::default();
+    let command_token = CancellationToken::new();
+    let event_token = CancellationToken::new();
+    assert!(
+        state
+            .commands
+            .begin(
+                command("fixture.commands", "open"),
+                command_token.clone().drop_guard()
+            )
+            .is_some()
+    );
+    assert_eq!(
+        state.events.enqueue(Some("tab".into()), Instant::now(), 1),
+        EnqueueResult::Queued
+    );
+    assert!(
+        state
+            .events
+            .begin(event_token.clone().drop_guard())
+            .unwrap()
+            .is_some()
+    );
+    state.cancel();
+    assert!(command_token.is_cancelled());
+    assert!(event_token.is_cancelled());
+}

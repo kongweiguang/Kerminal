@@ -2,6 +2,10 @@
 //!
 //! @author kongweiguang
 
+// 事件回归复用真实内容工厂和 Root 装配，避免用手工发布替代用户导航。
+#[path = "root_plugin_tab_events.rs"]
+mod tab_events;
+
 use super::*;
 use crate::features::workspace_controller::{
     WorkspaceRestoreFailure, WorkspaceRestoreItemId, WorkspaceRestoreStatus,

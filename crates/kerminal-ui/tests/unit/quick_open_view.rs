@@ -40,6 +40,7 @@ fn terminal_search_remains_enabled_without_a_clean_prompt_context() {
         workspace: None,
         terminal: None,
         terminal_binding: Some(binding.clone()),
+        plugin_commands: Vec::new(),
     };
 
     let entries = local_search_entries(&context, QuickOpenMode::CommandPalette, "terminal.search");
@@ -62,6 +63,7 @@ fn terminal_search_is_disabled_when_no_binding_was_captured() {
         workspace: None,
         terminal: None,
         terminal_binding: None,
+        plugin_commands: Vec::new(),
     };
 
     let entries = local_search_entries(&context, QuickOpenMode::CommandPalette, "terminal.search");
@@ -85,6 +87,7 @@ fn terminal_paste_requires_a_captured_binding() {
         workspace: None,
         terminal: None,
         terminal_binding: None,
+        plugin_commands: Vec::new(),
     };
     let unavailable = local_search_entries(
         &without_terminal,
@@ -103,6 +106,7 @@ fn terminal_paste_requires_a_captured_binding() {
         workspace: None,
         terminal: None,
         terminal_binding: Some(ui_binding()),
+        plugin_commands: Vec::new(),
     };
     let available = local_search_entries(
         &with_terminal,
@@ -126,6 +130,7 @@ fn command_palette_empty_query_keeps_quit_after_existing_actions() {
         workspace: None,
         terminal: None,
         terminal_binding: None,
+        plugin_commands: Vec::new(),
     };
 
     let entries = local_search_entries(&context, QuickOpenMode::CommandPalette, "");
@@ -153,6 +158,7 @@ fn command_palette_uses_human_details_while_preserving_action_search_ids() {
         workspace: None,
         terminal: None,
         terminal_binding: Some(ui_binding()),
+        plugin_commands: Vec::new(),
     };
 
     let entries = local_search_entries(&context, QuickOpenMode::CommandPalette, "");
@@ -185,6 +191,7 @@ fn command_history_action_matches_tool_rail_name_and_id() {
         workspace: None,
         terminal: None,
         terminal_binding: None,
+        plugin_commands: Vec::new(),
     };
     let entries = local_search_entries(&context, QuickOpenMode::CommandPalette, &label);
     assert!(entries.iter().any(|entry| {
@@ -204,4 +211,30 @@ fn quick_open_metadata_uses_readable_protocol_and_risk_labels() {
     assert_ne!(remote_protocol_label(RemoteProtocol::Ssh), "Host · Ssh");
     assert_ne!(snippet_risk_label(SnippetRisk::Inspect), "Inspect");
     assert_ne!(action_category(KeybindingAction::SettingsOpen), "Action");
+}
+
+/// 过滤后的插件行仍携带面板打开时的完整身份和安全目标，而不是确认时重新查询当前标签。
+#[test]
+fn plugin_palette_entry_keeps_captured_command_and_context() {
+    use crate::features::quick_open::QuickOpenPluginCommand;
+    let command = QuickOpenPluginCommand {
+        plugin: "fixture.commands".into(),
+        command: "open".into(),
+        title: "Open fixture".into(),
+        tab: Some("original-tab".into()),
+        host: Some("original-host".into()),
+    };
+    let context = QuickOpenOpenContext {
+        workspace: None,
+        terminal: None,
+        terminal_binding: None,
+        plugin_commands: vec![command.clone()],
+    };
+    let entries = local_search_entries(&context, QuickOpenMode::CommandPalette, "fixture.commands");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].selection,
+        Some(QuickOpenSelection::PluginCommand(command))
+    );
+    assert!(!entries[0].disabled);
 }

@@ -13,7 +13,10 @@ use zeroize::Zeroizing;
 use crate::{
     AppError, AppResult, PublicErrorCode,
     connections::management::HostManagementService,
-    plugin_ports::{PluginHostApi, PluginHostError, PluginViewIdentity, PreparedPlugin},
+    plugin_ports::{
+        PluginHostApi, PluginHostError, PluginViewIdentity, PluginWebViewEventSubscription,
+        PluginWebViewEventTarget, PreparedPlugin,
+    },
     plugin_settings::PluginSettingsService,
 };
 
@@ -148,6 +151,19 @@ impl PluginHostApiService {
 
 #[async_trait]
 impl PluginHostApi for PluginHostApiService {
+    /// 调用方已通过运行服务权限检查；此处仍核对插件身份，再创建网页专属流。
+    fn subscribe_webview_events(
+        &self,
+        target: PluginWebViewEventTarget,
+        names: Vec<String>,
+        lifetime: CancellationToken,
+    ) -> Result<PluginWebViewEventSubscription, PluginHostError> {
+        if !self.schemas.contains_key(&target.identity.plugin) {
+            return Err(host_error(error_code::STALE));
+        }
+        self.events.subscribe_webview(target, names, lifetime)
+    }
+
     /// 权限和进程代次由运行路由验证；此处独立核对插件、实例、参数和取消状态。
     async fn invoke(
         &self,

@@ -6,8 +6,8 @@ mod model;
 mod view;
 
 pub use model::{
-    QuickOpenEntry, QuickOpenEvent, QuickOpenMode, QuickOpenOpenContext, QuickOpenSelection,
-    QuickOpenTerminalTarget,
+    QuickOpenEntry, QuickOpenEvent, QuickOpenMode, QuickOpenOpenContext, QuickOpenPluginCommand,
+    QuickOpenSelection, QuickOpenTerminalTarget,
 };
 pub use view::QuickOpenView;
 

@@ -36,6 +36,11 @@ pub(super) fn handle_app_key_down(
             cx.stop_propagation();
             true
         }
+        KeybindingDispatch::Plugin(id) => {
+            root.run_external_plugin_command(id, cx);
+            cx.stop_propagation();
+            true
+        }
         KeybindingDispatch::Action(action) => {
             if root.dispatch_keybinding_action(action, window, cx) {
                 cx.stop_propagation();

@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
@@ -17,7 +18,7 @@ use kerminal_application::{
     },
     plugin_ports::{
         PluginHostApi, PluginHostError, PluginHostRouter, PluginProcessMessage, PluginProcessPort,
-        PluginRuntime, PluginViewIdentity, PreparedPlugin,
+        PluginRuntime, PluginViewIdentity, PluginWebViewEventTarget, PreparedPlugin,
     },
     plugin_runtime::{PluginRuntimeDescriptor, PluginRuntimeService},
     plugin_settings::{
@@ -216,6 +217,8 @@ struct Process {
     states: Mutex<BTreeMap<PluginId, PluginRuntimeState>>,
     sent: Mutex<Vec<(PluginId, u64, String, Value)>>,
     changes: broadcast::Sender<PluginProcessMessage>,
+    blocked_notify: Mutex<Option<PluginId>>,
+    notify_attempts: Mutex<Vec<PluginId>>,
 }
 impl Process {
     /// 模拟监督器的代次状态，与事件发送记录共用同一实例。
@@ -230,6 +233,8 @@ impl Process {
             ),
             sent: Mutex::new(Vec::new()),
             changes,
+            blocked_notify: Mutex::new(None),
+            notify_attempts: Mutex::new(Vec::new()),
         }
     }
 }
@@ -273,7 +278,7 @@ impl PluginProcessPort for Process {
         }
         Ok(json!({"data":{}}))
     }
-    /// 验证通知固定在指定代次，并记录可交付的事件。
+    /// 验证通知固定在指定代次；可冻结指定接收方，检查取消是否真的停止在途广播。
     async fn notify(
         &self,
         plugin: &PluginId,
@@ -284,6 +289,11 @@ impl PluginProcessPort for Process {
     ) -> AppResult<()> {
         if self.state(plugin)? != (PluginRuntimeState::Ready { generation }) {
             return Err(AppError::conflict("代次已过期"));
+        }
+        self.notify_attempts.lock().unwrap().push(plugin.clone());
+        let blocked = self.blocked_notify.lock().unwrap().as_ref() == Some(plugin);
+        if blocked {
+            std::future::pending::<()>().await;
         }
         self.sent
             .lock()
@@ -761,13 +771,20 @@ async fn view_subscription_uses_trusted_generation_after_process_restart() {
         vec![1, 2]
     );
 }
-#[tokio::test]
-/// WebView 请求经过真实权限路由后，订阅仍绑定打开视图时的进程代次。
-async fn runtime_routes_webview_subscription_with_verified_generation() {
-    let f = fixture();
+/// 同一构造器覆盖脚本与纯声明网页，权限仍交由真实运行服务判断。
+fn webview_runtime(
+    f: &Fixture,
+    declarative: bool,
+    permissions: BTreeSet<Permission>,
+) -> Arc<PluginRuntimeService> {
     let mut prepared_plugin = (*prepared(f.first.as_str())).clone();
     let manifest = &mut Arc::make_mut(&mut prepared_plugin.package).manifest;
-    manifest.permissions.push(Permission::EventsSubscribe);
+    manifest.permissions.extend(permissions.iter().cloned());
+    if declarative {
+        manifest.runtime = kerminal_plugin_protocol::PluginRuntime::None {
+            extensions: BTreeMap::new(),
+        };
+    }
     manifest.views.insert(
         "editor".into(),
         kerminal_plugin_protocol::ViewDefinition::Webview {
@@ -788,16 +805,23 @@ async fn runtime_routes_webview_subscription_with_verified_generation() {
         )
         .unwrap(),
     );
-    let runtime = PluginRuntimeService::new(
+    PluginRuntimeService::new(
         vec![PluginRuntimeDescriptor {
             prepared: prepared_plugin,
-            permissions: BTreeSet::from([Permission::EventsSubscribe]),
+            permissions,
         }],
         f.process.clone(),
         api,
         ApplicationTaskExecutor::new(tokio::runtime::Handle::current()),
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[tokio::test]
+/// 网页通过真实权限路由拿到独立接收端，不能把进程收到通知当作网页交付成功。
+async fn runtime_routes_webview_subscription_with_verified_generation() {
+    let f = fixture();
+    let runtime = webview_runtime(&f, false, BTreeSet::from([Permission::EventsSubscribe]));
     let identity = PluginViewIdentity {
         plugin: f.first.clone(),
         view: "editor".into(),
@@ -815,7 +839,7 @@ async fn runtime_routes_webview_subscription_with_verified_generation() {
         )
         .await
         .unwrap();
-    runtime
+    let error = runtime
         .route_webview(
             &identity,
             "events.subscribe",
@@ -823,17 +847,207 @@ async fn runtime_routes_webview_subscription_with_verified_generation() {
             CancellationToken::new(),
         )
         .await
+        .unwrap_err();
+    assert_eq!(error.code, error_code::INVALID_PARAMS);
+    let mut stream = runtime
+        .subscribe_webview_events(
+            PluginWebViewEventTarget::new(identity.clone(), 1, 1, 1),
+            json!({"names":["host.connected"]}),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        )
         .unwrap();
     assert_eq!(
         f.events
-            .publish("host.connected", json!({}), deadline)
+            .publish("host.connected", json!({"host":"one"}), deadline)
             .await
             .unwrap(),
         1
     );
-    let sent = f.process.sent.lock().unwrap();
-    assert_eq!((sent[0].1, sent[0].2.as_str()), (1, "event"));
+    assert_eq!(
+        stream.recv().await.unwrap(),
+        Some(json!({"name":"host.connected","payload":{"host":"one"}}))
+    );
+    assert!(f.process.sent.lock().unwrap().is_empty());
+    let error = runtime
+        .subscribe_webview_events(
+            PluginWebViewEventTarget::new(identity, 2, 1, 2),
+            json!({"names":[]}),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.code, error_code::STALE);
 }
+#[tokio::test]
+/// 两页与脚本各占独立槽；取消、空集合及旧序列都不能改写另一页。
+async fn webview_events_isolate_pages_script_and_cleanup() {
+    let f = fixture();
+    let identity = |instance: &str| PluginViewIdentity {
+        plugin: f.first.clone(),
+        view: "editor".into(),
+        instance: instance.into(),
+        generation: 3,
+    };
+    let target = |instance: &str, epoch, sequence| {
+        PluginWebViewEventTarget::new(identity(instance), 1, epoch, sequence)
+    };
+    let page1_lifetime = CancellationToken::new();
+    let mut first = f
+        .api
+        .subscribe_webview_events(
+            target("first", 1, 1),
+            vec!["host.connected".into()],
+            page1_lifetime.clone(),
+        )
+        .unwrap();
+    let mut second = f
+        .api
+        .subscribe_webview_events(
+            target("second", 1, 1),
+            vec!["host.connected".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+    invoke(
+        &f.api,
+        &f.first,
+        None,
+        "events.subscribe",
+        json!({"names":["host.connected"]}),
+    )
+    .await
+    .unwrap();
+    let publish = || {
+        f.events.publish(
+            "host.connected",
+            json!({}),
+            Instant::now() + Duration::from_secs(1),
+        )
+    };
+    assert_eq!(publish().await.unwrap(), 3);
+    // first 的事件故意留在队列中，替换必须先取消再丢弃旧页缓冲。
+    assert!(second.recv().await.unwrap().is_some());
+    let mut unsubscribed = f
+        .api
+        .subscribe_webview_events(target("first", 1, 3), vec![], page1_lifetime.clone())
+        .unwrap();
+    assert!(first.recv().await.unwrap().is_none());
+    let stale = f
+        .api
+        .subscribe_webview_events(
+            target("first", 1, 2),
+            vec!["host.connected".into()],
+            page1_lifetime.clone(),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(stale.code, error_code::STALE);
+    // 旧 receiver Drop 不能删掉替换后的空订阅墓碑。
+    drop(first);
+    assert_eq!(publish().await.unwrap(), 2);
+    assert!(second.recv().await.unwrap().is_some());
+    page1_lifetime.cancel();
+    assert!(unsubscribed.recv().await.unwrap().is_none());
+    drop(unsubscribed);
+    let mut reloaded = f
+        .api
+        .subscribe_webview_events(
+            target("first", 2, 1),
+            vec!["host.connected".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(publish().await.unwrap(), 3);
+    assert!(reloaded.recv().await.unwrap().is_some());
+    drop(reloaded);
+    drop(second);
+    assert_eq!(publish().await.unwrap(), 1);
+    assert_eq!(f.process.sent.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+/// 纯声明网页不需要伪造就绪进程；相同路径仍拒绝缺失权限与不存在的实例。
+async fn declarative_webview_events_use_zero_generation_and_enforce_permissions() {
+    let f = fixture();
+    f.process
+        .states
+        .lock()
+        .unwrap()
+        .insert(f.first.clone(), PluginRuntimeState::Idle);
+    let runtime = webview_runtime(&f, true, BTreeSet::from([Permission::EventsSubscribe]));
+    let identity = PluginViewIdentity {
+        plugin: f.first.clone(),
+        view: "editor".into(),
+        instance: "declarative".into(),
+        generation: 1,
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    runtime
+        .open(
+            identity.clone(),
+            json!({}),
+            None,
+            deadline,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let mut stream = runtime
+        .subscribe_webview_events(
+            PluginWebViewEventTarget::new(identity.clone(), 0, 1, 1),
+            json!({"names":["tab.changed"]}),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        f.events
+            .publish("tab.changed", json!({}), deadline)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        stream.recv().await.unwrap(),
+        Some(json!({"name":"tab.changed","payload":{}}))
+    );
+    let denied = webview_runtime(&f, true, BTreeSet::new());
+    denied
+        .open(
+            identity.clone(),
+            json!({}),
+            None,
+            deadline,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let error = denied
+        .subscribe_webview_events(
+            PluginWebViewEventTarget::new(identity.clone(), 0, 1, 1),
+            json!({"names":[]}),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.code, error_code::PERMISSION_DENIED);
+    let mut stale_identity = identity;
+    stale_identity.instance = "never-opened".into();
+    let error = runtime
+        .subscribe_webview_events(
+            PluginWebViewEventTarget::new(stale_identity, 0, 1, 1),
+            json!({"names":[]}),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.code, error_code::STALE);
+}
+
 #[tokio::test]
 /// 主机返回值限定为目录摘要，未知插件和未知方法不能绕过主路由。
 async fn host_projection_and_invalid_calls_are_explicit() {
@@ -1025,4 +1239,137 @@ async fn actual_host_management_projection_excludes_credentials_and_configuratio
     assert_eq!(result["hosts"][0]["kind"], "ssh");
     assert_eq!(result["hosts"][1]["kind"], "local");
     assert_eq!(result["hosts"][2]["kind"], "example.custom");
+}
+
+/// 只推进到真实 await 的 Pending，不靠睡眠推测是否已经进入阻塞投递。
+async fn event_delivery_is_pending<T>(future: std::pin::Pin<&mut impl Future<Output = T>>) -> bool {
+    let mut future = future;
+    std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+}
+
+#[tokio::test]
+/// 首个进程通知卡住后取消，必须立即结束广播且不能启动第二个进程的通知。
+async fn cancelling_blocked_process_event_stops_later_subscribers() {
+    let f = fixture();
+    *f.process.blocked_notify.lock().unwrap() = Some(f.first.clone());
+    for plugin in [&f.first, &f.second] {
+        f.events
+            .subscribe(
+                plugin,
+                1,
+                vec!["tab.changed".into()],
+                CancellationToken::new(),
+            )
+            .unwrap();
+    }
+    let cancellation = CancellationToken::new();
+    let mut publish = Box::pin(f.events.publish_cancellable(
+        "tab.changed",
+        json!({"tab":"cancelled"}),
+        Instant::now() + Duration::from_secs(5),
+        cancellation.clone(),
+    ));
+    assert!(event_delivery_is_pending(publish.as_mut()).await);
+    assert_eq!(
+        *f.process.notify_attempts.lock().unwrap(),
+        vec![f.first.clone()]
+    );
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(250), publish)
+        .await
+        .expect("取消不等待原五秒截止时间");
+    assert_eq!(
+        result.unwrap_err().public_code(),
+        kerminal_application::PublicErrorCode::Cancelled
+    );
+    assert_eq!(
+        *f.process.notify_attempts.lock().unwrap(),
+        vec![f.first.clone()]
+    );
+    assert!(f.process.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+/// 网页通道填满后取消，未提交的消息不能滞留或继续投递给后续页面。
+async fn cancelling_full_webview_event_queue_stops_later_pages() {
+    let f = fixture();
+    let identity = |instance: &str| PluginViewIdentity {
+        plugin: f.first.clone(),
+        view: "editor".into(),
+        instance: instance.into(),
+        generation: 1,
+    };
+    let mut blocked_page = f
+        .events
+        .subscribe_webview(
+            PluginWebViewEventTarget::new(identity("a-blocked"), 0, 1, 1),
+            vec!["tab.changed".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+    for index in 0..64 {
+        assert_eq!(
+            f.events
+                .publish(
+                    "tab.changed",
+                    json!({"index":index}),
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .await
+                .unwrap(),
+            1
+        );
+    }
+    let mut later_page = f
+        .events
+        .subscribe_webview(
+            PluginWebViewEventTarget::new(identity("z-later"), 0, 1, 1),
+            vec!["tab.changed".into()],
+            CancellationToken::new(),
+        )
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let mut publish = Box::pin(f.events.publish_cancellable(
+        "tab.changed",
+        json!({"cancelled":true}),
+        Instant::now() + Duration::from_secs(5),
+        cancellation.clone(),
+    ));
+    assert!(event_delivery_is_pending(publish.as_mut()).await);
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(250), publish)
+        .await
+        .expect("取消不等待满通道的五秒截止时间");
+    assert_eq!(
+        result.unwrap_err().public_code(),
+        kerminal_application::PublicErrorCode::Cancelled
+    );
+    for index in 0..64 {
+        assert_eq!(
+            blocked_page.recv().await.unwrap().unwrap()["payload"]["index"],
+            index
+        );
+    }
+    assert!(event_delivery_is_pending(Box::pin(blocked_page.recv()).as_mut()).await);
+    assert!(event_delivery_is_pending(Box::pin(later_page.recv()).as_mut()).await);
+    // 取消属于单次广播，两个页面的订阅仍可接收后续明确的新事件。
+    assert_eq!(
+        f.events
+            .publish(
+                "tab.changed",
+                json!({"retry":true}),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        blocked_page.recv().await.unwrap().unwrap()["payload"],
+        json!({"retry":true})
+    );
+    assert_eq!(
+        later_page.recv().await.unwrap().unwrap()["payload"],
+        json!({"retry":true})
+    );
 }

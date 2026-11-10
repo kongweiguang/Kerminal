@@ -480,6 +480,13 @@ impl RootView {
 
         match resolve_terminal_shortcut(&mut self.keybinding_runtime, event, ime_composing) {
             keybindings::KeybindingDispatch::Unhandled => {}
+            keybindings::KeybindingDispatch::Plugin(id) => {
+                self.keybinding_runtime
+                    .remember_terminal_shortcut_key(&event.keystroke);
+                self.run_external_plugin_command(id, cx);
+                cx.stop_propagation();
+                return;
+            }
             keybindings::KeybindingDispatch::Pending => {
                 self.keybinding_runtime
                     .remember_terminal_shortcut_key(&event.keystroke);
@@ -701,6 +708,10 @@ impl RootView {
         match resolve_terminal_shortcut(&mut self.keybinding_runtime, event, false) {
             keybindings::KeybindingDispatch::Unhandled => false,
             keybindings::KeybindingDispatch::Pending => true,
+            keybindings::KeybindingDispatch::Plugin(id) => {
+                self.run_external_plugin_command(id, cx);
+                true
+            }
             keybindings::KeybindingDispatch::Action(action) => {
                 self.keybinding_runtime.clear_pending();
                 match action {

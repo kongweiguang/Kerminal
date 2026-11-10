@@ -149,6 +149,74 @@ pub struct PluginHostError {
     pub message: String,
 }
 
+/// 网页订阅身份独立于进程订阅；页面代次和请求序列共同拒绝旧页面及乱序替换。
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct PluginWebViewEventTarget {
+    pub identity: PluginViewIdentity,
+    pub process_generation: u64,
+    pub page_epoch: u64,
+    pub sequence: u64,
+}
+
+impl PluginWebViewEventTarget {
+    /// 页面代次由宿主 renderer 提供，不能采信网页 RPC 参数中的实例身份。
+    pub fn new(
+        identity: PluginViewIdentity,
+        process_generation: u64,
+        page_epoch: u64,
+        sequence: u64,
+    ) -> Self {
+        Self {
+            identity,
+            process_generation,
+            page_epoch,
+            sequence,
+        }
+    }
+}
+
+/// 流由调用者独占；Drop 同时取消投递并删除对应槽位，不等待下一次事件触发清理。
+pub struct PluginWebViewEventSubscription {
+    receiver: tokio::sync::mpsc::Receiver<Value>,
+    cancellation: CancellationToken,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl PluginWebViewEventSubscription {
+    /// 只有应用事件服务可构造接收端，防止调用方伪造订阅成功而没有发送端。
+    pub(crate) fn new(
+        receiver: tokio::sync::mpsc::Receiver<Value>,
+        cancellation: CancellationToken,
+        cleanup: Box<dyn FnOnce() + Send>,
+    ) -> Self {
+        Self {
+            receiver,
+            cancellation,
+            cleanup: Some(cleanup),
+        }
+    }
+
+    /// 取消先于已排队事件，关闭或替换后的旧消息不能进入保留的页面。
+    pub async fn recv(&mut self) -> AppResult<Option<Value>> {
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => Ok(None),
+            event = self.receiver.recv() => event.map(Some).ok_or_else(|| AppError::infrastructure("网页事件订阅意外关闭")),
+        }
+    }
+}
+
+impl Drop for PluginWebViewEventSubscription {
+    /// 调用方不消费或窗口直接销毁时，也必须撤销已登记的发送端和生命周期令牌。
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
 /// 应用服务是进程回调与 WebView 的共同权限门禁。
 #[async_trait]
 pub trait PluginHostRouter: Send + Sync + 'static {
@@ -179,6 +247,19 @@ pub trait PluginHostRouter: Send + Sync + 'static {
 /// 权限检查之后才调用的宿主能力，具体 UI、Vault 等实现由组合根注入。
 #[async_trait]
 pub trait PluginHostApi: Send + Sync + 'static {
+    /// 网页必须获得独立事件接收端；不支持该端口时明确拒绝，不能回退到进程订阅。
+    fn subscribe_webview_events(
+        &self,
+        _target: PluginWebViewEventTarget,
+        _names: Vec<String>,
+        _lifetime: CancellationToken,
+    ) -> Result<PluginWebViewEventSubscription, PluginHostError> {
+        Err(PluginHostError {
+            code: kerminal_plugin_protocol::error_code::METHOD_NOT_FOUND,
+            message: "WebView event subscriptions unavailable".into(),
+        })
+    }
+
     /// 实例为空时不得把对话框等操作隐式绑定到当前窗口。
     async fn invoke(
         &self,

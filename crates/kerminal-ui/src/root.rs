@@ -27,9 +27,12 @@ pub(crate) mod pane_input;
 mod pane_input_runtime;
 #[cfg(feature = "right-rail-acceptance")]
 mod plugin_acceptance;
+mod plugin_commands;
 mod plugin_host_api;
 mod plugin_hosts;
 mod plugin_tab_close;
+#[cfg(feature = "right-rail-acceptance")]
+mod plugin_webview_acceptance;
 mod preferences;
 mod proxy_runtime;
 mod quick_open;
@@ -697,6 +700,8 @@ pub struct RootView {
     key_commit_generation: u64,
     /// 只保留当前设置编译的 keymap；配置替换时会清除未完成的 chord 前缀。
     keybinding_runtime: keybindings::RootKeybindingRuntime,
+    /// 命令与标签通知由窗口持有取消资源，导航不改变已经捕获的调用目标。
+    plugin_commands: plugin_commands::PluginCommandState,
     /// chord 前缀绑定到具体的 GPUI 焦点句柄，防止同一 scope 的控件之间串接。
     keybinding_focus: keybinding_focus::KeybindingFocusTracker<FocusHandle>,
     /// 输入建议候选只由桥接 controller 持有；缓存 context 仅用于绑定和 CAS 版本校验。
@@ -3847,6 +3852,7 @@ impl RootView {
             pending_key_commits: VecDeque::new(),
             key_commit_generation: 0,
             keybinding_runtime: keybindings::RootKeybindingRuntime::default(),
+            plugin_commands: plugin_commands::PluginCommandState::default(),
             keybinding_focus: keybinding_focus::KeybindingFocusTracker::default(),
             terminal_command_suggestions: command_suggestions::TerminalCommandSuggestionBridge::new(
             ),
@@ -4118,6 +4124,7 @@ impl RootView {
         self.application_task_snapshot = snapshot;
         if !snapshot.accepting {
             self.cancel_plugin_host_open();
+            self.plugin_commands.cancel();
             self.host_shutdown_requested = true;
             if self.host_lifecycle == RootHostLifecycle::Running {
                 self.host_lifecycle = RootHostLifecycle::Stopping;
@@ -4505,6 +4512,7 @@ impl RootView {
         let confirm_terminal_close = settings.terminal.confirm_close_tab;
         let suggestion_settings = settings.terminal.inline_suggestion.clone();
         self.keybinding_runtime.update(&settings.keybindings);
+        self.install_plugin_command_bindings();
         if let Some(commands) = self.services.commands.as_ref() {
             commands.update_suggestion_settings(&suggestion_settings);
         }
@@ -6725,6 +6733,7 @@ impl EventEmitter<RootViewEvent> for RootView {}
 impl Drop for RootView {
     /// 根视图销毁时取消所有仍由它持有的订阅令牌，避免后台等待绑定到已关闭窗口。
     fn drop(&mut self) {
+        self.plugin_commands.cancel();
         self.agent_watch_cancellation.cancel();
         for cancellation in self.workspace_restore_cancellations.values() {
             cancellation.cancel();
@@ -6927,6 +6936,23 @@ impl Render for RootView {
             .id("workbench-app-key-context")
             .size_full()
             .key_context(crate::keybindings::KeybindingContext::App.as_gpui_identifier())
+            .on_action(cx.listener(
+                |root, action: &plugin_commands::PluginCommandAction, _, cx| {
+                    root.run_external_plugin_command(action.id.clone(), cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |root,
+                 _: &crate::plugins::external_webview::OpenWebViewCommandPalette,
+                 window,
+                 cx| {
+                    root.dispatch_keybinding_action(
+                        crate::keybindings::KeybindingAction::WorkspaceCommandPalette,
+                        window,
+                        cx,
+                    );
+                },
+            ))
             .on_action(cx.listener(
                 |root, action: &crate::plugins::actions::OpenContentPage, window, cx| {
                     if let Err(error) = root.open_plugin_page(&action.content_id, window, cx) {

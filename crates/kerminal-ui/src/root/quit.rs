@@ -331,6 +331,7 @@ impl RootView {
                 return true;
             }
             self.host_lifecycle = RootHostLifecycle::Stopping;
+            self.plugin_commands.cancel();
             self.host_shutdown_requested = true;
             cx.emit(RootViewEvent::InstallReady {
                 update_id: update.update_id,
@@ -526,6 +527,7 @@ impl RootView {
                             return;
                         }
                         self.host_lifecycle = RootHostLifecycle::Stopping;
+                        self.plugin_commands.cancel();
                         self.host_shutdown_requested = true;
                         cx.emit(RootViewEvent::InstallReady {
                             update_id: *update_id,
@@ -535,6 +537,7 @@ impl RootView {
                     }
                     RootHostLifecycle::StoppedUpdateFailed => {
                         self.host_lifecycle = RootHostLifecycle::Stopping;
+                        self.plugin_commands.cancel();
                         self.host_shutdown_requested = true;
                         cx.emit(RootViewEvent::RetryInstallReady {
                             update_id: *update_id,
@@ -846,6 +849,7 @@ impl RootView {
             self.quit_ready_emitted = false;
             self.quit_ready_intent = None;
             self.host_lifecycle = RootHostLifecycle::Stopping;
+            self.plugin_commands.cancel();
             self.host_shutdown_requested = true;
             self.quit_preparation_failure = None;
             cx.emit(RootViewEvent::InstallReady {
@@ -888,6 +892,7 @@ impl RootView {
     ) {
         self.quit_preparation_failure = None;
         self.host_lifecycle = RootHostLifecycle::Stopping;
+        self.plugin_commands.cancel();
         self.host_shutdown_requested = true;
         self.quit_ready_emitted = true;
         self.quit_ready_intent = Some(intent.clone());

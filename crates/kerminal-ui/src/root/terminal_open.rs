@@ -1419,7 +1419,7 @@ impl RootView {
 
     /// 更新只读投影且先安装组拓扑再安装标签，避免同批组变化撤销新 active 标签的测量请求。
     /// 无窗口的恢复回调不创建 GPUI Entity，真实会话和布局所有权仍留在 controller；隐藏搜索先撤销计时和提交门。
-    /// 内容插件的显隐在此生命周期同步，避免在 render 中启动读取。
+    /// 内容插件的显隐在此生命周期同步，避免在 render 中启动读取；标签事件只在投影提交后发布，重复刷新由事件队列去重。
     ///
     /// @author kongweiguang
     pub(super) fn refresh_workspace_views(&mut self, cx: &mut Context<RootView>) {
@@ -1452,6 +1452,7 @@ impl RootView {
             });
             self.refresh_agent_target_candidate(cx);
             self.refresh_context_panel_projection(cx);
+            self.publish_plugin_tab_changed(cx);
             cx.notify();
             return;
         };
@@ -1539,6 +1540,7 @@ impl RootView {
         }
         self.refresh_agent_target_candidate(cx);
         self.refresh_context_panel_projection(cx);
+        self.publish_plugin_tab_changed(cx);
         cx.notify();
     }
 

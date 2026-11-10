@@ -8,6 +8,7 @@ pub mod content;
 pub mod external;
 pub mod external_host_form;
 pub mod external_settings;
+pub mod external_webview;
 pub(crate) mod host_api;
 pub mod host_forms;
 #[cfg(feature = "acceptance-metrics")]

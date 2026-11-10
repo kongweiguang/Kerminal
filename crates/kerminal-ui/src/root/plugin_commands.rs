@@ -395,6 +395,31 @@ fn target_host_id(target: &WorkspaceTargetRef) -> Option<String> {
 }
 
 impl RootView {
+    /// 设置快照替换后重建插件绑定；冲突只禁用对应快捷键，命令仍可从面板执行。
+    pub(super) fn install_plugin_command_bindings(&mut self) {
+        let commands = plugin_commands(&self.services.external_plugins, plugin_command_locale());
+        let issues = self.keybinding_runtime.install_plugin_commands(&commands);
+        for issue in &issues {
+            tracing::warn!(plugin = %issue.id.plugin, command = %issue.id.command, binding = %issue.binding, reason = issue.reason, "插件快捷键未安装");
+        }
+        if !issues.is_empty() {
+            self.status = Some(crate::locale::text(
+                "部分插件快捷键无效或与已有快捷键冲突，可从命令面板执行。",
+                "Some plugin shortcuts are invalid or conflict with existing shortcuts. Use the command palette.",
+            ));
+        }
+    }
+
+    /// 快捷键在触发时固定目标，命令面板则使用打开时已经捕获的 invocation。
+    pub(super) fn run_external_plugin_command(
+        &mut self,
+        id: PluginCommandId,
+        cx: &mut Context<Self>,
+    ) {
+        let context = self.capture_plugin_command_context();
+        self.run_plugin_command(PluginCommandInvocation { id, context }, cx);
+    }
+
     /// 文件宿主取冻结 target，终端取明确焦点 pane；不借侧栏或其它 pane 补全插件上下文。
     /// @author kongweiguang
     pub(crate) fn capture_plugin_command_context(&self) -> PluginCommandContext {
@@ -525,14 +550,14 @@ impl RootView {
                 {
                     return;
                 }
-                if let Err(error) = result {
-                    if error.public_code() != PublicErrorCode::Cancelled {
-                        root.status = Some(crate::locale::text(
-                            format!("插件命令执行失败：{}", error.public_message()),
-                            format!("The plugin command failed: {}", error.public_message()),
-                        ));
-                        cx.notify();
-                    }
+                if let Err(error) = result
+                    && error.public_code() != PublicErrorCode::Cancelled
+                {
+                    root.status = Some(crate::locale::text(
+                        format!("插件命令执行失败：{}", error.public_message()),
+                        format!("The plugin command failed: {}", error.public_message()),
+                    ));
+                    cx.notify();
                 }
             });
         })
@@ -599,7 +624,7 @@ impl RootView {
                         return Err(AppError::cancelled("插件标签事件已取消"));
                     }
                     events
-                        .publish("tab.changed", json!({"tab": tab}), deadline)
+                        .publish_cancellable("tab.changed", json!({"tab": tab}), deadline, token)
                         .await
                         .map(|_| ())
                 })
@@ -611,14 +636,14 @@ impl RootView {
                 if root.host_shutdown_requested {
                     return;
                 }
-                if let Err(error) = result {
-                    if error.public_code() != PublicErrorCode::Cancelled {
-                        root.status = Some(crate::locale::text(
-                            "插件标签事件发送失败。",
-                            "The plugin tab event could not be delivered.",
-                        ));
-                        cx.notify();
-                    }
+                if let Err(error) = result
+                    && error.public_code() != PublicErrorCode::Cancelled
+                {
+                    root.status = Some(crate::locale::text(
+                        "插件标签事件发送失败。",
+                        "The plugin tab event could not be delivered.",
+                    ));
+                    cx.notify();
                 }
                 root.start_next_plugin_tab_event(cx);
             });

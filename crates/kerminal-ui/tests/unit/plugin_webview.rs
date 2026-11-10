@@ -358,3 +358,78 @@ fn inline_acceptance_api_retains_its_isolated_document() {
         404
     );
 }
+
+/// 受验包只暴露冻结资源和获准 HTTPS 目标，未获准目标不能进入响应头。
+#[test]
+fn prepared_webview_uses_frozen_resources_and_declared_network_permissions() {
+    use kerminal_application::external_contributions::PreparedPlugin;
+    use kerminal_domain::plugins::{PluginId, PluginVersion};
+    use kerminal_plugin_protocol::{ManifestPolicy, ValidatedPackage, parse_manifest};
+    use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+
+    let manifest = serde_json::json!({
+        "schema": 1, "id": "acme.web", "name": {"en": "Web"},
+        "description": {"en": "Web"}, "version": "1.0.0", "api": "^1.0",
+        "publisher": "acme", "runtime": {"kind": "none"},
+        "permissions": ["network:example.com"],
+        "views": {"page": {"kind": "webview", "entry": "web/index.html", "csp": "https://example.com"}}
+    });
+    let manifest = parse_manifest(
+        &serde_json::to_vec(&manifest).unwrap(),
+        ManifestPolicy::ThirdParty,
+    )
+    .unwrap();
+    let mut prepared = PreparedPlugin {
+        id: PluginId::parse("acme.web").unwrap(),
+        version: PluginVersion::parse("1.0.0").unwrap(),
+        directory: PathBuf::from("must-not-be-read"),
+        package: Arc::new(ValidatedPackage {
+            manifest,
+            files: BTreeMap::new(),
+            views: BTreeMap::new(),
+            configuration_schemas: BTreeMap::new(),
+        }),
+        native_views: BTreeMap::new(),
+        localizations: BTreeMap::new(),
+        resources: BTreeMap::from([(
+            "web/index.html".into(),
+            Arc::from(b"<html></html>".as_slice()),
+        )]),
+    };
+    let source =
+        PluginWebViewResourceDocument::from_prepared(&prepared, "page", "instance".into()).unwrap();
+    let protocol = document::DocumentProtocol::new(source.into());
+    let response = protocol.response(&request(&protocol.url()));
+    assert_eq!(response.body().as_ref(), b"<html></html>");
+    assert!(
+        response.headers()["Content-Security-Policy"]
+            .to_str()
+            .unwrap()
+            .contains("connect-src https://example.com")
+    );
+    Arc::make_mut(&mut prepared.package)
+        .manifest
+        .permissions
+        .clear();
+    assert!(
+        PluginWebViewResourceDocument::from_prepared(&prepared, "page", "instance".into()).is_err()
+    );
+}
+
+/// 外部导航仅排队 HTTPS 候选；权限和实际打开由宿主独立决定。
+#[test]
+fn external_navigation_is_bounded_and_does_not_open_directly() {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+    document::enqueue_external_navigation(&sender, "view", "http://example.com");
+    document::enqueue_external_navigation(&sender, "view", "https://example.com/\ninvalid");
+    document::enqueue_external_navigation(
+        &sender,
+        "view",
+        &format!("https://example.com/{}", "x".repeat(4096)),
+    );
+    assert!(receiver.try_recv().is_err());
+    document::enqueue_external_navigation(&sender, "view", "https://example.com/docs");
+    assert!(
+        matches!(receiver.try_recv(), Ok(PluginWebViewEvent::ExternalNavigation { instance_id, url }) if instance_id == "view" && url == "https://example.com/docs")
+    );
+}

@@ -30,7 +30,8 @@ use crate::{
     plugin_ports::{
         PluginHostApi, PluginHostError, PluginHostRouter, PluginProcessPort,
         PluginResponseObserver, PluginRuntime, PluginRuntimeEvent, PluginViewDataSnapshot,
-        PluginViewIdentity, PluginViewSavedState, PreparedPlugin,
+        PluginViewIdentity, PluginViewSavedState, PluginWebViewEventSubscription,
+        PluginWebViewEventTarget, PreparedPlugin,
     },
 };
 
@@ -143,6 +144,12 @@ impl PluginRuntimeService {
         mut params: Value,
         cancellation: CancellationToken,
     ) -> Result<Value, PluginHostError> {
+        if method == "events.subscribe" {
+            return Err(host_error(
+                error_code::INVALID_PARAMS,
+                "WebView events require a page-bound stream",
+            ));
+        }
         let (generation, wire) =
             binding(&self.shared, identity).map_err(|_| host_error(error_code::STALE, "stale"))?;
         let object = params
@@ -164,6 +171,72 @@ impl PluginRuntimeService {
                 AppError::Cancelled { .. } => host_error(error_code::CANCELLED, "cancelled"),
                 _ => host_error(error_code::STALE, "stale"),
             })?
+    }
+
+    /// 页面订阅复用相同权限与实例绑定规则，并强制交付独立流，禁止转发到插件进程。
+    pub fn subscribe_webview_events(
+        &self,
+        target: PluginWebViewEventTarget,
+        params: Value,
+        request_cancellation: CancellationToken,
+        lifetime: CancellationToken,
+    ) -> Result<PluginWebViewEventSubscription, PluginHostError> {
+        if request_cancellation.is_cancelled() || lifetime.is_cancelled() {
+            return Err(host_error(error_code::CANCELLED, "cancelled"));
+        }
+        let (generation, wire) = binding(&self.shared, &target.identity)
+            .map_err(|_| host_error(error_code::STALE, "stale"))?;
+        if generation != target.process_generation {
+            return Err(host_error(error_code::STALE, "stale"));
+        }
+        let descriptor = self
+            .shared
+            .plugins
+            .get(&target.identity.plugin)
+            .ok_or_else(|| host_error(error_code::STALE, "stale"))?;
+        if !matches!(
+            descriptor
+                .prepared
+                .package
+                .manifest
+                .views
+                .get(&target.identity.view),
+            Some(kerminal_plugin_protocol::ViewDefinition::Webview { .. })
+        ) {
+            return Err(host_error(error_code::INVALID_PARAMS, "WebView required"));
+        }
+        if !descriptor
+            .permissions
+            .contains(&Permission::EventsSubscribe)
+            && !descriptor.permissions.contains(&Permission::FullAccess)
+        {
+            return Err(host_error(
+                error_code::PERMISSION_DENIED,
+                "permission denied",
+            ));
+        }
+        let names = params
+            .get("names")
+            .and_then(Value::as_array)
+            .ok_or_else(|| host_error(error_code::INVALID_PARAMS, "invalid params"))?
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| host_error(error_code::INVALID_PARAMS, "invalid params"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let identity = target.identity.clone();
+        let stream = self
+            .shared
+            .host
+            .subscribe_webview_events(target, names, lifetime)?;
+        if request_cancellation.is_cancelled() {
+            return Err(host_error(error_code::CANCELLED, "cancelled"));
+        }
+        ensure_binding(&self.shared, &identity, generation, &wire)
+            .map_err(|_| host_error(error_code::STALE, "stale"))?;
+        Ok(stream)
     }
 
     /// 当前就绪代次来自监督器；纯声明插件约定零代次，不创建空进程。

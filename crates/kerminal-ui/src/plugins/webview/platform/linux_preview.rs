@@ -5,7 +5,7 @@
 use std::time::Instant;
 
 use kerminal_application::{AppError, AppResult};
-use webkit2gtk::{SnapshotOptions, SnapshotRegion, prelude::WebViewExt as _};
+use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt as _};
 use wry::WebViewExtUnix as _;
 
 use super::{PreviewCapture, PreviewData};

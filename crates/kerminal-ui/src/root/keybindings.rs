@@ -10,6 +10,9 @@ use std::{
 use gpui_kit::{KeyContext, Keystroke};
 use kerminal_application::preferences::KeybindingPreference;
 
+use super::plugin_commands::{
+    PluginCommand, PluginCommandAction, PluginCommandId, PluginShortcutIssue,
+};
 use crate::keybindings::{
     CompiledKeybindings, KeybindingAction, KeybindingContext, KeybindingPlatform,
 };
@@ -34,7 +37,7 @@ pub(super) enum KeybindingFocusScope {
 }
 
 /// 一次 Root 快捷键解析结果；只有 Action 和 Pending 会拦截当前按键。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum KeybindingDispatch {
     /// 当前按键不属于快捷键，必须继续交给终端或焦点控件。
     Unhandled,
@@ -42,6 +45,8 @@ pub(super) enum KeybindingDispatch {
     Pending,
     /// 找到已知的业务动作，由 Root 调用对应的原生用例入口。
     Action(KeybindingAction),
+    /// 插件动作仍由 Root 捕获触发时的目标，不在 keymap 中保存可变工作区状态。
+    Plugin(PluginCommandId),
 }
 
 /// 保存当前设置编译出的不可变 keymap 与短暂 chord 前缀。
@@ -71,6 +76,42 @@ impl Default for RootKeybindingRuntime {
 }
 
 impl RootKeybindingRuntime {
+    /// 与当前内置绑定一起检查冲突，再安装到同一表；文本编辑专用表始终不接收插件动作。
+    pub(super) fn install_plugin_commands(
+        &mut self,
+        commands: &[PluginCommand],
+    ) -> Vec<PluginShortcutIssue> {
+        let reserved = self
+            .compiled
+            .keymap()
+            .bindings()
+            .cloned()
+            .collect::<Vec<_>>();
+        let (bindings, issues) =
+            super::plugin_commands::plugin_shortcut_bindings(commands, &reserved);
+        self.compiled.extend_bindings(bindings);
+        self.clear_pending();
+        issues
+    }
+
+    /// 同一 GPUI keymap 已应用 context predicate；此处只提取插件身份，调用方共享既有输入门禁。
+    fn plugin_command_for_sequence(
+        &self,
+        sequence: &[Keystroke],
+        contexts: &[KeyContext],
+    ) -> Option<PluginCommandId> {
+        let (matched, _) = self
+            .compiled
+            .keymap()
+            .bindings_for_input(sequence, contexts);
+        matched
+            .first()?
+            .action()
+            .as_any()
+            .downcast_ref::<PluginCommandAction>()
+            .map(|action| action.id.clone())
+    }
+
     /// Settings 变化时整体替换解析快照，并为文本编辑焦点单独编译最小全局动作白名单。
     ///
     /// @author kongweiguang
@@ -146,6 +187,10 @@ impl RootKeybindingRuntime {
             self.clear_pending();
             return KeybindingDispatch::Action(action);
         }
+        if let Some(id) = self.plugin_command_for_sequence(&sequence, &contexts) {
+            self.clear_pending();
+            return KeybindingDispatch::Plugin(id);
+        }
         if resolution.pending {
             self.pending_strokes = sequence;
             self.pending_scope = Some(scope);
@@ -165,6 +210,11 @@ impl RootKeybindingRuntime {
             );
             if let Some(action) = resolution.action {
                 return KeybindingDispatch::Action(action);
+            }
+            if let Some(id) =
+                self.plugin_command_for_sequence(std::slice::from_ref(keystroke), &contexts)
+            {
+                return KeybindingDispatch::Plugin(id);
             }
             if resolution.pending {
                 self.pending_strokes.push(keystroke.clone());

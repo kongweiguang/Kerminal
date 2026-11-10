@@ -44,7 +44,12 @@ pub fn install(
             )?));
         }
         for contribution in &plugin.package.manifest.contributes.tools {
-            if plugin.native_views.contains_key(&contribution.view) {
+            if plugin
+                .package
+                .manifest
+                .views
+                .contains_key(&contribution.view)
+            {
                 tools.push(Arc::new(ExternalToolFactory::new(
                     plugin.clone(),
                     contribution.clone(),
@@ -53,7 +58,12 @@ pub fn install(
             }
         }
         for contribution in &plugin.package.manifest.contributes.tabs {
-            if plugin.native_views.contains_key(&contribution.view) {
+            if plugin
+                .package
+                .manifest
+                .views
+                .contains_key(&contribution.view)
+            {
                 contents.push(Arc::new(ExternalContentFactory::new(
                     plugin.clone(),
                     contribution.clone(),

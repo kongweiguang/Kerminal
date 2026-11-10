@@ -57,6 +57,33 @@ fn reports_unreachable_chord_prefixes_in_either_order() {
     );
 }
 
+/// 插件绑定追加到已有解析表后必须保留原动作，独立测试入口也要覆盖这条共享路径。
+///
+/// @author kongweiguang
+#[test]
+fn extends_compiled_keymap_without_changing_action() {
+    let source = CompiledKeybindings::compile(
+        &[preference(
+            "settings.open",
+            "Ctrl+Alt+S",
+            "",
+            "",
+            KeybindingScope::Global,
+        )],
+        KeybindingPlatform::Windows,
+    );
+    let mut destination = CompiledKeybindings::compile(&[], KeybindingPlatform::Windows);
+    destination.extend_bindings(source.keymap().bindings().cloned().collect());
+
+    let key = Keystroke::parse("ctrl-alt-s").expect("parse shortcut");
+    assert_eq!(
+        destination
+            .resolve(&[key], &terminal_context_stack(), false, false, false)
+            .action,
+        Some(KeybindingAction::SettingsOpen)
+    );
+}
+
 /// 构造包含新增可选平台字段的测试配置，避免测试依赖用户配置文件。
 ///
 /// @author kongweiguang

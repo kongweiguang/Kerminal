@@ -28,9 +28,71 @@ pub struct PluginWebViewResourceDocument {
     pub(super) instance_id: String,
     pub(super) entrypoint: String,
     pub(super) resources: BTreeMap<String, PluginWebViewResource>,
+    pub(super) network_hosts: Vec<String>,
+    pub(super) initialization_script: Option<String>,
 }
 
 impl PluginWebViewResourceDocument {
+    /// 从启动校验后的包快照构造，网页资源和网络权限均不得回退读取磁盘。
+    pub fn from_prepared(
+        prepared: &kerminal_application::external_contributions::PreparedPlugin,
+        view_id: &str,
+        instance_id: String,
+    ) -> AppResult<Self> {
+        use kerminal_plugin_protocol::ViewDefinition;
+
+        let Some(ViewDefinition::Webview { entry, csp, .. }) =
+            prepared.package.manifest.views.get(view_id)
+        else {
+            return Err(AppError::invalid("插件贡献不是网页视图"));
+        };
+        let resources = prepared.resources.iter().filter_map(|(path, bytes)| {
+            content_type(path).map(|content_type| {
+                (
+                    path.clone(),
+                    PluginWebViewResource {
+                        content_type,
+                        bytes: bytes.clone(),
+                    },
+                )
+            })
+        });
+        let mut document = Self::new(
+            prepared.id.as_str().to_owned(),
+            instance_id,
+            entry.clone(),
+            resources,
+        )?;
+        if let Some(csp) = csp.as_deref().filter(|csp| *csp != "default") {
+            for origin in csp.split_whitespace() {
+                let Some(host) = origin.strip_prefix("https://") else {
+                    return Err(AppError::invalid("插件网页网络地址无效"));
+                };
+                if host.is_empty()
+                    || !host
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+                    || !prepared
+                        .package
+                        .manifest
+                        .permissions
+                        .iter()
+                        .any(|permission| permission.allows_network_host(host))
+                {
+                    return Err(AppError::invalid("插件网页网络地址未获授权"));
+                }
+                document.network_hosts.push(origin.to_owned());
+            }
+        }
+        Ok(document)
+    }
+
+    /// 宿主生成的桥接只在页面入口初始化，插件资源不能替换实例身份。
+    pub(crate) fn with_initialization_script(mut self, script: String) -> Self {
+        self.initialization_script = Some(script);
+        self
+    }
+
     /// 消费冻结集合而非路径；重复、大小写别名和 URL 歧义在创建原生页面前统一拒绝。
     pub fn new(
         plugin_id: String,
@@ -70,6 +132,8 @@ impl PluginWebViewResourceDocument {
             instance_id,
             entrypoint,
             resources: frozen,
+            network_hosts: Vec::new(),
+            initialization_script: None,
         })
     }
 }
@@ -95,6 +159,14 @@ impl From<PluginWebViewResourceDocument> for PluginWebViewSource {
 }
 
 impl PluginWebViewSource {
+    /// 内联验收文档沿用原有行为，正式资源文档可携带宿主生成的桥接脚本。
+    pub(super) fn initialization_script(&self) -> Option<&str> {
+        match self {
+            Self::Inline(_) => None,
+            Self::Resources(document) => document.initialization_script.as_deref(),
+        }
+    }
+
     /// 事件身份取自同一输入，不允许资源入口另行指定桥接身份。
     pub(super) fn instance_id(&self) -> &str {
         match self {

@@ -19,7 +19,7 @@ pub(super) struct DocumentProtocol {
     origins: [String; 2],
     entrypoint: String,
     resources: BTreeMap<String, PluginWebViewResource>,
-    csp: &'static str,
+    csp: String,
 }
 
 impl DocumentProtocol {
@@ -36,13 +36,20 @@ impl DocumentProtocol {
                         bytes: Arc::from(document.html.into_bytes()),
                     },
                 )]),
-                INLINE_CSP,
+                INLINE_CSP.to_owned(),
             ),
             PluginWebViewSource::Resources(document) => (
                 document.plugin_id,
                 document.entrypoint,
                 document.resources,
-                RESOURCE_CSP,
+                if document.network_hosts.is_empty() {
+                    RESOURCE_CSP.to_owned()
+                } else {
+                    RESOURCE_CSP.replace(
+                        "connect-src 'none'",
+                        &format!("connect-src {}", document.network_hosts.join(" ")),
+                    )
+                },
             ),
         };
         Self {
@@ -125,7 +132,8 @@ impl DocumentProtocol {
         );
         response.headers_mut().insert(
             "Content-Security-Policy",
-            wry::http::HeaderValue::from_static(self.csp),
+            wry::http::HeaderValue::from_str(&self.csp)
+                .unwrap_or_else(|_| wry::http::HeaderValue::from_static(RESOURCE_CSP)),
         );
         response.headers_mut().insert(
             "X-Content-Type-Options",
@@ -144,14 +152,25 @@ pub(super) fn builder<'a>(
     document: PluginWebViewSource,
     sender: SyncSender<PluginWebViewEvent>,
 ) -> wry::WebViewBuilder<'a> {
+    let initialization_script = document.initialization_script().map(str::to_owned);
     let message_id = document.instance_id().to_owned();
     let loaded_id = message_id.clone();
+    let navigation_id = message_id.clone();
+    let new_window_id = message_id.clone();
+    let navigation_sender = sender.clone();
+    let new_window_sender = sender.clone();
     let protocol = Arc::new(DocumentProtocol::new(document));
     let navigation = protocol.clone();
     let ipc_protocol = protocol.clone();
     let loaded_protocol = protocol.clone();
     let loaded_sender = sender.clone();
-    wry::WebViewBuilder::new()
+    let builder = wry::WebViewBuilder::new();
+    let builder = if let Some(script) = initialization_script {
+        builder.with_initialization_script(script)
+    } else {
+        builder
+    };
+    builder
         .with_url(protocol.url())
         .with_visible(false)
         .with_focused(false)
@@ -160,9 +179,19 @@ pub(super) fn builder<'a>(
         .with_clipboard(false)
         .with_general_autofill_enabled(false)
         .with_permission_handler(|_| wry::PermissionResponse::Deny)
-        .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+        .with_new_window_req_handler(move |url, _| {
+            enqueue_external_navigation(&new_window_sender, &new_window_id, &url);
+            wry::NewWindowResponse::Deny
+        })
         .with_download_started_handler(|_, _| false)
-        .with_navigation_handler(move |url| navigation.permits_document(&url))
+        .with_navigation_handler(move |url| {
+            if navigation.permits_document(&url) {
+                true
+            } else {
+                enqueue_external_navigation(&navigation_sender, &navigation_id, &url);
+                false
+            }
+        })
         .with_custom_protocol("kplugin".into(), move |_, request| {
             protocol.response(&request)
         })
@@ -185,6 +214,20 @@ pub(super) fn builder<'a>(
                 });
             }
         })
+}
+
+/// 队列仅传递有界 HTTPS 候选；是否授予打开权限仍由实例绑定的宿主路由决定。
+pub(super) fn enqueue_external_navigation(
+    sender: &SyncSender<PluginWebViewEvent>,
+    instance_id: &str,
+    url: &str,
+) {
+    if url.len() <= 4096 && url.starts_with("https://") && !url.chars().any(char::is_control) {
+        let _ = sender.try_send(PluginWebViewEvent::ExternalNavigation {
+            instance_id: instance_id.to_owned(),
+            url: url.to_owned(),
+        });
+    }
 }
 
 /// 保留目录分隔符，其余非安全字节逐字节编码，避免 UTF-8 名称被误认为查询或片段。

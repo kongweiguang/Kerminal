@@ -26,6 +26,18 @@ pub struct QuickOpenOpenContext {
     pub terminal: Option<QuickOpenTerminalTarget>,
     /// 搜索等不写 shell 的动作不依赖 prompt cleanliness，但仍绑定打开时的 owner/generation。
     pub terminal_binding: Option<UiSessionBinding>,
+    /// 启动快照中的插件命令和面板打开时的目标一起固定，确认时不追随其它标签。
+    pub plugin_commands: Vec<QuickOpenPluginCommand>,
+}
+
+/// UI 目录边界只保存稳定命令身份和安全上下文，不传递插件运行时或主机配置。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuickOpenPluginCommand {
+    pub plugin: String,
+    pub command: String,
+    pub title: String,
+    pub tab: Option<String>,
+    pub host: Option<String>,
 }
 
 /// 历史命令候选携带打开面板时的实际 UI binding 与 CAS 版本，不能重连后重新查找目标。
@@ -39,6 +51,7 @@ pub struct QuickOpenTerminalTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QuickOpenSelection {
     Action(KeybindingAction),
+    PluginCommand(QuickOpenPluginCommand),
     Host(HostId),
     Tab(TabId),
     Pane {

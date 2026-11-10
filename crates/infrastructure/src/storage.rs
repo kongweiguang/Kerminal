@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, System};
@@ -50,29 +50,30 @@ impl StorageCoordinator {
         let path = self.root.join(STORAGE_LOCK_FILE);
         let owner = current_lock_metadata().map_err(StorageLockError::Io)?;
 
-        let mut lock_file = None;
-        for _ in 0..3 {
+        // 同进程可能为同一根创建多个协调器；不同协调器的进程互斥不共享，但 OS 锁共享。
+        // 短暂持有会在另一个协调器释放后立刻可用，因此有界重试，而不是把正常启动顺序误报为活锁。
+        let mut contention_attempts = 0;
+        let file = loop {
             ensure_safe_lock_path(&path)?;
             match publish_lock_metadata(&self.root, &path, &owner) {
-                Ok(file) => {
-                    lock_file = Some(file);
-                    break;
-                }
+                Ok(file) => break file,
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     match reclaim_stale_lock(&self.root, &path, &owner)? {
-                        StaleLockRecovery::Acquired(file) => {
-                            lock_file = Some(file);
-                            break;
-                        }
+                        StaleLockRecovery::Acquired(file) => break file,
                         StaleLockRecovery::Retry => continue,
-                        StaleLockRecovery::Locked => return Err(StorageLockError::Locked),
+                        StaleLockRecovery::Locked => {
+                            contention_attempts += 1;
+                            if contention_attempts >= 100 {
+                                return Err(StorageLockError::Locked);
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
                     }
                 }
                 Err(error) => return Err(StorageLockError::Io(error)),
             }
-        }
+        };
 
-        let file = lock_file.ok_or(StorageLockError::Locked)?;
         if let Err(error) = sync_commit_directories(None, Some(self.root())) {
             tracing::warn!(
                 event = "storage_lock_directory_sync_failed",

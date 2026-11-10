@@ -32,6 +32,8 @@ mod platform_lifecycle;
 #[cfg(feature = "right-rail-acceptance")]
 mod plugin_acceptance;
 mod plugin_catalogs;
+#[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+mod plugin_webview_acceptance;
 mod plugins;
 mod profile_import;
 #[cfg(feature = "right-rail-acceptance")]
@@ -152,6 +154,25 @@ fn main() {
     // 导入只接收显式来源、目标与执行模式，不能让普通启动触及旧版真实数据。
     if let Some(exit_code) = profile_import::run_from_args(std::env::args_os().skip(1)) {
         std::process::exit(exit_code);
+    }
+    // 网页验收使用正式工厂和独立配置根，默认构建不开放此运行入口。
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--plugin-webview-acceptance")
+    {
+        #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+        {
+            if let Err(error) = plugin_webview_acceptance::run() {
+                eprintln!("插件网页验收运行失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(all(feature = "acceptance-metrics", feature = "right-rail-acceptance")))]
+        {
+            eprintln!("插件网页验收需要 acceptance-metrics 与 right-rail-acceptance features");
+            std::process::exit(1);
+        }
     }
     if std::env::args_os()
         .nth(1)

@@ -41,6 +41,30 @@ impl DesktopIsolationEvidence {
         Ok(())
     }
 
+    /// 插件验收运行普通应用窗口；只要已证明位于独立非输入桌面，可见窗口仍不占用用户桌面，
+    /// 不能套用右栏“必须隐藏”的采样约束。未知桌面或输入桌面仍失败关闭。
+    pub(crate) fn validate_plugin_window_state(
+        &self,
+        _visible: bool,
+        _active: bool,
+    ) -> Result<(), io::Error> {
+        let thread_desktop = self.ui_thread_desktop_name.as_deref().unwrap_or_default();
+        let input_desktop = self.input_desktop_name.as_deref().unwrap_or_default();
+        if !self.platform_supported
+            || !self.isolation_proven
+            || thread_desktop.is_empty()
+            || input_desktop.is_empty()
+            || thread_desktop.eq_ignore_ascii_case(input_desktop)
+            || self.ui_thread_id.is_none()
+            || self.process_id != Some(std::process::id())
+        {
+            return Err(io::Error::other(format!(
+                "插件验收未证明窗口位于独立的非输入桌面：{self:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// 动效专项允许显示之前必须先证明 UI 线程属于本轮私有桌面，绝不依赖隐藏窗口的默认状态。
     ///
     /// @author kongweiguang

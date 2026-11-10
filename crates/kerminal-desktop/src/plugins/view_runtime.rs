@@ -4,14 +4,14 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use kerminal_application::{
     AppError, AppResult,
     plugin_ports::{
         PluginProcessPort, PluginRuntime, PluginRuntimeEvent, PluginViewIdentity,
-        PluginViewSavedState,
+        PluginViewSavedState, PluginWebViewEventSubscription, PluginWebViewEventTarget,
     },
     plugin_runtime::PluginRuntimeService,
     plugin_settings::PluginSecretRepository,
@@ -19,7 +19,7 @@ use kerminal_application::{
 use kerminal_domain::plugins::{PluginId, PluginRuntimeState};
 use kerminal_ui::plugins::external::runtime::{
     AsyncViewRuntime, RuntimeEvent, RuntimeEventFuture, RuntimeFuture, RuntimeReply,
-    RuntimeRequest, RuntimeSubscription,
+    RuntimeRequest, RuntimeSubscription, WebViewEvents, WebViewEventsFuture, WebViewHostFuture,
 };
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -69,6 +69,51 @@ fn generation(
 }
 
 impl AsyncViewRuntime for DesktopViewRuntime {
+    /// 应用层完成实例与权限核对，桌面只把真实有界接收流适配成 UI 端口。
+    fn subscribe_webview_events(
+        &self,
+        target: PluginWebViewEventTarget,
+        params: Value,
+        request_cancellation: CancellationToken,
+        lifetime: CancellationToken,
+    ) -> WebViewEventsFuture {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime
+                .subscribe_webview_events(target, params, request_cancellation, lifetime)
+                .map(|stream| Box::new(DesktopWebViewEvents(stream)) as Box<dyn WebViewEvents>)
+        })
+    }
+
+    /// 页面与插件进程共用应用层门禁；计时留在既有 Tokio 适配层，不让 UI 引入运行时。
+    fn route_webview(
+        &self,
+        identity: PluginViewIdentity,
+        method: String,
+        params: Value,
+        cancellation: CancellationToken,
+    ) -> WebViewHostFuture {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let timeout_cancellation = cancellation.clone();
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                runtime.route_webview(&identity, &method, params, cancellation),
+            )
+            .await
+            {
+                Ok(reply) => reply,
+                Err(_) => {
+                    timeout_cancellation.cancel();
+                    Err(kerminal_application::plugin_ports::PluginHostError {
+                        code: kerminal_plugin_protocol::runtime::error_code::INTERNAL_ERROR,
+                        message: "WebView host request timed out".into(),
+                    })
+                }
+            }
+        })
+    }
+
     /// 指定实例重试沿用应用层登记身份及同一截止时间，绝不重放此前动作。
     fn retry_reopen(
         &self,
@@ -246,6 +291,18 @@ impl AsyncViewRuntime for DesktopViewRuntime {
             .await
             .map_err(|_| AppError::timeout("保存插件秘密"))?
         })
+    }
+}
+
+struct DesktopWebViewEvents(PluginWebViewEventSubscription);
+
+impl WebViewEvents for DesktopWebViewEvents {
+    /// 借用原流维持事件顺序，不建第二条广播管道或隐式绑定活动标签。
+    fn recv(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<Option<Value>>> + Send + '_>>
+    {
+        Box::pin(self.0.recv())
     }
 }
 

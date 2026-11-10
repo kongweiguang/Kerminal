@@ -276,3 +276,71 @@ fn runtime_yields_to_ime_text_fields_and_repeats() {
         );
     }
 }
+
+/// 插件动作进入同一解析表，并共享输入门禁；用户绑定及其组合键前缀优先于插件声明。
+#[test]
+fn plugin_shortcuts_share_focus_ime_repeat_and_conflict_gates() {
+    use super::super::plugin_commands::{PluginCommand, PluginCommandId};
+    let id = PluginCommandId {
+        plugin: "fixture.commands".into(),
+        command: "open".into(),
+    };
+    let mut runtime = RootKeybindingRuntime::default();
+    runtime.update(&[preference(
+        "settings.open",
+        "ctrl-k ctrl-s",
+        KeybindingScope::Global,
+    )]);
+    let command = PluginCommand {
+        id: id.clone(),
+        title: "Open".into(),
+        keybinding: Some("ctrl-alt-o".into()),
+    };
+    assert!(
+        runtime
+            .install_plugin_commands(std::slice::from_ref(&command))
+            .is_empty()
+    );
+    let key = Keystroke::parse("ctrl-alt-o").unwrap();
+    for scope in [
+        KeybindingFocusScope::App,
+        KeybindingFocusScope::Workspace,
+        KeybindingFocusScope::Terminal,
+    ] {
+        assert_eq!(
+            runtime.dispatch(&key, scope, false, false, false),
+            KeybindingDispatch::Plugin(id.clone())
+        );
+    }
+    for (scope, ime, text, repeat) in [
+        (KeybindingFocusScope::Editor, false, true, false),
+        (KeybindingFocusScope::Modal, false, false, false),
+        (KeybindingFocusScope::Terminal, true, false, false),
+        (KeybindingFocusScope::Terminal, false, false, true),
+    ] {
+        assert_eq!(
+            runtime.dispatch(&key, scope, ime, text, repeat),
+            KeybindingDispatch::Unhandled
+        );
+    }
+    runtime.update(&[preference(
+        "settings.open",
+        "ctrl-k ctrl-s",
+        KeybindingScope::Global,
+    )]);
+    let conflicting = PluginCommand {
+        keybinding: Some("ctrl-k".into()),
+        ..command
+    };
+    assert_eq!(runtime.install_plugin_commands(&[conflicting]).len(), 1);
+    assert_eq!(
+        runtime.dispatch(
+            &Keystroke::parse("ctrl-k").unwrap(),
+            KeybindingFocusScope::App,
+            false,
+            false,
+            false
+        ),
+        KeybindingDispatch::Pending
+    );
+}
