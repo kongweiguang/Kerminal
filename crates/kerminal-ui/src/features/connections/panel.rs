@@ -2145,6 +2145,11 @@ impl ConnectionsPanel {
                             {
                                 panel.selected_host = None;
                             }
+                            if let Some(status) = panel.reconcile_pending_deletions_after_reload(cx)
+                                && panel.status_after_reload.is_none()
+                            {
+                                panel.status_after_reload = Some(status);
+                            }
                             if let Some(status) = panel.status_after_reload.take() {
                                 panel.status = Some(status);
                             } else if !panel.external_conflict && !panel.save_outcome_unknown {
@@ -2591,16 +2596,108 @@ impl ConnectionsPanel {
     }
 
     /// 取消最上层的删除确认；写入门禁、未知回执和只读恢复仍由各取消入口裁决。
+    /// Escape 的归属必须给出明确反馈：替换列表后目标消失走取消路径，提交在途则保留并说明原因。
     ///
     /// @author kongweiguang
     pub(crate) fn cancel_pending_deletion_confirmation(&mut self, cx: &mut Context<Self>) {
         if self.local_hosts.pending_delete.is_some() {
             self.cancel_delete_local_host(cx);
         } else if self.pending_host_deletion.is_some() {
+            if self.configuration_mutation_busy {
+                self.status = Some(
+                    crate::locale::text(
+                        "主机删除正在提交，完成前不能取消确认。",
+                        "The host deletion is being submitted; its confirmation cannot be cancelled yet.",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
             self.cancel_host_deletion(cx);
+            self.status = Some(
+                crate::locale::text(
+                    "已取消主机删除确认。",
+                    "Host deletion confirmation cancelled.",
+                )
+                .to_string(),
+            );
+            cx.notify();
         } else if self.pending_group_deletion.is_some() {
+            if self.configuration_mutation_busy {
+                self.status = Some(
+                    crate::locale::text(
+                        "分组删除正在提交，完成前不能取消确认。",
+                        "The group deletion is being submitted; its confirmation cannot be cancelled yet.",
+                    )
+                    .to_string(),
+                );
+                cx.notify();
+                return;
+            }
             self.cancel_group_deletion(cx);
+            self.status = Some(
+                crate::locale::text(
+                    "已取消分组删除确认。",
+                    "Group deletion confirmation cancelled.",
+                )
+                .to_string(),
+            );
+            cx.notify();
         }
+    }
+
+    /// 重载成功后核对待删目标是否仍在最新快照里；目标消失时必须走既有取消路径清 pending
+    /// 和 Root return surface，避免 active=true 但确认层为空。写入在途时保留确认，
+    /// 由回执收尾，同时给出可见原因。
+    ///
+    /// @author kongweiguang
+    fn reconcile_pending_deletions_after_reload(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let mut status = None;
+        if self.pending_host_deletion.is_some() && !self.host_deletion_confirmation_visible() {
+            if self.configuration_mutation_busy {
+                status = Some(
+                    crate::locale::text(
+                        "主机删除目标已被刷新移除；提交结果仍在核对，完成前不会自动重试。",
+                        "The host deletion target was removed by the refresh; its outcome is still being confirmed and will not be retried automatically.",
+                    )
+                    .to_string(),
+                );
+            } else {
+                self.cancel_host_deletion(cx);
+                status = Some(
+                    crate::locale::text(
+                        "主机删除目标已不存在；已取消删除确认。",
+                        "The host deletion target no longer exists; the confirmation was cancelled.",
+                    )
+                    .to_string(),
+                );
+            }
+        }
+        if self.pending_group_deletion.is_some() && !self.group_deletion_confirmation_visible() {
+            if self.configuration_mutation_busy {
+                status.get_or_insert_with(|| {
+                    crate::locale::text(
+                        "分组删除目标已被刷新移除；提交结果仍在核对，完成前不会自动重试。",
+                        "The group deletion target was removed by the refresh; its outcome is still being confirmed and will not be retried automatically.",
+                    )
+                    .to_string()
+                });
+            } else {
+                self.cancel_group_deletion(cx);
+                status = Some(
+                    crate::locale::text(
+                        "分组删除目标已不存在；已取消删除确认。",
+                        "The group deletion target no longer exists; the confirmation was cancelled.",
+                    )
+                    .to_string(),
+                );
+            }
+        }
+        status
     }
 
     /// 撤销尚未提交的删除确认；无后台删除任务时不会触碰持久数据。

@@ -39,8 +39,7 @@ impl ConnectionsPanel {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = ThemeTokens::current(window, cx);
-        let selected_host = self.selected_host_snapshot();
-        let layers = confirmation_layers(self, selected_host.as_ref(), theme, true, cx);
+        let layers = confirmation_layers(self, theme, true, cx);
         (!layers.is_empty()).then(|| {
             div()
                 .id("workbench-connections-confirmation-layer")
@@ -117,20 +116,16 @@ pub(super) fn root_confirmation_layer_plan(
     )
 }
 
-/// 确认层只在选中主机仍匹配待删主机时出现；Root overlay 只接管可触发 Root 模态的子集。
+/// 确认层只在待删目标仍存在于当前 rows/groups 时出现；主机名与删除范围直接取自 pending 行，
+/// 不再依赖 selected_host，避免 active=true 而确认层为空形成隐形模态。
 ///
 /// @author kongweiguang
 fn confirmation_layers(
     panel: &mut ConnectionsPanel,
-    selected_host: Option<&ManagedHost>,
     theme: ThemeTokens,
     root_only: bool,
     cx: &mut Context<ConnectionsPanel>,
 ) -> Vec<AnyElement> {
-    let host_deletion = panel
-        .pending_host_deletion
-        .clone()
-        .is_some_and(|pending| selected_host.is_some_and(|host| host.id == pending.host_id));
     let plan = if root_only {
         root_confirmation_layer_plan(
             panel.host_deletion_confirmation_visible(),
@@ -141,8 +136,8 @@ fn confirmation_layers(
         )
     } else {
         confirmation_layer_plan(
-            host_deletion,
-            panel.pending_group_deletion.is_some(),
+            panel.host_deletion_confirmation_visible(),
+            panel.group_deletion_confirmation_visible(),
             panel.local_hosts.pending_delete.is_some(),
             panel.pending_external_password.is_some(),
             panel.pending_external_username.is_some(),
@@ -154,8 +149,12 @@ fn confirmation_layers(
         .filter_map(|layer| match layer {
             ConnectionsConfirmationLayer::HostDeletion => {
                 let pending = pending_host_deletion.as_ref()?;
-                let host = selected_host.filter(|host| host.id == pending.host_id)?;
-                Some(render_host_deletion_confirmation(panel, host, theme, cx))
+                let host = panel
+                    .rows
+                    .iter()
+                    .find(|host| host.id == pending.host_id)
+                    .cloned()?;
+                Some(render_host_deletion_confirmation(panel, &host, theme, cx))
             }
             ConnectionsConfirmationLayer::GroupDeletion => {
                 Some(render_group_deletion_confirmation(panel, theme, cx))
@@ -190,7 +189,6 @@ impl Render for ConnectionsPanel {
         let readonly = self.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
         let editing = self.editor_open();
         let editing_group = self.presentation.shows_group_editor();
-        let selected_host = self.selected_host_snapshot();
         let content = if editing {
             render_editor(self, theme, window, cx).into_any_element()
         } else if editing_group {
@@ -286,13 +284,7 @@ impl Render for ConnectionsPanel {
         // 删除确认统一挂在面板最上层的居中弹层里，确认卡不再参与内容流排版，
         // 避免在主机空状态下把整块工作区拉成横跨窗口的大弹框。远端/分组/本地与外部凭据
         // 都留在面板 Render 内；Root 只额外承载会触发 Root 模态的本地删除与外部凭据子集。
-        panel = panel.children(confirmation_layers(
-            self,
-            selected_host.as_ref(),
-            theme,
-            false,
-            cx,
-        ));
+        panel = panel.children(confirmation_layers(self, theme, false, cx));
 
         panel
     }
@@ -618,14 +610,6 @@ fn local_host_detail_label(
         .text_size(theme.text_xs)
         .text_color(theme.muted)
         .child(label)
-}
-
-impl ConnectionsPanel {
-    /// 返回选中主机快照副本，避免绘制代码持有跨事件可变借用。
-    fn selected_host_snapshot(&self) -> Option<ManagedHost> {
-        let selected = self.selected_host.as_ref()?;
-        self.rows.iter().find(|host| &host.id == selected).cloned()
-    }
 }
 
 /// 分组创建可嵌在主机编辑弹层内；两种入口共用输入、CAS 和未知结果核对流程。

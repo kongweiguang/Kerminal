@@ -915,3 +915,211 @@ fn saved_selection_event_preserves_host_and_profile_identity() {
         },
     );
 }
+
+/// 组装带合法 revision 的远端主机，供删除确认状态回归复用。
+///
+/// @author kongweiguang
+fn deletion_test_host(name: &str) -> ManagedHost {
+    ManagedHost {
+        id: HostId::new(),
+        group_id: None,
+        name: name.to_owned(),
+        note: None,
+        protocol: RemoteProtocol::Ssh,
+        endpoint: HostEndpoint {
+            host: "fixture.example.test".into(),
+            port: 22,
+            username: "tester".into(),
+        },
+        authentication: None,
+        authentication_mode: HostAuthenticationMode::Agent,
+        rdp_password: None,
+        route: HostRouteSettings::default(),
+        serial: None,
+        tags: Vec::new(),
+        sort_order: 0,
+        connect_timeout_ms: 12_000,
+        keepalive_interval_ms: None,
+        terminal_options: HostTerminalOptions::default(),
+        sftp_options: HostSftpOptions::default(),
+        rdp_display: RdpDisplayOptions::default(),
+        created_at: "1".into(),
+        updated_at: "1".into(),
+        revision: ConfigRevision::from_sha256(format!("{name}-revision")),
+    }
+}
+
+/// 删除确认渲染直接使用 pending 目标行；selected_host 漂移后 Root active 与面板层
+/// 必须仍然一致，不能出现 active=true 但确认层为空。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn host_deletion_confirmation_uses_pending_row_after_selection_drift(app: &mut TestAppContext) {
+    let deleting = deletion_test_host("delete-target");
+    let other = deletion_test_host("other-host");
+    let (_runtime, panel, visual) = super::connections_editor_dirty_tests::fixture(
+        app,
+        vec![deleting.clone(), other.clone()],
+        Vec::new(),
+    );
+    visual.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.selected_host = Some(other.id.clone());
+            panel.pending_host_deletion = Some(super::PendingHostDeletion {
+                host_id: deleting.id.clone(),
+                revision: deleting.revision.clone(),
+            });
+            assert!(panel.host_deletion_confirmation_visible());
+            assert!(panel.root_confirmation_active());
+            cx.notify();
+        });
+        window.draw(app).clear(app);
+        let id: gpui_kit::ElementId = "connections-delete-host-confirmation".into();
+        assert!(
+            gpui_kit::base::test_support::snapshots(window)
+                .into_iter()
+                .any(|node| node.visible() && node.path().contains(&id)),
+            "pending row must render even when selection drifted"
+        );
+    });
+}
+
+/// 读回后的新快照不再包含删除目标时，必须清 pending 与确认层，并允许退出；
+/// 提交在途时保留 pending 但给出可见提示，由回执收尾。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn deletion_confirmation_reconciles_targets_removed_by_reload(app: &mut TestAppContext) {
+    let deleting = deletion_test_host("delete-target");
+    let group = HostGroup {
+        id: "fixture-group".into(),
+        name: "测试分组".into(),
+        sort_order: 0,
+        created_at: "1".into(),
+        updated_at: "1".into(),
+    };
+    let (_runtime, panel, visual) =
+        super::connections_editor_dirty_tests::fixture(app, vec![deleting.clone()], vec![group]);
+    visual.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.selected_host = Some(deleting.id.clone());
+            panel.pending_host_deletion = Some(super::PendingHostDeletion {
+                host_id: deleting.id.clone(),
+                revision: deleting.revision.clone(),
+            });
+            panel.pending_group_deletion = Some(super::PendingGroupDeletion {
+                group_id: "fixture-group".into(),
+                revision: ConfigRevision::from_sha256("fixture-groups".into()),
+            });
+            assert!(panel.root_confirmation_active());
+
+            // 模拟一次成功 reload 已经应用的新 rows/groups：两个目标都不在其中。
+            panel.rows.clear();
+            panel.groups.clear();
+            let status = panel.reconcile_pending_deletions_after_reload(cx);
+            assert!(panel.pending_host_deletion.is_none());
+            assert!(panel.pending_group_deletion.is_none());
+            assert!(!panel.root_confirmation_active());
+            assert!(!panel.has_pending_deletion_confirmation());
+            assert!(
+                status
+                    .as_ref()
+                    .is_some_and(|status| status.contains("已取消删除确认")
+                        || status.contains("was cancelled")),
+                "removed targets must surface an explicit cancellation"
+            );
+            panel.status = status;
+            cx.notify();
+        });
+        assert!(
+            panel.read(app).quit_block_reason(app).is_none(),
+            "removed deletion targets must not block quit"
+        );
+        window.draw(app).clear(app);
+        for selector in [
+            "connections-delete-host-confirmation",
+            "rr-connections-delete-host-card",
+        ] {
+            let id: gpui_kit::ElementId = selector.into();
+            assert!(
+                !gpui_kit::base::test_support::snapshots(window)
+                    .into_iter()
+                    .any(|node| node.visible() && node.path().contains(&id)),
+                "removed target must not leave an invisible confirmation layer: {selector}"
+            );
+        }
+    });
+
+    let other = deletion_test_host("other-host");
+    visual.update(|_, app| {
+        panel.update(app, |panel, cx| {
+            panel.pending_host_deletion = Some(super::PendingHostDeletion {
+                host_id: other.id.clone(),
+                revision: other.revision.clone(),
+            });
+            panel.configuration_mutation_busy = true;
+            panel.rows.clear();
+            let status = panel.reconcile_pending_deletions_after_reload(cx);
+            assert!(
+                panel.pending_host_deletion.is_some(),
+                "in-flight submit must retain its pending snapshot"
+            );
+            assert!(
+                status
+                    .as_ref()
+                    .is_some_and(|status| status.contains("仍在核对")
+                        || status.contains("still being confirmed")),
+                "retained pending must explain why it stays"
+            );
+            panel.configuration_mutation_busy = false;
+        });
+    });
+}
+
+/// Escape 取消删除确认必须给出明确状态；提交在途时保留确认并说明不能取消。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn escape_deletion_confirmation_reports_cancellation_or_in_flight_reason(app: &mut TestAppContext) {
+    let host = deletion_test_host("delete-target");
+    let (_runtime, panel, visual) =
+        super::connections_editor_dirty_tests::fixture(app, vec![host.clone()], Vec::new());
+    visual.update(|_, app| {
+        panel.update(app, |panel, cx| {
+            panel.pending_host_deletion = Some(super::PendingHostDeletion {
+                host_id: host.id.clone(),
+                revision: host.revision.clone(),
+            });
+            panel.cancel_pending_deletion_confirmation(cx);
+            assert!(panel.pending_host_deletion.is_none());
+            assert!(
+                panel
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.contains("已取消")
+                        || status.contains("cancelled")),
+                "escape must report the cancellation"
+            );
+
+            panel.pending_host_deletion = Some(super::PendingHostDeletion {
+                host_id: host.id.clone(),
+                revision: host.revision.clone(),
+            });
+            panel.configuration_mutation_busy = true;
+            panel.cancel_pending_deletion_confirmation(cx);
+            assert!(
+                panel.pending_host_deletion.is_some(),
+                "in-flight deletion confirmation must be retained"
+            );
+            assert!(
+                panel
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.contains("不能取消")
+                        || status.contains("cannot be cancelled")),
+                "in-flight escape must explain why it cannot cancel"
+            );
+            panel.configuration_mutation_busy = false;
+        });
+    });
+}
