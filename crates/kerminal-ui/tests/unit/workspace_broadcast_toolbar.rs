@@ -41,6 +41,8 @@ fn mode_menu_explains_current_target_and_effective_counts() {
     let projection = WorkspaceBroadcastBarProjection {
         pane_count: 3,
         selected_count: 1,
+        // 仅一个 target 选中时用 Custom 才与 selected_count 自洽；默认 All 会要求全选。
+        mode: WorkspaceBroadcastTargetMode::Custom,
         targets: vec![
             target("pane-current", "本地终端", true, true, true),
             target("pane-ready", "172.16.41.45", false, false, true),
@@ -153,6 +155,53 @@ fn trigger_accessibility_keeps_mode_and_counts() {
         crate::locale::text(
             "发送目标：全部分屏 · 共 2 个分屏，已选 2 个；群发结果有异常，打开查看详情",
             "Broadcast targets: All panes · 2 panes, 2 selected; the last result has errors, open to review details",
+        )
+    );
+}
+
+/// 触发标签第一项固定取布局 pane 数，不能退化为可发送目标数；
+/// 当前聚焦失效时选中数归零仍要如实显示，模式与计数继续由提示承载。
+///
+/// @author kongweiguang
+#[test]
+fn trigger_label_uses_layout_pane_count_not_enabled_target_count() {
+    let mut projection = WorkspaceBroadcastBarProjection {
+        pane_count: 3,
+        selected_count: 2,
+        mode: WorkspaceBroadcastTargetMode::All,
+        targets: vec![
+            target("pane-current", "本地终端", true, true, true),
+            target("pane-ready", "172.16.41.45", false, true, true),
+            target("pane-offline", "离线主机", false, false, false),
+        ],
+        ..WorkspaceBroadcastBarProjection::default()
+    };
+
+    // 布局有 3 个 pane，但只有 2 个可发送；标签必须显示 3/2 而非 2/2。
+    assert_eq!(
+        target_mode_trigger_label(&projection),
+        crate::locale::text("分屏 3/2", "Panes 3/2").to_string()
+    );
+    assert_eq!(
+        target_mode_trigger_accessibility(&projection, false),
+        crate::locale::text(
+            "发送目标：全部分屏 · 共 3 个分屏，已选 2 个",
+            "Broadcast targets: All panes · 3 panes, 2 selected",
+        )
+    );
+
+    // 当前聚焦 pane 失效时生产投影给出 0 个选中目标，标签和无障碍都要如实降为 3/0。
+    projection.mode = WorkspaceBroadcastTargetMode::Current;
+    projection.selected_count = 0;
+    assert_eq!(
+        target_mode_trigger_label(&projection),
+        crate::locale::text("分屏 3/0", "Panes 3/0").to_string()
+    );
+    assert_eq!(
+        target_mode_trigger_accessibility(&projection, false),
+        crate::locale::text(
+            "发送目标：当前分屏 · 共 3 个分屏，已选 0 个",
+            "Broadcast targets: Current pane · 3 panes, 0 selected",
         )
     );
 }
