@@ -455,11 +455,15 @@ impl PluginStore {
             match apply_change(self, validator, &mut next.plugins, &change) {
                 Ok(()) => {
                     next.failures.remove(&id);
+                    next.pending_failures.remove(&id);
                 }
                 Err(reason) => {
                     blocked.insert(id.clone());
                     next.failures
                         .insert(id.clone(), failure_text(reason).to_owned());
+                    // 只有启动应用 pending 失败才把 failures 与待处理意图绑定；
+                    // 撤销入口据此拒绝把旧失败错配给后来排队的新操作。
+                    next.pending_failures.insert(id.clone());
                     rejected.insert(id, reason);
                     retained.push(change);
                 }
@@ -472,6 +476,7 @@ impl PluginStore {
                 Ok((directory, manifest)) => {
                     if !blocked.contains(id) {
                         next.failures.remove(id);
+                        next.pending_failures.remove(id);
                     }
                     plugins.push(BootPlugin {
                         id: id.clone(),
@@ -482,6 +487,8 @@ impl PluginStore {
                     });
                 }
                 Err(reason) => {
+                    // 包读取失败只说明包损坏，不构成可撤销的 pending 意图；
+                    // 若同一插件已有应用失败留下的绑定则保留，撤销仍针对那笔 pending。
                     next.failures
                         .insert(id.clone(), failure_text(reason).to_owned());
                     rejected.insert(id.clone(), reason);

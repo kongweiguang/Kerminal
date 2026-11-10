@@ -111,12 +111,15 @@ async fn failed_install_can_cancel_and_reinstall_same_version() {
     store.begin_startup(&validator, false).unwrap();
     let failed = store.load().unwrap().state;
     assert_eq!(failed.failures.len(), 1);
+    let id = PluginId::parse("acme.notes").unwrap();
+    assert!(failed.pending_failures.contains(&id));
     let receipt = installer.change(cancellation(&failed)).await.unwrap();
     assert!(!receipt.restart_required);
     assert!(receipt.cleanup_warning.is_none());
     let cancelled = store.load().unwrap().state;
     assert_eq!(cancelled.revision, receipt.revision);
     assert!(cancelled.pending.is_empty() && cancelled.failures.is_empty());
+    assert!(cancelled.pending_failures.is_empty());
     assert!(cancelled.plugins.is_empty());
     assert!(!directory.exists());
     let replay = installer.change(cancellation(&failed)).await.unwrap_err();
@@ -222,6 +225,35 @@ async fn cancel_rejects_unfailed_or_mismatched_pending() {
         .unwrap_err();
     assert_eq!(error.public_code(), PublicErrorCode::Conflict);
     assert_eq!(store.load().unwrap().state, failed);
+}
+
+/// 包读取失败没有启动应用绑定，后来排队的卸载不能被旧失败撤销，状态必须原样保留。
+#[tokio::test]
+async fn unbound_package_failure_cannot_cancel_later_pending() {
+    let (root, store, installer, validator) = fixture();
+    install_local(&installer, root.path(), "1.0.0").await;
+    store.begin_startup(&validator, false).unwrap();
+    let id = PluginId::parse("acme.notes").unwrap();
+    fs::write(
+        root.path()
+            .join("plugins/packages/acme.notes/1.0.0/kerminal-plugin.json"),
+        b"corrupt",
+    )
+    .unwrap();
+    store.begin_startup(&validator, false).unwrap();
+    let broken = store.load().unwrap().state;
+    assert!(broken.failures.contains_key(&id));
+    assert!(broken.pending.is_empty() && broken.pending_failures.is_empty());
+    installer
+        .change(ExtensionChange::Uninstall(id.clone()))
+        .await
+        .unwrap();
+    let queued = store.load().unwrap().state;
+    assert!(queued.failures.contains_key(&id));
+    assert!(!queued.pending_failures.contains(&id));
+    let error = installer.change(cancellation(&queued)).await.unwrap_err();
+    assert_eq!(error.public_code(), PublicErrorCode::Conflict);
+    assert_eq!(store.load().unwrap().state, queued);
 }
 
 /// 用户快照过期与读后并发 CAS 两种冲突都必须先失败，不能先清理包再发现冲突。

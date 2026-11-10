@@ -27,9 +27,15 @@ pub(super) fn cancel_failed_change(
     if &expected.state.pending[position] != pending || !expected.state.failures.contains_key(id) {
         return Err(AppError::conflict("插件失败操作已更改"));
     }
+    // 失败必须由当前 pending 的启动应用失败产生才可撤销；包读取失败留下的
+    // 旧记录不能借后来排队的新意图清除，否则会取消用户刚发起的别的操作。
+    if !expected.state.pending_failures.contains(id) {
+        return Err(AppError::conflict("插件失败与待处理操作不匹配"));
+    }
     let mut next = expected.state.clone();
     next.pending.remove(position);
     next.failures.remove(id);
+    next.pending_failures.remove(id);
     let mut cleanup_warning = None;
     let snapshot = store
         .publish_and_compare(expected, next.clone(), || {

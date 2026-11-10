@@ -1,7 +1,11 @@
 //! 外部插件的稳定身份与持久状态，不依赖进程或文件系统。
 //! @author kongweiguang
 
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
@@ -235,6 +239,10 @@ pub struct PluginStoreState {
     pub plugins: BTreeMap<PluginId, InstalledPlugin>,
     pub pending: Vec<PendingPluginChange>,
     pub failures: BTreeMap<PluginId, String>,
+    /// 只有启动应用 pending 失败产生的 failure 才属于可撤销意图；包读取失败不能被
+    /// 后续排队的新 pending 借用，因此用独立集合持久化绑定，旧状态缺省为空。
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pending_failures: BTreeSet<PluginId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot: Option<PluginBootMarker>,
 }
@@ -248,6 +256,7 @@ impl Default for PluginStoreState {
             plugins: BTreeMap::new(),
             pending: Vec::new(),
             failures: BTreeMap::new(),
+            pending_failures: BTreeSet::new(),
             boot: None,
         }
     }

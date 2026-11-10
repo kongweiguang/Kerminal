@@ -112,6 +112,61 @@ fn failed_update_preserves_active_version_and_other_plugins() {
     assert_eq!(boot.store.state.pending.len(), 1);
     assert_eq!(boot.rejected[&first], BootPackageError::Missing);
     assert_eq!(boot.enabled_plugins().count(), 2);
+    // 应用 pending 失败留下失败绑定；另一插件的读取成功不能误删它。
+    assert!(boot.store.state.pending_failures.contains(&first));
+    assert!(!boot.store.state.pending_failures.contains(&second));
+    package(root.path(), &first, &new);
+    let boot = store.begin_startup(&FixtureValidator, false).unwrap();
+    assert!(boot.store.state.failures.is_empty());
+    assert!(boot.store.state.pending_failures.is_empty());
+    assert!(boot.store.state.pending.is_empty());
+    assert_eq!(boot.store.state.plugins[&first].active, new);
+}
+
+#[test]
+/// 已安装包读取失败只记录原因，不与后来排队的操作绑定；修复后读取成功清除失败。
+fn package_read_failure_is_not_bound_to_later_pending() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    let id = PluginId::parse("acme.notes").unwrap();
+    let version = PluginVersion::parse("1.0.0").unwrap();
+    package(root.path(), &id, &version);
+    install(&store, &id, &version);
+    store.begin_startup(&FixtureValidator, false).unwrap();
+    let manifest = root
+        .path()
+        .join("plugins/packages")
+        .join(id.as_str())
+        .join(version.to_string())
+        .join("manifest");
+    fs::write(&manifest, b"corrupt").unwrap();
+    let broken = store.begin_startup(&FixtureValidator, false).unwrap();
+    assert_eq!(broken.rejected[&id], BootPackageError::Corrupt);
+    assert!(broken.store.state.failures.contains_key(&id));
+    // 包损坏不是可撤销的启动应用失败，不能产生绑定。
+    assert!(!broken.store.state.pending_failures.contains(&id));
+    fs::write(&manifest, format!("{id}@{version}")).unwrap();
+    let repaired = store.begin_startup(&FixtureValidator, false).unwrap();
+    assert!(repaired.store.state.failures.is_empty());
+    assert!(repaired.store.state.pending_failures.is_empty());
+
+    fs::write(&manifest, b"corrupt").unwrap();
+    store.begin_startup(&FixtureValidator, false).unwrap();
+    let current = store.load().unwrap();
+    let mut next = current.state.clone();
+    next.pending
+        .push(PendingPluginChange::Uninstall { id: id.clone() });
+    // 旧失败与新排队操作可以共存，但不会被自动绑定，撤销入口据此拒绝。
+    let queued = store.compare_and_swap(&current, next).unwrap();
+    assert!(queued.state.failures.contains_key(&id));
+    assert!(
+        queued
+            .state
+            .pending
+            .iter()
+            .any(|change| change.plugin_id() == &id)
+    );
+    assert!(!queued.state.pending_failures.contains(&id));
 }
 
 #[test]

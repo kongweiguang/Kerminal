@@ -6,8 +6,8 @@
 //! @author kongweiguang
 
 use super::{
-    Confirmation, ExtensionsEvent, ExtensionsPage, Filter, Operation, label, pending_only_failure,
-    sample, selection,
+    Confirmation, ExtensionsEvent, ExtensionsPage, Filter, Operation, cancelable_failed_change,
+    label, pending_only_failure, sample, selection,
 };
 use crate::theme::ThemeTokens;
 use gpui_kit::{
@@ -1318,11 +1318,8 @@ impl ExtensionsPage {
     ) -> Option<AnyElement> {
         let state = self.state.as_ref()?;
         let failure = state.failures.get(id)?.clone();
-        let pending = state
-            .pending
-            .iter()
-            .find(|change| change.plugin_id() == id)
-            .cloned();
+        // 原因始终展示；只有启动应用失败绑定到当前 pending 时才提供撤销。
+        let pending = cancelable_failed_change(state, id).cloned();
         let revision = state.revision;
         let mut block = div().w_full().flex().flex_col().gap_2().child(
             div()

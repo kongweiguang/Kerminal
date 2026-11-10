@@ -579,6 +579,7 @@ pub(crate) fn validate_state(state: &PluginStoreState) -> Result<(), PluginStore
     if state.schema != 1
         || state.plugins.len() > MAX_PLUGINS
         || state.failures.len() > MAX_PLUGINS
+        || state.pending_failures.len() > MAX_PLUGINS
         || state.pending.len() > MAX_PENDING
         || state
             .plugins
@@ -591,6 +592,15 @@ pub(crate) fn validate_state(state: &PluginStoreState) -> Result<(), PluginStore
             .is_some_and(|boot| uuid::Uuid::parse_str(&boot.id).is_err())
     {
         return Err(PluginStoreError::InvalidState);
+    }
+    // 绑定集合是撤销入口的唯一凭据：每个 id 必须同时拥有 failure 和 pending，
+    // 否则伪造或漂移的绑定会让旧失败错配到新排队操作。
+    for id in &state.pending_failures {
+        if !state.failures.contains_key(id)
+            || !state.pending.iter().any(|change| change.plugin_id() == id)
+        {
+            return Err(PluginStoreError::InvalidState);
+        }
     }
     for change in &state.pending {
         match change {

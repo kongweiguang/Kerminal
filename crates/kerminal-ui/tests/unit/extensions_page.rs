@@ -1,7 +1,7 @@
 //! 扩展页选择只使用当前平台的受信资产和语义版本。
 //! @author kongweiguang
 
-use super::{CatalogPlugin, pending_only_failure, sample, selection};
+use super::{CatalogPlugin, cancelable_failed_change, pending_only_failure, sample, selection};
 use kerminal_domain::plugins::{PluginId, PluginStoreState};
 use kerminal_plugin_protocol::Platform;
 use serde_json::json;
@@ -136,4 +136,41 @@ fn pending_only_failure_keeps_cancel_path() {
     }))
     .unwrap();
     assert_eq!(pending_only_failure(&installed, &id), None);
+}
+
+/// 撤销入口取决于失败是否绑定当前 pending：包读取失败的旧记录仍显示原因，但不能撤销。
+#[test]
+fn cancel_requires_failure_bound_to_pending() {
+    let pending = json!({
+        "op": "install",
+        "id": "acme.file-search",
+        "to": "1.0.0",
+        "staged": "packages/acme.file-search/1.0.0",
+        "source": "local",
+        "installed_at": "2026-11-10"
+    });
+    let id = PluginId::parse("acme.file-search").unwrap();
+    let bound: PluginStoreState = serde_json::from_value(json!({
+        "schema": 1,
+        "revision": 5,
+        "plugins": {},
+        "pending": [pending.clone()],
+        "failures": {"acme.file-search": "安装失败"},
+        "pending_failures": ["acme.file-search"]
+    }))
+    .unwrap();
+    assert!(cancelable_failed_change(&bound, &id).is_some());
+    assert_eq!(pending_only_failure(&bound, &id), Some("安装失败"));
+
+    let unbound: PluginStoreState = serde_json::from_value(json!({
+        "schema": 1,
+        "revision": 6,
+        "plugins": {},
+        "pending": [pending],
+        "failures": {"acme.file-search": "安装失败"}
+    }))
+    .unwrap();
+    assert!(cancelable_failed_change(&unbound, &id).is_none());
+    // 失败原因仍可展示，只是不提供撤销，避免把旧失败错绑到新排队的操作。
+    assert_eq!(pending_only_failure(&unbound, &id), Some("安装失败"));
 }

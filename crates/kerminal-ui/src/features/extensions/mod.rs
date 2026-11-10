@@ -16,7 +16,7 @@ use kerminal_application::{
         InstallProgress, LocalPackageInspection,
     },
 };
-use kerminal_domain::plugins::{PluginId, PluginStoreState};
+use kerminal_domain::plugins::{PendingPluginChange, PluginId, PluginStoreState};
 use kerminal_plugin_protocol::Platform;
 use std::{path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
@@ -848,6 +848,18 @@ fn pending_only_failure<'a>(state: &'a PluginStoreState, id: &PluginId) -> Optio
         return None;
     }
     state.failures.get(id).map(String::as_str)
+}
+
+/// 撤销入口只在启动应用 pending 失败留下的绑定上成立：包读取失败没有绑定，
+/// 即使后来排了新操作也不能借用它，避免页面把旧失败错绑到用户刚发起的变更。
+fn cancelable_failed_change<'a>(
+    state: &'a PluginStoreState,
+    id: &PluginId,
+) -> Option<&'a PendingPluginChange> {
+    if !state.pending_failures.contains(id) {
+        return None;
+    }
+    state.pending.iter().find(|change| change.plugin_id() == id)
 }
 
 /// 已安装版本和目录版本只按语义版本比较，不使用字符串排序。
