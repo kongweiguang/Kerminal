@@ -486,7 +486,7 @@ impl WorkspaceResourceOperationEntry {
     }
 
     /// 标签级关闭命中失败 ClosePane 时，把 Tab 意图与首个焦点票据挂到该 pane 的 entry；
-    /// 同一意图幂等，已有其它意图时拒绝覆盖，避免重复请求改写用户原始关闭目标。
+    /// 已有其它意图（例如先前关闭分屏候选）时保留原意图但仍允许重试，不能覆盖用户原始目标。
     ///
     /// @author kongweiguang
     fn retain_tab_close_after_failed_pane(
@@ -503,7 +503,8 @@ impl WorkspaceResourceOperationEntry {
         };
         match self.deferred_close.as_ref() {
             Some(existing) if existing == &intent => {}
-            Some(_) => return false,
+            // 原关闭意图优先；本次标签关闭只负责重试同一 ClosePane，成功后仍按原意图重放。
+            Some(_) => return true,
             None => {
                 self.cancel_requested = true;
                 self.deferred_close = Some(intent);
