@@ -28,9 +28,10 @@ use super::{
 };
 
 impl ConnectionsPanel {
-    /// 无编辑器时 Root 只需要确认层本身：外部凭据、本地/远端主机与分组删除确认都是独立居中模态，
+    /// 无编辑器时 Root 只需要承载能真正打开 Root 模态的确认层：本地主机删除与两类外部凭据；
+    /// 远端主机/分组删除仍由面板 Render 持有，prompt-only overlay 不会替它们占位。
     /// 再画一整块空主机面板会在弹层背后留下无意义的暗色大框。
-    /// 层顺序与面板内 Render 共用 confirmation_layers，最外层拦截点击并保持焦点陷阱稳定。
+    /// 层顺序与面板内 Render 共用同一层枚举，最外层拦截点击并保持焦点陷阱稳定。
     /// @author kongweiguang
     pub(crate) fn render_root_confirmation_overlay(
         &mut self,
@@ -39,7 +40,7 @@ impl ConnectionsPanel {
     ) -> Option<AnyElement> {
         let theme = ThemeTokens::current(window, cx);
         let selected_host = self.selected_host_snapshot();
-        let layers = confirmation_layers(self, selected_host.as_ref(), theme, cx);
+        let layers = confirmation_layers(self, selected_host.as_ref(), theme, true, cx);
         (!layers.is_empty()).then(|| {
             div()
                 .id("workbench-connections-confirmation-layer")
@@ -54,8 +55,8 @@ impl ConnectionsPanel {
     }
 }
 
-/// 确认层类型以固定顺序集中定义；Root 无编辑器 overlay 与面板 Render 都从这里取层，
-/// 避免新增远端/分组删除确认时只改一处而漏掉 prompt-only 分支。
+/// 确认层类型以固定顺序集中定义；面板 Render 取全部层，Root prompt-only overlay
+/// 只取其中能触发 Root 模态的子集，避免把面板内的远端/分组删除误当成 Root 模态。
 ///
 /// @author kongweiguang
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,7 +68,7 @@ pub(super) enum ConnectionsConfirmationLayer {
     ExternalUsername,
 }
 
-/// 按固定顺序返回当前应显示的全部确认层；条件与渲染 helper 保持同一来源。
+/// 按固定顺序返回面板 Render 应显示的全部确认层；条件与渲染 helper 保持同一来源。
 ///
 /// @author kongweiguang
 pub(super) fn confirmation_layer_plan(
@@ -96,26 +97,53 @@ pub(super) fn confirmation_layer_plan(
     layers
 }
 
-/// 确认层只在选中主机仍匹配待删主机时出现；顺序与面板原 Render 一致。
+/// Root prompt-only overlay 只承载会设置 `root_confirmation_active` 的层；
+/// 远端主机/分组删除没有 Root 模态与取消路径，必须留在面板 Render 内。
+///
+/// @author kongweiguang
+pub(super) fn root_confirmation_layer_plan(
+    local_host_deletion: bool,
+    external_password: bool,
+    external_username: bool,
+) -> Vec<ConnectionsConfirmationLayer> {
+    confirmation_layer_plan(
+        false,
+        false,
+        local_host_deletion,
+        external_password,
+        external_username,
+    )
+}
+
+/// 确认层只在选中主机仍匹配待删主机时出现；Root overlay 只接管可触发 Root 模态的子集。
 ///
 /// @author kongweiguang
 fn confirmation_layers(
     panel: &mut ConnectionsPanel,
     selected_host: Option<&ManagedHost>,
     theme: ThemeTokens,
+    root_only: bool,
     cx: &mut Context<ConnectionsPanel>,
 ) -> Vec<AnyElement> {
     let host_deletion = panel
         .pending_host_deletion
         .clone()
         .is_some_and(|pending| selected_host.is_some_and(|host| host.id == pending.host_id));
-    let plan = confirmation_layer_plan(
-        host_deletion,
-        panel.pending_group_deletion.is_some(),
-        panel.local_hosts.pending_delete.is_some(),
-        panel.pending_external_password.is_some(),
-        panel.pending_external_username.is_some(),
-    );
+    let plan = if root_only {
+        root_confirmation_layer_plan(
+            panel.local_hosts.pending_delete.is_some(),
+            panel.pending_external_password.is_some(),
+            panel.pending_external_username.is_some(),
+        )
+    } else {
+        confirmation_layer_plan(
+            host_deletion,
+            panel.pending_group_deletion.is_some(),
+            panel.local_hosts.pending_delete.is_some(),
+            panel.pending_external_password.is_some(),
+            panel.pending_external_username.is_some(),
+        )
+    };
     let pending_host_deletion = panel.pending_host_deletion.clone();
     let pending_local_delete = panel.local_hosts.pending_delete.clone();
     plan.into_iter()
@@ -252,9 +280,15 @@ impl Render for ConnectionsPanel {
         }
 
         // 删除确认统一挂在面板最上层的居中弹层里，确认卡不再参与内容流排版，
-        // 避免在主机空状态下把整块工作区拉成横跨窗口的大弹框。远端/分组/本地
-        // 与外部凭据共用同一层列表，prompt-only overlay 不会漏画其中任何一类。
-        panel = panel.children(confirmation_layers(self, selected_host.as_ref(), theme, cx));
+        // 避免在主机空状态下把整块工作区拉成横跨窗口的大弹框。远端/分组/本地与外部凭据
+        // 都留在面板 Render 内；Root 只额外承载会触发 Root 模态的本地删除与外部凭据子集。
+        panel = panel.children(confirmation_layers(
+            self,
+            selected_host.as_ref(),
+            theme,
+            false,
+            cx,
+        ));
 
         panel
     }

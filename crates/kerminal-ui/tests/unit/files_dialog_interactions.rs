@@ -526,7 +526,7 @@ fn stale_permission_receipt_keeps_new_target_state_and_releases_busy(app: &mut T
 }
 
 /// 没有旧清单时目录错误只在列表内联卡片出现一次：底栏不复述，重试落在卡片上，
-/// 而且 TCP 失败不能被误当成主机密钥问题弹出信任按钮。
+/// 而且 TCP 失败不能被误当成 known_hosts 记录问题弹出额外确认。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]

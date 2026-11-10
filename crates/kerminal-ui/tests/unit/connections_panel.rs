@@ -16,7 +16,9 @@ use kerminal_domain::{
 
 use gpui_kit::TestAppContext;
 
-use super::super::render::{ConnectionsConfirmationLayer, confirmation_layer_plan};
+use super::super::render::{
+    ConnectionsConfirmationLayer, confirmation_layer_plan, root_confirmation_layer_plan,
+};
 use super::{
     ConflictReloadTarget, ConnectionsEvent, ConnectionsPanel, ConnectionsPresentation,
     GroupSaveReconciliation, HostCredentialRecoveryAction, HostSaveReadback,
@@ -106,9 +108,9 @@ fn discard_continues_only_an_active_local_navigation_action() {
     ));
 }
 
-/// 远端、分组、本地删除与两类外部凭据共用同一层列表；顺序固定，
-/// 无编辑器 overlay 和面板 Render 因此不会分叉。真实 workbench prompt-only
-/// DOM 断言仍需 Root harness，见交付说明中的未覆盖项。
+/// 面板 Render 覆盖远端、分组、本地删除与两类外部凭据；Root prompt-only
+/// overlay 只取能触发 Root 模态的本地删除和外部凭据子集，顺序与面板一致。
+/// 真实 workbench prompt-only DOM 断言仍需 Root harness，见交付说明中的未覆盖项。
 /// @author kongweiguang
 #[test]
 fn confirmation_layer_plan_matches_panel_and_overlay_order() {
@@ -129,6 +131,15 @@ fn confirmation_layer_plan_matches_panel_and_overlay_order() {
     assert_eq!(
         confirmation_layer_plan(false, true, false, false, true),
         vec![GroupDeletion, ExternalUsername]
+    );
+    assert_eq!(
+        root_confirmation_layer_plan(true, true, true),
+        vec![LocalHostDeletion, ExternalPassword, ExternalUsername]
+    );
+    assert!(root_confirmation_layer_plan(false, false, false).is_empty());
+    assert_eq!(
+        root_confirmation_layer_plan(true, false, false),
+        vec![LocalHostDeletion]
     );
 }
 
@@ -415,7 +426,7 @@ fn connect_request_requires_current_host_protocol_match() {
     ));
 }
 
-/// SFTP 信任等待恢复的仍是原待处理动作，因此开始回执不会为同一请求生成新 ID。
+/// SFTP 文件选择等待恢复的仍是原待处理动作，因此开始回执不会为同一请求生成新 ID。
 /// @author kongweiguang
 #[test]
 fn sftp_started_event_preserves_request_id_when_pending_action_is_resumed() {

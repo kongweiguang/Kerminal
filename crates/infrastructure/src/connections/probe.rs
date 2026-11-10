@@ -270,7 +270,7 @@ impl ProbeCleanupRegistry {
 }
 
 impl SystemConnectionProbe {
-    /// 复用 composition root 的 credentials、trust 和 transport factory，避免创建应用会话。
+    /// 复用 composition root 的外部凭据解析、known_hosts 记录和 transport factory，避免创建应用会话。
     /// 活动 worker 与遗留清理 owner 分开持有，调用方可单独关闭并排空本适配器。
     ///
     /// @author kongweiguang

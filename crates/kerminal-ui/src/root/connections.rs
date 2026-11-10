@@ -78,7 +78,7 @@ pub(super) struct FileSftpOrigin {
     pub(super) navigation_generation: u64,
 }
 
-/// 主机密钥提示同一时间只有一个 owner，但左右各自的请求可以独立排队。
+/// 文件选择提示同一时间只有一个 owner，但左右各自的请求可以独立排队。
 #[derive(Clone, Debug)]
 pub(super) struct FileSftpSelectionRequest {
     pub(super) request_id: String,

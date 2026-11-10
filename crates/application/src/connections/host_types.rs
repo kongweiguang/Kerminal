@@ -779,7 +779,7 @@ impl BuiltinHost {
     }
 }
 
-/// 内置打开仅传身份和协议，具体信任、凭据与进程生命周期交回已有用例。
+/// 内置打开仅传身份和协议，具体 known_hosts 记录、外部凭据与进程生命周期交回已有用例。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuiltinHostOpenIntent {
     pub host_id: HostId,
@@ -804,7 +804,7 @@ pub enum PluginHostOpenIntent {
     },
 }
 
-/// 内置探测保留信任挑战和协议分层结果，扩展探测只承诺提供方返回成功。
+/// 内置探测保留 known_hosts 记录结果和协议分层结果，扩展探测只承诺提供方返回成功。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostTestOutcome {
     Plugin,
@@ -824,7 +824,7 @@ pub trait HostTypeProvider: Send + Sync + 'static {
         cancel: CancellationToken,
     ) -> AppResult<PluginHostOpenIntent>;
 
-    /// 内置草稿测试有独立的凭据和信任结果，不把缺省实现伪装成探测成功。
+    /// 内置草稿测试有独立的外部凭据与 known_hosts 记录结果，不把缺省实现伪装成探测成功。
     async fn test_builtin(
         &self,
         _host: &BuiltinHost,

@@ -254,7 +254,7 @@ impl KnownHostsRepository for UnknownKnownHosts {
         Ok(HostKeyStatus::Unknown)
     }
 
-    /// 测试不进入 SSH host-key trust 阶段，因此任何信任写入都应保留无副作用语义。
+    /// 测试不进入 SSH known_hosts 记录阶段，因此任何记录写入都应保留无副作用语义。
     async fn record(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
         Ok(())
     }
