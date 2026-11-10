@@ -31,7 +31,7 @@ pub(super) struct SidebarContainerRequest {
     tool_opened: bool,
 }
 
-/// 面板的失败和取消通知立即回收尚未创建 pane 的意图；错误回投当前工作台，指纹确认不设用户决策超时。
+/// 面板的失败和取消通知立即回收尚未创建 pane 的意图；错误回投当前工作台，连接确认不设用户决策超时。
 /// @author kongweiguang
 pub(super) fn sync_preflight(
     root: &mut RootView,
@@ -145,7 +145,7 @@ pub(super) fn open_pinned_details(
     );
 }
 
-/// 优先复用当前或唯一同 host 的真实 SSH pane；无可用 pane 时经连接面板执行指纹预检。
+/// 优先复用当前或唯一同 host 的真实 SSH pane；无可用 pane 时经连接面板执行连接准备。
 /// @author kongweiguang
 pub(super) fn open_host(
     root: &mut RootView,
@@ -221,7 +221,7 @@ pub(super) fn open_host(
     }
 }
 
-/// 将经过指纹预检的原请求绑定到实际新建 pane；过期回执不得打开终端或容器面板。
+/// 将经过连接准备的原请求绑定到实际新建 pane；过期回执不得打开终端或容器面板。
 /// @author kongweiguang
 pub(super) fn accept_connection(
     root: &mut RootView,

@@ -2306,7 +2306,7 @@ impl JumpInputs {
         }
     }
 
-    /// 由受信任主机快照构造跳板输入，并只回显公开 key path 与认证模式。
+    /// 由已保存主机快照构造跳板输入，并只回显公开 key path 与认证模式。
     fn from_model(
         jump: &ManagedJumpHost,
         window: &mut Window,

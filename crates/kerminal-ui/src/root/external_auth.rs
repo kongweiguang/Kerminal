@@ -28,7 +28,7 @@ pub(super) struct ExternalPasswordRetryTicket {
 }
 
 impl RootView {
-    /// 显式取消只使同一临时主机的重试票据失效；密码提交后的 host-key 预检不是取消信号。
+    /// 显式取消只使同一临时主机的重试票据失效；密码提交后的连接准备不是取消信号。
     ///
     /// @author kongweiguang
     pub(super) fn cancel_external_password_retry(&mut self, host_id: &HostId) {

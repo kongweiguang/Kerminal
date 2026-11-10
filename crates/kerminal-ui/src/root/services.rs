@@ -102,7 +102,7 @@ pub struct AppServices {
     pub snippet_transfer_files: Option<SnippetTransferFileService>,
     /// Commands 与 MCP 共用同一只读配置 validator，不在 UI 复制 TOML 规则。
     pub configuration_validation: Option<ConfigurationValidationService>,
-    /// 主机管理和 SSH 信任预检共用组合根的同一 service instance。
+    /// 主机管理和 SSH 连接准备共用组合根的同一 service instance。
     pub hosts: Option<HostManagementService>,
     /// 插件主机共享同一仓储与 codec，UI 只接收受控打开意图。
     pub plugin_hosts: Option<kerminal_application::connections::host_types::PluginHostService>,
@@ -391,7 +391,7 @@ impl AppServices {
         self
     }
 
-    /// 注入组合根创建的只读连接探测用例；界面不保存草稿或写入主机信任记录。
+    /// 注入组合根创建的只读连接探测用例；界面不保存草稿或直接写 known_hosts。
     ///
     /// @author kongweiguang
     pub fn with_connection_probe_service(mut self, service: Arc<ConnectionProbeService>) -> Self {

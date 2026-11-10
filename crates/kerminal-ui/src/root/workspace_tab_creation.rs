@@ -7,7 +7,7 @@ use kerminal_domain::connections::RemoteProtocol;
 
 impl RootView {
     /// 菜单只携带稳定目标，执行前重查当前目录；新建入口始终创建新会话，不借用现存主机 Tab。
-    /// 本地 Profile 交给统一 resolver，远程主机继续经过既有连接预检和信任流程。
+    /// 本地 Profile 交给统一 resolver，远程主机继续经过既有连接准备流程。
     ///
     /// @author kongweiguang
     pub(super) fn handle_workspace_tabs_create_event(

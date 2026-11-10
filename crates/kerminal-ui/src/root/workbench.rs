@@ -3009,7 +3009,7 @@ pub(super) fn render_workbench(
             let focus_handle = root.connections_modal_focus_handle.clone();
             let editor_open = connections_panel.read(cx).editor_open();
             if root.connection_prompt_modal_open && !editor_open {
-                // 指纹/凭据确认本身就是居中模态；没有编辑器时不再画主机面板背景，
+                // 外部用户名/密码等确认本身就是居中模态；没有编辑器时不再画主机面板背景，
                 // 否则确认卡背后会出现一块与任务无关的暗色空面板。
                 let overlay = connections_panel.update(cx, |panel, cx| {
                     panel.render_root_confirmation_overlay(window, cx)

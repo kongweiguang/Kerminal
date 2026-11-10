@@ -34,7 +34,7 @@ use crate::features::workspace_controller::{WorkspaceControllerEffect, Workspace
 use super::workspace_runtime::RuntimePanePhase;
 use super::{CenterPanel, RootView, TerminalTargetRequest, WorkspaceTerminalOpenKind};
 
-/// SFTP 预检可跨越指纹确认模态，但不能跨越用户后来的中央页面或标签导航。
+/// SFTP 预检可跨越外部连接确认模态，但不能跨越用户后来的中央页面或标签导航。
 pub(super) struct SftpNavigationRequest {
     pub(super) request_id: String,
     pub(super) navigation_generation: u64,
@@ -211,7 +211,7 @@ impl RootView {
         self.enqueue_file_sftp_host(origin, host_id, cx);
     }
 
-    /// 连接面板目前拥有一个指纹确认层；顺序执行预检而不取消另一侧的待处理请求。
+    /// 连接面板当前只保留外部用户名/密码等确认层；顺序执行预检而不取消另一侧的待处理请求。
     ///
     /// @author kongweiguang
     fn enqueue_file_sftp_host(
@@ -260,7 +260,7 @@ impl RootView {
         self.advance_file_sftp_selections(cx);
     }
 
-    /// 已消失的面板和过期代次在出队时跳过，避免把信任对话框投到后来打开的页面。
+    /// 已消失的面板和过期代次在出队时跳过，避免把连接确认对话框投到后来打开的页面。
     ///
     /// @author kongweiguang
     pub(super) fn advance_file_sftp_selections(&mut self, cx: &mut Context<Self>) {
@@ -308,7 +308,7 @@ impl RootView {
         }
     }
 
-    /// 页面离开时立即解除每侧等待；信任写入若已开始仍由连接面板等待回读后释放队列。
+    /// 页面离开时立即解除每侧等待；连接准备若已开始仍由连接面板等待回执后释放队列。
     ///
     /// @author kongweiguang
     pub(super) fn cancel_file_sftp_selections(&mut self, cx: &mut Context<Self>) {
@@ -1072,7 +1072,7 @@ fn handle_external_target(
     }
 }
 
-/// 把经过密码与逐跳 host-key 检查的 SFTP 目标交给文件面板，并让面板先独立 retain lease。
+/// 把经过密码认证与连接准备就绪的 SFTP 目标交给文件面板，并让面板先独立 retain lease。
 ///
 /// 连接事件携带的 lease 只在本次交接期间借用；面板返回成功前不会假设它已经接管运行时目标，成功后显式激活共享工作台 Tab。
 ///
@@ -2042,7 +2042,7 @@ pub(super) fn handle_host_navigation_event(
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) {
-    // 后来的侧栏操作优先；信任预检或终端就绪的迟到结果不能重开容器工具。
+    // 后来的侧栏操作优先；连接准备或终端就绪的迟到结果不能重开容器工具。
     root.pending_sidebar_container = None;
     root.cancel_plugin_host_open();
     match event {

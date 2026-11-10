@@ -1,4 +1,4 @@
-//! 左侧主机树；只发出带稳定 HostId 的意图，具体协议与信任流程留给完整连接面板。
+//! 左侧主机树；只发出带稳定 HostId 的意图，具体协议与连接流程留给完整连接面板。
 //!
 //! @author kongweiguang
 
@@ -1232,7 +1232,7 @@ impl HostNavigation {
         cx.emit(HostNavigationEvent::OpenSftpRequested { host_id });
     }
 
-    /// 独立传输 Tab 复用现有信任预检；菜单可能滞留在旧快照上，故先复核当前 SFTP 能力。
+    /// 独立传输 Tab 复用现有连接流程；菜单可能滞留在旧快照上，故先复核当前 SFTP 能力。
     ///
     /// @author kongweiguang
     fn request_create_sftp_transfer_tab(&mut self, host_id: HostId, cx: &mut Context<Self>) {

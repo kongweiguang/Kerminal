@@ -1,4 +1,4 @@
-//! 共享 SFTP 工作区的主机选择状态与信任流程事件。
+//! 共享 SFTP 工作区的主机选择状态与连接流程事件。
 //!
 //! @author kongweiguang
 
@@ -384,7 +384,7 @@ impl FilesPane {
         self.host_picker.requested_hosts[index] = None;
     }
 
-    /// 用户改变该侧意图时通知 Root 取消对应预检，避免旧指纹模态阻塞新目标。
+    /// 用户改变该侧意图时通知 Root 取消对应预检，避免旧连接确认阻塞新目标。
     ///
     /// @author kongweiguang
     pub(super) fn cancel_pending_host_selection(

@@ -731,12 +731,12 @@ pub(super) fn external_classification_text(
             "The target matches a saved host; this request still uses its own authentication method.",
         ),
         ExternalTargetClassification::RestrictedUnknown => crate::locale::text(
-            "没有匹配的保存主机；继续前请核对目标和指纹。",
-            "No saved host matched; verify the target and key before continuing.",
+            "没有匹配的保存主机；继续前请核对目标地址和账号。",
+            "No saved host matched; verify the target and account before continuing.",
         ),
         ExternalTargetClassification::LookupUnavailable => crate::locale::text(
-            "无法完成保存主机匹配；仍需核对目标和指纹。",
-            "Saved-host matching was unavailable; verify the target and key before continuing.",
+            "无法完成保存主机匹配；仍需核对目标地址和账号。",
+            "Saved-host matching was unavailable; verify the target and account before continuing.",
         ),
     }
 }

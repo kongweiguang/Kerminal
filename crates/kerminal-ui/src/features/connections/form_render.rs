@@ -1527,7 +1527,7 @@ fn editor_cancel_button(
         }))
 }
 
-/// 仅在真实 probe 服务存在时绘制测试动作；取消、一次性信任与普通重试各有明确入口。
+/// 仅在真实 probe 服务存在时绘制测试动作；取消、一次性凭据与普通重试各有明确入口。
 /// @author kongweiguang
 fn render_probe_action(
     panel: &ConnectionsPanel,

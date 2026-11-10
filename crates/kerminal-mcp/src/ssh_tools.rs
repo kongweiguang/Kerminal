@@ -673,7 +673,7 @@ fn remote_failure(error: AppError, entities: Vec<Value>) -> CallToolResult {
         "entities": entities,
         "errorKind": "remoteFailure",
         "recoverable": true,
-        "nextHints": ["检查 SSH 主机、凭据、网络和主机密钥信任状态后重试。"],
+        "nextHints": ["检查 SSH 主机、凭据和网络后重试。"],
     }))
 }
 
