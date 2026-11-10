@@ -622,7 +622,27 @@ impl ExtensionsPage {
             return;
         }
         if self.dialog_open {
-            self.close_open_confirmation(cx);
+            // 旧弹层与新弹层必须在同一个延迟窗口内先关后开，避免两个 defer 的执行顺序决定结果。
+            self.confirmation = Some(confirmation);
+            self.dialog_open = true;
+            self.dialog_generation = self.dialog_generation.wrapping_add(1);
+            let generation = self.dialog_generation;
+            let owner = cx.entity().downgrade();
+            let window_handle = self.window_handle;
+            cx.defer(move |app| {
+                let _ = window_handle.update(app, |_, window, app| {
+                    window.close_dialog(app);
+                    if let Some(page) = owner.upgrade() {
+                        page.update(app, |page, cx| {
+                            if page.dialog_open && page.dialog_generation == generation {
+                                page.present_confirmation(window, cx);
+                            }
+                        });
+                    }
+                });
+            });
+            cx.notify();
+            return;
         }
         self.confirmation = Some(confirmation);
         self.dialog_open = true;
@@ -663,15 +683,19 @@ impl ExtensionsPage {
         }
     }
 
-    /// 页面重新激活时关闭可能遗留的确认；Kit 负责把焦点还给原控件。
+    /// 页面重新激活时关闭可能遗留的确认；先用代次作废未执行的打开回调，再延迟关闭，避免窗口重入。
     fn close_open_confirmation(&mut self, cx: &mut Context<Self>) {
         let was_open = self.dialog_open;
         self.confirmation = None;
         self.dialog_open = false;
+        self.dialog_generation = self.dialog_generation.wrapping_add(1);
         if was_open {
             let window_handle = self.window_handle;
-            let _ = window_handle.update(cx, |_, window, cx| window.close_dialog(cx));
+            cx.defer(move |app| {
+                let _ = window_handle.update(app, |_, window, cx| window.close_dialog(cx));
+            });
         }
+        cx.notify();
     }
 
     /// 目录替换后留下的选择会展示另一份目录的旧详情，必须按当前目录与安装集合重新核对。

@@ -11,7 +11,7 @@ use super::{
 use crate::theme::ThemeTokens;
 use gpui_kit::{
     AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, Render,
-    SharedString, StatefulInteractiveElement as _, Window,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Window,
     assets::IconName,
     base::Selectable as _,
     component::{
@@ -81,6 +81,8 @@ impl Render for ExtensionsPage {
             Button::new("extensions-refresh")
                 .compact()
                 .ghost()
+                .w(theme.metrics.control_height)
+                .h(theme.metrics.control_height)
                 .child(Spinner::new().small().color(theme.muted))
                 .accessibility_label(crate::locale::text(
                     "取消刷新目录",
@@ -98,6 +100,8 @@ impl Render for ExtensionsPage {
             Button::new("extensions-refresh")
                 .compact()
                 .ghost()
+                .w(theme.metrics.control_height)
+                .h(theme.metrics.control_height)
                 .icon(IconName::RefreshCw)
                 .disabled(self.busy)
                 .accessibility_label(crate::locale::text("刷新目录", "Refresh catalog"))
@@ -160,6 +164,7 @@ impl Render for ExtensionsPage {
                     .when(pending_count > 0, |actions| {
                         actions.child(
                             Button::new("extensions-restart")
+                                .h(theme.metrics.control_height)
                                 .label(crate::locale::text("立即重启", "Restart now"))
                                 .on_click(cx.listener(|_, _, _, cx| {
                                     cx.emit(ExtensionsEvent::RestartRequested)
@@ -171,6 +176,7 @@ impl Render for ExtensionsPage {
                         Button::new("extensions-file")
                             .compact()
                             .ghost()
+                            .h(theme.metrics.control_height)
                             .label(crate::locale::text("从文件安装…", "Install from file…"))
                             .disabled(self.busy)
                             .on_click(cx.listener(|page, _, _, cx| page.choose_file(cx))),
@@ -367,7 +373,7 @@ impl Render for ExtensionsPage {
             list = list.child(empty);
         }
 
-        let mut notices = div().mx_2().mt_2().flex().flex_col().gap_1();
+        let mut notices = div().mx_4().mt_2().flex().flex_col().gap_1();
         // 文件预检和没有可见行的安装需要页面级活动条，否则用户看不到进度或取消入口。
         if self.inspecting || (self.progress.is_some() && !active_row_visible) {
             let message = if self.inspecting {
@@ -1024,7 +1030,10 @@ impl ExtensionsPage {
                 .is_some_and(|version| version.requires_full_access());
             detail = detail
                 .child(permissions_block(&plugin.permissions, full_access, theme))
-                .child(failure_readme(&self.readme, preview, &plugin));
+                .when_some(
+                    readme_section(&self.readme, preview, &plugin),
+                    |detail, readme| detail.child(readme),
+                );
         } else if let Some((id, installed)) = self.selected.as_ref().and_then(|id| {
             self.state
                 .as_ref()?
@@ -1290,7 +1299,10 @@ impl ExtensionsPage {
         let ok_operation = model.action.clone();
         let confirm_operation = model.action.clone();
         let danger = model.danger;
-        window.open_dialog(cx, move |dialog, _, _| {
+        // 弹层正文独立滚动，footer 保持固定；每次重建复用同一滚动句柄以保留位置。
+        let body_scroll = ScrollHandle::new();
+        window.open_dialog(cx, move |dialog, window, _| {
+            let body_scroll = body_scroll.clone();
             let ok_owner = ok_owner.clone();
             let cancel_owner = cancel_owner.clone();
             let dismiss_owner = dismiss_owner.clone();
@@ -1310,6 +1322,11 @@ impl ExtensionsPage {
                 )
                 .child(
                     div()
+                        .id("extensions-confirmation-body")
+                        .max_h(window.viewport_size().height * 0.55)
+                        .overflow_y_scroll()
+                        .track_scroll(&body_scroll)
+                        .vertical_scrollbar(&body_scroll)
                         .flex()
                         .flex_col()
                         .gap_3()
@@ -1643,7 +1660,7 @@ fn render_extension_row(
                 .into_any_element()
         })
     };
-    let second_line = progress.or(Some(description)).unwrap_or_default();
+    let second_line = progress.unwrap_or(description);
 
     div()
         .id(format!("extension-row-{id_text}"))
@@ -1754,10 +1771,16 @@ fn header_summary(
 ) -> SharedString {
     if preview {
         return if refreshing {
-            crate::locale::text(
-                "示例预览 · 正在获取市场目录",
-                "Sample preview · Fetching marketplace catalog",
-            )
+            let mut zh = "示例预览 · 正在获取市场目录".to_string();
+            let mut en = "Sample preview · Fetching marketplace catalog".to_string();
+            if pending > 0 {
+                zh.push_str(&format!(" · {pending} 项变更待重启"));
+                en.push_str(&format!(
+                    " · {} pending restart",
+                    english_count(pending, "change", "changes")
+                ));
+            }
+            crate::locale::text(zh, en)
         } else {
             let mut zh = format!("示例预览 · {extensions} 个示例 · 已安装 {installed}");
             let mut en = format!(
@@ -1911,17 +1934,20 @@ fn permissions_block(permissions: &[String], full_access: bool, theme: ThemeToke
 }
 
 /// README 只来自签名目录；示例和本地条目没有可验签正文，保持详情仅展示内嵌元数据。
-fn failure_readme(readme: &Option<String>, preview: bool, plugin: &CatalogPlugin) -> AnyElement {
+fn readme_section(
+    readme: &Option<String>,
+    preview: bool,
+    plugin: &CatalogPlugin,
+) -> Option<AnyElement> {
     if preview {
-        return div().into_any_element();
+        return None;
     }
-    match readme {
-        Some(readme) => super::markdown::render_readme(
+    readme.as_ref().map(|readme| {
+        super::markdown::render_readme(
             format!("extension-readme-{}", plugin.id.as_str()),
             readme.clone(),
-        ),
-        None => div().into_any_element(),
-    }
+        )
+    })
 }
 
 /// 进度属于当前安装行；下载显示百分比与 MB，避免裸字节数难以判断规模。
