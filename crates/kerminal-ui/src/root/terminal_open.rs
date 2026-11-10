@@ -42,6 +42,16 @@ use crate::features::workspace_controller::{
 };
 use crate::features::workspace_tabs::append_shared_sftp_workbench_projection;
 
+/// 打开结果只保留稳定错误类别；取消要映射为可取消重试项，其余失败保留真实资源失败语义。
+/// @author kongweiguang
+fn workspace_restore_failure_for_code(code: PublicErrorCode) -> WorkspaceRestoreFailure {
+    if code == PublicErrorCode::Cancelled {
+        WorkspaceRestoreFailure::Cancelled
+    } else {
+        WorkspaceRestoreFailure::ResourceFailure
+    }
+}
+
 /// 工作区 CAS 回执供 Root 的退出门控使用，未知提交与回读确认必须保持不同结果。
 pub(super) enum WorkspaceSnapshotSaveCompletion {
     NoChanges,
@@ -936,6 +946,15 @@ impl RootView {
                             cleanup_pending.is_some(),
                             cx,
                         );
+                        // CreatePane 的失败回执必须结束该候选的 pending，否则失败项无法重试，
+                        // 资源槽还会永久拒绝标签切换与新建终端。普通新标签没有匹配候选，调用无副作用。
+                        if let Some(controller) = root.workspace_controller.as_mut() {
+                            controller.fail_pending_create_pane(
+                                &tab_id,
+                                &pane_id,
+                                workspace_restore_failure_for_code(code),
+                            );
+                        }
                         if let Some((session, snapshot)) = cleanup_pending {
                             root.finish_pending_terminal_creation(&tab_id, &pane_id, generation);
                             let safe = crate::locale::text(

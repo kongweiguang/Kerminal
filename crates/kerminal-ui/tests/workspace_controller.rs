@@ -821,6 +821,86 @@ fn split_commits_only_after_resource_success_and_failure_can_be_discarded() {
     );
 }
 
+/// 失败候选仍占用资源槽时，用户必须能切换标签/焦点查看失败；选择要镜像进候选，
+/// 重试成功提交的也应是最后选择，而不是把界面拉回失败发生时的标签。
+///
+/// @author kongweiguang
+#[test]
+fn failed_split_pending_allows_selection_and_commits_latest_selection() {
+    let mut snapshot = snapshot_with_second_local_terminal(&one_terminal_snapshot());
+    snapshot.active_tab_id = Some(tab_id("tab-a"));
+    snapshot.focused_pane_id = Some(pane_id("pane-a"));
+    snapshot.selected_machine_id = Some("machine-local".to_owned());
+    snapshot.validate().expect("two-tab fixture is valid");
+    let mut controller = WorkspaceController::from_loaded(
+        document_for(&snapshot),
+        WorkspaceSessionRevision::new("revision-a"),
+    )
+    .unwrap();
+
+    let WorkspaceControllerEffect::ResourceOperation(operation) = controller
+        .apply_pane_event(
+            &tab_id("tab-a"),
+            WorkspacePaneEvent::Split {
+                pane_id: pane_id("pane-a"),
+                direction: SplitDirection::Vertical,
+                before: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("split must request a real pane resource");
+    };
+    controller
+        .complete_resource_operation(
+            operation.operation_id(),
+            Err(WorkspaceRestoreFailure::ResourceFailure),
+        )
+        .unwrap();
+
+    let effect = controller
+        .apply_tab_event(WorkspaceTabEvent::Activate(tab_id("tab-b")))
+        .expect("a failed split must not block tab selection");
+    assert!(matches!(effect, WorkspaceControllerEffect::Changed { .. }));
+    let candidate = controller
+        .pending_create_pane_candidate(operation.operation_id())
+        .expect("failed candidate remains retryable");
+    assert_eq!(candidate.active_tab_id, Some(tab_id("tab-b")));
+    assert_eq!(candidate.focused_pane_id, Some(pane_id("pane-b")));
+
+    controller
+        .apply_pane_event(
+            &tab_id("tab-a"),
+            WorkspacePaneEvent::Activate(pane_id("pane-a")),
+        )
+        .expect("a failed split must not block pane selection");
+    let candidate = controller
+        .pending_create_pane_candidate(operation.operation_id())
+        .expect("failed candidate remains retryable");
+    assert_eq!(candidate.active_tab_id, Some(tab_id("tab-a")));
+    assert_eq!(candidate.focused_pane_id, Some(pane_id("pane-a")));
+
+    // 结构性事件仍由原资源门禁拒绝，不能借失败候选修改布局或分组。
+    assert!(
+        controller
+            .apply_tab_event(WorkspaceTabEvent::Reorder {
+                tab_id: tab_id("tab-a"),
+                target_index: 0,
+            })
+            .is_err()
+    );
+
+    controller
+        .complete_resource_operation(operation.operation_id(), Ok(()))
+        .unwrap();
+    assert_eq!(controller.snapshot().active_tab_id, Some(tab_id("tab-a")));
+    assert_eq!(
+        controller.snapshot().focused_pane_id,
+        Some(pane_id("pane-a"))
+    );
+    assert_eq!(controller.snapshot().terminal_panes.len(), 3);
+}
+
 /// 未报告实时目录的 shell 仍使用原参数；公开分屏入口不能绕过已有资源操作门禁。
 ///
 /// @author kongweiguang

@@ -1048,7 +1048,7 @@ impl RootView {
 /// @author kongweiguang
 fn record_workspace_restore_failure(
     runtime: &mut WorkspaceRuntime,
-    controller: Option<&mut WorkspaceController>,
+    mut controller: Option<&mut WorkspaceController>,
     pane_id: &PaneId,
     failure: WorkspaceRestoreFailure,
     target: Option<SessionTarget>,
@@ -1076,6 +1076,13 @@ fn record_workspace_restore_failure(
                 "The pane changed state before the restore failure could be recorded.",
             )
         ));
+    }
+    if let Some(controller) = controller.as_deref_mut()
+        && let Some(tab_id) = runtime.pane(pane_id).map(|pane| pane.tab_id.clone())
+    {
+        // 目标解析等前置失败同样要结束分屏候选；只在 pane/tab 精确匹配时写回，
+        // 普通恢复失败不会影响其它资源操作。
+        controller.fail_pending_create_pane(&tab_id, pane_id, failure);
     }
     if let Some(controller) = controller
         && let Err(error) = controller

@@ -1487,7 +1487,8 @@ impl RootView {
         cx.notify();
     }
 
-    /// 失败时保留 controller pending operation，供显式重试；不发布未创建成功的候选布局。
+    /// 准入失败没有可重试的真实资源；精确丢弃本次 pending，并只清理本次注册且无
+    /// session/orphan owner 的空候选，避免把失败项永久留在资源槽并锁死新终端。
     fn fail_workspace_split_admission(
         &mut self,
         operation_id: &str,
@@ -1495,13 +1496,44 @@ impl RootView {
         message: SharedString,
         cx: &mut Context<RootView>,
     ) {
+        let candidate = self.workspace_controller.as_ref().and_then(|controller| {
+            let crate::features::workspace_controller::WorkspaceResourceOperation::CreatePane {
+                operation_id: pending_id,
+                tab_id,
+                pane,
+                ..
+            } = controller.pending_resource_operation()?
+            else {
+                return None;
+            };
+            (pending_id == operation_id && pane.id == *pane_id)
+                .then(|| (tab_id.clone(), pane.as_ref().clone()))
+        });
         if let Some(controller) = self.workspace_controller.as_mut() {
-            let _ = controller.complete_resource_operation(
-                operation_id,
-                Err(
-                    crate::features::workspace_controller::WorkspaceRestoreFailure::ResourceFailure,
-                ),
-            );
+            let _ = controller.discard_pending_resource_operation_if(operation_id);
+        }
+        if let Some((tab_id, pane)) = candidate {
+            let no_other_owner = self
+                .workspace_resource_operations
+                .get(pane_id)
+                .is_none_or(|entry| entry.operation_id() == operation_id);
+            let runtime_matches = self.workspace_runtime.pane(pane_id).is_some_and(|runtime| {
+                runtime.tab_id == tab_id
+                    && runtime.persisted == pane
+                    && runtime.session_id.is_none()
+            });
+            let no_resources = self.workspace_runtime.session_for_pane(pane_id).is_none()
+                && self
+                    .workspace_runtime
+                    .orphan_cleanup_for_pane(pane_id)
+                    .next()
+                    .is_none();
+            if no_other_owner && runtime_matches && no_resources {
+                self.cancel_workspace_restore(pane_id);
+                if matches!(self.workspace_runtime.remove_empty_pane(pane_id), Ok(true)) {
+                    self.workspace_resource_operations.remove(pane_id);
+                }
+            }
         }
         if self.workspace_runtime.pane(pane_id).is_some() {
             let _ = self
@@ -6030,9 +6062,7 @@ impl RootView {
                 .workspace_resource_operations
                 .get(&preview.pane_id)
                 .is_some_and(|entry| {
-                    entry.operation_id() == preview.operation_id
-                        && !entry.cancel_requested()
-                        && !entry.split_measurement_started()
+                    entry.operation_id() == preview.operation_id && !entry.cancel_requested()
                 })
             && self.cancel_unadmitted_workspace_split(&preview, cx)
         {

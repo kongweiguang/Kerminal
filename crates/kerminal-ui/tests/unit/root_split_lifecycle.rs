@@ -13,7 +13,9 @@ use std::{collections::BTreeMap, ffi::OsString};
 use kerminal_application::sessions::{
     SessionChange, SessionChangeKind, TerminalCommandAvailability, TerminalCommandUnavailableReason,
 };
-use kerminal_domain::{connections::RemoteShellDialect, sessions::SessionLifecycle};
+use kerminal_domain::{
+    connections::RemoteShellDialect, sessions::SessionLifecycle, workspace::SplitDirection,
+};
 use kerminal_terminal::{TerminalEngine, TerminalLimits};
 
 use crate::root::{
@@ -21,7 +23,14 @@ use crate::root::{
     workspace_pane_for_terminal_target, workspace_runtime::WorkspaceRuntime,
 };
 use crate::{
-    features::workspace_panes::WorkspacePaneEvent, root::workspace_render::WorkspaceRenderEvent,
+    features::{
+        workspace_controller::{WorkspaceResourceOperation, WorkspaceRestoreFailure},
+        workspace_panes::WorkspacePaneEvent,
+    },
+    root::{
+        workspace_close::{WorkspaceDeferredCloseIntent, WorkspaceResourceOperationEntry},
+        workspace_render::WorkspaceRenderEvent,
+    },
 };
 
 /// 测试仅显式启用单个可订阅会话；认证失败样本使用 None 保持原有封闭服务边界。
@@ -351,4 +360,268 @@ fn failed_and_cancelled_reconnect_rebind_original_session_directory(app: &mut Te
         })
     });
     settle(&runtime, visual);
+}
+
+/// 用真实打开路径安装一个 Ready 本地 pane，返回稳定 tab/pane/session 身份；
+/// 分屏与预检回归共用这一装配，避免各自伪造运行态。
+fn open_ready_local_pane(
+    root: &Entity<RootView>,
+    visual: &mut VisualTestContext,
+    runtime: &Runtime,
+    sessions: &Arc<CapturingSessions>,
+) -> (TabId, PaneId, SessionId) {
+    settle(runtime, visual);
+    let target = SessionTarget::Local(LocalSessionTarget {
+        program: OsString::from("fixture-shell"),
+        args: Vec::new(),
+        working_directory: None,
+        environment: BTreeMap::new(),
+    });
+    *sessions.live.lock().unwrap() = Some(LiveSession::new(target.clone()));
+    let source_pane = open_live_terminal(root, visual, target);
+    settle(runtime, visual);
+    visual.update(|_, app| {
+        root.update(app, |root, _| {
+            let pane = root
+                .workspace_runtime
+                .pane(&source_pane)
+                .expect("source pane is ready");
+            (
+                pane.tab_id.clone(),
+                source_pane.clone(),
+                pane.session_id
+                    .clone()
+                    .expect("source pane owns a live session"),
+            )
+        })
+    })
+}
+
+/// 用真实打开路径安装一个 Ready 本地 pane，再让 Root 产生未准入的分屏候选；
+/// 后续失败/关闭测试只操作这个精确候选，不依赖网络或用户配置。
+fn ready_split_candidate(
+    root: &Entity<RootView>,
+    visual: &mut VisualTestContext,
+    runtime: &Runtime,
+    sessions: &Arc<CapturingSessions>,
+) -> (TabId, PaneId, WorkspaceResourceOperation) {
+    let (tab_id, source_pane, _) = open_ready_local_pane(root, visual, runtime, sessions);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_render_event(
+                WorkspaceRenderEvent::Pane {
+                    tab_id: tab_id.clone(),
+                    event: WorkspacePaneEvent::Split {
+                        pane_id: source_pane.clone(),
+                        direction: SplitDirection::Vertical,
+                        before: false,
+                    },
+                },
+                window,
+                cx,
+            );
+            let operation = root
+                .workspace_controller
+                .as_ref()
+                .and_then(|controller| controller.pending_resource_operation())
+                .cloned()
+                .expect("split must produce a CreatePane candidate");
+            (tab_id, source_pane, operation)
+        })
+    })
+}
+
+/// 已结束失败的空白候选不会再有清理回执；关闭它必须立即收尾并释放资源槽，
+/// 而不是让 deferred close 永久等待。原 pane 与其它资源保持不变。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn completed_split_failure_closes_without_waiting_for_receipt(app: &mut TestAppContext) {
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (tab_id, source_pane, operation) =
+        ready_split_candidate(&root, visual, &runtime, &sessions);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            let WorkspaceResourceOperation::CreatePane {
+                operation_id, pane, ..
+            } = &operation
+            else {
+                panic!("split must create a pane");
+            };
+            let candidate = pane.id.clone();
+            root.workspace_controller
+                .as_mut()
+                .expect("workspace controller")
+                .complete_resource_operation(
+                    operation_id,
+                    Err(WorkspaceRestoreFailure::ResourceFailure),
+                )
+                .unwrap();
+            root.workspace_runtime
+                .mark_restore_failed(&candidate)
+                .unwrap();
+            root.workspace_resource_operations
+                .get_mut(&candidate)
+                .expect("split resource entry")
+                .try_admit_split_measurement(operation_id, 1);
+            assert!(root.defer_workspace_split_close_intent(
+                WorkspaceDeferredCloseIntent::Pane {
+                    tab_id: tab_id.clone(),
+                    pane_id: candidate.clone(),
+                },
+                true,
+                None,
+                None,
+                window,
+                cx,
+            ));
+            assert!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .pending_resource_operation()
+                    .is_none()
+            );
+            assert!(root.workspace_runtime.pane(&candidate).is_none());
+            assert!(!root.workspace_resource_operations.contains_key(&candidate));
+            assert!(root.workspace_runtime.pane(&source_pane).is_some());
+        });
+    });
+}
+
+/// 仍在途的候选即使已经测量，也必须等待真实清理回执；不能仅凭关闭意图移除资源或候选。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn in_flight_split_close_still_waits_for_receipt(app: &mut TestAppContext) {
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (tab_id, _, operation) = ready_split_candidate(&root, visual, &runtime, &sessions);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            let WorkspaceResourceOperation::CreatePane {
+                operation_id, pane, ..
+            } = &operation
+            else {
+                panic!("split must create a pane");
+            };
+            let candidate = pane.id.clone();
+            root.workspace_resource_operations
+                .get_mut(&candidate)
+                .expect("split resource entry")
+                .try_admit_split_measurement(operation_id, 1);
+            assert!(root.defer_workspace_split_close_intent(
+                WorkspaceDeferredCloseIntent::Pane {
+                    tab_id: tab_id.clone(),
+                    pane_id: candidate.clone(),
+                },
+                true,
+                None,
+                None,
+                window,
+                cx,
+            ));
+            assert!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .pending_resource_operation()
+                    .is_some()
+            );
+            assert!(root.workspace_runtime.pane(&candidate).is_some());
+        });
+    });
+}
+
+/// 准入失败后必须精确丢弃本次 pending 并移除空候选；恢复的资源槽要允许后续新建终端，
+/// 同时不能删除任何仍有 session/orphan 的资源。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn split_admission_failure_discards_exact_pending_and_empty_candidate(app: &mut TestAppContext) {
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (_, _, operation) = ready_split_candidate(&root, visual, &runtime, &sessions);
+    visual.update(|_, app| {
+        root.update(app, |root, cx| {
+            let WorkspaceResourceOperation::CreatePane {
+                operation_id, pane, ..
+            } = &operation
+            else {
+                panic!("split must create a pane");
+            };
+            let candidate = pane.id.clone();
+            root.fail_workspace_split_admission(
+                operation_id,
+                &candidate,
+                "fixture admission failure".into(),
+                cx,
+            );
+            assert!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .pending_resource_operation()
+                    .is_none()
+            );
+            assert!(root.workspace_runtime.pane(&candidate).is_none());
+            assert!(!root.workspace_resource_operations.contains_key(&candidate));
+            let (new_pane, _) =
+                workspace_pane_for_terminal_target(None, "after-admission-failure", None);
+            assert!(
+                root.reserve_new_workspace_terminal_tab(
+                    new_pane,
+                    "After failure".into(),
+                    TerminalSize::default(),
+                    false,
+                    cx,
+                )
+                .is_ok()
+            );
+        });
+    });
+}
+
+/// 失败候选仍被另一资源操作持有时，准入失败只能丢弃本次 pending，
+/// 不能删除别人的 pane 或操作记录。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn split_admission_failure_preserves_other_resource_owner(app: &mut TestAppContext) {
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (_, _, operation) = ready_split_candidate(&root, visual, &runtime, &sessions);
+    visual.update(|_, app| {
+        root.update(app, |root, cx| {
+            let WorkspaceResourceOperation::CreatePane {
+                operation_id, pane, ..
+            } = &operation
+            else {
+                panic!("split must create a pane");
+            };
+            let candidate = pane.id.clone();
+            root.workspace_resource_operations.insert(
+                candidate.clone(),
+                WorkspaceResourceOperationEntry::new("other-operation".into()),
+            );
+            root.fail_workspace_split_admission(
+                operation_id,
+                &candidate,
+                "fixture admission failure".into(),
+                cx,
+            );
+            assert!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .pending_resource_operation()
+                    .is_none()
+            );
+            assert!(root.workspace_runtime.pane(&candidate).is_some());
+            assert_eq!(
+                root.workspace_resource_operations
+                    .get(&candidate)
+                    .expect("other owner remains")
+                    .operation_id(),
+                "other-operation"
+            );
+        });
+    });
 }

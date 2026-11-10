@@ -376,7 +376,8 @@ impl WorkspaceResourceOperationEntry {
         &self.operation_id
     }
 
-    /// 区分关闭到达前是否已有真实布局测量准入，以决定撤销占位或等待资源 ACK。
+    /// 区分关闭到达前是否已有真实布局测量准入，以决定撤销占位或等待资源 ACK；
+    /// 已测量但恢复任务结束失败的空白候选不再等待回执。
     ///
     /// @author kongweiguang
     pub(super) fn split_measurement_started(&self) -> bool {
@@ -3250,7 +3251,30 @@ impl RootView {
         if owner.operation_id() != preview.operation_id {
             return false;
         }
-        if owner.split_measurement_started() {
+        let pane_phase = self
+            .workspace_runtime
+            .pane(&preview.pane_id)
+            .filter(|pane| pane.tab_id == preview.tab_id && pane.session_id.is_none())
+            .map(|pane| pane.phase);
+        let pane_is_empty_candidate = matches!(
+            pane_phase,
+            Some(RuntimePanePhase::RestorePending | RuntimePanePhase::RestoreFailed)
+        );
+        let has_session_owner = self
+            .workspace_runtime
+            .session_for_pane(&preview.pane_id)
+            .is_some();
+        let has_orphan_owner = self
+            .workspace_runtime
+            .orphan_cleanup_for_pane(&preview.pane_id)
+            .next()
+            .is_some();
+        // open 任务已经失败结束时不会再有清理回执；此时允许用户取消空白候选。
+        // 仍在途的测量/恢复必须继续等待真实 ACK，不能把“已放行”误当成资源已回收。
+        let completed_failure = pane_phase == Some(RuntimePanePhase::RestoreFailed)
+            && !has_session_owner
+            && !has_orphan_owner;
+        if owner.split_measurement_started() && !completed_failure {
             self.status = Some(crate::locale::text(
                 "分屏恢复已经开始，不能撤销正在等待的资源操作。",
                 "Split restoration has started and its in-flight resource operation cannot be cancelled.",
@@ -3266,23 +3290,6 @@ impl RootView {
             cx.notify();
             return true;
         }
-        let pane_is_empty_candidate =
-            self.workspace_runtime
-                .pane(&preview.pane_id)
-                .is_some_and(|pane| {
-                    pane.tab_id == preview.tab_id
-                        && pane.phase == RuntimePanePhase::RestorePending
-                        && pane.session_id.is_none()
-                });
-        let has_session_owner = self
-            .workspace_runtime
-            .session_for_pane(&preview.pane_id)
-            .is_some();
-        let has_orphan_owner = self
-            .workspace_runtime
-            .orphan_cleanup_for_pane(&preview.pane_id)
-            .next()
-            .is_some();
         if !pane_is_empty_candidate || has_session_owner || has_orphan_owner {
             self.status = Some(crate::locale::text(
                 "分屏资源已进入恢复或清理阶段，不能直接取消；请等待状态回执。",
@@ -3331,8 +3338,22 @@ impl RootView {
         true
     }
 
+    /// 已结束失败的空白候选不会再产生清理回执；只要仍有 session 或 orphan owner，
+    /// 就必须等待真实资源回执，不能把界面解除误当成资源已回收。
+    /// @author kongweiguang
+    fn failed_split_candidate_without_resources(&self, pane_id: &PaneId) -> bool {
+        self.workspace_runtime.pane(pane_id).is_some_and(|pane| {
+            pane.phase == RuntimePanePhase::RestoreFailed && pane.session_id.is_none()
+        }) && self.workspace_runtime.session_for_pane(pane_id).is_none()
+            && self
+                .workspace_runtime
+                .orphan_cleanup_for_pane(pane_id)
+                .next()
+                .is_none()
+    }
+
     /// Split 独占 reducer 资源槽时先保留关闭意图与原始焦点代次；仅首个请求捕获，重复请求不能升级或替换来源。
-    /// 未测量候选可立即撤销，已准入创建必须等待 ACK；焦点资料不参与资源取消判断。
+    /// 未测量候选可立即撤销；已测量但 open 任务已失败结束的空白候选也立即收尾，其余在途创建仍等待真实 ACK。
     ///
     /// @author kongweiguang
     pub(super) fn defer_workspace_split_close_intent(
@@ -3440,12 +3461,24 @@ impl RootView {
             WorkspaceDeferredCloseRequest::Duplicate => {}
             WorkspaceDeferredCloseRequest::Stored if measurement_started => {
                 self.cancel_workspace_restore(&split_pane_id);
-                self.status = Some(crate::locale::text(
-                    "正在取消分屏创建；收到资源清理回执后继续关闭。",
-                    "Cancelling split creation; close will continue after its cleanup receipt.",
-                ));
-                self.refresh_workspace_views(cx);
-                cx.notify();
+                if self.failed_split_candidate_without_resources(&split_pane_id) {
+                    // open 任务已失败结束，不会再有资源清理回执；立即收尾并回放原关闭意图，
+                    // 否则 deferred_close 会永久等待一个不存在的 ACK。
+                    self.finalize_cancelled_workspace_split_after_cleanup(
+                        &split_tab_id,
+                        &split_pane_id,
+                        &operation_id,
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.status = Some(crate::locale::text(
+                        "正在取消分屏创建；收到资源清理回执后继续关闭。",
+                        "Cancelling split creation; close will continue after its cleanup receipt.",
+                    ));
+                    self.refresh_workspace_views(cx);
+                    cx.notify();
+                }
             }
             WorkspaceDeferredCloseRequest::Stored => {
                 // 尚未进入测量门，因此没有 open task 持有资源或可能返回迟到 ACK。

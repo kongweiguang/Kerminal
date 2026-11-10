@@ -504,8 +504,13 @@ impl WorkspaceController {
         &mut self,
         event: WorkspaceTabEvent,
     ) -> AppResult<WorkspaceControllerEffect> {
-        self.ensure_no_pending_resource()?;
-        match event {
+        // 失败的分屏候选仍占用资源槽，但用户必须能切换标签查看失败原因；
+        // 只放行纯选择事件，布局、关闭、分组等结构性变更继续等待重试或放弃。
+        self.ensure_selection_allowed_during_failed_split(matches!(
+            &event,
+            WorkspaceTabEvent::Activate(_)
+        ))?;
+        let effect = match event {
             // 文件标签的剪贴板、导航与编辑器读回属于 Root 的 UI 能力，不写入快照 reducer。
             WorkspaceTabEvent::FileAction { .. } => Ok(WorkspaceControllerEffect::Unchanged),
             WorkspaceTabEvent::Activate(tab_id) => self.activate_tab(&tab_id),
@@ -550,7 +555,9 @@ impl WorkspaceController {
                 before_group_id,
             } => self.move_tab_group(&group_id, before_group_id.as_deref()),
             WorkspaceTabEvent::Ungroup(group_id) => self.ungroup_tabs(&group_id),
-        }
+        }?;
+        self.mirror_selection_into_failed_split_candidate();
+        Ok(effect)
     }
 
     /// Pane 交互按父 tab 明确定位；分屏生成新稳定 IDs，Root 只在会话创建成功后提交树。
@@ -562,8 +569,11 @@ impl WorkspaceController {
         tab_id: &TabId,
         event: WorkspacePaneEvent,
     ) -> AppResult<WorkspaceControllerEffect> {
-        self.ensure_no_pending_resource()?;
-        match event {
+        self.ensure_selection_allowed_during_failed_split(matches!(
+            &event,
+            WorkspacePaneEvent::Activate(_)
+        ))?;
+        let effect = match event {
             WorkspacePaneEvent::Activate(pane_id) => self.activate_pane(tab_id, &pane_id),
             WorkspacePaneEvent::Split {
                 pane_id,
@@ -588,7 +598,9 @@ impl WorkspaceController {
             WorkspacePaneEvent::Resize { split_id, sizes } => {
                 self.resize_split(tab_id, &split_id, sizes)
             }
-        }
+        }?;
+        self.mirror_selection_into_failed_split_candidate();
+        Ok(effect)
     }
 
     /// 返回尚未完成的资源操作，使 Root 可在失败提示后以相同 ID 显式重试。
@@ -666,6 +678,47 @@ impl WorkspaceController {
                 Ok(WorkspaceControllerEffect::Unchanged)
             }
         }
+    }
+
+    /// 分屏打开任务已结束并失败时必须写回候选；否则重试入口拿不到失败项，
+    /// 资源槽也会永久拒绝后续标签与新建终端。只匹配同一 tab 与候选 pane。
+    /// @author kongweiguang
+    pub fn fail_pending_create_pane(
+        &mut self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+        failure: WorkspaceRestoreFailure,
+    ) -> bool {
+        let Some(operation_id) = self.pending_resource.as_ref().and_then(|pending| {
+            let WorkspaceResourceOperation::CreatePane {
+                operation_id,
+                tab_id: pending_tab,
+                pane,
+                ..
+            } = &pending.operation
+            else {
+                return None;
+            };
+            (pending_tab == tab_id && pane.id == *pane_id).then(|| operation_id.clone())
+        }) else {
+            return false;
+        };
+        self.complete_resource_operation(&operation_id, Err(failure))
+            .is_ok()
+    }
+
+    /// 准入失败没有可重试的真实资源；只有精确 operation 的候选可以被丢弃，
+    /// 避免误清后来的资源操作或批量关闭状态。返回是否实际丢弃。
+    /// @author kongweiguang
+    pub fn discard_pending_resource_operation_if(&mut self, operation_id: &str) -> bool {
+        if !self
+            .pending_resource
+            .as_ref()
+            .is_some_and(|pending| pending.operation.operation_id() == operation_id)
+        {
+            return false;
+        }
+        self.discard_pending_resource_operation()
     }
 
     /// 再次返回原资源请求；Root 可在用户确认后重试，不会悄悄换 target 或重新生成 ID。
@@ -2045,6 +2098,53 @@ impl WorkspaceController {
         } else {
             self.save_state = WorkspacePersistenceState::Dirty;
         }
+    }
+
+    /// 失败的 CreatePane 仍保留候选供重试，但把整个工作区锁死会让用户看不到失败标签；
+    /// 因此只放行选择，保存冲突等其它门禁照旧生效，结构性事件仍由原资源门禁拒绝。
+    fn ensure_selection_allowed_during_failed_split(&self, selection_event: bool) -> AppResult<()> {
+        if selection_event && self.failed_create_pane_pending() {
+            if matches!(
+                &self.save_state,
+                WorkspacePersistenceState::Conflict { .. }
+                    | WorkspacePersistenceState::OutcomeUnknown { .. }
+                    | WorkspacePersistenceState::ReadbackConfirmedUncommitted { .. }
+            ) {
+                return Err(AppError::conflict("请先解决工作区保存冲突或回读结果"));
+            }
+            return Ok(());
+        }
+        self.ensure_no_pending_resource()
+    }
+
+    /// 只识别已完成失败回执的分屏候选；仍等待 ACK 的候选不能放行选择，避免提交错位布局。
+    fn failed_create_pane_pending(&self) -> bool {
+        self.pending_resource.as_ref().is_some_and(|pending| {
+            pending.failed.is_some()
+                && matches!(
+                    &pending.operation,
+                    WorkspaceResourceOperation::CreatePane { .. }
+                )
+        })
+    }
+
+    /// 用户切走失败候选后，重试成功应提交用户当前所在位置，而不是把视图拉回失败发生时的标签；
+    /// 只镜像三个选择字段，布局与候选 pane 仍由原操作独占。
+    fn mirror_selection_into_failed_split_candidate(&mut self) {
+        let Some(pending) = self.pending_resource.as_mut() else {
+            return;
+        };
+        if pending.failed.is_none()
+            || !matches!(
+                &pending.operation,
+                WorkspaceResourceOperation::CreatePane { .. }
+            )
+        {
+            return;
+        }
+        pending.candidate.active_tab_id = self.snapshot.active_tab_id.clone();
+        pending.candidate.focused_pane_id = self.snapshot.focused_pane_id.clone();
+        pending.candidate.selected_machine_id = self.snapshot.selected_machine_id.clone();
     }
 
     /// 资源变更只允许一个 in-flight 候选；内部文档关闭也须在释放缓冲前复用此门禁，避免描述仍保留却丢失正文。
