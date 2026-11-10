@@ -1570,10 +1570,9 @@ impl CommandsView {
             .label_for_binding(self.ui_session_binding.as_ref())
     }
 
-    /// 整页重读先取代独立历史搜索，避免两条读取链互相覆盖；I/O 留在应用 runtime。
-    /// 只重读会话、历史、工作流和 UI 会话；全局片段目录与 session 无关，由片段数据变化路径
-    /// 单独调用 `refresh_snippet_page`，切换终端不得重启目录并重置列表。
-    /// 全局工作流目录只在 Catalogs 重读或尚未成功加载时读取，避免切换终端无谓同步。
+    /// 重读会话、历史与 UI 会话；全局工作流目录只在 Catalogs 重读或尚未成功加载时读取，
+    /// 片段目录由片段数据变化路径单独调用 `refresh_snippet_page`，切换终端不得重启目录并重置列表。
+    /// 重读先取代独立历史搜索，避免两条读取链互相覆盖；I/O 留在应用 runtime。
     ///
     /// @author kongweiguang
     pub(super) fn reload_panel(&mut self, reload: PanelReload, cx: &mut Context<Self>) {
@@ -1624,6 +1623,7 @@ impl CommandsView {
     }
 
     /// 整页与历史读取分别核对版本；后发搜索不被先发整页回执覆盖，其余数据照常回投。
+    /// 工作流结果为 None 时保留已确认列表，不把“未读取”当成空目录。
     fn finish_panel_load(
         &mut self,
         generation: u64,
@@ -1657,7 +1657,12 @@ impl CommandsView {
                             self.workflows = workflows;
                             self.workflows_loaded = true;
                         }
-                        Err(error) => errors.push(error.public_message()),
+                        Err(error) => {
+                            // 失败后允许下一次会话或 Catalogs 重读补读；旧列表继续保留，
+                            // 避免“首次成功后一次失败就长期陈旧且没有刷新入口”。
+                            self.workflows_loaded = false;
+                            errors.push(error.public_message());
+                        }
                     }
                 }
                 match ui_sessions {

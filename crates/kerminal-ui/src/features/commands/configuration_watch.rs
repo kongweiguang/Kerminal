@@ -225,7 +225,10 @@ impl CommandsView {
             return;
         }
 
-        self.reload_panel(PanelReload::Catalogs, cx);
+        if workflows_changed {
+            // 整页重读只跟随工作流变化；仅片段变化时不重读全局目录，也不显示整页同步提示。
+            self.reload_panel(PanelReload::Catalogs, cx);
+        }
         if snippets_changed {
             // 片段文件变化才使目录过期；整页重读已不含片段页，仅调整工作流时不得重启目录。
             self.refresh_snippet_page(cx);
