@@ -463,15 +463,16 @@ impl Render for PreferencesPanel {
             window.on_next_frame(move |_, _| scroll.scroll_to_top_of_item(index));
         }
         let theme = ThemeTokens::current(window, cx).for_settings();
-        // 提示只服务退出被写入拒绝的场景；写操作结束后立即清除，避免下次写入显示旧原因。
-        if !self.extensions.is_writing(cx) {
+        // 同一帧只读取一次写入状态，用于清理旧提示和决定是否显示当前提示。
+        let extension_writing = self.extensions.is_writing(cx);
+        if !extension_writing {
             self.extensions.clear_notice();
         }
-        let extension_notice = self
-            .extensions
-            .notice()
-            .filter(|_| self.extensions.is_writing(cx))
-            .map(str::to_owned);
+        let extension_notice = if extension_writing {
+            self.extensions.notice().map(str::to_owned)
+        } else {
+            None
+        };
         let content = if let Some(page) = self
             .external_plugins
             .selected

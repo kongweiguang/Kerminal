@@ -229,8 +229,8 @@ impl PreferencesPanel {
                 "An extension write is still running. Try quitting again when it finishes.",
             )
             .to_string();
+            // 正文 notice 已显示同一原因；写入 status 会被其它设置页当作成功反馈渲染。
             self.set_extensions_notice(message.clone());
-            self.status = Some(message.clone());
             cx.emit(PreferencesEvent::QuitDeferred { message });
             cx.notify();
             return false;
