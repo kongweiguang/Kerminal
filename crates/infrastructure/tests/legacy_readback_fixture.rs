@@ -301,7 +301,7 @@ async fn generate_real_legacy_readback_fixture() {
         HostKeyStatus::Unknown
     );
     known_hosts
-        .trust(&readback_host.endpoint, &known_host_identity)
+        .record(&readback_host.endpoint, &known_host_identity)
         .await
         .expect("通过 known_hosts adapter 写入合成信任记录");
     assert_eq!(

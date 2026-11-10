@@ -255,7 +255,7 @@ impl KnownHostsRepository for UnknownKnownHosts {
     }
 
     /// 测试不进入 SSH host-key trust 阶段，因此任何信任写入都应保留无副作用语义。
-    async fn trust(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
+    async fn record(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
         Ok(())
     }
 }

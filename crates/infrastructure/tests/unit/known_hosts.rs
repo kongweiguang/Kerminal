@@ -20,6 +20,7 @@ const OTHER_PUBLIC_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
 const HASHED_HOST_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILIG2T/B0l0gaqj3puu510tu9N1OkQ4znY3LYuEm5zCF";
+const RSA_PUBLIC_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCpVx5I2Qqp6fuuV1kE52z7uiCTyWBeRZKMU50yKdvzcqFkdtlCiPPABxIzReRPNm4bLyif8OxDlufhgQ765BFX12x+SrmkcraBwuLxmOo7SRj0oHN3g5wSNVX9bZKxfWLmXArD88TuFLHcnSTV0wHGy3aIqX+Uo6ltCw/OLt8Yv+2V/r6F88e0dmWUHzHqq6E62huWYHW0uW09eO6fyao34IonUsl9udfZ5aW+ZuaRaL/GIbG2k150J9aCOQhjLmWMWjm6K+cNcU/W3jrIQhfZPe+2gSUkWB9EX6JKNp7TWIIMfMsffCYdMiuwsjzxYD27WB2kULXp5zR1Zc645srf";
 
 /// 从有效 OpenSSH 公钥构造 adapter 入参，测试同时覆盖格式和指纹校验。
 fn identity(public_key: &str) -> HostKeyIdentity {
@@ -45,7 +46,7 @@ fn classify_fixture(
     let directory = tempdir().expect("temp directory");
     let path = directory.path().join(KNOWN_HOSTS_FILE);
     std::fs::write(&path, content).expect("write fixture");
-    classify_key(endpoint, identity, &path, content)
+    classify_key(endpoint, identity, &path)
 }
 
 /// 验证首次信任写入完整 OpenSSH 公钥行，并让后续读取命中 Known。
@@ -68,7 +69,7 @@ async fn trust_writes_parseable_openssh_record() {
         HostKeyStatus::Unknown
     ));
     repository
-        .trust(&endpoint, &key_identity)
+        .record(&endpoint, &key_identity)
         .await
         .expect("trust");
     assert!(matches!(
@@ -84,7 +85,7 @@ async fn trust_writes_parseable_openssh_record() {
     assert!(!line.contains(&key_identity.fingerprint_sha256));
 
     repository
-        .trust(&endpoint, &key_identity)
+        .record(&endpoint, &key_identity)
         .await
         .expect("repeated trust is idempotent");
     assert_eq!(
@@ -108,7 +109,7 @@ async fn changed_key_is_atomically_replaced_on_trust() {
     let first = identity(PUBLIC_KEY);
     let changed = identity(OTHER_PUBLIC_KEY);
     repository
-        .trust(&endpoint, &first)
+        .record(&endpoint, &first)
         .await
         .expect("trust first");
     assert!(matches!(
@@ -120,7 +121,7 @@ async fn changed_key_is_atomically_replaced_on_trust() {
     ));
 
     repository
-        .trust(&endpoint, &changed)
+        .record(&endpoint, &changed)
         .await
         .expect("changed key is upserted instead of blocked");
     assert!(matches!(
@@ -147,27 +148,27 @@ async fn known_key_succeeds_without_write_access() {
     };
     let key_identity = identity(PUBLIC_KEY);
     store(directory.path())
-        .trust(&endpoint, &key_identity)
+        .record(&endpoint, &key_identity)
         .await
         .expect("seed writable known_hosts");
     let readonly = KnownHostsStore::new(StorageCoordinator::new(directory.path()), false);
 
     readonly
-        .trust(&endpoint, &key_identity)
+        .record(&endpoint, &key_identity)
         .await
         .expect("known key requires no write access");
     assert!(
         readonly
-            .trust(&endpoint, &identity(OTHER_PUBLIC_KEY))
+            .record(&endpoint, &identity(OTHER_PUBLIC_KEY))
             .await
             .is_err(),
         "unknown keys still report the read-only storage error for the caller to downgrade"
     );
 }
 
-/// 当前 key 的 @revoked 记录在 classify 中表现为 previous==current；自动信任只保留原记录并成功返回。
+/// 当前 key 的 @revoked 历史标记不再阻断记录；同一 endpoint 会追加正常记录并转为 Known。
 #[tokio::test]
-async fn revoked_key_trust_is_ignored_without_blocking() {
+async fn revoked_record_does_not_block_new_record() {
     let directory = tempdir().expect("temp directory");
     let repository = store(directory.path());
     let endpoint = HostEndpoint {
@@ -176,20 +177,34 @@ async fn revoked_key_trust_is_ignored_without_blocking() {
         username: "test".to_owned(),
     };
     let key_identity = identity(PUBLIC_KEY);
-    let fixture = format!(
-        "@revoked other.example {}\n",
+    let revoked = format!(
+        "@revoked example.test {}\n",
         key_identity.public_key_openssh
     );
     let known_hosts = directory.path().join(KNOWN_HOSTS_FILE);
-    std::fs::write(&known_hosts, &fixture).expect("write revoked fixture");
+    std::fs::write(&known_hosts, &revoked).expect("write revoked fixture");
 
     repository
-        .trust(&endpoint, &key_identity)
+        .record(&endpoint, &key_identity)
         .await
-        .expect("revoked key must not create a blocking error");
-    assert_eq!(
-        std::fs::read_to_string(&known_hosts).expect("read preserved fixture"),
-        fixture
+        .expect("revoked marker must not block recording the observed key");
+    assert!(matches!(
+        repository
+            .inspect(&endpoint, &key_identity)
+            .await
+            .expect("inspect recorded key"),
+        HostKeyStatus::Known
+    ));
+    let content = std::fs::read_to_string(&known_hosts).expect("read recorded fixture");
+    assert!(
+        content.contains("@revoked example.test"),
+        "撤销标记原样保留"
+    );
+    assert!(
+        content
+            .lines()
+            .any(|line| line.starts_with("example.test ")),
+        "撤销标记之外仍应追加正常记录"
     );
 }
 
@@ -209,11 +224,11 @@ fn hashed_hostname_record_is_known() {
     ));
 }
 
-/// 撤销记录仍归类为 Changed，供 trust 保留原记录并告警；分类本身不再阻断连接。
+/// 撤销记录不再参与分类：只有 @revoked 行的 endpoint 属于 Unknown，可以追加正常记录。
 #[test]
-fn revoked_key_is_never_known() {
+fn revoked_only_record_is_unknown() {
     let key_identity = identity(PUBLIC_KEY);
-    let content = b"@revoked other.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ\n";
+    let content = b"@revoked example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ\n";
     let endpoint = HostEndpoint {
         host: "example.test".to_owned(),
         port: 22,
@@ -221,8 +236,155 @@ fn revoked_key_is_never_known() {
     };
     assert!(matches!(
         classify_fixture(&endpoint, &key_identity, content).expect("classify revoked"),
-        HostKeyStatus::Changed { .. }
+        HostKeyStatus::Unknown
     ));
+}
+
+/// 同一 endpoint 的 rsa 与 ed25519 必须独立轮换：替换 ed25519 时保留 rsa 记录。
+#[tokio::test]
+async fn rotation_replaces_only_same_algorithm_record() {
+    let directory = tempdir().expect("temp directory");
+    let repository = store(directory.path());
+    let endpoint = HostEndpoint {
+        host: "example.test".to_owned(),
+        port: 22,
+        username: "test".to_owned(),
+    };
+    let rsa = identity(RSA_PUBLIC_KEY);
+    let ed25519 = identity(PUBLIC_KEY);
+    let rotated = identity(OTHER_PUBLIC_KEY);
+    let known_hosts = directory.path().join(KNOWN_HOSTS_FILE);
+    let original = format!(
+        "example.test {}\nexample.test {}\nexample.test {}\nother.example {}\n",
+        rsa.public_key_openssh,
+        ed25519.public_key_openssh,
+        ed25519.public_key_openssh,
+        ed25519.public_key_openssh
+    );
+    std::fs::write(&known_hosts, &original).expect("write multi-algorithm fixture");
+
+    repository
+        .record(&endpoint, &rotated)
+        .await
+        .expect("rotate ed25519 while rsa stays valid");
+    assert!(matches!(
+        repository
+            .inspect(&endpoint, &rotated)
+            .await
+            .expect("inspect rotated key"),
+        HostKeyStatus::Known
+    ));
+    let content = std::fs::read_to_string(&known_hosts).expect("read rotated fixture");
+    assert!(
+        content.contains(&rsa.public_key_openssh),
+        "rsa 记录必须保留"
+    );
+    assert!(
+        !content.contains(&format!("example.test {}", ed25519.public_key_openssh)),
+        "同算法的旧 ed25519 记录都必须移除"
+    );
+    assert!(
+        content.contains(&format!("other.example {}", ed25519.public_key_openssh)),
+        "其它主机的同算法记录不受影响"
+    );
+}
+
+/// russh 跳过注释但不递增行号；有前置注释时替换必须落在真实记录行，不能删错注释或邻居。
+#[tokio::test]
+async fn rotation_with_leading_comment_replaces_real_record_line() {
+    let directory = tempdir().expect("temp directory");
+    let repository = store(directory.path());
+    let endpoint = HostEndpoint {
+        host: "example.test".to_owned(),
+        port: 22,
+        username: "test".to_owned(),
+    };
+    let previous = identity(PUBLIC_KEY);
+    let rotated = identity(OTHER_PUBLIC_KEY);
+    let known_hosts = directory.path().join(KNOWN_HOSTS_FILE);
+    let original = format!(
+        "# managed by fixture\nfirst.example {}\nexample.test {}\nlast.example {}\n",
+        identity(HASHED_HOST_KEY).public_key_openssh,
+        previous.public_key_openssh,
+        previous.public_key_openssh
+    );
+    std::fs::write(&known_hosts, &original).expect("write commented fixture");
+
+    repository
+        .record(&endpoint, &rotated)
+        .await
+        .expect("comment must not shift the replaced line");
+    let content = std::fs::read_to_string(&known_hosts).expect("read replaced fixture");
+    assert_eq!(
+        content.lines().next(),
+        Some("# managed by fixture"),
+        "注释行保持原样"
+    );
+    assert!(
+        content.contains(&format!(
+            "first.example {}",
+            identity(HASHED_HOST_KEY).public_key_openssh
+        )),
+        "注释后的其它主机行保持不变"
+    );
+    assert!(
+        content.contains(&format!("last.example {}", previous.public_key_openssh)),
+        "注释后的邻居行保持不变"
+    );
+    assert!(
+        content.contains(&format!("example.test {}", rotated.public_key_openssh)),
+        "目标 endpoint 替换为新 key"
+    );
+    assert!(!content.contains(&format!("example.test {}", previous.public_key_openssh)));
+}
+
+/// 无关主机、端口和注释字节必须保持不变；替换只动当前 endpoint 的同算法记录。
+#[tokio::test]
+async fn rotation_preserves_unrelated_lines_and_port_identity() {
+    let directory = tempdir().expect("temp directory");
+    let repository = store(directory.path());
+    let endpoint = HostEndpoint {
+        host: "example.test".to_owned(),
+        port: 2222,
+        username: "test".to_owned(),
+    };
+    let previous = identity(PUBLIC_KEY);
+    let rotated = identity(OTHER_PUBLIC_KEY);
+    let known_hosts = directory.path().join(KNOWN_HOSTS_FILE);
+    let unrelated = format!(
+        "# header\r\nexample.test {} \r\n[example.test]:2222 {} \r\nother.example {}\r\n",
+        previous.public_key_openssh, previous.public_key_openssh, previous.public_key_openssh
+    );
+    std::fs::write(&known_hosts, &unrelated).expect("write unrelated fixture");
+
+    repository
+        .record(&endpoint, &rotated)
+        .await
+        .expect("replace only the non-default port record");
+    let content = std::fs::read_to_string(&known_hosts).expect("read preserved fixture");
+    assert!(content.starts_with("# header\r\n"), "注释和 CRLF 保留");
+    assert!(
+        content.contains(&format!(
+            "example.test {} \r\n",
+            previous.public_key_openssh
+        )),
+        "port 22 的同主机记录不受影响"
+    );
+    assert!(
+        content.contains(&format!(
+            "other.example {}\r\n",
+            previous.public_key_openssh
+        )),
+        "其它主机记录不受影响"
+    );
+    assert!(!content.contains(&format!(
+        "[example.test]:2222 {}",
+        previous.public_key_openssh
+    )));
+    assert!(content.contains(&format!(
+        "[example.test]:2222 {}",
+        rotated.public_key_openssh
+    )));
 }
 
 /// staging 完成后若外部编辑写入第三值，提交边界必须拒绝覆盖并保留该值。

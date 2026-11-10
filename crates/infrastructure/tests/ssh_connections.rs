@@ -126,7 +126,7 @@ impl KnownHostsRepository for ReadOnlyKnownHostsRepository {
     }
 
     /// 记录调用次数并返回只读错误，验证调用方只降级为 warning 而不是阻断连接。
-    async fn trust(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
+    async fn record(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
         self.trust_attempts.fetch_add(1, Ordering::Relaxed);
         Err(AppError::unsupported("test known_hosts is read-only"))
     }

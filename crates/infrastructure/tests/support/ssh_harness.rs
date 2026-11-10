@@ -698,8 +698,8 @@ impl KnownHostsRepository for TestKnownHostsRepository {
         })
     }
 
-    /// 将应用层自动信任的指纹写入当前测试实例。
-    async fn trust(&self, endpoint: &HostEndpoint, identity: &HostKeyIdentity) -> AppResult<()> {
+    /// 将应用层自动记录的指纹写入当前测试实例。
+    async fn record(&self, endpoint: &HostEndpoint, identity: &HostKeyIdentity) -> AppResult<()> {
         self.trust_fingerprint(endpoint, &identity.algorithm, &identity.fingerprint_sha256);
         Ok(())
     }

@@ -48,7 +48,7 @@ impl KnownHostsRepository for FixedKnownHosts {
     }
 
     /// 记录任何持久信任写入，验证 probe 只允许内存 pin。
-    async fn trust(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
+    async fn record(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
         self.trust_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

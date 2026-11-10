@@ -126,8 +126,8 @@ pub trait KnownHostsRepository: Send + Sync {
         endpoint: &HostEndpoint,
         identity: &HostKeyIdentity,
     ) -> AppResult<HostKeyStatus>;
-    /// 默认信任主机密钥后尽力 upsert 记录；未知追加、变化替换，失败只降级为 warning。
-    async fn trust(&self, endpoint: &HostEndpoint, identity: &HostKeyIdentity) -> AppResult<()>;
+    /// 连接层只把观察到的 key 尽力记录；未知追加、变化替换，失败只降级为 warning。
+    async fn record(&self, endpoint: &HostEndpoint, identity: &HostKeyIdentity) -> AppResult<()>;
 }
 
 /// 桌面平台的 RDP 启动 adapter；密码只能短暂交给平台凭据/DPAPI 实现，不得写进 argv。

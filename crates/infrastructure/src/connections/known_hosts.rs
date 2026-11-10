@@ -54,8 +54,9 @@ impl KnownHostsRepository for KnownHostsStore {
         tokio::task::spawn_blocking(move || {
             let _storage_lock = storage.lock().map_err(storage_lock_error)?;
             let path = storage.root().join(KNOWN_HOSTS_FILE);
-            let content = read_known_hosts(&path)?;
-            classify_key(&endpoint, &identity, &path, &content)
+            // 分类本身交给 russh 的 matcher，但仍先按共享读取边界拒绝符号链接和超大文件。
+            read_known_hosts(&path)?;
+            classify_key(&endpoint, &identity, &path)
         })
         .await
         .map_err(|error| {
@@ -63,13 +64,13 @@ impl KnownHostsRepository for KnownHostsStore {
         })?
     }
 
-    /// 幂等 upsert 观察到的公钥：已知直接成功，未知追加，变化时原子替换该端点的旧记录。
+    /// 幂等 upsert 观察到的公钥：已知直接成功，未知追加，同算法变化时原子替换该端点的旧记录。
     ///
-    /// 连接层已默认信任主机密钥，known_hosts 只承担后台记录职责；调用方把读取或写入
+    /// 连接层已默认接受主机密钥，known_hosts 只承担后台记录职责；调用方把读取或写入
     /// 失败降级为 warning，不会阻断握手或认证。
     /// 已知判定必须先于 writable 判断：只读数据根中已保存的主机仍应允许连接，
     /// 否则恢复态或受限运行环境会因无法写入而误拒已受信主机。
-    async fn trust(&self, endpoint: &HostEndpoint, identity: &HostKeyIdentity) -> AppResult<()> {
+    async fn record(&self, endpoint: &HostEndpoint, identity: &HostKeyIdentity) -> AppResult<()> {
         let endpoint = endpoint.clone();
         let identity = identity.clone();
         let storage = self.storage.clone();
@@ -78,7 +79,7 @@ impl KnownHostsRepository for KnownHostsStore {
             let _storage_lock = storage.lock().map_err(storage_lock_error)?;
             let path = storage.root().join(KNOWN_HOSTS_FILE);
             let existing = read_known_hosts(&path)?;
-            match classify_key(&endpoint, &identity, &path, &existing)? {
+            match classify_key(&endpoint, &identity, &path)? {
                 HostKeyStatus::Known => Ok(()),
                 HostKeyStatus::Changed {
                     previous_fingerprint_sha256,
@@ -88,26 +89,15 @@ impl KnownHostsRepository for KnownHostsStore {
                             "SSH host key rotation storage is read-only",
                         ));
                     }
-                    // classify 把当前 key 的 @revoked 记录表示为 previous==current；替换 helper
-                    // 拒绝这种输入，而连接已经放行，因此只保留原记录并记录 warning。
-                    if previous_fingerprint_sha256 == identity.fingerprint_sha256 {
-                        tracing::warn!(
-                            "SSH known_hosts 中当前主机密钥被标记为 @revoked；自动信任保持原记录"
-                        );
-                        return Ok(());
-                    }
-                    let updated = match replace_known_host_contents(
+                    // 并发编辑只让本次后台替换失败；调用方记录 warning，
+                    // 连接仍然完成，原 known_hosts 内容保持不变。
+                    let updated = replace_known_host_contents(
                         &endpoint,
                         &previous_fingerprint_sha256,
                         &identity,
                         &path,
                         &existing,
-                    ) {
-                        Ok(updated) => updated,
-                        // 撤销记录或并发编辑只让本次后台替换失败；调用方记录 warning，
-                        // 连接仍然完成，原 known_hosts 内容保持不变。
-                        Err(error) => return Err(error),
-                    };
+                    )?;
                     if updated == existing {
                         return Ok(());
                     }
@@ -128,7 +118,7 @@ impl KnownHostsRepository for KnownHostsStore {
                 HostKeyStatus::Unknown => {
                     if !writable {
                         return Err(AppError::unsupported(
-                            "SSH host key trust storage is read-only",
+                            "SSH host key record storage is read-only",
                         ));
                     }
                     let updated = append_known_host(&endpoint, &identity, &existing)?;
@@ -170,28 +160,28 @@ fn parse_identity(identity: &HostKeyIdentity) -> AppResult<PublicKey> {
     Ok(key)
 }
 
-/// 按 endpoint 的已有公钥分类，并在任何同名 key 已撤销时优先 fail closed。
+/// 按 endpoint 的已有公钥分类；只有与新 key 同算法的记录才能作为轮换前值。
+///
+/// 不同算法（如同时保存的 rsa 与 ed25519）是 OpenSSH 的正常多密钥布局，
+/// 不能把另一算法的 key 误当成“变化”，否则自动记录会删掉仍有效的旧算法记录。
+/// @revoked 行只表示历史撤销事实，不再参与连接判定或阻止重新记录。
 fn classify_key(
     endpoint: &HostEndpoint,
     identity: &HostKeyIdentity,
     path: &Path,
-    content: &[u8],
 ) -> AppResult<HostKeyStatus> {
     let key = parse_identity(identity)?;
-    let content = std::str::from_utf8(content)
-        .map_err(|error| AppError::infrastructure_with_source("SSH known_hosts 编码无效", error))?;
-    if revoked_key_exists(content, &key) {
-        return Ok(HostKeyStatus::Changed {
-            previous_fingerprint_sha256: identity.fingerprint_sha256.clone(),
-        });
-    }
     let records = matching_keys(endpoint, path)?;
     if records.iter().any(|recorded| recorded == &key) {
         return Ok(HostKeyStatus::Known);
     }
-    match records.first() {
-        Some(previous) => Ok(HostKeyStatus::Changed {
-            previous_fingerprint_sha256: previous.fingerprint(HashAlg::Sha256).to_string(),
+    let previous = records
+        .iter()
+        .find(|recorded| recorded.algorithm() == key.algorithm())
+        .map(|recorded| recorded.fingerprint(HashAlg::Sha256).to_string());
+    match previous {
+        Some(previous_fingerprint_sha256) => Ok(HostKeyStatus::Changed {
+            previous_fingerprint_sha256,
         }),
         None => Ok(HostKeyStatus::Unknown),
     }
@@ -204,25 +194,14 @@ fn matching_keys(endpoint: &HostEndpoint, path: &Path) -> AppResult<Vec<PublicKe
         .map_err(|error| AppError::infrastructure_with_source("SSH known_hosts 解析失败", error))
 }
 
-/// 兼容冻结版本的 revoked 策略：任何匹配当前公钥正文的 @revoked 记录都禁止信任。
-fn revoked_key_exists(content: &str, key: &PublicKey) -> bool {
-    let Ok(expected) = key.to_openssh() else {
-        return true;
-    };
-    content.lines().any(|line| {
-        let mut fields = line.split_whitespace();
-        if fields.next() != Some("@revoked") {
-            return false;
-        }
-        let _host_patterns = fields.next();
-        let Some(algorithm) = fields.next() else {
-            return false;
-        };
-        let Some(encoded_key) = fields.next() else {
-            return false;
-        };
-        format!("{algorithm} {encoded_key}") == expected
-    })
+/// russh 解析器跳过 `#` 注释时不递增行号，直接用它删行会在注释后错位。
+/// 在同一份读取字节上重建“parser 行号 → 真实行号”，只跳过注释行且保留真实行号。
+fn real_line_numbers(text: &str) -> Vec<usize> {
+    text.split_inclusive('\n')
+        .enumerate()
+        .filter(|(_, segment)| segment.as_bytes().first() != Some(&b'#'))
+        .map(|(index, _)| index + 1)
+        .collect()
 }
 
 /// 构造与旧 Kerminal 一致的 host 或 `[host]:port` 字段，并拒绝会变成多列的地址。
@@ -267,7 +246,10 @@ fn append_known_host(
     Ok(output)
 }
 
-/// 只替换当前 endpoint 上与分类得到的旧指纹完全一致的行，并保留同文件中的其它主机记录。
+/// 替换当前 endpoint 上所有与新 key 同算法的旧记录，并保留其它算法和其它主机行。
+///
+/// 只删除同算法旧行：OpenSSH 允许同一 endpoint 同时保存不同算法的 key，
+/// 轮换 ed25519 时删除 rsa 会让仍有效的备选算法失效。
 fn replace_known_host_contents(
     endpoint: &HostEndpoint,
     expected_previous_fingerprint_sha256: &str,
@@ -286,31 +268,42 @@ fn replace_known_host_contents(
     let text = std::str::from_utf8(existing).map_err(|error| {
         AppError::infrastructure_with_source("SSH known_hosts encoding is invalid", error)
     })?;
-    if revoked_key_exists(text, &new_key) {
-        return Err(AppError::conflict(
-            "SSH candidate host key is revoked; automatic trust keeps the existing record",
-        ));
-    }
     let records = known_hosts::known_host_keys_path(&endpoint.host, endpoint.port, path).map_err(
         |error| AppError::infrastructure_with_source("SSH known_hosts parsing failed", error),
     )?;
+    let parser_lines = real_line_numbers(text);
     let mut old_lines = BTreeSet::new();
+    let mut expected_previous_matched = false;
     let mut new_key_is_present = false;
-    for (line, recorded) in records {
-        let fingerprint = recorded.fingerprint(HashAlg::Sha256).to_string();
-        if fingerprint == expected_previous_fingerprint_sha256 {
-            old_lines.insert(line);
-        }
+    for (parser_line, recorded) in records {
         if recorded == new_key {
             new_key_is_present = true;
         }
+        if recorded.algorithm() != new_key.algorithm() {
+            continue;
+        }
+        if recorded.fingerprint(HashAlg::Sha256).to_string() == expected_previous_fingerprint_sha256
+        {
+            expected_previous_matched = true;
+        }
+        // parser 行号从 1 开始并跳过注释；映射回真实行号后才能删除正确记录。
+        let real_line = parser_lines
+            .get(parser_line.saturating_sub(1))
+            .copied()
+            .unwrap_or(parser_line);
+        old_lines.insert(real_line);
     }
     if old_lines.is_empty() {
         if new_key_is_present {
             return Ok(existing.to_vec());
         }
         return Err(AppError::conflict(
-            "SSH host key changed again; the previously trusted key no longer matches",
+            "SSH host key changed again; the previously recorded key no longer matches",
+        ));
+    }
+    if !expected_previous_matched {
+        return Err(AppError::conflict(
+            "SSH host key changed while the replacement was prepared",
         ));
     }
 

@@ -1209,7 +1209,7 @@ impl client::Handler for RusshHandler {
                 if status != HostKeyStatus::Known {
                     // 自动信任后写入只是后台记录；失败不能改变握手结果，也不能留下
                     // decision_error 把后续 KEX/认证错误误分类成主机密钥错误。
-                    if let Err(error) = self.known_hosts.trust(&self.endpoint, &identity).await {
+                    if let Err(error) = self.known_hosts.record(&self.endpoint, &identity).await {
                         tracing::warn!(
                             error = %error,
                             "SSH known_hosts 自动记录主机密钥失败；连接继续"
