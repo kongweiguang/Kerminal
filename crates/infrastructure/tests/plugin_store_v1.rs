@@ -170,6 +170,46 @@ fn package_read_failure_is_not_bound_to_later_pending() {
 }
 
 #[test]
+/// 同一插件既有失败 pending 又有损坏的已安装包时，读取失败只更新原因并保留应用失败绑定。
+fn package_read_failure_preserves_existing_apply_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    let id = PluginId::parse("acme.notes").unwrap();
+    let active = PluginVersion::parse("0.9.0").unwrap();
+    let target = PluginVersion::parse("1.0.0").unwrap();
+    package(root.path(), &id, &active);
+    install(&store, &id, &active);
+    let boot = store.begin_startup(&FixtureValidator, false).unwrap();
+    let mut next = boot.store.state.clone();
+    next.pending.push(PendingPluginChange::Update {
+        id: id.clone(),
+        to: target.clone(),
+        staged: format!("packages/{id}/{target}"),
+    });
+    store.compare_and_swap(&boot.store, next).unwrap();
+    let manifest = root
+        .path()
+        .join("plugins/packages")
+        .join(id.as_str())
+        .join(active.to_string())
+        .join("manifest");
+    fs::write(&manifest, b"corrupt").unwrap();
+    let boot = store.begin_startup(&FixtureValidator, false).unwrap();
+    assert!(boot.store.state.pending_failures.contains(&id));
+    assert_eq!(
+        boot.store.state.failures.get(&id).map(String::as_str),
+        Some("插件版本损坏")
+    );
+    assert!(
+        boot.store
+            .state
+            .pending
+            .iter()
+            .any(|change| change.plugin_id() == &id)
+    );
+}
+
+#[test]
 /// 只有连续两次冻结后首帧前退出才触发安全模式，旧启动身份不能确认首帧。
 fn safe_mode_counts_only_post_freeze_crashes() {
     let root = tempfile::tempdir().unwrap();
