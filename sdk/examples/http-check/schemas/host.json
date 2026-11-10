@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "title": "%host.url%",
+      "default": "https://example.com/",
+      "pattern": "^https://example\\.com(/[^#]*)?$",
+      "maxLength": 2048
+    }
+  },
+  "required": ["url"],
+  "additionalProperties": false
+}

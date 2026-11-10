@@ -1,0 +1,40 @@
+{
+  "data": {
+    "url": "",
+    "message": "",
+    "busy": false
+  },
+  "root": {
+    "gap": "md",
+    "children": [
+      {
+        "title": "%result.address%",
+        "children": [
+          {
+            "text": "$url",
+            "type": "text"
+          }
+        ],
+        "type": "section"
+      },
+      {
+        "title": "%result.status%",
+        "children": [
+          {
+            "text": "$message",
+            "type": "text"
+          }
+        ],
+        "type": "section"
+      },
+      {
+        "label": "%result.refresh%",
+        "action": "refresh",
+        "busy": "$busy",
+        "type": "button"
+      }
+    ],
+    "type": "stack"
+  },
+  "schema": 1
+}

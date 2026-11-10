@@ -1,0 +1,28 @@
+<!doctype html>
+<!-- @author kongweiguang -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title></title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./main.js"></script>
+</head>
+<body>
+  <main>
+    <h1 id="heading"></h1>
+    <form id="search-form">
+      <label for="root" id="root-label"></label>
+      <input id="root" name="root" autocomplete="off" required>
+      <label for="query" id="query-label"></label>
+      <input id="query" name="query" autocomplete="off" required>
+      <div class="actions">
+        <button id="search" type="submit"></button>
+        <button id="cancel" type="button" disabled></button>
+      </div>
+    </form>
+    <p id="status" role="status" aria-live="polite"></p>
+    <ul id="results" aria-labelledby="heading"></ul>
+  </main>
+</body>
+</html>

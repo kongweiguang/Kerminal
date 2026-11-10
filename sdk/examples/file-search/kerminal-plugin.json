@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "id": "kerminal.file-search",
+  "name": {"en": "File Search", "zh-CN": "文件搜索"},
+  "description": {"en": "Search file names in a directory", "zh-CN": "在指定目录搜索文件名"},
+  "version": "1.0.0",
+  "api": "^1.0",
+  "publisher": "kerminal",
+  "license": "MIT",
+  "categories": ["productivity"],
+  "runtime": {
+    "kind": "sidecar",
+    "main": {
+      "windows-x86_64": "bin/file-search.exe",
+      "linux-x86_64": "bin/file-search",
+      "macos-x86_64": "bin/file-search",
+      "macos-aarch64": "bin/file-search"
+    },
+    "activation": "on-demand"
+  },
+  "permissions": [],
+  "contributes": {
+    "tabs": [{"id": "search-tab", "title": "%search.title%", "view": "search.page", "state_version": 1}]
+  },
+  "views": {"search.page": {"kind": "webview", "entry": "web/index.html", "csp": "default"}},
+  "l10n": "l10n"
+}

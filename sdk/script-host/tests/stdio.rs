@@ -1034,6 +1034,19 @@ fn fetch_preaborted_and_unsupported_options_do_not_connect() {
     );
 }
 
+/// 官方示例实际入口经过受信标志握手并完成无网络的视图生命周期。
+#[test]
+fn official_http_example_loads_and_closes_a_view() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/http-check");
+    let data = tempfile::tempdir().unwrap();
+    let mut host = Host::start_fixture(&fixture, data.path(), true);
+    host.initialize_identity("kerminal.http-check", "1.0.0");
+    let opened = host.call("view.open", json!({"instance":"sample", "state":null}));
+    assert_eq!(opened["data"]["url"], "https://example.com/");
+    let closed = host.call("view.close", json!({"instance":"sample"}));
+    assert_eq!(closed["state"]["url"], "https://example.com/");
+}
+
 /// 目标不可替换时保留已有目录并清除本次创建的临时文件。
 #[test]
 fn storage_failed_replacement_cleans_its_temporary_file() {

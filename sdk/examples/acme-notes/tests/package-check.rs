@@ -20,14 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("windows-x86_64") => Platform::WindowsX86_64,
         _ => return Err("platform must be any or windows-x86_64".into()),
     };
-    if args.next().is_some() {
-        return Err("unexpected arguments".into());
-    }
+    if args.next().is_some() { return Err("unexpected arguments".into()); }
     let package = validate_package(Path::new(&root), policy)?;
     package.validate_for_platform(platform)?;
-    println!(
-        "{} {} validated",
-        package.manifest.id, package.manifest.version
-    );
+    println!("{} {} validated", package.manifest.id, package.manifest.version);
     Ok(())
 }

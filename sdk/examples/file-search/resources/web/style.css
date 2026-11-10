@@ -1,0 +1,29 @@
+/* @author kongweiguang */
+html {
+  color-scheme: light dark;
+  color: var(--k-fg, CanvasText);
+  background: var(--k-bg, Canvas);
+  font: var(--k-font, 1rem system-ui, sans-serif);
+}
+body { margin: 0; }
+main { max-width: 60rem; margin: 0 auto; padding: 1.25rem; }
+h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 1rem; }
+form { display: grid; gap: 0.5rem; }
+label { font-weight: 500; }
+input, button {
+  color: inherit;
+  background: var(--k-surface, Field);
+  border: 1px solid var(--k-border, GrayText);
+  border-radius: var(--k-radius, 0.375rem);
+  font: inherit;
+  padding: 0.4rem 0.625rem;
+  min-width: 0;
+}
+button { background: var(--k-button, ButtonFace); color: var(--k-button-fg, ButtonText); }
+button:not(:disabled):hover { background: var(--k-hover, ButtonFace); }
+button:disabled { color: var(--k-disabled-fg, GrayText); }
+:focus-visible { outline: 2px solid var(--k-focus, Highlight); outline-offset: 2px; }
+.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.25rem; }
+#status { min-height: 1.5em; color: var(--k-muted-fg, GrayText); }
+#results { padding: 0; margin: 0; list-style: none; overflow-wrap: anywhere; }
+#results li { padding: 0.4rem 0; border-bottom: 1px solid var(--k-border, GrayText); }

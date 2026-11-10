@@ -1,0 +1,8 @@
+{
+  "host.title": "HTTP endpoint",
+  "host.url": "URL on example.com",
+  "result.title": "HTTP result",
+  "result.address": "Address",
+  "result.status": "Result",
+  "result.refresh": "Check again"
+}

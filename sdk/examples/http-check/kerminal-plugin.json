@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "id": "kerminal.http-check",
+  "name": {"en": "HTTP Check", "zh-CN": "HTTP 检查"},
+  "description": {"en": "Check an example HTTP endpoint", "zh-CN": "检查示例 HTTP 服务"},
+  "version": "1.0.0",
+  "api": "^1.0",
+  "publisher": "kerminal",
+  "license": "MIT",
+  "categories": ["network"],
+  "runtime": {"kind": "script", "main": "dist/main.js", "activation": "on-demand"},
+  "permissions": ["network:example.com"],
+  "contributes": {
+    "host_types": [{"id": "http-endpoint", "title": "%host.title%", "schema": "schemas/host.json"}],
+    "tabs": [{"id": "http-result", "title": "%result.title%", "view": "http.result", "state_version": 1}]
+  },
+  "views": {"http.result": {"kind": "native", "file": "views/result.json"}},
+  "l10n": "l10n"
+}

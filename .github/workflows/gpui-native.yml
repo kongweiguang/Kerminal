@@ -90,6 +90,37 @@ jobs:
           set -euo pipefail
           cargo build --locked -p kerminal-desktop -p kerminal-plugin-host -p kerminal-plugin-cli --features kerminal-desktop/acceptance,kerminal-desktop/acceptance-metrics,kerminal-desktop/right-rail-acceptance
 
+      - name: Build and validate plugin examples
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            x86_64-pc-windows-msvc) platform=windows-x86_64; suffix=.exe ;;
+            x86_64-unknown-linux-gnu) platform=linux-x86_64; suffix= ;;
+            x86_64-apple-darwin) platform=macos-x86_64; suffix= ;;
+            aarch64-apple-darwin) platform=macos-aarch64; suffix= ;;
+            *) echo "Unsupported plugin platform" >&2; exit 1 ;;
+          esac
+          cli="target/debug/kerminal-plugin${suffix}"
+          evidence="target/diagnostics/plugin-examples"
+          mkdir -p "$evidence"
+          for example in acme-notes http-check file-search; do
+            project="sdk/examples/$example"
+            output="$evidence/$example"
+            mkdir -p "$output"
+            official=()
+            if [[ "$example" != acme-notes ]]; then official=(--official); fi
+            "$cli" build --project "$project" --platform "$platform" "${official[@]}" 2>&1 | tee "$output/build.log"
+            "$cli" check "$project/.kerminal/build" --platform "$platform" "${official[@]}" 2>&1 | tee "$output/check.log"
+            if [[ "$example" == file-search ]]; then
+              "$cli" conformance "$project/.kerminal/build/bin/file-search${suffix}" --id kerminal.file-search --version 1.0.0 2>&1 | tee "$output/conformance.log"
+            fi
+            "$cli" package --dir "$project/.kerminal/build" --out "$output" --platform "$platform" "${official[@]}" 2>&1 | tee "$output/package.log"
+            packages=("$output"/*.kplugin)
+            [[ ${#packages[@]} -eq 1 && -f "${packages[0]}" ]]
+            "$cli" check "${packages[0]}" --platform "$platform" "${official[@]}" 2>&1 | tee "$output/package-check.log"
+          done
+
       - name: Verify macOS WebView without desktop interaction
         if: runner.os == 'macOS'
         shell: bash

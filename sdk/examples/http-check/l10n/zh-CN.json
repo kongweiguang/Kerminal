@@ -1,0 +1,8 @@
+{
+  "host.title": "HTTP 服务",
+  "host.url": "example.com 上的地址",
+  "result.title": "HTTP 检查结果",
+  "result.address": "地址",
+  "result.status": "检查结果",
+  "result.refresh": "重新检查"
+}
