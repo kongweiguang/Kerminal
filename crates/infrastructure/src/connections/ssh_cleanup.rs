@@ -20,8 +20,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    HostEndpoint, HostKeyChallenge, HostKeyStatus, RusshHandler, RusshPeerSession,
-    make_peer_session, russh_error,
+    HostEndpoint, HostKeyChallenge, RusshHandler, RusshPeerSession, make_peer_session, russh_error,
 };
 
 const CLEANUP_GRACE: Duration = Duration::from_millis(500);
@@ -605,7 +604,8 @@ impl PendingHandshakeCleanup {
         }
     }
 
-    /// 保留 host-key challenge 与 handler 决策错误的既有分类，不把它们改成通用 SSH 错误。
+    /// 保留 handler 记录的内部决策错误（例如公钥无法序列化），其余 KEX/网络失败一律
+    /// 保持通用 SSH 分类；主机密钥已默认信任，不再由已观察状态改写错误类型。
     fn map_connect_error(&self, error: russh::Error) -> AppError {
         if let Some(error) = self
             .decision_error
@@ -614,18 +614,6 @@ impl PendingHandshakeCleanup {
             .take()
         {
             return error;
-        }
-        if let Some(challenge) = self
-            .observed
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone()
-        {
-            return match challenge.status {
-                HostKeyStatus::Unknown => AppError::host_key_unknown(),
-                HostKeyStatus::Changed { .. } => AppError::host_key_changed(),
-                HostKeyStatus::Known => russh_error("SSH key exchange failed", error),
-            };
         }
         russh_error("SSH key exchange failed", error)
     }

@@ -63,43 +63,102 @@ impl KnownHostsRepository for KnownHostsStore {
         })?
     }
 
-    /// 在统一文件锁内复读并 CAS，仅为 Unknown 追加新公钥；Changed 与 revoked key 均拒绝覆盖。
+    /// 幂等 upsert 观察到的公钥：已知直接成功，未知追加，变化时原子替换该端点的旧记录。
+    ///
+    /// 连接层已默认信任主机密钥，known_hosts 只承担后台记录职责，因此这里不再返回
+    /// `host_key_changed`；调用方把写入失败降级为 warning，不会阻断握手或认证。
+    /// 已知判定必须先于 writable 判断：只读数据根中已保存的主机仍应允许连接，
+    /// 否则恢复态或受限运行环境会因无法写入而误拒已受信主机。
     async fn trust(&self, endpoint: &HostEndpoint, identity: &HostKeyIdentity) -> AppResult<()> {
-        if !self.writable {
-            return Err(AppError::unsupported(
-                "SSH host key trust storage is read-only",
-            ));
-        }
         let endpoint = endpoint.clone();
         let identity = identity.clone();
         let storage = self.storage.clone();
+        let writable = self.writable;
         tokio::task::spawn_blocking(move || {
             let _storage_lock = storage.lock().map_err(storage_lock_error)?;
             let path = storage.root().join(KNOWN_HOSTS_FILE);
             let existing = read_known_hosts(&path)?;
             match classify_key(&endpoint, &identity, &path, &existing)? {
                 HostKeyStatus::Known => return Ok(()),
-                HostKeyStatus::Changed { .. } => return Err(AppError::host_key_changed()),
-                HostKeyStatus::Unknown => {}
-            }
+                HostKeyStatus::Changed {
+                    previous_fingerprint_sha256,
+                } => {
+                    if !writable {
+                        return Err(AppError::unsupported(
+                            "SSH host key rotation storage is read-only",
+                        ));
+                    }
+                    // classify 把当前 key 的 @revoked 记录表示为 previous==current；替换 helper
+                    // 拒绝这种输入，而连接已经放行，因此只保留原记录并记录 warning。
+                    if previous_fingerprint_sha256 == identity.fingerprint_sha256 {
+                        tracing::warn!(
+                            "SSH known_hosts 中当前主机密钥被标记为 @revoked；自动信任保持原记录"
+                        );
+                        return Ok(());
+                    }
+                    let updated = match replace_known_host_contents(
+                        &endpoint,
+                        &previous_fingerprint_sha256,
+                        &identity,
+                        &path,
+                        &existing,
+                    ) {
+                        Ok(updated) => updated,
+                        Err(AppError::HostKeyChanged) => {
+                            tracing::warn!(
+                                "SSH known_hosts 中候选主机密钥被标记为 @revoked；自动信任保持原记录"
+                            );
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if updated == existing {
+                        return Ok(());
+                    }
 
-            let updated = append_known_host(&endpoint, &identity, &existing)?;
-            let staging_path = write_staging_file(&path, &updated)?;
-            if path.exists() {
-                return commit_staged_known_hosts_replacement(
-                    &path,
-                    &staging_path,
-                    &existing,
-                    &updated,
-                );
-            }
+                    let staging_path = write_staging_file(&path, &updated)?;
+                    let stage_validation = validate_replaced_host_key(
+                        &endpoint,
+                        &previous_fingerprint_sha256,
+                        &identity,
+                        &staging_path,
+                    );
+                    if let Err(error) = stage_validation {
+                        let _ = fs::remove_file(&staging_path);
+                        return Err(error);
+                    }
+                    commit_staged_known_hosts_replacement(
+                        &path,
+                        &staging_path,
+                        &existing,
+                        &updated,
+                    )
+                }
+                HostKeyStatus::Unknown => {
+                    if !writable {
+                        return Err(AppError::unsupported(
+                            "SSH host key trust storage is read-only",
+                        ));
+                    }
+                    let updated = append_known_host(&endpoint, &identity, &existing)?;
+                    let staging_path = write_staging_file(&path, &updated)?;
+                    if path.exists() {
+                        return commit_staged_known_hosts_replacement(
+                            &path,
+                            &staging_path,
+                            &existing,
+                            &updated,
+                        );
+                    }
 
-            let commit = commit_staged_file(&staging_path, &path, CommitMode::CreateNew);
-            if let Err(error) = commit {
-                let _ = fs::remove_file(&staging_path);
-                return resolve_commit_error(&path, &updated, error);
+                    let commit = commit_staged_file(&staging_path, &path, CommitMode::CreateNew);
+                    if let Err(error) = commit {
+                        let _ = fs::remove_file(&staging_path);
+                        return resolve_commit_error(&path, &updated, error);
+                    }
+                    Ok(())
+                }
             }
-            Ok(())
         })
         .await
         .map_err(|error| {

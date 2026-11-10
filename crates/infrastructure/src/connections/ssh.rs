@@ -1388,7 +1388,7 @@ fn effective_remote_forward_port(requested_port: u16, returned_port: u32) -> App
         .map_err(|_| AppError::infrastructure("SSH server returned an invalid remote-forward port"))
 }
 
-/// Russh handler 执行 fail-closed known_hosts 校验，并接收远端端口转发的入站 channel。
+/// Russh handler 自动信任主机密钥并尽力记录 known_hosts，同时接收远端端口转发的入站 channel。
 struct RusshHandler {
     host_id: HostId,
     peer: HostKeyPeer,
@@ -1403,7 +1403,11 @@ struct RusshHandler {
 impl client::Handler for RusshHandler {
     type Error = russh::Error;
 
-    /// 未知或变化的 key 一律拒绝普通连接；只读指纹流程允许握手但不做认证或业务请求。
+    /// 默认信任所有主机密钥：观察到 Unknown/Changed 时尽力写入 known_hosts，随后一律放行。
+    ///
+    /// 主机密钥已不再承担连接准入职责，known_hosts 只用于迁移和排障；因此读取或写入失败
+    /// 都降级为 warning，不能阻断握手或认证。只有公钥无法序列化这类内部不变量错误，
+    /// 因为无法形成可持久化的 key 身份，才继续拒绝握手。
     async fn check_server_key(
         &mut self,
         key: &russh::keys::ssh_key::PublicKey,
@@ -1437,21 +1441,33 @@ impl client::Handler for RusshHandler {
                     endpoint: self.endpoint.clone(),
                     algorithm,
                     fingerprint_sha256: fingerprint,
-                    identity,
+                    identity: identity.clone(),
                     status: status.clone(),
                 };
                 *self
                     .observed
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner()) = Some(challenge);
-                Ok(self.inspect_only || status == HostKeyStatus::Known)
+                if !self.inspect_only && status != HostKeyStatus::Known {
+                    // 自动信任后写入只是后台记录；失败不能改变握手结果，也不能留下
+                    // decision_error 把后续 KEX/认证错误误分类成主机密钥错误。
+                    if let Err(error) = self.known_hosts.trust(&self.endpoint, &identity).await {
+                        tracing::warn!(
+                            error = %error,
+                            "SSH known_hosts 自动记录主机密钥失败；连接继续"
+                        );
+                    }
+                }
+                Ok(true)
             }
             Err(error) => {
-                *self
-                    .decision_error
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(error);
-                Ok(false)
+                // 读取失败同样只是记录能力降级；旧 inspect 路径可能拿不到 challenge，
+                // 但普通连接必须照常完成握手。
+                tracing::warn!(
+                    error = %error,
+                    "SSH known_hosts 读取主机密钥状态失败；连接继续"
+                );
+                Ok(true)
             }
         }
     }
@@ -1661,7 +1677,7 @@ async fn connect_route(
     Ok(sessions.into_sessions())
 }
 
-/// 完成一个 SSH peer 的加密 handshake 与 host-key 检查，凭据认证在调用方按 route 层次追加。
+/// 完成一个 SSH peer 的加密 handshake；主机密钥由 handler 自动信任，凭据认证在调用方按 route 层次追加。
 /// 将同一 handshake 的清理资源打包，避免丢失任何回收 owner。
 ///
 /// @author kongweiguang
@@ -1741,31 +1757,6 @@ async fn connect_peer(
             return Err(error);
         }
     };
-    let observed_challenge = session.observed.clone();
-    if !inspect_only
-        && observed_challenge
-            .as_ref()
-            .is_none_or(|challenge| challenge.status != HostKeyStatus::Known)
-    {
-        let error =
-            observed_challenge
-                .as_ref()
-                .map_or_else(AppError::host_key_unknown, |challenge| {
-                    match challenge.status {
-                        HostKeyStatus::Unknown => AppError::host_key_unknown(),
-                        HostKeyStatus::Changed { .. } => AppError::host_key_changed(),
-                        HostKeyStatus::Known => AppError::host_key_unknown(),
-                    }
-                });
-        let _ = disconnect_sessions(
-            &[Arc::clone(&session)],
-            &pending_cleanup,
-            &reservation,
-            "Kerminal rejected SSH host key",
-        )
-        .await;
-        return Err(error);
-    }
     Ok(session)
 }
 

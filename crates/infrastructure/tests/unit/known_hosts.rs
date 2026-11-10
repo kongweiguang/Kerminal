@@ -82,11 +82,22 @@ async fn trust_writes_parseable_openssh_record() {
         .expect("known_hosts content");
     assert!(line.starts_with("[example.test]:22461 ssh-ed25519 "));
     assert!(!line.contains(&key_identity.fingerprint_sha256));
+
+    repository
+        .trust(&endpoint, &key_identity)
+        .await
+        .expect("repeated trust is idempotent");
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join(KNOWN_HOSTS_FILE))
+            .expect("known_hosts content after retry"),
+        line,
+        "a known key must not be appended twice"
+    );
 }
 
-/// 已有不同 key 时回报 Changed，trust 不能通过覆盖或自动追加来抹掉冲突。
+/// 已有不同 key 时回报 Changed；自动信任路径由 trust 原子替换旧记录，连接不再被阻断。
 #[tokio::test]
-async fn changed_key_is_not_automatically_trusted() {
+async fn changed_key_is_atomically_replaced_on_trust() {
     let directory = tempdir().expect("temp directory");
     let repository = store(directory.path());
     let endpoint = HostEndpoint {
@@ -107,7 +118,79 @@ async fn changed_key_is_not_automatically_trusted() {
             .expect("inspect changed"),
         HostKeyStatus::Changed { .. }
     ));
-    assert!(repository.trust(&endpoint, &changed).await.is_err());
+
+    repository
+        .trust(&endpoint, &changed)
+        .await
+        .expect("changed key is upserted instead of blocked");
+    assert!(matches!(
+        repository
+            .inspect(&endpoint, &changed)
+            .await
+            .expect("inspect replaced key"),
+        HostKeyStatus::Known
+    ));
+    let content = std::fs::read_to_string(directory.path().join(KNOWN_HOSTS_FILE))
+        .expect("read replaced known_hosts");
+    assert!(!content.contains(&first.public_key_openssh));
+    assert!(content.contains(&changed.public_key_openssh));
+}
+
+/// 已知 key 必须在 writable 判断之前返回成功，使只读数据根中的已受信主机仍可连接。
+#[tokio::test]
+async fn known_key_succeeds_without_write_access() {
+    let directory = tempdir().expect("temp directory");
+    let endpoint = HostEndpoint {
+        host: "example.test".to_owned(),
+        port: 22,
+        username: "test".to_owned(),
+    };
+    let key_identity = identity(PUBLIC_KEY);
+    store(directory.path())
+        .trust(&endpoint, &key_identity)
+        .await
+        .expect("seed writable known_hosts");
+    let readonly = KnownHostsStore::new(StorageCoordinator::new(directory.path()), false);
+
+    readonly
+        .trust(&endpoint, &key_identity)
+        .await
+        .expect("known key requires no write access");
+    assert!(
+        readonly
+            .trust(&endpoint, &identity(OTHER_PUBLIC_KEY))
+            .await
+            .is_err(),
+        "unknown keys still report the read-only storage error for the caller to downgrade"
+    );
+}
+
+/// 当前 key 的 @revoked 记录在 classify 中表现为 previous==current；自动信任只保留原记录并成功返回。
+#[tokio::test]
+async fn revoked_key_trust_is_ignored_without_blocking() {
+    let directory = tempdir().expect("temp directory");
+    let repository = store(directory.path());
+    let endpoint = HostEndpoint {
+        host: "example.test".to_owned(),
+        port: 22,
+        username: "test".to_owned(),
+    };
+    let key_identity = identity(PUBLIC_KEY);
+    let fixture = format!(
+        "@revoked other.example {}\n",
+        key_identity.public_key_openssh
+    );
+    let known_hosts = directory.path().join(KNOWN_HOSTS_FILE);
+    std::fs::write(&known_hosts, &fixture).expect("write revoked fixture");
+
+    repository
+        .trust(&endpoint, &key_identity)
+        .await
+        .expect("revoked key must not create a blocking error");
+    assert_eq!(
+        std::fs::read_to_string(&known_hosts).expect("read preserved fixture"),
+        fixture
+    );
 }
 
 /// 轮换只替换确认过的 host:port；按原始字节和单主机解析核对其它记录，避免把追加顺序误当作保留语义。

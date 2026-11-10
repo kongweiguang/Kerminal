@@ -16,11 +16,11 @@ use kerminal_application::{
     AppError, AppResult,
     connections::{
         CommandEvent, CommandStreamHandle, ConnectionIntent, ExecRequest, HostConnectionRepository,
-        HostKeyChallenge, HostKeyPeer, HostKeyStatus, HostKeyTrustReceipt, HostKeyTrustRequest,
-        KnownHostsRepository, OpenSftpRequest, RemoteConnectionHandle, RemoteConnectionLease,
-        RemoteConnectionService, RemoteForwardHandle, RemoteForwardRequest, RemoteShellKind,
-        SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest, TunnelChannelHandle,
-        TunnelRequest,
+        HostKeyChallenge, HostKeyIdentity, HostKeyPeer, HostKeyStatus, HostKeyTrustReceipt,
+        HostKeyTrustRequest, KnownHostsRepository, OpenSftpRequest, RemoteConnectionHandle,
+        RemoteConnectionLease, RemoteConnectionService, RemoteForwardHandle, RemoteForwardRequest,
+        RemoteShellKind, SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest,
+        TunnelChannelHandle, TunnelRequest,
     },
     sessions::{SessionTransport, SessionTransportFactory},
 };
@@ -84,6 +84,65 @@ fn trusted_known_hosts(
     let known_hosts = Arc::new(TestKnownHostsRepository::default());
     known_hosts.trust_fingerprint(endpoint, "ecdsa-sha2-nistp256", &server.fingerprint_sha256);
     known_hosts
+}
+
+/// 内存 fixture 只按指纹分类，构造不含公钥正文的身份即可断言自动信任后的状态。
+fn observed_identity(server: &SshServerFixture) -> HostKeyIdentity {
+    HostKeyIdentity {
+        algorithm: "ecdsa-sha2-nistp256".to_owned(),
+        fingerprint_sha256: server.fingerprint_sha256.clone(),
+        public_key_openssh: String::new(),
+    }
+}
+
+/// 模拟 writable=false 的 known_hosts：读取照常，写入显式失败，用于验证连接层的 fail-open。
+struct ReadOnlyKnownHostsRepository {
+    entries: TestKnownHostsRepository,
+    trust_attempts: AtomicUsize,
+}
+
+impl ReadOnlyKnownHostsRepository {
+    /// 空信任集模拟首次连接；需要 Known/Changed 时再显式注入旧指纹。
+    fn new() -> Self {
+        Self {
+            entries: TestKnownHostsRepository::default(),
+            trust_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    /// 复用测试 fixture 的指纹分类，只把写入能力降级为只读错误。
+    fn seed_fingerprint(&self, endpoint: &HostEndpoint, fingerprint: &str) {
+        self.entries
+            .trust_fingerprint(endpoint, "ecdsa-sha2-nistp256", fingerprint);
+    }
+}
+
+#[async_trait::async_trait]
+impl KnownHostsRepository for ReadOnlyKnownHostsRepository {
+    /// 只读存储仍能读取已保存记录，保证 Known 判定先于写入能力判断。
+    async fn inspect(
+        &self,
+        endpoint: &HostEndpoint,
+        identity: &HostKeyIdentity,
+    ) -> AppResult<HostKeyStatus> {
+        self.entries.inspect(endpoint, identity).await
+    }
+
+    /// 记录调用次数并返回只读错误，验证调用方只降级为 warning 而不是阻断连接。
+    async fn trust(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
+        self.trust_attempts.fetch_add(1, Ordering::Relaxed);
+        Err(AppError::unsupported("test known_hosts is read-only"))
+    }
+
+    /// 本批次连接路径不调用 replace；显式失败避免测试误以为存在写入能力。
+    async fn replace(
+        &self,
+        _endpoint: &HostEndpoint,
+        _expected_previous_fingerprint_sha256: &str,
+        _identity: &HostKeyIdentity,
+    ) -> AppResult<()> {
+        Err(AppError::unsupported("test known_hosts is read-only"))
+    }
 }
 
 /// 构造测试用密码认证 profile 与隔离凭据解析器。
@@ -822,64 +881,262 @@ async fn sftp_subsystem_discards_stderr_and_preserves_initial_protocol_bytes() {
     server.shutdown().await;
 }
 
-/// 未知主机指纹必须在凭据解析前阻断连接，避免把 secret 发给未验证 peer。
+/// 未知主机不再阻断连接：握手自动信任并写入 known_hosts，认证只解析一次凭据。
 #[tokio::test]
-async fn unknown_host_key_fails_before_resolving_credentials() {
+async fn unknown_host_key_is_auto_trusted_and_connection_continues() {
     let server = SshServerFixture::spawn(SshServerOptions::default())
         .await
         .expect("loopback server starts");
     let (profile, credentials) = password_setup(&server);
     let host_id = profile.host_id.clone();
+    let endpoint = profile.endpoint.clone();
+    let known_hosts = Arc::new(TestKnownHostsRepository::default());
+    let service = connection_service(profile, credentials.clone(), known_hosts.clone());
+
+    let lease = service
+        .connect(host_id, ConnectionIntent::Exec, CancellationToken::new())
+        .await
+        .expect("unknown host key is trusted automatically");
+
+    assert_eq!(
+        credentials
+            .resolve_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "credentials are resolved once, after the automatic trust decision"
+    );
+    assert_eq!(
+        known_hosts
+            .inspect(&endpoint, &observed_identity(&server))
+            .await
+            .expect("inspect automatically recorded key"),
+        HostKeyStatus::Known,
+        "the observed host key is recorded before authentication"
+    );
+    lease.close("unknown host key test complete").await.ok();
+    server.shutdown().await;
+}
+
+/// 已保存指纹变化时自动替换旧 key 并继续连接，不再以 host_key_changed 阻断。
+#[tokio::test]
+async fn changed_host_key_is_replaced_and_connection_continues() {
+    let server = SshServerFixture::spawn(SshServerOptions::default())
+        .await
+        .expect("loopback server starts");
+    let (profile, credentials) = password_setup(&server);
+    let host_id = profile.host_id.clone();
+    let endpoint = profile.endpoint.clone();
+    let known_hosts = Arc::new(TestKnownHostsRepository::default());
+    known_hosts.trust_fingerprint(&endpoint, "ecdsa-sha2-nistp256", "SHA256:previous-host-key");
+    let service = connection_service(profile, credentials.clone(), known_hosts.clone());
+
+    let lease = service
+        .connect(host_id, ConnectionIntent::Exec, CancellationToken::new())
+        .await
+        .expect("changed host key is replaced instead of blocking");
+
+    assert_eq!(
+        credentials
+            .resolve_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "credentials are resolved once after the replacement decision"
+    );
+    assert_eq!(
+        known_hosts
+            .inspect(&endpoint, &observed_identity(&server))
+            .await
+            .expect("inspect replaced key"),
+        HostKeyStatus::Known
+    );
+    let stale_identity = HostKeyIdentity {
+        algorithm: "ecdsa-sha2-nistp256".to_owned(),
+        fingerprint_sha256: "SHA256:previous-host-key".to_owned(),
+        public_key_openssh: String::new(),
+    };
+    assert!(
+        matches!(
+            known_hosts
+                .inspect(&endpoint, &stale_identity)
+                .await
+                .expect("inspect previous key"),
+            HostKeyStatus::Changed { .. }
+        ),
+        "the previous fingerprint must be replaced, not retained as known"
+    );
+    lease.close("changed host key test complete").await.ok();
+    server.shutdown().await;
+}
+
+/// 只读 known_hosts 中已保存的 key 直接放行，且不会尝试写入。
+#[tokio::test]
+async fn read_only_known_hosts_allows_a_known_key() {
+    let server = SshServerFixture::spawn(SshServerOptions::default())
+        .await
+        .expect("loopback server starts");
+    let (profile, credentials) = password_setup(&server);
+    let host_id = profile.host_id.clone();
+    let endpoint = profile.endpoint.clone();
+    let known_hosts = Arc::new(ReadOnlyKnownHostsRepository::new());
+    known_hosts.seed_fingerprint(&endpoint, &server.fingerprint_sha256);
+    let service = connection_service(profile, credentials.clone(), known_hosts.clone());
+
+    let lease = service
+        .connect(host_id, ConnectionIntent::Exec, CancellationToken::new())
+        .await
+        .expect("known key connects without write access");
+
+    assert_eq!(known_hosts.trust_attempts.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        credentials
+            .resolve_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    lease.close("read-only known host test complete").await.ok();
+    server.shutdown().await;
+}
+
+/// 写入失败只记录日志；未知主机仍完成握手和认证。
+#[tokio::test]
+async fn read_only_known_hosts_unknown_key_is_fail_open() {
+    let server = SshServerFixture::spawn(SshServerOptions::default())
+        .await
+        .expect("loopback server starts");
+    let (profile, credentials) = password_setup(&server);
+    let host_id = profile.host_id.clone();
+    let endpoint = profile.endpoint.clone();
+    let known_hosts = Arc::new(ReadOnlyKnownHostsRepository::new());
+    let service = connection_service(profile, credentials.clone(), known_hosts.clone());
+
+    let lease = service
+        .connect(host_id, ConnectionIntent::Exec, CancellationToken::new())
+        .await
+        .expect("unknown key still connects when the recording write fails");
+
+    assert_eq!(
+        known_hosts.trust_attempts.load(Ordering::Relaxed),
+        1,
+        "the failed best-effort write is attempted exactly once per handshake"
+    );
+    assert_eq!(
+        known_hosts
+            .inspect(&endpoint, &observed_identity(&server))
+            .await
+            .expect("inspect unchanged read-only fixture"),
+        HostKeyStatus::Unknown,
+        "a failed write must not fabricate a trust record"
+    );
+    assert_eq!(
+        credentials
+            .resolve_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    lease
+        .close("read-only unknown host test complete")
+        .await
+        .ok();
+    server.shutdown().await;
+}
+
+/// 写入失败只记录日志；变化主机仍完成握手和认证。
+#[tokio::test]
+async fn read_only_known_hosts_changed_key_is_fail_open() {
+    let server = SshServerFixture::spawn(SshServerOptions::default())
+        .await
+        .expect("loopback server starts");
+    let (profile, credentials) = password_setup(&server);
+    let host_id = profile.host_id.clone();
+    let endpoint = profile.endpoint.clone();
+    let known_hosts = Arc::new(ReadOnlyKnownHostsRepository::new());
+    known_hosts.seed_fingerprint(&endpoint, "SHA256:previous-host-key");
+    let service = connection_service(profile, credentials.clone(), known_hosts.clone());
+
+    let lease = service
+        .connect(host_id, ConnectionIntent::Exec, CancellationToken::new())
+        .await
+        .expect("changed key still connects when the recording write fails");
+
+    assert_eq!(known_hosts.trust_attempts.load(Ordering::Relaxed), 1);
+    assert!(
+        matches!(
+            known_hosts
+                .inspect(&endpoint, &observed_identity(&server))
+                .await
+                .expect("inspect unchanged read-only fixture"),
+            HostKeyStatus::Changed { .. }
+        ),
+        "the read-only fixture must retain the previous fingerprint"
+    );
+    assert_eq!(
+        credentials
+            .resolve_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    lease
+        .close("read-only changed host test complete")
+        .await
+        .ok();
+    server.shutdown().await;
+}
+
+/// 网络在密钥交换完成前断开时必须保持通用 SSH 错误，不能伪装成 host_key_*。
+#[tokio::test]
+async fn network_failure_is_not_classified_as_host_key_error() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("raw listener binds");
+    let address = listener.local_addr().expect("raw listener address");
+    let accept = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept test client");
+        drop(stream);
+    });
+    let credential_ref = CredentialRef::new("test:password").expect("static ref is valid");
+    let profile = HostConnectionProfile {
+        host_id: HostId::new(),
+        protocol: RemoteProtocol::Ssh,
+        endpoint: HostEndpoint {
+            host: address.ip().to_string(),
+            port: address.port(),
+            username: "kerminal".to_owned(),
+        },
+        authentication: Some(SshAuthentication::Password {
+            secret: credential_ref,
+        }),
+        rdp_password: None,
+        route: SshRoute::default(),
+        shell_dialect: RemoteShellDialect::Posix,
+        connect_timeout_ms: 2_000,
+        keepalive_interval_ms: None,
+    };
+    let host_id = profile.host_id.clone();
+    let credentials = Arc::new(TestCredentialResolver::default());
     let service = connection_service(
         profile,
         credentials.clone(),
         Arc::new(TestKnownHostsRepository::default()),
     );
-    let error = service
-        .connect(host_id, ConnectionIntent::Exec, CancellationToken::new())
-        .await
-        .err()
-        .expect("unknown server key is rejected");
-    assert!(matches!(error, AppError::HostKeyUnknown));
-    assert_eq!(
-        credentials
-            .resolve_count
-            .load(std::sync::atomic::Ordering::Relaxed),
-        0
-    );
-    server.shutdown().await;
-}
-
-/// 与已保存指纹不符时必须在密码解析前拒绝连接并保留 changed 分类。
-#[tokio::test]
-async fn changed_host_key_fails_before_resolving_credentials() {
-    let server = SshServerFixture::spawn(SshServerOptions::default())
-        .await
-        .expect("loopback server starts");
-    let (profile, credentials) = password_setup(&server);
-    let host_id = profile.host_id.clone();
-    let known_hosts = Arc::new(TestKnownHostsRepository::default());
-    known_hosts.trust_fingerprint(
-        &profile.endpoint,
-        "ecdsa-sha2-nistp256",
-        "SHA256:previous-host-key",
-    );
-    let service = connection_service(profile, credentials.clone(), known_hosts);
 
     let error = service
         .connect(host_id, ConnectionIntent::Exec, CancellationToken::new())
         .await
         .err()
-        .expect("changed server key is rejected");
+        .expect("closed listener fails the handshake");
 
-    assert!(matches!(error, AppError::HostKeyChanged));
+    assert!(
+        !matches!(error, AppError::HostKeyUnknown | AppError::HostKeyChanged),
+        "a network KEX failure must keep its generic SSH classification"
+    );
     assert_eq!(
         credentials
             .resolve_count
             .load(std::sync::atomic::Ordering::Relaxed),
-        0
+        0,
+        "a failed handshake must not reach credential resolution"
     );
-    server.shutdown().await;
+    accept.await.expect("listener task completes");
 }
 
 /// 显式信任会重握手并比对完整指纹；保存 endpoint 快照以适配 service 消费 profile。
