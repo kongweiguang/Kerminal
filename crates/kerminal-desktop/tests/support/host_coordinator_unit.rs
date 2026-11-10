@@ -14,7 +14,8 @@ use tokio::{
 
 use super::{
     HostCommand, HostCoordinatorSender, HostRequest, HostResponse, PrimaryListener,
-    PrimaryListenerRecovery, UpdateCompletionPath, classify_install_result,
+    PrimaryListenerRecovery, UpdateCompletionPath, classify_install_result, restart_arguments,
+    restart_extensions_until,
 };
 use crate::external_activation::{ActivationRequest, activation_queue, encode_message};
 
@@ -78,6 +79,57 @@ fn unknown_install_result_keeps_the_window_open() {
     assert_eq!(
         classify_install_result(&result),
         UpdateCompletionPath::KeepOpen
+    );
+}
+
+/// 资源回收耗尽预算后不得启动下一进程；此测试只走拒绝分支，不创建桌面或读取用户配置。
+#[test]
+fn extensions_restart_rejects_an_expired_shutdown_deadline() {
+    let error = restart_extensions_until(
+        Instant::now() - Duration::from_millis(1),
+        &crate::plugins::arguments::PluginStartupOptions::default(),
+    )
+    .expect_err("expired restart must not spawn");
+    assert_eq!(error.public_code(), PublicErrorCode::Timeout);
+}
+
+/// 重启只保留插件开关，尤其安全模式不能恢复原开发目标；测试不修改 argv 或启动真实桌面。
+#[test]
+fn restart_arguments_preserve_only_valid_plugin_startup_options() {
+    use crate::plugins::arguments::PluginStartupOptions;
+    use std::ffi::OsString;
+
+    assert!(
+        restart_arguments(&PluginStartupOptions::default())
+            .expect("plain restart")
+            .is_empty()
+    );
+    let directory = std::env::temp_dir().join("kerminal-plugin-restart-中文");
+    assert_eq!(
+        restart_arguments(&PluginStartupOptions {
+            safe_mode: false,
+            dev_plugin: Some(directory.clone())
+        })
+        .expect("absolute dev path"),
+        vec![
+            OsString::from("--dev-plugin"),
+            directory.as_os_str().to_owned()
+        ]
+    );
+    assert_eq!(
+        restart_arguments(&PluginStartupOptions {
+            safe_mode: true,
+            dev_plugin: Some(directory)
+        })
+        .expect("safe mode wins"),
+        vec![OsString::from("--safe-mode")]
+    );
+    assert!(
+        restart_arguments(&PluginStartupOptions {
+            safe_mode: false,
+            dev_plugin: Some("relative-plugin".into())
+        })
+        .is_err()
     );
 }
 

@@ -1,0 +1,17 @@
+{
+  "publicKey": "RWR0ZXN0a2V5MRn/bKos0WpPXgqONL8IIeDjNpJWJ7JQXHHFM9kAALp9",
+  "fixtures": [
+    {
+      "raw": "{\"schema\":1,\"source_id\":\"official\",\"sequence\":1,\"plugins\":[]}",
+      "signature": "untrusted comment: isolated fixture\nRUR0ZXN0a2V5MVavJKsO/c4Snt6G6pGBHnoF6m+jgEtu2oBvhs13sLMMg6oYqZTPfTaWu3Nb/63x9n67BCpHb7ZWMr1lQgR7LA4=\ntrusted comment: isolated fixture\nxLxL+vKNGG0kkVaGoJMdrXgbA3qIcUDKFsWp/7w0iDSJu888xtj5BHsov11MBrd57L0QiFS/ajfsW01EZhJpCA=="
+    },
+    {
+      "raw": "{\"schema\":1,\"source_id\":\"official\",\"sequence\":2,\"plugins\":[]}",
+      "signature": "untrusted comment: isolated fixture\nRUR0ZXN0a2V5MZfYK/nb/6PvTJ00ANgaWzU7hVAzwRpe4L4a9mKHDJggrizhuZfoo9gp6i1cdEUmSOW02lwunqwhi4xNVS8g+Ag=\ntrusted comment: isolated fixture\nwzOyqExQ2EqpPpim8gKGoegCS6oWOQWMWFTGX2l4xhtIUNbWTMcvVsHpMtVMWyFGB/ddayNhW+9MqueMHRwVBg=="
+    },
+    {
+      "raw": "{ \"schema\":1,\"source_id\":\"official\",\"sequence\":2,\"plugins\":[]}",
+      "signature": "untrusted comment: isolated fixture\nRUR0ZXN0a2V5MXshfY8FO5vAhlJoiVAYI0ZRZTudmy1EKlvC1EsaxoA9LdhbX3uCBWbor83W8VKekLitVQ6781NDvPMremMqpQE=\ntrusted comment: isolated fixture\n4phQ4TUH/M6c/1zdxHaztQBg3D1ezqlFNc0mrABu36UOwB0lz9lwuB1SjPYgF1ZhpURghgcSjqV5AK8vAwupAA=="
+    }
+  ]
+}

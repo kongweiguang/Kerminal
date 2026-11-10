@@ -157,6 +157,14 @@ impl RootView {
                         cx,
                     );
                 }
+                QuickOpenSelection::Extensions => {
+                    if let Err(error) =
+                        self.open_plugin_page(super::extensions::EXTENSIONS_CONTENT_ID, window, cx)
+                    {
+                        self.status = Some(error.public_message().to_owned().into());
+                        cx.notify();
+                    }
+                }
                 QuickOpenSelection::Action(action) => {
                     if *action == crate::keybindings::KeybindingAction::TerminalSearch {
                         let Some(binding) = terminal_binding.as_ref() else {

@@ -336,7 +336,7 @@ fn window_state_flush_bridge_accepts_non_tokio_waiter() {
     );
 }
 
-/// 退出、安装和安装重试都必须复用 Root 的截止时间与原始操作身份。
+/// 退出、扩展重启和安装重试均复用 Root 的截止时间，不能绕过同一个资源收尾预算。
 ///
 /// @author kongweiguang
 #[test]
@@ -354,6 +354,12 @@ fn root_events_preserve_the_shared_shutdown_deadline() {
     assert!(
         matches!(command, HostCommand::Quit { intent: QuitIntent::Exit, deadline } if deadline == expected)
     );
+    let (command, flush_deadline) = host_command_from_root_event(&RootViewEvent::QuitReady {
+        intent: QuitIntent::RestartForExtensions,
+        deadline,
+    });
+    assert_eq!(flush_deadline, expected);
+    assert!(matches!(command, HostCommand::Restart { deadline } if deadline == expected));
 
     let update_id = DownloadedUpdateId::new();
     for retry in [false, true] {

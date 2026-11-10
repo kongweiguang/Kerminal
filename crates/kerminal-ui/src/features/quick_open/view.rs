@@ -465,6 +465,19 @@ pub(super) fn local_search_entries(
             );
         }
         for action in KeybindingAction::ALL {
+            if action == KeybindingAction::ApplicationQuit {
+                push_matching(
+                    &mut entries,
+                    QuickOpenEntry {
+                        label: text("打开扩展", "Open extensions"),
+                        detail: text("应用", "Application"),
+                        keywords: vec!["extensions".into(), "plugins".into()],
+                        selection: Some(QuickOpenSelection::Extensions),
+                        disabled: false,
+                    },
+                    query,
+                );
+            }
             if matches!(
                 action,
                 KeybindingAction::WorkspaceQuickOpen | KeybindingAction::WorkspaceCommandPalette

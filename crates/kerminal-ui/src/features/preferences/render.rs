@@ -742,7 +742,21 @@ impl PreferencesPanel {
                     .into_any_element(),
             );
         }
-        if no_matches {
+        if query.is_empty() || "扩展 extensions plugins".contains(&query.to_lowercase()) {
+            nav_rows.push(
+                Button::new("preferences-open-extensions")
+                    .w_full()
+                    .min_h(px(40.))
+                    .compact()
+                    .custom(super::render_settings::settings_ghost_variant(theme, cx))
+                    .child(crate::locale::text("扩展", "Extensions"))
+                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                        cx.emit(super::panel::PreferencesEvent::ExtensionsRequested)
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if no_matches && !"扩展 extensions plugins".contains(&query.to_lowercase()) {
             nav_rows.push(
                 div()
                     .px_2()

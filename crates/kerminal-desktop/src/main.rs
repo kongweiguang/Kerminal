@@ -32,6 +32,8 @@ mod platform_lifecycle;
 #[cfg(feature = "right-rail-acceptance")]
 mod plugin_acceptance;
 mod plugin_catalogs;
+#[cfg(all(feature = "acceptance", feature = "right-rail-acceptance"))]
+mod plugin_extensions_acceptance;
 #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
 mod plugin_webview_acceptance;
 mod plugins;
@@ -154,6 +156,25 @@ fn main() {
     // 导入只接收显式来源、目标与执行模式，不能让普通启动触及旧版真实数据。
     if let Some(exit_code) = profile_import::run_from_args(std::env::args_os().skip(1)) {
         std::process::exit(exit_code);
+    }
+    // 扩展页验收只使用显式测试目录与隔离根，不改变普通发行版的固定市场来源。
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--plugin-extensions-acceptance")
+    {
+        #[cfg(all(feature = "acceptance", feature = "right-rail-acceptance"))]
+        {
+            if let Err(error) = plugin_extensions_acceptance::run() {
+                eprintln!("插件扩展页验收运行失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(all(feature = "acceptance", feature = "right-rail-acceptance")))]
+        {
+            eprintln!("插件扩展页验收需要 acceptance 与 right-rail-acceptance features");
+            std::process::exit(1);
+        }
     }
     // 网页验收使用正式工厂和独立配置根，默认构建不开放此运行入口。
     if std::env::args_os()
@@ -604,7 +625,13 @@ fn run_primary_instance(
         runtime.handle().clone(),
         primary,
     );
-    let mut host = HostCoordinator::start(runtime.handle(), composition, update_service, listener);
+    let mut host = HostCoordinator::start(
+        runtime.handle(),
+        composition,
+        update_service,
+        listener,
+        startup_plugins.options.clone(),
+    );
     let startup_error = Arc::new(Mutex::new(None));
     let ui_result = catch_unwind(AssertUnwindSafe(|| {
         run_native_ui(
@@ -959,7 +986,7 @@ fn set_diagnostic_process_identity() {
     }
 }
 
-/// 沿用 Root 启动插件关闭时分配的绝对截止时间，避免桌面收尾重新获得一轮预算。
+/// 退出、安装与扩展重启均沿用 Root 关闭插件时的绝对截止时间，不再分配第二轮预算。
 ///
 /// @author kongweiguang
 fn host_command_from_root_event(event: &RootViewEvent) -> (HostCommand, TokioInstant) {
@@ -969,6 +996,10 @@ fn host_command_from_root_event(event: &RootViewEvent) -> (HostCommand, TokioIns
         | RootViewEvent::RetryInstallReady { deadline, .. } => *deadline,
     });
     let command = match event {
+        RootViewEvent::QuitReady {
+            intent: kerminal_ui::QuitIntent::RestartForExtensions,
+            ..
+        } => HostCommand::Restart { deadline },
         RootViewEvent::QuitReady { intent, .. } => HostCommand::Quit {
             intent: intent.clone(),
             deadline,
@@ -1070,7 +1101,7 @@ fn install_activation_listener(
     .detach();
 }
 
-/// 将宿主结果投影到 Root 生命周期；退出阶段独立留痕，不把宿主清理成功等同于原生事件循环已结束。
+/// 将宿主退出、安装和扩展重启回执投影到同一 Root 生命周期；重启失败仍保留已停止事实。
 /// @author kongweiguang
 fn apply_host_response(
     root_entity: gpui_kit::Entity<RootView>,

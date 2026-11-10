@@ -18,6 +18,7 @@ name = "kerminal-migrate"
 path = "src/bin/kerminal-migrate.rs"
 
 [features]
+acceptance = ["kerminal-infrastructure/acceptance"]
 acceptance-metrics = ["kerminal-ui/acceptance-metrics", "dep:windows"]
 right-rail-acceptance = [
     "kerminal-ui/right-rail-acceptance",

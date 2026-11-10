@@ -122,6 +122,10 @@ pub enum PreferencesEvent {
     },
     /// 用户完成 dirty-close 选择后请求 Root 恢复打开设置前的工作区页面。
     CloseRequested,
+    /// 请求经设置离开门禁后打开扩展中心。
+    ExtensionsRequested,
+    /// 取消离开时清除扩展导航意图，避免后续关闭误跳转。
+    ExtensionsNavigationCancelled,
     /// 确认层显隐变化时更新 Root 焦点陷阱，避免同时注册父子陷阱。
     LeaveConfirmationChanged,
     /// 未保存草稿需要退出确认；Root 确保设置窗口可见并保留当前退出意图。

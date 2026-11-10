@@ -12,6 +12,7 @@ pub mod data_migration;
 pub mod diagnostics;
 pub mod error;
 pub mod executor;
+pub mod extensions;
 pub mod external_contributions;
 pub mod files;
 pub mod local_shells;

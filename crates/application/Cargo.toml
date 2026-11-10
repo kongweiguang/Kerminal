@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+node-semver = "=2.2.0"
 kerminal-plugin-protocol.workspace = true
 sha2.workspace = true
 async-trait.workspace = true
@@ -16,6 +17,7 @@ kerminal-domain.workspace = true
 kerminal-terminal.workspace = true
 percent-encoding.workspace = true
 regex.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

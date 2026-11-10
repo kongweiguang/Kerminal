@@ -380,9 +380,20 @@ impl SerialPortService {
     }
 }
 
+/// 连接总数包含建立中和等待回收的路由；代次用于检测数量相同但连接已替换。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteConnectionActivity {
+    pub routes: usize,
+    pub generation: u64,
+}
+
 /// 终端、文件与运维适配器共用的 SSH 连接端口。
 #[async_trait]
 pub trait RemoteConnectionService: Send + Sync {
+    /// 缺少真实统计时拒绝重启确认，避免把未知连接误认为空闲。
+    fn activity(&self) -> AppResult<RemoteConnectionActivity> {
+        Err(AppError::unsupported("SSH 连接状态不可用"))
+    }
     /// 先验证协议能力，再解析凭据和建立连接，保证 SFTP-only 目标不会意外联网启动 shell。
     async fn connect(
         &self,

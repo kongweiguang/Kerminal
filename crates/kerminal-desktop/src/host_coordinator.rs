@@ -4,8 +4,7 @@
 
 #[cfg(any(windows, test))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
-#[cfg(not(target_os = "windows"))]
-use std::process::Command;
+use std::{ffi::OsString, process::Command};
 
 use kerminal_application::{
     AppError, AppResult,
@@ -24,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::composition::DesktopComposition;
 use crate::external_activation::{ActivationQueueSender, decode_message};
+use crate::plugins::arguments::PluginStartupOptions;
 
 const HOST_QUEUE_CAPACITY: usize = 8;
 
@@ -35,6 +35,9 @@ pub(crate) mod quit_diagnostics;
 pub(crate) enum HostCommand {
     Quit {
         intent: QuitIntent,
+        deadline: Instant,
+    },
+    Restart {
         deadline: Instant,
     },
     Install {
@@ -128,12 +131,13 @@ pub(crate) struct PrimaryListener {
 }
 
 impl HostCoordinator {
-    /// 在唯一 Tokio runtime 上启动串行 worker，保持 shutdown/update owner 跨 UI 回调存活。
+    /// 串行 worker 持有同一收尾 owner 与有效启动选项，重启不能从原始参数恢复已被安全模式禁用的开发包。
     pub(crate) fn start(
         handle: tokio::runtime::Handle,
         composition: std::sync::Arc<AsyncMutex<DesktopComposition>>,
         update_service: Option<UpdateService>,
         listener: PrimaryListener,
+        restart_options: PluginStartupOptions,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(HOST_QUEUE_CAPACITY);
         let sender = HostCoordinatorSender { sender };
@@ -143,6 +147,7 @@ impl HostCoordinator {
             composition.clone(),
             update_service,
             listener.clone(),
+            restart_options,
         ));
         Self {
             sender,
@@ -245,6 +250,7 @@ impl HostCoordinatorSender {
     pub(crate) async fn submit(&self, command: HostCommand) -> AppResult<HostResponse> {
         match &command {
             HostCommand::Quit { .. } => tracing::info!(event = "HOST_QUIT_SUBMITTED"),
+            HostCommand::Restart { .. } => tracing::info!(event = "HOST_RESTART_SUBMITTED"),
             HostCommand::Install { .. } => tracing::info!(event = "HOST_INSTALL_SUBMITTED"),
             HostCommand::Finalize { .. } => tracing::info!(event = "HOST_FINALIZE_SUBMITTED"),
         }
@@ -418,7 +424,7 @@ async fn forward_primary_messages(
     }
 }
 
-/// 串行处理同一 owner 的关闭重试；日志只记录固定命令阶段，避免失败活窗再次无法定位。
+/// 串行处理同一 owner 的关闭与扩展重启；只有资源及监听器均回收才启动下一进程。
 /// Quit 完成与回执 send 返回分开记录，后者仅确认交付及同步唤醒已返回，不代表 GPUI 已消费。
 /// 验收构建在成功回执后后台采样两次，不等待诊断，也不把诊断加入业务关闭 owner。
 /// @author kongweiguang
@@ -427,6 +433,7 @@ async fn run_host_coordinator(
     composition: std::sync::Arc<AsyncMutex<DesktopComposition>>,
     update_service: Option<UpdateService>,
     listener: std::sync::Arc<AsyncMutex<PrimaryListener>>,
+    restart_options: PluginStartupOptions,
 ) {
     let mut quiesced = false;
     while let Some(request) = receiver.recv().await {
@@ -457,6 +464,26 @@ async fn run_host_coordinator(
                     }
                 }
             }
+            HostCommand::Restart { deadline } => {
+                tracing::info!(event = "HOST_RESTART_BEGIN");
+                let result: AppResult<()> = async {
+                    ensure_quiesced(&composition, &mut quiesced, deadline).await?;
+                    stop_listener_until(&listener, deadline).await?;
+                    restart_extensions_until(deadline, &restart_options)
+                }
+                .await;
+                match &result {
+                    Ok(()) => tracing::info!(event = "HOST_RESTART_COMPLETE"),
+                    Err(error) => tracing::warn!(
+                        event = "HOST_RESTART_FAILED",
+                        code = error.public_code().as_str()
+                    ),
+                }
+                let _ = request.completion.send(HostResponse::Quit {
+                    intent: QuitIntent::RestartForExtensions,
+                    result: result.map_err(|error| error.public_message().to_owned()),
+                });
+            }
             HostCommand::Install {
                 update_id,
                 version,
@@ -474,6 +501,7 @@ async fn run_host_coordinator(
                         composition: &composition,
                         update_service: update_service.as_ref(),
                         listener: &listener,
+                        restart_options: &restart_options,
                     },
                 )
                 .await;
@@ -591,9 +619,10 @@ struct InstallUpdateContext<'a> {
     composition: &'a std::sync::Arc<AsyncMutex<DesktopComposition>>,
     update_service: Option<&'a UpdateService>,
     listener: &'a std::sync::Arc<AsyncMutex<PrimaryListener>>,
+    restart_options: &'a PluginStartupOptions,
 }
 
-/// 先完成应用资源收尾，再直接调用保留的 UpdateService；重试只允许复用已 quiesce 的宿主。
+/// 安装重试复用已收尾宿主；直接重启时只继承冻结的启动选项，Windows 仍由安装器安排新版启动。
 /// @author kongweiguang
 async fn install_update(
     update_id: DownloadedUpdateId,
@@ -607,6 +636,7 @@ async fn install_update(
         composition,
         update_service,
         listener,
+        restart_options,
     } = context;
     if retry {
         if !*quiesced {
@@ -679,7 +709,9 @@ async fn install_update(
             #[cfg(not(target_os = "windows"))]
             {
                 match stop_listener_until(listener, deadline).await {
-                    Ok(()) if restart_current_process().is_ok() => UpdateHostAction::Quit,
+                    Ok(()) if restart_current_process(restart_options).is_ok() => {
+                        UpdateHostAction::Quit
+                    }
                     Ok(()) => UpdateHostAction::RestartFailed(
                         "安装已完成，但新版进程未能启动；请手动重新打开 Kerminal。",
                     ),
@@ -691,7 +723,7 @@ async fn install_update(
         }
     };
 
-    let _ = deadline;
+    let _ = (deadline, restart_options);
     HostResponse::UpdateCompleted {
         update_id,
         version,
@@ -726,13 +758,46 @@ fn classify_install_result(result: &UpdateInstallResult) -> UpdateCompletionPath
     }
 }
 
-/// 只在宿主已同步关闭旧 listener 后重启当前可执行文件，避免建立第二条等待启动路径。
-#[cfg(not(target_os = "windows"))]
-fn restart_current_process() -> std::io::Result<()> {
+/// 扩展重启没有安装器代为启动进程；所有平台都须在原截止时间内明确启动当前程序。
+/// 失败保留停止事实交回 Root，不能把关闭资源成功当作重启成功或恢复普通服务。
+fn restart_extensions_until(deadline: Instant, options: &PluginStartupOptions) -> AppResult<()> {
+    if Instant::now() >= deadline {
+        return Err(AppError::timeout("等待扩展变更重启"));
+    }
+    restart_current_process(options).map_err(|source| {
+        AppError::infrastructure_with_source(
+            "应用服务已停止，但无法启动 Kerminal；请重试退出后手动重新打开",
+            source,
+        )
+    })
+}
+
+/// 旧 listener 已同步关闭且应用资源已回收才调用；Windows 同样显式 spawn，再由 GPUI 有序退出。
+/// 下一进程继承隔离配置根与合法插件开关，工作区从持久化恢复，不重放文件、URL 或验收参数。
+fn restart_current_process(options: &PluginStartupOptions) -> std::io::Result<()> {
     let executable = std::env::current_exe()?;
     let working_directory = std::env::current_dir()?;
     Command::new(executable)
+        .args(restart_arguments(options)?)
         .current_dir(working_directory)
         .spawn()
         .map(|_| ())
+}
+
+/// 只投影冻结后的插件开关；安全模式优先清除开发目标，路径保留原生编码且必须为绝对路径。
+fn restart_arguments(options: &PluginStartupOptions) -> std::io::Result<Vec<OsString>> {
+    if options.safe_mode {
+        return Ok(vec![OsString::from("--safe-mode")]);
+    }
+    match &options.dev_plugin {
+        Some(path) if path.is_absolute() => Ok(vec![
+            OsString::from("--dev-plugin"),
+            path.as_os_str().to_owned(),
+        ]),
+        Some(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "开发插件重启路径必须为绝对路径",
+        )),
+        None => Ok(Vec::new()),
+    }
 }

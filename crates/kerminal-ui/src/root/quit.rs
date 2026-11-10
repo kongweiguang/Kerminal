@@ -29,7 +29,11 @@ const HOST_SHUTDOWN_BUDGET: Duration = Duration::from_secs(12);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QuitIntent {
     Exit,
-    RestartForUpdate { version: String },
+    /// 扩展变更需要完整关闭服务后以同一配置根重新启动。
+    RestartForExtensions,
+    RestartForUpdate {
+        version: String,
+    },
 }
 
 /// 根窗口仅在全部用户草稿与文件编辑器门禁完成后向桌面组合根报告。
@@ -666,7 +670,7 @@ impl RootView {
                 .pending_update_install
                 .clone()
                 .filter(|request| &request.version == version),
-            QuitIntent::Exit => None,
+            QuitIntent::Exit | QuitIntent::RestartForExtensions => None,
         };
         if matches!(&intent, QuitIntent::RestartForUpdate { .. }) && update_request.is_none() {
             let message = crate::locale::text(

@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -36,6 +36,8 @@ pub struct RusshConnectionCleanupStatus {
     pub active_peer_owners: usize,
     /// 活跃或待清理 SSH 路由占用的有界 admission 配额数。
     pub reserved_route_owners: usize,
+    /// 每次接受新路由递增，避免同数量连接替换掩盖变化。
+    pub route_generation: u64,
     /// 等待 join 的 SSH session 数量。
     pub pending_sessions: usize,
     /// 等待握手 task 完成或 join 的数量。
@@ -106,6 +108,7 @@ pub(super) struct PendingRusshCleanup {
     state: StdMutex<PendingState>,
     admission: Arc<Semaphore>,
     active_peer_owners: AtomicUsize,
+    route_generation: AtomicU64,
     owner_released: Notify,
 }
 
@@ -121,6 +124,7 @@ impl PendingRusshCleanup {
             }),
             admission: Arc::new(Semaphore::new(MAX_ROUTE_OWNERS)),
             active_peer_owners: AtomicUsize::new(0),
+            route_generation: AtomicU64::new(0),
             owner_released: Notify::new(),
         })
     }
@@ -136,6 +140,7 @@ impl PendingRusshCleanup {
             accepting_connections,
             active_peer_owners: self.active_peer_owners.load(Ordering::Acquire),
             reserved_route_owners: MAX_ROUTE_OWNERS - self.admission.available_permits(),
+            route_generation: self.route_generation.load(Ordering::Acquire),
             pending_sessions: state.sessions.len(),
             pending_handshakes: state.handshakes.len(),
         }
@@ -147,6 +152,7 @@ impl PendingRusshCleanup {
         let permit = Arc::clone(&self.admission)
             .try_acquire_owned()
             .map_err(|_| AppError::conflict("SSH cleanup owner capacity is exhausted"))?;
+        self.route_generation.fetch_add(1, Ordering::AcqRel);
         Ok(Arc::new(RusshCleanupReservation {
             state: StdMutex::new(ReservationState {
                 route_active: true,

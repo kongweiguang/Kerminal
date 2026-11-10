@@ -2,6 +2,8 @@
 //! @author kongweiguang
 
 pub mod boot;
+pub mod catalog;
+pub mod installer;
 pub mod process;
 pub mod rpc;
 pub mod store;

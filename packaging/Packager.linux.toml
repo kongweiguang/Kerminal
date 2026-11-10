@@ -25,12 +25,21 @@ resources = [
 ]
 
 [deb]
-depends = ["libc6 (>= 2.35)", "libegl1", "libgcc-s1", "libudev1", "libvulkan1", "libwayland-client0", "libxcb1", "libxkbcommon0", "libxkbcommon-x11-0"]
+depends = ["libc6 (>= 2.35)", "libegl1", "libgcc-s1", "libudev1", "libvulkan1", "libwayland-client0", "libxcb1", "libxkbcommon0", "libxkbcommon-x11-0", "libgtk-3-0", "libwebkit2gtk-4.1-0"]
 
 [[binaries]]
 # 显式固定旧快捷方式和更新器所依赖的主程序名，目标目录由 xtask 按平台注入。
 path = "kerminal"
 main = true
+
+# 插件程序与主程序同目录，运行时不从 PATH 选择宿主。
+[[binaries]]
+path = "kerminal-plugin-host"
+main = false
+
+[[binaries]]
+path = "kerminal-plugin"
+main = false
 
 # 桌面入口只声明应用自有 scheme；ssh/sftp 仍由应用解析，不改系统通用处理程序。
 [[deep-link-protocols]]

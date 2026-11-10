@@ -54,7 +54,8 @@ jobs:
             libx11-dev libx11-xcb-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev \
             libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libegl1-mesa-dev libudev-dev
+            libegl1-mesa-dev libudev-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            xvfb dbus-x11
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -69,3 +70,40 @@ jobs:
 
       - name: Verify architecture, format, lint, and tests
         run: cargo xtask ci
+
+      - name: Install SDK test runtime
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Verify generated SDK and browser contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --prefix sdk/ts --no-audit --no-fund
+          npm test --prefix sdk/ts
+          node crates/kerminal-ui/tests/support/check_plugin_browser_sdk.mjs
+
+      - name: Build plugin helpers and acceptance entry points
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p kerminal-desktop -p kerminal-plugin-host -p kerminal-plugin-cli --features kerminal-desktop/acceptance,kerminal-desktop/acceptance-metrics,kerminal-desktop/right-rail-acceptance
+
+      - name: Verify macOS WebView without desktop interaction
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export KERMINAL_CONFIG_ROOT="${RUNNER_TEMP}/plugin-webview-config"
+          for theme in light dark system; do
+            target/debug/kerminal --webview-probe --headless-check --theme "$theme" --output "target/diagnostics/webview-$theme"
+          done
+
+      - name: Preserve native verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-native-${{ matrix.target }}
+          path: target/diagnostics/
+          if-no-files-found: ignore

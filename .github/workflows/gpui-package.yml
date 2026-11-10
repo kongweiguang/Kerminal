@@ -58,7 +58,7 @@ jobs:
             desktop-file-utils libfontconfig1-dev libvulkan-dev libwayland-dev \
             libx11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxcb-randr0-dev libxcb-xkb-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libegl1-mesa-dev
+            libxkbcommon-dev libxkbcommon-x11-dev libegl1-mesa-dev libgtk-3-dev libwebkit2gtk-4.1-dev
 
       - name: Install NSIS
         if: runner.os == 'Windows'
@@ -116,7 +116,7 @@ jobs:
           elif [[ -n "$KERMINAL_GPUI_UPDATER_PUBLIC_KEY" ]]; then
             python packaging/updater_key.py
           fi
-          cargo --locked build --release --package kerminal-desktop --target "$PACKAGE_TARGET"
+          cargo --locked build --release --package kerminal-desktop --package kerminal-plugin-host --package kerminal-plugin-cli --target "$PACKAGE_TARGET"
           if [[ "$SIGNED_CANDIDATE" == "true" ]]; then
             BINARY_PATH="target/$PACKAGE_TARGET/release/kerminal"
             if [[ "$PACKAGE_TARGET" == *-windows-* ]]; then BINARY_PATH+=".exe"; fi

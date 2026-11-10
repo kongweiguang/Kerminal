@@ -129,6 +129,16 @@ impl RusshRemoteConnectionService {
 
 #[async_trait]
 impl RemoteConnectionService for RusshRemoteConnectionService {
+    /// 使用路由配额覆盖建立中、活动和待回收连接，避免遗漏独立 SFTP/exec。
+    fn activity(&self) -> AppResult<kerminal_application::connections::RemoteConnectionActivity> {
+        let status = self.cleanup_status();
+        Ok(
+            kerminal_application::connections::RemoteConnectionActivity {
+                routes: status.reserved_route_owners,
+                generation: status.route_generation,
+            },
+        )
+    }
     /// 先读 profile 并校验协议能力，再解密凭据和联网；SFTP-only 主机不会触发 SSH shell 请求。
     async fn connect(
         &self,

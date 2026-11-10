@@ -104,13 +104,25 @@ fn registered_factories_render_only_their_matching_workspace() {
 #[test]
 fn every_builtin_content_declaration_has_one_render_factory() {
     let registry = kerminal_application::plugins::PluginRegistry::builtin().unwrap();
-    assert_eq!(registry.content_types().len(), FACTORIES.len());
+    // 扩展中心采用完整生命周期工厂，不属于仅挂载既有实体的轻量绘制桥接表。
+    let standalone = [crate::root::EXTENSIONS_CONTENT_ID];
+    let _factory_contract: fn(
+        &crate::root::ExtensionsContentFactory,
+    ) -> &dyn crate::plugins::content::ContentFactory = |factory| factory;
+    assert_eq!(
+        registry.content_types().len(),
+        FACTORIES.len() + standalone.len()
+    );
     for content in registry.content_types() {
         assert_eq!(
             FACTORIES
                 .iter()
                 .filter(|(id, _, _)| *id == content.id.as_str())
-                .count(),
+                .count()
+                + standalone
+                    .iter()
+                    .filter(|id| **id == content.id.as_str())
+                    .count(),
             1,
         );
     }

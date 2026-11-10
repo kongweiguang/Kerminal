@@ -7,6 +7,7 @@ pub mod commands;
 pub mod connections;
 pub mod context;
 pub mod editor;
+pub mod extensions;
 pub mod files;
 pub(crate) mod host_picker;
 pub(crate) mod input_composition;

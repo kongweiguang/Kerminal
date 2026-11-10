@@ -158,8 +158,27 @@ pub(super) fn migration_helper_build_arguments(target: &str) -> Result<Vec<&str>
     ])
 }
 
+/// 插件宿主和作者工具随应用分发，但保持 SDK 自己的版本；每次打包重建，拒绝旧缓存产物。
+///
+/// @author kongweiguang
+pub(super) fn plugin_helper_build_arguments(target: &str) -> Result<Vec<&str>, Box<dyn Error>> {
+    packaging_config(target)?;
+    Ok(vec![
+        "--locked",
+        "build",
+        "--release",
+        "--package",
+        "kerminal-plugin-host",
+        "--package",
+        "kerminal-plugin-cli",
+        "--bins",
+        "--target",
+        target,
+    ])
+}
+
 /// 在 desktop crate 目录用指定平台配置打包，隔离 workspace 虚拟根的包发现行为。
-/// 先构建当前源码和 target 的迁移 helper，再组装资源，确保构建失败时不会继续打包磁盘旧文件。
+/// 先构建当前源码和 target 的迁移及插件 helper，再组装资源，防止打包磁盘旧文件。
 /// 许可证报告仍由锁文件生成；本地候选包不读取或传入签名私钥。
 ///
 /// @author kongweiguang
@@ -170,6 +189,8 @@ pub fn package(root: &Path, target: &str) -> Result<(), Box<dyn Error>> {
     let helper_build_arguments = migration_helper_build_arguments(target)?;
     cargo(root, &helper_build_arguments)
         .map_err(|error| format!("build migration helper for {target}: {error}"))?;
+    cargo(root, &plugin_helper_build_arguments(target)?)
+        .map_err(|error| format!("build plugin helpers for {target}: {error}"))?;
     let temporary_config = prepare_packager_config(root, target, config)?;
     let target_directory = root.join("crates").join("kerminal-desktop");
     let invocation = Command::new("cargo")
@@ -486,7 +507,9 @@ fn validate_relative_package_path(path: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// 要求平台配置保留一个且仅一个 kerminal 主程序，并验证 release 文件已实际构建。
+/// 固定唯一桌面入口与两个同目录插件程序，拒绝符号链接、遗漏和额外执行文件混入安装包。
+///
+/// @author kongweiguang
 fn validate_packager_binary(
     config: &toml::map::Map<String, toml::Value>,
     target: &str,
@@ -516,17 +539,36 @@ fn validate_packager_binary(
     if relative.is_absolute() || relative.components().count() != 1 || binary_name != "kerminal" {
         return Err("packager main binary must be the Kerminal executable".into());
     }
-    let executable = if target == "x86_64-pc-windows-msvc" {
-        release_directory.join(relative).with_extension("exe")
-    } else {
-        release_directory.join(relative)
-    };
-    if !executable.is_file() {
-        return Err(format!(
-            "packager binary is missing at {}; build the desktop release for target {target} first",
-            executable.display()
-        )
-        .into());
+    let mut names = std::collections::BTreeSet::new();
+    for binary in binaries {
+        let name = binary
+            .get("path")
+            .and_then(toml::Value::as_str)
+            .ok_or("packager binary path is missing")?;
+        if !matches!(
+            name,
+            "kerminal" | "kerminal-plugin-host" | "kerminal-plugin"
+        ) || !names.insert(name)
+        {
+            return Err("packager binaries must be the unique desktop and plugin helpers".into());
+        }
+        let executable = if target == "x86_64-pc-windows-msvc" {
+            release_directory.join(name).with_extension("exe")
+        } else {
+            release_directory.join(name)
+        };
+        if !fs::symlink_metadata(&executable).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            return Err(format!(
+                "packager binary is missing or not a regular file at {}",
+                executable.display()
+            )
+            .into());
+        }
+    }
+    if names.len() != 3 {
+        return Err(
+            "packager config must include both plugin helpers beside the desktop binary".into(),
+        );
     }
     Ok(())
 }

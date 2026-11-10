@@ -221,7 +221,17 @@ impl PluginStore {
     pub fn compare_and_swap(
         &self,
         expected: &PluginStoreSnapshot,
+        next: PluginStoreState,
+    ) -> Result<PluginStoreSnapshot, PluginStoreError> {
+        self.publish_and_compare(expected, next, || Ok(()))
+    }
+
+    /// 版本发布与状态 CAS 共用同一锁；清理不能介入发布和 pending 提交之间。
+    pub(super) fn publish_and_compare(
+        &self,
+        expected: &PluginStoreSnapshot,
         mut next: PluginStoreState,
+        publish: impl FnOnce() -> Result<(), PluginStoreError>,
     ) -> Result<PluginStoreSnapshot, PluginStoreError> {
         let _guard = self.storage.lock().map_err(|_| PluginStoreError::Lock)?;
         self.require_no_recovery_unlocked()?;
@@ -257,6 +267,7 @@ impl PluginStore {
         } else {
             CommitMode::CreateNew
         };
+        publish()?;
         commit_with_recovery(
             &directory,
             &temporary,

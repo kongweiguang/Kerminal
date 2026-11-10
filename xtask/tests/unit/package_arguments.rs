@@ -274,7 +274,7 @@ fn dependency_report_requires_license_sections() {
     assert!(command::validate_third_party_report("<html></html>").is_err());
 }
 
-/// 验证同一 release target 的桌面主程序、迁移 helper 和 wrappers 被映射到包内固定路径。
+/// 验证同一 target 的桌面与插件程序来自同一 release 根，且任何 helper 缺失都会阻止打包。
 ///
 /// @author kongweiguang
 #[test]
@@ -316,6 +316,10 @@ fn generated_packager_config_resolves_workspace_inputs_and_target_binary() {
     fs::create_dir_all(&release_directory).expect("create target release directory");
     fs::write(release_directory.join("kerminal.exe"), "executable")
         .expect("write built binary fixture");
+    for name in ["kerminal-plugin-host.exe", "kerminal-plugin.exe"] {
+        fs::write(release_directory.join(name), "plugin helper")
+            .expect("write built plugin helper fixture");
+    }
     fs::write(
         release_directory.join("kerminal-migrate.exe"),
         "migration helper",
@@ -338,6 +342,14 @@ resources = [
 [[binaries]]
 path = "kerminal"
 main = true
+
+[[binaries]]
+path = "kerminal-plugin-host"
+main = false
+
+[[binaries]]
+path = "kerminal-plugin"
+main = false
 
 [[deep-link-protocols]]
 schemes = ["kerminal"]
@@ -496,6 +508,23 @@ role = "viewer"
         "temporary config is removed on drop"
     );
 
+    fs::remove_file(release_directory.join("kerminal-plugin-host.exe"))
+        .expect("remove plugin host for fail-closed check");
+    let missing_host = command::prepare_packager_config_at(
+        root,
+        "x86_64-pc-windows-msvc",
+        "Packager.windows.toml",
+        &release_directory,
+    );
+    assert!(
+        missing_host.is_err(),
+        "missing plugin host must block packaging"
+    );
+    fs::write(
+        release_directory.join("kerminal-plugin-host.exe"),
+        "plugin helper",
+    )
+    .expect("restore plugin host fixture");
     fs::remove_file(release_directory.join("kerminal-migrate.exe"))
         .expect("remove helper fixture for fail-closed check");
     let error = match command::prepare_packager_config_at(

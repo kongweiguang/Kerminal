@@ -16,6 +16,7 @@ mod content_render;
 mod context_projection;
 mod cursor_blink;
 mod custom_agent_manager;
+mod extensions;
 mod external_auth;
 #[cfg(feature = "right-rail-acceptance")]
 mod external_plugin_acceptance;
@@ -111,6 +112,9 @@ mod workspace_sessions;
 mod workspace_tab_creation;
 mod workspace_transient;
 
+// 工厂契约回归需要核对完整生命周期工厂；仅测试可见，不扩大生产导航接口。
+#[cfg(test)]
+pub(crate) use self::extensions::{EXTENSIONS_CONTENT_ID, ExtensionsContentFactory};
 pub use self::plugin_host_api::{PluginUiBridge, PluginUiRegistration};
 pub use self::quit::{QuitIntent, RootHostLifecycle, RootViewEvent};
 #[cfg(feature = "right-rail-acceptance")]
@@ -935,6 +939,9 @@ pub struct RootView {
     workspace_renders: HashMap<TabId, Entity<workspace_render::WorkspaceRender>>,
     /// 内容视图按 Page/Tab 身份保活，关闭失败仍由此宿主持有资源。
     content_host: crate::plugins::content::ContentHost,
+    extensions_factory: Option<std::sync::Arc<extensions::ExtensionsContentFactory>>,
+    extensions_subscription: Option<gpui_kit::Subscription>,
+    pending_extensions_navigation: bool,
     plugin_tools: crate::plugins::tools::PluginTools,
     plugin_tab_close_deadlines: BTreeMap<TabId, std::time::Instant>,
     active_content_scope: Option<crate::plugins::content::ContentScope>,
@@ -3166,6 +3173,13 @@ impl RootView {
     ///
     /// @author kongweiguang
     pub fn new(services: AppServices, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let extensions_factory = services.extensions.as_ref().map(|service| {
+            std::sync::Arc::new(extensions::ExtensionsContentFactory::new(
+                service.clone(),
+                services.executor.clone(),
+                "1.0.0".into(),
+            ))
+        });
         let mut content_host = crate::plugins::content::ContentHost::default();
         let mut plugin_tools = crate::plugins::tools::PluginTools::default();
         let mut content_registration_error = None;
@@ -3185,6 +3199,12 @@ impl RootView {
                 content_registration_error
                     .get_or_insert_with(|| error.public_message().to_owned().into());
             }
+        }
+        if let Some(factory) = &extensions_factory
+            && let Err(error) = content_host.register(factory.clone())
+        {
+            content_registration_error
+                .get_or_insert_with(|| error.public_message().to_owned().into());
         }
         let initial_appearance = window.appearance();
         for factory in &services.tool_factories {
@@ -3301,6 +3321,19 @@ impl RootView {
                 }
                 PreferencesEvent::CloseRequested => {
                     root.close_preferences_modal(window, cx);
+                    if std::mem::take(&mut root.pending_extensions_navigation)
+                        && let Err(error) =
+                            root.open_plugin_page(extensions::EXTENSIONS_CONTENT_ID, window, cx)
+                    {
+                        root.status = Some(error.public_message().to_owned().into());
+                    }
+                }
+                PreferencesEvent::ExtensionsRequested => {
+                    root.pending_extensions_navigation = true;
+                    root.request_close_preferences_modal(cx);
+                }
+                PreferencesEvent::ExtensionsNavigationCancelled => {
+                    root.pending_extensions_navigation = false
                 }
                 PreferencesEvent::QuitConfirmationRequested => {
                     root.show_preferences_quit_confirmation(window, cx);
@@ -4020,6 +4053,9 @@ impl RootView {
             session_reconnect: session_reconnect::SessionReconnectController::default(),
             workspace_renders: HashMap::new(),
             content_host,
+            extensions_factory,
+            extensions_subscription: None,
+            pending_extensions_navigation: false,
             plugin_tools,
             plugin_tab_close_deadlines: BTreeMap::new(),
             active_content_scope: None,

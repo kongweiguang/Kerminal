@@ -172,6 +172,7 @@ impl PreferencesPanel {
     ///
     /// @author kongweiguang
     pub(in crate::features::preferences) fn cancel_close(&mut self, cx: &mut Context<Self>) {
+        cx.emit(PreferencesEvent::ExtensionsNavigationCancelled);
         let was_open = self.close_confirmation;
         self.close_confirmation = false;
         if let Some(draft) = self.settings.as_mut()

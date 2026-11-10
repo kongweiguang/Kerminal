@@ -21,6 +21,15 @@ resources = [
 path = "kerminal"
 main = true
 
+# 插件程序与主程序同目录，运行时不从 PATH 选择宿主。
+[[binaries]]
+path = "kerminal-plugin-host"
+main = false
+
+[[binaries]]
+path = "kerminal-plugin"
+main = false
+
 [nsis]
 # 旧版只安装到当前用户；固定该模式以沿用 HKCU 注册表和本地用户目录。
 installMode = "currentUser"

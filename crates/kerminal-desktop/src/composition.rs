@@ -28,6 +28,7 @@ use kerminal_application::{
         probe::{ConnectionProbeBackend, ConnectionProbeService},
     },
     executor::ApplicationTaskExecutor,
+    extensions::ExtensionsService,
     files::{
         FileAccessProvider, FileBookmarkRepository, FileService,
         clipboard_download::{FileClipboardDownloadService, FileClipboardPort},
@@ -91,6 +92,7 @@ use kerminal_infrastructure::{
         external_launch::SystemExternalProtocolAdapter, file_clipboard::SystemFileClipboard,
         local_shells::SystemLocalShellDiscovery, notification::NotifyRustAdapter,
     },
+    plugins::{catalog::CatalogClient, installer::PackageInstaller},
     session_logs::SessionLogStore,
     sessions::{
         CompositeSessionTransportFactory, SessionManager, SessionRuntimeConfig, SessionTargetKind,
@@ -168,6 +170,8 @@ pub struct DesktopComposition {
     task_executor: ApplicationTaskExecutor,
     sessions: Arc<SessionManager>,
     connection_probe_backend: Arc<SystemConnectionProbe>,
+    /// 保留 SSH adapter 的唯一 owner，以便与消费者并行关闭 intake 并等待真实回收。
+    remote_connection_backend: Arc<RusshRemoteConnectionService>,
     operations: Arc<OperationsService>,
     transfers: TransferService,
     session_logs: SessionLogStore,
@@ -302,13 +306,15 @@ impl DesktopComposition {
         let runtime_credentials: Arc<dyn CredentialResolver> = external_runtime_registry.clone();
         let known_hosts: Arc<dyn KnownHostsRepository> =
             Arc::new(KnownHostsStore::new(storage.clone(), writable));
-        let remote_connections: Arc<dyn RemoteConnectionService> = Arc::new(
-            RusshRemoteConnectionService::new(RusshRemoteConnectionDependencies {
+        let remote_connection_backend = Arc::new(RusshRemoteConnectionService::new(
+            RusshRemoteConnectionDependencies {
                 hosts: runtime_hosts,
                 credentials: runtime_credentials,
                 known_hosts: known_hosts.clone(),
-            }),
-        );
+            },
+        ));
+        let remote_connections: Arc<dyn RemoteConnectionService> =
+            remote_connection_backend.clone();
 
         let credential_vault: Arc<dyn CredentialVaultRepository> = vault.clone();
         let credential_service = CredentialService::new(credential_vault);
@@ -700,6 +706,7 @@ impl DesktopComposition {
             task_executor,
             sessions,
             connection_probe_backend,
+            remote_connection_backend,
             operations,
             transfers,
             session_logs,
@@ -732,8 +739,8 @@ impl DesktopComposition {
         self.app_services.clone()
     }
 
-    /// 基础服务就绪后建立插件路由并装配冻结的界面工厂，避免声明可见却无法创建实例；
-    /// 先保留运行服务所有权，后续装配失败仍沿用组合根的资源收尾门禁。
+    /// 基础服务就绪后装配插件与扩展市场，二者共享状态仓储、设置事务和信任目录；
+    /// 可失败的目录准备先于后台任务，任务启动后立即保留 owner，后续失败仍可统一收尾。
     pub async fn install_external_plugins(
         &mut self,
         startup: Arc<crate::plugins::startup::StartupPlugins>,
@@ -756,6 +763,8 @@ impl DesktopComposition {
             kerminal_application::preferences::settings::ThemeMode::Light => "light",
             kerminal_application::preferences::settings::ThemeMode::System => "system",
         };
+        let catalog = Arc::new(CatalogClient::for_runtime(self.storage.clone())?);
+        let platform = crate::plugins::startup::current_platform()?;
         let plugins = crate::plugins::assembly::DesktopPlugins::new(
             startup.clone(),
             self.configuration.clone(),
@@ -765,6 +774,14 @@ impl DesktopComposition {
             locale.clone(),
             theme.into(),
         )?;
+        let installer = Arc::new(PackageInstaller::new(
+            startup.store.clone(),
+            catalog.clone(),
+            Arc::new(plugins.settings.clone()),
+            crate::plugins::startup::HOST_API.into(),
+            platform,
+        ));
+        self.app_services.extensions = Some(Arc::new(ExtensionsService::new(catalog, installer)));
         self.app_services.plugin_ui = Some(plugins.ui.clone());
         self.app_services.external_plugin_runtime = Some(plugins.runtime.clone());
         self.app_services.external_plugin_settings = Some(plugins.settings.clone());
@@ -838,6 +855,7 @@ impl DesktopComposition {
             watcher_result,
             suggestion_result,
             git_sync_result,
+            ssh_result,
             (task_executor_result, session_result, rdp_result),
         ) = tokio::join!(
             self.agent_manager.shutdown_until(deadline),
@@ -851,6 +869,7 @@ impl DesktopComposition {
             ),
             self.remote_command_suggestions.shutdown_until(deadline),
             self.git_sync_repository.shutdown_until(deadline),
+            self.remote_connection_backend.shutdown_until(deadline),
             join_session_dependent_shutdowns(
                 self.task_executor.shutdown_until(deadline),
                 self.sessions.close_all_until(deadline),
@@ -864,6 +883,7 @@ impl DesktopComposition {
         append_failure(&mut failures, watcher_result);
         append_failure(&mut failures, suggestion_result);
         append_failure(&mut failures, git_sync_result);
+        append_failure(&mut failures, ssh_result);
         append_failure(&mut failures, task_executor_result);
         append_failure(&mut failures, session_result);
         append_failure(&mut failures, rdp_result);

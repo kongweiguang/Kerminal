@@ -52,6 +52,7 @@ pub struct QuickOpenTerminalTarget {
 pub enum QuickOpenSelection {
     Action(KeybindingAction),
     PluginCommand(QuickOpenPluginCommand),
+    Extensions,
     Host(HostId),
     Tab(TabId),
     Pane {

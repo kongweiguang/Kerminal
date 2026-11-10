@@ -51,6 +51,8 @@ pub struct AppServices {
         Option<kerminal_application::plugin_settings::PluginSettingsService>,
     pub external_plugins: Vec<Arc<kerminal_application::external_contributions::PreparedPlugin>>,
     pub plugin_events: Option<Arc<kerminal_application::plugin_host_api::PluginEventSubscriptions>>,
+    /// 市场安装只经应用用例；窗口只保留页面实体，写入由共享仓储协调。
+    pub extensions: Option<Arc<kerminal_application::extensions::ExtensionsService>>,
     /// 工厂只捕获各自需要的应用端口；实例在所属窗口按需创建，不能在装配时挂载视图。
     pub content_factories: Vec<Arc<dyn crate::plugins::content::ContentFactory>>,
     /// 工具工厂与运行端口一同注入，视图实例仍只在所属窗口按需创建。
@@ -179,6 +181,7 @@ impl AppServices {
             external_plugin_settings: None,
             external_plugins: Vec::new(),
             plugin_events: None,
+            extensions: None,
             content_factories: Vec::new(),
             tool_factories: Vec::new(),
             host_form_factories: Arc::default(),

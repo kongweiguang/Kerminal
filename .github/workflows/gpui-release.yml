@@ -89,7 +89,11 @@ jobs:
           packages = {
               package["name"]: package["version"]
               for package in lock["package"]
-              if package["name"].startswith("kerminal-")
+              if package["name"] in {
+                  "kerminal-domain", "kerminal-application", "kerminal-terminal",
+                  "kerminal-infrastructure", "kerminal-ui", "kerminal-mcp",
+                  "kerminal-desktop",
+              }
           }
           mismatches = {name: value for name, value in packages.items() if value != version}
           if mismatches:
@@ -161,7 +165,7 @@ jobs:
             libvulkan-dev libwayland-dev libxdo-dev \
             libx11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxcb-randr0-dev libxcb-xkb-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libegl1-mesa-dev
+            libxkbcommon-dev libxkbcommon-x11-dev libegl1-mesa-dev libgtk-3-dev libwebkit2gtk-4.1-dev
 
       - name: Install NSIS
         if: runner.os == 'Windows'
@@ -208,7 +212,7 @@ jobs:
           PACKAGE_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          cargo --locked build --release --package kerminal-desktop --target "$PACKAGE_TARGET"
+          cargo --locked build --release --package kerminal-desktop --package kerminal-plugin-host --package kerminal-plugin-cli --target "$PACKAGE_TARGET"
           cargo --locked xtask package --target "$PACKAGE_TARGET"
 
       - name: Upload beta candidate

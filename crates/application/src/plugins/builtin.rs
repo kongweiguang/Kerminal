@@ -23,6 +23,7 @@ pub(super) fn register(builder: &mut PluginRegistryBuilder) -> Result<(), Plugin
         ("files", "Files"),
         ("editor", "Editor"),
         ("preferences", "Preferences"),
+        ("extensions", "Extensions"),
         ("commands", "Commands"),
         ("connections", "Connections"),
         ("agents", "Agents"),
