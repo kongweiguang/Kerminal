@@ -4219,6 +4219,7 @@ impl RootView {
     }
 
     /// 从 controller 的活动终端布局与 Ready runtime pane 生成 Agent 首选目标候选；不从焦点外的 Tab 推断目标。
+    /// 候选只用于新建或显式绑定，候选变化不重读历史；历史由会话归属 scope 筛选。
     /// 收尾及标签实体尚未换挂时不刷新旧面板，避免新标签目标清除旧标签的选择和历史筛选。
     ///
     /// @author kongweiguang

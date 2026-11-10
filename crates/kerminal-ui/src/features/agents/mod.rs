@@ -469,7 +469,10 @@ impl AgentsPanel {
         cx.notify();
     }
 
-    /// 候选变化重置其可见摘要并刷新历史，不调用绑定用例，避免普通切 Tab 改写 Agent 首选目标。
+    /// 候选只是新建或显式绑定的首选终端，历史筛选由会话归属 scope 决定；切 pane/Tab 时候选变化
+    /// 只更新候选，不重读历史、不重置筛选或改名草稿，避免内容未变时的整块刷新和刷新图标转动。
+    ///
+    /// @author kongweiguang
     pub fn set_target_candidate(
         &mut self,
         candidate: Option<AgentTargetCandidate>,
@@ -479,10 +482,6 @@ impl AgentsPanel {
             return;
         }
         self.candidate = candidate;
-        self.target_summary = None;
-        self.history_mode = AgentHistoryMode::CurrentTarget;
-        self.rename_target = None;
-        self.reload(cx);
         cx.notify();
     }
 

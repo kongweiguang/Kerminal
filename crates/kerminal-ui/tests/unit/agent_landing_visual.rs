@@ -13,12 +13,15 @@ use gpui_kit::{
 };
 use kerminal_application::{
     ApplicationTaskExecutor,
-    agents::{AgentResumeCapability, AgentSessionView},
+    agents::{AgentHistoryMode, AgentResumeCapability, AgentSessionView},
     preferences::ThemeMode,
 };
 use kerminal_domain::{
-    agents::{AgentProvider, AgentSession, AgentSessionLaunch, AgentSessionScope},
-    identity::{AgentSessionId, SessionId},
+    agents::{
+        AgentProvider, AgentSession, AgentSessionLaunch, AgentSessionScope, AgentTargetBinding,
+        AgentTargetLiveStatus,
+    },
+    identity::{AgentSessionId, PaneId, SessionId, TabId},
     sessions::{
         LocalSessionTarget, SessionInfo, SessionLifecycle, SessionOwner, SessionTarget,
         TerminalSize,
@@ -27,6 +30,7 @@ use kerminal_domain::{
 use tokio::runtime::{Builder, Runtime};
 
 use super::{AgentsPanel, history_filter_display_text};
+use crate::features::agents::AgentTargetCandidate;
 use support::FixtureAgentService;
 
 /// 当前目标和全部筛选都在标签后显示计数，零值也必须可见。
@@ -421,4 +425,82 @@ fn launcher_and_history_controls_fit_narrow_tool_panels(app: &mut TestAppContext
             });
         }
     }
+}
+
+/// 分屏切换终端只更新首选候选：不重读历史、不重置筛选和改名草稿；真实 scope 变化仍会刷新。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn candidate_change_updates_target_without_reloading_history(app: &mut TestAppContext) {
+    let (runtime, service, panel, id, visual) = fixture(app);
+
+    click(visual, "agents-history-all");
+    pump(&runtime, visual);
+    let loads_after_filter = service.history_loads();
+    visual.update(|_, app| {
+        assert_eq!(panel.read(app).history_mode, AgentHistoryMode::All);
+        assert!(loads_after_filter >= 2, "filter switch must reload history");
+    });
+
+    let rename = format!("agent-session-rename-{}", id.as_str());
+    click(visual, &rename);
+    let rename_before = visual.update(|_, app| panel.read(app).rename_target.clone());
+    assert!(rename_before.is_some(), "rename editor must be open");
+
+    let candidate = AgentTargetCandidate {
+        binding: AgentTargetBinding {
+            binding_id: Some("fixture-target-switch".to_owned()),
+            generation: 7,
+            pane_id: Some(PaneId::new()),
+            tab_id: Some(TabId::new()),
+            terminal_session_id: Some(SessionId::new()),
+            target_ref: Some("local:fixture".to_owned()),
+            target_kind: Some("local".to_owned()),
+            cwd: Some("workspace".to_owned()),
+            shell: Some("bash".to_owned()),
+            live_status: AgentTargetLiveStatus::Ready,
+            last_seen_at: None,
+        },
+        label: "Fixture target".to_owned(),
+    };
+    visual.update(|_, app| {
+        panel.update(app, |panel, cx| {
+            panel.set_target_candidate(Some(candidate), cx);
+            panel.set_target_summary(Some("Another terminal".to_owned()), cx);
+        });
+    });
+    pump(&runtime, visual);
+    visual.update(|_, app| {
+        let panel = panel.read(app);
+        assert_eq!(
+            service.history_loads(),
+            loads_after_filter,
+            "candidate changes must not reload history"
+        );
+        assert!(!panel.loading);
+        assert!(panel.sessions_verified);
+        assert_eq!(panel.history_mode, AgentHistoryMode::All);
+        assert_eq!(panel.rename_target, rename_before);
+    });
+
+    visual.update(|_, app| {
+        panel.update(app, |panel, cx| {
+            panel.set_scope(
+                AgentSessionScope::Tab {
+                    tab_id: TabId::new(),
+                },
+                cx,
+            );
+        });
+    });
+    pump(&runtime, visual);
+    visual.update(|_, app| {
+        let panel = panel.read(app);
+        assert_eq!(
+            service.history_loads(),
+            loads_after_filter + 1,
+            "real filter scope changes must still reload history"
+        );
+        assert_eq!(panel.history_mode, AgentHistoryMode::CurrentTarget);
+    });
 }

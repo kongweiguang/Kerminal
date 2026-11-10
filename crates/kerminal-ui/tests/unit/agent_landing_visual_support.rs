@@ -4,7 +4,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
@@ -94,6 +94,7 @@ pub(super) struct FixtureAgentService {
     hold_history: AtomicBool,
     fail_history: AtomicBool,
     history_gate: Semaphore,
+    history_loads: AtomicUsize,
 }
 
 impl FixtureAgentService {
@@ -111,7 +112,13 @@ impl FixtureAgentService {
             hold_history: AtomicBool::new(false),
             fail_history: AtomicBool::new(false),
             history_gate: Semaphore::new(0),
+            history_loads: AtomicUsize::new(0),
         }
+    }
+
+    /// 暴露真实历史查询次数，供回归测试区分“只更新候选”和“重新读取历史”。
+    pub(super) fn history_loads(&self) -> usize {
+        self.history_loads.load(Ordering::SeqCst)
     }
 
     /// 阻塞下一次历史查询，使测试可以检查已确认记录在刷新期间的真实布局。
@@ -148,8 +155,10 @@ macro_rules! impl_fixture_service {
         Ok(self.catalog.clone())
     }
 
-    /// 受控回执始终保留同一个运行中会话，等待期间接受取消避免遗留任务。
+    /// 受控回执始终保留同一个运行中会话，等待期间接受取消避免遗留任务；进入真实查询时计数，
+    /// 使回归测试能确认候选变化没有隐式重读历史。
     async fn history(&self, _: AgentHistoryRequest, cancellation: CancellationToken) -> AppResult<AgentHistoryProjection> {
+        self.history_loads.fetch_add(1, Ordering::SeqCst);
         if self.hold_history.load(Ordering::SeqCst) {
             tokio::select! {
                 permit = self.history_gate.acquire() => { permit.expect("fixture gate remains open").forget(); }
