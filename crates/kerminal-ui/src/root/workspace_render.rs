@@ -49,9 +49,8 @@ pub(super) struct WorkspacePaneProjection {
     pub split_candidate_cancelable: bool,
     /// ClosePane/CloseTab 已拥有该 pane 时禁止把同一错误状态误呈现为恢复重试。
     pub close_operation_pending: bool,
-    /// 失败 ClosePane 仍保留真实资源；占位必须给出“重试恢复”入口回到同一关闭操作，
-    /// 而不是只提示用户自行寻找关闭控件。
-    pub close_operation_retryable: bool,
+    /// 已收到失败回执的关闭范围；只有该范围显示“重试关闭”，在途关闭仍只显示等待占位。
+    pub close_operation_failure: Option<CloseOperationFailureScope>,
     /// 换代目录未确认时保持动作槽位，防止复制上一进程的目录。
     pub split_enabled: bool,
     /// 当前 pane 唯一的重新连接动作；稳定态来自服务观察，进行中携带同一 attempt。
@@ -59,6 +58,13 @@ pub(super) struct WorkspacePaneProjection {
     /// 服务观察确认会话已退出或失败；正文只读，标题栏必须给出可见的重连入口。
     pub session_disconnected: bool,
     pub broadcast: PaneBroadcastProjection,
+}
+
+/// 失败关闭的精确范围决定占位动作：pane 级保留终端，tab 级保留整个标签。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CloseOperationFailureScope {
+    Pane,
+    Tab,
 }
 
 /// 只向 Root 返回需要业务处理的 pane 意图，不在渲染层创建或关闭会话。
@@ -69,6 +75,16 @@ pub(super) enum WorkspaceRenderEvent {
         event: WorkspacePaneEvent,
     },
     RetryPane {
+        tab_id: TabId,
+        pane_id: PaneId,
+    },
+    /// 已收到失败回执的 ClosePane 可被用户明确放弃；保留真实 session，只释放关闭门禁。
+    KeepPane {
+        tab_id: TabId,
+        pane_id: PaneId,
+    },
+    /// 失败 CloseTab 在任意 pane 占位上提供标签级出口，保留全部 tab/session。
+    KeepTab {
         tab_id: TabId,
         pane_id: PaneId,
     },
@@ -669,25 +685,27 @@ fn render_pane_projection(
     };
 
     if close_operation_blocks_retry_or_measurement(&projection, probe_context.is_some()) {
-        // 失败 ClosePane 已拥有该 pane 但资源仍在；给回同一重试按钮，Root 会重新派发
-        // 原 ClosePane。仍在途的关闭没有失败回执，继续保持不可重试的等待占位。
-        let retry_pane = projection
-            .close_operation_retryable
-            .then(|| projection.pane_id.clone());
-        return render_placeholder(
-            pane_id,
-            projection.status.clone().unwrap_or_else(|| {
-                crate::locale::text(
-                    "此分屏仍由关闭操作处理，请从关闭/清理入口继续。",
-                    "This pane is still owned by a close operation. Continue from the close or cleanup controls.",
-                )
-            }),
-            retry_pane,
-            tab_id,
-            retry_emitter,
-            window,
-            cx,
-        );
+        // 失败 ClosePane/CloseTab 显示真实失败原因并同时提供“重试关闭”和保留出口；
+        // 仍在途的关闭没有失败回执，继续保持不可重试的等待占位。
+        let message = projection.status.clone().unwrap_or_else(|| {
+            crate::locale::text(
+                "此分屏仍由关闭操作处理，请从关闭/清理入口继续。",
+                "This pane is still owned by a close operation. Continue from the close or cleanup controls.",
+            )
+        });
+        if let Some(scope) = projection.close_operation_failure {
+            return render_close_failure_placeholder(
+                pane_id,
+                message,
+                scope,
+                tab_id,
+                retry_emitter,
+                reconnect_emitter,
+                window,
+                cx,
+            );
+        }
+        return render_placeholder(pane_id, message, None, tab_id, retry_emitter, window, cx);
     }
 
     if let Some(probe_context) = probe_context {
@@ -740,10 +758,14 @@ fn render_pane_projection(
                 cx,
             );
         }
-        let message = crate::locale::text(
-            "正在校验分屏布局；持续未完成时可取消后重试。",
-            "Checking the split layout; cancel and retry if it does not finish.",
-        );
+        // 失败候选可能已保留 session/orphan；此时必须显示运行态的真实失败原因，
+        // 不能继续用“正在校验”覆盖用户已经看到的错误。
+        let message = projection.status.clone().unwrap_or_else(|| {
+            crate::locale::text(
+                "正在校验分屏布局；持续未完成时可取消后重试。",
+                "Checking the split layout; cancel and retry if it does not finish.",
+            )
+        });
         // 无论测量是否已经准入，待创建分屏都必须留一个可见出口：未准入直接撤销候选，
         // 已准入则走正常关闭入口，由 Root 取消在途创建并等待清理回执，避免占位页无法收尾。
         let cancel = Some(PlaceholderCancel {
@@ -830,6 +852,7 @@ fn render_pane_projection(
 }
 
 /// 关闭操作拥有失败 pane 时禁止恢复重试；候选测量也不能在关闭 owner 未收敛时启动。
+/// 已收到失败回执的关闭即使仍保留 session/快照也进入失败占位，否则重试/保留动作会被正常终端正文遮住。
 ///
 /// @author kongweiguang
 fn close_operation_blocks_retry_or_measurement(
@@ -837,7 +860,9 @@ fn close_operation_blocks_retry_or_measurement(
     has_candidate_probe: bool,
 ) -> bool {
     projection.close_operation_pending
-        && (has_candidate_probe || pane_surface_state(projection) == PaneSurfaceState::Failed)
+        && (has_candidate_probe
+            || projection.close_operation_failure.is_some()
+            || pane_surface_state(projection) == PaneSurfaceState::Failed)
 }
 
 /// 将关闭操作与 pane 精确关联，避免它的暂态失败覆盖成另一个恢复/分屏操作。
@@ -859,20 +884,28 @@ pub(super) fn close_operation_targets_pane(
     }
 }
 
-/// 失败 ClosePane 才能从占位直接重试；仍未收到失败回执的关闭仍只能等待真实 ACK。
+/// 失败关闭按 pane 归属决定保留范围；仍在途的关闭没有失败回执，不能显示放弃入口。
 ///
 /// @author kongweiguang
-pub(super) fn close_operation_retryable(
+pub(super) fn close_operation_failure_scope(
     failed_operation: Option<&WorkspaceResourceOperation>,
     pane_id: &PaneId,
-) -> bool {
-    matches!(
-        failed_operation,
+) -> Option<CloseOperationFailureScope> {
+    match failed_operation {
         Some(WorkspaceResourceOperation::ClosePane {
             pane_id: closing_pane,
             ..
-        }) if closing_pane == pane_id
-    )
+        }) if closing_pane == pane_id => Some(CloseOperationFailureScope::Pane),
+        Some(WorkspaceResourceOperation::CloseTab { pane_ids, .. })
+            if pane_ids.iter().any(|closing_pane| closing_pane == pane_id) =>
+        {
+            Some(CloseOperationFailureScope::Tab)
+        }
+        Some(WorkspaceResourceOperation::ClosePane { .. })
+        | Some(WorkspaceResourceOperation::CloseTab { .. })
+        | Some(WorkspaceResourceOperation::CreatePane { .. })
+        | None => None,
+    }
 }
 
 /// 只给失败的真实恢复或分屏创建重试；Close owner 必须沿关闭/清理入口收敛。
@@ -1016,6 +1049,76 @@ fn render_placeholder_with_probe(
         );
     }
     body.into_any_element()
+}
+
+/// 失败关闭占位必须同时给出“重试关闭”和真实的保留出口；用户不能被持续失败锁在无法保存/新建的状态。
+/// 保留动作只发事件，不在这里触碰 controller 或 session。
+///
+/// @author kongweiguang
+fn render_close_failure_placeholder(
+    pane_id: &PaneId,
+    message: SharedString,
+    scope: CloseOperationFailureScope,
+    tab_id: &TabId,
+    retry_emitter: &Rc<RetryEmitter>,
+    event_emitter: &Rc<ReconnectEmitter>,
+    window: &mut Window,
+    cx: &mut Context<WorkspacePanes>,
+) -> AnyElement {
+    let theme = ThemeTokens::current(window, cx);
+    let retry_tab = tab_id.clone();
+    let retry_pane = pane_id.clone();
+    let retry_action = Rc::clone(retry_emitter);
+    let keep_event = match scope {
+        CloseOperationFailureScope::Pane => WorkspaceRenderEvent::KeepPane {
+            tab_id: tab_id.clone(),
+            pane_id: pane_id.clone(),
+        },
+        CloseOperationFailureScope::Tab => WorkspaceRenderEvent::KeepTab {
+            tab_id: tab_id.clone(),
+            pane_id: pane_id.clone(),
+        },
+    };
+    let keep_label = match scope {
+        CloseOperationFailureScope::Pane => crate::locale::text("保留终端", "Keep terminal"),
+        CloseOperationFailureScope::Tab => crate::locale::text("保留标签", "Keep tab"),
+    };
+    let keep_action = Rc::clone(event_emitter);
+    div()
+        .id(format!("workspace-pane-close-failure-{}", pane_id.as_str()))
+        .w_full()
+        .h_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_4()
+        .bg(theme.materials.workspace)
+        .text_color(theme.muted)
+        .child(message)
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    Button::new(format!("workspace-pane-retry-close-{}", pane_id.as_str()))
+                        .compact()
+                        .label(crate::locale::text("重试关闭", "Retry close"))
+                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            retry_action(retry_tab.clone(), retry_pane.clone(), cx);
+                        })),
+                )
+                .child(
+                    Button::new(format!("workspace-pane-keep-{}", pane_id.as_str()))
+                        .compact()
+                        .label(keep_label)
+                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            keep_action(keep_event.clone(), cx);
+                        })),
+                ),
+        )
+        .into_any_element()
 }
 
 /// 缺失或失败状态占据真实 pane 边界；背景沿用 workspace 材料以免遮住根 underlay。

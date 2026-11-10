@@ -485,6 +485,36 @@ impl WorkspaceResourceOperationEntry {
         request
     }
 
+    /// 标签级关闭命中失败 ClosePane 时，把 Tab 意图与首个焦点票据挂到该 pane 的 entry；
+    /// 同一意图幂等，已有其它意图时拒绝覆盖，避免重复请求改写用户原始关闭目标。
+    ///
+    /// @author kongweiguang
+    fn retain_tab_close_after_failed_pane(
+        &mut self,
+        operation_id: &str,
+        tab_id: &TabId,
+        close_tab_focus: Option<CloseTabFocusIntent>,
+    ) -> bool {
+        if self.operation_id != operation_id {
+            return false;
+        }
+        let intent = WorkspaceDeferredCloseIntent::Tab {
+            tab_id: tab_id.clone(),
+        };
+        match self.deferred_close.as_ref() {
+            Some(existing) if existing == &intent => {}
+            Some(_) => return false,
+            None => {
+                self.cancel_requested = true;
+                self.deferred_close = Some(intent);
+            }
+        }
+        if self.close_tab_focus.is_none() {
+            self.close_tab_focus = close_tab_focus;
+        }
+        true
+    }
+
     /// Restore 已有 Close operation 时仅借用同一 pane→entry 保留首个来源，不改变取消、资源 ACK 或测量状态。
     ///
     /// @author kongweiguang
@@ -2296,6 +2326,21 @@ impl RootView {
                     WorkspaceResourceOperation::CreatePane { .. } => false,
                 });
             if let Some(operation) = retry {
+                // 失败 ClosePane 只重试该 pane；标签级关闭必须先保存 Tab 意图，
+                // 成功后由既有 replay 关闭余下 pane 并移除标签。
+                if matches!(operation, WorkspaceResourceOperation::ClosePane { .. })
+                    && !self.retain_failed_close_tab_intent(
+                        &operation,
+                        tab_close_focus_override.clone().flatten(),
+                    )
+                {
+                    self.status = Some(crate::locale::text(
+                        "该分屏已有其它关闭意图，未改写原目标；请先完成或保留该关闭。",
+                        "This pane already has another close intent; the original target was not replaced. Finish or keep that close first.",
+                    ));
+                    cx.notify();
+                    return false;
+                }
                 self.handle_workspace_resource_operation_from_window_with_tab_focus(
                     operation,
                     None,
@@ -3555,6 +3600,113 @@ impl RootView {
                     } if pending_tab == tab_id && pending_pane == pane_id
                 )
             })
+    }
+
+    /// 标签级关闭命中失败 ClosePane 时，成功回执必须继续关闭余下 pane；先把 Tab 意图
+    /// 和标签焦点票据挂到该 pane 的 entry。entry 缺失时按同一 operation_id 新建，
+    /// 使普通 ClosePane 失败也能在成功重试后重放标签关闭。
+    ///
+    /// @author kongweiguang
+    fn retain_failed_close_tab_intent(
+        &mut self,
+        operation: &WorkspaceResourceOperation,
+        close_tab_focus: Option<CloseTabFocusIntent>,
+    ) -> bool {
+        let WorkspaceResourceOperation::ClosePane {
+            operation_id,
+            tab_id,
+            pane_id,
+        } = operation
+        else {
+            return false;
+        };
+        self.workspace_resource_operations
+            .entry(pane_id.clone())
+            .or_insert_with(|| WorkspaceResourceOperationEntry::new(operation_id.clone()))
+            .retain_tab_close_after_failed_pane(operation_id, tab_id, close_tab_focus)
+    }
+
+    /// 已收到失败回执的关闭允许用户明确保留终端/标签：只丢弃 controller pending、匹配 entry
+    /// 与焦点票据，不关闭真实 session。随后保存、新建终端和退出准备恢复可用，用户仍可再次普通关闭。
+    ///
+    /// @author kongweiguang
+    pub(super) fn keep_failed_close_operation(
+        &mut self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+        keep_tab: bool,
+        cx: &mut Context<RootView>,
+    ) -> bool {
+        let Some(operation) = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.retry_pending_resource_operation())
+        else {
+            return false;
+        };
+        let (operation_id, retained_panes) = match (&operation, keep_tab) {
+            (
+                WorkspaceResourceOperation::ClosePane {
+                    operation_id,
+                    tab_id: pending_tab,
+                    pane_id: pending_pane,
+                },
+                false,
+            ) if pending_tab == tab_id && pending_pane == pane_id => {
+                (operation_id.clone(), vec![pane_id.clone()])
+            }
+            (
+                WorkspaceResourceOperation::CloseTab {
+                    operation_id,
+                    tab_id: pending_tab,
+                    pane_ids,
+                    ..
+                },
+                true,
+            ) if pending_tab == tab_id && pane_ids.contains(pane_id) => {
+                (operation_id.clone(), pane_ids.clone())
+            }
+            _ => return false,
+        };
+        let discarded = self
+            .workspace_controller
+            .as_mut()
+            .is_some_and(|controller| {
+                controller.discard_pending_resource_operation_if(&operation_id);
+                controller.pending_resource_operation().is_none()
+            });
+        if !discarded {
+            return false;
+        }
+        for retained_pane in retained_panes {
+            if self
+                .workspace_resource_operations
+                .get(&retained_pane)
+                .is_some_and(|entry| entry.operation_id() == operation_id)
+            {
+                self.workspace_resource_operations.remove(&retained_pane);
+            }
+            self.workspace_runtime
+                .keep_close_failed_pane(&retained_pane);
+        }
+        // 失败关闭的确认/批次焦点票据已无对应操作，继续保留会让后续关闭错误复用旧焦点。
+        self.pending_close_tab_confirmation_focus = None;
+        self.pending_close_batch_focus = None;
+        self.status = Some(if keep_tab {
+            crate::locale::text(
+                "已保留标签与其中的终端；关闭操作已放弃。",
+                "The tab and its terminals were kept; the close action was abandoned.",
+            )
+        } else {
+            crate::locale::text(
+                "已保留终端；关闭操作已放弃。",
+                "The terminal was kept; the close action was abandoned.",
+            )
+        });
+        self.refresh_workspace_views(cx);
+        self.refresh_workspace_orphan_cleanup(cx);
+        cx.notify();
+        true
     }
 
     /// 只读核对失败 CreatePane 的完整身份；Ready 收尾失败与 deferred close 共用同一判定，

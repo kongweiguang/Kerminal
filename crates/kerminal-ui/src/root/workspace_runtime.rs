@@ -1157,6 +1157,23 @@ impl WorkspaceRuntime {
         Ok(true)
     }
 
+    /// 用户明确选择保留关闭失败的终端后，同一 session 必须恢复可交互状态；
+    /// 只接受仍有 session 的 CloseFailed，避免把已失去资源的 pane 伪装成 Ready。
+    ///
+    /// @author kongweiguang
+    pub fn keep_close_failed_pane(&mut self, pane_id: &PaneId) -> bool {
+        let Some(pane) = self.panes.get_mut(pane_id) else {
+            return false;
+        };
+        if pane.phase != RuntimePanePhase::CloseFailed || pane.session_id.is_none() {
+            return false;
+        }
+        pane.phase = RuntimePanePhase::Ready;
+        // 关闭失败文案会持续提示“重试关闭”；用户已明确保留，清理它以免误导再次误触关闭。
+        pane.status = None;
+        true
+    }
+
     /// Records the exact UI binding only on natural retirement, so close failure cannot invent history access.
     ///
     /// @author kongweiguang

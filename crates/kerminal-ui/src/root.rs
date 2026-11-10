@@ -1820,7 +1820,7 @@ impl RootView {
                         pending_operation,
                         &pane_id,
                     ),
-                    close_operation_retryable: workspace_render::close_operation_retryable(
+                    close_operation_failure: workspace_render::close_operation_failure_scope(
                         failed_operation.as_ref(),
                         &pane_id,
                     ),
@@ -2898,7 +2898,10 @@ impl RootView {
         match event {
             workspace_render::WorkspaceRenderEvent::RetryPane { tab_id, pane_id } => {
                 let Some(pane) = self.workspace_runtime.pane(&pane_id) else {
-                    self.status = Some("此分屏已不存在，不能重试。".into());
+                    self.status = Some(crate::locale::text(
+                        "此分屏已不存在，不能重试。",
+                        "This pane no longer exists and cannot be retried.",
+                    ));
                     cx.notify();
                     return;
                 };
@@ -2907,7 +2910,10 @@ impl RootView {
                 let pane_has_session = pane.session_id.is_some();
                 let runtime_persisted = pane.persisted.clone();
                 if pane_tab_id != tab_id {
-                    self.status = Some("分屏重试目标已变化。".into());
+                    self.status = Some(crate::locale::text(
+                        "分屏重试目标已变化。",
+                        "The pane retry target has changed.",
+                    ));
                     cx.notify();
                     return;
                 }
@@ -3036,9 +3042,18 @@ impl RootView {
                     }
                     self.restore_workspace_pane(tab_id, runtime_persisted, cx);
                 } else {
-                    self.status = Some("此分屏当前没有可重试的恢复操作。".into());
+                    self.status = Some(crate::locale::text(
+                        "此分屏当前没有可重试的恢复操作。",
+                        "This pane has no retryable restore action right now.",
+                    ));
                     cx.notify();
                 }
+            }
+            workspace_render::WorkspaceRenderEvent::KeepPane { tab_id, pane_id } => {
+                self.keep_failed_close_operation(&tab_id, &pane_id, false, cx);
+            }
+            workspace_render::WorkspaceRenderEvent::KeepTab { tab_id, pane_id } => {
+                self.keep_failed_close_operation(&tab_id, &pane_id, true, cx);
             }
             workspace_render::WorkspaceRenderEvent::ReconnectPane {
                 tab_id,
@@ -3062,6 +3077,7 @@ impl RootView {
                     WorkspacePaneEvent::Close(_)
                         | WorkspacePaneEvent::CloseFromKeyboard { .. }
                         | WorkspacePaneEvent::Split { .. }
+                        | WorkspacePaneEvent::ChooseSplitTarget { .. }
                 ) {
                     self.discard_unresourced_failed_split_candidate(cx);
                 }
@@ -3266,7 +3282,10 @@ impl RootView {
                         cx.notify();
                     }
                     None => {
-                        self.status = Some("工作区尚未就绪，无法更改分屏。".into());
+                        self.status = Some(crate::locale::text(
+                            "工作区尚未就绪，无法更改分屏。",
+                            "The workspace is not ready to change splits.",
+                        ));
                         cx.notify();
                     }
                 }
