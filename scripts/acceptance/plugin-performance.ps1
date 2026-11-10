@@ -232,14 +232,14 @@ function Get-PerformanceProcessSample {
 }
 
 function Get-RequiredNumber {
-    # 拒绝缺失、字符串、非有限数及非整数，避免 PowerShell 将空值转换成合法零。
+    # 计数/序号必须是整数；毫秒 p95 与时间戳天然带小数，用 -AllowFractional 显式放行。
     # @author kongweiguang
-    param($Object, [string]$Name, [bool]$AllowNegative = $false)
+    param($Object, [string]$Name, [bool]$AllowNegative = $false, [switch]$AllowFractional)
     if ($null -eq $Object -or $null -eq $Object.PSObject.Properties[$Name]) { throw "Missing numeric field: $Name" }
     $value = $Object.PSObject.Properties[$Name].Value
     if ($null -eq $value -or $value -is [bool] -or $value -is [string] -or $value -isnot [ValueType]) { throw "Invalid numeric field: $Name" }
     try { $number = [double]$value } catch { throw "Invalid numeric field: $Name" }
-    if (![double]::IsFinite($number) -or [math]::Abs($number) -gt 9007199254740991 -or $number -ne [math]::Floor($number) -or (!$AllowNegative -and $number -lt 0)) { throw "Invalid numeric field: $Name" }
+    if (![double]::IsFinite($number) -or [math]::Abs($number) -gt 9007199254740991 -or (!$AllowFractional -and $number -ne [math]::Floor($number)) -or (!$AllowNegative -and $number -lt 0)) { throw "Invalid numeric field: $Name" }
     return $number
 }
 
@@ -327,9 +327,9 @@ function Get-HostListSummary {
     $lateToleranceMs = Get-RequiredNumber $List 'scheduleLateToleranceMs'
     if ($intervalMs -lt 55 -or $lateToleranceMs -gt 100 -or (Get-RequiredNumber $List 'scheduleSlots') -ne 515) { throw 'Host list sampling plan budget is invalid.' }
     $clock = Assert-RawFrameIntegrity $FrameReport
-    $start = Get-RequiredNumber $List 'startedUnixMs'
-    $end = Get-RequiredNumber $List 'finishedUnixMs'
-    $elapsed = Get-RequiredNumber $List 'elapsedMs'
+    $start = Get-RequiredNumber $List 'startedUnixMs' -AllowFractional
+    $end = Get-RequiredNumber $List 'finishedUnixMs' -AllowFractional
+    $elapsed = Get-RequiredNumber $List 'elapsedMs' -AllowFractional
     if ($end -le $start -or [math]::Abs(($end - $start) - $elapsed) -gt 10 -or $start -lt ($clock.originUnixMs + $clock.alignmentMarginMs) -or $end -gt ($clock.endUnixMs - $clock.alignmentMarginMs)) { throw 'Host list interval was not fully captured or its clocks disagree.' }
     $fetches = @($List.fixture.fetches)
     $fetchStart = Get-RequiredNumber $List 'fixtureFetchStart'
@@ -363,7 +363,7 @@ function Get-HostListSummary {
         $expectedPlanned = $i * $intervalNs
         if ($planned -ne $expectedPlanned) { throw 'Host list sampling plan differs from the recorded interval.' }
         $late = $requested - $planned
-        $recordedLate = Get-RequiredNumber $observation 'lateMs'
+        $recordedLate = Get-RequiredNumber $observation 'lateMs' -AllowFractional
         # 单调时钟与调度器允许极小提前；明显早发仍拒绝。记录值与实测差同样受 2ms 上限。
         if ($late -lt -1000000 -or $late -gt ($lateToleranceNs + 1000000) -or [math]::Abs($recordedLate * 1000000 - $late) -gt 2000000) { throw 'Host list sampling request was late, early or misrecorded.' }
         if ($null -ne $previousRequested) {
@@ -403,7 +403,7 @@ function Get-HostListSummary {
     $activationProperty = $List.PSObject.Properties['activation']
     if ($null -eq $activationProperty -or $null -eq $activationProperty.Value) { throw 'Host list activation evidence is missing.' }
     $activation = $activationProperty.Value
-    $activationElapsed = Get-RequiredNumber $activation 'elapsedMs'
+    $activationElapsed = Get-RequiredNumber $activation 'elapsedMs' -AllowFractional
     $activationReserve = Get-RequiredNumber $activation 'reserveMs'
     if ($activationReserve -ne $ActivationReserveMs) { throw 'Host list activation reserve differs from the shared budget.' }
     $themeScopeProperty = $List.PSObject.Properties['themeScope']
@@ -480,16 +480,16 @@ function Assert-HostListComparison {
     }
     # 两组实际请求时刻的相对偏差必须落在各自容差之内，否则不能声称同一目标节奏。
     if ($maxDeviationNs -gt (2 * $zeroTolerance + 2) * 1000000) { throw 'Host list observed pacing deviates beyond the shared plan tolerance.' }
-    $zeroStart = Get-RequiredNumber $Zero 'startOffsetMs'
-    $threeStart = Get-RequiredNumber $Three 'startOffsetMs'
+    $zeroStart = Get-RequiredNumber $Zero 'startOffsetMs' -AllowFractional
+    $threeStart = Get-RequiredNumber $Three 'startOffsetMs' -AllowFractional
     $offsetDelta = [math]::Abs($zeroStart - $threeStart)
-    $zeroElapsed = Get-RequiredNumber $Zero 'elapsedMs'
-    $threeElapsed = Get-RequiredNumber $Three 'elapsedMs'
+    $zeroElapsed = Get-RequiredNumber $Zero 'elapsedMs' -AllowFractional
+    $threeElapsed = Get-RequiredNumber $Three 'elapsedMs' -AllowFractional
     $elapsedDelta = [math]::Abs($zeroElapsed - $threeElapsed)
     # 3 插件激活天然让列表起点后移；先把实际激活耗时与共享预留比较，
     # 超预留时明确报“激活超预算”，而不是让偏移门禁误报“采样窗不可比”。
-    $zeroActivation = Get-RequiredNumber $Zero 'activationElapsedMs'
-    $threeActivation = Get-RequiredNumber $Three 'activationElapsedMs'
+    $zeroActivation = Get-RequiredNumber $Zero 'activationElapsedMs' -AllowFractional
+    $threeActivation = Get-RequiredNumber $Three 'activationElapsedMs' -AllowFractional
     $zeroReserve = Get-RequiredNumber $Zero 'activationReserveMs'
     $threeReserve = Get-RequiredNumber $Three 'activationReserveMs'
     if ($zeroReserve -ne $threeReserve) { throw 'Host list activation reserve differs between 0 and 3 external plugins.' }
@@ -499,13 +499,13 @@ function Assert-HostListComparison {
     $activationDelta = [math]::Abs($threeActivation - $zeroActivation)
     $allowedOffsetDelta = 2000 + $activationDelta
     if ($offsetDelta -gt $allowedOffsetDelta -or $elapsedDelta -gt 2000) { throw 'Host list relative sampling windows differ beyond the activation-adjusted 2000 ms gate between cases.' }
-    if ((Get-RequiredNumber $Zero 'frameOriginUnixMs') -ge (Get-RequiredNumber $Zero 'frameEndUnixMs') -or (Get-RequiredNumber $Three 'frameOriginUnixMs') -ge (Get-RequiredNumber $Three 'frameEndUnixMs')) { throw 'Host list frame window is missing or invalid.' }
+    if ((Get-RequiredNumber $Zero 'frameOriginUnixMs' -AllowFractional) -ge (Get-RequiredNumber $Zero 'frameEndUnixMs' -AllowFractional) -or (Get-RequiredNumber $Three 'frameOriginUnixMs' -AllowFractional) -ge (Get-RequiredNumber $Three 'frameEndUnixMs' -AllowFractional)) { throw 'Host list frame window is missing or invalid.' }
     if ((Get-RequiredNumber $Zero 'frameCount') -le 0 -or (Get-RequiredNumber $Three 'frameCount') -le 0) { throw 'Host list case has no frames inside its observed interval.' }
     # 可比条件满足后才计算同口径 p95；没有用户确认的预算，只给原值、差值和适用时的比值。
-    $zeroLatency = Get-RequiredNumber $Zero 'invalidationToPresentP95Ms'
-    $threeLatency = Get-RequiredNumber $Three 'invalidationToPresentP95Ms'
-    $zeroDraw = Get-RequiredNumber $Zero 'drawP95Ms'
-    $threeDraw = Get-RequiredNumber $Three 'drawP95Ms'
+    $zeroLatency = Get-RequiredNumber $Zero 'invalidationToPresentP95Ms' -AllowFractional
+    $threeLatency = Get-RequiredNumber $Three 'invalidationToPresentP95Ms' -AllowFractional
+    $zeroDraw = Get-RequiredNumber $Zero 'drawP95Ms' -AllowFractional
+    $threeDraw = Get-RequiredNumber $Three 'drawP95Ms' -AllowFractional
     $latencyRatio = if ($zeroLatency -gt 0) { [math]::Round($threeLatency / $zeroLatency, 4) } else { $null }
     $drawRatio = if ($zeroDraw -gt 0) { [math]::Round($threeDraw / $zeroDraw, 4) } else { $null }
     return [ordered]@{
@@ -518,8 +518,8 @@ function Assert-HostListComparison {
         pacingMethodology = 'both cases use the same 515-slot absolute monotonic plan, interval, tolerance and target sequence; per-slot requested offsets are compared and late slots fail closed'
         scheduleIntervalMs = $zeroInterval
         scheduleLateToleranceMs = $zeroTolerance
-        maxScheduleLateMs = @((Get-RequiredNumber $Zero 'maxScheduleLateMs'), (Get-RequiredNumber $Three 'maxScheduleLateMs'))
-        p95ScheduleLateMs = @((Get-RequiredNumber $Zero 'p95ScheduleLateMs'), (Get-RequiredNumber $Three 'p95ScheduleLateMs'))
+        maxScheduleLateMs = @((Get-RequiredNumber $Zero 'maxScheduleLateMs' -AllowFractional), (Get-RequiredNumber $Three 'maxScheduleLateMs' -AllowFractional))
+        p95ScheduleLateMs = @((Get-RequiredNumber $Zero 'p95ScheduleLateMs' -AllowFractional), (Get-RequiredNumber $Three 'p95ScheduleLateMs' -AllowFractional))
         maxRequestOffsetDeviationMs = $maxDeviationNs / 1000000
         activationReserveMs = $zeroReserve
         activationElapsedMs = @($zeroActivation, $threeActivation)
@@ -553,8 +553,8 @@ function Get-PluginProcessEvidence {
     # @author kongweiguang
     param($TreeSamples, $ListSummary, [int]$Expected)
     if ($null -eq $ListSummary) { throw 'Plugin process evidence requires the host list summary.' }
-    $start = Get-RequiredNumber $ListSummary 'startedUnixMs'
-    $end = Get-RequiredNumber $ListSummary 'finishedUnixMs'
+    $start = Get-RequiredNumber $ListSummary 'startedUnixMs' -AllowFractional
+    $end = Get-RequiredNumber $ListSummary 'finishedUnixMs' -AllowFractional
     if ($end -le $start) { throw 'Host list window for plugin process evidence is invalid.' }
     # 只接受采样时刻真正落在列表窗内的进程树快照；窗外样本不能证明同窗负载。
     $inside = @($TreeSamples | Where-Object { $null -ne $_.unixMs -and [double]$_.unixMs -ge $start -and [double]$_.unixMs -le $end })
@@ -639,9 +639,9 @@ function Get-StressFrameSummary {
     # @author kongweiguang
     param($FrameReport, $Data)
     $clock = Assert-RawFrameIntegrity $FrameReport
-    $start = Get-RequiredNumber $Data 'started_unix_ms'
-    $sendEnd = Get-RequiredNumber $Data 'send_finished_unix_ms'
-    $completionEnd = Get-RequiredNumber $Data 'finished_unix_ms'
+    $start = Get-RequiredNumber $Data 'started_unix_ms' -AllowFractional
+    $sendEnd = Get-RequiredNumber $Data 'send_finished_unix_ms' -AllowFractional
+    $completionEnd = Get-RequiredNumber $Data 'finished_unix_ms' -AllowFractional
     $margin = $clock.alignmentMarginMs
     if ($start -le 0 -or $sendEnd -le $start -or $completionEnd -lt $sendEnd) { throw 'Invalid plugin flood window.' }
     if ($start -lt ($clock.originUnixMs + $margin) -or $completionEnd -gt ($clock.endUnixMs - $margin)) { throw 'Complete plugin flood and acknowledgement window was not captured.' }
@@ -692,11 +692,11 @@ function Get-FloodThroughput {
     $inFlight = Get-RequiredNumber $Data 'in_flight'
     $skipped = Get-RequiredNumber $Data 'skipped_due_to_in_flight_limit'
     $seq = Get-RequiredNumber $Data 'seq'
-    $sendElapsed = Get-RequiredNumber $Data 'send_elapsed_ms'
-    $completionElapsed = Get-RequiredNumber $Data 'completion_elapsed_ms'
-    $start = Get-RequiredNumber $Data 'started_unix_ms'
-    $sendEnd = Get-RequiredNumber $Data 'send_finished_unix_ms'
-    $completionEnd = Get-RequiredNumber $Data 'finished_unix_ms'
+    $sendElapsed = Get-RequiredNumber $Data 'send_elapsed_ms' -AllowFractional
+    $completionElapsed = Get-RequiredNumber $Data 'completion_elapsed_ms' -AllowFractional
+    $start = Get-RequiredNumber $Data 'started_unix_ms' -AllowFractional
+    $sendEnd = Get-RequiredNumber $Data 'send_finished_unix_ms' -AllowFractional
+    $completionEnd = Get-RequiredNumber $Data 'finished_unix_ms' -AllowFractional
     if ($start -le 0 -or $attempted -le 0 -or $seq -le 0 -or $sendElapsed -le 0 -or $completionElapsed -lt $sendElapsed -or $completionEnd - $start -ne $completionElapsed -or $sendEnd - $start -ne $sendElapsed -or $acknowledged -ne $attempted -or $inFlight -ne 0 -or $failed -ne 0) { throw 'Plugin flood did not complete with consistent send and acknowledgement timestamps.' }
     # 发送窗和尝试次数必须达到 fixture 声明的持续负载语义；高瞬时速率的短 burst
     # 不能证明 12 秒持续洪泛，也不能与接收确认吞吐混为一谈。
@@ -849,7 +849,7 @@ function Invoke-PerformanceCase {
         if ($Expected -eq 3) {
             $data = $workload.data.renderer.data
             if ($null -eq $result.hostListSummary) { throw 'Host list summary is missing before real plugin flood.' }
-            if ((Get-RequiredNumber $data 'started_unix_ms') -le $result.hostListSummary.finishedUnixMs) { throw 'Real plugin flood overlapped the common host list workload.' }
+            if ((Get-RequiredNumber $data 'started_unix_ms' -AllowFractional) -le $result.hostListSummary.finishedUnixMs) { throw 'Real plugin flood overlapped the common host list workload.' }
             $result.throughput = Get-FloodThroughput $data
             $problems = [Collections.Generic.List[string]]::new()
             try {
