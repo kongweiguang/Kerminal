@@ -220,6 +220,43 @@ pub(super) fn lifecycle_retains_terminal_history(lifecycle: SessionLifecycle) ->
 }
 
 impl RootView {
+    /// 失败关闭被用户保留后，恢复同一 pane 的输入绑定并主动补读一次快照。
+    /// 关闭发起现在保留 watch/input，但其它失败路径仍可能拆掉绑定；只接受 Ready 且
+    /// session 仍精确映射到该 pane 的运行态，避免为已换代的资源重新打开输入。
+    ///
+    /// @author kongweiguang
+    pub(super) fn restore_kept_workspace_pane_input(
+        &mut self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+        cx: &mut Context<RootView>,
+    ) {
+        let Some(session_id) = self.workspace_runtime.pane(pane_id).and_then(|pane| {
+            (pane.phase == RuntimePanePhase::Ready && pane.tab_id == *tab_id)
+                .then(|| pane.session_id.clone())
+                .flatten()
+        }) else {
+            return;
+        };
+        let owner = SessionOwner::Ui {
+            tab_id: tab_id.clone(),
+            pane_id: pane_id.clone(),
+        };
+        let _ = self.ensure_pane_input_handler(session_id.clone(), owner, cx);
+        #[cfg(feature = "acceptance-metrics")]
+        let fresh_probe_pending = Arc::new(AtomicBool::new(false));
+        self.request_terminal_input_context_reconcile(
+            tab_id.clone(),
+            pane_id.clone(),
+            session_id,
+            false,
+            #[cfg(feature = "acceptance-metrics")]
+            fresh_probe_pending,
+            cx,
+        );
+        self.request_workspace_pane_snapshot(tab_id.clone(), pane_id.clone(), cx);
+    }
+
     /// Ready 不重放创建前已发布的 Running lifecycle，因此可见首帧接管后显式查 context；后台恢复 pane 等待焦点路径按需绑定。
     /// lifecycle 仍查询隐藏 pane 以退休历史；只有所属 tab 可见时才安装 Running handler，且每个回执都经过身份与 generation 门禁。
     /// Fresh probe 只在可见 pane 的精确 binding 真正安装后触发；若 Ready 入场或回执时 pane 已隐藏，

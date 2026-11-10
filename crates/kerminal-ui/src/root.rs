@@ -2921,10 +2921,39 @@ impl RootView {
                 // “不是分屏创建”挡回；仍等待回执的 ClosePane 继续走下面的等待提示。
                 if let Some(operation) = self.retry_failed_close_pane_for_target(&tab_id, &pane_id)
                 {
+                    // 重试已派发但回执尚未返回时必须切换为等待态，隐藏 Retry/Keep，
+                    // 否则用户会再次派发同一关闭或误保留仍在 Closing 的终端。
+                    if let Some(controller) = self.workspace_controller.as_mut() {
+                        controller.mark_resource_operation_retrying(operation.operation_id());
+                    }
                     // 占位按钮没有键盘票据，仍须走可变 Window 入口捕获当前幸存焦点；
                     // 无窗口入口会静默丢掉焦点交接。
                     self.handle_workspace_resource_operation_from_window(
                         operation, None, window, cx,
+                    );
+                    return;
+                }
+                let failed_close_tab = self
+                    .workspace_controller
+                    .as_ref()
+                    .and_then(|controller| controller.retry_pending_resource_operation())
+                    .filter(|operation| {
+                        matches!(
+                            operation,
+                            crate::features::workspace_controller::WorkspaceResourceOperation::CloseTab {
+                                tab_id: pending_tab,
+                                pane_ids,
+                                ..
+                            } if pending_tab == &tab_id && pane_ids.contains(&pane_id)
+                        )
+                    });
+                if failed_close_tab.is_some() {
+                    // 标签级失败不能退化成 pane 级等待提示；回到同一标签关闭重试，
+                    // 由既有 CloseTab 意图在成功后继续关闭余下 pane。
+                    self.handle_workspace_tab_event(
+                        &WorkspaceTabEvent::Close(tab_id.clone()),
+                        window,
+                        cx,
                     );
                     return;
                 }
@@ -3016,6 +3045,10 @@ impl RootView {
                         ));
                         cx.notify();
                         return;
+                    }
+                    // 重派发后立即清除失败标记，占位回到等待回执态，避免同一失败候选被重复启动。
+                    if let Some(controller) = self.workspace_controller.as_mut() {
+                        controller.mark_resource_operation_retrying(operation.operation_id());
                     }
                     self.handle_workspace_resource_operation(operation, cx);
                 } else if pane_phase == RuntimePanePhase::RestoreFailed && !pane_has_session {
@@ -3145,6 +3178,10 @@ impl RootView {
                     if let Some(operation) =
                         self.retry_failed_close_pane_for_target(&tab_id, pane_id)
                     {
+                        // 派发重试后立即清失败标记，避免在途回执期间仍显示 Retry/Keep。
+                        if let Some(controller) = self.workspace_controller.as_mut() {
+                            controller.mark_resource_operation_retrying(operation.operation_id());
+                        }
                         // 键盘来源继续透传原票据；鼠标与占位重试都经由带窗口入口
                         // 捕获当前焦点，不能退化成后台资源入口。
                         let window_focus =

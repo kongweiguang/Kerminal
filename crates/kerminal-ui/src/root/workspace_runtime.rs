@@ -407,6 +407,55 @@ impl WorkspaceRuntime {
             && self.orphan_cleanup_for_pane(pane_id).next().is_none()
     }
 
+    /// 关闭失败但 pane 已不在任何已提交布局时，把它残留的 session/target/snapshot 原子移交给
+    /// orphan cleanup owner。先摘除 pane 映射再登记，避免不可见的失败 pending 永久占用资源门禁；
+    /// 只接受 CloseFailed 且 session 仍精确映射到该 pane 的运行态。
+    ///
+    /// @author kongweiguang
+    pub fn move_close_failed_pane_to_orphan_cleanup(
+        &mut self,
+        pane_id: &PaneId,
+        status: SharedString,
+    ) -> Result<SessionId, WorkspaceRuntimeError> {
+        let input = {
+            let pane = self
+                .panes
+                .get(pane_id)
+                .ok_or(WorkspaceRuntimeError::PaneMissing)?;
+            if pane.phase != RuntimePanePhase::CloseFailed {
+                return Err(WorkspaceRuntimeError::PaneNotReady);
+            }
+            let session_id = pane
+                .session_id
+                .clone()
+                .ok_or(WorkspaceRuntimeError::PaneNotReady)?;
+            if self.pane_by_session.get(&session_id) != Some(pane_id)
+                || self.orphan_cleanup.contains_key(&session_id)
+            {
+                return Err(WorkspaceRuntimeError::SessionMismatch);
+            }
+            OrphanCleanupInput {
+                tab_id: pane.tab_id.clone(),
+                pane_id: pane_id.clone(),
+                session_id,
+                target: pane
+                    .target
+                    .clone()
+                    .ok_or(WorkspaceRuntimeError::SessionMismatch)?,
+                size: pane.size,
+                snapshot: pane.snapshot.clone(),
+                status,
+                external_lease: pane.external_lease.clone(),
+                transient: pane.transient,
+            }
+        };
+        let session_id = input.session_id.clone();
+        self.panes.remove(pane_id);
+        self.pane_by_session.remove(&session_id);
+        self.retain_orphan_cleanup(input)?;
+        Ok(session_id)
+    }
+
     /// 在 pane 已被替换或移除时仍保留真实 owner；按值接收 DTO 保留 lease 与状态字段原有所有权。
     ///
     /// @author kongweiguang

@@ -784,6 +784,21 @@ impl WorkspaceController {
             .map(|pending| pending.operation.clone())
     }
 
+    /// 重试已经派发、真实回执尚未返回时清除失败标记，让占位立即回到“等待回执”，
+    /// 避免在途操作仍显示 Retry/Keep 并被用户重复派发或误保留。
+    /// 只匹配精确 operation ID，不影响后来换代的操作。
+    ///
+    /// @author kongweiguang
+    pub fn mark_resource_operation_retrying(&mut self, operation_id: &str) -> bool {
+        let Some(pending) = self.pending_resource.as_mut() else {
+            return false;
+        };
+        if pending.operation.operation_id() != operation_id {
+            return false;
+        }
+        pending.failed.take().is_some()
+    }
+
     /// 用户取消失败操作时丢弃候选，保留原布局和仍运行的 session。
     pub fn discard_pending_resource_operation(&mut self) -> bool {
         let discarded = self.pending_resource.take().is_some();

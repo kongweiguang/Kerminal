@@ -2306,6 +2306,10 @@ impl RootView {
                 if close_workbench_after_batch {
                     self.sftp_workbench_close_after_batch = close_after_batch_targets.clone();
                 }
+                // 批次重试同样立即进入等待回执态，Retry/Keep 不能对在途关闭继续显示。
+                if let Some(controller) = self.workspace_controller.as_mut() {
+                    controller.mark_resource_operation_retrying(operation.operation_id());
+                }
                 self.handle_workspace_resource_operation(operation, cx);
                 return false;
             }
@@ -2341,6 +2345,10 @@ impl RootView {
                     ));
                     cx.notify();
                     return false;
+                }
+                // 标签关闭重试派发后立即清失败标记，等待态不再暴露 Retry/Keep。
+                if let Some(controller) = self.workspace_controller.as_mut() {
+                    controller.mark_resource_operation_retrying(operation.operation_id());
                 }
                 self.handle_workspace_resource_operation_from_window_with_tab_focus(
                     operation,
@@ -2811,13 +2819,18 @@ impl RootView {
 
         let mut cancelled_work = QueueDropSummary::default();
         for request in &sessions_to_close {
-            cancelled_work
-                .merge(self.cancel_workspace_session_input_for_close(&request.session_id, cx));
-            if let Some(watcher) = self.session_watch_cancellations.remove(&request.session_id) {
-                watcher.cancel();
+            // 不可见 orphan 只在清理面板重试，关闭开始即可撤销输入与订阅；
+            // 可见 pane 则把撤销推迟到真实 close 成功，失败或用户保留后终端仍要保持可交互。
+            if matches!(request.resource, WorkspaceCloseResource::Orphan { .. }) {
+                cancelled_work
+                    .merge(self.cancel_workspace_session_input_for_close(&request.session_id, cx));
+                if let Some(watcher) = self.session_watch_cancellations.remove(&request.session_id)
+                {
+                    watcher.cancel();
+                }
+                self.terminal_tools_runtime
+                    .cancel_session(&request.session_id);
             }
-            self.terminal_tools_runtime
-                .cancel_session(&request.session_id);
         }
         self.refresh_workspace_orphan_cleanup(cx);
 
@@ -2931,10 +2944,26 @@ impl RootView {
                     return;
                 }
                 let mut failures: Vec<String> = Vec::new();
+                let mut cancelled_work = cancelled_work_for_task;
+                // 不可见 pane 的关闭失败已经转交 orphan owner，controller pending 随之丢弃；
+                // 后续不能再按同一 operation 提交成功回执，否则会用“回执已过期”覆盖清理提示。
+                let mut invisible_close_handed_to_orphan = false;
                 for (request, result) in close_results {
                     let session_id = request.session_id;
                     match result {
                         Ok(()) => {
+                            // 真实 close 已确认，才撤销仍在运行的 watch、输入与工具来源；
+                            // 失败回执会保留它们，供用户保留终端后继续交互。
+                            cancelled_work.merge(
+                                root.cancel_workspace_session_input_for_close(&session_id, cx),
+                            );
+                            if let Some(watcher) =
+                                root.session_watch_cancellations.remove(&session_id)
+                            {
+                                watcher.cancel();
+                            }
+                            root.terminal_tools_runtime
+                                .cancel_session(&session_id);
                             let removed = match request.resource {
                                 WorkspaceCloseResource::Pane(pane_id) => {
                                     let removed = matches!(
@@ -2983,9 +3012,64 @@ impl RootView {
                                             pane.session_id.as_ref() == Some(&session_id)
                                         });
                                     if pane_retains_session {
+                                        // 先回到可重试失败态，后续不可见移交与普通 Keep/Retry 都以该
+                                        // 真实回执为前提，不能把仍在 Closing 的 pane 直接转交 orphan。
                                         let marked = root
                                             .workspace_runtime
                                             .mark_close_failed(&pane_id, &session_id);
+                                        // 失败分屏转 ClosePane 后，候选不在任何已提交布局；
+                                        // 若仍保留不可见的 Keep/Retry pending，保存、新建终端和退出都会被
+                                        // 永久挡住。把 session 交给可见的 orphan 清理面板，并丢弃精确 pending。
+                                        let pane_in_committed_layout = root
+                                            .workspace_controller
+                                            .as_ref()
+                                            .is_some_and(|controller| {
+                                                controller.snapshot().terminal_tabs.iter().any(|tab| {
+                                                    tab.terminal_layout()
+                                                        .is_some_and(|layout| layout.contains_pane(&pane_id))
+                                                })
+                                            });
+                                        if matches!(marked, Ok(true))
+                                            && !remove_tab_layout_on_success
+                                            && !pane_in_committed_layout
+                                        {
+                                            let orphan_status = crate::locale::text(
+                                                "关闭失败，终端已保留待清理；请在清理面板重试。",
+                                                "Close failed; the terminal was retained for cleanup. Retry it from the cleanup panel.",
+                                            );
+                                            if let Ok(orphan_session) = root
+                                                .workspace_runtime
+                                                .move_close_failed_pane_to_orphan_cleanup(
+                                                    &pane_id,
+                                                    orphan_status.clone(),
+                                                )
+                                            {
+                                                cancelled_work.merge(
+                                                    root.cancel_workspace_session_input_for_close(
+                                                        &orphan_session,
+                                                        cx,
+                                                    ),
+                                                );
+                                                if let Some(watcher) = root
+                                                    .session_watch_cancellations
+                                                    .remove(&orphan_session)
+                                                {
+                                                    watcher.cancel();
+                                                }
+                                                root.terminal_tools_runtime
+                                                    .cancel_session(&orphan_session);
+                                                root.discard_invisible_failed_close_pending(
+                                                    &operation_id_for_task,
+                                                    &pane_id,
+                                                );
+                                                root.mark_container_exec_target_dirty(&pane_id, cx);
+                                                root.status = Some(orphan_status);
+                                                root.refresh_workspace_views(cx);
+                                                root.refresh_workspace_orphan_cleanup(cx);
+                                                invisible_close_handed_to_orphan = true;
+                                                continue;
+                                            }
+                                        }
                                         // CloseFailed 仍保留 session，关闭按钮和标签关闭都会重试同一操作；
                                         // 在 pane 文案里指明入口，避免用户只看到失败原因却找不到重试动作。
                                         let retry_message = SharedString::from(format!(
@@ -3059,6 +3143,12 @@ impl RootView {
                         }
                     }
                 }
+                if invisible_close_handed_to_orphan {
+                    // 该 ClosePane 的唯一 pending 已在移交时丢弃，不能再用原 operation 提交回执。
+                    root.refresh_workspace_orphan_cleanup(cx);
+                    cx.notify();
+                    return;
+                }
                 if !failures.is_empty() {
                     let operation_result = root
                         .workspace_controller
@@ -3073,12 +3163,12 @@ impl RootView {
                         failures.push(error.public_message().to_owned());
                     }
                     let mut message = failures.join(" · ");
-                    if cancelled_work_for_task.commands > 0 {
+                    if cancelled_work.commands > 0 {
                         message.push_str(&format!(
                             "；关闭期间取消了 {} 项未发送工作（输入 {} 条，{} 字节）。",
-                            cancelled_work_for_task.commands,
-                            cancelled_work_for_task.input_events,
-                            cancelled_work_for_task.input_bytes,
+                            cancelled_work.commands,
+                            cancelled_work.input_events,
+                            cancelled_work.input_bytes,
                         ));
                     }
                     if let Some(remaining) = root
@@ -3150,12 +3240,12 @@ impl RootView {
                         if remove_tab_layout_on_success {
                             root.note_close_batch_tab_success(&tab_id);
                         }
-                        root.status = (cancelled_work_for_task.commands > 0).then(|| {
+                        root.status = (cancelled_work.commands > 0).then(|| {
                             SharedString::from(format!(
                                 "终端已关闭；取消了 {} 项未发送工作（输入 {} 条，{} 字节）。",
-                                cancelled_work_for_task.commands,
-                                cancelled_work_for_task.input_events,
-                                cancelled_work_for_task.input_bytes,
+                                cancelled_work.commands,
+                                cancelled_work.input_events,
+                                cancelled_work.input_bytes,
                             ))
                         });
                         root.refresh_workspace_views(cx);
@@ -3627,6 +3717,32 @@ impl RootView {
             .retain_tab_close_after_failed_pane(operation_id, tab_id, close_tab_focus)
     }
 
+    /// 不可见 pane 的关闭失败已交给 orphan 清理面板后，精确丢弃 controller pending、
+    /// 对应 entry 及关闭焦点票据；资源门禁必须一起释放，不能留下用户看不见的永久 Closing。
+    ///
+    /// @author kongweiguang
+    fn discard_invisible_failed_close_pending(&mut self, operation_id: &str, pane_id: &PaneId) {
+        let discarded = self
+            .workspace_controller
+            .as_mut()
+            .is_some_and(|controller| {
+                controller.discard_pending_resource_operation_if(operation_id);
+                controller.pending_resource_operation().is_none()
+            });
+        if self
+            .workspace_resource_operations
+            .get(pane_id)
+            .is_some_and(|entry| entry.operation_id() == operation_id)
+        {
+            self.workspace_resource_operations.remove(pane_id);
+        }
+        if discarded {
+            // 精确 close 的焦点票据已经随 entry 失效；继续保留只会被后来的关闭错误复用。
+            self.pending_close_tab_confirmation_focus = None;
+            self.pending_close_batch_focus = None;
+        }
+    }
+
     /// 已收到失败回执的关闭允许用户明确保留终端/标签：只丢弃 controller pending、匹配 entry
     /// 与焦点票据，不关闭真实 session。随后保存、新建终端和退出准备恢复可用，用户仍可再次普通关闭。
     ///
@@ -3641,7 +3757,8 @@ impl RootView {
         let Some(operation) = self
             .workspace_controller
             .as_ref()
-            .and_then(|controller| controller.retry_pending_resource_operation())
+            .and_then(|controller| controller.pending_resource_operation())
+            .cloned()
         else {
             return false;
         };
@@ -3669,6 +3786,37 @@ impl RootView {
             }
             _ => return false,
         };
+        let failed_receipt_arrived = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.retry_pending_resource_operation())
+            .is_some_and(|failed| failed.operation_id() == operation_id);
+        if !failed_receipt_arrived {
+            self.status = Some(crate::locale::text(
+                "关闭仍在等待资源回执，暂不能保留；请等待关闭结果。",
+                "Close is still waiting for its resource receipt and cannot be kept yet; wait for the close result.",
+            ));
+            cx.notify();
+            return false;
+        }
+        // 保留必须建立在真实失败回执之上；任一目标仍在 Closing 或仍是活动 session 时拒绝，
+        // 避免丢弃在途回执后把 pane 永久留在 Closing。
+        let all_targets_keepable = retained_panes.iter().all(|retained_pane| {
+            self.workspace_runtime
+                .pane(retained_pane)
+                .is_none_or(|pane| {
+                    pane.phase == RuntimePanePhase::CloseFailed
+                        || (pane.session_id.is_none() && pane.phase != RuntimePanePhase::Closing)
+                })
+        });
+        if !all_targets_keepable {
+            self.status = Some(crate::locale::text(
+                "关闭仍在进行，暂不能保留终端；请等待资源回执。",
+                "Close is still in progress and the terminal cannot be kept yet; wait for the resource receipt.",
+            ));
+            cx.notify();
+            return false;
+        }
         let discarded = self
             .workspace_controller
             .as_mut()
@@ -3687,8 +3835,14 @@ impl RootView {
             {
                 self.workspace_resource_operations.remove(&retained_pane);
             }
-            self.workspace_runtime
-                .keep_close_failed_pane(&retained_pane);
+            if self
+                .workspace_runtime
+                .keep_close_failed_pane(&retained_pane)
+            {
+                // 关闭发起时刻意保留 watch/input，但其它路径仍可能已拆掉绑定；
+                // Keep 后统一补建输入绑定并补读一次快照，避免终端显示存活却无法输入或刷新。
+                self.restore_kept_workspace_pane_input(tab_id, &retained_pane, cx);
+            }
         }
         // 失败关闭的确认/批次焦点票据已无对应操作，继续保留会让后续关闭错误复用旧焦点。
         self.pending_close_tab_confirmation_focus = None;

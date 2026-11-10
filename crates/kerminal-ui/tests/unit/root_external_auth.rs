@@ -325,6 +325,8 @@ struct CapturingSessions {
     closed: Mutex<Vec<SessionId>>,
     /// 关闭重试回归需要先记录必然失败，再切换为成功验证 pending/entry 收敛。
     close_succeeds: AtomicBool,
+    /// 重试在途回归用一对 Notify 冻结 close_until，验证等待态不会继续暴露 Retry/Keep。
+    close_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 #[async_trait]
@@ -522,8 +524,14 @@ impl SessionService for CapturingSessions {
         }
     }
     /// 记录按时限关闭尝试；真实关闭失败由调用方降级为可重试清理。
+    /// 可选门闩让重试在途态可观察，回执成功与否仍由同一 close_succeeds 决定。
     async fn close_until(&self, session_id: SessionId, _: SessionDeadline) -> AppResult<()> {
         self.closed.lock().unwrap().push(session_id);
+        let gate = self.close_gate.lock().unwrap().clone();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         if self.close_succeeds.load(Ordering::Relaxed) {
             Ok(())
         } else {
