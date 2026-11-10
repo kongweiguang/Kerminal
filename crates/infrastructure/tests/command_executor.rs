@@ -19,11 +19,10 @@ use kerminal_application::{
     AppError, AppResult,
     connections::{
         CommandEvent, CommandInputHandle, CommandStreamHandle, ConnectionIntent, ExecRequest,
-        HostKeyChallenge, HostKeyPeer, HostKeyTrustReceipt, HostKeyTrustRequest, OpenSftpRequest,
-        RemoteCommandInput, RemoteCommandStream, RemoteConnectionHandle, RemoteConnectionLease,
-        RemoteConnectionService, RemoteForwardHandle, RemoteForwardRequest, RemoteShellDialect,
-        SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest, TunnelChannelHandle,
-        TunnelRequest,
+        OpenSftpRequest, RemoteCommandInput, RemoteCommandStream, RemoteConnectionHandle,
+        RemoteConnectionLease, RemoteConnectionService, RemoteForwardHandle, RemoteForwardRequest,
+        RemoteShellDialect, SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest,
+        TunnelChannelHandle, TunnelRequest,
     },
     operations::{
         CommandExecutionLimits, CommandExecutionTarget, CommandInvocation, CommandStreamEvent,
@@ -99,39 +98,6 @@ impl RemoteConnectionService for UnusedRemoteConnections {
         _cancel: CancellationToken,
     ) -> AppResult<RemoteConnectionLease> {
         Err(AppError::unsupported("测试未配置远端连接"))
-    }
-
-    /// 非本组测试关注的指纹查询保持明确不支持，避免伪造安全回执。
-    async fn inspect_host_key(
-        &self,
-        _host_id: HostId,
-        _peer: HostKeyPeer,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        Err(AppError::unsupported("测试未配置主机指纹查询"))
-    }
-
-    /// 非本组测试不持久化信任状态，调用表示测试越界。
-    async fn trust_host_key(
-        &self,
-        _request: HostKeyTrustRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        Err(AppError::unsupported("测试未配置主机信任"))
-    }
-
-    /// 此测试替身未覆盖主机密钥轮换，显式拒绝可避免伪造信任回执。
-    ///
-    /// @author kongweiguang
-    async fn replace_host_key(
-        &self,
-        _request: kerminal_application::connections::HostKeyRotationRequest,
-        _cancel: tokio_util::sync::CancellationToken,
-    ) -> kerminal_application::AppResult<kerminal_application::connections::HostKeyRotationReceipt>
-    {
-        Err(kerminal_application::AppError::unsupported(
-            "test fake does not support host-key rotation",
-        ))
     }
 }
 
@@ -1339,39 +1305,6 @@ impl RemoteConnectionService for FakeRemoteConnections {
             return Err(AppError::invalid("测试连接目标或用途不匹配"));
         }
         Ok(RemoteConnectionLease::new(self.handle.clone()))
-    }
-
-    /// 当前场景不查询 host key。
-    async fn inspect_host_key(
-        &self,
-        _host_id: HostId,
-        _peer: HostKeyPeer,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        Err(AppError::unsupported("测试未配置主机指纹查询"))
-    }
-
-    /// 当前场景不修改 known_hosts。
-    async fn trust_host_key(
-        &self,
-        _request: HostKeyTrustRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        Err(AppError::unsupported("测试未配置主机信任"))
-    }
-
-    /// 此测试替身未覆盖主机密钥轮换，显式拒绝可避免伪造信任回执。
-    ///
-    /// @author kongweiguang
-    async fn replace_host_key(
-        &self,
-        _request: kerminal_application::connections::HostKeyRotationRequest,
-        _cancel: tokio_util::sync::CancellationToken,
-    ) -> kerminal_application::AppResult<kerminal_application::connections::HostKeyRotationReceipt>
-    {
-        Err(kerminal_application::AppError::unsupported(
-            "test fake does not support host-key rotation",
-        ))
     }
 }
 

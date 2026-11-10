@@ -688,11 +688,6 @@ fn public_error_message(error: &AppError) -> String {
             "The save result is unknown. Reload the file before continuing; the save will not be retried automatically."
         }
         PublicErrorCode::AuthenticationFailed => "File access authentication failed.",
-        PublicErrorCode::HostKeyUnknown => "The host key has not been trusted yet.",
-        PublicErrorCode::HostKeyChanged => "The host key changed. The connection was blocked.",
-        PublicErrorCode::HostKeyTrustMismatch => {
-            "The host key confirmation did not match. Trust was not saved."
-        }
         PublicErrorCode::Timeout => "The file operation timed out.",
         PublicErrorCode::RemoteExit => "The remote file operation exited unexpectedly.",
         PublicErrorCode::ConfigurationCorrupt => {

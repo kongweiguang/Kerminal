@@ -65,8 +65,8 @@ impl KnownHostsRepository for KnownHostsStore {
 
     /// 幂等 upsert 观察到的公钥：已知直接成功，未知追加，变化时原子替换该端点的旧记录。
     ///
-    /// 连接层已默认信任主机密钥，known_hosts 只承担后台记录职责，因此这里不再返回
-    /// `host_key_changed`；调用方把写入失败降级为 warning，不会阻断握手或认证。
+    /// 连接层已默认信任主机密钥，known_hosts 只承担后台记录职责；调用方把读取或写入
+    /// 失败降级为 warning，不会阻断握手或认证。
     /// 已知判定必须先于 writable 判断：只读数据根中已保存的主机仍应允许连接，
     /// 否则恢复态或受限运行环境会因无法写入而误拒已受信主机。
     async fn trust(&self, endpoint: &HostEndpoint, identity: &HostKeyIdentity) -> AppResult<()> {
@@ -79,7 +79,7 @@ impl KnownHostsRepository for KnownHostsStore {
             let path = storage.root().join(KNOWN_HOSTS_FILE);
             let existing = read_known_hosts(&path)?;
             match classify_key(&endpoint, &identity, &path, &existing)? {
-                HostKeyStatus::Known => return Ok(()),
+                HostKeyStatus::Known => Ok(()),
                 HostKeyStatus::Changed {
                     previous_fingerprint_sha256,
                 } => {
@@ -104,12 +104,8 @@ impl KnownHostsRepository for KnownHostsStore {
                         &existing,
                     ) {
                         Ok(updated) => updated,
-                        Err(AppError::HostKeyChanged) => {
-                            tracing::warn!(
-                                "SSH known_hosts 中候选主机密钥被标记为 @revoked；自动信任保持原记录"
-                            );
-                            return Ok(());
-                        }
+                        // 撤销记录或并发编辑只让本次后台替换失败；调用方记录 warning，
+                        // 连接仍然完成，原 known_hosts 内容保持不变。
                         Err(error) => return Err(error),
                     };
                     if updated == existing {
@@ -127,12 +123,7 @@ impl KnownHostsRepository for KnownHostsStore {
                         let _ = fs::remove_file(&staging_path);
                         return Err(error);
                     }
-                    commit_staged_known_hosts_replacement(
-                        &path,
-                        &staging_path,
-                        &existing,
-                        &updated,
-                    )
+                    commit_staged_known_hosts_replacement(&path, &staging_path, &existing, &updated)
                 }
                 HostKeyStatus::Unknown => {
                     if !writable {
@@ -165,56 +156,6 @@ impl KnownHostsRepository for KnownHostsStore {
             AppError::infrastructure_with_source("SSH known_hosts 写入任务失败", error)
         })?
     }
-
-    /// 在同一存储锁内核对旧指纹与撤销记录，再以原子替换发布新 key。
-    async fn replace(
-        &self,
-        endpoint: &HostEndpoint,
-        expected_previous_fingerprint_sha256: &str,
-        identity: &HostKeyIdentity,
-    ) -> AppResult<()> {
-        if !self.writable {
-            return Err(AppError::unsupported(
-                "SSH host key rotation storage is read-only",
-            ));
-        }
-        let endpoint = endpoint.clone();
-        let previous_fingerprint = expected_previous_fingerprint_sha256.to_owned();
-        let identity = identity.clone();
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || {
-            let _storage_lock = storage.lock().map_err(storage_lock_error)?;
-            let path = storage.root().join(KNOWN_HOSTS_FILE);
-            let existing = read_known_hosts(&path)?;
-            let updated = replace_known_host_contents(
-                &endpoint,
-                &previous_fingerprint,
-                &identity,
-                &path,
-                &existing,
-            )?;
-            if updated == existing {
-                return Ok(());
-            }
-
-            let staging_path = write_staging_file(&path, &updated)?;
-            let stage_validation = validate_replaced_host_key(
-                &endpoint,
-                &previous_fingerprint,
-                &identity,
-                &staging_path,
-            );
-            if let Err(error) = stage_validation {
-                let _ = fs::remove_file(&staging_path);
-                return Err(error);
-            }
-            commit_staged_known_hosts_replacement(&path, &staging_path, &existing, &updated)
-        })
-        .await
-        .map_err(|error| {
-            AppError::infrastructure_with_source("SSH known_hosts 轮换任务失败", error)
-        })?
-    }
 }
 
 /// 校验 OpenSSH 公钥文本与独立算法/指纹字段一致，避免上层拼造信任记录。
@@ -224,7 +165,7 @@ fn parse_identity(identity: &HostKeyIdentity) -> AppResult<PublicKey> {
     if key.algorithm().to_string() != identity.algorithm
         || key.fingerprint(HashAlg::Sha256).to_string() != identity.fingerprint_sha256
     {
-        return Err(AppError::host_key_trust_mismatch());
+        return Err(AppError::invalid("SSH 主机公钥字段与指纹不一致"));
     }
     Ok(key)
 }
@@ -326,7 +267,7 @@ fn append_known_host(
     Ok(output)
 }
 
-/// 只替换当前 endpoint 上与用户确认的旧指纹完全一致的行，并保留同文件中的其它主机记录。
+/// 只替换当前 endpoint 上与分类得到的旧指纹完全一致的行，并保留同文件中的其它主机记录。
 fn replace_known_host_contents(
     endpoint: &HostEndpoint,
     expected_previous_fingerprint_sha256: &str,
@@ -346,7 +287,9 @@ fn replace_known_host_contents(
         AppError::infrastructure_with_source("SSH known_hosts encoding is invalid", error)
     })?;
     if revoked_key_exists(text, &new_key) {
-        return Err(AppError::host_key_changed());
+        return Err(AppError::conflict(
+            "SSH candidate host key is revoked; automatic trust keeps the existing record",
+        ));
     }
     let records = known_hosts::known_host_keys_path(&endpoint.host, endpoint.port, path).map_err(
         |error| AppError::infrastructure_with_source("SSH known_hosts parsing failed", error),

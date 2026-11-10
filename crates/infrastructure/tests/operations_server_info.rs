@@ -10,10 +10,7 @@ use std::{
 use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult,
-    connections::{
-        ConnectionIntent, HostKeyChallenge, HostKeyPeer, HostKeyTrustReceipt, HostKeyTrustRequest,
-        RemoteConnectionLease, RemoteConnectionService,
-    },
+    connections::{ConnectionIntent, RemoteConnectionLease, RemoteConnectionService},
     operations::{
         CommandExecutionLimits, CommandExecutionResult, CommandExecutionTarget, CommandInvocation,
         ContainerStageCleanupCapability, ContainerStageCleanupRequest, OperationsCommandExecutor,
@@ -166,39 +163,6 @@ impl RemoteConnectionService for NoRemoteConnections {
         _cancel: CancellationToken,
     ) -> AppResult<RemoteConnectionLease> {
         Err(AppError::unsupported("test SSH connection is disabled"))
-    }
-
-    /// 测试不接受 host key 挑战，避免 fixture 写入用户 trust store。
-    async fn inspect_host_key(
-        &self,
-        _host_id: HostId,
-        _peer: HostKeyPeer,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        Err(AppError::unsupported("test SSH connection is disabled"))
-    }
-
-    /// 测试不修改 known_hosts。
-    async fn trust_host_key(
-        &self,
-        _request: HostKeyTrustRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        Err(AppError::unsupported("test SSH connection is disabled"))
-    }
-
-    /// 此测试替身未覆盖主机密钥轮换，显式拒绝可避免伪造信任回执。
-    ///
-    /// @author kongweiguang
-    async fn replace_host_key(
-        &self,
-        _request: kerminal_application::connections::HostKeyRotationRequest,
-        _cancel: tokio_util::sync::CancellationToken,
-    ) -> kerminal_application::AppResult<kerminal_application::connections::HostKeyRotationReceipt>
-    {
-        Err(kerminal_application::AppError::unsupported(
-            "test fake does not support host-key rotation",
-        ))
     }
 }
 

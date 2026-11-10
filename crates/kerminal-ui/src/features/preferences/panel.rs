@@ -254,11 +254,6 @@ pub(super) fn localized_error(error: &AppError) -> String {
             "The result is unknown. Read the affected state back before retrying."
         }
         PublicErrorCode::AuthenticationFailed => "Authentication failed.",
-        PublicErrorCode::HostKeyUnknown => "The host key has not been trusted.",
-        PublicErrorCode::HostKeyChanged => "The host key changed. The connection was blocked.",
-        PublicErrorCode::HostKeyTrustMismatch => {
-            "Host key verification did not match. Trust was not saved."
-        }
         PublicErrorCode::Timeout => "The operation timed out.",
         PublicErrorCode::RemoteExit => "The remote command exited.",
         PublicErrorCode::ConfigurationCorrupt => {

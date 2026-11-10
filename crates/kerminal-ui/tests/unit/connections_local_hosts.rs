@@ -17,15 +17,10 @@ use gpui_kit::{
 };
 use kerminal_application::{
     AppError, AppResult, ApplicationTaskExecutor, ProfileService,
-    connections::{
-        ConnectionIntent, HostKeyChallenge, HostKeyPeer, HostKeyRotationReceipt,
-        HostKeyRotationRequest, HostKeyTrustReceipt, HostKeyTrustRequest, RemoteConnectionLease,
-        RemoteConnectionService,
-        management::{
-            HostDocumentRevision, HostDraft, HostGroupDeletionReceipt, HostGroupDraft,
-            HostGroupSnapshot, HostManagementRepository, HostManagementService,
-            LocalHostSaveRecoveryToken, ManagedHost, ManagedLocalHost,
-        },
+    connections::management::{
+        HostDocumentRevision, HostDraft, HostGroupDeletionReceipt, HostGroupDraft,
+        HostGroupSnapshot, HostManagementRepository, HostManagementService,
+        LocalHostSaveRecoveryToken, ManagedHost, ManagedLocalHost,
     },
     local_shells::LocalShellCandidate,
     preferences::{
@@ -888,46 +883,6 @@ impl DefaultLocalShellProvider for NoLocalShell {
     }
 }
 
-struct NoRemoteService;
-
-#[async_trait]
-impl RemoteConnectionService for NoRemoteService {
-    /// 本地主机删除回归不建立网络连接。
-    async fn connect(
-        &self,
-        _: HostId,
-        _: ConnectionIntent,
-        _: CancellationToken,
-    ) -> AppResult<RemoteConnectionLease> {
-        Err(AppError::unsupported("test"))
-    }
-    /// 不探测远端密钥。
-    async fn inspect_host_key(
-        &self,
-        _: HostId,
-        _: HostKeyPeer,
-        _: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        Err(AppError::unsupported("test"))
-    }
-    /// 不写入远端密钥信任。
-    async fn trust_host_key(
-        &self,
-        _: HostKeyTrustRequest,
-        _: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        Err(AppError::unsupported("test"))
-    }
-    /// 不轮换远端密钥。
-    async fn replace_host_key(
-        &self,
-        _: HostKeyRotationRequest,
-        _: CancellationToken,
-    ) -> AppResult<HostKeyRotationReceipt> {
-        Err(AppError::unsupported("test"))
-    }
-}
-
 /// 隔离仓储使用固定本地主机，不涉及用户配置、环境秘密或 OS 进程。
 fn delayed_local_host_repository() -> Arc<DelayedLocalHosts> {
     Arc::new(DelayedLocalHosts {
@@ -972,7 +927,6 @@ fn local_delete_fixture(
         let panel = cx.new(|cx| {
             ConnectionsPanel::new(
                 hosts,
-                Arc::new(NoRemoteService),
                 None,
                 executor,
                 ConfigurationRecoveryState {

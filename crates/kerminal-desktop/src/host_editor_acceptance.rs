@@ -405,10 +405,6 @@ fn run_window(
         .hosts
         .clone()
         .ok_or_else(|| io::Error::other("桌面服务未提供主机管理用例"))?;
-    let remote = services
-        .remote_connections
-        .clone()
-        .ok_or_else(|| io::Error::other("桌面服务未提供远程连接用例"))?;
     let rdp = services.rdp_launcher.clone();
     let executor = services.executor.clone();
     let profiles = services.profiles.clone();
@@ -445,7 +441,6 @@ fn run_window(
                 let state = cx.new(|cx| {
                     HostEditorAcceptanceState::new(
                         hosts,
-                        remote,
                         rdp,
                         executor,
                         profiles,

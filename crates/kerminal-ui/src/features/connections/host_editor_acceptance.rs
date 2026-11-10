@@ -8,7 +8,7 @@ use gpui_kit::{Context, Entity, Focusable as _, Render, Window, div, prelude::*}
 use kerminal_application::{
     ProfileService,
     connections::{
-        RdpLaunchService, RemoteConnectionService, SerialPortService,
+        RdpLaunchService, SerialPortService,
         management::{HostAuthenticationMode, HostManagementService},
         probe::ConnectionProbeService,
     },
@@ -49,7 +49,6 @@ impl HostEditorAcceptanceState {
     /// @author kongweiguang
     pub fn new(
         hosts: HostManagementService,
-        remote: Arc<dyn RemoteConnectionService>,
         rdp: Option<Arc<RdpLaunchService>>,
         executor: ApplicationTaskExecutor,
         profiles: ProfileService,
@@ -63,7 +62,7 @@ impl HostEditorAcceptanceState {
             issues: Vec::new(),
         };
         let panel = cx.new(|cx| {
-            ConnectionsPanel::new(hosts, remote, rdp, executor, recovery, window, cx)
+            ConnectionsPanel::new(hosts, rdp, executor, recovery, window, cx)
                 .with_profiles(profiles, cx)
                 .with_serial_port_service(serial_ports)
                 .with_connection_probe_service(probe)

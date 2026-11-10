@@ -20,12 +20,11 @@ use kerminal_application::{
     AppError, AppResult,
     connections::{
         AsyncDuplex, CommandEvent, CommandStreamHandle, ConnectionIntent, CredentialResolver,
-        HostConnectionRepository, HostKeyChallenge, HostKeyIdentity, HostKeyPeer,
-        HostKeyRotationReceipt, HostKeyRotationRequest, HostKeyStatus, HostKeyTrustReceipt,
-        HostKeyTrustRequest, KnownHostsRepository, OpenSftpRequest, RemoteConnectionHandle,
-        RemoteConnectionLease, RemoteConnectionService, RemoteForwardHandle, RemoteForwardListener,
-        RemoteShellDialect, RemoteShellKind, ResolvedCredential, SftpChannelHandle,
-        ShellScriptRequest, TerminalOpenRequest, TunnelChannelHandle, TunnelRequest,
+        HostConnectionRepository, HostKeyIdentity, HostKeyStatus, KnownHostsRepository,
+        OpenSftpRequest, RemoteConnectionHandle, RemoteConnectionLease, RemoteConnectionService,
+        RemoteForwardHandle, RemoteForwardListener, RemoteShellDialect, RemoteShellKind,
+        ResolvedCredential, SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest,
+        TunnelChannelHandle, TunnelRequest,
     },
     sessions::SessionTransport,
 };
@@ -157,7 +156,6 @@ impl RemoteConnectionService for RusshRemoteConnectionService {
         let sessions = connect_route(
             &profile,
             &self.dependencies,
-            None,
             Arc::clone(&forward_router),
             Arc::clone(&self.pending_cleanup),
             Arc::clone(&reservation),
@@ -222,228 +220,6 @@ impl RemoteConnectionService for RusshRemoteConnectionService {
             lifetime_owner,
         });
         Ok(RemoteConnectionLease::new(peer))
-    }
-
-    /// 仅完成 SSH key exchange，以供用户在认证前查看未知或变化的指纹。
-    async fn inspect_host_key(
-        &self,
-        host_id: HostId,
-        peer: HostKeyPeer,
-        cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        let _intake = self.enter().await?;
-        let profile = self.dependencies.hosts.load(&host_id).await?;
-        require_ssh_protocol(&profile)?;
-        validate_profile(&profile)?;
-        let index = peer_index(&profile, &peer)?;
-        let reservation = self.pending_cleanup.reserve()?;
-        let sessions = connect_route(
-            &profile,
-            &self.dependencies,
-            Some(index),
-            Arc::new(ForwardRouter::default()),
-            Arc::clone(&self.pending_cleanup),
-            Arc::clone(&reservation),
-            &cancel,
-        )
-        .await?;
-        let mut sessions_guard = SessionSetGuard::with_sessions(
-            Arc::clone(&self.pending_cleanup),
-            Arc::clone(&reservation),
-            sessions.clone(),
-        );
-        let challenge = sessions
-            .last()
-            .and_then(|session| session.observed.clone())
-            .ok_or_else(|| {
-                AppError::infrastructure("SSH host key inspection returned no peer key")
-            });
-        disconnect_sessions(
-            &sessions,
-            &self.pending_cleanup,
-            &reservation,
-            "Kerminal host-key check completed",
-        )
-        .await?;
-        sessions_guard.disarm();
-        let challenge = challenge?;
-        Ok(challenge)
-    }
-
-    /// 用户确认后重新握手，并逐项核对主机、跳板序号和 SHA256 指纹，再写入 known_hosts。
-    async fn trust_host_key(
-        &self,
-        request: HostKeyTrustRequest,
-        cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        let _intake = self.enter().await?;
-        let profile = self.dependencies.hosts.load(&request.host_id).await?;
-        require_ssh_protocol(&profile)?;
-        validate_profile(&profile)?;
-        let endpoint = endpoint_for_peer(&profile, &request.peer)?;
-        if endpoint != request.endpoint {
-            return Err(AppError::conflict(
-                "SSH host key trust target changed; inspect the current endpoint again",
-            ));
-        }
-        let index = peer_index(&profile, &request.peer)?;
-        let reservation = self.pending_cleanup.reserve()?;
-        let sessions = connect_route(
-            &profile,
-            &self.dependencies,
-            Some(index),
-            Arc::new(ForwardRouter::default()),
-            Arc::clone(&self.pending_cleanup),
-            Arc::clone(&reservation),
-            &cancel,
-        )
-        .await?;
-        let mut sessions_guard = SessionSetGuard::with_sessions(
-            Arc::clone(&self.pending_cleanup),
-            Arc::clone(&reservation),
-            sessions.clone(),
-        );
-        let observed = sessions.last().and_then(|session| session.observed.clone());
-        disconnect_sessions(
-            &sessions,
-            &self.pending_cleanup,
-            &reservation,
-            "Kerminal host-key trust check completed",
-        )
-        .await?;
-        sessions_guard.disarm();
-        let observed = observed
-            .ok_or_else(|| AppError::infrastructure("SSH trust check returned no peer key"))?;
-        if observed.host_id != request.host_id
-            || observed.peer != request.peer
-            || observed.endpoint != request.endpoint
-            || observed.fingerprint_sha256 != request.expected_fingerprint_sha256
-        {
-            return Err(AppError::host_key_trust_mismatch());
-        }
-        let latest_profile = self.dependencies.hosts.load(&request.host_id).await?;
-        let latest_endpoint = endpoint_for_peer(&latest_profile, &request.peer)?;
-        if latest_profile != profile || latest_endpoint != request.endpoint {
-            return Err(AppError::conflict(
-                "SSH host configuration changed during key trust; inspect the current endpoint again",
-            ));
-        }
-        if cancel.is_cancelled() {
-            return Err(AppError::cancelled("SSH host key trust was cancelled"));
-        }
-        self.dependencies
-            .known_hosts
-            .trust(&request.endpoint, &observed.identity)
-            .await?;
-        Ok(HostKeyTrustReceipt {
-            host_id: request.host_id,
-            peer: request.peer,
-            endpoint: request.endpoint,
-            fingerprint_sha256: observed.fingerprint_sha256,
-        })
-    }
-
-    /// 只有旧 key 仍匹配用户所见指纹且新握手精确匹配 HostId/peer/host:port 后才原子轮换。
-    async fn replace_host_key(
-        &self,
-        request: HostKeyRotationRequest,
-        cancel: CancellationToken,
-    ) -> AppResult<HostKeyRotationReceipt> {
-        if request.expected_previous_fingerprint_sha256.is_empty()
-            || request.expected_fingerprint_sha256.is_empty()
-            || request.expected_previous_fingerprint_sha256 == request.expected_fingerprint_sha256
-        {
-            return Err(AppError::invalid(
-                "SSH host key rotation confirmation is invalid",
-            ));
-        }
-        if cancel.is_cancelled() {
-            return Err(AppError::cancelled("SSH host key rotation was cancelled"));
-        }
-        let _intake = self.enter().await?;
-        let profile = self.dependencies.hosts.load(&request.host_id).await?;
-        require_ssh_protocol(&profile)?;
-        validate_profile(&profile)?;
-        let endpoint = endpoint_for_peer(&profile, &request.peer)?;
-        if endpoint != request.endpoint {
-            return Err(AppError::conflict(
-                "SSH host key rotation target changed; inspect the current endpoint again",
-            ));
-        }
-        let index = peer_index(&profile, &request.peer)?;
-        let reservation = self.pending_cleanup.reserve()?;
-        let sessions = connect_route(
-            &profile,
-            &self.dependencies,
-            Some(index),
-            Arc::new(ForwardRouter::default()),
-            Arc::clone(&self.pending_cleanup),
-            Arc::clone(&reservation),
-            &cancel,
-        )
-        .await?;
-        let mut sessions_guard = SessionSetGuard::with_sessions(
-            Arc::clone(&self.pending_cleanup),
-            Arc::clone(&reservation),
-            sessions.clone(),
-        );
-        let observed = sessions.last().and_then(|session| session.observed.clone());
-        disconnect_sessions(
-            &sessions,
-            &self.pending_cleanup,
-            &reservation,
-            "Kerminal host-key rotation check completed",
-        )
-        .await?;
-        sessions_guard.disarm();
-        let observed = observed
-            .ok_or_else(|| AppError::infrastructure("SSH rotation check returned no peer key"))?;
-        if cancel.is_cancelled() {
-            return Err(AppError::cancelled("SSH host key rotation was cancelled"));
-        }
-        if observed.host_id != request.host_id
-            || observed.peer != request.peer
-            || observed.endpoint != request.endpoint
-            || observed.fingerprint_sha256 != request.expected_fingerprint_sha256
-        {
-            return Err(AppError::host_key_trust_mismatch());
-        }
-        match &observed.status {
-            HostKeyStatus::Changed {
-                previous_fingerprint_sha256,
-            } if previous_fingerprint_sha256 == &request.expected_previous_fingerprint_sha256 => {}
-            HostKeyStatus::Known => {}
-            _ => {
-                return Err(AppError::conflict(
-                    "SSH host key or previously trusted fingerprint changed; inspect again before rotating",
-                ));
-            }
-        }
-
-        let latest_profile = self.dependencies.hosts.load(&request.host_id).await?;
-        let latest_endpoint = endpoint_for_peer(&latest_profile, &request.peer)?;
-        if latest_profile != profile || latest_endpoint != request.endpoint {
-            return Err(AppError::conflict(
-                "SSH host configuration changed during key rotation; inspect the current endpoint again",
-            ));
-        }
-        if cancel.is_cancelled() {
-            return Err(AppError::cancelled("SSH host key rotation was cancelled"));
-        }
-        self.dependencies
-            .known_hosts
-            .replace(
-                &request.endpoint,
-                &request.expected_previous_fingerprint_sha256,
-                &observed.identity,
-            )
-            .await?;
-        Ok(HostKeyRotationReceipt {
-            host_id: request.host_id,
-            peer: request.peer,
-            endpoint: request.endpoint,
-            fingerprint_sha256: observed.fingerprint_sha256,
-        })
     }
 }
 
@@ -667,7 +443,6 @@ pub(super) struct RusshPeer {
 struct RusshPeerSession {
     handle: Mutex<Handle<RusshHandler>>,
     endpoint: HostEndpoint,
-    observed: Option<HostKeyChallenge>,
     disconnected: AtomicBool,
     /// disconnect 已入队后跨 close 重试保留，避免再次发送或误判稍后到达的完成 sentinel。
     disconnect_requested: AtomicBool,
@@ -1390,12 +1165,8 @@ fn effective_remote_forward_port(requested_port: u16, returned_port: u32) -> App
 
 /// Russh handler 自动信任主机密钥并尽力记录 known_hosts，同时接收远端端口转发的入站 channel。
 struct RusshHandler {
-    host_id: HostId,
-    peer: HostKeyPeer,
     endpoint: HostEndpoint,
     known_hosts: Arc<dyn KnownHostsRepository>,
-    inspect_only: bool,
-    observed: Arc<StdMutex<Option<HostKeyChallenge>>>,
     decision_error: Arc<StdMutex<Option<AppError>>>,
     forward_router: Arc<ForwardRouter>,
 }
@@ -1429,26 +1200,13 @@ impl client::Handler for RusshHandler {
             }
         };
         let identity = HostKeyIdentity {
-            algorithm: algorithm.clone(),
-            fingerprint_sha256: fingerprint.clone(),
+            algorithm,
+            fingerprint_sha256: fingerprint,
             public_key_openssh,
         };
         match self.known_hosts.inspect(&self.endpoint, &identity).await {
             Ok(status) => {
-                let challenge = HostKeyChallenge {
-                    host_id: self.host_id.clone(),
-                    peer: self.peer.clone(),
-                    endpoint: self.endpoint.clone(),
-                    algorithm,
-                    fingerprint_sha256: fingerprint,
-                    identity: identity.clone(),
-                    status: status.clone(),
-                };
-                *self
-                    .observed
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(challenge);
-                if !self.inspect_only && status != HostKeyStatus::Known {
+                if status != HostKeyStatus::Known {
                     // 自动信任后写入只是后台记录；失败不能改变握手结果，也不能留下
                     // decision_error 把后续 KEX/认证错误误分类成主机密钥错误。
                     if let Err(error) = self.known_hosts.trust(&self.endpoint, &identity).await {
@@ -1461,8 +1219,7 @@ impl client::Handler for RusshHandler {
                 Ok(true)
             }
             Err(error) => {
-                // 读取失败同样只是记录能力降级；旧 inspect 路径可能拿不到 challenge，
-                // 但普通连接必须照常完成握手。
+                // 读取失败同样只是记录能力降级；普通连接必须照常完成握手。
                 tracing::warn!(
                     error = %error,
                     "SSH known_hosts 读取主机密钥状态失败；连接继续"
@@ -1506,10 +1263,9 @@ impl client::Handler for RusshHandler {
     }
 }
 
-/// 每个 route hop 记录 endpoint 和真实 handshake 结果，便于显式 host-key 信任闭环。
+/// 每个 route hop 记录 endpoint 和认证材料；主机密钥已由 handler 自动信任，无需 peer 编号。
 #[derive(Clone)]
 struct PeerSpec {
-    peer: HostKeyPeer,
     endpoint: HostEndpoint,
     authentication: Option<SshAuthentication>,
 }
@@ -1523,23 +1279,18 @@ struct PeerConnectionContext {
     reservation: Arc<RusshCleanupReservation>,
 }
 
-/// 按 proxy → jump hosts → target 顺序建立认证链，检查到达选定 peer 前的每个跳板都可信。
+/// 按 proxy → jump hosts → target 顺序建立完整认证链。
 ///
 /// @author kongweiguang
 async fn connect_route(
     profile: &HostConnectionProfile,
     dependencies: &RusshRemoteConnectionDependencies,
-    inspect_index: Option<usize>,
     forward_router: Arc<ForwardRouter>,
     pending_cleanup: Arc<PendingRusshCleanup>,
     reservation: Arc<RusshCleanupReservation>,
     cancel: &CancellationToken,
 ) -> AppResult<Vec<Arc<RusshPeerSession>>> {
     let route = peer_specs(profile)?;
-    let end = inspect_index.unwrap_or(route.len().saturating_sub(1));
-    if end >= route.len() {
-        return Err(AppError::invalid("SSH route peer index is invalid"));
-    }
     let first = route
         .first()
         .ok_or_else(|| AppError::invalid("SSH route has no peers"))?;
@@ -1557,7 +1308,8 @@ async fn connect_route(
     };
     let mut sessions = SessionSetGuard::new(Arc::clone(&pending_cleanup), Arc::clone(&reservation));
     let mut next_stream = Some(stream);
-    for (index, spec) in route.into_iter().enumerate().take(end + 1) {
+    let peer_count = route.len();
+    for (index, spec) in route.into_iter().enumerate() {
         if cancel.is_cancelled() {
             let _ = disconnect_sessions(
                 sessions.sessions(),
@@ -1571,14 +1323,12 @@ async fn connect_route(
         let stream = next_stream
             .take()
             .ok_or_else(|| AppError::infrastructure("SSH route stream was not initialized"))?;
-        let inspect_only = inspect_index == Some(index);
         let authentication = spec.authentication.clone();
         let session = match connect_peer(
             profile,
             dependencies,
             spec,
             stream,
-            inspect_only,
             PeerConnectionContext {
                 forward_router: Arc::clone(&forward_router),
                 pending_cleanup: Arc::clone(&pending_cleanup),
@@ -1601,37 +1351,35 @@ async fn connect_route(
             }
         };
         sessions.push(Arc::clone(&session));
-        if !inspect_only {
-            let Some(authentication) = authentication.as_ref() else {
-                let _ = disconnect_sessions(
-                    sessions.sessions(),
-                    &pending_cleanup,
-                    &reservation,
-                    "Kerminal SSH peer has no authentication",
-                )
-                .await;
-                return Err(AppError::invalid("SSH peer has no authentication method"));
-            };
-            if let Err(error) = authenticate_peer(
-                &session,
-                authentication,
-                dependencies.credentials.as_ref(),
-                cancel,
-                profile.connect_timeout_ms,
+        let Some(authentication) = authentication.as_ref() else {
+            let _ = disconnect_sessions(
+                sessions.sessions(),
+                &pending_cleanup,
+                &reservation,
+                "Kerminal SSH peer has no authentication",
             )
-            .await
-            {
-                let _ = disconnect_sessions(
-                    sessions.sessions(),
-                    &pending_cleanup,
-                    &reservation,
-                    "Kerminal SSH peer authentication failed",
-                )
-                .await;
-                return Err(error);
-            }
+            .await;
+            return Err(AppError::invalid("SSH peer has no authentication method"));
+        };
+        if let Err(error) = authenticate_peer(
+            &session,
+            authentication,
+            dependencies.credentials.as_ref(),
+            cancel,
+            profile.connect_timeout_ms,
+        )
+        .await
+        {
+            let _ = disconnect_sessions(
+                sessions.sessions(),
+                &pending_cleanup,
+                &reservation,
+                "Kerminal SSH peer authentication failed",
+            )
+            .await;
+            return Err(error);
         }
-        if index < end {
+        if index + 1 < peer_count {
             let next = peer_specs(profile)?
                 .get(index + 1)
                 .cloned()
@@ -1686,7 +1434,6 @@ async fn connect_peer(
     dependencies: &RusshRemoteConnectionDependencies,
     spec: PeerSpec,
     stream: Box<dyn AsyncDuplex>,
-    inspect_only: bool,
     context: PeerConnectionContext,
     cancel: &CancellationToken,
 ) -> AppResult<Arc<RusshPeerSession>> {
@@ -1698,15 +1445,10 @@ async fn connect_peer(
     let transport_cancel = CancellationToken::new();
     let stream: Box<dyn AsyncDuplex> =
         Box::new(CancellablePeerStream::new(stream, transport_cancel.clone()));
-    let observed = Arc::new(StdMutex::new(None));
     let decision_error = Arc::new(StdMutex::new(None));
     let handler = RusshHandler {
-        host_id: profile.host_id.clone(),
-        peer: spec.peer.clone(),
         endpoint: spec.endpoint.clone(),
         known_hosts: Arc::clone(&dependencies.known_hosts),
-        inspect_only,
-        observed: Arc::clone(&observed),
         decision_error: Arc::clone(&decision_error),
         forward_router,
     };
@@ -1720,7 +1462,6 @@ async fn connect_peer(
     let handshake = PendingHandshakeCleanup::new(
         Arc::clone(&reservation),
         spec.endpoint.clone(),
-        Arc::clone(&observed),
         Arc::clone(&decision_error),
         transport_cancel.clone(),
         task,
@@ -1760,20 +1501,15 @@ async fn connect_peer(
     Ok(session)
 }
 
-/// 统一创建 handle owner，使 handshake 取消和 host-key 拒绝也能显式回收 russh task。
+/// 统一创建 handle owner，使 handshake 取消和底层 transport 取消也能显式回收 russh task。
 fn make_peer_session(
     handle: Handle<RusshHandler>,
     endpoint: &HostEndpoint,
-    observed: &Arc<StdMutex<Option<HostKeyChallenge>>>,
     transport_cancel: CancellationToken,
 ) -> Arc<RusshPeerSession> {
     Arc::new(RusshPeerSession {
         handle: Mutex::new(handle),
         endpoint: endpoint.clone(),
-        observed: observed
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone(),
         disconnected: AtomicBool::new(false),
         disconnect_requested: AtomicBool::new(false),
         transport_cancel,
@@ -2006,15 +1742,12 @@ fn peer_specs(profile: &HostConnectionProfile) -> AppResult<Vec<PeerSpec>> {
         .route
         .jump_hosts
         .iter()
-        .enumerate()
-        .map(|(index, jump)| PeerSpec {
-            peer: HostKeyPeer::Jump { index },
+        .map(|jump| PeerSpec {
             endpoint: jump.endpoint.clone(),
             authentication: Some(jump.authentication.clone()),
         })
         .collect::<Vec<_>>();
     peers.push(PeerSpec {
-        peer: HostKeyPeer::Target,
         endpoint: profile.endpoint.clone(),
         authentication: profile.authentication.clone(),
     });
@@ -2022,31 +1755,6 @@ fn peer_specs(profile: &HostConnectionProfile) -> AppResult<Vec<PeerSpec>> {
         validate_endpoint(&peer.endpoint)?;
     }
     Ok(peers)
-}
-
-/// 把 host-key UI 请求映射到实际 SSH route 的 peer 索引。
-fn peer_index(profile: &HostConnectionProfile, peer: &HostKeyPeer) -> AppResult<usize> {
-    match peer {
-        HostKeyPeer::Target => Ok(profile.route.jump_hosts.len()),
-        HostKeyPeer::Jump { index } if *index < profile.route.jump_hosts.len() => Ok(*index),
-        HostKeyPeer::Jump { .. } => Err(AppError::not_found("SSH jump host was not found")),
-    }
-}
-
-/// 从同一个 profile 取出与已确认 host-key peer 一致的 known_hosts endpoint。
-fn endpoint_for_peer(
-    profile: &HostConnectionProfile,
-    peer: &HostKeyPeer,
-) -> AppResult<HostEndpoint> {
-    match peer {
-        HostKeyPeer::Target => Ok(profile.endpoint.clone()),
-        HostKeyPeer::Jump { index } => profile
-            .route
-            .jump_hosts
-            .get(*index)
-            .map(|jump| jump.endpoint.clone())
-            .ok_or_else(|| AppError::not_found("SSH jump host was not found")),
-    }
 }
 
 /// 对已建立的连接链发送显式 disconnect；失败的 session 立即转给服务级 owner 重试。

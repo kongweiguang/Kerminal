@@ -22,9 +22,6 @@ pub enum PublicErrorCode {
     Infrastructure,
     OutcomeUnknown,
     AuthenticationFailed,
-    HostKeyUnknown,
-    HostKeyChanged,
-    HostKeyTrustMismatch,
     Timeout,
     RemoteExit,
     ConfigurationCorrupt,
@@ -43,9 +40,6 @@ impl PublicErrorCode {
             Self::Infrastructure => "infrastructure",
             Self::OutcomeUnknown => "outcome_unknown",
             Self::AuthenticationFailed => "authentication_failed",
-            Self::HostKeyUnknown => "host_key_unknown",
-            Self::HostKeyChanged => "host_key_changed",
-            Self::HostKeyTrustMismatch => "host_key_trust_mismatch",
             Self::Timeout => "timeout",
             Self::RemoteExit => "remote_exit",
             Self::ConfigurationCorrupt => "configuration_corrupt",
@@ -92,9 +86,6 @@ pub enum AppError {
         source: Arc<dyn Error + Send + Sync>,
     },
     AuthenticationFailed,
-    HostKeyUnknown,
-    HostKeyChanged,
-    HostKeyTrustMismatch,
     Timeout {
         operation: &'static str,
     },
@@ -221,21 +212,6 @@ impl AppError {
         Self::AuthenticationFailed
     }
 
-    /// 未知主机指纹需走显式信任流程，不得自动改写 known_hosts。
-    pub fn host_key_unknown() -> Self {
-        Self::HostKeyUnknown
-    }
-
-    /// 已保存指纹发生变化时必须阻断连接并提示用户复核。
-    pub fn host_key_changed() -> Self {
-        Self::HostKeyChanged
-    }
-
-    /// 二次握手和用户确认值不匹配时阻断写入可信列表。
-    pub fn host_key_trust_mismatch() -> Self {
-        Self::HostKeyTrustMismatch
-    }
-
     /// 区分操作超时和一般网络故障，便于界面提供重试语义。
     pub fn timeout(operation: &'static str) -> Self {
         Self::Timeout { operation }
@@ -268,9 +244,6 @@ impl AppError {
             Self::OutcomeUnknown { .. } => PublicErrorCode::OutcomeUnknown,
             Self::DiagnosticSource { code, .. } => *code,
             Self::AuthenticationFailed => PublicErrorCode::AuthenticationFailed,
-            Self::HostKeyUnknown => PublicErrorCode::HostKeyUnknown,
-            Self::HostKeyChanged => PublicErrorCode::HostKeyChanged,
-            Self::HostKeyTrustMismatch => PublicErrorCode::HostKeyTrustMismatch,
             Self::Timeout { .. } => PublicErrorCode::Timeout,
             Self::RemoteExit { .. } => PublicErrorCode::RemoteExit,
             Self::ConfigurationCorrupt { .. } => PublicErrorCode::ConfigurationCorrupt,
@@ -293,9 +266,6 @@ impl AppError {
             Self::DiagnosticSource { message, .. } => message,
             Self::CapabilityNotSupported { .. } => "当前连接不支持此能力",
             Self::AuthenticationFailed => "连接认证失败",
-            Self::HostKeyUnknown => "主机指纹尚未确认",
-            Self::HostKeyChanged => "主机指纹已变化，连接已阻断",
-            Self::HostKeyTrustMismatch => "主机指纹复核不匹配，未保存信任",
             Self::Timeout { .. } => "操作超时",
             Self::RemoteExit { .. } => "远端命令已退出",
             Self::ConfigurationCorrupt { .. } => "配置文件损坏，需要恢复",

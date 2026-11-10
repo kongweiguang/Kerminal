@@ -20,23 +20,6 @@ fn infrastructure_error_retains_source_without_displaying_it() {
     assert!(error.source().is_some());
 }
 
-/// SSH 信任错误必须有独立稳定码，供 UI 触发确认或安全阻断流程。
-#[test]
-fn host_key_failures_have_distinct_public_codes() {
-    assert_eq!(
-        AppError::host_key_unknown().public_code().as_str(),
-        "host_key_unknown"
-    );
-    assert_eq!(
-        AppError::host_key_changed().public_code().as_str(),
-        "host_key_changed"
-    );
-    assert_eq!(
-        AppError::host_key_trust_mismatch().public_code().as_str(),
-        "host_key_trust_mismatch"
-    );
-}
-
 /// 配置损坏错误不冒充宿主当前恢复状态，状态需由 recovery result 单独表达。
 #[test]
 fn corrupt_configuration_message_does_not_claim_recovery_state() {
@@ -90,7 +73,6 @@ fn unrelated_or_wrapped_errors_are_not_retryable_disconnects() {
         AppError::cancelled("用户取消"),
         AppError::timeout("连接超时"),
         AppError::authentication_failed(),
-        AppError::host_key_changed(),
         AppError::remote_exit(Some(7)),
         AppError::retryable_remote_disconnect(io::Error::other("source"))
             .with_source(io::Error::other("wrapped")),

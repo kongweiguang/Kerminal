@@ -258,20 +258,6 @@ impl KnownHostsRepository for UnknownKnownHosts {
     async fn trust(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
         Ok(())
     }
-
-    /// 测试不执行密钥轮换；明确 Unsupported 以免把静态 fixture 状态误作持久信任。
-    ///
-    /// @author kongweiguang
-    async fn replace(
-        &self,
-        _endpoint: &HostEndpoint,
-        _expected_previous_fingerprint_sha256: &str,
-        _identity: &HostKeyIdentity,
-    ) -> AppResult<()> {
-        Err(kerminal_application::AppError::unsupported(
-            "test known_hosts fake does not support key rotation",
-        ))
-    }
 }
 
 /// 从业务用例新建 proxy credential，再经 host 回读与 production SSH route 解析同一个 ref。

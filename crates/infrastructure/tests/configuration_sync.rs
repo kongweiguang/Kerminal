@@ -16,8 +16,7 @@ use kerminal_application::configuration_sync::{
     ConfigurationSyncOutcome, ConfigurationSyncService,
 };
 use kerminal_application::connections::{
-    ConnectionIntent, HostKeyChallenge, HostKeyPeer, HostKeyTrustReceipt, HostKeyTrustRequest,
-    RemoteConnectionLease, RemoteConnectionService,
+    ConnectionIntent, RemoteConnectionLease, RemoteConnectionService,
 };
 use kerminal_application::operations::OperationsCommandExecutor;
 use kerminal_application::{AppError, AppResult, preferences::ConfigurationRepository};
@@ -41,39 +40,6 @@ impl RemoteConnectionService for NoRemoteConnections {
         _cancel: CancellationToken,
     ) -> AppResult<RemoteConnectionLease> {
         Err(AppError::unsupported("Git fixture 不允许远端连接"))
-    }
-
-    /// fixture 不读取或信任任何主机密钥。
-    async fn inspect_host_key(
-        &self,
-        _host_id: HostId,
-        _peer: HostKeyPeer,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        Err(AppError::unsupported("Git fixture 不允许远端连接"))
-    }
-
-    /// fixture 不写入 known_hosts。
-    async fn trust_host_key(
-        &self,
-        _request: HostKeyTrustRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        Err(AppError::unsupported("Git fixture 不允许远端连接"))
-    }
-
-    /// 此测试替身未覆盖主机密钥轮换，显式拒绝可避免伪造信任回执。
-    ///
-    /// @author kongweiguang
-    async fn replace_host_key(
-        &self,
-        _request: kerminal_application::connections::HostKeyRotationRequest,
-        _cancel: tokio_util::sync::CancellationToken,
-    ) -> kerminal_application::AppResult<kerminal_application::connections::HostKeyRotationReceipt>
-    {
-        Err(kerminal_application::AppError::unsupported(
-            "test fake does not support host-key rotation",
-        ))
     }
 }
 

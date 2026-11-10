@@ -665,7 +665,7 @@ pub struct TestKnownHostsRepository {
 }
 
 impl TestKnownHostsRepository {
-    /// 在测试开始前注入可信指纹，用于普通连接和变化检测用例。
+    /// 在测试开始前注入已记录指纹，用于普通连接和变化检测用例。
     pub fn trust_fingerprint(&self, endpoint: &HostEndpoint, algorithm: &str, fingerprint: &str) {
         self.entries
             .lock()
@@ -679,7 +679,7 @@ impl TestKnownHostsRepository {
 
 #[async_trait]
 impl KnownHostsRepository for TestKnownHostsRepository {
-    /// unknown/changed 指纹不会自动信任，只有测试显式写入后才返回 Known。
+    /// unknown/changed 指纹在显式写入前返回各自状态，供连接层验证自动 upsert。
     async fn inspect(
         &self,
         endpoint: &HostEndpoint,
@@ -698,49 +698,9 @@ impl KnownHostsRepository for TestKnownHostsRepository {
         })
     }
 
-    /// 将应用层已二次确认的指纹写入当前测试实例。
+    /// 将应用层自动信任的指纹写入当前测试实例。
     async fn trust(&self, endpoint: &HostEndpoint, identity: &HostKeyIdentity) -> AppResult<()> {
         self.trust_fingerprint(endpoint, &identity.algorithm, &identity.fingerprint_sha256);
-        Ok(())
-    }
-
-    /// 在隔离的内存 fixture 内做旧指纹 CAS 替换，供 SSH 轮换测试验证回读而不接触用户 known_hosts。
-    ///
-    /// @author kongweiguang
-    async fn replace(
-        &self,
-        endpoint: &HostEndpoint,
-        expected_previous_fingerprint_sha256: &str,
-        identity: &HostKeyIdentity,
-    ) -> AppResult<()> {
-        if expected_previous_fingerprint_sha256.is_empty()
-            || expected_previous_fingerprint_sha256 == identity.fingerprint_sha256
-        {
-            return Err(kerminal_application::AppError::invalid(
-                "test host-key rotation fingerprints are invalid",
-            ));
-        }
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let endpoint = endpoint_key(endpoint);
-        match entries.get(&endpoint) {
-            Some((_, current)) if current == &identity.fingerprint_sha256 => return Ok(()),
-            Some((_, current)) if current == expected_previous_fingerprint_sha256 => {}
-            _ => {
-                return Err(kerminal_application::AppError::conflict(
-                    "test known_hosts key changed before rotation",
-                ));
-            }
-        }
-        entries.insert(
-            endpoint,
-            (
-                identity.algorithm.clone(),
-                identity.fingerprint_sha256.clone(),
-            ),
-        );
         Ok(())
     }
 }

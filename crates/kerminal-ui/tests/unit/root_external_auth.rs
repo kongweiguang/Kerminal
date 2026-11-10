@@ -45,9 +45,7 @@ use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 use kerminal_application::{
     AppError, AppResult, ApplicationTaskExecutor,
     connections::{
-        ConnectionIntent, HostKeyChallenge, HostKeyPeer, HostKeyRotationReceipt,
-        HostKeyRotationRequest, HostKeyTrustReceipt, HostKeyTrustRequest, RemoteConnectionLease,
-        RemoteConnectionService,
+        ConnectionIntent, RemoteConnectionLease, RemoteConnectionService,
         management::{
             HostAuthenticationMode, HostDocumentRevision, HostDraft, HostGroupDeletionReceipt,
             HostGroupDraft, HostGroupSnapshot, HostManagementRepository, HostManagementService,
@@ -271,31 +269,6 @@ impl RemoteConnectionService for NoRemote {
         _: ConnectionIntent,
         _: CancellationToken,
     ) -> AppResult<RemoteConnectionLease> {
-        unavailable()
-    }
-    /// 不访问网络探测主机密钥。
-    async fn inspect_host_key(
-        &self,
-        _: HostId,
-        _: HostKeyPeer,
-        _: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        unavailable()
-    }
-    /// 不写 known_hosts。
-    async fn trust_host_key(
-        &self,
-        _: HostKeyTrustRequest,
-        _: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        unavailable()
-    }
-    /// 不更换真实密钥。
-    async fn replace_host_key(
-        &self,
-        _: HostKeyRotationRequest,
-        _: CancellationToken,
-    ) -> AppResult<HostKeyRotationReceipt> {
         unavailable()
     }
 }

@@ -12,11 +12,10 @@ use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult,
     connections::{
-        ConnectionIntent, ExecRequest, HostKeyChallenge, HostKeyPeer, HostKeyTrustReceipt,
-        HostKeyTrustRequest, OpenSftpRequest, RemoteConnectionHandle, RemoteConnectionLease,
-        RemoteConnectionService, RemoteForwardHandle, RemoteForwardListener, RemoteForwardRequest,
-        RemoteShellDialect, SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest,
-        TunnelChannelHandle, TunnelRequest,
+        ConnectionIntent, ExecRequest, OpenSftpRequest, RemoteConnectionHandle,
+        RemoteConnectionLease, RemoteConnectionService, RemoteForwardHandle, RemoteForwardListener,
+        RemoteForwardRequest, RemoteShellDialect, SftpChannelHandle, ShellScriptRequest,
+        TerminalOpenRequest, TunnelChannelHandle, TunnelRequest,
     },
     operations::PortForwardRuntime,
     sessions::SessionTransport,
@@ -81,39 +80,6 @@ impl RemoteConnectionService for FakeRemoteConnections {
             behavior: self.behavior,
             receipts: self.receipts.clone(),
         })))
-    }
-
-    /// 此测试不查询主机指纹，避免构造虚假的信任状态。
-    async fn inspect_host_key(
-        &self,
-        _host_id: HostId,
-        _peer: HostKeyPeer,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        Err(AppError::unsupported("测试不提供主机指纹"))
-    }
-
-    /// 此测试不写 known_hosts，也不伪造用户确认。
-    async fn trust_host_key(
-        &self,
-        _request: HostKeyTrustRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        Err(AppError::unsupported("测试不提供主机信任"))
-    }
-
-    /// 此测试替身未覆盖主机密钥轮换，显式拒绝可避免伪造信任回执。
-    ///
-    /// @author kongweiguang
-    async fn replace_host_key(
-        &self,
-        _request: kerminal_application::connections::HostKeyRotationRequest,
-        _cancel: tokio_util::sync::CancellationToken,
-    ) -> kerminal_application::AppResult<kerminal_application::connections::HostKeyRotationReceipt>
-    {
-        Err(kerminal_application::AppError::unsupported(
-            "test fake does not support host-key rotation",
-        ))
     }
 }
 

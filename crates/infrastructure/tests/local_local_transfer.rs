@@ -15,10 +15,7 @@ use std::{
 use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult,
-    connections::{
-        ConnectionIntent, HostKeyChallenge, HostKeyPeer, HostKeyTrustReceipt, HostKeyTrustRequest,
-        RemoteConnectionLease, RemoteConnectionService,
-    },
+    connections::{ConnectionIntent, RemoteConnectionLease, RemoteConnectionService},
     transfers::{TransferBackend, TransferPhase, TransferQueueOptions, TransferService},
 };
 use kerminal_domain::{
@@ -53,41 +50,6 @@ impl RemoteConnectionService for UnexpectedRemoteAccess {
     ) -> AppResult<RemoteConnectionLease> {
         self.calls.fetch_add(1, Ordering::AcqRel);
         Err(AppError::unsupported("本机传输测试不允许访问 SSH"))
-    }
-
-    /// 本机传输不会读取远端主机密钥，若误路由则记录调用并失败。
-    async fn inspect_host_key(
-        &self,
-        _host_id: HostId,
-        _peer: HostKeyPeer,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        self.calls.fetch_add(1, Ordering::AcqRel);
-        Err(AppError::unsupported("本机传输测试不允许访问 SSH"))
-    }
-
-    /// 本机传输不会写远端信任状态，若误路由则记录调用并失败。
-    async fn trust_host_key(
-        &self,
-        _request: HostKeyTrustRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        self.calls.fetch_add(1, Ordering::AcqRel);
-        Err(AppError::unsupported("本机传输测试不允许访问 SSH"))
-    }
-
-    /// 此测试替身未覆盖主机密钥轮换，显式拒绝可避免伪造信任回执。
-    ///
-    /// @author kongweiguang
-    async fn replace_host_key(
-        &self,
-        _request: kerminal_application::connections::HostKeyRotationRequest,
-        _cancel: tokio_util::sync::CancellationToken,
-    ) -> kerminal_application::AppResult<kerminal_application::connections::HostKeyRotationReceipt>
-    {
-        Err(kerminal_application::AppError::unsupported(
-            "test fake does not support host-key rotation",
-        ))
     }
 }
 

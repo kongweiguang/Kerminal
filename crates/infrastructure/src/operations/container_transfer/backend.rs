@@ -510,11 +510,9 @@ pub(super) fn app_failure_with_cleanup(
         PublicErrorCode::Unsupported | PublicErrorCode::CapabilityNotSupported => {
             TransferFailureKind::Unsupported
         }
-        PublicErrorCode::AuthenticationFailed
-        | PublicErrorCode::HostKeyUnknown
-        | PublicErrorCode::HostKeyChanged
-        | PublicErrorCode::HostKeyTrustMismatch
-        | PublicErrorCode::Infrastructure => TransferFailureKind::Connection,
+        PublicErrorCode::AuthenticationFailed | PublicErrorCode::Infrastructure => {
+            TransferFailureKind::Connection
+        }
         PublicErrorCode::Timeout => TransferFailureKind::IdleTimeout,
         PublicErrorCode::OutcomeUnknown => TransferFailureKind::CommitUnknown,
         _ => TransferFailureKind::Internal,

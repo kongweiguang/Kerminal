@@ -14,16 +14,11 @@ use std::{
 use gpui_kit::{AppContext as _, Context, Entity, TestAppContext, VisualTestContext, Window};
 use kerminal_application::{
     AppResult, ApplicationTaskExecutor, ProfileService,
-    connections::{
-        ConnectionIntent, HostKeyChallenge, HostKeyPeer, HostKeyRotationReceipt,
-        HostKeyRotationRequest, HostKeyTrustReceipt, HostKeyTrustRequest, RemoteConnectionLease,
-        RemoteConnectionService,
-        management::{
-            HostAuthenticationMode, HostDocumentRevision, HostDraft, HostGroup,
-            HostGroupDeletionReceipt, HostGroupDraft, HostGroupSnapshot, HostManagementRepository,
-            HostManagementService, HostRouteSettings, HostSftpOptions, HostTerminalOptions,
-            ManagedHost, RdpDisplayOptions,
-        },
+    connections::management::{
+        HostAuthenticationMode, HostDocumentRevision, HostDraft, HostGroup,
+        HostGroupDeletionReceipt, HostGroupDraft, HostGroupSnapshot, HostManagementRepository,
+        HostManagementService, HostRouteSettings, HostSftpOptions, HostTerminalOptions,
+        ManagedHost, RdpDisplayOptions,
     },
     preferences::{
         DefaultLocalShellProvider, ProfileDraft, ProfileRepository, ProfileRevision,
@@ -158,77 +153,6 @@ impl HostManagementRepository for ReadOnlyHostDirectory {
         Self: 'f,
     {
         panic!("关闭表单不应删除分组")
-    }
-}
-
-struct NoRemoteConnections {
-    preflight_fails: bool,
-}
-
-impl RemoteConnectionService for NoRemoteConnections {
-    /// 本回归只操作表单，任何连接请求均代表越过测试边界。
-    /// @author kongweiguang
-    fn connect<'a, 'f>(
-        &'a self,
-        _: HostId,
-        _: ConnectionIntent,
-        _: CancellationToken,
-    ) -> PortFuture<'f, RemoteConnectionLease>
-    where
-        'a: 'f,
-        Self: 'f,
-    {
-        panic!("表单关闭回归不得建立远程连接")
-    }
-
-    /// 表单初始化与取消不需要读取服务器指纹；仅失败反馈回归允许一次确定的离线失败。
-    /// @author kongweiguang
-    fn inspect_host_key<'a, 'f>(
-        &'a self,
-        _: HostId,
-        _: HostKeyPeer,
-        _: CancellationToken,
-    ) -> PortFuture<'f, HostKeyChallenge>
-    where
-        'a: 'f,
-        Self: 'f,
-    {
-        if self.preflight_fails {
-            return Box::pin(async {
-                Err(kerminal_application::AppError::infrastructure(
-                    "SSH TCP connection failed",
-                ))
-            });
-        }
-        panic!("表单关闭回归不得探测主机密钥")
-    }
-
-    /// 丢弃确认不是信任服务器的授权。
-    /// @author kongweiguang
-    fn trust_host_key<'a, 'f>(
-        &'a self,
-        _: HostKeyTrustRequest,
-        _: CancellationToken,
-    ) -> PortFuture<'f, HostKeyTrustReceipt>
-    where
-        'a: 'f,
-        Self: 'f,
-    {
-        panic!("表单关闭回归不得信任主机密钥")
-    }
-
-    /// 测试完全隔离 known_hosts，密钥轮换不得被间接触发。
-    /// @author kongweiguang
-    fn replace_host_key<'a, 'f>(
-        &'a self,
-        _: HostKeyRotationRequest,
-        _: CancellationToken,
-    ) -> PortFuture<'f, HostKeyRotationReceipt>
-    where
-        'a: 'f,
-        Self: 'f,
-    {
-        panic!("表单关闭回归不得轮换主机密钥")
     }
 }
 
@@ -404,9 +328,6 @@ fn fixture_with_profiles(
         let panel = cx.new(|cx| {
             let panel = ConnectionsPanel::new(
                 hosts,
-                Arc::new(NoRemoteConnections {
-                    preflight_fails: false,
-                }),
                 None,
                 executor,
                 ConfigurationRecoveryState {

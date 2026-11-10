@@ -5044,9 +5044,6 @@ fn localized_error(error: &AppError) -> String {
             "The result is unknown. Check the destination before retrying."
         }
         PublicErrorCode::AuthenticationFailed => "Connection authentication failed.",
-        PublicErrorCode::HostKeyUnknown => "The host key has not been trusted.",
-        PublicErrorCode::HostKeyChanged => "The host key changed; the connection was blocked.",
-        PublicErrorCode::HostKeyTrustMismatch => "Host key verification failed.",
         PublicErrorCode::Timeout => "The operation timed out.",
         PublicErrorCode::RemoteExit => "The remote command exited.",
         PublicErrorCode::ConfigurationCorrupt => {

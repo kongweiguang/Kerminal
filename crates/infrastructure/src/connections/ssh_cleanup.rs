@@ -19,9 +19,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    HostEndpoint, HostKeyChallenge, RusshHandler, RusshPeerSession, make_peer_session, russh_error,
-};
+use super::{HostEndpoint, RusshHandler, RusshPeerSession, make_peer_session, russh_error};
 
 const CLEANUP_GRACE: Duration = Duration::from_millis(500);
 const MAX_ROUTE_OWNERS: usize = 256;
@@ -430,20 +428,6 @@ impl SessionSetGuard {
         }
     }
 
-    /// 立即接管已有路由，避免后续提前返回丢掉最后的 session owner。
-    pub(super) fn with_sessions(
-        cleanup: Arc<PendingRusshCleanup>,
-        reservation: Arc<RusshCleanupReservation>,
-        sessions: Vec<Arc<RusshPeerSession>>,
-    ) -> Self {
-        Self {
-            cleanup,
-            reservation,
-            sessions,
-            armed: true,
-        }
-    }
-
     /// 在下一个可能取消路由的 await 前接管已连接 hop。
     pub(super) fn push(&mut self, session: Arc<RusshPeerSession>) {
         self.sessions.push(session);
@@ -458,18 +442,6 @@ impl SessionSetGuard {
     pub(super) fn into_sessions(mut self) -> Vec<Arc<RusshPeerSession>> {
         self.armed = false;
         std::mem::take(&mut self.sessions)
-    }
-
-    /// 所有 session task 均已 join 后解除 Drop 清理。
-    pub(super) fn disarm(&mut self) {
-        if self
-            .sessions
-            .iter()
-            .all(|session| session.disconnected.load(Ordering::Acquire))
-        {
-            self.armed = false;
-            self.reservation.finish_route();
-        }
     }
 }
 
@@ -488,7 +460,6 @@ impl Drop for SessionSetGuard {
 pub(super) struct PendingHandshakeCleanup {
     _reservation: Arc<RusshCleanupReservation>,
     endpoint: HostEndpoint,
-    observed: Arc<StdMutex<Option<HostKeyChallenge>>>,
     decision_error: Arc<StdMutex<Option<AppError>>>,
     transport_cancel: CancellationToken,
     state: Mutex<HandshakeState>,
@@ -506,7 +477,6 @@ impl PendingHandshakeCleanup {
     pub(super) fn new(
         reservation: Arc<RusshCleanupReservation>,
         endpoint: HostEndpoint,
-        observed: Arc<StdMutex<Option<HostKeyChallenge>>>,
         decision_error: Arc<StdMutex<Option<AppError>>>,
         transport_cancel: CancellationToken,
         task: ConnectTask,
@@ -514,7 +484,6 @@ impl PendingHandshakeCleanup {
         Arc::new(Self {
             _reservation: reservation,
             endpoint,
-            observed,
             decision_error,
             transport_cancel,
             state: Mutex::new(HandshakeState::Running(task)),
@@ -544,12 +513,8 @@ impl PendingHandshakeCleanup {
         };
         match joined {
             Ok(Ok(handle)) => {
-                let session = make_peer_session(
-                    handle,
-                    &self.endpoint,
-                    &self.observed,
-                    self.transport_cancel.clone(),
-                );
+                let session =
+                    make_peer_session(handle, &self.endpoint, self.transport_cancel.clone());
                 *state = HandshakeState::Connected(Arc::clone(&session));
                 Ok(Some(session))
             }

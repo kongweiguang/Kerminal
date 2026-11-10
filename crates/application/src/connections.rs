@@ -83,66 +83,13 @@ impl std::fmt::Debug for HostKeyIdentity {
     }
 }
 
-/// 已检查的 SSH 主机指纹挑战，可安全展示给用户；不包含认证材料。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostKeyChallenge {
-    pub host_id: HostId,
-    pub peer: HostKeyPeer,
-    pub endpoint: HostEndpoint,
-    pub algorithm: String,
-    pub fingerprint_sha256: String,
-    pub identity: HostKeyIdentity,
-    pub status: HostKeyStatus,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HostKeyPeer {
-    Target,
-    Jump { index: usize },
-}
-
+/// known_hosts 的当前状态；保留它是因为记录逻辑仍要区分已保存、未知和变化，
+/// 但状态只影响后台 upsert，不再参与连接准入或 UI 确认。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostKeyStatus {
     Unknown,
     Changed { previous_fingerprint_sha256: String },
     Known,
-}
-
-/// 用户确认的指纹绑定；infra 重新握手并逐字段比对后才会写 known_hosts。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostKeyTrustRequest {
-    pub host_id: HostId,
-    pub peer: HostKeyPeer,
-    pub endpoint: HostEndpoint,
-    pub expected_fingerprint_sha256: String,
-}
-
-/// 已完成二次校验并持久化的显式信任回执。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostKeyTrustReceipt {
-    pub host_id: HostId,
-    pub peer: HostKeyPeer,
-    pub endpoint: HostEndpoint,
-    pub fingerprint_sha256: String,
-}
-
-/// 主机密钥轮换请求把账号、逐跳 peer、网络端点和前后指纹绑定到一次明确操作。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostKeyRotationRequest {
-    pub host_id: HostId,
-    pub peer: HostKeyPeer,
-    pub endpoint: HostEndpoint,
-    pub expected_previous_fingerprint_sha256: String,
-    pub expected_fingerprint_sha256: String,
-}
-
-/// 轮换回执供 UI 校验目标后再继续原连接意图。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostKeyRotationReceipt {
-    pub host_id: HostId,
-    pub peer: HostKeyPeer,
-    pub endpoint: HostEndpoint,
-    pub fingerprint_sha256: String,
 }
 
 /// 凭据解析器只向 SSH adapter 交付短生命周期的运行态凭据。
@@ -173,22 +120,14 @@ pub trait CredentialResolver: Send + Sync {
 /// known_hosts 访问通过端口注入，使桌面复用应用存储、测试使用隔离状态。
 #[async_trait]
 pub trait KnownHostsRepository: Send + Sync {
-    /// 检查当前指纹并区分未知、已知和变化，默认不得自动信任。
+    /// 读取当前指纹状态，供连接层决定是否需要后台记录；状态不阻断握手。
     async fn inspect(
         &self,
         endpoint: &HostEndpoint,
         identity: &HostKeyIdentity,
     ) -> AppResult<HostKeyStatus>;
-    /// 只有经过单独确认并二次验证的指纹才可写入可信集合。
+    /// 默认信任主机密钥后尽力 upsert 记录；未知追加、变化替换，失败只降级为 warning。
     async fn trust(&self, endpoint: &HostEndpoint, identity: &HostKeyIdentity) -> AppResult<()>;
-
-    /// 仅在上层绑定旧指纹且再次确认新身份后原子替换指定端点的旧记录。
-    async fn replace(
-        &self,
-        endpoint: &HostEndpoint,
-        expected_previous_fingerprint_sha256: &str,
-        identity: &HostKeyIdentity,
-    ) -> AppResult<()>;
 }
 
 /// 桌面平台的 RDP 启动 adapter；密码只能短暂交给平台凭据/DPAPI 实现，不得写进 argv。
@@ -400,26 +339,6 @@ pub trait RemoteConnectionService: Send + Sync {
         intent: ConnectionIntent,
         cancel: CancellationToken,
     ) -> AppResult<RemoteConnectionLease>;
-    /// 读取单个 target/jump peer 的当前指纹供显式确认 UI 展示。
-    async fn inspect_host_key(
-        &self,
-        host_id: HostId,
-        peer: HostKeyPeer,
-        cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge>;
-    /// 重新握手并比对用户确认的完整 peer/fingerprint 后才持久化信任。
-    async fn trust_host_key(
-        &self,
-        request: HostKeyTrustRequest,
-        cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt>;
-
-    /// 重新探测 HostId 与 peer；只有旧/新端点及指纹都匹配确认时才替换 known_hosts。
-    async fn replace_host_key(
-        &self,
-        request: HostKeyRotationRequest,
-        cancel: CancellationToken,
-    ) -> AppResult<HostKeyRotationReceipt>;
 }
 
 /// 已认证连接的拥有式租约；各操作在共享 transport 上打开各自的 channel。

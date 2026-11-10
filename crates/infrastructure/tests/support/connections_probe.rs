@@ -12,12 +12,10 @@ use std::time::Duration;
 use kerminal_application::{
     AppError,
     connections::{
-        CommandStreamHandle, ConnectionIntent, ExecRequest, HostKeyChallenge, HostKeyIdentity,
-        HostKeyPeer, HostKeyRotationReceipt, HostKeyRotationRequest, HostKeyStatus,
-        HostKeyTrustReceipt, HostKeyTrustRequest, OpenSftpRequest, RemoteConnectionHandle,
-        RemoteConnectionLease, RemoteConnectionService, RemoteForwardHandle, RemoteForwardRequest,
-        SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest, TunnelChannelHandle,
-        TunnelRequest,
+        CommandStreamHandle, ConnectionIntent, ExecRequest, HostKeyIdentity, HostKeyStatus,
+        OpenSftpRequest, RemoteConnectionHandle, RemoteConnectionLease, RemoteConnectionService,
+        RemoteForwardHandle, RemoteForwardRequest, SftpChannelHandle, ShellScriptRequest,
+        TerminalOpenRequest, TunnelChannelHandle, TunnelRequest,
     },
     sessions::{
         SessionOpenCleanupOwner, SessionTransport, SessionTransportControl,
@@ -53,20 +51,6 @@ impl KnownHostsRepository for FixedKnownHosts {
     async fn trust(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
         self.trust_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
-    }
-
-    /// 测试不执行密钥轮换；明确 Unsupported 以免把静态 fixture 状态误作持久信任。
-    ///
-    /// @author kongweiguang
-    async fn replace(
-        &self,
-        _endpoint: &HostEndpoint,
-        _expected_previous_fingerprint_sha256: &str,
-        _identity: &HostKeyIdentity,
-    ) -> AppResult<()> {
-        Err(kerminal_application::AppError::unsupported(
-            "test known_hosts fake does not support key rotation",
-        ))
     }
 }
 
@@ -886,46 +870,6 @@ impl RemoteConnectionService for SftpDirectoryFixtureService {
         }
         let handle: Arc<dyn RemoteConnectionHandle> = Arc::clone(&self.handle) as _;
         Ok(RemoteConnectionLease::new(handle))
-    }
-
-    /// 测试直接调用已认证阶段，host-key 检查不属于该 fixture 的责任。
-    ///
-    /// @author kongweiguang
-    async fn inspect_host_key(
-        &self,
-        _host_id: HostId,
-        _peer: HostKeyPeer,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        Err(AppError::unsupported(
-            "SFTP probe fixture host-key inspection is unavailable",
-        ))
-    }
-
-    /// Fixture 不修改 known_hosts。
-    ///
-    /// @author kongweiguang
-    async fn trust_host_key(
-        &self,
-        _request: HostKeyTrustRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        Err(AppError::unsupported(
-            "SFTP probe fixture trust is unavailable",
-        ))
-    }
-
-    /// Fixture 不支持 host-key 轮换。
-    ///
-    /// @author kongweiguang
-    async fn replace_host_key(
-        &self,
-        _request: HostKeyRotationRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyRotationReceipt> {
-        Err(AppError::unsupported(
-            "SFTP probe fixture key rotation is unavailable",
-        ))
     }
 }
 

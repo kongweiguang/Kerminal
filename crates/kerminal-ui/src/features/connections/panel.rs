@@ -17,8 +17,7 @@ use kerminal_application::{
     configuration_changes::{ConfigurationChangeEvent, ConfigurationChangeMessage},
     connections::{
         RdpClientLifecycle, RdpLaunchId, RdpLaunchReceipt, RdpLaunchRequest, RdpLaunchService,
-        RdpLaunchStatus, RdpLaunchStatusService, RemoteConnectionService, SerialPortDescriptor,
-        SerialPortService,
+        RdpLaunchStatus, RdpLaunchStatusService, SerialPortDescriptor, SerialPortService,
         host_types::{PluginHostOpenIntent, PluginHostService},
         management::{
             CredentialCleanupStatus, HostAuthenticationMode, HostCredentialChange,
@@ -983,7 +982,6 @@ impl ConnectionRequestEpoch {
 pub struct ConnectionsPanel {
     pub(super) hosts: HostManagementService,
     plugin_hosts: Option<PluginHostService>,
-    pub(super) remote: Arc<dyn RemoteConnectionService>,
     pub(super) rdp: Option<Arc<RdpLaunchService>>,
     pub(super) executor: ApplicationTaskExecutor,
     pub(super) recovery: ConfigurationRecoveryState,
@@ -1074,7 +1072,6 @@ impl ConnectionsPanel {
     /// @author kongweiguang
     pub fn new(
         hosts: HostManagementService,
-        remote: Arc<dyn RemoteConnectionService>,
         rdp: Option<Arc<RdpLaunchService>>,
         executor: ApplicationTaskExecutor,
         recovery: ConfigurationRecoveryState,
@@ -1103,7 +1100,6 @@ impl ConnectionsPanel {
         let mut panel = Self {
             hosts,
             plugin_hosts: None,
-            remote,
             rdp,
             executor,
             recovery,
@@ -3126,7 +3122,7 @@ impl ConnectionsPanel {
         self.connect_selected_with_destination(sftp, false, None, cx);
     }
 
-    /// 保留现有协议和 host-key 检查，仅将 SSH 新传输意图记入待信任动作而非共享右栏面板。
+    /// 保留现有协议和连接准备，仅将 SSH 新传输意图记入待连接动作而非共享右栏面板。
     ///
     /// @author kongweiguang
     fn connect_selected_for_transfer_tab(&mut self, cx: &mut Context<Self>) {
@@ -3240,7 +3236,7 @@ impl ConnectionsPanel {
         cx.notify();
     }
 
-    /// 保留原协议、SFTP 与容器意图，信任预检及后续回执仍使用既有 owner。
+    /// 保留原协议、SFTP 与容器意图，连接准备及后续回执仍使用既有 owner。
     /// @author kongweiguang
     fn connect_selected_with_destination_direct(
         &mut self,
@@ -5386,9 +5382,6 @@ pub(super) fn localized_error(error: &AppError) -> String {
                 "The save outcome is unknown; refresh before retrying"
             }
             PublicErrorCode::AuthenticationFailed => "Connection authentication failed",
-            PublicErrorCode::HostKeyUnknown => "The host key has not been verified",
-            PublicErrorCode::HostKeyChanged => "The host key changed; the connection was blocked",
-            PublicErrorCode::HostKeyTrustMismatch => "Host key verification did not match",
             PublicErrorCode::Timeout => "The operation timed out",
             PublicErrorCode::RemoteExit => "The remote command exited",
             PublicErrorCode::ConfigurationCorrupt => {
@@ -5469,7 +5462,7 @@ fn builtin_host_intent_matches(
         if &intent.host_id == host_id && intent.configuration_type == expected_type)
 }
 
-/// 目录快照必须仍是请求开始时的版本，防止旧路由参与信任预检。
+/// 目录快照必须仍是请求开始时的版本，防止旧路由参与连接准备。
 fn builtin_host_snapshot_matches(
     host: &ManagedHost,
     host_id: &HostId,

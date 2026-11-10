@@ -7,17 +7,16 @@ mod support;
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
 use kerminal_application::{
-    AppError, AppResult,
+    AppError, AppResult, PublicErrorCode,
     connections::{
-        CommandEvent, CommandStreamHandle, ConnectionIntent, ExecRequest, HostConnectionRepository,
-        HostKeyChallenge, HostKeyIdentity, HostKeyPeer, HostKeyStatus, HostKeyTrustReceipt,
-        HostKeyTrustRequest, KnownHostsRepository, OpenSftpRequest, RemoteConnectionHandle,
+        CommandEvent, CommandStreamHandle, ConnectionIntent, ExecRequest, HostKeyIdentity,
+        HostKeyStatus, KnownHostsRepository, OpenSftpRequest, RemoteConnectionHandle,
         RemoteConnectionLease, RemoteConnectionService, RemoteForwardHandle, RemoteForwardRequest,
         RemoteShellKind, SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest,
         TunnelChannelHandle, TunnelRequest,
@@ -49,9 +48,7 @@ use support::ssh_harness::{
     connection_service,
 };
 
-use kerminal_infrastructure::connections::{
-    RusshRemoteConnectionDependencies, RusshRemoteConnectionService, SshSessionTransportFactory,
-};
+use kerminal_infrastructure::connections::SshSessionTransportFactory;
 
 /// 使用 loopback fixture 地址生成不引用用户 home/config 的 SSH profile。
 fn profile_for(
@@ -76,7 +73,7 @@ fn profile_for(
     }
 }
 
-/// 给 loopback server 注入精确指纹，测试普通连接路径必须已显式受信。
+/// 为需要 Known 状态的用例注入精确指纹，普通连接仍使用自动信任路径。
 fn trusted_known_hosts(
     server: &SshServerFixture,
     endpoint: &HostEndpoint,
@@ -131,16 +128,6 @@ impl KnownHostsRepository for ReadOnlyKnownHostsRepository {
     /// 记录调用次数并返回只读错误，验证调用方只降级为 warning 而不是阻断连接。
     async fn trust(&self, _endpoint: &HostEndpoint, _identity: &HostKeyIdentity) -> AppResult<()> {
         self.trust_attempts.fetch_add(1, Ordering::Relaxed);
-        Err(AppError::unsupported("test known_hosts is read-only"))
-    }
-
-    /// 本批次连接路径不调用 replace；显式失败避免测试误以为存在写入能力。
-    async fn replace(
-        &self,
-        _endpoint: &HostEndpoint,
-        _expected_previous_fingerprint_sha256: &str,
-        _identity: &HostKeyIdentity,
-    ) -> AppResult<()> {
         Err(AppError::unsupported("test known_hosts is read-only"))
     }
 }
@@ -917,7 +904,7 @@ async fn unknown_host_key_is_auto_trusted_and_connection_continues() {
     server.shutdown().await;
 }
 
-/// 已保存指纹变化时自动替换旧 key 并继续连接，不再以 host_key_changed 阻断。
+/// 已保存指纹变化时自动替换旧 key 并继续连接，不再因主机密钥变化阻断。
 #[tokio::test]
 async fn changed_host_key_is_replaced_and_connection_continues() {
     let server = SshServerFixture::spawn(SshServerOptions::default())
@@ -1125,8 +1112,9 @@ async fn network_failure_is_not_classified_as_host_key_error() {
         .err()
         .expect("closed listener fails the handshake");
 
-    assert!(
-        !matches!(error, AppError::HostKeyUnknown | AppError::HostKeyChanged),
+    assert_eq!(
+        error.public_code(),
+        PublicErrorCode::Infrastructure,
         "a network KEX failure must keep its generic SSH classification"
     );
     assert_eq!(
@@ -1137,205 +1125,6 @@ async fn network_failure_is_not_classified_as_host_key_error() {
         "a failed handshake must not reach credential resolution"
     );
     accept.await.expect("listener task completes");
-}
-
-/// 显式信任会重握手并比对完整指纹；保存 endpoint 快照以适配 service 消费 profile。
-///
-/// @author kongweiguang
-#[tokio::test]
-async fn host_key_trust_requires_second_handshake_and_exact_fingerprint() {
-    let server = SshServerFixture::spawn(SshServerOptions::default())
-        .await
-        .expect("loopback server starts");
-    let (profile, credentials) = password_setup(&server);
-    let host_id = profile.host_id.clone();
-    let endpoint = profile.endpoint.clone();
-    let known_hosts = Arc::new(TestKnownHostsRepository::default());
-    let service = connection_service(profile, credentials, known_hosts.clone());
-    let challenge = service
-        .inspect_host_key(
-            host_id.clone(),
-            HostKeyPeer::Target,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("host key inspection succeeds before authentication");
-    assert_eq!(challenge.status, HostKeyStatus::Unknown);
-
-    let incorrect = service
-        .trust_host_key(
-            HostKeyTrustRequest {
-                host_id: host_id.clone(),
-                peer: HostKeyPeer::Target,
-                endpoint: endpoint.clone(),
-                expected_fingerprint_sha256: "SHA256:incorrect".to_owned(),
-            },
-            CancellationToken::new(),
-        )
-        .await
-        .expect_err("mismatched confirmation is rejected");
-    assert!(matches!(incorrect, AppError::HostKeyTrustMismatch));
-    let still_unknown = service
-        .inspect_host_key(
-            host_id.clone(),
-            HostKeyPeer::Target,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("mismatched trust attempt leaves current state untouched");
-    assert_eq!(still_unknown.status, HostKeyStatus::Unknown);
-
-    let receipt = service
-        .trust_host_key(
-            HostKeyTrustRequest {
-                host_id: host_id.clone(),
-                peer: HostKeyPeer::Target,
-                endpoint: endpoint.clone(),
-                expected_fingerprint_sha256: server.fingerprint_sha256.clone(),
-            },
-            CancellationToken::new(),
-        )
-        .await
-        .expect("exact fingerprint confirmation is persisted");
-    assert_eq!(receipt.fingerprint_sha256, server.fingerprint_sha256);
-    assert_eq!(receipt.endpoint, endpoint);
-
-    let lease = service
-        .connect(host_id, ConnectionIntent::Exec, CancellationToken::new())
-        .await
-        .expect("trusted peer accepts a later authenticated connection");
-    lease.close("host key trust test complete").await.ok();
-    server.shutdown().await;
-}
-
-/// 仅供 endpoint 变更竞态用例替换单个 profile，其他 SSH 行为仍使用真实 russh fixture。
-struct MutableHostRepository {
-    profile: StdMutex<HostConnectionProfile>,
-}
-
-impl MutableHostRepository {
-    /// 保存可控的单个测试 profile，避免共享配置文件或用户主机数据。
-    ///
-    /// @author kongweiguang
-    fn new(profile: HostConnectionProfile) -> Self {
-        Self {
-            profile: StdMutex::new(profile),
-        }
-    }
-
-    /// 在 UI challenge 产生后更新 endpoint，精确模拟信任确认期间配置被替换。
-    ///
-    /// @author kongweiguang
-    fn replace_profile(&self, profile: HostConnectionProfile) {
-        *self
-            .profile
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = profile;
-    }
-}
-
-#[async_trait::async_trait]
-impl HostConnectionRepository for MutableHostRepository {
-    /// 按 HostId 返回最新快照，使 service 能发现挑战后 endpoint 已变化。
-    ///
-    /// @author kongweiguang
-    async fn load(&self, host_id: &HostId) -> AppResult<HostConnectionProfile> {
-        let profile = self
-            .profile
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
-        if &profile.host_id != host_id {
-            return Err(AppError::not_found("测试主机不存在"));
-        }
-        Ok(profile)
-    }
-}
-
-/// challenge 之后 profile 改指向同 key 的另一 SSH endpoint 时，旧确认不得信任新目标。
-///
-/// @author kongweiguang
-#[tokio::test]
-async fn host_key_trust_rejects_endpoint_change_after_challenge() {
-    let original_server = SshServerFixture::spawn(SshServerOptions::default())
-        .await
-        .expect("original loopback server starts");
-    let replacement_server = SshServerFixture::spawn(SshServerOptions::default())
-        .await
-        .expect("replacement loopback server starts");
-    assert_eq!(
-        original_server.fingerprint_sha256, replacement_server.fingerprint_sha256,
-        "both isolated fixtures expose the same test SSH host key"
-    );
-
-    let (profile, credentials) = password_setup(&original_server);
-    let host_id = profile.host_id.clone();
-    let repository = Arc::new(MutableHostRepository::new(profile.clone()));
-    let known_hosts = Arc::new(TestKnownHostsRepository::default());
-    let service = Arc::new(RusshRemoteConnectionService::new(
-        RusshRemoteConnectionDependencies {
-            hosts: repository.clone(),
-            credentials,
-            known_hosts: known_hosts.clone(),
-        },
-    ));
-    let challenge = service
-        .inspect_host_key(
-            host_id.clone(),
-            HostKeyPeer::Target,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("the original endpoint produces a live host-key challenge");
-    assert_eq!(challenge.endpoint, profile.endpoint);
-    assert_eq!(challenge.status, HostKeyStatus::Unknown);
-
-    let mut replacement_profile = profile.clone();
-    replacement_profile.endpoint = HostEndpoint {
-        host: replacement_server.address.ip().to_string(),
-        port: replacement_server.address.port(),
-        username: profile.endpoint.username.clone(),
-    };
-    repository.replace_profile(replacement_profile.clone());
-
-    let result = service
-        .trust_host_key(
-            HostKeyTrustRequest {
-                host_id,
-                peer: HostKeyPeer::Target,
-                endpoint: challenge.endpoint.clone(),
-                expected_fingerprint_sha256: challenge.fingerprint_sha256.clone(),
-            },
-            CancellationToken::new(),
-        )
-        .await;
-    assert!(
-        matches!(result, Err(AppError::Conflict { .. })),
-        "the endpoint in the stale UI confirmation must not be substituted"
-    );
-    assert_eq!(
-        replacement_server
-            .accepted_connections
-            .load(Ordering::Relaxed),
-        0,
-        "endpoint drift is rejected before the replacement endpoint is contacted"
-    );
-    assert_eq!(
-        original_server.accepted_connections.load(Ordering::Relaxed),
-        1,
-        "only the initial challenge handshake reaches the original endpoint"
-    );
-    assert_eq!(
-        known_hosts
-            .inspect(&replacement_profile.endpoint, &challenge.identity)
-            .await
-            .expect("replacement endpoint trust state remains readable"),
-        HostKeyStatus::Unknown,
-        "the stale confirmation must not write the new endpoint's trust record"
-    );
-
-    original_server.shutdown().await;
-    replacement_server.shutdown().await;
 }
 
 /// 连接开始前取消必须在取密和网络操作前终止本次连接尝试。
@@ -2724,41 +2513,6 @@ impl RemoteConnectionService for RetryableOpenFailureConnections {
         }
         let inner: Arc<dyn RemoteConnectionHandle> = self.handle.clone();
         Ok(RemoteConnectionLease::new(inner))
-    }
-
-    /// 此测试不经过 host-key 流程，意外调用时明确拒绝。
-    /// @author kongweiguang
-    async fn inspect_host_key(
-        &self,
-        _host_id: HostId,
-        _peer: HostKeyPeer,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        Err(AppError::unsupported("test host-key inspection is unused"))
-    }
-
-    /// 此测试不保存 host-key 信任，意外调用时明确拒绝。
-    /// @author kongweiguang
-    async fn trust_host_key(
-        &self,
-        _request: HostKeyTrustRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        Err(AppError::unsupported("test host-key trust is unused"))
-    }
-
-    /// 此测试替身未覆盖主机密钥轮换，显式拒绝可避免伪造信任回执。
-    ///
-    /// @author kongweiguang
-    async fn replace_host_key(
-        &self,
-        _request: kerminal_application::connections::HostKeyRotationRequest,
-        _cancel: tokio_util::sync::CancellationToken,
-    ) -> kerminal_application::AppResult<kerminal_application::connections::HostKeyRotationReceipt>
-    {
-        Err(kerminal_application::AppError::unsupported(
-            "test fake does not support host-key rotation",
-        ))
     }
 }
 

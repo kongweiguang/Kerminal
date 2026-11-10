@@ -732,7 +732,7 @@ pub struct RootView {
     /// 主机编辑器和设置互斥使用独立焦点边界；关闭只恢复焦点，不切换工作区或重建会话。
     connections_modal_focus_handle: FocusHandle,
     connections_modal_open: bool,
-    /// 信任与外部认证提示和主机编辑共用单一 Root 遮罩与焦点边界，不留在左栏子树里。
+    /// 外部认证提示和主机编辑共用单一 Root 遮罩与焦点边界，不留在左栏子树里。
     connection_prompt_modal_open: bool,
     connections_modal_return_focus: Option<FocusHandle>,
     connections_modal_generation: u64,
@@ -869,7 +869,7 @@ pub struct RootView {
     sftp_workbench_tab_open: bool,
     /// 只在批量持久标签全部收到成功回执后关闭工作台；失败批次保留此意图供原目标重试。
     sftp_workbench_close_after_batch: Option<Vec<TabId>>,
-    /// 中央导航或 picker 新建表单推进意图代次；连接指纹模态的焦点变化保留本次 SFTP 意图。
+    /// 中央导航或 picker 新建表单推进意图代次；连接确认模态的焦点变化保留本次 SFTP 意图。
     surface_navigation_generation: u64,
     /// 仅在侧栏显式请求后保留 host 与 pane 身份；导航变化或请求替换立即失效。
     pending_sidebar_container: Option<sidebar_containers::SidebarContainerRequest>,
@@ -880,7 +880,7 @@ pub struct RootView {
     pending_sftp_transfer_navigation: Option<connections::SftpNavigationRequest>,
     /// 仅工作台选择器的专用创建流程可在保存后回投；窗口重建不恢复此一次性意图。
     pending_sftp_host_creation: Option<connections::PendingSftpHostCreation>,
-    /// 双侧选择各自冻结来源；复用连接面板的单个信任通道依次处理。
+    /// 双侧选择各自冻结来源；复用连接面板的单个连接确认通道依次处理。
     pending_file_sftp_selections: VecDeque<connections::FileSftpSelectionRequest>,
     active_file_sftp_selection: Option<connections::FileSftpSelectionRequest>,
     /// orphan session 的可见重试入口只投影 WorkspaceRuntime 中保留的实际资源 owner。
@@ -3477,52 +3477,48 @@ impl RootView {
             snippet_current_command_subscription,
             snippet_host_move_subscription,
         ) = Self::subscribe_commands_view(commands_view.as_ref(), window, cx);
-        let connections_panel = services
-            .hosts
-            .clone()
-            .zip(services.remote_connections.clone())
-            .map(|(hosts, remote)| {
-                let rdp = services.rdp_launcher.clone();
-                let rdp_status = services.rdp_launch_status.clone();
-                let serial_ports = services.serial_ports.clone();
-                let connection_probe = services.connection_probe.clone();
-                let external_launch = services.external_launch.clone();
-                let profiles = services.profiles.clone();
-                let executor = services.executor.clone();
-                let recovery = configuration_recovery.clone();
-                let configuration_changes = services.configuration_changes.clone();
-                cx.new(|cx| {
-                    let panel = crate::features::connections::ConnectionsPanel::new(
-                        hosts, remote, rdp, executor, recovery, window, cx,
-                    )
-                    .with_profiles(profiles, cx)
-                    .with_host_form_factories(services.host_form_factories.clone());
-                    let panel = match services.plugin_hosts.clone() {
-                        Some(service) => panel.with_plugin_hosts(service),
-                        None => panel,
-                    };
-                    let panel = match external_launch {
-                        Some(service) => panel.with_external_launch_service(service),
-                        None => panel,
-                    };
-                    let panel = match configuration_changes {
-                        Some(changes) => panel.with_configuration_changes(changes),
-                        None => panel,
-                    };
-                    let panel = match serial_ports {
-                        Some(service) => panel.with_serial_port_service(service),
-                        None => panel,
-                    };
-                    let panel = match connection_probe {
-                        Some(service) => panel.with_connection_probe_service(service),
-                        None => panel,
-                    };
-                    match rdp_status {
-                        Some(service) => panel.with_rdp_launch_status_service(service),
-                        None => panel,
-                    }
-                })
-            });
+        let connections_panel = services.hosts.clone().map(|hosts| {
+            let rdp = services.rdp_launcher.clone();
+            let rdp_status = services.rdp_launch_status.clone();
+            let serial_ports = services.serial_ports.clone();
+            let connection_probe = services.connection_probe.clone();
+            let external_launch = services.external_launch.clone();
+            let profiles = services.profiles.clone();
+            let executor = services.executor.clone();
+            let recovery = configuration_recovery.clone();
+            let configuration_changes = services.configuration_changes.clone();
+            cx.new(|cx| {
+                let panel = crate::features::connections::ConnectionsPanel::new(
+                    hosts, rdp, executor, recovery, window, cx,
+                )
+                .with_profiles(profiles, cx)
+                .with_host_form_factories(services.host_form_factories.clone());
+                let panel = match services.plugin_hosts.clone() {
+                    Some(service) => panel.with_plugin_hosts(service),
+                    None => panel,
+                };
+                let panel = match external_launch {
+                    Some(service) => panel.with_external_launch_service(service),
+                    None => panel,
+                };
+                let panel = match configuration_changes {
+                    Some(changes) => panel.with_configuration_changes(changes),
+                    None => panel,
+                };
+                let panel = match serial_ports {
+                    Some(service) => panel.with_serial_port_service(service),
+                    None => panel,
+                };
+                let panel = match connection_probe {
+                    Some(service) => panel.with_connection_probe_service(service),
+                    None => panel,
+                };
+                match rdp_status {
+                    Some(service) => panel.with_rdp_launch_status_service(service),
+                    None => panel,
+                }
+            })
+        });
         let host_navigation = services.hosts.clone().map(|hosts| {
             let executor = services.executor.clone();
             let profiles = services.profiles.clone();
@@ -5514,7 +5510,7 @@ impl RootView {
         true
     }
 
-    /// 先聚焦 Root 的 trap，再下一帧把输入移交给一次性认证框；信任确认本身保留 trap 焦点。
+    /// 先聚焦 Root 的 trap，再下一帧把输入移交给一次性认证框；用户名/密码确认本身保留 trap 焦点。
     ///
     /// @author kongweiguang
     fn focus_connection_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {

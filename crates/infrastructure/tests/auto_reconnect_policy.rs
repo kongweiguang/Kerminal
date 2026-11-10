@@ -216,19 +216,16 @@ fn suppresses_non_ui_targets_initial_commands_manual_close_and_exit_status() {
     );
 }
 
-/// 只有专用 retryable disconnect 能触发重试；认证、hostkey、超时和泛化 IO 仍失败关闭。
+/// 只有专用 retryable disconnect 能触发重试；认证、超时和泛化 IO 仍失败关闭。
 ///
 /// @author kongweiguang
 #[test]
-fn suppresses_authentication_hostkey_timeout_and_generic_failures() {
+fn suppresses_authentication_timeout_and_generic_failures() {
     let policy = AutoReconnectPolicy::default();
     let owner = ui_owner();
     let target = ssh_target(None);
     let failures = [
         AppError::AuthenticationFailed,
-        AppError::HostKeyUnknown,
-        AppError::HostKeyChanged,
-        AppError::HostKeyTrustMismatch,
         AppError::timeout("SSH connect"),
         AppError::infrastructure("unclassified SSH IO failure"),
     ];

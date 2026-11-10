@@ -7,11 +7,7 @@ use std::{fs, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult,
-    connections::{
-        ConnectionIntent, HostKeyChallenge, HostKeyPeer, HostKeyRotationReceipt,
-        HostKeyRotationRequest, HostKeyTrustReceipt, HostKeyTrustRequest, RemoteConnectionLease,
-        RemoteConnectionService,
-    },
+    connections::{ConnectionIntent, RemoteConnectionLease, RemoteConnectionService},
     transfers::{
         TransferBackend, TransferExecutionContext, TransferExecutionError, TransferExecutionResult,
         TransferQueueOptions, TransferService,
@@ -112,40 +108,6 @@ impl RemoteConnectionService for LocalOnlyConnections {
         _cancel: CancellationToken,
     ) -> AppResult<RemoteConnectionLease> {
         Err(AppError::unsupported("本机续传测试不连接远端"))
-    }
-
-    /// 本机续传不读取远端主机密钥。
-    ///
-    /// @author kongweiguang
-    async fn inspect_host_key(
-        &self,
-        _host_id: HostId,
-        _peer: HostKeyPeer,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyChallenge> {
-        Err(AppError::unsupported("本机续传测试不读取远端密钥"))
-    }
-
-    /// 本机续传不修改远端主机信任。
-    ///
-    /// @author kongweiguang
-    async fn trust_host_key(
-        &self,
-        _request: HostKeyTrustRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyTrustReceipt> {
-        Err(AppError::unsupported("本机续传测试不修改远端信任"))
-    }
-
-    /// 本机续传不触发远端主机密钥轮换。
-    ///
-    /// @author kongweiguang
-    async fn replace_host_key(
-        &self,
-        _request: HostKeyRotationRequest,
-        _cancel: CancellationToken,
-    ) -> AppResult<HostKeyRotationReceipt> {
-        Err(AppError::unsupported("本机续传测试不轮换远端密钥"))
     }
 }
 

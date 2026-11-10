@@ -3757,11 +3757,9 @@ fn transfer_error(
         }
         PublicErrorCode::Invalid | PublicErrorCode::NotFound => TransferFailureKind::InvalidSource,
         PublicErrorCode::Timeout => TransferFailureKind::IdleTimeout,
-        PublicErrorCode::Infrastructure
-        | PublicErrorCode::AuthenticationFailed
-        | PublicErrorCode::HostKeyUnknown
-        | PublicErrorCode::HostKeyChanged
-        | PublicErrorCode::HostKeyTrustMismatch => TransferFailureKind::Connection,
+        PublicErrorCode::Infrastructure | PublicErrorCode::AuthenticationFailed => {
+            TransferFailureKind::Connection
+        }
         _ => TransferFailureKind::Internal,
     };
     let retryable = matches!(
