@@ -64,6 +64,8 @@ pub(crate) struct PaneHeaderProjection {
     pub(crate) broadcast: PaneBroadcastProjection,
     /// 会话已断开时标题栏显示固定状态标记；正文不插入状态条，连接后自动消失。
     pub(crate) session_disconnected: bool,
+    /// 候选分屏已进入失败态；标题徽标必须如实提示，不能继续宣称正在准备。
+    pub(crate) candidate_failed: bool,
 }
 
 /// 标题栏会话操作来自当前服务观察；同一槽位切换重新连接或取消重新连接。
@@ -564,14 +566,24 @@ impl WorkspacePanes {
 
         if candidate_pane {
             // 用固定宽度的短徽标代替整句占位，避免提示语挤走右侧操作按钮。
+            // 失败态继续显示“准备中”会误导用户等待，因此按真实运行阶段切换文案与颜色。
+            let (badge_label, badge_color) = if header_projection.candidate_failed {
+                (
+                    crate::locale::text("启动失败", "Start failed"),
+                    theme.warning,
+                )
+            } else {
+                (crate::locale::text("准备中…", "Preparing…"), theme.muted)
+            };
             header = header.child(
                 div()
                     .id(format!("workspace-pane-prepare-{}", pane_id.as_str()))
+                    .debug_selector(|| "rr-workspace-pane-prepare".into())
                     .flex_none()
                     .px(px(4.))
                     .text_size(px(11.))
-                    .text_color(theme.muted)
-                    .child(crate::locale::text("准备中…", "Preparing…")),
+                    .text_color(badge_color)
+                    .child(badge_label),
             );
         }
 
@@ -638,6 +650,8 @@ impl WorkspacePanes {
                 .icon(IconName::Close)
                 .w(px(22.))
                 .h(px(22.))
+                // 窄分屏先压缩标题而不是按钮，保证关闭/取消入口始终留在标题栏内。
+                .flex_none()
                 .accessibility_label(close_label.clone())
                 .tooltip(close_label)
                 .tab_stop(true)
@@ -1043,11 +1057,7 @@ fn split_button(
             .w(px(22.))
             .h(px(22.))
             .accessibility_label(label.clone())
-            .tooltip(if enabled {
-                tooltip
-            } else {
-                disabled_reason
-            })
+            .tooltip(if enabled { tooltip } else { disabled_reason })
             .tab_stop(true)
             .disabled(!enabled)
             .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
@@ -1239,3 +1249,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../../tests/unit/workspace_panes_candidate_path.rs"]
 mod candidate_path_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/workspace_panes_candidate_header.rs"]
+mod candidate_header_tests;

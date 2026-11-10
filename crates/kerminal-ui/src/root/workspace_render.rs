@@ -206,6 +206,8 @@ impl WorkspaceRender {
                         }),
                         broadcast: projection.broadcast,
                         session_disconnected: projection.session_disconnected,
+                        candidate_failed: pane_surface_state(&projection)
+                            == PaneSurfaceState::Failed,
                     },
                     Err(_) => PaneHeaderProjection {
                         title: crate::locale::text("本地终端", "Local terminal"),
@@ -214,6 +216,7 @@ impl WorkspaceRender {
                         host_picker: None,
                         broadcast: PaneBroadcastProjection::default(),
                         session_disconnected: false,
+                        candidate_failed: false,
                     },
                 },
             )
