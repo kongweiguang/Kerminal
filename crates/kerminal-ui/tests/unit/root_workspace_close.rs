@@ -19,13 +19,14 @@ use crate::root::workspace_close::{
     take_restore_close_tab_focus,
 };
 use crate::root::{
-    PendingPaneFocusIntent,
+    CloseRetryFocusSource, PendingPaneFocusIntent, close_retry_focus_source,
     workspace_close::{
         CleanupOwnerSnapshot, CloseSurvivorFocusIntent, CloseTabFocusIntent, SessionCloseRequest,
         WorkspaceCloseResource, close_sessions_until,
     },
     workspace_runtime::{RuntimePanePhase, WorkspaceRuntime},
 };
+use gpui_kit::TestAppContext;
 use kerminal_application::sessions::{SessionDeadline, UiSessionBinding};
 use kerminal_application::workspace::{
     WorkspaceLocalMachineScope, WorkspaceMachineStatus, WorkspacePaneMode,
@@ -1468,4 +1469,21 @@ fn batch_close_keeps_shared_deadline_and_retries_partial_ack_in_place() {
         .expect("the same operation commits after every close acknowledgement");
     assert!(controller.snapshot().terminal_tabs.is_empty());
     assert!(controller.pending_resource_operation().is_none());
+}
+
+/// 失败关闭的鼠标重试没有键盘票据，仍必须选择带窗口入口捕获当前焦点；
+/// 键盘来源则透传原控件票据。该纯选择锁定两个重试分支都不会退回无窗口资源入口。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn close_retry_focus_source_keeps_window_entry_for_pointer_retry(app: &mut TestAppContext) {
+    let keyboard_focus = app.update(|cx| cx.focus_handle());
+    assert_eq!(
+        close_retry_focus_source(Some(&keyboard_focus)),
+        CloseRetryFocusSource::Keyboard
+    );
+    assert_eq!(
+        close_retry_focus_source(None),
+        CloseRetryFocusSource::Pointer
+    );
 }

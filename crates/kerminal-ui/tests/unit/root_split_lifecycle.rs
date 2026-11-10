@@ -1047,3 +1047,100 @@ fn split_admission_failure_preserves_other_resource_owner(app: &mut TestAppConte
         });
     });
 }
+
+/// 批量分屏中止后 cleanup 回投仍必须登记 orphan owner；只有摘要不被普通清理文案覆盖，
+/// 两次登记都失败时则把“关闭不会提交”的关键状态追加到摘要。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn aborted_split_batch_still_retains_orphan_cleanup_owner(app: &mut TestAppContext) {
+    let (_runtime, root, _sessions, _, visual) = fixture(app);
+    visual.update(|_, app| {
+        root.update(app, |root, cx| {
+            let target = SessionTarget::Local(LocalSessionTarget {
+                program: OsString::from("fixture-cleanup-owner"),
+                args: Vec::new(),
+                working_directory: None,
+                environment: BTreeMap::new(),
+            });
+            let batch = SharedString::from("split batch summary");
+            root.split_batch_abort_status = Some(batch.clone());
+            root.status = Some(batch.clone());
+
+            // runtime 中没有目标 pane，retain_cleanup_session 会失败；orphan 必须兜底成功。
+            let orphan_pane = PaneId::new();
+            root.retain_failed_terminal_open_cleanup(
+                crate::root::terminal_open::FailedOpenCleanup {
+                    tab_id: TabId::new(),
+                    pane_id: orphan_pane.clone(),
+                    session_id: SessionId::new(),
+                    target: target.clone(),
+                    size: TerminalSize::default(),
+                    snapshot: None,
+                    status: "fixture cleanup".into(),
+                    external_lease: None,
+                    transient: false,
+                },
+                true,
+                cx,
+            );
+            assert!(
+                root.workspace_runtime
+                    .orphan_cleanup_for_pane(&orphan_pane)
+                    .next()
+                    .is_some(),
+                "aborted batch must still register an orphan cleanup owner"
+            );
+            assert_eq!(root.status.as_ref(), Some(&batch));
+            assert_eq!(root.split_batch_abort_status.as_ref(), Some(&batch));
+
+            // 预先占用同一 session 让 orphan 兜底也失败；关键失败必须并入摘要而不是被吞掉。
+            let duplicate_session = SessionId::new();
+            root.workspace_runtime
+                .retain_orphan_cleanup(crate::root::workspace_runtime::OrphanCleanupInput {
+                    tab_id: TabId::new(),
+                    pane_id: PaneId::new(),
+                    session_id: duplicate_session.clone(),
+                    target: target.clone(),
+                    size: TerminalSize::default(),
+                    snapshot: None,
+                    status: "existing owner".into(),
+                    external_lease: None,
+                    transient: false,
+                })
+                .unwrap();
+            root.retain_failed_terminal_open_cleanup(
+                crate::root::terminal_open::FailedOpenCleanup {
+                    tab_id: TabId::new(),
+                    pane_id: PaneId::new(),
+                    session_id: duplicate_session,
+                    target,
+                    size: TerminalSize::default(),
+                    snapshot: None,
+                    status: "fixture duplicate".into(),
+                    external_lease: None,
+                    transient: false,
+                },
+                true,
+                cx,
+            );
+            let status = root
+                .status
+                .as_ref()
+                .expect("critical cleanup failure must stay visible");
+            assert!(status.as_ref().starts_with(batch.as_ref()));
+            assert!(
+                status.as_ref().contains("清理 owner 无法登记")
+                    || status
+                        .as_ref()
+                        .contains("cleanup owner could not be retained"),
+                "status must surface the unregistered cleanup owner: {status:?}"
+            );
+            assert_eq!(
+                root.split_batch_abort_status.as_ref(),
+                Some(status),
+                "batch summary record must include the critical failure"
+            );
+        });
+    });
+}

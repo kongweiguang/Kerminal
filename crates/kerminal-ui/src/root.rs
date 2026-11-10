@@ -2915,7 +2915,11 @@ impl RootView {
                 // “不是分屏创建”挡回；仍等待回执的 ClosePane 继续走下面的等待提示。
                 if let Some(operation) = self.retry_failed_close_pane_for_target(&tab_id, &pane_id)
                 {
-                    self.handle_workspace_resource_operation(operation, cx);
+                    // 占位按钮没有键盘票据，仍须走可变 Window 入口捕获当前幸存焦点；
+                    // 无窗口入口会静默丢掉焦点交接。
+                    self.handle_workspace_resource_operation_from_window(
+                        operation, None, window, cx,
+                    );
                     return;
                 }
                 let pending_operation = self
@@ -3125,16 +3129,19 @@ impl RootView {
                     if let Some(operation) =
                         self.retry_failed_close_pane_for_target(&tab_id, pane_id)
                     {
-                        if let Some(close_focus) = keyboard_close_focus {
-                            self.handle_workspace_resource_operation_from_window(
-                                operation,
-                                Some(close_focus),
-                                window,
-                                cx,
-                            );
-                        } else {
-                            self.handle_workspace_resource_operation(operation, cx);
-                        }
+                        // 键盘来源继续透传原票据；鼠标与占位重试都经由带窗口入口
+                        // 捕获当前焦点，不能退化成后台资源入口。
+                        let window_focus =
+                            match close_retry_focus_source(keyboard_close_focus.as_ref()) {
+                                CloseRetryFocusSource::Keyboard => keyboard_close_focus,
+                                CloseRetryFocusSource::Pointer => None,
+                            };
+                        self.handle_workspace_resource_operation_from_window(
+                            operation,
+                            window_focus,
+                            window,
+                            cx,
+                        );
                         return;
                     }
                     let committed_layout =
@@ -7390,6 +7397,31 @@ fn recovery_banner_height(state: &ConfigurationRecoveryState) -> f32 {
         return 0.0;
     }
     RECOVERY_BANNER_HEADER_HEIGHT + RECOVERY_ISSUE_ROW_HEIGHT * state.issues.len() as f32
+}
+
+/// 失败关闭重试的焦点票据来源：键盘 click 携带精确控件焦点并需要再次核对；
+/// 鼠标与占位重试没有票据。两种来源都必须走可变 Window 入口，后者在 Pointer 时
+/// 自行捕获当前幸存焦点，不能退回无窗口资源入口而静默丢失交接。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CloseRetryFocusSource {
+    Keyboard,
+    Pointer,
+}
+
+/// 只有键盘来源透传控件焦点；Pointer 显式表示由带窗口入口捕获。
+/// 返回值不承载 Window，避免调用方误把来源选择当成可使用后台入口的依据。
+///
+/// @author kongweiguang
+pub(crate) fn close_retry_focus_source(
+    keyboard_close_focus: Option<&FocusHandle>,
+) -> CloseRetryFocusSource {
+    if keyboard_close_focus.is_some() {
+        CloseRetryFocusSource::Keyboard
+    } else {
+        CloseRetryFocusSource::Pointer
+    }
 }
 
 #[cfg(test)]

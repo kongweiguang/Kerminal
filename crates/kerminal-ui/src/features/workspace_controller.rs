@@ -659,7 +659,22 @@ impl WorkspaceController {
                     .pending_resource
                     .take()
                     .ok_or_else(|| AppError::conflict("工作区资源操作状态已变化"))?;
-                self.snapshot = pending.candidate;
+                let mut candidate = pending.candidate;
+                // 关闭失败期间仍放行选择，用户可能在重试前切到其它标签或 pane；
+                // 直接回放关闭开始时克隆的候选会把选择拉回旧位置并再次持久化。
+                // 这里只修正选择字段，候选布局与已移除 pane 仍由关闭操作自身决定。
+                if matches!(
+                    &pending.operation,
+                    WorkspaceResourceOperation::ClosePane { .. }
+                        | WorkspaceResourceOperation::CloseTab { .. }
+                ) {
+                    let (active_tab_id, focused_pane_id, selected_machine_id) =
+                        reconciled_close_candidate_selection(&self.snapshot, &candidate);
+                    candidate.active_tab_id = active_tab_id;
+                    candidate.focused_pane_id = focused_pane_id;
+                    candidate.selected_machine_id = selected_machine_id;
+                }
+                self.snapshot = candidate;
                 self.sync_restore_status_after_change(&pending.operation);
                 if completed_tab_id.is_some()
                     && let Some(batch) = self.close_batch.as_mut()
@@ -2181,7 +2196,8 @@ impl WorkspaceController {
     }
 
     /// 用户切走失败候选后，重试成功应提交用户当前所在位置，而不是把视图拉回失败发生时的标签；
-    /// 只有 CreatePane 持有候选布局可镜像，ClosePane/CloseTab 没有候选树，保持无操作。
+    /// CreatePane 的候选布局可即时镜像选择；ClosePane/CloseTab 的候选只含已关闭结构，
+    /// 选择在 `complete_resource_operation` 提交时按候选内仍然有效的资源重新收敛，避免两侧互相覆盖。
     /// 只镜像三个选择字段，布局与候选 pane 仍由原操作独占。
     fn mirror_selection_into_failed_split_candidate(&mut self) {
         if !self.failed_create_pane_pending() {
@@ -2427,6 +2443,78 @@ fn remove_tab_from_snapshot(snapshot: &mut WorkspaceSessionSnapshot, index: usiz
             .any(|pane| &pane.id == focused)
     }) {
         snapshot.focused_pane_id = None;
+    }
+}
+
+/// 关闭候选在失败等待期间允许用户切换标签与 pane；提交时若整体回放候选，会把选择
+/// 拉回关闭发起时刻并再次持久化。此纯函数以当前快照中仍指向候选资源的选择为准，
+/// 同时保证 focused pane 属于最终 active tab、selected machine 跟随最终焦点：
+/// active tab 必须仍存在于候选，focused pane 必须属于该 tab 布局或候选中仍有该 pane，
+/// 否则回退候选自身的有效焦点或该 tab 的首个 pane，避免提交不可验证的快照。
+///
+/// @author kongweiguang
+fn reconciled_close_candidate_selection(
+    current: &WorkspaceSessionSnapshot,
+    candidate: &WorkspaceSessionSnapshot,
+) -> (Option<TabId>, Option<PaneId>, Option<String>) {
+    let retained_active_tab_id = current.active_tab_id.as_ref().filter(|tab_id| {
+        candidate
+            .terminal_tabs
+            .iter()
+            .any(|tab| tab.id() == *tab_id)
+    });
+    let active_tab_id = retained_active_tab_id
+        .cloned()
+        .or_else(|| candidate.active_tab_id.clone());
+    let active_tab = active_tab_id.as_ref().and_then(|tab_id| {
+        candidate
+            .terminal_tabs
+            .iter()
+            .find(|tab| tab.id() == tab_id)
+    });
+    let active_layout = active_tab.and_then(WorkspaceSessionTab::terminal_layout);
+
+    let current_focus_is_retained = current.focused_pane_id.as_ref().is_some_and(|focused| {
+        candidate
+            .terminal_panes
+            .iter()
+            .any(|pane| &pane.id == focused)
+            && active_layout.is_some_and(|layout| layout.contains_pane(focused))
+    });
+    let candidate_focus_is_retained = candidate
+        .focused_pane_id
+        .as_ref()
+        .is_some_and(|focused| active_layout.is_some_and(|layout| layout.contains_pane(focused)));
+    let focused_pane_id = if current_focus_is_retained {
+        current.focused_pane_id.clone()
+    } else if candidate_focus_is_retained {
+        candidate.focused_pane_id.clone()
+    } else {
+        active_layout.and_then(|layout| layout.pane_ids().first().cloned())
+    };
+
+    let selected_machine_id = focused_pane_id
+        .as_ref()
+        .and_then(|focused| {
+            candidate
+                .terminal_panes
+                .iter()
+                .find(|pane| &pane.id == focused)
+        })
+        .map(|pane| pane.machine_id.clone())
+        .or_else(|| active_tab.and_then(tab_selected_machine_id));
+    (active_tab_id, focused_pane_id, selected_machine_id)
+}
+
+/// 非终端标签没有 pane 焦点，机器选择跟随标签自身；扩展与未知标签不保留机器归属。
+/// @author kongweiguang
+fn tab_selected_machine_id(tab: &WorkspaceSessionTab) -> Option<String> {
+    match tab {
+        WorkspaceSessionTab::Terminal { machine_id, .. }
+        | WorkspaceSessionTab::SftpTransfer { machine_id, .. }
+        | WorkspaceSessionTab::FileWorkspace { machine_id, .. }
+        | WorkspaceSessionTab::WorkspaceFile { machine_id, .. } => Some(machine_id.clone()),
+        WorkspaceSessionTab::Extension { .. } | WorkspaceSessionTab::Unsupported { .. } => None,
     }
 }
 

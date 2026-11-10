@@ -1258,48 +1258,23 @@ impl RootView {
                         {
                             return;
                         }
-                        let session_id = session.session_id.clone();
-                        let target = session.target.clone();
-                        let session_size = session.size;
-                        let retained = root.workspace_runtime.retain_cleanup_session(
-                            &pane_id,
-                            session_id.clone(),
-                            target.clone(),
-                            session_size,
-                            snapshot.clone(),
-                            message.clone(),
+                        // 批量摘要只影响可见普通文案；清理 owner 的登记与 orphan 兜底必须始终执行，
+                        // 否则新 session 没有关闭路径，关键失败也会被摘要吞掉。
+                        root.retain_failed_terminal_open_cleanup(
+                            FailedOpenCleanup {
+                                tab_id: tab_id.clone(),
+                                pane_id: pane_id.clone(),
+                                session_id: session.session_id.clone(),
+                                target: session.target.clone(),
+                                size: session.size,
+                                snapshot,
+                                status: message,
+                                external_lease: orphan_lease.clone(),
+                                transient,
+                            },
+                            split_batch_aborted,
+                            cx,
                         );
-                        // 批量分屏已用真实原因生成中止摘要；本次 cleanup 回投只负责保留资源 owner，
-                        // 不能再把用户需要看到的摘要覆盖成单条清理文案。
-                        if !split_batch_aborted {
-                            root.status = Some(match retained {
-                                Ok(()) => message,
-                                Err(_) => {
-                                    let retained = root.workspace_runtime.retain_orphan_cleanup(
-                                        OrphanCleanupInput {
-                                            tab_id: tab_id.clone(),
-                                            pane_id: pane_id.clone(),
-                                            session_id,
-                                            target,
-                                            size: session_size,
-                                            snapshot,
-                                            status: message.clone(),
-                                            external_lease: orphan_lease.clone(),
-                                            transient,
-                                        },
-                                    );
-                                    root.refresh_workspace_orphan_cleanup(cx);
-                                    if retained.is_ok() {
-                                        message
-                                    } else {
-                                        crate::locale::text(
-                                            "终端已创建，但清理 owner 无法登记；关闭不会提交。",
-                                            "The terminal was created, but its cleanup owner could not be retained; close will not commit.",
-                                        )
-                                    }
-                                }
-                            });
-                        }
                         root.refresh_workspace_views(cx);
                         cx.notify();
                     });
@@ -2700,6 +2675,93 @@ async fn prepare_workspace_session(
                     }
                 }
             }
+        }
+    }
+}
+
+/// 已创建但未成功接入 pane 的真实资源；所有身份与 lease 集中传递，
+/// 避免清理回投的调用点逐个复制字段时漏掉关闭所需的 owner 信息。
+pub(super) struct FailedOpenCleanup {
+    pub(super) tab_id: TabId,
+    pub(super) pane_id: PaneId,
+    pub(super) session_id: SessionId,
+    pub(super) target: SessionTarget,
+    pub(super) size: TerminalSize,
+    pub(super) snapshot: Option<RenderSnapshot>,
+    pub(super) status: SharedString,
+    pub(super) external_lease: Option<ExternalTargetLease>,
+    pub(super) transient: bool,
+}
+
+impl RootView {
+    /// 批量分屏中止只能决定是否用普通清理文案覆盖摘要，不能跳过 orphan 登记：
+    /// 新 session 若没有 cleanup owner，关闭不会提交且真实资源会泄漏。
+    /// 两次登记都失败时必须把关键状态并入批量摘要，避免被“已中止”的摘要吞掉。
+    ///
+    /// @author kongweiguang
+    pub(super) fn retain_failed_terminal_open_cleanup(
+        &mut self,
+        cleanup: FailedOpenCleanup,
+        split_batch_aborted: bool,
+        cx: &mut Context<RootView>,
+    ) {
+        let FailedOpenCleanup {
+            tab_id,
+            pane_id,
+            session_id,
+            target,
+            size,
+            snapshot,
+            status,
+            external_lease,
+            transient,
+        } = cleanup;
+        let retained_cleanup = self.workspace_runtime.retain_cleanup_session(
+            &pane_id,
+            session_id.clone(),
+            target.clone(),
+            size,
+            snapshot.clone(),
+            status.clone(),
+        );
+        // 失败回执可能发生在 pane 已换代或已被占用之后；此时 orphan 仍是可关闭的真实资源。
+        let (owner_status, owner_registered) = match retained_cleanup {
+            Ok(()) => (status, true),
+            Err(_) => {
+                let retained_orphan =
+                    self.workspace_runtime
+                        .retain_orphan_cleanup(OrphanCleanupInput {
+                            tab_id,
+                            pane_id,
+                            session_id,
+                            target,
+                            size,
+                            snapshot,
+                            status: status.clone(),
+                            external_lease,
+                            transient,
+                        });
+                self.refresh_workspace_orphan_cleanup(cx);
+                if retained_orphan.is_ok() {
+                    (status, true)
+                } else {
+                    (
+                        crate::locale::text(
+                            "终端已创建，但清理 owner 无法登记；关闭不会提交。",
+                            "The terminal was created, but its cleanup owner could not be retained; close will not commit.",
+                        ),
+                        false,
+                    )
+                }
+            }
+        };
+        if split_batch_aborted {
+            // 批量摘要已携带真实中止原因；只有资源确实没有 owner 时才追加关键失败。
+            if !owner_registered {
+                self.append_split_batch_abort_status(owner_status, cx);
+            }
+        } else {
+            self.status = Some(owner_status);
         }
     }
 }

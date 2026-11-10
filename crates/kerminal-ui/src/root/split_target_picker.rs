@@ -1145,6 +1145,26 @@ impl RootView {
         true
     }
 
+    /// 批量中止摘要已占用可见状态时，清理 owner 登记失败必须追加而不是覆盖摘要；
+    /// 同步更新精确记录，避免后续按同一字符串清理时误删或残留关键失败。
+    ///
+    /// @author kongweiguang
+    pub(super) fn append_split_batch_abort_status(
+        &mut self,
+        critical: SharedString,
+        cx: &mut Context<RootView>,
+    ) {
+        let label = match self.split_batch_abort_status.as_ref() {
+            Some(current) => {
+                SharedString::from(format!("{} {}", current.as_ref(), critical.as_ref()))
+            }
+            None => critical,
+        };
+        self.split_batch_abort_status = Some(label.clone());
+        self.status = Some(label);
+        cx.notify();
+    }
+
     /// 新 pane 的会话输入 handler 异步绑定；保留当前焦点快照，只有新 pane Ready 且用户未改焦点才转交。
     ///
     /// @author kongweiguang

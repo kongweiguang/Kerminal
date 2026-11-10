@@ -901,6 +901,221 @@ fn failed_split_pending_allows_selection_and_commits_latest_selection() {
     assert_eq!(controller.snapshot().terminal_panes.len(), 3);
 }
 
+/// failed ClosePane 期间用户切到另一个标签，重试成功必须保留用户当前标签与焦点，
+/// 不能把关闭开始时的候选选择再次持久化回去。
+///
+/// @author kongweiguang
+#[test]
+fn failed_close_pane_retry_preserves_tab_selected_during_failure() {
+    let mut snapshot = snapshot_with_second_local_terminal(&one_terminal_snapshot());
+    let pane_a2 = local_pane("pane-a2");
+    let WorkspaceSessionTab::Terminal { layout, .. } = &mut snapshot.terminal_tabs[0] else {
+        unreachable!("fixture starts with a terminal tab");
+    };
+    *layout = layout
+        .split_pane(
+            &pane_id("pane-a"),
+            pane_a2.id.clone(),
+            SplitDirection::Vertical,
+            "split-a",
+            false,
+        )
+        .expect("fixture split is valid");
+    snapshot.terminal_panes.push(pane_a2.clone());
+    snapshot.active_tab_id = Some(tab_id("tab-a"));
+    snapshot.focused_pane_id = Some(pane_a2.id.clone());
+    snapshot.selected_machine_id = Some(pane_a2.machine_id.clone());
+    snapshot.validate().expect("two-pane fixture is valid");
+    let mut controller = WorkspaceController::from_loaded(
+        document_for(&snapshot),
+        WorkspaceSessionRevision::new("close-pane-selection"),
+    )
+    .unwrap();
+
+    let WorkspaceControllerEffect::ResourceOperation(operation) = controller
+        .apply_pane_event(
+            &tab_id("tab-a"),
+            WorkspacePaneEvent::Close(pane_a2.id.clone()),
+        )
+        .unwrap()
+    else {
+        panic!("closing a split pane must request a resource operation");
+    };
+    controller
+        .complete_resource_operation(
+            operation.operation_id(),
+            Err(WorkspaceRestoreFailure::ResourceFailure),
+        )
+        .unwrap();
+    controller
+        .apply_tab_event(WorkspaceTabEvent::Activate(tab_id("tab-b")))
+        .expect("failed close must not block tab selection");
+
+    controller
+        .complete_resource_operation(operation.operation_id(), Ok(()))
+        .unwrap();
+
+    assert_eq!(
+        controller.snapshot().active_tab_id,
+        Some(tab_id("tab-b")),
+        "retry must keep the user's current tab"
+    );
+    assert_eq!(
+        controller.snapshot().focused_pane_id,
+        Some(pane_id("pane-b")),
+        "focus must stay on the tab selected during the failure"
+    );
+    assert_eq!(
+        controller.snapshot().selected_machine_id,
+        Some("machine-local".to_owned())
+    );
+    assert!(
+        !controller
+            .snapshot()
+            .terminal_panes
+            .iter()
+            .any(|pane| pane.id == pane_a2.id),
+        "closed pane must still be removed"
+    );
+}
+
+/// failed CloseTab 期间用户切到未被关闭的标签，重试成功仍应停留在该标签，
+/// 而不是回退到关闭发起时持有的另一个标签。
+///
+/// @author kongweiguang
+#[test]
+fn failed_close_tab_retry_preserves_other_tab_selected_during_failure() {
+    let mut snapshot = snapshot_with_second_local_terminal(&one_terminal_snapshot());
+    let pane_c = local_pane("pane-c");
+    snapshot.terminal_panes.push(pane_c.clone());
+    snapshot
+        .terminal_tabs
+        .push(terminal_tab("tab-c", "Terminal C", &pane_c.id));
+    snapshot.active_tab_id = Some(tab_id("tab-a"));
+    snapshot.focused_pane_id = Some(pane_id("pane-a"));
+    snapshot.selected_machine_id = Some("machine-local".to_owned());
+    snapshot.validate().expect("three-tab fixture is valid");
+    let mut controller = WorkspaceController::from_loaded(
+        document_for(&snapshot),
+        WorkspaceSessionRevision::new("close-tab-selection"),
+    )
+    .unwrap();
+
+    let WorkspaceControllerEffect::ResourceOperation(operation) = controller
+        .apply_tab_event(WorkspaceTabEvent::Close(tab_id("tab-b")))
+        .unwrap()
+    else {
+        panic!("closing a tab must request a resource operation");
+    };
+    controller
+        .complete_resource_operation(
+            operation.operation_id(),
+            Err(WorkspaceRestoreFailure::ResourceFailure),
+        )
+        .unwrap();
+    controller
+        .apply_tab_event(WorkspaceTabEvent::Activate(tab_id("tab-c")))
+        .expect("failed close must not block tab selection");
+
+    controller
+        .complete_resource_operation(operation.operation_id(), Ok(()))
+        .unwrap();
+
+    assert_eq!(
+        controller.snapshot().active_tab_id,
+        Some(tab_id("tab-c")),
+        "retry must keep the tab selected after the failure"
+    );
+    assert_eq!(
+        controller.snapshot().focused_pane_id,
+        Some(pane_id("pane-c"))
+    );
+    assert_eq!(
+        controller.snapshot().selected_machine_id,
+        Some("machine-local".to_owned())
+    );
+    assert!(
+        !controller
+            .snapshot()
+            .terminal_tabs
+            .iter()
+            .any(|tab| tab.id() == &tab_id("tab-b")),
+        "closed tab must still be removed"
+    );
+}
+
+/// 当前焦点仍指向已被关闭的 pane 时，重试提交不能保留失效焦点，
+/// 应回退到候选内首个幸存 pane 并保持机器选择一致。
+///
+/// @author kongweiguang
+#[test]
+fn failed_close_pane_retry_does_not_focus_removed_pane() {
+    let mut snapshot = one_terminal_snapshot();
+    let pane_a2 = local_pane("pane-a2");
+    let WorkspaceSessionTab::Terminal { layout, .. } = &mut snapshot.terminal_tabs[0] else {
+        unreachable!("fixture starts with a terminal tab");
+    };
+    *layout = layout
+        .split_pane(
+            &pane_id("pane-a"),
+            pane_a2.id.clone(),
+            SplitDirection::Vertical,
+            "split-a",
+            false,
+        )
+        .expect("fixture split is valid");
+    snapshot.terminal_panes.push(pane_a2.clone());
+    snapshot.focused_pane_id = Some(pane_a2.id.clone());
+    snapshot.validate().expect("two-pane fixture is valid");
+    let mut controller = WorkspaceController::from_loaded(
+        document_for(&snapshot),
+        WorkspaceSessionRevision::new("close-pane-removed-focus"),
+    )
+    .unwrap();
+
+    let WorkspaceControllerEffect::ResourceOperation(operation) = controller
+        .apply_pane_event(
+            &tab_id("tab-a"),
+            WorkspacePaneEvent::Close(pane_a2.id.clone()),
+        )
+        .unwrap()
+    else {
+        panic!("closing a split pane must request a resource operation");
+    };
+    controller
+        .complete_resource_operation(
+            operation.operation_id(),
+            Err(WorkspaceRestoreFailure::ResourceFailure),
+        )
+        .unwrap();
+    assert_eq!(
+        controller.snapshot().focused_pane_id,
+        Some(pane_a2.id.clone()),
+        "failed close leaves the current snapshot untouched"
+    );
+
+    controller
+        .complete_resource_operation(operation.operation_id(), Ok(()))
+        .unwrap();
+
+    assert_eq!(
+        controller.snapshot().focused_pane_id,
+        Some(pane_id("pane-a")),
+        "focus must fall back to a surviving pane"
+    );
+    assert_eq!(
+        controller.snapshot().selected_machine_id,
+        Some("machine-local".to_owned())
+    );
+    assert!(
+        !controller
+            .snapshot()
+            .terminal_panes
+            .iter()
+            .any(|pane| pane.id == pane_a2.id)
+    );
+}
+
 /// 未报告实时目录的 shell 仍使用原参数；公开分屏入口不能绕过已有资源操作门禁。
 ///
 /// @author kongweiguang
