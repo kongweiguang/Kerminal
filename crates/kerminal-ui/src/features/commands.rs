@@ -1558,12 +1558,13 @@ impl CommandsView {
     }
 
     /// 整页重读先取代独立历史搜索，避免两条读取链互相覆盖；I/O 留在应用 runtime。
+    /// 只重读会话、历史、工作流和 UI 会话；全局片段目录与 session 无关，由片段数据变化路径
+    /// 单独调用 `refresh_snippet_page`，切换终端不得重启目录并重置列表。
     ///
     /// @author kongweiguang
     pub(super) fn reload_panel(&mut self, cx: &mut Context<Self>) {
         self.history_read.cancel();
         let history_generation = self.history_read.generation();
-        self.refresh_snippet_page(cx);
         self.panel_generation = self.panel_generation.wrapping_add(1).max(1);
         let generation = self.panel_generation;
         let service = self.commands.clone();
@@ -2946,6 +2947,7 @@ impl CommandsView {
     }
 
     /// 接受已保存定义并回显版本化草稿，同时重建变量输入而不写回默认值。
+    /// 保存成功后目录内容已变化，而整页重读不再覆盖片段页，因此需显式重读。
     fn finish_snippet_save(
         &mut self,
         generation: u64,
@@ -2967,6 +2969,7 @@ impl CommandsView {
                     format!("Saved snippet: {}", definition.title),
                 ));
                 self.reload_panel(cx);
+                self.refresh_snippet_page(cx);
                 if let Some(transition) = self.pending_snippet_transition.take() {
                     self.apply_snippet_transition(transition, window, cx);
                 }
@@ -3054,6 +3057,8 @@ impl CommandsView {
                         view.snippet_is_new = false;
                         view.status = Some(command_message("片段已删除", "Snippet deleted"));
                         view.reload_panel(cx);
+                        // 删除改变了目录内容，整页重读已不含片段页，必须显式重读。
+                        view.refresh_snippet_page(cx);
                     }
                     Ok(false) => {
                         view.status =

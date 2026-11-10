@@ -1036,6 +1036,8 @@ impl CommandsView {
                                 "The user copy is confirmed. The current built-in detail and runtime variables were kept",
                             ));
                             view.reload_panel(cx);
+                            // 用户副本已确认，目录条目发生变化；整页重读不再覆盖片段页。
+                            view.refresh_snippet_page(cx);
                         }
                         Err(error) => {
                             // 读回失败或暂未出现都不能证明原提交失败，因此继续保留 ID。

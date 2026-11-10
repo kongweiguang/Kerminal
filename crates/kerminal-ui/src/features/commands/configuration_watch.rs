@@ -226,6 +226,10 @@ impl CommandsView {
         }
 
         self.reload_panel(cx);
+        if snippets_changed {
+            // 片段文件变化才使目录过期；整页重读已不含片段页，仅调整工作流时不得重启目录。
+            self.refresh_snippet_page(cx);
+        }
         match self.section {
             CommandsSection::Snippets if snippets_changed => {
                 let Some(key) = self.selected_snippet.as_ref().map(|selected| {
