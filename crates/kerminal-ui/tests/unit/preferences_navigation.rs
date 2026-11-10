@@ -168,6 +168,7 @@ fn mcp_and_about_search_stay_inside_the_settings_pages() {
             PreferencesSection::Mcp,
         ),
         ("about", "settings-about-panel", PreferencesSection::About),
+        ("更新", "settings-about-panel", PreferencesSection::About),
     ] {
         let results = matching_navigation_targets(None, false, query);
         assert!(
@@ -203,8 +204,8 @@ fn extension_search_locates_the_settings_page() {
         "market",
         "插件",
         "市场",
-        "安装",
-        "更新",
+        "插件 安装",
+        "插件 更新",
         "启用",
         "禁用",
         "卸载",

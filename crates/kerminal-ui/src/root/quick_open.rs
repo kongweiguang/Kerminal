@@ -161,13 +161,10 @@ impl RootView {
                     // 扩展页已收回设置弹框：命令面板入口必须定位到弹框内的扩展分类。
                     self.open_preferences_modal(window, cx);
                     if !self.preferences_modal_open {
-                        self.status = Some(
-                            crate::locale::text(
-                                "请先关闭当前对话框，再打开扩展设置。",
-                                "Close the current dialog before opening extension settings.",
-                            )
-                            .into(),
-                        );
+                        self.status = Some(crate::locale::text(
+                            "请先关闭当前对话框，再打开扩展设置。",
+                            "Close the current dialog before opening extension settings.",
+                        ));
                         cx.notify();
                         return;
                     }

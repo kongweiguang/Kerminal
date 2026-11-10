@@ -548,7 +548,7 @@ async fn wait(
             draw(window, app);
             root.update(app, |root, cx| {
                 let mut value = root.plugin_acceptance_snapshot(cx);
-                value["page"] = serde_json::to_value(root.extensions_acceptance_snapshot(cx)?)
+                value["page"] = serde_json::to_value(root.extensions_acceptance_snapshot(cx))
                     .map_err(io::Error::other)?;
                 value["quitReady"] = json!(
                     root.transfer_workspace_acceptance_quit_ready()

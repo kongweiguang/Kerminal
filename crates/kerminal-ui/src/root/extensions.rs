@@ -170,6 +170,10 @@ impl super::RootView {
         }
         self.preferences_panel
             .update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+        // 服务缺失或页面创建失败时立即失败，避免验收到超时才报空快照。
+        if !self.preferences_panel.read(cx).extensions_page_exists() {
+            return Err(AppError::not_found("扩展页面不可用"));
+        }
         Ok(())
     }
 
@@ -194,11 +198,10 @@ impl super::RootView {
     pub fn extensions_acceptance_snapshot(
         &self,
         cx: &gpui_kit::App,
-    ) -> AppResult<Option<crate::features::extensions::ExtensionsAcceptanceSnapshot>> {
-        Ok(self
-            .preferences_panel
+    ) -> Option<crate::features::extensions::ExtensionsAcceptanceSnapshot> {
+        self.preferences_panel
             .read(cx)
-            .extensions_acceptance_snapshot(cx))
+            .extensions_acceptance_snapshot(cx)
     }
 }
 

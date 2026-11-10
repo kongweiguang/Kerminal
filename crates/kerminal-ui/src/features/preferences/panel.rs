@@ -1164,10 +1164,6 @@ impl PreferencesPanel {
         }
         self.section = section;
         self.selected_navigation_target = None;
-        // Extensions 页面需要窗口才能创建输入状态；这里只登记进入意图，正文绘制时创建并激活。
-        if section == PreferencesSection::Extensions {
-            self.extensions.request_activation();
-        }
         cx.notify();
     }
 

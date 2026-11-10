@@ -359,13 +359,6 @@ fn navigation_targets(
             0,
         ),
         (
-            "settings-extensions-panel",
-            PreferencesSection::Extensions,
-            "扩展市场",
-            "浏览、安装、更新、启用、禁用和卸载扩展。 extensions plugins market 插件 市场 安装 更新 启用 禁用 卸载",
-            0,
-        ),
-        (
             "settings-external-launch-compatibility",
             PreferencesSection::ExternalLaunch,
             "外部 SSH 启动",
@@ -405,6 +398,13 @@ fn navigation_targets(
             PreferencesSection::About,
             "关于",
             "版本、更新和项目链接。 about version update 关于 版本 更新",
+            0,
+        ),
+        (
+            "settings-extensions-panel",
+            PreferencesSection::Extensions,
+            "扩展市场",
+            "浏览、安装、更新、启用、禁用和卸载扩展。 extensions plugins market 插件 市场 安装 更新 启用 禁用 卸载",
             0,
         ),
     ] {
@@ -463,6 +463,15 @@ impl Render for PreferencesPanel {
             window.on_next_frame(move |_, _| scroll.scroll_to_top_of_item(index));
         }
         let theme = ThemeTokens::current(window, cx).for_settings();
+        // 提示只服务退出被写入拒绝的场景；写操作结束后立即清除，避免下次写入显示旧原因。
+        if !self.extensions.is_writing(cx) {
+            self.extensions.clear_notice();
+        }
+        let extension_notice = self
+            .extensions
+            .notice()
+            .filter(|_| self.extensions.is_writing(cx))
+            .map(str::to_owned);
         let content = if let Some(page) = self
             .external_plugins
             .selected
@@ -485,7 +494,7 @@ impl Render for PreferencesPanel {
                     .render_command_suggestions(theme, window, cx)
                     .into_any_element(),
                 PreferencesSection::Sftp => self.render_sftp(theme, window, cx).into_any_element(),
-                PreferencesSection::Extensions => match self.extensions_page(window, cx) {
+                PreferencesSection::Extensions => match self.extensions_page() {
                     Some(page) => page.into_any_element(),
                     None => div()
                         .p_4()
@@ -519,6 +528,33 @@ impl Render for PreferencesPanel {
                     self.render_configuration_sync(theme, cx).into_any_element()
                 }
             }
+        };
+
+        // 写入中退出被拒绝时，正文顶部保留可见原因；页面本身仍可继续操作。
+        let content = if let Some(notice) = extension_notice {
+            div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .w_full()
+                        .flex_shrink_0()
+                        .rounded(theme.control_radius)
+                        .border_1()
+                        .border_color(theme.warning.opacity(0.2))
+                        .bg(theme.warning.opacity(0.1))
+                        .px_3()
+                        .py_2()
+                        .text_size(theme.text_sm)
+                        .text_color(theme.warning)
+                        .child(notice),
+                )
+                .child(div().flex_1().min_h(px(0.)).child(content))
+                .into_any_element()
+        } else {
+            content
         };
 
         settings_text_font(
@@ -745,6 +781,7 @@ impl PreferencesPanel {
                     )),
                 ),
             );
+        let no_matches = !query.is_empty() && matches.is_empty() && plugin_matches.is_empty();
         let mut nav_rows = matches
             .into_iter()
             .map(|target| self.nav_button(target, theme, cx).into_any_element())
@@ -764,6 +801,20 @@ impl PreferencesPanel {
                     .on_click(cx.listener(move |panel, _: &ClickEvent, window, cx| {
                         panel.open_external_plugin(&id, window, cx);
                     }))
+                    .into_any_element(),
+            );
+        }
+        // 搜索无结果时保留可见空态，避免侧栏只剩搜索框而没有解释。
+        if no_matches {
+            nav_rows.push(
+                div()
+                    .px_2()
+                    .text_size(theme.text_sm)
+                    .text_color(theme.muted)
+                    .child(crate::locale::text(
+                        "没有找到匹配设置。",
+                        "No matching settings found.",
+                    ))
                     .into_any_element(),
             );
         }

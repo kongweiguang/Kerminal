@@ -1,10 +1,10 @@
-//! 三栏扩展页使用工作台语义颜色，操作状态不改变列表行高。
+//! 设置弹框内嵌三栏扩展页；操作状态不改变列表行高。
 //! @author kongweiguang
 
 use super::{Confirmation, ExtensionsEvent, ExtensionsPage, Filter, Operation, label, selection};
 use crate::theme::ThemeTokens;
 use gpui_kit::{
-    Context, IntoElement, Render, Window,
+    Context, InteractiveElement as _, IntoElement, Render, StatefulInteractiveElement as _, Window,
     component::{
         Disableable as _,
         button::{Button, ButtonVariants as _},
@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 impl Render for ExtensionsPage {
     /// 三列分别承载筛选、稳定行高的结果和所选条目详情；写操作由共享服务执行。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 页面现在由设置弹框承载，使用设置语义色才能与弹框内其它页面一致。
+        // 统一经设置主题入口取色；该入口当前可能没有视觉差异，保留以便后续主题演进。
         let theme = ThemeTokens::current(window, cx).for_settings();
         let query = self.search.read(cx).value().trim().to_lowercase();
         let mut categories = BTreeSet::new();
@@ -32,6 +32,7 @@ impl Render for ExtensionsPage {
         let installed = self.state.as_ref().map_or(0, |state| state.plugins.len());
         let pending = self.state.as_ref().map_or(0, |state| state.pending.len());
         let mut sidebar = div()
+            .id("extensions-filter-sidebar")
             .w(px(192.))
             .h_full()
             .flex_shrink_0()
@@ -39,6 +40,8 @@ impl Render for ExtensionsPage {
             .flex_col()
             .gap_2()
             .p_3()
+            .min_h(px(0.))
+            .overflow_y_scroll()
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.border)
@@ -709,9 +712,12 @@ impl Render for ExtensionsPage {
             .child(toolbar)
             .child(
                 div()
+                    .id("extensions-columns")
                     .flex_1()
                     .min_h(px(0.))
                     .flex()
+                    // 设置弹框可能窄于三栏自然宽度；保留横向滚动，避免详情和操作被裁掉。
+                    .overflow_x_scroll()
                     .child(sidebar)
                     .child(list)
                     .child(detail),

@@ -24,6 +24,8 @@ mod render;
 #[derive(Clone, Debug)]
 pub enum ExtensionsEvent {
     RestartRequested,
+    /// 写操作完成时通知设置面板重绘，让退出拒绝提示随写入结束立即消失。
+    WriteFinished,
 }
 
 /// 导航仅用于本页面的过滤，不改变安装状态。
@@ -60,6 +62,8 @@ pub struct ExtensionsPage {
     readme_generation: u64,
     status: Option<String>,
     busy: bool,
+    /// 只有安装、更新、启停或卸载等会改插件目录的操作才阻止退出；只读加载不阻止。
+    writing: bool,
     cancel: Option<CancellationToken>,
     generation: u64,
     progress: Option<InstallProgress>,
@@ -101,6 +105,7 @@ impl ExtensionsPage {
             readme_generation: 0,
             status: None,
             busy: false,
+            writing: false,
             cancel: None,
             generation: 0,
             progress: None,
@@ -139,7 +144,8 @@ impl ExtensionsPage {
                         page.offline = catalog.as_ref().is_some_and(|snapshot| snapshot.stale);
                         page.catalog = catalog;
                         page.status = None;
-                        page.refresh(cx);
+                        // 每次进入分类都会 activate；日常刷新按 24 小时缓存判断，不能重复打网络。
+                        page.refresh_if_due(cx);
                     }
                     Err(error) => page.status = Some(error.public_message().to_owned()),
                 }
@@ -150,8 +156,18 @@ impl ExtensionsPage {
         cx.notify();
     }
 
-    /// 市场刷新保持旧缓存可见，取消和失败不伪装成空目录。
+    /// 工具栏刷新是用户显式动作，始终重新请求目录并保留旧缓存可见。
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_catalog(false, cx);
+    }
+
+    /// 进入分类时只按缓存有效期刷新，避免每次切换设置页都重复下载市场。
+    fn refresh_if_due(&mut self, cx: &mut Context<Self>) {
+        self.refresh_catalog(true, cx);
+    }
+
+    /// 强制与按需刷新共用同一取消、代次和错误投影，避免两条路径出现不同状态机。
+    fn refresh_catalog(&mut self, due_only: bool, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -165,7 +181,11 @@ impl ExtensionsPage {
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run_cancellable(cancel, move |token| async move {
-                    service.refresh_catalog(token).await
+                    if due_only {
+                        service.refresh_if_due(token).await
+                    } else {
+                        service.refresh_catalog(token).await
+                    }
                 })
                 .await;
             let _ = this.update(cx, |page, cx| {
@@ -333,6 +353,8 @@ impl ExtensionsPage {
             return;
         }
         self.busy = true;
+        // 写操作尚未收到权威回读时退出会丢失提交结果，只有这一阶段需要阻止退出。
+        self.writing = true;
         self.status = None;
         self.retry_operation = None;
         self.active_install = match &operation {
@@ -390,6 +412,7 @@ impl ExtensionsPage {
                     return;
                 }
                 page.busy = false;
+                page.writing = false;
                 page.cancel = None;
                 page.progress = None;
                 page.active_install = None;
@@ -409,6 +432,8 @@ impl ExtensionsPage {
                     }
                     Err(error) => page.status = Some(error.public_message().to_owned()),
                 }
+                // 页面实体只重绘自身；父面板依赖写入状态控制提示显隐，必须显式通知。
+                cx.emit(ExtensionsEvent::WriteFinished);
                 cx.notify();
             });
         })
@@ -471,9 +496,9 @@ impl ExtensionsPage {
         }
     }
 
-    /// 宿主在操作收尾之前不能释放页面，尤其不能把未返回的提交当作完成。
-    pub fn is_busy(&self) -> bool {
-        self.busy
+    /// 只有写操作会改变插件目录和待重启集合；只读加载不应阻止退出。
+    pub fn is_writing(&self) -> bool {
+        self.writing
     }
 
     /// 页面关闭时只取消可以取消的后台任务；应用层负责实际收尾。
