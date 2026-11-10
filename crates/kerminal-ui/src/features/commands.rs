@@ -550,6 +550,8 @@ pub struct CommandsView {
     pub(super) snippet_history_generation: u64,
     pub(super) snippet_history_cancellation: Option<CancellationToken>,
     pub(super) workflows: Vec<CommandWorkflow>,
+    /// 全局工作流目录是否至少成功读取过；失败后的下一次会话切换仍会重试。
+    pub(super) workflows_loaded: bool,
     pub(super) ui_sessions: Vec<SessionInfo>,
     pub(super) suggestions: Vec<CommandSuggestionCandidate>,
     pub(super) selected_snippet: Option<VersionedCommandDefinition<SnippetDefinition>>,
@@ -601,6 +603,8 @@ pub struct CommandsView {
     pub(super) confirm_clear_history: bool,
     pub(super) configuration_conflict: Option<String>,
     pub(super) loading: bool,
+    /// 本次整页重读是否包含全局工作流目录；分区加载提示据此区分会话同步与目录同步。
+    pub(super) loading_includes_workflows: bool,
     /// 命令与广播共用唯一 busy token，过期回执不能解除新操作的锁定。
     send_operation: SendOperationState,
     /// 目标 generation 改变时通知用例停止排队；writer 已接纳后必须等真实回执收敛。
@@ -625,10 +629,17 @@ pub struct CommandsView {
 impl EventEmitter<SnippetCurrentCommandRequested> for CommandsView {}
 impl EventEmitter<SnippetHostMoveRequested> for CommandsView {}
 
+/// 整页重读范围：Session 只重读会话相关数据；Catalogs 还包含与 session 无关的全局工作流目录。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PanelReload {
+    Session,
+    Catalogs,
+}
+
 type PanelLoad = (
     Option<Result<SessionInfo, AppError>>,
     Result<Vec<CommandHistoryEntry>, AppError>,
-    Result<Vec<CommandWorkflow>, AppError>,
+    Option<Result<Vec<CommandWorkflow>, AppError>>,
     Result<Vec<SessionInfo>, AppError>,
 );
 
@@ -803,6 +814,7 @@ impl CommandsView {
             snippet_history_generation: 0,
             snippet_history_cancellation: None,
             workflows: Vec::new(),
+            workflows_loaded: false,
             ui_sessions: Vec::new(),
             suggestions: Vec::new(),
             selected_snippet: None,
@@ -842,6 +854,7 @@ impl CommandsView {
             record_command: true,
             confirm_clear_history: false,
             loading: false,
+            loading_includes_workflows: false,
             send_operation: SendOperationState::default(),
             command_send_cancellation: None,
             status: None,
@@ -1363,7 +1376,7 @@ impl CommandsView {
         } else {
             None
         };
-        self.reload_panel(cx);
+        self.reload_panel(PanelReload::Session, cx);
     }
 
     /// Root 传入当前 pane binding；generation 变化时清名称并取消旧执行，但保留旧运行直到回执收敛。
@@ -1560,9 +1573,10 @@ impl CommandsView {
     /// 整页重读先取代独立历史搜索，避免两条读取链互相覆盖；I/O 留在应用 runtime。
     /// 只重读会话、历史、工作流和 UI 会话；全局片段目录与 session 无关，由片段数据变化路径
     /// 单独调用 `refresh_snippet_page`，切换终端不得重启目录并重置列表。
+    /// 全局工作流目录只在 Catalogs 重读或尚未成功加载时读取，避免切换终端无谓同步。
     ///
     /// @author kongweiguang
-    pub(super) fn reload_panel(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn reload_panel(&mut self, reload: PanelReload, cx: &mut Context<Self>) {
         self.history_read.cancel();
         let history_generation = self.history_read.generation();
         self.panel_generation = self.panel_generation.wrapping_add(1).max(1);
@@ -1573,7 +1587,9 @@ impl CommandsView {
         let query = self
             .history_query
             .update(cx, |input, _| input.value().to_string());
+        let load_workflows = matches!(reload, PanelReload::Catalogs) || !self.workflows_loaded;
         self.loading = true;
+        self.loading_includes_workflows = load_workflows;
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |cancellation| async move {
@@ -1584,7 +1600,11 @@ impl CommandsView {
                     let request = history_query::HistoryScope::session(session_id.clone())
                         .list_request(query, None, 100);
                     let history = service.list_history(request).await;
-                    let workflows = service.list_workflows(WorkflowListRequest::default()).await;
+                    let workflows = if load_workflows {
+                        Some(service.list_workflows(WorkflowListRequest::default()).await)
+                    } else {
+                        None
+                    };
                     let ui_sessions = service.list_ui_sessions().await;
                     if cancellation.is_cancelled() {
                         return Err(AppError::cancelled(command_error_context(
@@ -1615,6 +1635,7 @@ impl CommandsView {
             return;
         }
         self.loading = false;
+        self.loading_includes_workflows = false;
         match result {
             Ok((session, history, workflows, ui_sessions)) => {
                 let mut errors = Vec::new();
@@ -1630,9 +1651,14 @@ impl CommandsView {
                         Err(error) => errors.push(error.public_message()),
                     }
                 }
-                match workflows {
-                    Ok(workflows) => self.workflows = workflows,
-                    Err(error) => errors.push(error.public_message()),
+                if let Some(workflows) = workflows {
+                    match workflows {
+                        Ok(workflows) => {
+                            self.workflows = workflows;
+                            self.workflows_loaded = true;
+                        }
+                        Err(error) => errors.push(error.public_message()),
+                    }
                 }
                 match ui_sessions {
                     Ok(sessions) => self.ui_sessions = sessions,
@@ -2968,7 +2994,7 @@ impl CommandsView {
                     format!("已保存片段：{}", definition.title),
                     format!("Saved snippet: {}", definition.title),
                 ));
-                self.reload_panel(cx);
+                self.reload_panel(PanelReload::Session, cx);
                 self.refresh_snippet_page(cx);
                 if let Some(transition) = self.pending_snippet_transition.take() {
                     self.apply_snippet_transition(transition, window, cx);
@@ -3056,7 +3082,7 @@ impl CommandsView {
                         view.snippet_context_bindings.clear();
                         view.snippet_is_new = false;
                         view.status = Some(command_message("片段已删除", "Snippet deleted"));
-                        view.reload_panel(cx);
+                        view.reload_panel(PanelReload::Session, cx);
                         // 删除改变了目录内容，整页重读已不含片段页，必须显式重读。
                         view.refresh_snippet_page(cx);
                     }

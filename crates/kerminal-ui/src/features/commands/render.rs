@@ -106,6 +106,18 @@ impl Render for CommandsView {
 }
 
 impl CommandsView {
+    /// 分区加载提示只反映该分区真实读取：历史看会话整页，工作流仅在目录被重读时显示，
+    /// 片段使用自己的刷新图标；避免切换终端时 Workflows 出现无内容变化的“同步中”。
+    ///
+    /// @author kongweiguang
+    fn panel_reload_indicator_visible(&self) -> bool {
+        match self.section {
+            CommandsSection::History => self.loading,
+            CommandsSection::Workflows => self.loading && self.loading_includes_workflows,
+            CommandsSection::Snippets => false,
+        }
+    }
+
     /// 片段刷新固定在标题栏，用同尺寸旋转图标反馈请求，避免临时文字改变内容区几何。
     /// 其它命令页维持原有目标和反馈，不扩大本次片段面板的改动范围。
     /// 宿主切换按钮只发送方向，Root 必须复核实际挂载，不能把可能延迟的布局投影当成事实。
@@ -222,17 +234,14 @@ impl CommandsView {
                         })),
                 )
             })
-            .when(
-                self.loading && self.section != CommandsSection::Snippets,
-                |bar| {
-                    bar.child(
-                        div()
-                            .text_size(theme.text_xs)
-                            .text_color(theme.muted)
-                            .child(crate::locale::text("同步中…", "Refreshing…")),
-                    )
-                },
-            )
+            .when(self.panel_reload_indicator_visible(), |bar| {
+                bar.child(
+                    div()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(crate::locale::text("同步中…", "Refreshing…")),
+                )
+            })
     }
 
     /// 导航使用 chrome 材质区分工作区标题层与内部卡片，并在紧凑槽位换行保留操作空间。

@@ -11,7 +11,7 @@ use kerminal_domain::commands::{
     CommandWorkflow, CommandWorkflowStep, WorkflowRunState, WorkflowScope,
 };
 
-use super::{CommandsView, EditorTransition, WorkflowStepEditor};
+use super::{CommandsView, EditorTransition, PanelReload, WorkflowStepEditor};
 
 impl CommandsView {
     /// 紧凑面板先进入同一编辑草稿的详情层；同一新稿重复点击不制造隐式切换。
@@ -529,7 +529,7 @@ impl CommandsView {
                             view.install_new_workflow(window, cx);
                             view.status =
                                 Some(super::command_message("工作流已删除", "Workflow deleted"));
-                            view.reload_panel(cx);
+                            view.reload_panel(PanelReload::Catalogs, cx);
                         }
                         Ok(false) => {
                             view.status = Some(super::command_message(
@@ -673,7 +673,7 @@ impl CommandsView {
                 let transition = self.pending_workflow_transition.take();
                 self.install_workflow(saved, window, cx);
                 self.workflow_is_new = false;
-                self.reload_panel(cx);
+                self.reload_panel(PanelReload::Catalogs, cx);
                 if let Some(transition) = transition {
                     self.apply_workflow_transition(transition, window, cx);
                 } else {

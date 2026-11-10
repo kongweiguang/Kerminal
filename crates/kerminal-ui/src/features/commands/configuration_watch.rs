@@ -11,7 +11,7 @@ use kerminal_domain::commands::{
     SnippetDefinition, SnippetPreferenceKey, SnippetRisk, SnippetScope,
 };
 
-use super::{CommandsSection, CommandsView, SnippetDraftValues, command_message};
+use super::{CommandsSection, CommandsView, PanelReload, SnippetDraftValues, command_message};
 
 /// 保存解析前的片段表单值，用来识别新建入口的真实空白基线。
 ///
@@ -225,7 +225,7 @@ impl CommandsView {
             return;
         }
 
-        self.reload_panel(cx);
+        self.reload_panel(PanelReload::Catalogs, cx);
         if snippets_changed {
             // 片段文件变化才使目录过期；整页重读已不含片段页，仅调整工作流时不得重启目录。
             self.refresh_snippet_page(cx);

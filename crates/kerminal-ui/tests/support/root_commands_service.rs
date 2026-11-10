@@ -34,10 +34,11 @@ struct UnusedCommandCatalog {
 }
 struct UnusedSuggestions;
 
-/// 片段目录读取计数；只统计 `SnippetRepository::list`，工作流仓储读取不计入。
+/// 片段/工作流目录读取计数；只统计对应仓储的 list，两个计数互不影响。
 #[derive(Default)]
 pub struct CatalogCalls {
     pub snippet_lists: AtomicUsize,
+    pub workflow_lists: AtomicUsize,
 }
 
 /// 暴露片段目录读取次数，供宿主测试确认切换终端不重启全局目录。
@@ -193,6 +194,7 @@ impl SnippetRepository for UnusedCommandCatalog {
 impl WorkflowRepository for UnusedCommandCatalog {
     /// 空工作流目录允许测试切换到工作流后再定位片段。
     async fn list(&self, _request: WorkflowListRequest) -> AppResult<Vec<CommandWorkflow>> {
+        self.calls.workflow_lists.fetch_add(1, Ordering::AcqRel);
         Ok(Vec::new())
     }
 

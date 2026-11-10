@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
 use super::{
-    CommandsSection, CommandsView, SnippetEditorVisibilityChanged, command_error_context,
-    command_message, snippet_definition_from_catalog,
+    CommandsSection, CommandsView, PanelReload, SnippetEditorVisibilityChanged,
+    command_error_context, command_message, snippet_definition_from_catalog,
 };
 
 const SNIPPET_PAGE_SIZE: usize = 100;
@@ -1036,7 +1036,7 @@ impl CommandsView {
                                 "已确认用户副本存在；当前内置详情和运行变量保持不变",
                                 "The user copy is confirmed. The current built-in detail and runtime variables were kept",
                             ));
-                            view.reload_panel(cx);
+                            view.reload_panel(PanelReload::Session, cx);
                             // 用户副本已确认，目录条目发生变化；整页重读不再覆盖片段页。
                             view.refresh_snippet_page(cx);
                         }

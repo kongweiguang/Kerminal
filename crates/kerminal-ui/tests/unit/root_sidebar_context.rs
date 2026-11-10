@@ -85,6 +85,58 @@ fn switching_terminal_does_not_reload_snippet_catalog(app: &mut TestAppContext) 
     );
 }
 
+/// 全局工作流目录只在首次需要时加载；后续切换终端不得重读，避免 Workflows 分区无内容变化地提示同步。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn switching_terminal_does_not_reload_global_catalogs(app: &mut TestAppContext) {
+    let (runtime, root, _, _, visual, calls) = fixture_with_commands(app);
+    // 片段目录在面板构造时加载；工作流目录此时尚未读取，首次切换终端才会补齐。
+    for _ in 0..10 {
+        if calls.snippet_lists.load(Ordering::Acquire) > 0 {
+            break;
+        }
+        settle(&runtime, visual);
+    }
+    let snippets_before = calls.snippet_lists.load(Ordering::Acquire);
+    assert!(
+        snippets_before > 0,
+        "fixture must load the snippet catalog before switching terminals"
+    );
+    assert_eq!(
+        calls.workflow_lists.load(Ordering::Acquire),
+        0,
+        "workflow catalog must not load before the panel has a session"
+    );
+
+    visual.update(|_, app| {
+        root.update(app, |root, cx| {
+            let commands = root.commands_view.clone().expect("commands view");
+            commands.update(cx, |view, cx| view.set_session(Some(SessionId::new()), cx));
+        });
+    });
+    settle(&runtime, visual);
+    assert_eq!(
+        calls.workflow_lists.load(Ordering::Acquire),
+        1,
+        "first session change must load the global workflow catalog once"
+    );
+
+    visual.update(|_, app| {
+        root.update(app, |root, cx| {
+            let commands = root.commands_view.clone().expect("commands view");
+            commands.update(cx, |view, cx| view.set_session(Some(SessionId::new()), cx));
+        });
+    });
+    settle(&runtime, visual);
+    assert_eq!(
+        calls.workflow_lists.load(Ordering::Acquire),
+        1,
+        "switching terminals must not reread the global workflow catalog"
+    );
+    assert_eq!(calls.snippet_lists.load(Ordering::Acquire), snippets_before);
+}
+
 /// 页面动作等待测试平台提交窗口激活回调，再从已绘制的主工作区焦点发起。
 /// 与真实鼠标进入工作区一致，保留生产模态门禁，不依赖验收构建的活动态覆盖。
 fn activate_commands_surface(root: &Entity<RootView>, visual: &mut VisualTestContext) {
