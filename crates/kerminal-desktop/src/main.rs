@@ -35,6 +35,12 @@ mod plugin_catalogs;
 #[cfg(all(feature = "acceptance", feature = "right-rail-acceptance"))]
 mod plugin_extensions_acceptance;
 #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+mod plugin_list_performance_acceptance;
+#[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+mod plugin_performance_acceptance;
+#[cfg(all(windows, feature = "right-rail-acceptance"))]
+mod plugin_restart_acceptance;
+#[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
 mod plugin_webview_acceptance;
 mod plugins;
 mod profile_import;
@@ -173,6 +179,25 @@ fn main() {
         #[cfg(not(all(feature = "acceptance", feature = "right-rail-acceptance")))]
         {
             eprintln!("插件扩展页验收需要 acceptance 与 right-rail-acceptance features");
+            std::process::exit(1);
+        }
+    }
+    // 列表性能验收使用正式外部工厂及分页运行服务，默认发行构建不开放独立探针入口。
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--plugin-list-performance-acceptance")
+    {
+        #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+        {
+            if let Err(error) = plugin_list_performance_acceptance::run() {
+                eprintln!("插件列表性能验收运行失败：{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(all(feature = "acceptance-metrics", feature = "right-rail-acceptance")))]
+        {
+            eprintln!("插件列表性能验收需要 acceptance-metrics 与 right-rail-acceptance features");
             std::process::exit(1);
         }
     }
@@ -412,6 +437,17 @@ fn run_application(
     config_root: config_root::ConfigRoot,
     log_guard: &mut Option<logging::DesktopLogGuard>,
 ) -> Result<(), Box<dyn Error>> {
+    #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+    let host_list_acceptance =
+        plugin_performance_acceptance::enabled_in_isolated_root(config_root.as_path())?;
+    // 缺少任一验收特性时显式拒绝性能报告环境，避免普通构建静默跑成不含共同列表的样本。
+    #[cfg(not(all(feature = "acceptance-metrics", feature = "right-rail-acceptance")))]
+    if std::env::var_os("KERMINAL_PLUGIN_PERFORMANCE_REPORT").is_some() {
+        return Err(io::Error::other(
+            "插件性能验收需要同时启用 acceptance-metrics 与 right-rail-acceptance",
+        )
+        .into());
+    }
     let instance_id = single_instance_id(config_root.as_path())?;
     let activation = current_process_external_activation()?;
     match acquire_single_instance(runtime, &instance_id)? {
@@ -425,6 +461,14 @@ fn run_application(
                 config_root.as_path(),
                 options,
             )?);
+            #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+            let catalogs = if host_list_acceptance {
+                // catalogs() 已登记冻结标记；此处替换为同一迁移输入上追加宿主声明的目录。
+                plugin_performance_acceptance::acceptance_catalogs(&startup_plugins, "zh-CN")?
+            } else {
+                startup_plugins.catalogs("zh-CN")?
+            };
+            #[cfg(not(all(feature = "acceptance-metrics", feature = "right-rail-acceptance")))]
             let catalogs = startup_plugins.catalogs("zh-CN")?;
             let legacy_window_state = bootstrap::legacy_window_state_path(false);
             let migration = bootstrap::migration_service(
@@ -437,7 +481,9 @@ fn run_application(
                 *log_guard = Some(logging::initialize(config_root.as_path()).map_err(|error| {
                     io::Error::other(format!("Kerminal 无法初始化诊断日志：{error}"))
                 })?);
-                run_primary_instance(runtime, instance_id, primary, config_root, activation, catalogs, startup_plugins)
+                run_primary_instance(runtime, instance_id, primary, config_root, activation, catalogs, startup_plugins,
+                    #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+                    host_list_acceptance)
             })
             .map_err(|error| io::Error::other(format!(
                 "Kerminal 数据迁移未完成：{}。请运行安装包内 migration 脚本做只读预检并保留恢复材料。",
@@ -546,6 +592,8 @@ fn run_primary_instance(
     initial_activation: Option<ExternalActivation>,
     catalogs: plugin_catalogs::PluginCatalogs,
     startup_plugins: Arc<plugins::startup::StartupPlugins>,
+    #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+    host_list_acceptance: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut composition = runtime.block_on(DesktopComposition::build_with_plugin_catalogs(
         runtime.handle(),
@@ -613,6 +661,22 @@ fn run_primary_instance(
         }
     };
     let services = composition.app_services();
+    #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+    let (services, host_list_telemetry) =
+        match plugin_performance_acceptance::prepare_services(services, host_list_acceptance) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Err(cleanup) = runtime
+                    .block_on(composition.shutdown_until(TokioInstant::now() + SHUTDOWN_TIMEOUT))
+                {
+                    tracing::error!(
+                        event = "PLUGIN_ACCEPTANCE_CLEANUP_FAILED",
+                        code = cleanup.public_code().as_str()
+                    );
+                }
+                return Err(error.into());
+            }
+        };
     let update_service = composition.update_service().cloned();
     let composition = Arc::new(tokio::sync::Mutex::new(composition));
     let (activation_sender, activation_receiver) = activation_queue();
@@ -645,6 +709,8 @@ fn run_primary_instance(
             window_state_load,
             startup_error.clone(),
             startup_plugins,
+            #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+            host_list_telemetry,
         );
     }));
     tracing::info!(event = "DESKTOP_NATIVE_UI_RETURNED");
@@ -709,6 +775,8 @@ fn run_native_ui(
     window_state_load: WindowStateLoad,
     startup_error: StartupError,
     startup_plugins: Arc<plugins::startup::StartupPlugins>,
+    #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+    host_list_telemetry: Option<Arc<Mutex<serde_json::Value>>>,
 ) {
     #[cfg(all(target_os = "windows", feature = "acceptance-metrics"))]
     set_diagnostic_process_identity();
@@ -769,6 +837,24 @@ fn run_native_ui(
         if let Err(error) = gpui_kit::open_window(window_options, cx, |window, cx| {
             window.set_background_appearance(WindowBackgroundAppearance::Transparent);
             let root = cx.new(|cx| RootView::new(services.clone(), window, cx));
+            // 性能驱动只在显式报告环境变量下运行，复用正式实例与共享执行器。
+            #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+            if let Err(error) = plugin_performance_acceptance::install(
+                services.clone(), root.clone(), host_list_telemetry.clone(), window, cx,
+            ) {
+                record_startup_error(&startup_error, error.public_message().to_owned());
+                cx.quit();
+                return root;
+            }
+            // 重启验收复用普通主入口和 HostCoordinator，显式隔离环境变量之外不建立任务。
+            #[cfg(all(windows, feature = "right-rail-acceptance"))]
+            if let Err(error) = plugin_restart_acceptance::install(
+                services.clone(), root.clone(), window, cx, startup_plugins.clone(),
+            ) {
+                record_startup_error(&startup_error, error.public_message().to_owned());
+                cx.quit();
+                return root;
+            }
             // 只有真实窗口完成首轮绘制后才提交健康标记；磁盘提交交给共享后台执行器。
             let boot = startup_plugins.clone();
             let executor = services.executor.clone();

@@ -21,6 +21,11 @@ const LOG_FILE_SUFFIX: &str = "log";
 const RETAINED_LOG_FILES: usize = 8;
 const LOG_QUEUE_CAPACITY: usize = 4096;
 const SAFE_EVENTS: &[&str] = &[
+    // 重启边界只保留固定阶段名，便于核对关闭与继任进程，不放行路径或命令参数。
+    "HOST_RESTART_SUBMITTED",
+    "HOST_RESTART_BEGIN",
+    "HOST_RESTART_COMPLETE",
+    "HOST_RESTART_FAILED",
     "DESKTOP_APPLICATION_STOPPED_AFTER_ERROR",
     "DESKTOP_APPLICATION_RETURNED",
     "DESKTOP_NATIVE_UI_RETURNED",

@@ -575,3 +575,278 @@ fn terminal_echo_report_serializes_probe_admission_and_lifecycle_counts() {
         2
     );
 }
+
+/// 原始时间必须来自同一个 PresentedFrame；非法顺序仍保留诊断，不能被识别为有效采样。
+///
+/// @author kongweiguang
+#[test]
+fn raw_frame_samples_preserve_same_frame_and_report_invalid_timestamps() {
+    let origin = Instant::now();
+    let at = |nanos| origin + Duration::from_nanos(nanos);
+    let window_id = WindowId::from(41);
+    let frame = |dirty_at, draw_start, draw_end, present_start, present_end| PresentedFrame {
+        frame: FrameTiming {
+            window_id,
+            dirty_at,
+            invalidations: 1,
+            draw_start,
+            draw_end,
+            refresh_interval: None,
+            signal_at: None,
+            phases: DrawPhases::default(),
+        },
+        presentation: PresentTiming {
+            window_id,
+            present_start,
+            present_end,
+            animation_interval: None,
+        },
+    };
+    let mut samples = super::RawFrameSamples::new(origin);
+    samples.push(frame(Some(at(1)), at(2), at(3), at(4), at(6)));
+    samples.push(frame(Some(at(8)), at(7), at(9), at(10), at(11)));
+    samples.push(frame(None, at(12), at(13), at(14), at(15)));
+    let mut mismatched = frame(Some(at(16)), at(17), at(18), at(19), at(20));
+    mismatched.presentation.window_id = WindowId::from(42);
+    samples.push(mismatched);
+    let report = serde_json::to_value(samples.finish()).unwrap();
+    assert_eq!(report["dropped"], 0);
+    assert_eq!(report["invalid"], 2);
+    assert_eq!(report["samples"][0]["dirtyAtNs"], 1);
+    assert_eq!(report["samples"][0]["drawStartNs"], 2);
+    assert_eq!(report["samples"][0]["drawEndNs"], 3);
+    assert_eq!(report["samples"][0]["presentStartNs"], 4);
+    assert_eq!(report["samples"][0]["presentEndNs"], 6);
+    assert!(report["samples"][2]["dirtyAtNs"].is_null());
+    assert_eq!(report["samples"][3]["windowIdsMatch"], false);
+    assert_eq!(report["samples"].as_array().unwrap().len(), 4);
+}
+
+/// journal 尾部必须由截止后的同窗帧形成 fence，迟到的截止前帧仍计入原始数据。
+///
+/// @author kongweiguang
+#[test]
+fn raw_frame_fence_includes_delayed_pre_boundary_frames_without_post_boundary_frames() {
+    let origin = Instant::now();
+    let at = |millis| origin + Duration::from_millis(millis);
+    let window_id = WindowId::from(51);
+    let presented = |id, start, end| {
+        ForegroundJournalEntry::Boundary(IntervalBoundary::Presented(PresentedFrame {
+            frame: FrameTiming {
+                window_id: id,
+                dirty_at: Some(at(start)),
+                invalidations: 1,
+                draw_start: at(start),
+                draw_end: at(start + 1),
+                refresh_interval: None,
+                signal_at: None,
+                phases: DrawPhases::default(),
+            },
+            presentation: PresentTiming {
+                window_id: id,
+                present_start: at(start + 1),
+                present_end: at(end),
+                animation_interval: None,
+            },
+        }))
+    };
+    let mut accumulator = FramePhaseAccumulator {
+        raw_frames: Some(super::RawFrameSamples::new(origin)),
+        ..FramePhaseAccumulator::default()
+    };
+    accumulator.merge_fence_drained(
+        DrainedEntries {
+            entries: vec![presented(WindowId::from(52), 11, 13)],
+            lost: 0,
+        },
+        window_id,
+        at(10),
+    );
+    assert!(!accumulator.journal_fence_observed);
+    accumulator.merge_fence_drained(
+        DrainedEntries {
+            entries: vec![presented(window_id, 3, 5), presented(window_id, 11, 13)],
+            lost: 1,
+        },
+        window_id,
+        at(10),
+    );
+    let summary = accumulator.finish();
+    assert!(summary.journal_fence_observed);
+    assert_eq!(summary.journal_fence_dirty_at_ns, Some(11_000_000));
+    assert_eq!(summary.journal_fence_draw_start_ns, Some(11_000_000));
+    assert_eq!(summary.journal_fence_present_end_ns, Some(13_000_000));
+    assert_eq!(summary.journal_entries_lost, 1);
+    assert_eq!(summary.presented_frame_count, 1);
+    let raw = summary.raw_frames.unwrap();
+    assert_eq!(raw.samples.len(), 1);
+    assert_eq!(raw.samples[0].dirty_at_ns, Some(3_000_000));
+    assert_eq!(raw.samples[0].present_end_ns, 5_000_000);
+}
+
+/// 电源事件的察觉时间不等于中断时间；截止后、fence 前后观察到的事件都须保守计入。
+///
+/// @author kongweiguang
+#[test]
+fn raw_frame_fence_counts_power_interruptions_observed_after_cutoff() {
+    let origin = Instant::now();
+    let at = |seconds| origin + Duration::from_secs(seconds);
+    let window_id = WindowId::from(55);
+    let power_transition = |ended_at| {
+        ForegroundJournalEntry::Boundary(IntervalBoundary::PowerTransition {
+            ended_at: at(ended_at),
+        })
+    };
+    let fence = ForegroundJournalEntry::Boundary(IntervalBoundary::Presented(PresentedFrame {
+        frame: FrameTiming {
+            window_id,
+            dirty_at: Some(at(23)),
+            invalidations: 1,
+            draw_start: at(23),
+            draw_end: at(24),
+            refresh_interval: None,
+            signal_at: None,
+            phases: DrawPhases::default(),
+        },
+        presentation: PresentTiming {
+            window_id,
+            present_start: at(24),
+            present_end: at(25),
+            animation_interval: None,
+        },
+    }));
+    let mut accumulator = FramePhaseAccumulator {
+        raw_frames: Some(super::RawFrameSamples::new(origin)),
+        ..FramePhaseAccumulator::default()
+    };
+    accumulator.merge_fence_drained(
+        DrainedEntries {
+            entries: vec![power_transition(19), power_transition(21)],
+            lost: 0,
+        },
+        window_id,
+        at(20),
+    );
+    assert!(!accumulator.journal_fence_observed);
+    assert_eq!(accumulator.power_transitions, 2);
+
+    // 同一批次中 fence 前后均已被观察，保守统计不能依赖事件在批次内的位置。
+    accumulator.merge_fence_drained(
+        DrainedEntries {
+            entries: vec![power_transition(22), fence, power_transition(26)],
+            lost: 0,
+        },
+        window_id,
+        at(20),
+    );
+    let summary = accumulator.finish();
+    assert!(summary.journal_fence_observed);
+    assert_eq!(summary.journal_fence_draw_start_ns, Some(23_000_000_000));
+    assert_eq!(summary.journal_entries_lost, 0);
+    assert_eq!(summary.power_transitions, 4);
+    assert_eq!(
+        serde_json::to_value(&summary).unwrap()["powerTransitions"],
+        4
+    );
+}
+
+/// 不能假设采样回调绝不与同窗绘制跨界；延迟完成帧必须连同原始时间保留为不完整证据。
+///
+/// @author kongweiguang
+#[test]
+fn raw_frame_crossing_measurement_end_is_retained_even_with_later_fence() {
+    let origin = Instant::now();
+    let at = |seconds| origin + Duration::from_secs(seconds);
+    let window_id = WindowId::from(54);
+    let presented = |dirty, draw, draw_end, present_start, present_end| {
+        ForegroundJournalEntry::Boundary(IntervalBoundary::Presented(PresentedFrame {
+            frame: FrameTiming {
+                window_id,
+                dirty_at: Some(at(dirty)),
+                invalidations: 1,
+                draw_start: at(draw),
+                draw_end: at(draw_end),
+                refresh_interval: None,
+                signal_at: None,
+                phases: DrawPhases::default(),
+            },
+            presentation: PresentTiming {
+                window_id,
+                present_start: at(present_start),
+                present_end: at(present_end),
+                animation_interval: None,
+            },
+        }))
+    };
+    let mut accumulator = FramePhaseAccumulator {
+        raw_frames: Some(super::RawFrameSamples::new(origin)),
+        ..FramePhaseAccumulator::default()
+    };
+    accumulator.merge_fence_drained(
+        DrainedEntries {
+            entries: vec![presented(12, 19, 20, 20, 21), presented(22, 22, 22, 22, 23)],
+            lost: 0,
+        },
+        window_id,
+        at(20),
+    );
+    let summary = accumulator.finish();
+    assert!(summary.journal_fence_observed);
+    assert_eq!(summary.journal_fence_dirty_at_ns, Some(22_000_000_000));
+    assert_eq!(summary.journal_cross_boundary_frames, 1);
+    assert_eq!(summary.presented_frame_count, 1);
+    let raw = summary.raw_frames.unwrap();
+    assert_eq!(raw.samples.len(), 1);
+    assert_eq!(raw.samples[0].dirty_at_ns, Some(12_000_000_000));
+    assert_eq!(raw.samples[0].draw_start_ns, 19_000_000_000);
+    assert_eq!(raw.samples[0].present_end_ns, 21_000_000_000);
+}
+
+/// 容量达到上限后必须显式累计丢帧，不能让保留前缀冒充整个测量窗口。
+///
+/// @author kongweiguang
+#[test]
+fn raw_frame_capacity_reports_every_unretained_frame() {
+    let origin = Instant::now();
+    let window_id = WindowId::from(53);
+    let presented = PresentedFrame {
+        frame: FrameTiming {
+            window_id,
+            dirty_at: Some(origin),
+            invalidations: 1,
+            draw_start: origin,
+            draw_end: origin,
+            refresh_interval: None,
+            signal_at: None,
+            phases: DrawPhases::default(),
+        },
+        presentation: PresentTiming {
+            window_id,
+            present_start: origin,
+            present_end: origin,
+            animation_interval: None,
+        },
+    };
+    let mut samples = super::RawFrameSamples::new(origin);
+    for _ in 0..=MAX_FRAME_PHASE_SAMPLES_PER_PHASE {
+        samples.push(presented);
+    }
+    let report = samples.finish();
+    assert_eq!(report.samples.len(), MAX_FRAME_PHASE_SAMPLES_PER_PHASE);
+    assert_eq!(report.dropped, 1);
+}
+
+/// 原始 invalidation 可早于测量起点；负偏移及时钟缺口必须保留供后续门禁判断。
+///
+/// @author kongweiguang
+#[test]
+fn raw_frame_offsets_preserve_pre_origin_invalidation_and_missing_end() {
+    let origin = Instant::now() + Duration::from_millis(5);
+    assert_eq!(
+        super::raw_frame_offset_ns(origin, origin - Duration::from_millis(2)),
+        Some(-2_000_000)
+    );
+    let report = serde_json::to_value(super::RawFrameSamples::new(origin).finish()).unwrap();
+    assert!(report["measurementEndNs"].is_null());
+    assert!(report["measurementEndUnixMs"].is_null());
+}

@@ -12,7 +12,7 @@ use kerminal_ui::plugins::{content::ContentFactory, tools::ToolFactory};
 /// 工厂身份必须有声明且不能重复，以免不同实现覆盖同一内容。
 ///
 /// @author kongweiguang
-pub(super) fn validate_content_factories(
+pub(crate) fn validate_content_factories(
     plugins: &PluginRegistry,
     factories: &[Arc<dyn ContentFactory>],
 ) -> AppResult<()> {

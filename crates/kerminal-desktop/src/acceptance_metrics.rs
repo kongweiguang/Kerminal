@@ -37,7 +37,9 @@ const DEFAULT_WARMUP_DURATION_MS: u64 = 5_000;
 const MAX_WARMUP_DURATION_MS: u64 = 300_000;
 const MAX_MEASUREMENT_DURATION_MS: u64 = 7_200_000;
 const FRAME_PHASE_JOURNAL_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_FRAME_PHASE_SAMPLES_PER_PHASE: usize = 10_000;
+const FRAME_JOURNAL_FENCE_TIMEOUT: Duration = Duration::from_secs(3);
+const RAW_FRAME_SAMPLES_ENV: &str = "KERMINAL_ACCEPTANCE_METRICS_RAW_FRAMES";
+const MAX_FRAME_PHASE_SAMPLES_PER_PHASE: usize = 50_000;
 
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -137,13 +139,19 @@ pub(crate) fn install(
                 .timer(config.warmup_duration)
                 .await;
             let baseline = match window_cx.update(|window, cx| {
+                // 游标与起始时间在同一窗口回调内确定，避免将后台调度延迟冒充采样覆盖。
+                let collector = cx.foreground_journal().collector();
+                let measurement_started_at = Instant::now();
+                let raw_frames = (env::var(RAW_FRAME_SAMPLES_ENV).ok().as_deref() == Some("1"))
+                    .then(|| RawFrameSamples::new(measurement_started_at));
                 (
                     window.frame_duration_snapshot(),
                     window.input_latency_snapshot(),
                     WindowMetricsSnapshot::capture(window, cx),
                     window.window_handle().window_id(),
-                    // collector 在预热边界取游标，只读取本次测量之后的有界 journal 项。
-                    cx.foreground_journal().collector(),
+                    collector,
+                    measurement_started_at,
+                    raw_frames,
                 )
             }) {
                 Ok(baseline) => baseline,
@@ -161,8 +169,11 @@ pub(crate) fn install(
 
             let window_id = baseline.3;
             let mut journal_collector = baseline.4;
-            let mut frame_phase_accumulator = FramePhaseAccumulator::default();
-            let measurement_started_at = Instant::now();
+            let mut frame_phase_accumulator = FramePhaseAccumulator {
+                raw_frames: baseline.6,
+                ..FramePhaseAccumulator::default()
+            };
+            let measurement_started_at = baseline.5;
             let measurement_deadline = measurement_started_at + config.duration;
             loop {
                 let remaining = measurement_deadline.saturating_duration_since(Instant::now());
@@ -188,12 +199,16 @@ pub(crate) fn install(
                 // 最后一段与最终窗口快照在同一回调中收取，报告计数覆盖完整测量窗。
                 frame_phase_accumulator
                     .merge_drained(journal_collector.collect_unseen(), window_id);
-                (
-                    window.frame_duration_snapshot(),
-                    window.input_latency_snapshot(),
-                    WindowMetricsSnapshot::capture(window, cx),
-                    terminal_echo_probe_registry().take_measurement(),
-                )
+                let frame = window.frame_duration_snapshot();
+                let input = window.input_latency_snapshot();
+                let metadata = WindowMetricsSnapshot::capture(window, cx);
+                let echo = terminal_echo_probe_registry().take_measurement();
+                // 结束边界来自最后一次排空，而不是后续序列化或后台调度时间。
+                let measurement_ended_at = Instant::now();
+                if let Some(raw) = &mut frame_phase_accumulator.raw_frames {
+                    raw.mark_end(measurement_ended_at);
+                }
+                (frame, input, metadata, echo, measurement_ended_at)
             }) {
                 Ok(current) => current,
                 Err(error) => {
@@ -204,6 +219,32 @@ pub(crate) fn install(
                     return;
                 }
             };
+
+            // journal 只暴露已发布序列；后续真实帧可作为有序发布 fence，证明尾部不是未发布数据。
+            if frame_phase_accumulator.raw_frames.is_some() {
+                let fence_deadline = Instant::now() + FRAME_JOURNAL_FENCE_TIMEOUT;
+                while !frame_phase_accumulator.journal_fence_observed
+                    && Instant::now() < fence_deadline
+                {
+                    window_cx
+                        .background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    if let Err(error) = window_cx.update(|_, _| {
+                        frame_phase_accumulator.merge_fence_drained(
+                            journal_collector.collect_unseen(),
+                            window_id,
+                            current.4,
+                        );
+                    }) {
+                        tracing::error!(
+                            event = "NATIVE_WINDOW_METRICS_JOURNAL_FENCE_FAILED",
+                            error = %error,
+                        );
+                        return;
+                    }
+                }
+            }
 
             let environment = FrameMetricsEnvironment::new(
                 config.environment_id,
@@ -242,7 +283,7 @@ pub(crate) fn install(
                 warmup_duration_ms: config.warmup_duration.as_millis() as u64,
                 target_measurement_duration_ms: config.duration.as_millis() as u64,
                 actual_measurement_duration_ms: u64::try_from(
-                    measurement_started_at.elapsed().as_millis(),
+                    current.4.duration_since(measurement_started_at).as_millis(),
                 )
                 .unwrap_or(u64::MAX),
                 window_metadata: WindowMetricsBoundary {
@@ -442,11 +483,19 @@ struct NativeWindowMetricsReport {
 struct FramePhaseDiagnostics {
     journal_entries_seen: u64,
     journal_entries_lost: u64,
+    journal_fence_observed: bool,
+    journal_fence_dirty_at_ns: Option<i64>,
+    journal_fence_draw_start_ns: Option<i64>,
+    journal_fence_present_end_ns: Option<i64>,
+    journal_cross_boundary_frames: u64,
+    power_transitions: u64,
     presented_frame_count: u64,
     gpui_callback_count: u64,
     callbacks_with_signal_timestamp: u64,
     reentrant_frame_skips: u64,
     actual_dwm_vsync_interarrival_measured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_frames: Option<RawFrameReport>,
     first_invalidation_to_frame_signal: TimingDistribution,
     frame_signal_to_gpui_callback: TimingDistribution,
     frame_signal_to_draw_start: TimingDistribution,
@@ -473,11 +522,18 @@ struct TimingDistribution {
 struct FramePhaseAccumulator {
     journal_entries_seen: u64,
     journal_entries_lost: u64,
+    journal_fence_observed: bool,
+    journal_fence_dirty_at_ns: Option<i64>,
+    journal_fence_draw_start_ns: Option<i64>,
+    journal_fence_present_end_ns: Option<i64>,
+    journal_cross_boundary_frames: u64,
+    power_transitions: u64,
     presented_frame_count: u64,
     gpui_callback_count: u64,
     callbacks_with_signal_timestamp: u64,
     reentrant_frame_skips: u64,
     samples: FramePhaseDurationSamples,
+    raw_frames: Option<RawFrameSamples>,
 }
 
 impl FramePhaseAccumulator {
@@ -499,9 +555,13 @@ impl FramePhaseAccumulator {
         for entry in drained.entries {
             match entry {
                 ForegroundJournalEntry::Boundary(IntervalBoundary::Presented(presented))
-                    if presented.frame.window_id == window_id =>
+                    if presented.frame.window_id == window_id
+                        || presented.presentation.window_id == window_id =>
                 {
                     self.presented_frame_count = self.presented_frame_count.saturating_add(1);
+                    if let Some(raw) = &mut self.raw_frames {
+                        raw.push(presented);
+                    }
                     if let (Some(dirty_at), Some(signal_at)) =
                         (presented.frame.dirty_at, presented.frame.signal_at)
                     {
@@ -541,6 +601,9 @@ impl FramePhaseAccumulator {
                         );
                     }
                 }
+                ForegroundJournalEntry::Boundary(IntervalBoundary::PowerTransition { .. }) => {
+                    self.power_transitions = self.power_transitions.saturating_add(1);
+                }
                 ForegroundJournalEntry::PlatformSignal(signal) if signal.window_id == window_id => {
                     self.gpui_callback_count = self.gpui_callback_count.saturating_add(1);
                     if let Some(signal_at) = signal.signal_at {
@@ -564,6 +627,81 @@ impl FramePhaseAccumulator {
         }
     }
 
+    /// 保留跨截止帧的原始证据；后续同窗帧只能证明更早的 journal 序列已发布。
+    /// fence drain 中的电源事件也须计入，因为察觉时刻不能排除采样期间已中断。
+    ///
+    /// @author kongweiguang
+    fn merge_fence_drained(
+        &mut self,
+        drained: gpui_kit::profiler::journal::DrainedEntries,
+        window_id: gpui_kit::WindowId,
+        measurement_end: Instant,
+    ) {
+        use gpui_kit::profiler::journal::{ForegroundJournalEntry, IntervalBoundary};
+
+        let mut entries = Vec::new();
+        for entry in drained.entries {
+            let retain = match entry {
+                ForegroundJournalEntry::Boundary(IntervalBoundary::Presented(presented)) => {
+                    let targets_window = presented.frame.window_id == window_id
+                        || presented.presentation.window_id == window_id;
+                    let crosses_boundary = targets_window
+                        && presented.frame.draw_start <= measurement_end
+                        && presented.presentation.present_end > measurement_end;
+                    if crosses_boundary {
+                        self.journal_cross_boundary_frames =
+                            self.journal_cross_boundary_frames.saturating_add(1);
+                    }
+                    if !self.journal_fence_observed
+                        && presented.frame.window_id == window_id
+                        && presented.presentation.window_id == window_id
+                        && presented.frame.draw_start > measurement_end
+                        && presented.frame.draw_start <= presented.frame.draw_end
+                        && presented.frame.draw_end <= presented.presentation.present_start
+                        && presented.presentation.present_start
+                            <= presented.presentation.present_end
+                    {
+                        if let Some(raw) = &self.raw_frames {
+                            self.journal_fence_draw_start_ns =
+                                raw_frame_offset_ns(raw.origin, presented.frame.draw_start);
+                            self.journal_fence_present_end_ns =
+                                raw_frame_offset_ns(raw.origin, presented.presentation.present_end);
+                        }
+                        self.journal_fence_dirty_at_ns = self.raw_frames.as_ref().and_then(|raw| {
+                            presented.frame.dirty_at.and_then(|dirty_at| {
+                                if dirty_at <= presented.frame.draw_start {
+                                    raw_frame_offset_ns(raw.origin, dirty_at)
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                        self.journal_fence_observed = true;
+                    }
+                    presented.presentation.present_end <= measurement_end || crosses_boundary
+                }
+                // 察觉时间不一定是实际中断时间；fence drain 内的电源事件都保守计入。
+                ForegroundJournalEntry::Boundary(IntervalBoundary::PowerTransition { .. }) => true,
+                ForegroundJournalEntry::PlatformSignal(signal) => {
+                    signal.handled_at <= measurement_end
+                }
+                ForegroundJournalEntry::ReentrantFrameSkipped { at, .. } => at <= measurement_end,
+                _ => false,
+            };
+            if retain {
+                entries.push(entry);
+            }
+        }
+        self.merge_drained(
+            gpui_kit::profiler::journal::DrainedEntries {
+                entries,
+                // 即使无法判断丢失位置，也不能把 fence 期间的缺口说成采样完整。
+                lost: drained.lost,
+            },
+            window_id,
+        );
+    }
+
     /// 结束累计并对每相位保留的确定性前缀计算分位数，不把分段 p95 相互平均。
     ///
     /// @author kongweiguang
@@ -571,11 +709,18 @@ impl FramePhaseAccumulator {
         FramePhaseDiagnostics {
             journal_entries_seen: self.journal_entries_seen,
             journal_entries_lost: self.journal_entries_lost,
+            journal_fence_observed: self.journal_fence_observed,
+            journal_fence_dirty_at_ns: self.journal_fence_dirty_at_ns,
+            journal_fence_draw_start_ns: self.journal_fence_draw_start_ns,
+            journal_fence_present_end_ns: self.journal_fence_present_end_ns,
+            journal_cross_boundary_frames: self.journal_cross_boundary_frames,
+            power_transitions: self.power_transitions,
             presented_frame_count: self.presented_frame_count,
             gpui_callback_count: self.gpui_callback_count,
             callbacks_with_signal_timestamp: self.callbacks_with_signal_timestamp,
             reentrant_frame_skips: self.reentrant_frame_skips,
             actual_dwm_vsync_interarrival_measured: false,
+            raw_frames: self.raw_frames.map(RawFrameSamples::finish),
             first_invalidation_to_frame_signal: summarize_timing_distribution(
                 self.samples.first_invalidation_to_frame_signal,
             ),
@@ -596,6 +741,165 @@ impl FramePhaseAccumulator {
                 self.samples.first_invalidation_to_platform_present_end,
             ),
         }
+    }
+}
+
+/// 各时间来自同一个 journal PresentedFrame；平台调用返回不保证合成或物理显示。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RawFrameSample {
+    dirty_at_ns: Option<i64>,
+    draw_start_ns: i64,
+    draw_end_ns: i64,
+    present_start_ns: i64,
+    present_end_ns: i64,
+    window_ids_match: bool,
+}
+
+/// 原始边界与各时钟读取耗时用于保守对齐跨进程负载；丢失和异常分开报告。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RawFrameReport {
+    origin_unix_ms: Option<u64>,
+    origin_clock_read_delay_ns: Option<u64>,
+    measurement_end_ns: Option<u64>,
+    measurement_end_unix_ms: Option<u64>,
+    end_clock_read_delay_ns: Option<u64>,
+    dropped: u64,
+    invalid: u64,
+    samples: Vec<RawFrameSample>,
+}
+
+struct RawFrameSamples {
+    origin: Instant,
+    origin_unix_ms: Option<u64>,
+    origin_clock_read_delay_ns: Option<u64>,
+    measurement_end_ns: Option<u64>,
+    measurement_end_unix_ms: Option<u64>,
+    end_clock_read_delay_ns: Option<u64>,
+    dropped: u64,
+    invalid: u64,
+    samples: Vec<RawFrameSample>,
+}
+
+impl RawFrameSamples {
+    /// 将读取墙钟前的单调基线及读取耗时一并保留，避免假设两次系统调用完全同时发生。
+    ///
+    /// @author kongweiguang
+    fn new(origin: Instant) -> Self {
+        let (origin_unix_ms, origin_clock_read_delay_ns) = raw_frame_clock_anchor(origin);
+        Self {
+            origin,
+            origin_unix_ms,
+            origin_clock_read_delay_ns,
+            measurement_end_ns: None,
+            measurement_end_unix_ms: None,
+            end_clock_read_delay_ns: None,
+            dropped: 0,
+            invalid: 0,
+            samples: Vec::new(),
+        }
+    }
+
+    /// 同一 PresentedFrame 内的字段不可跨帧拼接；异常顺序保留原样供诊断并标记无效。
+    ///
+    /// @author kongweiguang
+    fn push(&mut self, presented: gpui_kit::profiler::journal::PresentedFrame) {
+        if self.samples.len() >= MAX_FRAME_PHASE_SAMPLES_PER_PHASE {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        let frame = presented.frame;
+        let presentation = presented.presentation;
+        let dirty_at_ns = match frame.dirty_at {
+            Some(at) => match raw_frame_offset_ns(self.origin, at) {
+                Some(offset) => Some(offset),
+                None => {
+                    self.dropped = self.dropped.saturating_add(1);
+                    return;
+                }
+            },
+            None => None,
+        };
+        let values = raw_frame_offset_ns(self.origin, frame.draw_start)
+            .zip(raw_frame_offset_ns(self.origin, frame.draw_end))
+            .zip(raw_frame_offset_ns(self.origin, presentation.present_start))
+            .zip(raw_frame_offset_ns(self.origin, presentation.present_end));
+        let Some((((draw_start_ns, draw_end_ns), present_start_ns), present_end_ns)) = values
+        else {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        };
+        let window_ids_match = frame.window_id == presentation.window_id;
+        if !window_ids_match
+            || dirty_at_ns.is_some_and(|at| at > draw_start_ns)
+            || draw_start_ns > draw_end_ns
+            || draw_end_ns > present_start_ns
+            || present_start_ns > present_end_ns
+        {
+            self.invalid = self.invalid.saturating_add(1);
+        }
+        self.samples.push(RawFrameSample {
+            dirty_at_ns,
+            draw_start_ns,
+            draw_end_ns,
+            present_start_ns,
+            present_end_ns,
+            window_ids_match,
+        });
+    }
+
+    /// 结束墙钟与单调基线一起记录，调用方才能发现时钟跳变和不完整覆盖。
+    ///
+    /// @author kongweiguang
+    fn mark_end(&mut self, end: Instant) {
+        self.measurement_end_ns = end
+            .checked_duration_since(self.origin)
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+        (self.measurement_end_unix_ms, self.end_clock_read_delay_ns) = raw_frame_clock_anchor(end);
+    }
+
+    /// 不排序原始帧，保留实际提交次序及失败计数供负载窗口对齐。
+    ///
+    /// @author kongweiguang
+    fn finish(self) -> RawFrameReport {
+        RawFrameReport {
+            origin_unix_ms: self.origin_unix_ms,
+            origin_clock_read_delay_ns: self.origin_clock_read_delay_ns,
+            measurement_end_ns: self.measurement_end_ns,
+            measurement_end_unix_ms: self.measurement_end_unix_ms,
+            end_clock_read_delay_ns: self.end_clock_read_delay_ns,
+            dropped: self.dropped,
+            invalid: self.invalid,
+            samples: self.samples,
+        }
+    }
+}
+
+/// 墙钟只提供毫秒对齐，读取耗时也必须可见；失败时保留未知而不是虚构零值。
+///
+/// @author kongweiguang
+fn raw_frame_clock_anchor(at: Instant) -> (Option<u64>, Option<u64>) {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    let delay_ns = Instant::now()
+        .checked_duration_since(at)
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+    (unix_ms, delay_ns)
+}
+
+/// 起始前的真实 invalidation 保留负偏移，不能把跨基线帧截断成零延迟。
+///
+/// @author kongweiguang
+fn raw_frame_offset_ns(origin: Instant, at: Instant) -> Option<i64> {
+    if let Some(after) = at.checked_duration_since(origin) {
+        i64::try_from(after.as_nanos()).ok()
+    } else {
+        i64::try_from(origin.duration_since(at).as_nanos())
+            .ok()
+            .and_then(i64::checked_neg)
     }
 }
 

@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "id": "test.list-performance",
+  "name": {"en": "Native list performance fixture"},
+  "description": {"en": "Deterministic RPC rows for native list sampling"},
+  "version": "1.0.0",
+  "api": "^1.0",
+  "publisher": "test",
+  "license": "MIT",
+  "runtime": {"kind":"script","main":"main.js","activation":"on-demand"},
+  "permissions": [],
+  "contributes": {"tabs":[{"id":"records","title":"Native list 100000","view":"records","state_version":1}]},
+  "views": {"records":{"kind":"native","file":"views/records.json"}}
+}

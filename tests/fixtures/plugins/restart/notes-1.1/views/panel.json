@@ -1,0 +1,23 @@
+{
+  "data": {
+    "saved": "",
+    "showPreview": true
+  },
+  "root": {
+    "gap": "md",
+    "children": [
+      {
+        "text": "%panel.saved%",
+        "tone": "muted",
+        "type": "text"
+      },
+      {
+        "text": "$saved",
+        "visible": "$showPreview",
+        "type": "text"
+      }
+    ],
+    "type": "stack"
+  },
+  "schema": 1
+}

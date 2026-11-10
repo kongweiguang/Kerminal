@@ -35,11 +35,12 @@ use super::{
 };
 
 const INITIAL_FETCH_ROWS: usize = 40;
+const MAX_CACHED_ROWS: usize = 4096;
 
 #[derive(Clone)]
 struct CachedPage {
     total: usize,
-    rows: BTreeMap<usize, Value>,
+    rows: Rc<BTreeMap<usize, Value>>,
 }
 
 #[derive(Clone)]
@@ -59,14 +60,60 @@ pub struct NativeCollection {
     sort: Option<ViewFetchSort>,
     pages: Vec<(CollectionQuery, CachedPage)>,
     visible: Range<usize>,
+    visible_queries: BTreeMap<CollectionQuery, Range<usize>>,
+    tree_positions: BTreeMap<CollectionQuery, BTreeMap<usize, String>>,
+    #[cfg(feature = "right-rail-acceptance")]
+    rendered_visible_rows: Vec<(usize, String)>,
+    /// 验收计数只在同一集合生命周期内累积；成功页会清除可见错误文本，
+    /// 但这里的计数保留曾发生的请求、成功和失败，避免旧错误被成功结果掩盖。
+    #[cfg(feature = "right-rail-acceptance")]
+    acceptance_fetch_requests: u64,
+    #[cfg(feature = "right-rail-acceptance")]
+    acceptance_fetch_successes: u64,
+    #[cfg(feature = "right-rail-acceptance")]
+    acceptance_fetch_errors: u64,
+    #[cfg(feature = "right-rail-acceptance")]
+    acceptance_last_fetch: Option<(Range<usize>, CollectionQuery)>,
     last_query: CollectionQuery,
     bootstrap_pending: bool,
     error: Option<String>,
+    row_sizes: Rc<Vec<gpui_kit::Size<gpui_kit::Pixels>>>,
 }
 
 impl EventEmitter<CollectionEvent> for NativeCollection {}
 
 impl NativeCollection {
+    /// 验收只驱动同一原生滚动句柄，不直接改可视范围或伪造分页事件。
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn external_plugin_acceptance_scroll_to(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if index >= self.rows_for(&self.query()).0 {
+            return false;
+        }
+        self.scroll
+            .scroll_to_item(index, gpui_kit::ScrollStrategy::Top);
+        cx.notify();
+        true
+    }
+
+    /// 采样只返回真正构造过业务行的绘制回调记录，刚到达但尚未绘制的缓存不能冒充可见内容。
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn external_plugin_acceptance_snapshot(&self) -> Value {
+        let (total, _) = self.rows_for(&self.last_query);
+        let visible_rows: Vec<_> = self
+            .rendered_visible_rows
+            .iter()
+            .map(|(index, key)| serde_json::json!({"index":index,"key":key}))
+            .collect();
+        serde_json::json!({"total":total,"visible_start":self.visible.start,"visible_end":self.visible.end,
+            "visible_rows":visible_rows,"cached_rows":self.pages.iter().map(|(_,page)|page.rows.len()).sum::<usize>(),
+            "cached_queries":self.pages.len(),"error":self.error,
+            "fetch_requests":self.acceptance_fetch_requests,"fetch_successes":self.acceptance_fetch_successes,"fetch_errors":self.acceptance_fetch_errors})
+    }
+
     /// 构造时只冻结静态节点与初始数据；RPC 集合首屏请求延后到首帧后发出。
     pub fn new(
         config: NativeCollectionConfig,
@@ -87,13 +134,26 @@ impl NativeCollection {
             sort: None,
             pages: Vec::new(),
             visible: 0..INITIAL_FETCH_ROWS,
+            visible_queries: BTreeMap::new(),
+            tree_positions: BTreeMap::new(),
+            #[cfg(feature = "right-rail-acceptance")]
+            rendered_visible_rows: Vec::new(),
+            #[cfg(feature = "right-rail-acceptance")]
+            acceptance_fetch_requests: 0,
+            #[cfg(feature = "right-rail-acceptance")]
+            acceptance_fetch_successes: 0,
+            #[cfg(feature = "right-rail-acceptance")]
+            acceptance_fetch_errors: 0,
+            #[cfg(feature = "right-rail-acceptance")]
+            acceptance_last_fetch: None,
             last_query: CollectionQuery::default(),
             bootstrap_pending: is_rpc,
             error: None,
+            row_sizes: Rc::new(Vec::new()),
         }
     }
 
-    /// 只接受当前树父键和表格排序对应的结果，保持旧页直到新查询完整到达。
+    /// 页回执只复制一次必要数据；渲染共享不可变快照，缓存淘汰不改变业务键选择和滚动坐标。
     pub fn apply_page(
         &mut self,
         query: &CollectionQuery,
@@ -104,6 +164,21 @@ impl NativeCollection {
         if !self.accepts_query(query) {
             return;
         }
+        #[cfg(feature = "right-rail-acceptance")]
+        {
+            self.acceptance_fetch_successes = self.acceptance_fetch_successes.saturating_add(1);
+        }
+        if let Some(positions) = self.tree_positions.get_mut(query) {
+            positions.retain(|index, _| *index < total);
+            for row in rows {
+                if positions.get(&row.index()).is_some_and(|old| {
+                    row_key(row.value(), &self.config.node).as_ref() != Some(old)
+                        || row.value().get("has_children").and_then(Value::as_bool) != Some(true)
+                }) {
+                    positions.remove(&row.index());
+                }
+            }
+        }
         let page = if let Some((_, page)) = self.pages.iter_mut().find(|(key, _)| key == query) {
             page
         } else {
@@ -111,17 +186,103 @@ impl NativeCollection {
                 query.clone(),
                 CachedPage {
                     total,
-                    rows: BTreeMap::new(),
+                    rows: Rc::new(BTreeMap::new()),
                 },
             ));
             &mut self.pages.last_mut().expect("page was inserted").1
         };
         page.total = total;
+        let cached = Rc::make_mut(&mut page.rows);
+        cached.retain(|index, _| *index < total);
         for row in rows {
-            page.rows.insert(row.index(), row.value().clone());
+            if row.index() < total {
+                cached.insert(row.index(), row.value().clone());
+            }
         }
+        let incoming = rows.first().map_or(0..0, |first| {
+            first.index()
+                ..rows
+                    .last()
+                    .map_or(first.index(), PageRow::index)
+                    .saturating_add(1)
+        });
+        self.trim_cached_rows(query, incoming);
         self.error = None;
         cx.notify();
+    }
+
+    /// 展开结构只保留坐标和业务键，完整 JSON 仅保护本帧全部可见查询和刚到达页。
+    fn trim_cached_rows(&mut self, incoming_query: &CollectionQuery, incoming: Range<usize>) {
+        let count = self
+            .pages
+            .iter()
+            .map(|(_, page)| page.rows.len())
+            .sum::<usize>();
+        if count <= MAX_CACHED_ROWS {
+            return;
+        }
+        for (query, page) in &self.pages {
+            let positions = self.tree_positions.entry(query.clone()).or_default();
+            positions.retain(|_, key| self.expanded.contains(key));
+            for (index, row) in page.rows.iter() {
+                if row.get("has_children").and_then(Value::as_bool) == Some(true)
+                    && let Some(key) = row_key(row, &self.config.node)
+                    && self.expanded.contains(&key)
+                {
+                    positions.insert(*index, key);
+                }
+            }
+        }
+        let mut candidates = Vec::new();
+        for (page_index, (query, page)) in self.pages.iter().enumerate() {
+            for index in page.rows.keys() {
+                if (query == incoming_query && incoming.contains(index))
+                    || (query == &self.last_query && self.visible.contains(index))
+                    || self
+                        .visible_queries
+                        .get(query)
+                        .is_some_and(|range| range.contains(index))
+                {
+                    continue;
+                }
+                let anchor = if query == incoming_query {
+                    &incoming
+                } else {
+                    &self.visible
+                };
+                let distance = if *index < anchor.start {
+                    anchor.start - *index
+                } else {
+                    index.saturating_sub(anchor.end.saturating_sub(1))
+                };
+                candidates.push((query != incoming_query, distance, page_index, *index));
+            }
+        }
+        candidates.sort_unstable_by(|left, right| right.cmp(left));
+        let mut removed = BTreeMap::<usize, BTreeSet<usize>>::new();
+        for (_, _, page, index) in candidates.into_iter().take(count - MAX_CACHED_ROWS) {
+            removed.entry(page).or_default().insert(index);
+        }
+        for (page, indices) in removed {
+            Rc::make_mut(&mut self.pages[page].1.rows).retain(|index, _| !indices.contains(index));
+        }
+    }
+
+    /// 固定行高只有数量或字体尺寸改变才重新分配，普通帧复用同一份十万行尺寸快照。
+    fn row_sizes(
+        &mut self,
+        count: usize,
+        row_height: gpui_kit::Pixels,
+    ) -> Rc<Vec<gpui_kit::Size<gpui_kit::Pixels>>> {
+        if self.row_sizes.len() != count
+            || self
+                .row_sizes
+                .first()
+                .is_some_and(|size| size.height != row_height)
+        {
+            self.row_sizes = Rc::new(vec![size(px(1.), row_height); count]);
+        }
+        Rc::clone(&self.row_sizes)
     }
 
     /// 内联列表来自 ViewState 的合并快照；直接替换数据而不改写分页缓存。
@@ -139,6 +300,10 @@ impl NativeCollection {
 
     /// 分页失败保留先前行；错误由宿主传入已本地化文案并提供原位重试。
     pub fn apply_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        #[cfg(feature = "right-rail-acceptance")]
+        {
+            self.acceptance_fetch_errors = self.acceptance_fetch_errors.saturating_add(1);
+        }
         self.error = Some(message.into());
         cx.notify();
     }
@@ -170,7 +335,7 @@ impl NativeCollection {
         &self.selected
     }
 
-    /// 虚拟行只描述已测量的屏幕范围，RPC 意图在下一帧回调中发给宿主。
+    /// 逐父查询累积本帧实际可视范围；last_query 仅用于原有重试入口，不再代表完整视口。
     fn schedule_visible(
         &mut self,
         range: Range<usize>,
@@ -180,6 +345,17 @@ impl NativeCollection {
     ) {
         self.visible = range.clone();
         self.last_query = query.clone();
+        // 同一范围/查询的连续重绘不应膨胀请求计数；只有范围或查询真正变化时才记录一次，
+        // 与布局层按 ViewState 去重后的分页请求节奏保持同向。
+        #[cfg(feature = "right-rail-acceptance")]
+        {
+            let request = (range.clone(), query.clone());
+            if self.acceptance_last_fetch.as_ref() != Some(&request) {
+                self.acceptance_fetch_requests = self.acceptance_fetch_requests.saturating_add(1);
+                self.acceptance_last_fetch = Some(request);
+            }
+        }
+        self.visible_queries.insert(query.clone(), range.clone());
         let node = self.config.node_key.clone();
         cx.on_next_frame(window, move |_, _, cx| {
             cx.emit(CollectionEvent::Visible { node, range, query });
@@ -279,8 +455,8 @@ impl NativeCollection {
         cx.notify();
     }
 
-    /// RPC 和内联集合分别读取自己的快照，未到达的分页位置只保留行高而不伪造内容。
-    fn rows_for(&self, query: &CollectionQuery) -> (usize, BTreeMap<usize, Value>) {
+    /// RPC 只克隆快照句柄，不在每帧复制分页 JSON；内联列表仍按有界静态数据排序。
+    fn rows_for(&self, query: &CollectionQuery) -> (usize, Rc<BTreeMap<usize, Value>>) {
         if collection_source(&self.config.node) == Some(CollectionSource::Rpc) {
             if let Some((_, page)) = self.pages.iter().find(|(key, _)| key == query) {
                 return (page.total, page.rows.clone());
@@ -291,7 +467,7 @@ impl NativeCollection {
                 .rev()
                 .find(|(cached_query, _)| cached_query.parent_key == query.parent_key)
                 .map(|(_, page)| (page.total, page.rows.clone()))
-                .unwrap_or((0, BTreeMap::new()));
+                .unwrap_or((0, Rc::new(BTreeMap::new())));
         }
         let mut rows = inline_rows(&self.config.data, &self.config.node);
         if let Some(sort) = self.sort.as_ref() {
@@ -302,7 +478,7 @@ impl NativeCollection {
                 rows.reverse();
             }
         }
-        (rows.len(), rows.into_iter().enumerate().collect())
+        (rows.len(), Rc::new(rows.into_iter().enumerate().collect()))
     }
 
     /// 显示字段只按协议声明的对象键读取，不把插件自定义 HTML 当成界面内容。
@@ -369,7 +545,7 @@ impl NativeCollection {
         result
     }
 
-    /// 每个父键的行序维持源坐标，展开子列表后仍能准确请求它自己的可视区间。
+    /// 离屏展开父行即使已淘汰 JSON，也用轻量坐标继续保留子树槽位，避免滚动长度跳变。
     fn append_tree_slots(
         &self,
         parent_key: Option<String>,
@@ -381,17 +557,36 @@ impl NativeCollection {
             sort: self.sort.clone(),
         };
         let (total, rows) = self.rows_for(&query);
+        let positions = self
+            .pages
+            .iter()
+            .find(|(cached, _)| cached == &query)
+            .or_else(|| {
+                self.pages
+                    .iter()
+                    .rev()
+                    .find(|(cached, _)| cached.parent_key == query.parent_key)
+            })
+            .and_then(|(cached, _)| self.tree_positions.get(cached));
         for index in 0..total {
             let row = rows.get(&index).cloned();
-            let item_key = row.as_ref().and_then(|row| row_key(row, &self.config.node));
+            let item_key = row
+                .as_ref()
+                .and_then(|row| row_key(row, &self.config.node))
+                .or_else(|| {
+                    positions
+                        .and_then(|positions| positions.get(&index))
+                        .cloned()
+                });
             result.push(TreeSlot {
                 query: query.clone(),
                 index,
                 depth,
                 row: row.clone(),
             });
-            if let (Some(row), Some(item_key)) = (row, item_key)
-                && self.tree_has_children(&row)
+            if let Some(item_key) = item_key
+                && (row.as_ref().is_some_and(|row| self.tree_has_children(row))
+                    || positions.is_some_and(|positions| positions.contains_key(&index)))
                 && self.expanded.contains(&item_key)
             {
                 self.append_tree_slots(Some(item_key), depth + 1, result);
@@ -401,7 +596,7 @@ impl NativeCollection {
 }
 
 impl Render for NativeCollection {
-    /// 集合主体使用 Kit 虚拟列表；构建元素只捕获快照，RPC 在下一帧事件中交给宿主。
+    /// 集合主体共享行数据与固定尺寸快照，只有可视范围生成元素；RPC 继续延至下一帧分发。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let node = self.config.node.clone();
         let entity = cx.entity().clone();
@@ -410,7 +605,7 @@ impl Render for NativeCollection {
             matches!(&node.kind, NativeNodeKind::Tree { .. }).then(|| self.flatten_tree());
         let count = tree_slots.as_ref().map_or(total, Vec::len);
         let row_height = window.rem_size() * 2.5;
-        let row_sizes = Rc::new(vec![size(px(1.), row_height); count]);
+        let row_sizes = self.row_sizes(count, row_height);
         let title = match &node.kind {
             NativeNodeKind::List { title, .. } | NativeNodeKind::Tree { title, .. } => {
                 Some(self.localized(title))
@@ -520,9 +715,10 @@ impl Render for NativeCollection {
                 format!("native-collection-list-{}", self.config.node_key),
                 row_sizes,
                 move |this, range, window, cx| {
-                    if source_rpc {
-                        this.schedule_visible(range.clone(), callback_query.clone(), window, cx);
-                    }
+                    // 测量回调和绘制回调分别重建各自完整的范围，避免把上帧不可见行永久钉住。
+                    this.visible_queries.clear();
+                    #[cfg(feature = "right-rail-acceptance")]
+                    this.rendered_visible_rows.clear();
                     if let Some(slots) = callback_slots.as_ref() {
                         return render_tree_range(
                             this,
@@ -533,6 +729,9 @@ impl Render for NativeCollection {
                             window,
                             cx,
                         );
+                    }
+                    if source_rpc {
+                        this.schedule_visible(range.clone(), callback_query.clone(), window, cx);
                     }
                     render_flat_range(this, &callback_node, &callback_rows, range, theme_muted, cx)
                 },
@@ -585,7 +784,7 @@ impl Render for NativeCollection {
     }
 }
 
-/// 列表和表格仅按视口范围创建行，所有回调均使用稳定业务键绑定交互。
+/// 列表只按视口范围构造业务行；验收记录在构造处更新，不能把仅缓存到达误当作已绘制。
 fn render_flat_range(
     this: &mut NativeCollection,
     node: &NativeNode,
@@ -599,12 +798,16 @@ fn render_flat_range(
             let Some(row) = rows.get(&index) else {
                 return div().h_10().into_any_element();
             };
+            #[cfg(feature = "right-rail-acceptance")]
+            if let Some(key) = row_key(row, node) {
+                this.rendered_visible_rows.push((index, key));
+            }
             render_row(this, node, row, 0, muted, cx)
         })
         .collect()
 }
 
-/// 树把全局虚拟范围映射为各 parent_key 的局部请求区间。
+/// 树完整收集所有可见父查询范围，并只在真正构造业务行时记录验收键。
 fn render_tree_range(
     this: &mut NativeCollection,
     slots: &[TreeSlot],
@@ -631,6 +834,10 @@ fn render_tree_range(
             visible_queries.push((slot.query.clone(), slot.index..slot.index + 1));
         }
         if let Some(row) = &slot.row {
+            #[cfg(feature = "right-rail-acceptance")]
+            if let Some(key) = row_key(row, node) {
+                this.rendered_visible_rows.push((index, key));
+            }
             elements.push(render_row(this, node, row, slot.depth, muted, cx));
         } else {
             elements.push(div().h_10().into_any_element());

@@ -34,10 +34,37 @@ pub(crate) fn catalogs_for_plugins(
     active: &[Arc<PreparedPlugin>],
     locale: &str,
 ) -> AppResult<PluginCatalogs> {
+    catalogs_for_plugins_inner(plugins, active, locale, false)
+}
+
+/// 只有验收入口能附加宿主声明，所有来源仍在首次扫描前共同校验和冻结。
+pub(crate) fn catalogs_for_plugins_inner(
+    plugins: &[Arc<PreparedPlugin>],
+    active: &[Arc<PreparedPlugin>],
+    locale: &str,
+    host_list: bool,
+) -> AppResult<PluginCatalogs> {
     let mut builder = PluginRegistryBuilder::new();
     builder
         .register_builtins()
         .map_err(|source| AppError::infrastructure_with_source("注册内置插件贡献失败", source))?;
+    #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+    if host_list {
+        use kerminal_application::plugins::{ContentDescriptor, ContentTypeId, PluginId};
+        let content = ContentTypeId::new(kerminal_ui::RootView::HOST_LIST_PERFORMANCE_CONTENT_ID)
+            .map_err(|source| {
+            AppError::infrastructure_with_source("宿主列表贡献身份无效", source)
+        })?;
+        let provider = PluginId::new("kerminal")
+            .map_err(|source| AppError::infrastructure_with_source("宿主来源身份无效", source))?;
+        builder.register_content_type(ContentDescriptor::new(
+            content,
+            provider,
+            "Host list acceptance",
+        ));
+    }
+    #[cfg(not(all(feature = "acceptance-metrics", feature = "right-rail-acceptance")))]
+    let _ = host_list;
     register_external_plugins(
         &mut builder,
         active.iter().map(Arc::as_ref),

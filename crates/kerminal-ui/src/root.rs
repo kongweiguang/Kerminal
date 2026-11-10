@@ -31,6 +31,8 @@ mod plugin_acceptance;
 mod plugin_commands;
 mod plugin_host_api;
 mod plugin_hosts;
+#[cfg(feature = "right-rail-acceptance")]
+mod plugin_list_performance_acceptance;
 mod plugin_tab_close;
 #[cfg(feature = "right-rail-acceptance")]
 mod plugin_webview_acceptance;

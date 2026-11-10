@@ -1138,3 +1138,37 @@ impl Render for NativeRenderer {
         container.child(content)
     }
 }
+
+#[cfg(feature = "right-rail-acceptance")]
+impl NativeRenderer {
+    /// 验收只读取真实集合实体的绘制范围，不用应用缓存冒充用户看到的业务行。
+    /// 同时固定外部插件来源：插件身份、视图、清单运行时种类和渲染错误都来自真实实体，
+    /// 采样方无需信任驱动传入的字符串即可拒绝宿主 fixture 或替身路径。
+    pub fn external_plugin_list_performance_snapshot(&self, node: &str, cx: &App) -> Value {
+        let runtime = serde_json::to_value(&self.prepared.package.manifest.runtime)
+            .ok()
+            .and_then(|value| value["kind"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        json!({"instance":self.identity.instance,"generation":self.process_generation,"visible":self.visible,"status":format!("{:?}",self.status),"error":self.error,"plugin":self.identity.plugin.as_str(),"view":self.identity.view,"runtime":runtime,"external":true,"collection":self.collections.get(node).map(|collection|collection.read(cx).external_plugin_acceptance_snapshot())})
+    }
+
+    /// 索引调整由集合自己的虚拟滚动句柄实现，失败保持目标缺失而不构造替代集合。
+    pub fn external_plugin_list_performance_scroll(
+        &mut self,
+        node: &str,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AppResult<()> {
+        let collection = self
+            .collections
+            .get(node)
+            .ok_or_else(|| AppError::not_found("列表集合"))?;
+        let scrolled = collection.update(cx, |collection, cx| {
+            collection.external_plugin_acceptance_scroll_to(index, cx)
+        });
+        if !scrolled {
+            return Err(AppError::invalid("列表滚动索引无效"));
+        }
+        Ok(())
+    }
+}

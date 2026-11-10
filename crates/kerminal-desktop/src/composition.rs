@@ -121,7 +121,7 @@ mod notification_bridge;
 use notification_bridge::NotificationBridge;
 
 #[path = "builtin_plugins.rs"]
-mod builtin_plugins;
+pub(crate) mod builtin_plugins;
 
 const STARTUP_CLEANUP_BUDGET: Duration = Duration::from_secs(12);
 

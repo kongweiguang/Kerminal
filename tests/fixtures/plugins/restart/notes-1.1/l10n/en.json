@@ -1,0 +1,15 @@
+{
+  "panel.title": "Workspace notes",
+  "panel.saved": "Saved note",
+  "editor.title": "Workspace notes",
+  "editor.text": "Note",
+  "editor.placeholder": "Write a note",
+  "editor.save": "Save",
+  "editor.check": "Check example.com",
+  "editor.copy": "Copy note",
+  "editor.count": "Count code points",
+  "editor.countResult": "Code points",
+  "settings.title": "Notes settings",
+  "settings.preview": "Show note preview",
+  "command.check": "Notes: Check example.com"
+}
