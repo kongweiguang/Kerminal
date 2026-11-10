@@ -10,7 +10,10 @@ use async_trait::async_trait;
 // Windows 分支的显式 shell 契约只在 Windows 用例中构造；按平台导入避免其它平台告警。
 use kerminal_application::{
     AppError, AppResult, PreferencesService,
-    agents::{AgentLaunchResolver, AgentLauncherInstallationProbe, resolve_agent_launcher},
+    agents::{
+        AgentLaunchResolver, AgentLauncherInstallationProbe, builtin_launch_command_line,
+        resolve_agent_launcher,
+    },
     preferences::{
         AgentLauncherSettings, ConfigurationGuideStatus, ConfigurationRepository,
         CustomAgentDefinition, ProfileDraft, ProfileRepository, ProfileRevision,
@@ -246,7 +249,8 @@ fn selected_custom(id: &str, name: &str, command: &str) -> SettingsSnapshot {
     }
 }
 
-/// 保留各 CLI 的启动语义：Codex/Claude 使用完整权限参数，Pi 信任受管 session 的项目配置。
+/// 保留各 CLI 的启动语义：Codex/Claude 使用完整权限参数，Pi 信任受管 session 的项目配置，
+/// Windows 上另以 regular TUI 模式启动，避免 ConPTY 吞掉鼠标模式后滚轮退化成方向键。
 #[test]
 fn builtin_launcher_preserves_provider_permission_modes() {
     let mut settings = SettingsSnapshot::default();
@@ -272,7 +276,33 @@ fn builtin_launcher_preserves_provider_permission_modes() {
 
     settings.agent_launcher.selected_agent_key = "builtin:pi".to_owned();
     let pi = resolve_agent_launcher(&settings).expect("Pi launcher resolves");
+    // Windows 的 ConPTY 不转发 DEC 鼠标跟踪模式，Pi 必须用 regular 模式把历史交给终端 scrollback。
+    #[cfg(windows)]
+    assert_eq!(pi.args, ["--approve", "--tui-mode", "regular"]);
+    #[cfg(not(windows))]
     assert_eq!(pi.args, ["--approve"]);
+}
+
+/// 技术提示复用冻结 argv：菜单显示的参数必须与实际启动一致，避免两处各自维护造成漂移。
+#[test]
+fn builtin_command_lines_match_launch_argv() {
+    assert_eq!(
+        builtin_launch_command_line(AgentProvider::Codex).as_deref(),
+        Some("codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust")
+    );
+    assert_eq!(
+        builtin_launch_command_line(AgentProvider::Claude).as_deref(),
+        Some("claude --dangerously-skip-permissions")
+    );
+    #[cfg(windows)]
+    let pi = "pi --approve --tui-mode regular";
+    #[cfg(not(windows))]
+    let pi = "pi --approve";
+    assert_eq!(
+        builtin_launch_command_line(AgentProvider::Pi).as_deref(),
+        Some(pi)
+    );
+    assert_eq!(builtin_launch_command_line(AgentProvider::Custom), None);
 }
 
 /// Custom 命令只做安全 argv 分词，命令替换语法作为普通参数原样保留。

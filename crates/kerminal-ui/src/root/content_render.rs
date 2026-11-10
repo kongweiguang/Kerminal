@@ -33,6 +33,14 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = ThemeTokens::current(window, cx);
+        // 文件工作区标签的活动身份优先于残留的文件面板选择，避免同一标签下显示双端 SFTP 工作台。
+        if let Some(tab @ WorkspaceSessionTab::FileWorkspace { .. }) = active_workspace_tab
+            && (self.center_panel == CenterPanel::Editor
+                || (self.center_panel == CenterPanel::Files
+                    && !self.shared_sftp_workbench_is_selected()))
+        {
+            return self.render_host_file_workspace(tab, window, cx);
+        }
         match self.center_panel {
             CenterPanel::Contributed => self.render_plugin_content(cx),
             CenterPanel::Terminal => match active_workspace_tab {

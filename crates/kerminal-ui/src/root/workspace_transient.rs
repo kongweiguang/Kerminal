@@ -150,6 +150,7 @@ fn normalize_selection(snapshot: &mut WorkspaceSessionSnapshot) {
 fn tab_machine_id(tab: &WorkspaceSessionTab) -> Option<&str> {
     match tab {
         WorkspaceSessionTab::SftpTransfer { machine_id, .. }
+        | WorkspaceSessionTab::FileWorkspace { machine_id, .. }
         | WorkspaceSessionTab::WorkspaceFile { machine_id, .. } => Some(machine_id),
         WorkspaceSessionTab::Terminal { .. }
         | WorkspaceSessionTab::Extension { .. }
@@ -177,7 +178,8 @@ fn tab_has_external_target(tab: &WorkspaceSessionTab) -> bool {
                 .any(host_id_is_external)
                 || external_launch_id.is_some()
         }
-        WorkspaceSessionTab::WorkspaceFile { target, .. } => target_is_external(target),
+        WorkspaceSessionTab::FileWorkspace { target, .. }
+        | WorkspaceSessionTab::WorkspaceFile { target, .. } => target_is_external(target),
     }
 }
 

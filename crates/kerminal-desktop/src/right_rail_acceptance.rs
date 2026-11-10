@@ -12,6 +12,7 @@ mod functional_containers;
 mod functional_follow;
 mod functional_forwarding;
 mod functional_logs;
+mod functional_sidebar;
 mod functional_snippets;
 mod functional_tmux_attach;
 mod functional_transfer_restart;

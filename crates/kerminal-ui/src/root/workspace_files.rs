@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use gpui_kit::{App, AppContext as _, Context, Entity, SharedString, Subscription, Window};
+use gpui_kit::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
 use kerminal_application::{
     AppError, AppResult,
     platform::external_launch::ExternalTargetLease,
@@ -25,17 +25,21 @@ use kerminal_domain::{
 };
 
 use crate::features::{
-    editor::{EditorWorkspaceProjection, FileEditorWorkspace},
+    editor::EditorWorkspaceProjection,
     files::{
         ActivateEditorFileRequested, CreateSftpHostRequested, FilesPane, FilesPaneEvent,
         OpenFileRequested, SftpHostKeyTrustRequested, SftpHostRequested,
     },
-    workspace_controller::{WorkspaceController, WorkspaceRestoreFailure, WorkspaceRestoreItemId},
+    workspace_controller::{WorkspaceRestoreFailure, WorkspaceRestoreItemId},
     workspace_tabs::WorkspaceFileTabAction,
 };
 use tokio_util::sync::CancellationToken;
 
 use super::{CenterPanel, RootView};
+
+#[path = "host_file_workspace.rs"]
+mod host_file_workspace;
+pub(super) use host_file_workspace::workspace_origins;
 
 /// 中央共享工作台与独立传输标签显式区分，避免后台活动标签覆盖用户刚打开的工作台。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -77,7 +81,21 @@ impl FilesWorkspaceSelection {
 #[derive(Default)]
 pub(super) struct WorkspaceFileRuntime {
     tabs: BTreeMap<TabId, WorkspaceFileTabRuntime>,
+    /// 内部文档与顶层身份分离，迁移沿用旧 TabId 时也不会覆盖宿主。
+    documents: BTreeMap<(TabId, TabId), WorkspaceFileTabRuntime>,
+    /// 每个目录独占浏览实体与订阅，切文档不重建目录状态。
+    directories: BTreeMap<(TabId, TabId), (Entity<FilesPane>, FilesPaneSubscriptions)>,
+    host_tab_scroll_handles: BTreeMap<TabId, gpui_kit::ScrollHandle>,
+    /// 只保留仍对应原文档与宿主目录的一次性交接，不共享终端 binding 或写操作 owner。
+    right_browser_contexts: BTreeMap<TabId, RightBrowserContextHandoff>,
     snapshot_installed: bool,
+}
+
+/// 用文档与目录身份限定纯浏览值的有效期，不保留来源面板或异步操作所有权。
+struct RightBrowserContextHandoff {
+    snapshot: crate::features::files::FileBrowserContextSnapshot,
+    document: FileEndpoint,
+    directory: FileEndpoint,
 }
 
 /// 运行态只持有该 tab 的资源，不复制文件服务或改变 snapshot 中的业务身份。
@@ -118,6 +136,8 @@ impl WorkspaceFileTabRuntime {
 /// 一个 FilesPane 的 Root 桥接和删除观察器同生共灭，避免工作区标签漏接安全边界。
 pub(super) struct FilesPaneSubscriptions {
     _open_file: Subscription,
+    _open_directory: Subscription,
+    _directory_changed: Subscription,
     _activate_editor_file: Subscription,
     _sftp_host: Subscription,
     _sftp_host_key_trust: Subscription,
@@ -201,8 +221,27 @@ impl WorkspaceFileRuntime {
                 },
             );
         }
+        let host_tab_scroll_handles =
+            tabs.iter()
+                .map(|(id, runtime)| {
+                    let handle = gpui_kit::ScrollHandle::new();
+                    // 冷恢复的活动文档也需在首帧显露，不让长标签带把实际内容藏在屏外。
+                    if let WorkspaceSessionTab::FileWorkspace { state, .. } = &runtime.tab
+                        && let Some(index) = state.active_item_id.as_ref().and_then(|active| {
+                            state.items.iter().position(|item| item.id() == active)
+                        })
+                    {
+                        handle.scroll_to_item(index);
+                    }
+                    (id.clone(), handle)
+                })
+                .collect();
         Self {
             tabs,
+            documents: BTreeMap::new(),
+            directories: BTreeMap::new(),
+            host_tab_scroll_handles,
+            right_browser_contexts: BTreeMap::new(),
             snapshot_installed: true,
         }
     }
@@ -215,23 +254,6 @@ impl WorkspaceFileRuntime {
             &tab,
             WorkspaceSessionTab::SftpTransfer {
                 external_launch_id: None,
-                ..
-            }
-        ) {
-            return false;
-        }
-        self.register_pending_file_tab(tab)
-    }
-
-    /// Compose 入口只登记明确只读的文件描述，实际加载和失败重试复用恢复链路。
-    ///
-    /// @author kongweiguang
-    pub(super) fn register_pending_compose_yaml_tab(&mut self, tab: WorkspaceSessionTab) -> bool {
-        if !matches!(
-            &tab,
-            WorkspaceSessionTab::WorkspaceFile {
-                access: kerminal_application::workspace::WorkspaceFileAccess::Readonly,
-                source: kerminal_application::workspace::WorkspaceFileSource::ComposeYaml,
                 ..
             }
         ) {
@@ -264,107 +286,17 @@ impl WorkspaceFileRuntime {
         true
     }
 
-    /// 活动文件沿用已验证的端点；临时目标由独立 lease 保活，持久恢复仍走严格 descriptor 校验。
-    ///
-    /// @author kongweiguang
-    pub(super) fn register_open_file_tab(
-        &mut self,
-        tab: WorkspaceSessionTab,
-        endpoint: FileEndpoint,
-        external_target_lease: Option<ExternalTargetLease>,
-        transient: bool,
-    ) -> bool {
-        let id = tab.id().clone();
-        if !self.register_pending_file_tab(tab) {
-            return false;
-        }
-        if let Some(runtime) = self.tabs.get_mut(&id) {
-            runtime.endpoint = Some(endpoint);
-            runtime.external_target_lease = external_target_lease;
-            runtime.transient = transient;
-        }
-        true
-    }
-
     /// 完整 endpoint 决定导航身份；已恢复、待恢复和失败描述都不能按来源创建新的别名。
     ///
     /// @author kongweiguang
     pub(super) fn tab_for_endpoint(&self, endpoint: &FileEndpoint) -> Option<TabId> {
-        self.tabs
-            .iter()
-            .find_map(|(id, runtime)| runtime.matches_file_endpoint(endpoint).then(|| id.clone()))
-    }
-
-    /// 把同一标签收紧为只读；编辑器与快照在单次更新内协调，失败恢复原策略且不改变正文。
-    ///
-    /// @author kongweiguang
-    pub(super) fn restrict_file_to_readonly(
-        &mut self,
-        controller: &mut WorkspaceController,
-        editor: &Entity<FileEditorWorkspace>,
-        tab_id: &TabId,
-        endpoint: &FileEndpoint,
-        cx: &mut App,
-    ) -> AppResult<bool> {
-        let runtime = self
-            .tabs
-            .get_mut(tab_id)
-            .ok_or_else(|| AppError::not_found("工作区文件标签不存在"))?;
-        if !runtime.matches_file_endpoint(endpoint) {
-            return Err(AppError::conflict("工作区文件目标已变化"));
-        }
-        let WorkspaceSessionTab::WorkspaceFile {
-            target: runtime_target,
-            path: runtime_path,
-            source: runtime_source,
-            access: runtime_access,
-            ..
-        } = &mut runtime.tab
-        else {
-            return Err(AppError::conflict("工作区标签不是文件"));
-        };
-        let original = controller.snapshot().clone();
-        let mut candidate = original.clone();
-        let Some(WorkspaceSessionTab::WorkspaceFile {
-            target,
-            path,
-            source,
-            access,
-            ..
-        }) = candidate
-            .terminal_tabs
-            .iter_mut()
-            .find(|tab| tab.id() == tab_id)
-        else {
-            return Err(AppError::conflict("工作区文件描述已变化"));
-        };
-        if target != runtime_target
-            || path != runtime_path
-            || source != runtime_source
-            || access != runtime_access
-        {
-            return Err(AppError::conflict("工作区文件描述与运行状态不一致"));
-        }
-        let changed = *access != WorkspaceFileAccess::Readonly;
-        *access = WorkspaceFileAccess::Readonly;
-
-        // 先检查 controller 的资源和保存门禁；随后编辑器事务不会产生并发 Root 回调。
-        controller.synchronize_snapshot(original)?;
-        editor.update(cx, |workspace, cx| {
-            let old_policy = workspace.workspace_file_readonly_before_restriction(endpoint, cx)?;
-            if old_policy == Some(false) {
-                workspace.set_workspace_file_readonly(endpoint, true, cx)?;
+        self.tabs.iter().find_map(|(id, runtime)| {
+            if runtime.matches_file_endpoint(endpoint) {
+                return Some(id.clone());
             }
-            if let Err(error) = controller.synchronize_snapshot(candidate) {
-                if old_policy == Some(false) {
-                    workspace
-                        .set_workspace_file_readonly(endpoint, false, cx)
-                        .map_err(|_| AppError::conflict("工作区文件只读状态回滚失败"))?;
-                }
-                return Err(error);
-            }
-            *runtime_access = WorkspaceFileAccess::Readonly;
-            Ok(changed)
+            self.host_document_endpoints(id)
+                .contains(endpoint)
+                .then(|| id.clone())
         })
     }
 
@@ -436,11 +368,20 @@ impl WorkspaceFileRuntime {
         self.tabs
             .values()
             .filter_map(|tab| tab.files_pane.clone())
+            .chain(self.directories.values().map(|(pane, _)| pane.clone()))
             .collect()
     }
 
     /// 供 Root 激活对应的共享原生编辑器文档，不把 FileEndpoint 写成新的领域身份。
+    /// 当前目录不冒充文档；文档缓冲和宿主的真实连接锚点分别维护。
+    /// @author kongweiguang
     pub fn file_endpoint(&self, tab_id: &TabId) -> Option<FileEndpoint> {
+        if matches!(
+            self.tabs.get(tab_id)?.tab,
+            WorkspaceSessionTab::FileWorkspace { .. }
+        ) {
+            return self.host_active_document(tab_id);
+        }
         self.tabs.get(tab_id)?.endpoint.clone()
     }
 
@@ -453,6 +394,11 @@ impl WorkspaceFileRuntime {
         tab_id: &TabId,
     ) -> Option<(FileEndpoint, Option<ExternalTargetLease>)> {
         let runtime = self.tabs.get(tab_id)?;
+        if matches!(runtime.tab, WorkspaceSessionTab::FileWorkspace { .. }) {
+            return self
+                .host_browser_target(tab_id)
+                .filter(|(endpoint, _)| !matches!(endpoint, FileEndpoint::Container { .. }));
+        }
         if !matches!(runtime.tab, WorkspaceSessionTab::WorkspaceFile { .. }) {
             return None;
         }
@@ -490,11 +436,20 @@ impl WorkspaceFileRuntime {
     ///
     /// @author kongweiguang
     pub fn workspace_file_requires_readonly(&self, endpoint: &FileEndpoint) -> bool {
-        self.tabs.values().any(|tab| {
-            let WorkspaceSessionTab::WorkspaceFile { access, .. } = &tab.tab else {
-                return false;
-            };
-            *access == WorkspaceFileAccess::Readonly && tab.matches_file_endpoint(endpoint)
+        self.tabs.iter().any(|(owner, tab)| match &tab.tab {
+            WorkspaceSessionTab::WorkspaceFile { access, .. } => {
+                *access == WorkspaceFileAccess::Readonly && tab.matches_file_endpoint(endpoint)
+            }
+            WorkspaceSessionTab::FileWorkspace { state, .. } => state.items.iter().any(|item| {
+                matches!(
+                    item,
+                    kerminal_application::workspace::FileWorkspaceItem::Document {
+                        access: WorkspaceFileAccess::Readonly,
+                        ..
+                    }
+                ) && self.host_document_endpoint(owner, item.id()).as_ref() == Some(endpoint)
+            }),
+            _ => false,
         })
     }
 
@@ -713,12 +668,35 @@ impl RootView {
                 let from_compact_sftp = root.compact_tool_drawer_open
                     && root.tool_rail_rendered_compact == (true, Some(ToolRailToolId::Sftp))
                     && root.sftp_panel.as_ref().is_some_and(|pane| pane == source);
+                let source_is_right_browser =
+                    root.sftp_panel.as_ref().is_some_and(|pane| pane == source);
+                let browser_context = source_is_right_browser
+                    .then(|| {
+                        let source = source.read(cx);
+                        source
+                            .current_directory_endpoint()
+                            .same_filesystem(&event.endpoint)
+                            .then(|| source.capture_file_browser_context(cx))
+                            .flatten()
+                    })
+                    .flatten();
                 let accepted = root.open_file_endpoint_with_lease(
                     event.endpoint.clone(),
                     event.external_target_lease.clone(),
                     window,
                     cx,
                 );
+                if accepted
+                    && let Some(owner) = root
+                        .workspace_files
+                        .host_workspace_for_endpoint(&event.endpoint)
+                {
+                    root.workspace_files.replace_right_browser_context(
+                        &owner,
+                        &event.endpoint,
+                        browser_context,
+                    );
+                }
                 if accepted && from_compact_sftp {
                     root.reveal_file_from_compact_sftp(&event.endpoint, window, cx);
                 }
@@ -802,8 +780,35 @@ impl RootView {
                 }
             },
         );
+        let open_directory = cx.subscribe_in(
+            pane,
+            window,
+            |root,
+             source,
+             event: &crate::features::files::OpenDirectoryInWorkspaceRequested,
+             window,
+             cx| {
+                if !root.is_cached_sftp_panel(source) {
+                    root.open_directory_in_host_workspace(
+                        event.endpoint.clone(),
+                        event.lease.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            },
+        );
+        let directory_changed = cx.subscribe_in(
+            pane,
+            window,
+            |root, source, event: &crate::features::files::FileWorkspaceDirectoryChanged, _, cx| {
+                root.host_file_directory_changed(source, &event.endpoint, cx);
+            },
+        );
         FilesPaneSubscriptions {
             _open_file: open_file,
+            _open_directory: open_directory,
+            _directory_changed: directory_changed,
             _activate_editor_file: activate_editor_file,
             _sftp_host: sftp_host,
             _sftp_host_key_trust: sftp_host_key_trust,
@@ -968,6 +973,11 @@ impl RootView {
         let Some(editor) = self.file_editor_workspace.clone() else {
             return;
         };
+        if editor_projection_contains_endpoint(&editor.read(cx).workspace_projection(), &endpoint)
+            && self.activate_registered_host_document(&endpoint, window, cx)
+        {
+            return;
+        }
         let activated = editor.update(cx, |workspace, cx| {
             let projection = workspace.workspace_projection();
             if !editor_projection_contains_endpoint(&projection, &endpoint) {
@@ -1030,6 +1040,9 @@ impl RootView {
         }
 
         match tab {
+            WorkspaceSessionTab::FileWorkspace { .. } => {
+                self.ensure_host_file_workspace(tab_id, window, cx);
+            }
             WorkspaceSessionTab::WorkspaceFile {
                 title,
                 target,
@@ -1139,6 +1152,14 @@ impl RootView {
     ///
     /// @author kongweiguang
     pub(super) fn remove_workspace_file_tab_after_close(&mut self, tab_id: &TabId) {
+        self.workspace_files.right_browser_contexts.remove(tab_id);
+        self.workspace_files.host_tab_scroll_handles.remove(tab_id);
+        self.workspace_files
+            .documents
+            .retain(|(owner, _), _| owner != tab_id);
+        self.workspace_files
+            .directories
+            .retain(|(owner, _), _| owner != tab_id);
         self.workspace_files.tabs.remove(tab_id);
         self.files_workspace_selection.reconcile_removed_tab(
             tab_id,
@@ -1655,6 +1676,16 @@ fn workspace_file_action_endpoint(
     snapshot_tab: Option<&WorkspaceSessionTab>,
     runtime: &WorkspaceFileRuntime,
 ) -> Option<FileEndpoint> {
+    if matches!(
+        snapshot_tab,
+        Some(WorkspaceSessionTab::FileWorkspace { .. })
+    ) {
+        let registered = runtime.tabs.get(tab_id)?;
+        return (registered.status == WorkspaceFileRestoreState::Ready
+            && snapshot_tab == Some(&registered.tab))
+        .then(|| runtime.host_active_document(tab_id))
+        .flatten();
+    }
     let WorkspaceSessionTab::WorkspaceFile {
         id,
         target,

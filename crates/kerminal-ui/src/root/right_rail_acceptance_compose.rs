@@ -318,7 +318,7 @@ impl RootView {
             == Some(terminal_tab_id))
     }
 
-    /// Waits for the exact Compose WorkspaceFile descriptor and its loaded, clean, read-only editor session.
+    /// 精确匹配宿主内的 Compose 文档及活动项，再核对真实干净只读缓冲，不假定文档为顶层。
     ///
     /// @author kongweiguang
     pub fn right_rail_acceptance_compose_file_ready(
@@ -337,35 +337,52 @@ impl RootView {
             return Ok(None);
         };
         let snapshot = controller.snapshot();
-        let Some((tab_id, endpoint)) = snapshot.terminal_tabs.iter().find_map(|tab| match tab {
-            WorkspaceSessionTab::WorkspaceFile {
+        let mut matching = Vec::new();
+        for tab in &snapshot.terminal_tabs {
+            let WorkspaceSessionTab::FileWorkspace {
                 id,
-                title,
                 target:
                     WorkspaceTargetRef::Ssh {
                         host_id: target_host,
                     },
-                path: target_path,
-                root_path: Some(target_root),
-                source: WorkspaceFileSource::ComposeYaml,
-                access: WorkspaceFileAccess::Readonly,
+                state,
                 ..
-            } if target_host == host_id
-                && target_path == path
-                && title == selection_name
-                && target_root == root_path =>
-            {
-                Some((
-                    id.clone(),
-                    FileEndpoint::Remote {
-                        host_id: host_id.clone(),
-                        path: RemotePath::parse(path).ok()?,
-                    },
-                ))
+            } = tab
+            else {
+                continue;
+            };
+            if target_host != host_id {
+                continue;
             }
-            _ => None,
-        }) else {
+            for item in &state.items {
+                if let kerminal_application::workspace::FileWorkspaceItem::Document {
+                    id: item_id,
+                    title,
+                    path: target_path,
+                    root_path: Some(target_root),
+                    source: WorkspaceFileSource::ComposeYaml,
+                    access: WorkspaceFileAccess::Readonly,
+                } = item
+                    && target_path == path
+                    && title == selection_name
+                    && target_root == root_path
+                {
+                    matching.push((id.clone(), state.active_item_id.as_ref() == Some(item_id)));
+                }
+            }
+        }
+        if matching.len() > 1 {
+            return Err("同一 Compose 文档出现多个内部标签".into());
+        }
+        let Some((tab_id, item_active)) = matching.into_iter().next() else {
             return Ok(None);
+        };
+        if !item_active {
+            return Ok(None);
+        }
+        let endpoint = FileEndpoint::Remote {
+            host_id: host_id.clone(),
+            path: RemotePath::parse(path).map_err(|_| "Compose 文件路径无效".to_owned())?,
         };
         if snapshot.active_tab_id.as_ref() != Some(&tab_id) {
             return Ok(None);

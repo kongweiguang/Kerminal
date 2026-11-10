@@ -87,14 +87,14 @@ fn menu_right_click_does_not_request_focus() {
     ));
 }
 
-/// 右键菜单的四向分屏与四向选主机动作都保留原 pane 和插入位置。
+/// 右键菜单的四向分屏动作都保留原 pane 和插入位置，且不再提供选主机入口。
 ///
 /// @author kongweiguang
 #[test]
-fn split_menu_actions_keep_direction_and_host_choice_intent() {
+fn split_menu_actions_keep_direction_and_source_pane() {
     let pane_id = PaneId::new();
     let actions = terminal_split_menu_actions();
-    assert_eq!(actions.len(), 8);
+    assert_eq!(actions.len(), 4);
 
     for (action, _, _) in actions {
         let event = workspace_pane_event_for_menu_action(action, pane_id.clone());
@@ -102,14 +102,6 @@ fn split_menu_actions_keep_direction_and_host_choice_intent() {
             (
                 TerminalContextMenuAction::Split { direction, before },
                 Some(WorkspacePaneEvent::Split {
-                    pane_id: event_pane,
-                    direction: event_direction,
-                    before: event_before,
-                }),
-            )
-            | (
-                TerminalContextMenuAction::ChooseSplitTarget { direction, before },
-                Some(WorkspacePaneEvent::ChooseSplitTarget {
                     pane_id: event_pane,
                     direction: event_direction,
                     before: event_before,
@@ -136,12 +128,6 @@ fn only_split_menu_actions_anchor_terminal_focus_before_handoff() {
         TerminalContextMenuAction::Split {
             direction: SplitDirection::Horizontal,
             before: false,
-        }
-    ));
-    assert!(split_menu_action_requires_terminal_focus(
-        TerminalContextMenuAction::ChooseSplitTarget {
-            direction: SplitDirection::Vertical,
-            before: true,
         }
     ));
     for action in [

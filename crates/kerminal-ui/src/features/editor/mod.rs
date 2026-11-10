@@ -5,6 +5,7 @@
 mod confirmation;
 mod context_menu;
 mod file_io;
+mod group_close;
 mod language;
 mod quit_gate;
 mod render;
@@ -12,6 +13,7 @@ mod search;
 mod search_model;
 mod workspace;
 
+pub(crate) use context_menu::editor_tab_context_menu;
 pub use quit_gate::{
     EditorQuitGate, EditorSaveFailureAction, EditorSaveSuccessAction, editor_save_failure_action,
     editor_save_success_action, evaluate_editor_quit_gate,

@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 pub(super) const MARKER_FILE_NAME: &str = ".kerminal-format.toml";
 pub(super) const CURRENT_DATA_FORMAT: u32 = 4;
-pub(super) const CURRENT_MIGRATION_CONTRACT: u32 = 3;
+pub(super) const CURRENT_MIGRATION_CONTRACT: u32 = 4;
+/// 契约 3 已发布的独立文件标签仍需保留精确 journal 摘要，再进入聚合迁移。
+pub(super) const FILE_TABS_MIGRATION_CONTRACT: u32 = 3;
 pub(super) const PREVIOUS_MIGRATION_CONTRACT: u32 = 2;
 pub(super) const EARLIEST_MIGRATION_CONTRACT: u32 = 1;
 const MAX_MARKER_BYTES: u64 = 4 * 1024;
@@ -53,7 +55,8 @@ pub(super) fn read_marker(root: &Path) -> AppResult<MarkerRead> {
     classify_marker_bytes(&bytes)
 }
 
-/// 只接受完整的两个字段；已知契约 1、2 只进入迁移，不成为业务 reader 的兼容分支。
+/// 只接受完整的两个字段；已知契约 1、2、3 只进入迁移，不成为业务 reader 的兼容分支。
+/// @author kongweiguang
 pub(super) fn classify_marker_bytes(bytes: &[u8]) -> AppResult<MarkerRead> {
     let marker = match toml::from_str::<FormatMarker>(std::str::from_utf8(bytes).unwrap_or("")) {
         Ok(marker) => marker,
@@ -82,7 +85,7 @@ pub(super) fn classify_marker_bytes(bytes: &[u8]) -> AppResult<MarkerRead> {
     }
     if matches!(
         marker.migration_contract,
-        EARLIEST_MIGRATION_CONTRACT | PREVIOUS_MIGRATION_CONTRACT
+        EARLIEST_MIGRATION_CONTRACT | PREVIOUS_MIGRATION_CONTRACT | FILE_TABS_MIGRATION_CONTRACT
     ) {
         return Ok(MarkerRead::PreviousSupported(marker.migration_contract));
     }
@@ -116,6 +119,15 @@ pub(super) fn previous_marker_bytes() -> Vec<u8> {
 pub(super) fn earliest_marker_bytes() -> Vec<u8> {
     format!(
         "data_format = {CURRENT_DATA_FORMAT}\nmigration_contract = {EARLIEST_MIGRATION_CONTRACT}\n"
+    )
+    .into_bytes()
+}
+
+/// 固定契约 3 的原始 marker，避免升级后把仍在前滚的 journal 判成损坏。
+/// @author kongweiguang
+pub(super) fn file_tabs_marker_bytes() -> Vec<u8> {
+    format!(
+        "data_format = {CURRENT_DATA_FORMAT}\nmigration_contract = {FILE_TABS_MIGRATION_CONTRACT}\n"
     )
     .into_bytes()
 }

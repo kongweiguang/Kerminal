@@ -45,6 +45,50 @@ enum TreeDirectoryState {
     Failed(String),
 }
 
+/// 目录快照刻意没有Loading变体，跨视图交接不能转移子目录取消owner。
+#[derive(Clone, Debug)]
+enum TreeDirectorySnapshot {
+    Unloaded,
+    Loaded(Vec<FileEntry>),
+    Failed(String),
+}
+
+/// 只保存树的领域浏览值；新的视图会独立创建节点ID、TreeState及订阅。
+#[derive(Clone, Debug)]
+pub(super) struct FileTreeContextSnapshot {
+    root: FileEndpoint,
+    directories: HashMap<FileEndpoint, TreeDirectorySnapshot>,
+    expanded: HashSet<FileEndpoint>,
+    selected: HashSet<FileEndpoint>,
+    anchor: Option<FileEndpoint>,
+    focused: Option<FileEndpoint>,
+}
+
+impl FileTreeContextSnapshot {
+    /// 恢复前核对整个缓存文件系统，不能通过子树快照夹带另一目标的数据。
+    ///
+    /// @author kongweiguang
+    pub(super) fn is_for_directory(&self, directory: &FileEndpoint) -> bool {
+        self.root == *directory
+            && self.directories.iter().all(|(endpoint, state)| {
+                endpoint.same_filesystem(directory)
+                    && match state {
+                        TreeDirectorySnapshot::Loaded(entries) => entries
+                            .iter()
+                            .all(|entry| entry.endpoint.same_filesystem(directory)),
+                        TreeDirectorySnapshot::Unloaded | TreeDirectorySnapshot::Failed(_) => true,
+                    }
+            })
+    }
+
+    /// 面板的当前项可能位于已展开子目录，不能只在根listing里误判其失效。
+    ///
+    /// @author kongweiguang
+    pub(super) fn contains_entry(&self, selected: &FileEntry) -> bool {
+        self.directories.values().any(|state| matches!(state, TreeDirectorySnapshot::Loaded(entries) if entries.contains(selected)))
+    }
+}
+
 /// 将树行映射回完整 endpoint；重试占位行显式保存它所属的目录目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum TreeNode {
@@ -173,6 +217,68 @@ impl TreeRequestCancellation {
 }
 
 impl FileTreeBrowser {
+    /// 完成的惰性缓存可复制，但任何Loading节点都让交接显式拒绝，原请求仍由源视图收尾。
+    ///
+    /// @author kongweiguang
+    pub(super) fn capture_context(&self) -> Option<FileTreeContextSnapshot> {
+        let root = self.root.clone()?;
+        let directories = self
+            .directories
+            .iter()
+            .map(|(endpoint, state)| {
+                let state = match state {
+                    TreeDirectoryState::Loading { .. } => return None,
+                    TreeDirectoryState::Unloaded => TreeDirectorySnapshot::Unloaded,
+                    TreeDirectoryState::Loaded(entries) => {
+                        TreeDirectorySnapshot::Loaded(entries.clone())
+                    }
+                    TreeDirectoryState::Failed(error) => {
+                        TreeDirectorySnapshot::Failed(error.clone())
+                    }
+                };
+                Some((endpoint.clone(), state))
+            })
+            .collect::<Option<HashMap<_, _>>>()?;
+        Some(FileTreeContextSnapshot {
+            root,
+            directories,
+            expanded: self.expanded.clone(),
+            selected: self.selected.clone(),
+            anchor: self.anchor.clone(),
+            focused: self.focused.clone(),
+        })
+    }
+
+    /// 新模型从纯值重建，不复用旧节点映射或请求代次，使旧视图迟到响应没有接收入口。
+    ///
+    /// @author kongweiguang
+    pub(super) fn from_context(snapshot: FileTreeContextSnapshot, generation: u64) -> Self {
+        Self {
+            root: Some(snapshot.root),
+            root_generation: generation,
+            revision: 1,
+            directories: snapshot
+                .directories
+                .into_iter()
+                .map(|(endpoint, state)| {
+                    let state = match state {
+                        TreeDirectorySnapshot::Unloaded => TreeDirectoryState::Unloaded,
+                        TreeDirectorySnapshot::Loaded(entries) => {
+                            TreeDirectoryState::Loaded(entries)
+                        }
+                        TreeDirectorySnapshot::Failed(error) => TreeDirectoryState::Failed(error),
+                    };
+                    (endpoint, state)
+                })
+                .collect(),
+            expanded: snapshot.expanded,
+            selected: snapshot.selected,
+            anchor: snapshot.anchor,
+            focused: snapshot.focused,
+            ..Self::default()
+        }
+    }
+
     /// 标签恢复时保留已有树缓存和选择，但旧标签的子目录请求不得写入当前代次。
     ///
     /// @author kongweiguang

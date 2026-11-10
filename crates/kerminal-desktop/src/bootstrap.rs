@@ -10,7 +10,7 @@ use std::{
 use kerminal_application::{
     AppResult,
     connections::host_types::HostConfigurationCatalog,
-    data_migration::{DataMigrationReport, DataMigrationService},
+    data_migration::{DataMigrationOutcome, DataMigrationReport, DataMigrationService},
 };
 use kerminal_infrastructure::data_migration::FileDataMigrationRepository;
 
@@ -38,15 +38,37 @@ pub(crate) fn migration_service(
 }
 
 /// 迁移成功后才调用后继动作，形成可验证的装配屏障；未知或失败结果不得创建任何运行态资源。
+/// 正式发版前，GPUI 默认测试根把契约 3 与当前契约视为同一代，可直接读取现有 beta 数据；
+/// 该例外只接受无恢复事务的明确契约 3，不自动迁移、不覆盖文件，正式根仍走严格门禁。
 ///
 /// @author kongweiguang
 pub(crate) fn run_after_migration<T>(
     service: &DataMigrationService,
+    allow_beta_contract: bool,
     start: impl FnOnce(DataMigrationReport) -> T,
 ) -> AppResult<T> {
-    let report = service.migrate()?;
-    Ok(start(report))
+    match service.migrate() {
+        Ok(report) => Ok(start(report)),
+        Err(error) if allow_beta_contract => {
+            let inspection = service.inspect()?;
+            if inspection.migration_contract == Some(BETA_CONTRACT) && !inspection.recovery_pending
+            {
+                return Ok(start(DataMigrationReport {
+                    outcome: DataMigrationOutcome::AlreadyCurrent,
+                    changed_file_count: 0,
+                    resumed: false,
+                    backup_relative_path: None,
+                    backup_relative_paths: Vec::new(),
+                }));
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
 }
+
+/// GPUI beta 数据仍使用契约 3；正式发版提升契约后删除该豁免。
+const BETA_CONTRACT: u32 = 3;
 
 /// GPUI 默认测试根不读取旧 Tauri 窗口资料，避免旧版仍在运行时共享其状态文件。
 /// 正式根的原有来源限制保留，显式 CLI 根和环境隔离根也不查询该来源。

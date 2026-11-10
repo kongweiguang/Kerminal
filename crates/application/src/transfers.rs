@@ -39,6 +39,40 @@ pub enum TransferOrigin {
     SharedWorkbench,
 }
 
+/// 查询范围独立于任务创建来源，聚合旧来源别名时不能改写历史归属。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransferQueryScope {
+    /// 包含旧的无来源记录，不能用空来源集合隐式表示。
+    All,
+    /// 只匹配完整来源身份，空集合明确表示没有匹配项。
+    Origins(Vec<TransferOrigin>),
+}
+
+impl TransferQueryScope {
+    /// 去重但保留首次出现顺序，避免来源别名重复导致重复查询或扩大空集合语义。
+    ///
+    /// @author kongweiguang
+    pub fn origins(origins: impl IntoIterator<Item = TransferOrigin>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        Self::Origins(
+            origins
+                .into_iter()
+                .filter(|origin| seen.insert(origin.clone()))
+                .collect(),
+        )
+    }
+
+    /// 集中限定未绑定记录只属于 All，直接构造的重复来源也不能改变匹配资格。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn matches_origin(&self, origin: Option<&TransferOrigin>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Origins(origins) => origin.is_some_and(|origin| origins.contains(origin)),
+        }
+    }
+}
+
 /// 进度只报告已经确认的字节；更新走 watch 通道，繁忙时合并旧帧而不积压内存。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferProgressUpdate {

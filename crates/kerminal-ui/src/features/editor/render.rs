@@ -37,6 +37,7 @@ struct SaveToolbarState {
     label: String,
     can_save: bool,
     saving: bool,
+    reading: bool,
     cancel_requested: bool,
     endpoint: Option<kerminal_domain::files::FileEndpoint>,
 }
@@ -203,11 +204,13 @@ impl Render for FileEditorWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ThemeTokens::current(window, cx);
         self.update_search_decoration_theme(theme, cx);
-        schedule_active_tab_reveal_probe(
-            window,
-            cx.entity().clone(),
-            self.tabs_scroll_handle.clone(),
-        );
+        if !self.embedded_navigation {
+            schedule_active_tab_reveal_probe(
+                window,
+                cx.entity().clone(),
+                self.tabs_scroll_handle.clone(),
+            );
+        }
         let tab_inputs = self
             .tabs()
             .iter()
@@ -354,6 +357,9 @@ impl Render for FileEditorWorkspace {
             .as_ref()
             .and_then(|(_, _, session, _, _, _)| *session)
             .is_some_and(|(phase, _, _)| phase == EditorPhase::Saving);
+        let reading = active
+            .as_ref()
+            .is_some_and(|(_, _, _, loading, _, _)| *loading);
         let cancel_requested = active
             .as_ref()
             .is_some_and(|(_, _, _, _, _, requested)| *requested);
@@ -374,13 +380,15 @@ impl Render for FileEditorWorkspace {
                     label: save_label,
                     can_save,
                     saving,
+                    reading,
                     cancel_requested,
                     endpoint: save_endpoint,
                 },
                 theme,
                 cx,
-            ))
-            .child(
+            ));
+        if !self.embedded_navigation {
+            content = content.child(
                 div()
                     .id("file-editor-tabs-scroll")
                     .h(px(38.))
@@ -394,39 +402,11 @@ impl Render for FileEditorWorkspace {
                     .track_scroll(&self.tabs_scroll_handle)
                     .children(tabs),
             );
+        }
 
         // 查询文本可跨文件保留，但没有已创建的编辑器时没有可操作目标，因此不显示无效输入与替换按钮。
         if self.search_visible() && self.active_tab().is_some_and(|tab| tab.editor.is_some()) {
             content = content.child(self.render_search_bar(theme, cx));
-        }
-
-        if let Some((endpoint, _, _, true, _, _)) = active.as_ref() {
-            let endpoint = endpoint.clone();
-            content = content.child(
-                div()
-                    .w_full()
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .flex_shrink_0()
-                    .gap_2()
-                    .bg(theme.panel)
-                    .text_color(theme.muted)
-                    .child(div().w_full().min_w(px(0.)).child(crate::locale::text(
-                        "正在读取文件；取消不会替换当前编辑内容。",
-                        "Reading the file. Cancelling keeps the current editor contents.",
-                    )))
-                    .child(
-                        Button::new("file-editor-cancel-load")
-                            .compact()
-                            .label(crate::locale::text("取消读取", "Cancel read"))
-                            .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                                workspace.cancel_load(endpoint.clone(), cx);
-                            })),
-                    ),
-            );
         }
 
         if let Some((endpoint, error, session_state, _loading, _dirty, _cancel_requested)) = active
@@ -584,6 +564,7 @@ impl FileEditorWorkspace {
             label: save_label,
             can_save,
             saving,
+            reading,
             cancel_requested,
             endpoint: save_endpoint,
         } = save;
@@ -609,6 +590,24 @@ impl FileEditorWorkspace {
                     .label(save_label)
                     .disabled(true)
             }
+        } else if reading {
+            // 读取沿用工具栏操作槽，重载时不再插入提示行挤动已有正文。
+            Button::new("file-editor-cancel-load")
+                .debug_selector(|| "file-editor-cancel-load".into())
+                .compact()
+                .flex_shrink_0()
+                .icon(IconName::Close)
+                .label(crate::locale::text("取消读取", "Cancel read"))
+                .disabled(save_endpoint.is_none())
+                .tooltip(crate::locale::text(
+                    "正在读取；取消会保留当前正文。",
+                    "Reading the file. Cancelling keeps the current contents.",
+                ))
+                .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                    if let Some(endpoint) = save_endpoint.as_ref() {
+                        workspace.cancel_load(endpoint.clone(), cx);
+                    }
+                }))
         } else {
             Button::new("file-editor-save")
                 .debug_selector(|| "rr-file-editor-save".to_owned())
@@ -639,7 +638,7 @@ impl FileEditorWorkspace {
         let tooltip_label = target_accessibility_label.clone();
         div()
             .w_full()
-            .h(px(42.))
+            .h(theme.metrics.toolbar_height)
             .px_3()
             .flex()
             .items_center()
@@ -1052,6 +1051,7 @@ impl FileEditorWorkspace {
     }
 
     /// 待确认期间正文只读作为根焦点挂载前防线；不改变文件权限或取消后的编辑能力。
+    /// 代码底色与 Kit 行号槽同源，保持横向滚动遮盖和活动行对比稳定。
     ///
     /// @author kongweiguang
     fn render_editor_body(&mut self, theme: ThemeTokens, cx: &mut Context<Self>) -> AnyElement {
@@ -1090,12 +1090,13 @@ impl FileEditorWorkspace {
             let workspace = cx.entity().clone();
             let pane = div()
                 .id("file-editor-pane")
+                .debug_selector(|| "file-editor-document".into())
                 .flex_1()
                 .w_full()
                 .min_h(px(0.))
                 .flex()
                 .flex_col()
-                .bg(theme.panel)
+                .bg(theme.code_surface())
                 .on_key_down(cx.listener(move |workspace, event, window, cx| {
                     workspace.handle_key_down(event, window, cx);
                 }))

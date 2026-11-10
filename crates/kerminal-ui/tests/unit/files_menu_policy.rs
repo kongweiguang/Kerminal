@@ -253,7 +253,9 @@ fn copy_menu_rejects_same_target_but_allows_a_safe_mixed_selection(app: &mut Tes
     });
 }
 
-/// 空白菜单在紧凑栏与工作台共用当前目录动作，避免附加不可见的工作区或剪贴板入口。
+/// 空白菜单共用当前目录范围，并提供显式工作区打开意图而不隐式改变普通双击。
+///
+/// @author kongweiguang
 #[test]
 fn background_menu_has_same_scope_in_both_surfaces() {
     let snapshot = FileMenuSnapshot {
@@ -270,6 +272,7 @@ fn background_menu_has_same_scope_in_both_surfaces() {
         [
             FileMenuAction::UploadFiles,
             FileMenuAction::UploadDirectories,
+            FileMenuAction::OpenInWorkspace,
             FileMenuAction::NewDirectory,
             FileMenuAction::Separator,
             FileMenuAction::Refresh,

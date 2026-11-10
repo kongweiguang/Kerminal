@@ -3,6 +3,7 @@
 //! @author kongweiguang
 
 mod close_guard;
+mod query;
 mod resume;
 
 use std::{
@@ -546,17 +547,12 @@ impl TransferService {
         ordered.into_iter().map(|record| record.summary()).collect()
     }
 
-    /// 只投影匹配来源的实时任务，排序仍使用同一全局队列分配的序号。
+    /// 单来源与集合共用同一快照投影，避免旧调用方与工作区别名查询产生不同排序或归属。
     ///
     /// @author kongweiguang
     pub async fn list_for_origin(&self, origin: &TransferOrigin) -> Vec<TransferSummary> {
-        let records = self.inner.records.lock().await;
-        let mut ordered = records
-            .values()
-            .filter(|record| record.origin.as_ref() == Some(origin))
-            .collect::<Vec<_>>();
-        ordered.sort_unstable_by_key(|record| std::cmp::Reverse(record.sequence));
-        ordered.into_iter().map(|record| record.summary()).collect()
+        self.list_for_scope(&super::TransferQueryScope::origins([origin.clone()]))
+            .await
     }
 
     /// 恢复项只读加载，不恢复 worker 或 SSH lease；活跃任务仍由普通队列独占展示。
@@ -577,7 +573,7 @@ impl TransferService {
         Ok(recovery)
     }
 
-    /// 重启后的孤儿材料只属于持久化时明确登记的来源，旧记录不能按端点猜测归属。
+    /// 单来源复用集合查询的精确身份与取消门禁，旧未绑定记录仍不能按端点猜测归属。
     ///
     /// @author kongweiguang
     pub async fn list_recovery_for_origin(
@@ -585,9 +581,11 @@ impl TransferService {
         origin: &TransferOrigin,
         cancellation: CancellationToken,
     ) -> AppResult<Vec<TransferRecoveryRecord>> {
-        let mut records = self.list_recovery(cancellation).await?;
-        records.retain(|record| record.origin.as_ref() == Some(origin));
-        Ok(records)
+        self.list_recovery_for_scope(
+            &super::TransferQueryScope::origins([origin.clone()]),
+            cancellation,
+        )
+        .await
     }
 
     /// 动作在执行前校验冻结来源，活记录缺失时再核验持久孤儿材料。

@@ -5,8 +5,8 @@
 mod session_document;
 
 pub use session_document::{
-    WorkspaceContainerRuntime, WorkspaceFileAccess, WorkspaceFileSource,
-    WorkspaceLocalMachineScope, WorkspaceMachineStatus, WorkspacePaneMode,
+    FileWorkspaceItem, FileWorkspaceState, WorkspaceContainerRuntime, WorkspaceFileAccess,
+    WorkspaceFileSource, WorkspaceLocalMachineScope, WorkspaceMachineStatus, WorkspacePaneMode,
     WorkspacePinnedContainer, WorkspaceSessionDocument, WorkspaceSessionPane,
     WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTabGroup, WorkspaceTabGroupColor,
     WorkspaceTabGroupId, WorkspaceTargetRef, WorkspaceTargetUnavailableReason,
@@ -86,11 +86,16 @@ pub enum WorkspaceSessionLoad {
     },
 }
 
-/// UI 显示保存闭环结果；冲突携带只读 latest 分类，不自动覆盖运行态。
+/// 成功回执同时携带实际提交的完整文档，避免合并外部未知字段后用旧候选重建 CAS 基线。
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkspaceSessionSaveOutcome {
-    Saved { revision: WorkspaceSessionRevision },
-    Conflict { latest: WorkspaceSessionLoad },
+    Saved {
+        revision: WorkspaceSessionRevision,
+        document: WorkspaceSessionDocument,
+    },
+    Conflict {
+        latest: WorkspaceSessionLoad,
+    },
     OutcomeUnknown,
 }
 
@@ -138,7 +143,9 @@ impl WorkspaceSessionService {
             .await
     }
 
-    /// 仅当最新 owned workspace snapshot 与 base 相同，才把外部未知字段合并后重试一次。
+    /// 仅当最新 owned workspace snapshot 与 base 相同才合并；成功返回实际提交文档供下一次 CAS 保留未知字段。
+    ///
+    /// @author kongweiguang
     pub async fn save_workspace_snapshot(
         &self,
         cancellation: CancellationToken,
@@ -169,7 +176,12 @@ impl WorkspaceSessionService {
             .save(cancellation.clone(), &proposed, expected_revision.clone())
             .await
         {
-            Ok(revision) => return Ok(WorkspaceSessionSaveOutcome::Saved { revision }),
+            Ok(revision) => {
+                return Ok(WorkspaceSessionSaveOutcome::Saved {
+                    revision,
+                    document: proposed,
+                });
+            }
             Err(error) if error.public_code() == crate::PublicErrorCode::OutcomeUnknown => {
                 return Ok(WorkspaceSessionSaveOutcome::OutcomeUnknown);
             }
@@ -210,7 +222,10 @@ impl WorkspaceSessionService {
             .save(cancellation, &merged, retry_revision)
             .await
         {
-            Ok(revision) => Ok(WorkspaceSessionSaveOutcome::Saved { revision }),
+            Ok(revision) => Ok(WorkspaceSessionSaveOutcome::Saved {
+                revision,
+                document: merged,
+            }),
             Err(error) if error.public_code() == crate::PublicErrorCode::OutcomeUnknown => {
                 Ok(WorkspaceSessionSaveOutcome::OutcomeUnknown)
             }

@@ -14,10 +14,11 @@ use gpui_kit::{MouseButton, TestAppContext, VisualTestContext, px, size};
 use kerminal_application::{
     AppError, AppResult,
     transfers::{
-        TransferBackend, TransferCleanupState, TransferExecutionContext, TransferExecutionError,
-        TransferExecutionFailure, TransferExecutionResult, TransferOrigin, TransferQueueOptions,
-        TransferRecoveryInspection, TransferRecoveryRecord, TransferResourceCleanup,
-        TransferService,
+        InMemoryTransferRecoveryRepository, TransferBackend, TransferCleanupState,
+        TransferExecutionContext, TransferExecutionError, TransferExecutionFailure,
+        TransferExecutionResult, TransferOrigin, TransferQueueOptions, TransferRecoveryInspection,
+        TransferRecoveryRecord, TransferRecoveryRepository, TransferResourceCleanup,
+        TransferService, TransferStagingOwnership,
     },
 };
 use kerminal_domain::{
@@ -531,6 +532,114 @@ fn history_clear_retries_terminal_cleanup_and_preserves_other_origins(app: &mut 
         })
     });
     visual.update(|_, cx| assert!(pane.read(cx).transfer_recovery_rows.is_empty()));
+}
+
+/// 孤儿恢复记录必须能从自己那一行人工删除；带待清理暂存事实的旧记录同样可手动归档。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn orphan_recovery_row_deletes_through_its_own_action(app: &mut TestAppContext) {
+    let directory = support::remote_endpoint(&HostId::new(), "/srv/recovery-delete");
+    let (runtime, pane, _, visual) = support::window_fixture(app, directory, |pane| {
+        pane.compact_layout = true;
+        pane.current_terminal_endpoint = Some(pane.panels[1].endpoint.clone());
+        pane.queue_watch_started = true;
+    });
+    let origin = TransferOrigin::SharedWorkbench;
+    let id = TransferId::new();
+    let request = TransferRequest {
+        source: FileEndpoint::Local {
+            path: "source".into(),
+        },
+        destination: FileEndpoint::Local {
+            path: "destination".into(),
+        },
+        kind: TransferKind::File,
+        conflict_policy: ConflictPolicy::Rename,
+        idle_timeout_seconds: None,
+    };
+    // 待清理暂存和未确认结果不再让恢复行永久占位；人工删除仍先归档完整证据。
+    let record = TransferRecoveryRecord {
+        id: id.clone(),
+        origin: Some(origin.clone()),
+        request: request.clone(),
+        drag_staging: false,
+        actual_destination: Some(request.destination.clone()),
+        checkpoint: None,
+        staging_ownership: vec![TransferStagingOwnership {
+            staging_destination: FileEndpoint::Local {
+                path: "staging.partial".into(),
+            },
+            actual_destination: request.destination.clone(),
+            staging_owner: id.clone(),
+            staging_token: "fixture".into(),
+        }],
+        cleanup_pending: true,
+        commit_unknown: false,
+        inspection: TransferRecoveryInspection::Insufficient,
+        archived: false,
+    };
+    let repository = Arc::new(InMemoryTransferRecoveryRepository::default());
+    runtime
+        .block_on(repository.upsert(record, tokio_util::sync::CancellationToken::new()))
+        .expect("fixture recovery record is stored");
+    let owner = Arc::new(RetryCleanupOwner {
+        allowed: AtomicBool::new(true),
+        attempts: AtomicUsize::new(0),
+        released: AtomicBool::new(false),
+    });
+    let policy = kerminal_application::transfers::SftpTransferPolicyStore::new(
+        kerminal_application::preferences::SftpPerformanceSettings::default(),
+    )
+    .expect("fixture policy store");
+    let transfers = TransferService::new_with_recovery_repository(
+        vec![Arc::new(RetryCleanupBackend {
+            owner,
+            attempts: AtomicUsize::new(0),
+            retryable: true,
+        })],
+        runtime.handle().clone(),
+        TransferQueueOptions::default(),
+        policy,
+        repository.clone(),
+        None,
+    )
+    .expect("isolated transfer queue");
+    visual.update(|_, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.transfers = transfers.clone();
+            pane.transfer_origin = Some(origin.clone());
+            pane.queue_watch_started = true;
+            pane.reload_transfers(cx);
+        });
+    });
+    wait_until(&runtime, visual, |visual| {
+        visual.update(|_, cx| {
+            let pane = pane.read(cx);
+            !pane.queue.recovery_list_loading
+                && pane.transfer_rows.is_empty()
+                && pane.transfer_recovery_rows.iter().any(|row| row.id == id)
+        })
+    });
+    click_button(visual, &format!("files-transfer-dismiss-{id}"));
+    wait_until(&runtime, visual, |visual| {
+        visual.update(|_, cx| {
+            let pane = pane.read(cx);
+            !pane.queue.is_dismissing_recovery(&id) && pane.transfer_recovery_rows.is_empty()
+        })
+    });
+    visual.update(|_, cx| assert!(pane.read(cx).status.is_none()));
+    let archived = runtime
+        .block_on(transfers.list_archived_recovery(
+            None,
+            10,
+            tokio_util::sync::CancellationToken::new(),
+        ))
+        .expect("archive remains readable");
+    assert_eq!(archived.records.len(), 1);
+    assert_eq!(archived.records[0].id, id);
+    assert!(archived.records[0].cleanup_pending);
+    assert_eq!(archived.records[0].staging_ownership.len(), 1);
 }
 
 /// 失败卡片只暴露可用重试，未知提交不能显示重试或恢复材料操作。

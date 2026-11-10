@@ -6,7 +6,16 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{future::Future, sync::Arc};
 
-use gpui_kit::{AppContext as _, Context, SharedString};
+use gpui_kit::{
+    AnyElement, AppContext as _, ClickEvent, Context, IntoElement, SharedString, Window,
+    component::{
+        Disableable as _, WindowExt as _,
+        button::{Button, ButtonVariant},
+    },
+    div,
+    prelude::*,
+    px,
+};
 use kerminal_application::{
     AppError, PublicErrorCode,
     operations::OperationsService,
@@ -42,6 +51,59 @@ pub(super) enum WorkspaceSnapshotSaveCompletion {
     OutcomeUnknown,
     Busy,
     Failed(SharedString),
+}
+
+/// 受管 executor 的外层未知回执与仓储未知回执有相同提交风险，必须进入同一只读核对路径。
+///
+/// @author kongweiguang
+pub(super) fn normalize_workspace_save_result(
+    result: Result<WorkspaceSessionSaveOutcome, AppError>,
+) -> Result<WorkspaceSessionSaveOutcome, AppError> {
+    match result {
+        Err(error) if error.public_code() == PublicErrorCode::OutcomeUnknown => {
+            Ok(WorkspaceSessionSaveOutcome::OutcomeUnknown)
+        }
+        result => result,
+    }
+}
+
+/// 界面只投影状态机允许的恢复意图，不以暂时隐藏的按钮绕过提交门禁。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkspaceRecoveryAction {
+    Readback,
+    RetryUncommitted,
+    ConfirmOverwrite,
+    RetryFailed,
+}
+
+/// 为每种阻断状态选择安全动作；损坏和未来版本不能被当作可覆盖的有效工作区。
+///
+/// @author kongweiguang
+pub(super) fn workspace_recovery_actions(
+    state: &WorkspacePersistenceState,
+    has_error: bool,
+) -> Vec<WorkspaceRecoveryAction> {
+    match state {
+        WorkspacePersistenceState::OutcomeUnknown { .. } => vec![WorkspaceRecoveryAction::Readback],
+        WorkspacePersistenceState::ReadbackConfirmedUncommitted { .. } => {
+            vec![WorkspaceRecoveryAction::RetryUncommitted]
+        }
+        WorkspacePersistenceState::Conflict { latest } => {
+            let mut actions = vec![WorkspaceRecoveryAction::Readback];
+            if matches!(
+                latest.as_ref(),
+                WorkspaceSessionLoad::Loaded { .. } | WorkspaceSessionLoad::Missing
+            ) {
+                actions.push(WorkspaceRecoveryAction::ConfirmOverwrite);
+            }
+            actions
+        }
+        WorkspacePersistenceState::Failed => vec![WorkspaceRecoveryAction::RetryFailed],
+        WorkspacePersistenceState::Clean | WorkspacePersistenceState::Dirty if has_error => {
+            vec![WorkspaceRecoveryAction::RetryFailed]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// 创建结果保留 subscription 与首帧；Root 接管后 watcher 才开始消费更新。
@@ -1544,6 +1606,387 @@ impl RootView {
         cx.notify();
     }
 
+    /// 重读只更新同一未知请求或冲突证据，不因读取成功直接覆盖磁盘或替换运行中的资源。
+    ///
+    /// @author kongweiguang
+    fn readback_workspace_persistence(&mut self, cx: &mut Context<RootView>) {
+        if self.workspace_persistence_readback_in_flight || self.pending_quit_intent.is_some() {
+            return;
+        }
+        let Some(state) = self
+            .workspace_controller
+            .as_ref()
+            .map(|controller| controller.persistence_state().clone())
+        else {
+            return;
+        };
+        if !matches!(
+            &state,
+            WorkspacePersistenceState::OutcomeUnknown { .. }
+                | WorkspacePersistenceState::Conflict { .. }
+        ) {
+            return;
+        }
+        let Some(service) = self.services.workspace_sessions.clone() else {
+            self.workspace_persistence_error = Some(crate::locale::text(
+                "工作区持久化服务不可用，无法核对。",
+                "Workspace persistence is unavailable; the result cannot be verified.",
+            ));
+            cx.notify();
+            return;
+        };
+        self.workspace_persistence_readback_in_flight = true;
+        self.workspace_persistence_error = None;
+        let executor = self.services.executor.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .run(move |task_cancel| async move { service.load(task_cancel).await })
+                .await;
+            let _ = this.update(cx, |root, cx| {
+                root.workspace_persistence_readback_in_flight = false;
+                let Some(controller) = root.workspace_controller.as_mut() else {
+                    root.workspace_persistence_error = Some(crate::locale::text(
+                        "工作区状态已关闭，核对结果未应用。",
+                        "Workspace state is unavailable; the readback was not applied.",
+                    ));
+                    cx.notify();
+                    return;
+                };
+                if controller.persistence_state() != &state {
+                    // 迟到结果不能改变后续请求、冲突或已经处理的工作区。
+                    cx.notify();
+                    return;
+                }
+                let latest = match result {
+                    Ok(latest) => latest,
+                    Err(error) => {
+                        root.workspace_persistence_error =
+                            Some(error.public_message().to_owned().into());
+                        cx.notify();
+                        return;
+                    }
+                };
+                let was_unknown = matches!(state, WorkspacePersistenceState::OutcomeUnknown { .. });
+                let applied = if was_unknown {
+                    controller.resolve_unknown_readback(latest.clone())
+                } else {
+                    controller.refresh_conflicting_readback(latest.clone())
+                };
+                if let Err(error) = applied {
+                    root.workspace_persistence_error =
+                        Some(error.public_message().to_owned().into());
+                    cx.notify();
+                    return;
+                }
+                // 只有原未知请求已被 desired 回读确认，后续变化才能继续原自动保存链。
+                let confirmed = was_unknown
+                    && matches!(
+                        controller.persistence_state(),
+                        WorkspacePersistenceState::Clean | WorkspacePersistenceState::Dirty
+                    );
+                root.workspace_session_state = Some(latest);
+                root.workspace_persistence_error = None;
+                root.refresh_workspace_views(cx);
+                if confirmed
+                    && root
+                        .workspace_controller
+                        .as_ref()
+                        .is_some_and(|controller| {
+                            matches!(
+                                controller.persistence_state(),
+                                WorkspacePersistenceState::Dirty
+                            ) && controller.pending_resource_operation().is_none()
+                        })
+                {
+                    root.persist_workspace_snapshot(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 已确认未提交与确定失败才可显式重试；未知结果和冲突不能走普通保存快路。
+    ///
+    /// @author kongweiguang
+    fn retry_workspace_persistence(&mut self, after_readback: bool, cx: &mut Context<RootView>) {
+        if self.workspace_persistence_readback_in_flight || self.pending_quit_intent.is_some() {
+            return;
+        }
+        let Some(controller) = self.workspace_controller.as_mut() else {
+            self.persist_workspace_snapshot(cx);
+            return;
+        };
+        if controller.pending_resource_operation().is_some()
+            || controller.pending_close_batch_remaining_count().is_some()
+        {
+            self.workspace_persistence_error = Some(crate::locale::text(
+                "请先完成当前工作区资源操作，再重试保存。",
+                "Finish the current workspace resource operation before retrying the save.",
+            ));
+            cx.notify();
+            return;
+        }
+        let result = if after_readback {
+            controller.retry_after_readback()
+        } else if matches!(
+            controller.persistence_state(),
+            WorkspacePersistenceState::Clean
+                | WorkspacePersistenceState::Dirty
+                | WorkspacePersistenceState::Failed
+        ) {
+            Ok(())
+        } else {
+            Err(AppError::conflict("工作区状态已变化，请重新核对"))
+        };
+        if let Err(error) = result {
+            self.workspace_persistence_error = Some(error.public_message().to_owned().into());
+            cx.notify();
+            return;
+        }
+        self.persist_workspace_snapshot(cx);
+    }
+
+    /// 覆盖只针对用户看到的冲突证据二次确认；核对时保留完整运行态和每份编辑草稿。
+    ///
+    /// @author kongweiguang
+    fn confirm_workspace_persistence_overwrite(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<RootView>,
+    ) {
+        if self.workspace_persistence_readback_in_flight
+            || self.pending_quit_intent.is_some()
+            || window.has_active_dialog(cx)
+            || window.has_active_prompt()
+        {
+            return;
+        }
+        let Some(controller) = self.workspace_controller.as_ref() else {
+            return;
+        };
+        if controller.pending_resource_operation().is_some()
+            || controller.pending_close_batch_remaining_count().is_some()
+        {
+            return;
+        }
+        let WorkspacePersistenceState::Conflict { latest } = controller.persistence_state() else {
+            return;
+        };
+        if !matches!(
+            latest.as_ref(),
+            WorkspaceSessionLoad::Loaded { .. } | WorkspaceSessionLoad::Missing
+        ) {
+            return;
+        }
+        let expected_latest = latest.clone();
+        let expected_snapshot = controller.snapshot().clone();
+        let entity = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let entity = entity.clone();
+            let expected_latest = expected_latest.clone();
+            let expected_snapshot = expected_snapshot.clone();
+            alert
+                .confirm()
+                .title(crate::locale::text("覆盖磁盘工作区？", "Overwrite the saved workspace?"))
+                .description(crate::locale::text(
+                    "将用当前窗口的工作区布局覆盖磁盘上的布局，其他位置的布局修改会丢失。当前终端、文件和编辑草稿不会被重载。",
+                    "The current window's workspace layout will replace the saved layout, discarding the other changes. Open terminals, files, and editor drafts will not be reloaded.",
+                ))
+                .ok_text(crate::locale::text("覆盖工作区", "Overwrite workspace"))
+                .ok_variant(ButtonVariant::Danger)
+                .cancel_text(crate::locale::text("取消", "Cancel"))
+                .on_ok(move |_, _, app| {
+                    if let Some(entity) = entity.upgrade() {
+                        entity.update(app, |root, cx| {
+                            let Some(controller) = root.workspace_controller.as_mut() else {
+                                root.workspace_persistence_error = Some(crate::locale::text(
+                                    "工作区状态已关闭，未覆盖磁盘。",
+                                    "Workspace state is unavailable; nothing was overwritten.",
+                                ));
+                                cx.notify();
+                                return;
+                            };
+                            let same_conflict = matches!(
+                                controller.persistence_state(),
+                                WorkspacePersistenceState::Conflict { latest } if latest == &expected_latest
+                            );
+                            if !same_conflict
+                                || controller.snapshot() != &expected_snapshot
+                                || controller.pending_resource_operation().is_some()
+                                || controller.pending_close_batch_remaining_count().is_some()
+                                || root.workspace_persistence_readback_in_flight
+                                || root.pending_quit_intent.is_some()
+                            {
+                                root.workspace_persistence_error = Some(crate::locale::text(
+                                    "工作区冲突已变化，未覆盖磁盘；请重新核对。",
+                                    "The workspace conflict changed; nothing was overwritten. Verify it again.",
+                                ));
+                                cx.notify();
+                                return;
+                            }
+                            if let Err(error) = controller.confirm_overwrite_latest() {
+                                root.workspace_persistence_error = Some(error.public_message().to_owned().into());
+                                cx.notify();
+                                return;
+                            }
+                            root.workspace_persistence_error = None;
+                            root.persist_workspace_snapshot(cx);
+                        });
+                    }
+                    true
+                })
+        });
+    }
+
+    /// 恢复提示悬浮于工作台而非改变终端网格；状态与按钮均来自现有 controller。
+    ///
+    /// @author kongweiguang
+    pub(super) fn render_workspace_persistence_recovery(
+        &self,
+        window: &Window,
+        cx: &mut Context<RootView>,
+    ) -> Option<AnyElement> {
+        let state = self
+            .workspace_controller
+            .as_ref()
+            .map(|controller| controller.persistence_state());
+        let actions = match state {
+            Some(state) => {
+                workspace_recovery_actions(state, self.workspace_persistence_error.is_some())
+            }
+            None if self.workspace_persistence_error.is_some() => {
+                vec![WorkspaceRecoveryAction::RetryFailed]
+            }
+            None => Vec::new(),
+        };
+        if actions.is_empty() {
+            return None;
+        }
+        let message = match state {
+            Some(WorkspacePersistenceState::OutcomeUnknown { .. }) => crate::locale::text(
+                "工作区保存结果未确认，请先读取磁盘核对；当前布局和草稿已保留。",
+                "The workspace save result is unknown. Read the saved workspace to verify it; the current layout and drafts are retained.",
+            ),
+            Some(WorkspacePersistenceState::ReadbackConfirmedUncommitted { .. }) => {
+                crate::locale::text(
+                    "已核对：上次工作区修改未提交。可明确重试保存；当前布局和草稿已保留。",
+                    "Verified: the previous workspace change was not committed. You can explicitly retry; the current layout and drafts are retained.",
+                )
+            }
+            Some(WorkspacePersistenceState::Conflict { latest }) => match latest.as_ref() {
+                WorkspaceSessionLoad::Loaded { .. } => crate::locale::text(
+                    "磁盘工作区已被其他修改，当前布局和草稿已保留。核对或确认覆盖后才能继续持久导航。",
+                    "The saved workspace changed elsewhere. The current layout and drafts are retained; verify or confirm an overwrite before continuing persistent navigation.",
+                ),
+                WorkspaceSessionLoad::Missing => crate::locale::text(
+                    "磁盘工作区已被移除，当前布局和草稿已保留。可核对或确认重新保存。",
+                    "The saved workspace was removed. The current layout and drafts are retained; verify it or confirm saving again.",
+                ),
+                WorkspaceSessionLoad::Invalid { .. } => crate::locale::text(
+                    "磁盘工作区无效，原文件、当前布局和草稿均已保留；修复原文件后重新核对。",
+                    "The saved workspace is invalid. Its file, the current layout, and drafts are retained; repair the file and verify again.",
+                ),
+                WorkspaceSessionLoad::Unsupported { .. } => crate::locale::text(
+                    "磁盘工作区版本不受支持，原文件、当前布局和草稿均已保留；处理原文件后重新核对。",
+                    "The saved workspace version is unsupported. Its file, the current layout, and drafts are retained; resolve the version and verify again.",
+                ),
+            },
+            _ => crate::locale::text(
+                "工作区未保存，当前布局和草稿已保留。可重试保存。",
+                "The workspace was not saved. The current layout and drafts are retained; you can retry saving.",
+            ),
+        };
+        let theme = crate::theme::ThemeTokens::current(window, cx);
+        // 位置按窗口实际宽度限界，不改变已有工作台或终端布局。
+        let width = (window.bounds().size.width.as_f32() - 72.0).clamp(1.0, 420.0);
+        let mut buttons = div().flex().flex_wrap().gap_2();
+        let disabled =
+            self.workspace_persistence_readback_in_flight || self.pending_quit_intent.is_some();
+        let resource_pending = self
+            .workspace_controller
+            .as_ref()
+            .is_some_and(|controller| {
+                controller.pending_resource_operation().is_some()
+                    || controller.pending_close_batch_remaining_count().is_some()
+            });
+        for action in actions {
+            let (id, label) = match action {
+                WorkspaceRecoveryAction::Readback => (
+                    "workspace-persistence-readback",
+                    crate::locale::text("重新核对", "Verify again"),
+                ),
+                WorkspaceRecoveryAction::RetryUncommitted => (
+                    "workspace-persistence-retry-uncommitted",
+                    crate::locale::text("重试保存", "Retry saving"),
+                ),
+                WorkspaceRecoveryAction::ConfirmOverwrite => (
+                    "workspace-persistence-overwrite",
+                    crate::locale::text("覆盖工作区…", "Overwrite workspace…"),
+                ),
+                WorkspaceRecoveryAction::RetryFailed => (
+                    "workspace-persistence-retry-failed",
+                    crate::locale::text("重试保存", "Retry saving"),
+                ),
+            };
+            buttons = buttons.child(
+                Button::new(id)
+                    .compact()
+                    .label(label)
+                    .disabled(
+                        disabled
+                            || (resource_pending && action != WorkspaceRecoveryAction::Readback),
+                    )
+                    .on_click(
+                        cx.listener(move |root, _: &ClickEvent, window, cx| match action {
+                            WorkspaceRecoveryAction::Readback => {
+                                root.readback_workspace_persistence(cx)
+                            }
+                            WorkspaceRecoveryAction::RetryUncommitted => {
+                                root.retry_workspace_persistence(true, cx)
+                            }
+                            WorkspaceRecoveryAction::RetryFailed => {
+                                root.retry_workspace_persistence(false, cx)
+                            }
+                            WorkspaceRecoveryAction::ConfirmOverwrite => {
+                                root.confirm_workspace_persistence_overwrite(window, cx)
+                            }
+                        }),
+                    ),
+            );
+        }
+        let mut panel = div()
+            .id("workspace-persistence-recovery")
+            .absolute()
+            .top(px(56.0))
+            .right(px(56.0))
+            .w(px(width))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.materials.panel)
+            .text_color(theme.foreground)
+            .child(div().text_color(theme.error).child(message));
+        if let Some(error) = &self.workspace_persistence_error {
+            panel = panel.child(div().text_color(theme.muted).child(error.clone()));
+        }
+        if resource_pending {
+            panel = panel.child(crate::locale::text(
+                "请先完成当前工作区资源操作。",
+                "Finish the current workspace resource operation first.",
+            ));
+        }
+        if self.workspace_persistence_readback_in_flight {
+            panel = panel.child(crate::locale::text("正在核对…", "Verifying…"));
+        }
+        Some(panel.child(buttons).into_any_element())
+    }
+
     /// CAS 保存唯一 typed snapshot；transient 资源先归一化，再通过同一 application service 落盘。
     pub(super) fn persist_workspace_snapshot(&mut self, cx: &mut Context<RootView>) {
         self.persist_workspace_snapshot_with_completion(|_, _, _| {}, cx);
@@ -1558,33 +2001,30 @@ impl RootView {
         cx: &mut Context<RootView>,
     ) {
         if let Err(error) = self.capture_plugin_tab_states(cx) {
-            completion(
-                self,
-                WorkspaceSnapshotSaveCompletion::Failed(error.public_message().to_owned().into()),
-                cx,
-            );
+            let message: SharedString = error.public_message().to_owned().into();
+            self.workspace_persistence_error = Some(message.clone());
+            cx.notify();
+            completion(self, WorkspaceSnapshotSaveCompletion::Failed(message), cx);
             return;
         }
         let Some(workspace_service) = self.services.workspace_sessions.clone() else {
-            completion(
-                self,
-                WorkspaceSnapshotSaveCompletion::Failed(crate::locale::text(
-                    "工作区持久化服务不可用。",
-                    "Workspace persistence is unavailable.",
-                )),
-                cx,
+            let message = crate::locale::text(
+                "工作区持久化服务不可用。",
+                "Workspace persistence is unavailable.",
             );
+            self.workspace_persistence_error = Some(message.clone());
+            cx.notify();
+            completion(self, WorkspaceSnapshotSaveCompletion::Failed(message), cx);
             return;
         };
         let Some(controller) = self.workspace_controller.as_ref() else {
-            completion(
-                self,
-                WorkspaceSnapshotSaveCompletion::Failed(crate::locale::text(
-                    "工作区状态尚未完成初始化。",
-                    "Workspace state has not been initialized.",
-                )),
-                cx,
+            let message = crate::locale::text(
+                "工作区状态尚未完成初始化。",
+                "Workspace state has not been initialized.",
             );
+            self.workspace_persistence_error = Some(message.clone());
+            cx.notify();
+            completion(self, WorkspaceSnapshotSaveCompletion::Failed(message), cx);
             return;
         };
         let snapshot = controller.snapshot().clone();
@@ -1598,6 +2038,7 @@ impl RootView {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.status = Some(error.public_message().into());
+                self.workspace_persistence_error = Some(error.public_message().to_owned().into());
                 cx.notify();
                 completion(
                     self,
@@ -1616,13 +2057,17 @@ impl RootView {
         {
             Some(Ok(Some(request))) => request,
             Some(Ok(None)) => {
+                let busy = self
+                    .workspace_controller
+                    .as_ref()
+                    .is_some_and(|controller| controller.has_unsaved_or_pending_work());
+                if !busy {
+                    self.workspace_persistence_error = None;
+                    cx.notify();
+                }
                 completion(
                     self,
-                    if self
-                        .workspace_controller
-                        .as_ref()
-                        .is_some_and(|controller| controller.has_unsaved_or_pending_work())
-                    {
+                    if busy {
                         WorkspaceSnapshotSaveCompletion::Busy
                     } else {
                         WorkspaceSnapshotSaveCompletion::NoChanges
@@ -1632,18 +2077,18 @@ impl RootView {
                 return;
             }
             None => {
-                completion(
-                    self,
-                    WorkspaceSnapshotSaveCompletion::Failed(crate::locale::text(
-                        "工作区状态已在保存前关闭。",
-                        "Workspace state became unavailable before saving.",
-                    )),
-                    cx,
+                let message = crate::locale::text(
+                    "工作区状态已在保存前关闭。",
+                    "Workspace state became unavailable before saving.",
                 );
+                self.workspace_persistence_error = Some(message.clone());
+                cx.notify();
+                completion(self, WorkspaceSnapshotSaveCompletion::Failed(message), cx);
                 return;
             }
             Some(Err(error)) => {
                 self.status = Some(error.public_message().to_owned().into());
+                self.workspace_persistence_error = Some(error.public_message().to_owned().into());
                 cx.notify();
                 completion(
                     self,
@@ -1655,6 +2100,7 @@ impl RootView {
                 return;
             }
         };
+        self.workspace_persistence_error = None;
         let executor = self.services.executor.clone();
         let request_id = request.request_id.clone();
         let base_document = request.base_document.clone();
@@ -1664,19 +2110,21 @@ impl RootView {
         let current_desired = desired_snapshot.clone();
         cx.spawn(async move |this, cx| {
             let save_service = workspace_service.clone();
-            let result = executor
-                .run(move |task_cancel| async move {
-                    save_service
-                        .save_workspace_snapshot(
-                            task_cancel,
-                            &base_document,
-                            expected_revision,
-                            &base_snapshot,
-                            &desired_snapshot,
-                        )
-                        .await
-                })
-                .await;
+            let result = normalize_workspace_save_result(
+                executor
+                    .run(move |task_cancel| async move {
+                        save_service
+                            .save_workspace_snapshot(
+                                task_cancel,
+                                &base_document,
+                                expected_revision,
+                                &base_snapshot,
+                                &desired_snapshot,
+                            )
+                            .await
+                    })
+                    .await,
+            );
             let mut reread = None;
             if matches!(&result, Ok(WorkspaceSessionSaveOutcome::OutcomeUnknown)) {
                 let reload = workspace_service.clone();
@@ -1762,6 +2210,8 @@ impl RootView {
                                 &request_id,
                                 WorkspaceSessionSaveOutcome::OutcomeUnknown,
                             );
+                            root.workspace_persistence_error =
+                                Some(error.public_message().to_owned().into());
                             root.status = Some(crate::locale::text(
                                 error.public_message(),
                                 "Workspace save status is unknown and could not be read back.",
@@ -1773,7 +2223,15 @@ impl RootView {
                                 ),
                             }
                         }
-                        None => WorkspaceSnapshotSaveCompletion::OutcomeUnknown,
+                        None => match controller.finish_save(
+                            &request_id,
+                            WorkspaceSessionSaveOutcome::OutcomeUnknown,
+                        ) {
+                            Ok(()) => WorkspaceSnapshotSaveCompletion::OutcomeUnknown,
+                            Err(error) => WorkspaceSnapshotSaveCompletion::Failed(
+                                error.public_message().to_owned().into(),
+                            ),
+                        },
                     },
                     Ok(outcome) => {
                         let saved = matches!(&outcome, WorkspaceSessionSaveOutcome::Saved { .. });
@@ -1821,6 +2279,10 @@ impl RootView {
                         }
                     }
                 };
+
+                if let WorkspaceSnapshotSaveCompletion::Failed(message) = &completion_result {
+                    root.workspace_persistence_error = Some(message.clone());
+                }
 
                 // finish_save compares the full source snapshot and leaves later UI edits dirty.
                 let retry_changed_snapshot = matches!(

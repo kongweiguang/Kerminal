@@ -8,10 +8,13 @@ use kerminal_domain::files::{TransferFailureKind, TransferSummary};
 use tokio_util::sync::CancellationToken;
 
 use super::{TransferRecord, TransferService, is_terminal};
-use crate::{AppError, AppResult, transfers::TransferOrigin};
+use crate::{
+    AppError, AppResult,
+    transfers::{TransferOrigin, TransferQueryScope},
+};
 
 impl TransferService {
-    /// 同时核对 live worker 与恢复孤儿；普通终态历史可关闭，尚未确认收尾的 owner 必须保留入口。
+    /// 兼容单来源关闭入口，统一复用范围门禁以免迁移后的别名与旧页面走不同生命周期规则。
     ///
     /// @author kongweiguang
     pub async fn origin_has_close_blockers(
@@ -19,20 +22,37 @@ impl TransferService {
         origin: &TransferOrigin,
         cancellation: CancellationToken,
     ) -> AppResult<bool> {
+        self.scope_has_close_blockers(&TransferQueryScope::origins([origin.clone()]), cancellation)
+            .await
+    }
+
+    /// 一次核对全部来源的真实 owner 与恢复孤儿，任一查询错误或取消都不能冒充允许关闭。
+    ///
+    /// @author kongweiguang
+    pub async fn scope_has_close_blockers(
+        &self,
+        scope: &TransferQueryScope,
+        cancellation: CancellationToken,
+    ) -> AppResult<bool> {
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("传输关闭状态核对已取消"));
         }
         let recovery = self
-            .list_recovery_for_origin(origin, cancellation.clone())
+            .list_recovery_for_scope(scope, cancellation.clone())
             .await?;
+        let records = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(AppError::cancelled("传输关闭状态核对已取消"));
+            }
+            records = self.inner.records.lock() => records,
+        };
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("传输关闭状态核对已取消"));
         }
-
-        let records = self.inner.records.lock().await;
         let live_records = records
             .values()
-            .filter(|record| record.origin.as_ref() == Some(origin))
+            .filter(|record| scope.matches_origin(record.origin.as_ref()))
             .collect::<Vec<_>>();
         let live_ids = live_records
             .iter()

@@ -21,6 +21,7 @@ mod transfer_refresh;
 mod transfer_workspace_acceptance;
 mod tree;
 mod view_mode;
+mod workspace_context;
 
 pub use host_picker::{
     CreateSftpHostRequested, FilePaneSide, SftpHostKeyTrustRequested, SftpHostRequested,
@@ -50,7 +51,10 @@ use kerminal_application::{
     platform::external_launch::ExternalTargetLease,
     preferences::{InterfaceDensity, ThemeMode},
     sessions::UiSessionBinding,
-    transfers::{TransferOrigin, TransferQueueEvent, TransferRecoveryRecord, TransferService},
+    transfers::{
+        TransferOrigin, TransferQueryScope, TransferQueueEvent, TransferRecoveryRecord,
+        TransferService,
+    },
 };
 use kerminal_domain::files::{
     BookmarkTarget, ConflictPolicy, DeleteTargetKind, DirectoryListing, FileBookmark, FileEndpoint,
@@ -58,6 +62,9 @@ use kerminal_domain::files::{
 };
 use kerminal_domain::identity::HostId;
 use tokio_util::sync::CancellationToken;
+use workspace_context::CompactFilesContext;
+pub(crate) use workspace_context::FileBrowserContextSnapshot;
+pub use workspace_context::{FileWorkspaceDirectoryChanged, OpenDirectoryInWorkspaceRequested};
 
 use crate::locale;
 use transfer_refresh::{
@@ -438,6 +445,11 @@ pub struct FilesPane {
     follow_terminal_directory: bool,
     current_terminal_endpoint: Option<FileEndpoint>,
     current_terminal_binding: Option<UiSessionBinding>,
+    compact_context: CompactFilesContext,
+    /// 只标记通过纯浏览快照交接的清单；下一次精确文件目标绑定后即消费。
+    restored_file_browser_endpoint: Option<FileEndpoint>,
+    /// 中央目录页只复用右侧 BrowserPanel，不携带传输台的双端编排外壳。
+    file_workspace_layout: bool,
     /// 只标记自动跟随发起的根读取；关闭开关不能取消用户手动导航。
     terminal_directory_follow_generation: Option<u64>,
     bookmarks: Vec<FileBookmark>,
@@ -447,6 +459,10 @@ pub struct FilesPane {
     bookmark_error: Option<String>,
     bookmark_error_target: Option<BookmarkTarget>,
     transfer_origin: Option<TransferOrigin>,
+    transfer_query_scope: TransferQueryScope,
+    /// 来源/筛选往返也撤销旧动作反馈；普通队列回读不能推进此代次。
+    transfer_query_generation: u64,
+    current_source_scope: TransferQueryScope,
     all_transfer_rows: Vec<TransferSummary>,
     transfer_rows: Vec<TransferSummary>,
     transfer_recovery_rows: Vec<TransferRecoveryRecord>,
@@ -859,6 +875,9 @@ impl FilesPane {
             follow_terminal_directory: false,
             current_terminal_endpoint: None,
             current_terminal_binding: None,
+            compact_context: CompactFilesContext::Unavailable,
+            restored_file_browser_endpoint: None,
+            file_workspace_layout: false,
             terminal_directory_follow_generation: None,
             bookmarks: Vec::new(),
             bookmarks_target: None,
@@ -867,6 +886,9 @@ impl FilesPane {
             bookmark_error: None,
             bookmark_error_target: None,
             transfer_origin: Some(TransferOrigin::SharedWorkbench),
+            transfer_query_scope: TransferQueryScope::All,
+            transfer_query_generation: 0,
+            current_source_scope: TransferQueryScope::origins([TransferOrigin::SharedWorkbench]),
             all_transfer_rows: Vec::new(),
             transfer_rows: Vec::new(),
             transfer_recovery_rows: Vec::new(),
@@ -934,15 +956,10 @@ impl FilesPane {
             return;
         }
         self.cancel_transfer_preparation(cx);
-        self.transfer_origin = origin;
-        self.transfer_rows.clear();
-        self.transfer_recovery_rows.clear();
-        let generation = self.queue.begin_transfer_refresh();
-        self.queue.finish_recovery_refresh(generation, Ok(()));
-        if self.initialized {
-            self.reload_transfers(cx);
-        }
-        cx.notify();
+        self.transfer_query_generation = self.transfer_query_generation.wrapping_add(1);
+        self.transfer_origin = origin.clone();
+        self.current_source_scope = TransferQueryScope::origins(origin);
+        self.set_transfer_query_scope(self.current_source_scope.clone(), cx);
     }
 
     /// 关闭门禁只读取当前面板来源，避免把另一 pane/tab 的入队状态当成目标来源状态。
@@ -1000,8 +1017,8 @@ impl FilesPane {
         cx.notify();
     }
 
-    /// 会话身份与可信目录原子同步，避免同主机换终端被误判成文件系统切换而丢失清单和取消资格。
-    /// 文件来源没有终端 binding，切换文件时采用其父目录；隐藏的跟随开关不影响文件来源。
+    /// 终端会话与可信目录原子同步；文件工作区使用独立入口，不再从缺少 binding 推断文件跟随。
+    /// 同主机换终端仍保留清单，SSH 目录跟随继续受原偏好约束。
     /// 目标失效仍撤销旧数据；跟随以在途目录为准，避免 A→B→A 的慢响应覆盖最新位置。
     ///
     /// @author kongweiguang
@@ -1013,8 +1030,8 @@ impl FilesPane {
         binding: Option<UiSessionBinding>,
         cx: &mut Context<Self>,
     ) {
+        let endpoint = endpoint.filter(|_| binding.is_some());
         let binding_changed = self.current_terminal_binding != binding;
-        let file_source = binding.is_none();
         let mut action = compact_target_update_action(
             self.current_terminal_endpoint.as_ref(),
             self.panels[1]
@@ -1022,21 +1039,17 @@ impl FilesPane {
                 .as_ref()
                 .unwrap_or(&self.panels[1].endpoint),
             endpoint.as_ref(),
-            self.follow_terminal_directory || file_source,
+            self.follow_terminal_directory,
         );
-        // 本机终端保留手动目录；本机文件 Tab 则必须采用新文件的父目录。
-        if file_source && action == CompactTargetUpdateAction::PreservePath {
-            action = CompactTargetUpdateAction::FollowDirectory;
-        }
         if binding_changed
-            && (file_source
-                || (self.follow_terminal_directory
-                    && matches!(endpoint, Some(FileEndpoint::Remote { .. }))))
+            && self.follow_terminal_directory
+            && matches!(endpoint, Some(FileEndpoint::Remote { .. }))
             && action == CompactTargetUpdateAction::Unchanged
         {
             action = CompactTargetUpdateAction::FollowDirectory;
         }
         if action == CompactTargetUpdateAction::Unavailable {
+            self.compact_context = CompactFilesContext::Unavailable;
             if self.compact_target_is_cleared() {
                 return;
             }
@@ -1098,11 +1111,15 @@ impl FilesPane {
             return;
         }
 
+        self.compact_context = binding
+            .clone()
+            .map(CompactFilesContext::Terminal)
+            .unwrap_or(CompactFilesContext::Unavailable);
         self.current_terminal_binding = binding;
         self.current_terminal_endpoint = Some(endpoint.clone());
         self.external_target_lease = retained_lease;
 
-        // 文件系统切换清除旧目标；文件 Tab 跟随父目录，终端来源遵守本机保留和 SSH opt-in。
+        // 文件系统切换清除旧目标；终端来源遵守本机保留和 SSH opt-in。
         let should_notify = match action {
             CompactTargetUpdateAction::BindTarget => {
                 self.invalidate_compact_target(cx);
@@ -1326,6 +1343,7 @@ impl FilesPane {
     ///
     /// @author kongweiguang
     fn invalidate_compact_target(&mut self, cx: &mut Context<Self>) {
+        self.restored_file_browser_endpoint = None;
         self.terminal_directory_follow_generation = None;
         self.directory_navigation_generations[1] =
             self.directory_navigation_generations[1].wrapping_add(1);
@@ -1407,7 +1425,9 @@ impl FilesPane {
         if self.compact_target_error_is_current(&message) {
             return;
         }
+        self.compact_context = CompactFilesContext::Unavailable;
         self.current_terminal_endpoint = None;
+        self.current_terminal_binding = None;
         self.external_target_lease = None;
         self.invalidate_compact_target(cx);
         self.status = Some(message);
@@ -1418,9 +1438,11 @@ impl FilesPane {
     ///
     /// @author kongweiguang
     pub(super) fn compact_target_is_available(&self) -> bool {
-        self.current_terminal_endpoint
-            .as_ref()
-            .is_some_and(|current| endpoint_same_filesystem(current, &self.panels[1].endpoint))
+        !matches!(self.compact_context, CompactFilesContext::Unavailable)
+            && self
+                .current_terminal_endpoint
+                .as_ref()
+                .is_some_and(|current| endpoint_same_filesystem(current, &self.panels[1].endpoint))
     }
 
     /// 已弹出的行菜单只对创建它时的面板代次生效，防止切主机后迟到点击写入新目标。
@@ -2659,12 +2681,14 @@ impl FilesPane {
         }
         self.initialized = true;
         self.sync_target_name_requests(cx);
-        if !self.compact_layout {
+        if !self.compact_layout && !self.file_workspace_layout {
             self.load_panel(0, cx);
         }
         if (!self.host_picker.enabled || !self.host_picker.target_unselected[1])
-            && (!self.compact_layout
-                || !matches!(&self.panels[1].endpoint, FileEndpoint::Local { .. }))
+            && (!self.compact_layout || self.compact_target_is_available())
+            && !self.panels[1].loading
+            && self.panels[1].listing.is_none()
+            && self.panels[1].failed_directory.is_none()
         {
             self.load_panel(1, cx);
         }
@@ -3841,6 +3865,11 @@ impl FilesPane {
                             if let FileEndpoint::Local { path } = &panel.endpoint {
                                 pane.local_directories[side] = path.clone();
                             }
+                            if pane.file_workspace_layout && side == 1 {
+                                cx.emit(FileWorkspaceDirectoryChanged {
+                                    endpoint: pane.panels[1].endpoint.clone(),
+                                });
+                            }
                             pane.complete_active_host_tab_refresh(side);
                             if side == pane.active_side {
                                 pane.load_bookmarks(side, cx);
@@ -4730,7 +4759,7 @@ impl FilesPane {
     }
 
     /// 活队列与恢复材料共用读取代次，只接纳当前来源的最新快照。
-    /// 进度广播不扫描没有界面入口的冷档，避免无用的后台读取。
+    /// 全局视图复用一次权威快照及其标记清理，进度广播不扫描没有界面入口的冷档。
     ///
     /// @author kongweiguang
     fn reload_transfers(&mut self, cx: &mut Context<Self>) {
@@ -4738,20 +4767,19 @@ impl FilesPane {
         cx.notify();
         let transfers = self.transfers.clone();
         let executor = self.executor.clone();
-        let origin = self.transfer_origin.clone();
+        let scope = self.transfer_query_scope.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |cancellation| async move {
                     let rows = transfers.list().await;
-                    let (visible, recovery) = match origin {
-                        Some(origin) => (
-                            transfers.list_for_origin(&origin).await,
-                            transfers
-                                .list_recovery_for_origin(&origin, cancellation)
-                                .await,
-                        ),
-                        None => (Vec::new(), Ok(Vec::new())),
+                    let visible = if matches!(&scope, TransferQueryScope::All) {
+                        rows.clone()
+                    } else {
+                        transfers.list_for_scope(&scope).await
                     };
+                    let recovery = transfers
+                        .list_recovery_for_scope(&scope, cancellation)
+                        .await;
                     Ok((rows, visible, recovery))
                 })
                 .await;
@@ -4790,7 +4818,7 @@ impl FilesPane {
     /// 队列信号允许合并；活任务状态快照用于识别一次性的提交成功并刷新精确目标目录。
     /// 删除事件立即使缓存失效，并跨代次保留补偿；接受权威快照后才合并目录回读。
     /// 事件读取与按钮共用代次，同时保持串行读取以免进度广播堆积磁盘任务。
-    /// 后台读取开始后立即通知，让 loading 不依赖其它窗口输入事件。
+    /// 全局视图复用同一权威快照，后台读取开始后立即通知，不依赖其它窗口输入事件。
     ///
     /// @author kongweiguang
     fn watch_transfer_queue(&mut self, cx: &mut Context<Self>) {
@@ -4829,25 +4857,22 @@ impl FilesPane {
                         }
                         let generation = pane.queue.begin_transfer_refresh();
                         cx.notify();
-                        (generation, pane.transfer_origin.clone())
+                        (generation, pane.transfer_query_scope.clone())
                     })
                 });
-                let Ok((generation, origin)) = generation else {
+                let Ok((generation, scope)) = generation else {
                     break;
                 };
                 let service = transfers.clone();
                 let result = executor
                     .run(move |cancellation| async move {
                         let rows = service.list().await;
-                        let (visible, recovery) = match origin {
-                            Some(origin) => (
-                                service.list_for_origin(&origin).await,
-                                service
-                                    .list_recovery_for_origin(&origin, cancellation)
-                                    .await,
-                            ),
-                            None => (Vec::new(), Ok(Vec::new())),
+                        let visible = if matches!(&scope, TransferQueryScope::All) {
+                            rows.clone()
+                        } else {
+                            service.list_for_scope(&scope).await
                         };
+                        let recovery = service.list_recovery_for_scope(&scope, cancellation).await;
                         Ok((rows, visible, recovery))
                     })
                     .await;
@@ -4884,7 +4909,7 @@ impl FilesPane {
         .detach();
     }
 
-    /// 固定当前来源后再取消，目标项回执屏障仍由全局队列负责。
+    /// 固定显示范围后再取消，全部视图也只操作点击的原 ID，目标项回执屏障仍由全局队列负责。
     ///
     /// @author kongweiguang
     fn cancel_transfer(
@@ -4892,22 +4917,21 @@ impl FilesPane {
         id: kerminal_domain::identity::TransferId,
         cx: &mut Context<Self>,
     ) {
-        let Some(origin) = self.transfer_origin.clone() else {
-            return;
-        };
-        let result_origin = origin.clone();
+        let scope = self.transfer_query_scope.clone();
+        let result_scope = scope.clone();
         let transfers = self.transfers.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |cancellation| async move {
-                    transfers.ensure_origin(&id, &origin, cancellation).await?;
+                    transfers.get_for_scope(&id, &scope).await?;
+                    let _ = cancellation;
                     transfers.cancel(&id).await
                 })
                 .await;
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
-                    if pane.transfer_origin.as_ref() != Some(&result_origin) {
+                    if pane.transfer_query_scope != result_scope {
                         return;
                     }
                     if let Err(error) = result {
@@ -4930,24 +4954,21 @@ impl FilesPane {
         resume: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(origin) = self.transfer_origin.clone() else {
-            return;
-        };
+        let scope = self.transfer_query_scope.clone();
         if !self.queue.begin_transfer_retry(id.clone()) {
             return;
         }
         let retry_id = id.clone();
-        let result_origin = origin.clone();
+        let result_scope = scope.clone();
+        let result_origin = self.transfer_origin.clone();
+        let result_generation = self.transfer_query_generation;
         let external_target_lease = self.external_target_lease.clone();
         let transfers = self.transfers.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |cancellation| async move {
-                    transfers
-                        .ensure_origin(&id, &origin, cancellation.clone())
-                        .await?;
-                    let summary = transfers.get(&id).await?;
+                    let summary = transfers.get_for_scope(&id, &scope).await?;
                     if summary.cleanup_pending
                         && summary.failure_kind
                             != Some(kerminal_domain::files::TransferFailureKind::CommitUnknown)
@@ -4980,7 +5001,10 @@ impl FilesPane {
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
                     pane.queue.finish_transfer_retry(&retry_id);
-                    if pane.transfer_origin.as_ref() != Some(&result_origin) {
+                    if pane.transfer_query_scope != result_scope
+                        || pane.transfer_origin != result_origin
+                        || pane.transfer_query_generation != result_generation
+                    {
                         cx.notify();
                         return;
                     }
@@ -5082,6 +5106,8 @@ impl Drop for BrowserPanel {
 }
 
 impl EventEmitter<OpenFileRequested> for FilesPane {}
+impl EventEmitter<OpenDirectoryInWorkspaceRequested> for FilesPane {}
+impl EventEmitter<FileWorkspaceDirectoryChanged> for FilesPane {}
 impl EventEmitter<FilesPaneEvent> for FilesPane {}
 impl EventEmitter<ActivateEditorFileRequested> for FilesPane {}
 impl EventEmitter<SftpHostRequested> for FilesPane {}
@@ -5352,34 +5378,11 @@ fn finish_panel_load_request(
 #[cfg(test)]
 #[path = "../../../tests/unit/files_transfer_completion_refresh.rs"]
 mod transfer_completion_refresh_tests;
-/// 判断两个 endpoint 是否处于同一逻辑文件系统，用于队列定位时复用正确一侧浏览器。
-///
-/// @author kongweiguang
+/// 复用领域文件系统身份，避免队列定位与文件操作对主机或容器的判断分叉。
 ///
 /// @author kongweiguang
 fn endpoint_same_filesystem(left: &FileEndpoint, right: &FileEndpoint) -> bool {
-    match (left, right) {
-        (FileEndpoint::Local { .. }, FileEndpoint::Local { .. }) => true,
-        (
-            FileEndpoint::Remote { host_id: left, .. },
-            FileEndpoint::Remote { host_id: right, .. },
-        ) => left == right,
-        (
-            FileEndpoint::Container {
-                host_id: left_host,
-                runtime: left_runtime,
-                container_id: left_id,
-                ..
-            },
-            FileEndpoint::Container {
-                host_id: right_host,
-                runtime: right_runtime,
-                container_id: right_id,
-                ..
-            },
-        ) => left_host == right_host && left_runtime == right_runtime && left_id == right_id,
-        _ => false,
-    }
+    left.same_filesystem(right)
 }
 
 /// 这里只排除跨目录和不可显示的名称；反斜杠在 POSIX 上合法，目标平台限制由 child_endpoint 核对。

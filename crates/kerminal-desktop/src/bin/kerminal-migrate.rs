@@ -137,7 +137,7 @@ fn run_command(arguments: impl IntoIterator<Item = OsString>) -> AppResult<Comma
             })
         }
         MigrationAction::Apply => {
-            bootstrap::run_after_migration(&service, |report| CommandOutput {
+            bootstrap::run_after_migration(&service, false, |report| CommandOutput {
                 success: true,
                 document: json!({"ok": true, "mode": "apply", "report": report}),
             })

@@ -100,7 +100,7 @@ pub(super) fn editor_context_menu(
 /// 为编辑器内部文件标签提供路径复制和安全重载；目标取右键时捕获的 endpoint 与读取代次。
 ///
 /// @author kongweiguang
-pub(super) fn editor_tab_context_menu(
+pub(crate) fn editor_tab_context_menu(
     menu: PopupMenu,
     workspace: Entity<FileEditorWorkspace>,
     endpoint: FileEndpoint,

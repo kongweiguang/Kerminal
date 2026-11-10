@@ -1101,7 +1101,11 @@ impl AgentSessionService {
         })
     }
 
-    /// 先关闭 CLI 并确认资源收尾，再保存归档状态，避免持久状态伪装成已关闭。
+    /// 先关闭 CLI 并确认资源收尾，再只提交归档状态，避免持久状态伪装成已关闭。
+    ///
+    /// 归档是纯本地状态转换：不重写说明、MCP 配置与上下文文档，因此不能依赖当前
+    /// MCP listener 是否已启动。删除历史记录在监听器未就绪时也必须成功；真正需要
+    /// endpoint 的新建、恢复和派生入口会自行启动 MCP 运行时。
     ///
     /// @author kongweiguang
     pub async fn archive(
@@ -1123,7 +1127,6 @@ impl AgentSessionService {
                 "Agent resume recovery must be reconciled before archiving",
             ));
         }
-        let endpoint = self.endpoint().await?;
         let stored = self.read_session(id.clone(), &cancellation).await?;
         let resume_capability = self
             .read_resume_capability(&stored.session, &cancellation)
@@ -1137,23 +1140,10 @@ impl AgentSessionService {
                 .await?;
         }
         session.archive(current_timestamp());
-        self.persist_workspace(
-            SessionDocumentWrite {
-                session: &session,
-                expected_revision: session_revision,
-            },
-            &endpoint,
-            None,
-            WorkspaceSnapshotInput {
-                target_session_id: None,
-                output: "",
-                max_bytes: DEFAULT_SNAPSHOT_BYTES,
-                truncated: false,
-                redacted: false,
-            },
-            &cancellation,
-        )
-        .await?;
+        // 只写 session 文档：归档后 workspace 作为历史保留，原有上下文与说明文档
+        // 既不再被使用，也不应因归档被清空或改写。
+        self.persist_session_only(&session, session_revision, &cancellation)
+            .await?;
         Ok(AgentSessionView {
             session,
             terminal: None,

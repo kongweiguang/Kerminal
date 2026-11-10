@@ -139,6 +139,7 @@ fn append_local_terminal(snapshot: &mut WorkspaceSessionSnapshot, suffix: &str, 
 }
 
 /// 首次创建只使用 Missing CAS；外部仅新增根扩展时，重试合并扩展并保留新 revision。
+/// @author kongweiguang
 #[tokio::test]
 async fn first_save_safely_merges_unknown_fields_after_missing_cas_conflict() {
     let base = WorkspaceSessionDocument::empty_v3();
@@ -172,13 +173,16 @@ async fn first_save_safely_merges_unknown_fields_after_missing_cas_conflict() {
         .await
         .unwrap();
 
-    assert_eq!(
-        outcome,
-        WorkspaceSessionSaveOutcome::Saved {
-            revision: WorkspaceSessionRevision::new("revision-saved")
-        }
-    );
+    let WorkspaceSessionSaveOutcome::Saved {
+        revision,
+        document: committed,
+    } = outcome
+    else {
+        panic!("the merged write must report its committed document");
+    };
+    assert_eq!(revision, WorkspaceSessionRevision::new("revision-saved"));
     let saves = repository.saves.lock().await;
+    assert_eq!(committed, saves[1].document);
     assert_eq!(saves.len(), 2);
     assert_eq!(saves[0].expected, WorkspaceSessionExpectedRevision::Missing);
     assert_eq!(
@@ -328,6 +332,7 @@ async fn missing_revision_rejects_nonempty_baseline_before_repository_write() {
 }
 
 /// 保存回执后的候选文档必须能作为下一次 CAS 的基线，包括 UI 使用的显式空 prompt。
+/// @author kongweiguang
 #[tokio::test]
 async fn saved_candidate_with_empty_prompt_can_be_reused_as_next_baseline() {
     let base = WorkspaceSessionDocument::empty_v3();
@@ -355,13 +360,15 @@ async fn saved_candidate_with_empty_prompt_can_be_reused_as_next_baseline() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        first_outcome,
-        WorkspaceSessionSaveOutcome::Saved {
-            revision: first_revision.clone()
-        }
-    );
-    let saved_document = repository.saves.lock().await[0].document.clone();
+    let WorkspaceSessionSaveOutcome::Saved {
+        revision,
+        document: saved_document,
+    } = first_outcome
+    else {
+        panic!("the first write must return the committed document");
+    };
+    assert_eq!(revision, first_revision);
+    assert_eq!(saved_document, repository.saves.lock().await[0].document);
     assert_eq!(saved_document.workspace_snapshot().unwrap(), first_desired);
 
     let mut second_desired = first_desired.clone();
@@ -377,13 +384,102 @@ async fn saved_candidate_with_empty_prompt_can_be_reused_as_next_baseline() {
         .await
         .unwrap();
 
+    let WorkspaceSessionSaveOutcome::Saved { revision, document } = second_outcome else {
+        panic!("the second write must return the committed document");
+    };
+    assert_eq!(revision, second_revision);
+    let saves = repository.saves.lock().await;
+    assert_eq!(saves.len(), 2);
+    assert_eq!(document, saves[1].document);
+}
+
+/// 自动合并后的实际文档是下一次 CAS 的唯一正确基线，根、标签和 pane 扩展都不能在第二次保存消失。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn merged_unknown_fields_survive_the_next_save_using_the_receipt_document() {
+    let mut base = WorkspaceSessionDocument::empty_v3();
+    let mut base_snapshot = base.workspace_snapshot().unwrap();
+    append_local_terminal(&mut base_snapshot, "shared", "");
+    base.update_known_fields(&base_snapshot).unwrap();
+    let mut external = base.clone().into_value();
+    external["futureRoot"] = json!({"writer": "other"});
+    external["terminalTabs"][0]["futureTab"] = json!({"keep": 1});
+    external["terminalPanes"][0]["futurePane"] = json!({"keep": 2});
+    let first_revision = WorkspaceSessionRevision::new("merged-revision");
+    let second_revision = WorkspaceSessionRevision::new("next-revision");
+    let repository = Arc::new(FakeRepository::new(
+        WorkspaceSessionLoad::Loaded {
+            document: document(external),
+            revision: WorkspaceSessionRevision::new("external-revision"),
+        },
+        vec![
+            SaveResponse::Conflict,
+            SaveResponse::Saved(first_revision.clone()),
+            SaveResponse::Saved(second_revision.clone()),
+        ],
+    ));
+    let service = WorkspaceSessionService::new(repository.clone());
+    let mut first_desired = base_snapshot.clone();
+    first_desired.selected_machine_id = Some("first".to_owned());
+    let first_outcome = service
+        .save_workspace_snapshot(
+            CancellationToken::new(),
+            &base,
+            WorkspaceSessionExpectedRevision::Revision(WorkspaceSessionRevision::new("base")),
+            &base_snapshot,
+            &first_desired,
+        )
+        .await
+        .unwrap();
+    let WorkspaceSessionSaveOutcome::Saved {
+        revision,
+        document: committed,
+    } = first_outcome
+    else {
+        panic!("the merged save must return its exact committed document");
+    };
+    assert_eq!(revision, first_revision);
+    assert_eq!(committed.workspace_snapshot().unwrap(), first_desired);
+    assert_eq!(committed, repository.saves.lock().await[1].document);
+
+    let mut second_desired = first_desired.clone();
+    second_desired.selected_machine_id = Some("second".to_owned());
+    let second_outcome = service
+        .save_workspace_snapshot(
+            CancellationToken::new(),
+            &committed,
+            WorkspaceSessionExpectedRevision::Revision(revision),
+            &first_desired,
+            &second_desired,
+        )
+        .await
+        .unwrap();
+    let WorkspaceSessionSaveOutcome::Saved {
+        revision,
+        document: next,
+    } = second_outcome
+    else {
+        panic!("the next save must return its exact committed document");
+    };
+    assert_eq!(revision, second_revision);
+    assert_eq!(next.workspace_snapshot().unwrap(), second_desired);
+    assert_eq!(next.as_value()["futureRoot"]["writer"], json!("other"));
     assert_eq!(
-        second_outcome,
-        WorkspaceSessionSaveOutcome::Saved {
-            revision: second_revision
-        }
+        next.as_value()["terminalTabs"][0]["futureTab"]["keep"],
+        json!(1)
     );
-    assert_eq!(repository.saves.lock().await.len(), 2);
+    assert_eq!(
+        next.as_value()["terminalPanes"][0]["futurePane"]["keep"],
+        json!(2)
+    );
+    let saves = repository.saves.lock().await;
+    assert_eq!(saves.len(), 3);
+    assert_eq!(next, saves[2].document);
+    assert_eq!(
+        saves[2].expected,
+        WorkspaceSessionExpectedRevision::Revision(first_revision)
+    );
 }
 
 /// 当前 reader 不再替缺失/null prompt 造值，避免加载后将不完整会话误当作可保存状态。

@@ -97,13 +97,20 @@ pub(super) fn plan_vault_migration(root: &Path) -> AppResult<Vec<FileEdit>> {
 /// @author kongweiguang
 fn validate_entry(entry: &VaultEntryDocument) -> AppResult<Option<String>> {
     let reference = CredentialRef::new(entry.id.clone()).map_err(|_| invalid_vault())?;
-    let parsed_reference = CredentialReference::parse(reference).map_err(|_| invalid_vault())?;
     CredentialKind::parse(&entry.kind).map_err(|_| invalid_vault())?;
-    if parsed_reference.reference().as_str() != entry.id
+    // 应用自身的服务引用（如 MCP 令牌）不是七段 host 凭据，但仍以 id 作为 AAD 解密。
+    let host_reference = CredentialReference::parse(reference).ok();
+    let service_reference = is_service_reference(entry.id.as_str());
+    if host_reference.is_none() && !service_reference
         || entry.algorithm != CURRENT_ALGORITHM
         || entry.key_id.trim().is_empty()
         || entry.created_at.trim().is_empty()
         || entry.updated_at.trim().is_empty()
+    {
+        return Err(invalid_vault());
+    }
+    if let Some(parsed_reference) = host_reference
+        && parsed_reference.reference().as_str() != entry.id
     {
         return Err(invalid_vault());
     }
@@ -126,6 +133,26 @@ fn validate_entry(entry: &VaultEntryDocument) -> AppResult<Option<String>> {
         }
         _ => Ok(Some(BASE64.encode(entry.id.as_bytes()))),
     }
+}
+
+/// 服务引用的协议与版本段固定，服务名只允许安全字符，避免把任意损坏 id 当成可迁移项。
+///
+/// @author kongweiguang
+fn is_service_reference(value: &str) -> bool {
+    let mut parts = value.split(':');
+    let (Some("service"), Some("kerminal"), Some(service), Some("v1"), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return false;
+    };
+    !service.is_empty()
+        && service
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// 只修改 entries 中指定的 AAD 值，并保留 TOML decor、未知字段、注释和其它条目顺序。
@@ -263,3 +290,7 @@ fn invalid_vault() -> AppError {
 fn storage_error(context: &'static str, source: io::Error) -> AppError {
     AppError::infrastructure_with_source(context, source)
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/data_migration_vault_unit.rs"]
+mod tests;

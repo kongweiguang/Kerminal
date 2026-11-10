@@ -918,6 +918,59 @@ async fn target_context_rejects_legacy_snake_case_context_headers_during_recover
     );
 }
 
+/// 删除历史记录只做本地状态转换；MCP listener 未启动时也必须成功且不改写上下文文档。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn archive_without_mcp_endpoint_keeps_history_and_workspace_context() {
+    let agent_session_id = AgentSessionId::new();
+    let session = active_agent(agent_session_id.clone(), AgentSessionStatus::Stale);
+    let workspace = Arc::new(MemoryAgentWorkspace::new(
+        session,
+        codex_provider_session(),
+        CommitBehavior::Accept,
+    ));
+    let endpoint_context = serde_json::json!({
+        "schemaVersion": 1,
+        "agentSessionId": agent_session_id.as_str(),
+        "endpoint": TEST_AGENT_ENDPOINT,
+        "transport": "streamable-http",
+        "toolsOnly": true,
+        "generatedAt": "2026-10-19T00:00:00Z"
+    });
+    let endpoint_context = serde_json::to_string(&endpoint_context)
+        .expect("fixture endpoint context should serialize");
+    workspace.seed_mcp_endpoint_context(&agent_session_id, endpoint_context.clone());
+    let sessions = Arc::new(MemorySessions::new(
+        Vec::new(),
+        TEST_SESSION_GENERATION,
+        false,
+    ));
+    let service = agent_service(workspace.clone(), sessions);
+    assert!(
+        service.endpoint().await.is_err(),
+        "fixture must start without a published MCP endpoint"
+    );
+
+    let archived = service
+        .archive(agent_session_id.clone(), CancellationToken::new())
+        .await
+        .expect("deleting a history record must not require the MCP listener");
+
+    assert_eq!(archived.session.status, AgentSessionStatus::Archived);
+    assert!(archived.terminal.is_none());
+    assert_eq!(
+        workspace.stored_session(&agent_session_id).status,
+        AgentSessionStatus::Archived,
+        "archive must persist the terminal-free state"
+    );
+    assert_eq!(
+        workspace.mcp_endpoint_context(&agent_session_id),
+        Some(endpoint_context),
+        "archive must leave retained workspace context documents untouched"
+    );
+}
+
 /// 旧 scoped endpoint 在迁移前仍失败闭合，停止同步不能绕过校验并覆盖原文档。
 ///
 /// @author kongweiguang

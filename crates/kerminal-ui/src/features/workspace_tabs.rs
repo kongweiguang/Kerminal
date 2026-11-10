@@ -45,6 +45,8 @@ pub enum WorkspaceTabKind {
     Terminal,
     SftpTransfer,
     SftpWorkbench,
+    /// 宿主不代表某个可变的活动文档，文件操作必须由内部标签冻结身份。
+    FileWorkspace,
     WorkspaceFile,
     Extension(SharedString),
     Unsupported(SharedString),

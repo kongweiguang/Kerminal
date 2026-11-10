@@ -79,6 +79,15 @@ pub enum FileEditorWorkspaceEvent {
         endpoint: FileEndpoint,
         closed: bool,
     },
+    /// 整组文档全部完成保护后才回报成功，Root 不得按单个批准票据提前移除标签。
+    WorkspaceGroupCloseResolved {
+        operation_id: String,
+        closed: bool,
+    },
+    /// 组内全部批准只代表正文可安全丢弃；正文必须等 Root 关闭工具与提交工作区后才释放。
+    WorkspaceGroupClosePrepared {
+        operation_id: String,
+    },
 }
 
 /// 给文件面板使用的带版本只读快照，不暴露 GPUI Entity 或正文缓冲。
@@ -131,10 +140,14 @@ pub(super) struct PendingEditorSave {
     generation: u64,
     cancellation: CancellationToken,
     cancel_requested: bool,
+    /// 组关闭被抢占后旧保存仍要结算，但不再继承关闭授权。
+    pub(super) workspace_group_generation: Option<u64>,
 }
 
 impl PendingEditorSave {
     /// 保存意图在领域状态进入 Saving 后建立，确保文件身份和异步结果所有者一致。
+    ///
+    /// @author kongweiguang
     pub(super) fn new(
         endpoint: FileEndpoint,
         generation: u64,
@@ -145,6 +158,7 @@ impl PendingEditorSave {
             generation,
             cancellation,
             cancel_requested: false,
+            workspace_group_generation: None,
         }
     }
 
@@ -319,6 +333,11 @@ pub struct FileEditorWorkspace {
     pub(super) status: Option<EditorStatus>,
     /// Root 的单一资源关闭操作在编辑器确认完成前保持挂起，避免先移除 workspace tab。
     pub(super) pending_workspace_close: Option<PendingWorkspaceClose>,
+    /// 嵌入根工作区时仅由外层绘制导航，所有正文仍由同一实体持有。
+    pub(super) embedded_navigation: bool,
+    pub(super) pending_workspace_group_close:
+        Option<super::group_close::PendingWorkspaceGroupClose>,
+    pub(super) next_workspace_group_generation: u64,
 }
 
 impl FileEditorWorkspace {
@@ -391,6 +410,9 @@ impl FileEditorWorkspace {
             next_save_generation: 1,
             status: None,
             pending_workspace_close: None,
+            embedded_navigation: false,
+            pending_workspace_group_close: None,
+            next_workspace_group_generation: 1,
         }
     }
 
@@ -410,7 +432,7 @@ impl FileEditorWorkspace {
     /// 只为已打开标签的唯一目标查询名称；标签关闭或重开时由 key+generation 丢弃旧回执。
     ///
     /// @author kongweiguang
-    fn sync_target_name_requests(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn sync_target_name_requests(&mut self, cx: &mut Context<Self>) {
         let endpoints = self
             .tabs
             .iter()
@@ -614,10 +636,28 @@ impl FileEditorWorkspace {
         Ok(())
     }
 
-    /// 关闭确认和异步读回按 endpoint/代次关联，且普通提示保持独立于保存成功标记。
+    /// 外层导航只改变展示所有权，不迁移正文、搜索、保存或确认状态；独立用例默认保留旧导航。
+    ///
+    /// @author kongweiguang
+    pub fn set_embedded_navigation(&mut self, embedded: bool, cx: &mut Context<Self>) {
+        if self.embedded_navigation != embedded {
+            self.embedded_navigation = embedded;
+            cx.notify();
+        }
+    }
+
+    /// 关闭确认和异步读回按 endpoint/代次关联，单文件请求明确抢占整组事务而不丢失其 owner。
     ///
     /// @author kongweiguang
     pub fn request_close(&mut self, endpoint: FileEndpoint, cx: &mut Context<Self>) {
+        self.cancel_workspace_group_close(cx);
+        self.request_close_impl(endpoint, cx);
+    }
+
+    /// 组内推进复用同一保护流程，但不把内部逐文件决策误当成外部抢占。
+    ///
+    /// @author kongweiguang
+    pub(super) fn request_close_impl(&mut self, endpoint: FileEndpoint, cx: &mut Context<Self>) {
         let load_generation = self
             .tabs
             .iter()
@@ -710,13 +750,16 @@ impl FileEditorWorkspace {
         cx.notify();
     }
 
-    /// 保留 Root operation owner，并把当前读取代次作为关闭回执的匹配边界。
+    /// 保留 Root operation owner，并把当前读取代次作为关闭回执的匹配边界；单项请求先结清组 owner。
+    ///
+    /// @author kongweiguang
     pub fn request_workspace_close(
         &mut self,
         endpoint: FileEndpoint,
         operation_id: String,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_workspace_group_close(cx);
         if let Some(pending_close) = &self.pending_workspace_close {
             let duplicate =
                 pending_close.operation_id == operation_id && pending_close.endpoint == endpoint;
@@ -741,7 +784,9 @@ impl FileEditorWorkspace {
         self.request_close(endpoint, cx);
     }
 
-    /// 仅匹配原 endpoint 和 load generation 后回报结果，Root 才可提交同一关闭操作。
+    /// 仅匹配原 endpoint 和 load generation 后回报结果，失败同时结清匹配的整组 owner。
+    ///
+    /// @author kongweiguang
     pub(super) fn resolve_workspace_close(
         &mut self,
         endpoint: &FileEndpoint,
@@ -749,6 +794,9 @@ impl FileEditorWorkspace {
         closed: bool,
         cx: &mut Context<Self>,
     ) {
+        if !closed && self.workspace_group_close_matches(endpoint, generation) {
+            self.cancel_workspace_group_close(cx);
+        }
         let Some(event) = take_workspace_close_resolution(
             &mut self.pending_workspace_close,
             endpoint,
@@ -765,6 +813,7 @@ impl FileEditorWorkspace {
     ///
     /// @author kongweiguang
     pub fn request_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        self.cancel_workspace_group_close(cx);
         if let Some(event) = take_workspace_close_cancellation(&mut self.pending_workspace_close) {
             if let FileEditorWorkspaceEvent::WorkspaceTabCloseResolved { endpoint, .. } = &event {
                 if self
@@ -873,7 +922,8 @@ impl FileEditorWorkspace {
         cx.notify();
     }
 
-    /// 取消前保存被取消代次、先换代再丢任务，并为同一关闭 owner 回报失败收据。
+    /// 先换代再丢任务并结清关闭 owner；已有正文的正常取消只留状态反馈，避免错误条挤动正文。
+    /// 首次读取尚无正文时保留可重试错误入口，不能把取消显示为成功加载。
     ///
     /// @author kongweiguang
     pub(super) fn cancel_load(&mut self, endpoint: FileEndpoint, cx: &mut Context<Self>) {
@@ -897,7 +947,7 @@ impl FileEditorWorkspace {
             "File loading was cancelled. The current contents were kept.",
         )
         .to_string();
-        tab.error = Some(message.clone());
+        tab.error = (tab.editor.is_none() || tab.session.is_none()).then(|| message.clone());
         if let (Some(editor), Some(session)) = (&tab.editor, &tab.session) {
             let readonly = effective_readonly(session.is_readonly(), tab.workspace_readonly);
             editor.update(cx, |state, cx| state.set_readonly(readonly, cx));
@@ -925,6 +975,9 @@ impl FileEditorWorkspace {
     ///
     /// @author kongweiguang
     pub(super) fn remove_tab(&mut self, endpoint: &FileEndpoint, cx: &mut Context<Self>) {
+        if self.approve_workspace_group_tab(endpoint, false, cx) {
+            return;
+        }
         let was_active = self.active_endpoint.as_ref() == Some(endpoint);
         if was_active {
             self.clear_search_projection(cx);
@@ -1243,6 +1296,18 @@ impl FileEditorWorkspace {
         }
     }
 
+    /// 目录页面不应让保存或查找动作命中隐藏文档；只撤销活动引用，缓冲和在途保存仍保留。
+    /// @author kongweiguang
+    pub(crate) fn deactivate_document(&mut self, cx: &mut Context<Self>) {
+        if self.active_endpoint.is_none() {
+            return;
+        }
+        self.clear_search_projection(cx);
+        self.active_endpoint = None;
+        self.publish_workspace_projection_if_changed(cx);
+        cx.notify();
+    }
+
     /// 切换活动标签后重建该文档搜索范围，并同步活动项快照。
     ///
     /// @author kongweiguang
@@ -1252,6 +1317,15 @@ impl FileEditorWorkspace {
         self.sync_search_query(query, cx);
         self.publish_workspace_projection_if_changed(cx);
         cx.notify();
+    }
+
+    /// 外层文档标签复用原菜单的代次门禁，不复制正文，也不让旧菜单操作重开的同路径文件。
+    /// @author kongweiguang
+    pub(crate) fn load_generation_for(&self, endpoint: &FileEndpoint) -> Option<u64> {
+        self.tabs
+            .iter()
+            .find(|tab| &tab.endpoint == endpoint)
+            .map(|tab| tab.load_generation)
     }
 
     /// 只激活仍存在的文件标签；Root 的迟到行点击不能隐式重新打开或重读已关闭文件。
@@ -1428,7 +1502,9 @@ impl FileEditorWorkspace {
         self.save_endpoint(endpoint, SaveResolution::CompareRevision, true, quit, cx);
     }
 
-    /// 用户明确选择放弃编辑时清除该 tab，再按需处理剩余退出目标。
+    /// 组内丢弃只授权当前修订关闭，不提前清空正文；最后一项通过后才提交整组移除。
+    ///
+    /// @author kongweiguang
     pub(super) fn confirm_discard_and_close(
         &mut self,
         endpoint: FileEndpoint,
@@ -1436,6 +1512,10 @@ impl FileEditorWorkspace {
         cx: &mut Context<Self>,
     ) {
         self.confirmation = None;
+        if self.approve_workspace_group_tab(&endpoint, true, cx) {
+            cx.notify();
+            return;
+        }
         self.remove_tab(&endpoint, cx);
         if quit || self.quit_flow {
             self.advance_quit(cx);
@@ -1555,7 +1635,9 @@ impl FileEditorWorkspace {
         }
         if !user_reload_request_is_available(
             self.confirmation.is_some(),
-            self.pending_workspace_close.is_some() || self.quit_flow,
+            self.pending_workspace_close.is_some()
+                || self.pending_workspace_group_close.is_some()
+                || self.quit_flow,
             tab_loading,
             self.tabs
                 .iter()
@@ -1635,6 +1717,7 @@ impl FileEditorWorkspace {
     ///
     /// @author kongweiguang
     pub(super) fn cancel_confirmation(&mut self, cx: &mut Context<Self>) {
+        self.cancel_workspace_group_close(cx);
         let cancelled_readback_close = match self.confirmation.as_ref() {
             Some(EditorConfirmation::Reload {
                 endpoint,
@@ -1838,7 +1921,9 @@ mod search_panel_tests;
 mod projection_tests;
 
 /// 返回确认框绑定的文件身份，关闭事件可在 tab 已移除后清理过期对话框。
-fn confirmation_endpoint(confirmation: &EditorConfirmation) -> &FileEndpoint {
+///
+/// @author kongweiguang
+pub(super) fn confirmation_endpoint(confirmation: &EditorConfirmation) -> &FileEndpoint {
     match confirmation {
         EditorConfirmation::Close(endpoint)
         | EditorConfirmation::Quit(endpoint)

@@ -253,7 +253,7 @@ fn capture_refresh_in_flight(
     Ok(result)
 }
 
-/// 独立专项只检查同目录刷新，在浅色、深色和跟随系统主题下等待真实回执。
+/// 专项先检查左栏折叠不触发 SFTP 读取，再在三种主题下验证主动刷新的真实回执。
 ///
 /// @author kongweiguang
 async fn run_refresh_only(
@@ -278,6 +278,8 @@ async fn run_refresh_only(
             })
         })?;
         let _ = frame_signature(cx, window)?;
+        super::functional_sidebar::run_for_theme(cx, root, window, capture, &mut records, name)
+            .await?;
         let (busy, settled) = match name {
             "light" => ("sftp-refresh-light-loading", "sftp-refresh-light-settled"),
             "dark" => ("sftp-refresh-dark-loading", "sftp-refresh-dark-settled"),
@@ -323,6 +325,9 @@ async fn run_refresh_only(
             "same_directory_refresh_completed_without_success_footer",
         )
         .await?;
+        if name == "light" {
+            super::functional_sidebar::run_other_panels(cx, root, window, capture).await?;
+        }
     }
     Ok(records)
 }

@@ -194,10 +194,11 @@ async fn exercise(
         .await
         .map_err(|error| stage_error(error, "阶段 wait_view"))?;
     window
-        .update(cx, |_, _, app| {
+        .update(cx, |_, window, app| {
             root.update(app, |root, cx| {
-                // 重启验收只操作工作区标签和内容，不需要右栏验收活动面板；
-                // 该面板会挤窄标签栏，使已保存的首标签脱离可点击可视区。
+                // 重启验收只操作工作区标签和内容；右栏活动面板会挤窄标签栏，
+                // 使已保存的首标签脱离可点击可视区，因此先沿生产开关关闭它。
+                root.close_right_rail_acceptance_panels(window, cx);
                 root.set_right_rail_acceptance_theme(options.theme, cx);
             })
         })

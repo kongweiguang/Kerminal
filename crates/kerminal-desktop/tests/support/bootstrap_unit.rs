@@ -10,7 +10,7 @@ use std::sync::{
 use kerminal_application::{
     AppError, AppResult,
     data_migration::{
-        DataMigrationInspection, DataMigrationReadiness, DataMigrationReport,
+        DataMigrationInspection, DataMigrationOutcome, DataMigrationReadiness, DataMigrationReport,
         DataMigrationRepository, DataMigrationService,
     },
 };
@@ -82,7 +82,8 @@ fn failed_or_unknown_migration_never_starts_desktop_resources() {
             called: Arc::clone(&called),
             error,
         }));
-        let result = run_after_migration(&service, |_| started.store(true, Ordering::SeqCst));
+        let result =
+            run_after_migration(&service, false, |_| started.store(true, Ordering::SeqCst));
         let error = result.expect_err("migration failure must stop startup");
         assert!(called.load(Ordering::SeqCst));
         assert!(!started.load(Ordering::SeqCst));
@@ -101,7 +102,7 @@ fn successful_migration_commits_before_the_start_callback() {
     let (_, host_types) = crate::plugin_catalogs::builtin_catalogs().expect("冻结内置目录");
     let service = migration_service(&root, None, host_types);
     let started = AtomicBool::new(false);
-    run_after_migration(&service, |_| {
+    run_after_migration(&service, false, |_| {
         assert!(matches!(
             service
                 .inspect()
@@ -154,4 +155,68 @@ fn migration_service_uses_the_supplied_host_catalog() {
         DataMigrationReadiness::Legacy
     );
     assert_eq!(std::fs::read_to_string(path).expect("原文未改写"), raw);
+}
+
+/// GPUI beta 根仍以契约 3 写入；正式发版前允许按原数据启动，不留迁移写入口。
+struct BetaContractMigration {
+    called: Arc<AtomicBool>,
+    recovery_pending: bool,
+}
+
+impl DataMigrationRepository for BetaContractMigration {
+    /// 阻断来自“无法迁移”而非格式未知；调用方据此区分同代 beta 数据与真正的损坏。
+    fn inspect(&self) -> AppResult<DataMigrationInspection> {
+        Ok(DataMigrationInspection {
+            readiness: DataMigrationReadiness::Blocked,
+            data_format: Some(4),
+            migration_contract: Some(3),
+            blockers: Vec::new(),
+            notices: Vec::new(),
+            recovery_pending: self.recovery_pending,
+        })
+    }
+
+    /// 契约 3 的 beta 根不再执行迁移；测试记录调用以证明门禁先询问了真实结果。
+    fn migrate(&self) -> AppResult<DataMigrationReport> {
+        self.called.store(true, Ordering::SeqCst);
+        Err(AppError::conflict("用户数据迁移预检存在阻断项"))
+    }
+}
+
+/// 无恢复事务的契约 3 根可直接进入装配；错误回执不被伪装成迁移成功。
+///
+/// @author kongweiguang
+#[test]
+fn beta_contract_three_starts_without_running_migration() {
+    let called = Arc::new(AtomicBool::new(false));
+    let service = DataMigrationService::new(Arc::new(BetaContractMigration {
+        called: Arc::clone(&called),
+        recovery_pending: false,
+    }));
+    let started = AtomicBool::new(false);
+    let report = run_after_migration(&service, true, |report| {
+        started.store(true, Ordering::SeqCst);
+        report
+    })
+    .expect("同代 beta 数据不阻断启动");
+    assert!(called.load(Ordering::SeqCst));
+    assert!(started.load(Ordering::SeqCst));
+    assert_eq!(report.outcome, DataMigrationOutcome::AlreadyCurrent);
+    assert_eq!(report.changed_file_count, 0);
+}
+
+/// 存在未完成恢复事务时仍必须阻断；豁免只覆盖可证明无前滚风险的同代数据。
+///
+/// @author kongweiguang
+#[test]
+fn beta_contract_with_pending_recovery_still_blocks() {
+    let service = DataMigrationService::new(Arc::new(BetaContractMigration {
+        called: Arc::new(AtomicBool::new(false)),
+        recovery_pending: true,
+    }));
+    let started = AtomicBool::new(false);
+    let error = run_after_migration(&service, true, |_| started.store(true, Ordering::SeqCst))
+        .expect_err("未完成恢复必须阻断");
+    assert_eq!(error.public_code(), AppError::conflict("x").public_code());
+    assert!(!started.load(Ordering::SeqCst));
 }

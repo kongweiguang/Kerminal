@@ -4,6 +4,8 @@
 
 #[path = "transfer_history_dismissal.rs"]
 mod history_dismissal;
+#[path = "transfer_query_scope.rs"]
+mod query_scope;
 
 use std::{
     collections::BTreeMap,

@@ -297,6 +297,7 @@ fn missing_baseline_synchronizes_created_tab_and_keeps_no_clobber_cas() {
 }
 
 /// transient pane 仍保留在完整工作区；CAS 只提交过滤后的分屏且回执后状态 clean。
+/// @author kongweiguang
 #[test]
 fn projected_save_keeps_transient_split_visible_and_clean() {
     let (full, projected) = mixed_split_snapshots();
@@ -324,6 +325,7 @@ fn projected_save_keeps_transient_split_visible_and_clean() {
             &request.request_id,
             WorkspaceSessionSaveOutcome::Saved {
                 revision: WorkspaceSessionRevision::new("revision-projected"),
+                document: request.candidate_document.clone(),
             },
         )
         .unwrap();
@@ -362,6 +364,7 @@ fn transient_only_projection_cleans_working_state_without_save_request() {
 }
 
 /// 保存期间发生新的 persistent 选择后，旧回执只确认旧请求快照并保留 dirty 状态。
+/// @author kongweiguang
 #[test]
 fn projected_save_receipt_does_not_clean_changes_made_while_saving() {
     let base = one_terminal_snapshot();
@@ -387,6 +390,7 @@ fn projected_save_receipt_does_not_clean_changes_made_while_saving() {
             &request.request_id,
             WorkspaceSessionSaveOutcome::Saved {
                 revision: WorkspaceSessionRevision::new("revision-saved"),
+                document: request.candidate_document.clone(),
             },
         )
         .unwrap();
@@ -400,6 +404,7 @@ fn projected_save_receipt_does_not_clean_changes_made_while_saving() {
 }
 
 /// 保存 A 期间允许 Root 同步资源 B；A 的旧回执只确认 A，B 仍可按新 revision 再保存。
+/// @author kongweiguang
 #[test]
 fn resource_ack_during_save_is_preserved_and_remains_dirty_until_next_cas() {
     let base = one_terminal_snapshot();
@@ -433,6 +438,7 @@ fn resource_ack_during_save_is_preserved_and_remains_dirty_until_next_cas() {
             &first_request.request_id,
             WorkspaceSessionSaveOutcome::Saved {
                 revision: WorkspaceSessionRevision::new("revision-after-a"),
+                document: first_request.candidate_document.clone(),
             },
         )
         .unwrap();
@@ -448,6 +454,7 @@ fn resource_ack_during_save_is_preserved_and_remains_dirty_until_next_cas() {
 }
 
 /// transient pane B 在投影保存 A 时到达；A 回执不丢资源，投影等于新基线后不重复写盘。
+/// @author kongweiguang
 #[test]
 fn transient_resource_ack_during_projected_save_stays_visible_without_extra_cas() {
     let (full_base, durable_base) = mixed_split_snapshots();
@@ -473,6 +480,7 @@ fn transient_resource_ack_during_projected_save_stays_visible_without_extra_cas(
             &request_a.request_id,
             WorkspaceSessionSaveOutcome::Saved {
                 revision: WorkspaceSessionRevision::new("revision-after-a"),
+                document: request_a.candidate_document.clone(),
             },
         )
         .unwrap();
@@ -494,6 +502,60 @@ fn transient_resource_ack_during_projected_save_stays_visible_without_extra_cas(
         WorkspacePersistenceState::Clean
     ));
     assert!(!controller.has_unsaved_or_pending_work());
+}
+
+/// 保存回执采用实际合并文档，后续 UI 意图必须继承另一写入者新增的未知字段。
+///
+/// @author kongweiguang
+#[test]
+fn saved_merged_document_becomes_the_next_controller_cas_baseline() {
+    let base = one_terminal_snapshot();
+    let mut controller = WorkspaceController::from_loaded(
+        document_for(&base),
+        WorkspaceSessionRevision::new("revision-base"),
+    )
+    .unwrap();
+    let mut first = base;
+    first.selected_machine_id = Some("first".to_owned());
+    controller.synchronize_snapshot(first.clone()).unwrap();
+    let request = controller.begin_save().unwrap().unwrap();
+    let mut merged_value = request.candidate_document.clone().into_value();
+    merged_value["futureRoot"] = serde_json::json!({"writer": "other"});
+    merged_value["terminalTabs"][0]["futureTab"] = serde_json::json!({"keep": true});
+    merged_value["terminalPanes"][0]["futurePane"] = serde_json::json!({"keep": true});
+    let committed = WorkspaceSessionDocument::try_from_value(merged_value).unwrap();
+    controller
+        .finish_save(
+            &request.request_id,
+            WorkspaceSessionSaveOutcome::Saved {
+                revision: WorkspaceSessionRevision::new("revision-merged"),
+                document: committed.clone(),
+            },
+        )
+        .unwrap();
+    let mut second = first;
+    second.selected_machine_id = Some("second".to_owned());
+    controller.synchronize_snapshot(second).unwrap();
+    let next = controller.begin_save().unwrap().unwrap();
+    assert_eq!(next.base_document, committed);
+    assert_eq!(
+        next.expected_revision,
+        WorkspaceSessionExpectedRevision::Revision(WorkspaceSessionRevision::new(
+            "revision-merged"
+        )),
+    );
+    assert_eq!(
+        next.candidate_document.as_value()["futureRoot"]["writer"],
+        "other"
+    );
+    assert_eq!(
+        next.candidate_document.as_value()["terminalTabs"][0]["futureTab"]["keep"],
+        true
+    );
+    assert_eq!(
+        next.candidate_document.as_value()["terminalPanes"][0]["futurePane"]["keep"],
+        true
+    );
 }
 
 /// 未知提交按投影回读确认；UI 继续显示 transient pane，且其 HostId 不进入持久化基线。
@@ -1058,6 +1120,85 @@ fn restore_plan_and_projection_preserve_all_supported_tab_kinds() {
         WorkspaceTabKind::WorkspaceFile
     ));
     assert!(projections[2].layout.is_none());
+}
+
+/// 文件工作区复用文件恢复种类但不制造 pane，激活和改名仍由同一 reducer 持有。
+/// @author kongweiguang
+#[test]
+fn file_workspace_restore_projection_and_activation_preserve_owner_identity() {
+    use kerminal_application::workspace::{FileWorkspaceItem, FileWorkspaceState};
+
+    let mut snapshot = one_terminal_snapshot();
+    let owner_id = tab_id("file-workspace-owner");
+    let host_id = HostId::new();
+    snapshot
+        .terminal_tabs
+        .push(WorkspaceSessionTab::FileWorkspace {
+            id: owner_id.clone(),
+            tab_group_id: None,
+            title: "Project files".into(),
+            machine_id: "file-host-machine".into(),
+            target: WorkspaceTargetRef::Ssh { host_id },
+            state: FileWorkspaceState {
+                items: vec![FileWorkspaceItem::Directory {
+                    id: tab_id("file-workspace-directory"),
+                    path: "/srv/project".into(),
+                }],
+                active_item_id: Some(tab_id("file-workspace-directory")),
+                source_tab_ids: Vec::new(),
+            },
+        });
+    let mut controller = WorkspaceController::from_loaded(
+        document_for(&snapshot),
+        WorkspaceSessionRevision::new("file-workspace-revision"),
+    )
+    .expect("file workspace snapshot is valid");
+    assert!(matches!(
+        controller.restore_plan().last(),
+        Some(WorkspaceRestoreItem::WorkspaceFile { tab }) if tab.id() == &owner_id,
+    ));
+    let projections = controller.tab_projections();
+    let file = projections
+        .iter()
+        .find(|tab| tab.id == owner_id)
+        .expect("owner tab");
+    assert!(matches!(file.kind, WorkspaceTabKind::FileWorkspace));
+    assert!(file.layout.is_none());
+    assert_eq!(
+        controller.restore_status(&WorkspaceRestoreItemId::Tab(owner_id.clone())),
+        Some(WorkspaceRestoreStatus::Pending),
+    );
+
+    controller
+        .apply_tab_event(WorkspaceTabEvent::Activate(owner_id.clone()))
+        .expect("activate owner");
+    assert_eq!(controller.snapshot().active_tab_id, Some(owner_id.clone()));
+    assert_eq!(controller.snapshot().focused_pane_id, None);
+    assert_eq!(
+        controller.snapshot().selected_machine_id.as_deref(),
+        Some("file-host-machine")
+    );
+    assert_eq!(controller.snapshot().terminal_panes.len(), 1);
+    controller
+        .apply_tab_event(WorkspaceTabEvent::RenameTab {
+            tab_id: owner_id.clone(),
+            title: "Server files".into(),
+        })
+        .expect("rename owner");
+    controller
+        .apply_tab_event(WorkspaceTabEvent::CreateGroupForTab {
+            tab_id: owner_id.clone(),
+            title: "Files".into(),
+        })
+        .expect("group owner");
+    let owner = controller
+        .snapshot()
+        .terminal_tabs
+        .iter()
+        .find(|tab| tab.id() == &owner_id)
+        .expect("owner remains");
+    assert_eq!(owner.title(), "Server files");
+    assert!(owner.tab_group_id().is_some());
 }
 
 /// Root 的真实回执被错误 pane/tab ID 关联时拒绝，不能提交过期布局候选。

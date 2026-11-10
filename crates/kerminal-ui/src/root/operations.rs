@@ -420,7 +420,7 @@ fn open_compose_config(
         cx.notify();
         return;
     }
-    let Some(editor) = root.file_editor_workspace.clone() else {
+    let Some(_editor) = root.file_editor_workspace.clone() else {
         root.status = Some(crate::locale::text(
             "文件编辑服务尚未配置。",
             "The file editor service is unavailable.",
@@ -447,41 +447,9 @@ fn open_compose_config(
         FileEndpoint::Container { .. } => return,
     };
     let root_path = configured_root_path.map(str::to_owned).or(root_path);
-    let Some(controller) = root.workspace_controller.as_ref() else {
-        root.status = Some("工作区尚未就绪，未打开 Compose YAML。".into());
-        cx.notify();
-        return;
-    };
     use kerminal_application::workspace::{
         WorkspaceFileAccess, WorkspaceFileSource, WorkspaceSessionTab,
     };
-    if let Some(id) = root.workspace_files.tab_for_endpoint(&endpoint) {
-        let Some(controller) = root.workspace_controller.as_mut() else {
-            return;
-        };
-        let changed = match root
-            .workspace_files
-            .restrict_file_to_readonly(controller, &editor, &id, &endpoint, cx)
-        {
-            Ok(changed) => changed,
-            Err(error) => {
-                root.status = Some(error.public_message().into());
-                cx.notify();
-                return;
-            }
-        };
-        if changed {
-            root.refresh_workspace_views(cx);
-            root.persist_workspace_snapshot(cx);
-        }
-        // 去重后仍须提交 controller 的活动身份；仅切换编辑器会被原导航覆盖。
-        let event = crate::features::workspace_tabs::WorkspaceTabEvent::Activate(id.clone());
-        if root.handle_workspace_tab_event(&event, window, cx) {
-            root.activate_workspace_tab(&id, window, cx);
-        }
-        return;
-    }
-    let mut snapshot = controller.snapshot().clone();
     let id = kerminal_domain::identity::TabId::new();
     let tab = WorkspaceSessionTab::WorkspaceFile {
         id: id.clone(),
@@ -494,28 +462,17 @@ fn open_compose_config(
         access: WorkspaceFileAccess::Readonly,
         source: WorkspaceFileSource::ComposeYaml,
     };
-    snapshot.terminal_tabs.push(tab.clone());
-    snapshot.active_tab_id = Some(id.clone());
-    snapshot.focused_pane_id = None;
-    if !root.workspace_files.register_pending_compose_yaml_tab(tab) {
-        root.status = Some("文件工作区尚未就绪，未打开 Compose YAML。".into());
-        cx.notify();
-        return;
+    match root.open_host_document_descriptor(tab, endpoint, None, false, cx) {
+        Ok(owner) => {
+            root.refresh_workspace_views(cx);
+            root.activate_workspace_tab(&owner, window, cx);
+            root.persist_workspace_snapshot(cx);
+        }
+        Err(error) => {
+            root.status = Some(error.public_message().into());
+            cx.notify();
+        }
     }
-    if let Err(error) = root
-        .workspace_controller
-        .as_mut()
-        .expect("controller was checked above")
-        .synchronize_snapshot(snapshot)
-    {
-        root.remove_workspace_file_tab_after_close(&id);
-        root.status = Some(error.public_message().to_owned().into());
-        cx.notify();
-        return;
-    }
-    root.refresh_workspace_views(cx);
-    root.activate_workspace_tab(&id, window, cx);
-    root.persist_workspace_snapshot(cx);
 }
 
 /// Compose 只接受宿主文件系统端点，避免把 host 路径错送到容器文件浏览器。

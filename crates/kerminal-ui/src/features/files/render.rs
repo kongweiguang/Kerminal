@@ -74,6 +74,17 @@ impl Render for FilesPane {
                     .child(browser::render_browser(self, 1, window, theme, cx))
                     .into_any_element()
             }
+        } else if self.file_workspace_layout {
+            div()
+                .id("files-browser-area-workspace")
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(browser::render_browser(self, 1, window, theme, cx))
+                .into_any_element()
         } else {
             let pane_id = cx.entity_id().as_u64();
             let orientation = window.use_keyed_state(
@@ -185,7 +196,9 @@ impl Render for FilesPane {
             pane = pane.child(render_bookmarks(self, theme, cx));
         }
         // 传输区只展示当前任务和必要恢复操作，不暴露冷档入口。
-        if !self.compact_layout || self.compact_target_is_available() {
+        if !self.file_workspace_layout
+            && (!self.compact_layout || self.compact_target_is_available())
+        {
             pane = pane.child(transfers::render_transfers(self, theme, cx));
         }
         if let Some(details) = render_status_details(self, theme) {

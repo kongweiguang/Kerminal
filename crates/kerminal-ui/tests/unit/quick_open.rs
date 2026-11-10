@@ -177,3 +177,71 @@ fn workspace_subtitles_hide_machine_ids_and_omit_blank_cwd() {
     let id_search = workspace_entries(&snapshot, "machine-local");
     assert_eq!(id_search.len(), 2);
 }
+
+/// 内部路径命中仍返回真实 owner，避免菜单把目录和文档误生成为多个顶层标签。
+/// @author kongweiguang
+#[test]
+fn file_workspace_search_resolves_internal_paths_to_the_owner() {
+    use kerminal_application::workspace::{
+        FileWorkspaceItem, FileWorkspaceState, WorkspaceFileAccess, WorkspaceFileSource,
+        WorkspaceTargetRef,
+    };
+
+    let owner_id = TabId::new();
+    let directory_id = TabId::new();
+    let document_id = TabId::new();
+    let mut snapshot = WorkspaceSessionSnapshot {
+        pinned_containers: Vec::new(),
+        active_tab_id: Some(owner_id.clone()),
+        focused_pane_id: None,
+        selected_machine_id: Some("file-machine".into()),
+        terminal_tabs: vec![WorkspaceSessionTab::FileWorkspace {
+            id: owner_id.clone(),
+            tab_group_id: None,
+            title: "Project files".into(),
+            machine_id: "file-machine".into(),
+            target: WorkspaceTargetRef::Local { profile_id: None },
+            state: FileWorkspaceState {
+                items: vec![
+                    FileWorkspaceItem::Directory {
+                        id: directory_id,
+                        path: "C:/project".into(),
+                    },
+                    FileWorkspaceItem::Document {
+                        id: document_id.clone(),
+                        title: "notes.txt".into(),
+                        path: "C:/project/notes.txt".into(),
+                        root_path: Some("C:/project".into()),
+                        access: WorkspaceFileAccess::Editable,
+                        source: WorkspaceFileSource::Local,
+                    },
+                ],
+                active_item_id: Some(document_id),
+                source_tab_ids: Vec::new(),
+            },
+        }],
+        terminal_panes: Vec::new(),
+        tab_groups: BTreeMap::new(),
+    };
+
+    let entries = workspace_entries(&snapshot, "notes.txt");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].label, "Project files");
+    assert_eq!(entries[0].detail, "C:/project/notes.txt");
+    assert_eq!(
+        entries[0].selection,
+        Some(QuickOpenSelection::WorkspaceFile(owner_id.clone())),
+    );
+
+    let WorkspaceSessionTab::FileWorkspace { state, .. } = &mut snapshot.terminal_tabs[0] else {
+        panic!("fixture retains file workspace");
+    };
+    state.active_item_id = None;
+    let entries = workspace_entries(&snapshot, "notes.txt");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].detail, "C:/project");
+    assert_eq!(
+        entries[0].selection,
+        Some(QuickOpenSelection::WorkspaceFile(owner_id)),
+    );
+}

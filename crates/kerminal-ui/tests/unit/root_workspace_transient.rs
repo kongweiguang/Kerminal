@@ -275,6 +275,61 @@ fn sftp_tab_with_uuid_external_launch_id_is_transient() {
     assert!(projected.validate().is_ok());
 }
 
+/// 文件宿主按明确 external target 或运行态 transient 标记剥离，普通宿主保留自身 machine。
+/// @author kongweiguang
+#[test]
+fn file_workspace_persistence_honors_explicit_target_and_runtime_marker() {
+    use kerminal_application::workspace::{FileWorkspaceItem, FileWorkspaceState};
+
+    let saved_host = HostId::new();
+    let external_host = HostId::parse("external:file-workspace").expect("valid external identity");
+    for (host_id, transient, retained) in [
+        (saved_host.clone(), false, true),
+        (saved_host, true, false),
+        (external_host, false, false),
+    ] {
+        let owner_id = TabId::new();
+        let item_id = TabId::new();
+        let snapshot = WorkspaceSessionSnapshot {
+            pinned_containers: Vec::new(),
+            active_tab_id: Some(owner_id.clone()),
+            focused_pane_id: None,
+            selected_machine_id: Some("file-host-machine".into()),
+            terminal_tabs: vec![WorkspaceSessionTab::FileWorkspace {
+                id: owner_id.clone(),
+                tab_group_id: None,
+                title: "Files".into(),
+                machine_id: "file-host-machine".into(),
+                target: WorkspaceTargetRef::Ssh { host_id },
+                state: FileWorkspaceState {
+                    items: vec![FileWorkspaceItem::Directory {
+                        id: item_id.clone(),
+                        path: "/srv/project".into(),
+                    }],
+                    active_item_id: Some(item_id),
+                    source_tab_ids: Vec::new(),
+                },
+            }],
+            terminal_panes: Vec::new(),
+            tab_groups: BTreeMap::new(),
+        };
+        let transient_tabs = if transient {
+            BTreeSet::from([owner_id.clone()])
+        } else {
+            BTreeSet::new()
+        };
+        let projected = without_transient_resources(&snapshot, &transient_tabs, &BTreeSet::new())
+            .expect("file workspace persistence projection");
+        assert_eq!(projected.terminal_tabs.len(), usize::from(retained));
+        assert_eq!(projected.active_tab_id, retained.then_some(owner_id));
+        assert_eq!(projected.focused_pane_id, None);
+        assert_eq!(
+            projected.selected_machine_id.as_deref(),
+            retained.then_some("file-host-machine"),
+        );
+    }
+}
+
 /// 未知未来版 tab 的原始载荷若带临时主机身份，也不应被无损保留到旧 schema 文件。
 #[test]
 fn unsupported_tab_with_external_host_reference_is_removed() {

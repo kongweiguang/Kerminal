@@ -91,7 +91,7 @@ fn render_trigger(
         })
 }
 
-/// 主机标签由外框统一绘制焦点边界（包含关闭按钮），并按视口约束、选择和焦点显露。
+/// 主机标签带透出浏览器阅读面，选中标签以轻叠层标记；外框统一绘制焦点边界并约束视口、选择和焦点显露。
 /// 关闭按钮保留独立键盘焦点；刷新消息与键盘行号使用同一过滤结果，避免列表跳动和索引错位。
 ///
 /// @author kongweiguang
@@ -322,7 +322,14 @@ pub(super) fn render_selector_header(
             .when(activate_focus.is_focused(window), |chip| {
                 chip.border_color(theme.accent)
             })
-            .when(selected, |chip| chip.bg(theme.selected))
+            .when(selected, |chip| chip.bg(theme.surface_selected()))
+            .hover(|style| {
+                style.bg(if selected {
+                    theme.surface_selected()
+                } else {
+                    theme.surface_hover()
+                })
+            })
             .child(
                 div()
                     .min_w(px(0.))
@@ -438,7 +445,6 @@ pub(super) fn render_selector_header(
         .gap_2()
         .border_b_1()
         .border_color(theme.border)
-        .bg(theme.secondary)
         .child(tabs_viewport)
         .child(
             div()

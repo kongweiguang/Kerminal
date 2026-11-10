@@ -456,7 +456,12 @@ impl RootView {
             .as_ref()
             .is_some_and(|controller| {
                 controller.snapshot().terminal_tabs.iter().any(|tab| {
-                    tab.id() == tab_id && matches!(tab, WorkspaceSessionTab::WorkspaceFile { .. })
+                    tab.id() == tab_id
+                        && matches!(
+                            tab,
+                            WorkspaceSessionTab::FileWorkspace { .. }
+                                | WorkspaceSessionTab::WorkspaceFile { .. }
+                        )
                 })
             });
         if !is_file {

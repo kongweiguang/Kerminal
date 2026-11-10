@@ -4,17 +4,25 @@
 
 use std::{collections::BTreeMap, ffi::OsString, path::Path};
 
-use kerminal_application::workspace::{
-    WorkspaceContainerRuntime, WorkspaceFileAccess, WorkspaceFileSource, WorkspaceSessionPane,
-    WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTargetRef,
-    WorkspaceTargetUnavailableReason,
+use gpui_kit::{App, Entity};
+use kerminal_application::{
+    AppError, AppResult,
+    platform::external_launch::ExternalTargetLease,
+    workspace::{
+        WorkspaceContainerRuntime, WorkspaceFileAccess, WorkspaceFileSource, WorkspaceSessionPane,
+        WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTargetRef,
+        WorkspaceTargetUnavailableReason,
+    },
 };
 use kerminal_domain::{
     files::{ContainerRuntime, FileEndpoint, RemotePath},
     identity::{HostId, TabId},
 };
 
-use crate::features::editor::{EditorTabProjection, EditorWorkspaceProjection};
+use crate::features::{
+    editor::{EditorTabProjection, EditorWorkspaceProjection, FileEditorWorkspace},
+    workspace_controller::WorkspaceController,
+};
 use crate::root::workspace_files::{
     FilesWorkspaceSelection, WorkspaceFileRestoreIssue, WorkspaceFileRestoreState,
     WorkspaceFileRuntime, editor_projection_contains_endpoint, sftp_transfer_endpoints,
@@ -27,6 +35,121 @@ use crate::root::{
 };
 
 impl WorkspaceFileRuntime {
+    /// 保留 Compose 描述的只读约束，让测试复用真实登记与恢复门禁。
+    ///
+    /// @author kongweiguang
+    pub(in crate::root) fn register_pending_compose_yaml_tab(
+        &mut self,
+        tab: WorkspaceSessionTab,
+    ) -> bool {
+        if !matches!(
+            &tab,
+            WorkspaceSessionTab::WorkspaceFile {
+                access: WorkspaceFileAccess::Readonly,
+                source: WorkspaceFileSource::ComposeYaml,
+                ..
+            }
+        ) {
+            return false;
+        }
+        self.register_pending_file_tab(tab)
+    }
+
+    /// 测试直接装配已验证端点及其 lease，才能检查临时目标的独立生命周期。
+    ///
+    /// @author kongweiguang
+    pub(in crate::root) fn register_open_file_tab(
+        &mut self,
+        tab: WorkspaceSessionTab,
+        endpoint: FileEndpoint,
+        external_target_lease: Option<ExternalTargetLease>,
+        transient: bool,
+    ) -> bool {
+        let id = tab.id().clone();
+        if !self.register_pending_file_tab(tab) {
+            return false;
+        }
+        if let Some(runtime) = self.tabs.get_mut(&id) {
+            runtime.endpoint = Some(endpoint);
+            runtime.external_target_lease = external_target_lease;
+            runtime.transient = transient;
+        }
+        true
+    }
+
+    /// 测试保留只读快照与编辑器的原有事务，避免迁移测试辅助代码时丢失回滚覆盖。
+    ///
+    /// @author kongweiguang
+    pub(in crate::root) fn restrict_file_to_readonly(
+        &mut self,
+        controller: &mut WorkspaceController,
+        editor: &Entity<FileEditorWorkspace>,
+        tab_id: &TabId,
+        endpoint: &FileEndpoint,
+        cx: &mut App,
+    ) -> AppResult<bool> {
+        let runtime = self
+            .tabs
+            .get_mut(tab_id)
+            .ok_or_else(|| AppError::not_found("工作区文件标签不存在"))?;
+        if !runtime.matches_file_endpoint(endpoint) {
+            return Err(AppError::conflict("工作区文件目标已变化"));
+        }
+        let WorkspaceSessionTab::WorkspaceFile {
+            target: runtime_target,
+            path: runtime_path,
+            source: runtime_source,
+            access: runtime_access,
+            ..
+        } = &mut runtime.tab
+        else {
+            return Err(AppError::conflict("工作区标签不是文件"));
+        };
+        let original = controller.snapshot().clone();
+        let mut candidate = original.clone();
+        let Some(WorkspaceSessionTab::WorkspaceFile {
+            target,
+            path,
+            source,
+            access,
+            ..
+        }) = candidate
+            .terminal_tabs
+            .iter_mut()
+            .find(|tab| tab.id() == tab_id)
+        else {
+            return Err(AppError::conflict("工作区文件描述已变化"));
+        };
+        if target != runtime_target
+            || path != runtime_path
+            || source != runtime_source
+            || access != runtime_access
+        {
+            return Err(AppError::conflict("工作区文件描述与运行状态不一致"));
+        }
+        let changed = *access != WorkspaceFileAccess::Readonly;
+        *access = WorkspaceFileAccess::Readonly;
+
+        // 先检查 controller 的资源和保存门禁；随后编辑器事务不会产生并发 Root 回调。
+        controller.synchronize_snapshot(original)?;
+        editor.update(cx, |workspace, cx| {
+            let old_policy = workspace.workspace_file_readonly_before_restriction(endpoint, cx)?;
+            if old_policy == Some(false) {
+                workspace.set_workspace_file_readonly(endpoint, true, cx)?;
+            }
+            if let Err(error) = controller.synchronize_snapshot(candidate) {
+                if old_policy == Some(false) {
+                    workspace
+                        .set_workspace_file_readonly(endpoint, false, cx)
+                        .map_err(|_| AppError::conflict("工作区文件只读状态回滚失败"))?;
+                }
+                return Err(error);
+            }
+            *runtime_access = WorkspaceFileAccess::Readonly;
+            Ok(changed)
+        })
+    }
+
     /// 只读测试中暂存的双端点，验证 CAS 门禁没有丢弃面板的最新选择。
     ///
     /// @author kongweiguang

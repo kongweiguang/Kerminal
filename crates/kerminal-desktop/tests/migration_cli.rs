@@ -296,7 +296,7 @@ fn profile_import_console_previews_and_imports_once() {
     .unwrap();
     fs::write(
         target.join(".kerminal-format.toml"),
-        b"data_format = 4\nmigration_contract = 3\n",
+        b"data_format = 4\nmigration_contract = 4\n",
     )
     .unwrap();
     let source_before = snapshot(&source);

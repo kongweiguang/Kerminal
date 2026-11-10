@@ -771,10 +771,43 @@ impl RootView {
                 ))
             })
             .unwrap_or((None, None, None, None));
+        let workspace_origins = match origin.as_ref() {
+            Some(TransferOrigin::WorkspaceFile(id)) => {
+                Some(self.workspace_files.host_transfer_origins(id))
+            }
+            _ => None,
+        };
         if let Some(files) = self.sftp_panel.clone() {
+            let right_browser_context = match origin.as_ref() {
+                Some(TransferOrigin::WorkspaceFile(id)) => {
+                    self.workspace_files.take_right_browser_context(id)
+                }
+                _ => None,
+            };
             files.update(cx, move |files, cx| {
-                files.set_transfer_origin(origin, cx);
-                files.set_current_terminal_target(endpoint, lease, binding, cx);
+                files.set_transfer_origin(origin.clone(), cx);
+                match (origin, endpoint) {
+                    (Some(TransferOrigin::WorkspaceFile(workspace_id)), Some(endpoint)) => {
+                        if let Some(snapshot) = right_browser_context
+                            && !files.restore_file_browser_context(snapshot, cx)
+                        {
+                            // 已绑定、已加载、忙碌或快照无效时保留目标，不重试旧来源状态。
+                            tracing::debug!("目标右栏已有状态或快照无效，丢弃本次浏览交接");
+                        }
+                        files.set_file_workspace_target(workspace_id, endpoint, lease, cx);
+                        if let Some(origins) = workspace_origins {
+                            files.set_transfer_query_scope(
+                                kerminal_application::transfers::TransferQueryScope::origins(
+                                    origins,
+                                ),
+                                cx,
+                            );
+                        }
+                    }
+                    (_, endpoint) => {
+                        files.set_current_terminal_target(endpoint, lease, binding, cx)
+                    }
+                }
             });
         }
     }

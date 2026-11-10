@@ -3,21 +3,67 @@ param(
     [Parameter(Mandatory = $true)][string]$ExecutablePath,
     [ValidateRange(800, 3840)][int]$Width = 1440,
     [ValidateRange(600, 2160)][int]$Height = 900,
-    [ValidateRange(30, 600)][int]$TimeoutSeconds = 360
+    [ValidateRange(30, 600)][int]$TimeoutSeconds = 360,
+    # 需要工作区文件与传输闭环时显式扩大同一隔离 fixture；默认跟随专项范围不变。
+    [switch]$IncludeTransferChecks
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 function Convert-ToWslPath {
-    # 交由 WSL 转换绝对路径，避免手工拼接盘符和中文目录。
+    # WSL 固定输出 UTF-8，不能沿用 Windows 控制台代码页，否则中文仓库路径会损坏；独立管道也避免改动调用者编码。
     # @author kongweiguang
     param([Parameter(Mandatory = $true)][string]$Path)
-    $converted = & wsl.exe --user root --exec wslpath -a $Path
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($converted)) {
-        throw 'Cannot convert the isolated fixture path for WSL.'
+    $startInfo = [Diagnostics.ProcessStartInfo]::new('wsl.exe')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    foreach ($argument in @('--user', 'root', '--exec', 'wslpath', '-a', $Path)) {
+        $startInfo.ArgumentList.Add($argument)
     }
-    return ([string]$converted).Trim()
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw 'Cannot start WSL path conversion.' }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $converted = $stdout.GetAwaiter().GetResult()
+        $errorOutput = $stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($converted)) {
+            throw "Cannot convert the isolated fixture path for WSL: $errorOutput"
+        }
+        return $converted.Trim()
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Set-ProcessEnvironmentValue {
+    # PowerShell 会把传给 .NET string 参数的 $null 绑定为空串；新运行时保留空值，必须显式 null 才能关闭按存在性判定的专项。
+    # @author kongweiguang
+    param([Parameter(Mandatory = $true)][string]$Name, [AllowNull()][object]$Value)
+    if ($null -eq $Value) {
+        [Environment]::SetEnvironmentVariable($Name, [NullString]::Value, 'Process')
+    } else {
+        [Environment]::SetEnvironmentVariable($Name, [string]$Value, 'Process')
+    }
+}
+
+function Get-ProcessEnvironmentSnapshot {
+    # Windows 环境变量可能不存在、为空或非空；只读值会丢失存在性，导致清理时污染调用方。
+    # @author kongweiguang
+    param([Parameter(Mandatory = $true)][string[]]$Names)
+    $environment = [Environment]::GetEnvironmentVariables('Process')
+    $snapshot = @{}
+    foreach ($name in $Names) {
+        $snapshot[$name] = @{ Present = $environment.Contains($name); Value = $environment[$name] }
+    }
+    return $snapshot
 }
 
 function Get-PrivateDesktopLauncherSource {
@@ -73,6 +119,60 @@ function Write-Utf8 {
     [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
+function Write-FixtureHostConfigurations {
+    # 两个不同 HostId 共用本轮独立 loopback sshd；原生用例从同一远端根向其独立子目录双向复制，不冒称两台服务器。
+    # @author kongweiguang
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigDirectory,
+        [Parameter(Mandatory = $true)][int]$Port,
+        [Parameter(Mandatory = $true)][string]$RemoteDirectory,
+        [Parameter(Mandatory = $true)][string]$KeyPath,
+        [Parameter(Mandatory = $true)][string]$LocalPath,
+        [switch]$IncludeTransferChecks
+    )
+    $hosts = @([pscustomobject]@{ Id = 'right-rail-fixture'; Name = 'SFTP follow fixture'; SortOrder = 10 })
+    if ($IncludeTransferChecks) {
+        $hosts += [pscustomobject]@{ Id = 'transfer-source-fixture'; Name = 'SFTP transfer source fixture'; SortOrder = 20 }
+    }
+    foreach ($hostDefinition in $hosts) {
+        $hostToml = @"
+# @author kongweiguang
+schema_version = 3
+protocol = "ssh"
+id = "$($hostDefinition.Id)"
+name = "$($hostDefinition.Name)"
+host = "127.0.0.1"
+port = $Port
+username = "root"
+auth_type = "key"
+credential_ref = "$KeyPath"
+tags = ["fixture"]
+sort_order = $($hostDefinition.SortOrder)
+created_at = "1"
+updated_at = "1"
+
+[ssh_options.terminal]
+connect_timeout_seconds = 30
+keepalive_seconds = 60
+working_directory = "$RemoteDirectory"
+
+[ssh_options.sftp]
+enabled = true
+local_start_directory = "$LocalPath"
+remote_start_directory = "$RemoteDirectory"
+preserve_mtime = true
+follow_source_symlinks = false
+concurrency = 2
+"@
+        $hostPath = Join-Path $ConfigDirectory ("hosts\{0}.toml" -f $hostDefinition.Id)
+        Write-Utf8 -Path $hostPath -Content $hostToml
+        if (-not (Test-Path -LiteralPath $hostPath -PathType Leaf) -or
+            [IO.File]::ReadAllText($hostPath, [Text.Encoding]::UTF8) -cne $hostToml) {
+            throw "The isolated fixture host configuration is missing or differs after writing: $($hostDefinition.Id)"
+        }
+    }
+}
+
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $executable = [IO.Path]::GetFullPath($ExecutablePath)
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw "Executable not found: $executable" }
@@ -86,9 +186,8 @@ $fixtureProcess = $null
 $nativeProcess = $null
 $runFailure = $null
 $cleanupFailures = [Collections.Generic.List[string]]::new()
-$environmentNames = @('KERMINAL_RIGHT_RAIL_FOLLOW_ONLY', 'KERMINAL_SFTP_FOLLOW_MANIFEST')
-$previousEnvironment = @{}
-foreach ($name in $environmentNames) { $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+$environmentNames = @('KERMINAL_RIGHT_RAIL_FOLLOW_ONLY', 'KERMINAL_RIGHT_RAIL_REFRESH_ONLY', 'KERMINAL_SFTP_FOLLOW_MANIFEST', 'KERMINAL_CONFIG_ROOT')
+$previousEnvironment = Get-ProcessEnvironmentSnapshot -Names $environmentNames
 
 try {
     $fixtureScript = Convert-ToWslPath -Path (Join-Path $PSScriptRoot 'sftp-follow-native-ssh-fixture.py')
@@ -120,36 +219,9 @@ try {
     $keyPath = (Join-Path $fixtureRoot 'client-key').Replace('\', '/')
     $localPath = $localFiles.Replace('\', '/')
     if ($keyPath.Contains('"') -or $localPath.Contains('"')) { throw 'Unsupported quote in fixture path.' }
-    $hostToml = @"
-# @author kongweiguang
-schema_version = 3
-protocol = "ssh"
-id = "right-rail-fixture"
-name = "SFTP follow fixture"
-host = "127.0.0.1"
-port = $($ready.port)
-username = "root"
-auth_type = "key"
-credential_ref = "$keyPath"
-tags = ["fixture"]
-sort_order = 10
-created_at = "1"
-updated_at = "1"
-
-[ssh_options.terminal]
-connect_timeout_seconds = 30
-keepalive_seconds = 60
-working_directory = "$($ready.remoteDirectory)"
-
-[ssh_options.sftp]
-enabled = true
-local_start_directory = "$localPath"
-remote_start_directory = "$($ready.remoteDirectory)"
-preserve_mtime = true
-follow_source_symlinks = false
-concurrency = 2
-"@
-    Write-Utf8 -Path (Join-Path $config 'hosts\right-rail-fixture.toml') -Content $hostToml
+    Write-FixtureHostConfigurations -ConfigDirectory $config -Port ([int]$ready.port) `
+        -RemoteDirectory ([string]$ready.remoteDirectory) -KeyPath $keyPath -LocalPath $localPath `
+        -IncludeTransferChecks:$IncludeTransferChecks
     $manifestPath = Join-Path $fixtureRoot 'manifest.json'
     $manifest = [ordered]@{
         state = 'ready'
@@ -160,8 +232,17 @@ concurrency = 2
         containerTargetPort = 1
     }
     Write-Utf8 -Path $manifestPath -Content ((ConvertTo-Json -InputObject $manifest) + [Environment]::NewLine)
-    [Environment]::SetEnvironmentVariable('KERMINAL_RIGHT_RAIL_FOLLOW_ONLY', '1', 'Process')
-    [Environment]::SetEnvironmentVariable('KERMINAL_SFTP_FOLLOW_MANIFEST', $manifestPath, 'Process')
+    Set-ProcessEnvironmentValue -Name 'KERMINAL_RIGHT_RAIL_FOLLOW_ONLY' -Value $(if ($IncludeTransferChecks) { $null } else { '1' })
+    if ($IncludeTransferChecks) {
+        Set-ProcessEnvironmentValue -Name 'KERMINAL_RIGHT_RAIL_REFRESH_ONLY' -Value $null
+        $childEnvironment = [Environment]::GetEnvironmentVariables('Process')
+        foreach ($name in @('KERMINAL_RIGHT_RAIL_FOLLOW_ONLY', 'KERMINAL_RIGHT_RAIL_REFRESH_ONLY')) {
+            if ($childEnvironment.Contains($name)) { throw "The full acceptance child environment still contains $name." }
+        }
+    }
+    Set-ProcessEnvironmentValue -Name 'KERMINAL_SFTP_FOLLOW_MANIFEST' -Value $manifestPath
+    # 该根与 fixture-config 和 output 为兄弟目录，既隔离继承配置，也不绕过验收程序的重叠路径 guard。
+    Set-ProcessEnvironmentValue -Name 'KERMINAL_CONFIG_ROOT' -Value (Join-Path $fixtureRoot 'environment-config')
 
     if (-not ('Kerminal.SftpFollowAcceptance.NativeDesktopLauncher' -as [type])) {
         Add-Type -TypeDefinition (Get-PrivateDesktopLauncherSource) -Language CSharp
@@ -191,12 +272,21 @@ concurrency = 2
         $report.nativeIsolation.inputDesktopName -ceq $desktopName) {
         throw 'The report does not prove the expected isolated native process and desktop.'
     }
-    $expected = @('sftp-follow-disabled', 'sftp-follow-enabled', 'sftp-follow-unicode',
-        'sftp-follow-rapid', 'sftp-follow-reenabled', 'sftp-follow-keyboard', 'sftp-follow-light', 'sftp-follow-dark', 'sftp-follow-system')
+    $expected = if ($IncludeTransferChecks) {
+        @('sftp-file-tabs', 'sftp-file-dirty-close', 'sftp-file-close-cancelled',
+          'sftp-file-saved', 'sftp-file-save-conflict', 'sftp-file-reloaded', 'sftp-directory-successor', 'sftp-terminal-successor',
+          'sftp-file-workspace-theme-light', 'sftp-file-workspace-theme-dark', 'sftp-file-workspace-theme-system',
+          'sftp-workspace-dual-host', 'sftp-workspace-host-tabs',
+          'sftp-workspace-theme-light', 'sftp-workspace-theme-dark', 'sftp-workspace-theme-system',
+          'sftp-workspace-copy', 'sftp-workspace-drag-file', 'sftp-workspace-drag-directory', 'sftp-workspace-tab-persist')
+    } else {
+        @('sftp-follow-disabled', 'sftp-follow-enabled', 'sftp-follow-unicode',
+          'sftp-follow-rapid', 'sftp-follow-reenabled', 'sftp-follow-keyboard', 'sftp-follow-light', 'sftp-follow-dark', 'sftp-follow-system')
+    }
     foreach ($operation in $expected) {
-        if (@($report.functional | Where-Object { $_.operation -ceq $operation }).Count -ne 1) {
-            throw "Native acceptance report is missing or duplicated: $operation"
-        }
+        $operationRecords = @($report.functional | Where-Object { $_.operation -ceq $operation })
+        if ($operationRecords.Count -eq 0) { throw "Native acceptance report is missing: $operation" }
+        if ($operationRecords.Count -gt 1) { throw "Native acceptance report has duplicate records: $operation" }
     }
     Write-Utf8 -Path (Join-Path $fixtureRoot 'process-result.json') -Content ((ConvertTo-Json -InputObject ([ordered]@{
         processId = $processId; exitCode = $exitCode; desktopName = $desktopName
@@ -205,7 +295,12 @@ concurrency = 2
 } catch {
     $runFailure = $_
 } finally {
-    foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process') }
+    foreach ($name in $environmentNames) {
+        try {
+            $previous = $previousEnvironment[$name]
+            Set-ProcessEnvironmentValue -Name $name -Value $(if ($previous.Present) { $previous.Value } else { $null })
+        } catch { $cleanupFailures.Add("Environment restoration failed for ${name}: $($_.Exception.Message)") }
+    }
     if ($null -ne $nativeProcess) {
         try {
             if (-not $nativeProcess.WaitForExit(0)) { Stop-OwnedNativeProcess -NativeProcess $nativeProcess }

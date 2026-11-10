@@ -122,6 +122,10 @@ fn workspace_file_context_actions_keep_stable_target_and_reject_other_kinds() {
         ]
     );
     assert!(workspace_file_context_action_events(&WorkspaceTabKind::Terminal, &tab_id).is_empty());
+    assert!(
+        workspace_file_context_action_events(&WorkspaceTabKind::FileWorkspace, &tab_id).is_empty(),
+        "宿主不能把打开菜单后变化的当前文档当作冻结目标"
+    );
 }
 
 /// 共享 SFTP 临时标签只在实际选中时独占 active；隐藏时保留 controller 的持久 active 投影。

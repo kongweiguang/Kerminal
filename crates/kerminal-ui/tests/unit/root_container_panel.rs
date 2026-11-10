@@ -325,6 +325,55 @@ fn workspace_file_without_ssh_host_has_no_container_host_context() {
     assert_eq!(workspace_file_host_context(&telnet), None);
 }
 
+/// 文件宿主即使只保留目录也携带精确 SSH 宿主，不需要制造 pane/session 来固定容器。
+/// @author kongweiguang
+#[test]
+fn directory_workspace_exposes_only_its_explicit_container_host() {
+    use kerminal_application::workspace::{FileWorkspaceItem, FileWorkspaceState};
+
+    let host_id = HostId::new();
+    for target in [
+        WorkspaceTargetRef::Ssh {
+            host_id: host_id.clone(),
+        },
+        WorkspaceTargetRef::DockerContainer {
+            host_id: host_id.clone(),
+            container_id: "file-container".into(),
+            runtime: WorkspaceContainerRuntime::Docker,
+            container_name: None,
+            user: None,
+            workdir: None,
+        },
+        WorkspaceTargetRef::Local { profile_id: None },
+    ] {
+        let remote = !matches!(&target, WorkspaceTargetRef::Local { .. });
+        let tab_id = TabId::new();
+        let directory_id = TabId::new();
+        let workspace = WorkspaceSessionTab::FileWorkspace {
+            id: tab_id.clone(),
+            tab_group_id: None,
+            title: "Files".into(),
+            machine_id: "file-host".into(),
+            target,
+            state: FileWorkspaceState {
+                items: vec![FileWorkspaceItem::Directory {
+                    id: directory_id.clone(),
+                    path: "/srv/project".into(),
+                }],
+                active_item_id: Some(directory_id),
+                source_tab_ids: Vec::new(),
+            },
+        };
+        assert_eq!(
+            workspace_file_host_context(&workspace),
+            remote.then(|| ContainerPanelContext::WorkspaceHost {
+                tab_id,
+                host_id: host_id.clone(),
+            }),
+        );
+    }
+}
+
 /// 以精确 host/runtime/container ID 构造容器终端目标。
 ///
 /// @author kongweiguang

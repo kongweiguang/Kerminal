@@ -38,6 +38,8 @@ pub(super) struct TransferQueueUi {
     clear_completed_cancellation: Option<CancellationToken>,
     clear_completed_origin: Option<TransferOrigin>,
     pending_retries: BTreeSet<TransferId>,
+    /// 单条恢复记录的删除只能提交一次；结果回执前禁用该行入口，其他行仍可独立操作。
+    pending_recovery_dismissals: BTreeSet<TransferId>,
     pub(super) recovery_list_loading: bool,
     pub(super) recovery_list_error: Option<String>,
     refresh_generation: u64,
@@ -54,6 +56,7 @@ impl Default for TransferQueueUi {
             clear_completed_cancellation: None,
             clear_completed_origin: None,
             pending_retries: BTreeSet::new(),
+            pending_recovery_dismissals: BTreeSet::new(),
             recovery_list_loading: false,
             recovery_list_error: None,
             refresh_generation: 0,
@@ -128,6 +131,34 @@ impl TransferQueueUi {
     /// @author kongweiguang
     pub(super) fn is_retrying_transfer(&self, id: &TransferId) -> bool {
         self.pending_retries.contains(id)
+    }
+
+    /// 单条恢复记录的删除在回执前独占该记录；重复点击不能形成第二个归档请求。
+    ///
+    /// @author kongweiguang
+    pub(super) fn begin_recovery_dismissal(&mut self, id: &TransferId) -> bool {
+        self.pending_recovery_dismissals.insert(id.clone())
+    }
+
+    /// 无论成功、拒绝或取消都释放该行门禁，失败原因由状态栏保留。
+    ///
+    /// @author kongweiguang
+    pub(super) fn finish_recovery_dismissal(&mut self, id: &TransferId) {
+        self.pending_recovery_dismissals.remove(id);
+    }
+
+    /// 只投影当前行自己的等待状态，不能因另一条记录删除而禁用全部恢复入口。
+    ///
+    /// @author kongweiguang
+    pub(super) fn is_dismissing_recovery(&self, id: &TransferId) -> bool {
+        self.pending_recovery_dismissals.contains(id)
+    }
+
+    /// 归档回执属于原面板，即使来源切换或恢复行消失也不能提前销毁其 owner。
+    ///
+    /// @author kongweiguang
+    pub(super) fn has_pending_recovery_dismissal(&self) -> bool {
+        !self.pending_recovery_dismissals.is_empty()
     }
 
     /// 清理会移除原任务，因此任一续传等待回执时都禁用清理入口。
@@ -227,10 +258,21 @@ impl FilesPane {
     ///
     /// @author kongweiguang
     pub(super) fn clear_completed_transfer_history(&mut self, cx: &mut Context<Self>) {
-        let Some(origin) = self.transfer_origin.clone() else {
+        let kerminal_application::transfers::TransferQueryScope::Origins(origins) =
+            self.current_source_scope.clone()
+        else {
             return;
         };
-        let result_origin = origin.clone();
+        if origins.is_empty()
+            || matches!(
+                self.transfer_query_scope,
+                kerminal_application::transfers::TransferQueryScope::All
+            )
+        {
+            return;
+        }
+        let result_origin = self.transfer_origin.clone();
+        let origin = self.transfer_origin.clone();
         let Some(cancellation) = self.queue.begin_clear_completed_history() else {
             self.status = Some(
                 locale::text(
@@ -242,7 +284,7 @@ impl FilesPane {
             cx.notify();
             return;
         };
-        self.queue.clear_completed_origin = Some(origin.clone());
+        self.queue.clear_completed_origin = origin;
         let transfers = self.transfers.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
@@ -250,7 +292,7 @@ impl FilesPane {
                 .run_cancellable(cancellation, move |task_cancellation| async move {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     let cleanup = async {
-                        for summary in transfers.list_for_origin(&origin).await {
+                        for summary in transfers.list_for_scope(&kerminal_application::transfers::TransferQueryScope::origins(origins.clone())).await {
                             if summary.cleanup_pending
                                 && is_clearable_history(&summary)
                                 && !transfers.is_drag_staging_pending_delivery(&summary.id)
@@ -262,13 +304,16 @@ impl FilesPane {
                     };
                     task_cancellation.run_until_cancelled(cleanup).await
                         .ok_or_else(|| kerminal_application::AppError::cancelled("传输历史清理已取消"))??;
-                    transfers.dismiss_completed_for_origin(&origin, task_cancellation).await
+                    for origin in origins {
+                        transfers.dismiss_completed_for_origin(&origin, task_cancellation.clone()).await?;
+                    }
+                    Ok(())
                 })
                 .await;
             cx.update(|app| {
                 let _ = this.update(app, |pane, cx| {
                     pane.queue.finish_clear_completed_history();
-                    if pane.transfer_origin.as_ref() != Some(&result_origin) {
+                    if pane.transfer_origin != result_origin {
                         pane.reload_transfers(cx);
                         return;
                     }
@@ -316,6 +361,45 @@ impl FilesPane {
             );
             cx.notify();
         }
+    }
+
+    /// 单条恢复记录的人工删除先耐久归档证据再移出待处理列表；运行中 owner 由应用层拒绝。
+    /// 侧栏与传输台共用同一入口；成功由行消失表达，失败保留原记录并回显原因。
+    ///
+    /// @author kongweiguang
+    pub(super) fn dismiss_transfer_recovery(&mut self, id: TransferId, cx: &mut Context<Self>) {
+        if !self.queue.begin_recovery_dismissal(&id) {
+            return;
+        }
+        let result_origin = self.transfer_origin.clone();
+        let transfers = self.transfers.clone();
+        let executor = self.executor.clone();
+        let dismiss_id = id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .run(move |cancellation| async move {
+                    transfers.archive_recovery(&dismiss_id, cancellation).await
+                })
+                .await;
+            cx.update(|app| {
+                let _ = this.update(app, |pane, cx| {
+                    pane.queue.finish_recovery_dismissal(&id);
+                    if pane.transfer_origin != result_origin {
+                        pane.reload_transfers(cx);
+                        cx.notify();
+                        return;
+                    }
+                    pane.status = match result {
+                        Ok(()) => None,
+                        Err(error) => Some(crate::features::files::localized_error(&error)),
+                    };
+                    pane.reload_transfers(cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+        cx.notify();
     }
 }
 

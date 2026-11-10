@@ -84,7 +84,7 @@ impl RootView {
         Ok(self.terminal_snapshot_for_binding(binding).is_some())
     }
 
-    /// Waits for the selected production panel's own successful read, always tied to the active SSH pane.
+    /// 等待内置面板对实际 SSH fixture 的读取；扩展工具使用独立插件验收契约。
     ///
     /// @author kongweiguang
     pub fn right_rail_acceptance_panel_ready(

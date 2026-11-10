@@ -13,16 +13,86 @@ use kerminal_domain::{
     identity::{HostId, TabId},
 };
 
-use crate::features::{files::FilesPane, workspace_tabs::WorkspaceTabEvent};
+use crate::features::files::FilesPane;
 
 use super::{RootConfirmationOwner, RootView};
 
-/// 验收读回固定导航身份、数量、内部索引及活动/脏状态，别名保留现有只读探针契约。
+/// 验收读回固定宿主身份、精确文档数量、稳定内部ID及活动/脏状态。
 ///
 /// @author kongweiguang
-pub type RightRailFileTabState = (TabId, usize, usize, bool, bool);
+pub type RightRailFileTabState = (TabId, usize, TabId, bool, bool);
+
+/// 仅供原生验收比较身份与布局回执；不向生产运行时增加刷新计数或第二份状态。
+#[derive(Clone, Debug)]
+pub struct RightRailSidebarState {
+    pub collapsed: bool,
+    pub terminal_columns: u16,
+    pub palette_generation: u64,
+    pub palette_ready: bool,
+    pub layout_pending: bool,
+    pub layout_failed: bool,
+    pub files_entity: Option<gpui_kit::EntityId>,
+    pub tool_entity: Option<gpui_kit::EntityId>,
+    pub binding: UiSessionBinding,
+}
 
 impl RootView {
+    /// 回读真实终端网格和保留的 SFTP Entity；等待主题回执后再比较布局，避免混入切主题的异步帧。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_sidebar_state(
+        &self,
+        host_id: &HostId,
+    ) -> Result<Option<RightRailSidebarState>, String> {
+        let Some(binding) = self.right_rail_acceptance_fixture_binding(host_id)? else {
+            return Ok(None);
+        };
+        let Some(terminal) = self.terminal_snapshot_for_binding(&binding) else {
+            return Ok(None);
+        };
+        Ok(Some(RightRailSidebarState {
+            collapsed: self.host_sidebar_collapsed,
+            terminal_columns: terminal.size.columns(),
+            palette_generation: self.palette_update_generation,
+            palette_ready: !self.palette_update_running
+                && self.pending_palette_update.is_none()
+                && terminal.palette == self.current_terminal_palette(),
+            layout_pending: self.workbench_layout_intent.is_some(),
+            layout_failed: self.workbench_layout_save_error.is_some(),
+            files_entity: self.sftp_panel.as_ref().map(Entity::entity_id),
+            tool_entity: match self.right_rail_acceptance_active_tool() {
+                Some(ToolRailToolId::AgentLauncher) => {
+                    self.agents_panel.as_ref().map(Entity::entity_id)
+                }
+                Some(ToolRailToolId::Sftp) => self.sftp_panel.as_ref().map(Entity::entity_id),
+                Some(ToolRailToolId::Snippets) => {
+                    self.commands_view.as_ref().map(Entity::entity_id)
+                }
+                Some(ToolRailToolId::Logs) => self.logs_view.as_ref().map(Entity::entity_id),
+                Some(tool) => self
+                    .right_rail_acceptance_operations_view(tool)
+                    .as_ref()
+                    .map(Entity::entity_id),
+                None => None,
+            },
+            binding,
+        }))
+    }
+
+    /// 将 System 的自然采样与布局引发的生命周期变化区分，读取过程中仍必须保留原目标与数据。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_system_lifecycle(
+        &self,
+        host_id: &HostId,
+        cx: &Context<Self>,
+    ) -> Result<(u64, u64, u64), String> {
+        self.right_rail_acceptance_operations_view(ToolRailToolId::System)
+            .ok_or_else(|| "System 验收视图不可用".to_owned())?
+            .read(cx)
+            .right_rail_acceptance_server_lifecycle(host_id)
+    }
+
     /// 在挂载文件面板前核对真实终端目录，使验收首个 SFTP 读取也限定在 fixture 内。
     ///
     /// @author kongweiguang
@@ -136,7 +206,7 @@ impl RootView {
         })
     }
 
-    /// 返回精确 endpoint 的顶栏数量、内部索引和编辑状态，不把加载中的文件当作就绪。
+    /// 描述和编辑缓冲都按精确 endpoint 核对，返回稳定宿主与内部文档身份，不把位置索引当 ID。
     ///
     /// @author kongweiguang
     pub fn right_rail_acceptance_file_tab_state(
@@ -151,39 +221,84 @@ impl RootView {
             return Ok(None);
         };
         let snapshot = controller.snapshot();
-        let matching = snapshot
-            .terminal_tabs
-            .iter()
-            .filter(|tab| self.workspace_files.file_endpoint(tab.id()).as_ref() == Some(&endpoint))
-            .map(|tab| tab.id().clone())
-            .collect::<Vec<_>>();
-        let Some(tab_id) = matching.first().cloned() else {
+        let mut matching = Vec::new();
+        for tab in &snapshot.terminal_tabs {
+            let WorkspaceSessionTab::FileWorkspace {
+                id,
+                target: WorkspaceTargetRef::Ssh { host_id: actual },
+                state,
+                ..
+            } = tab
+            else {
+                continue;
+            };
+            if actual != host_id {
+                continue;
+            }
+            for item in &state.items {
+                if let kerminal_application::workspace::FileWorkspaceItem::Document {
+                    id: item_id,
+                    path,
+                    ..
+                } = item
+                    && endpoint
+                        .remote_path()
+                        .is_some_and(|expected| expected.as_str() == path)
+                {
+                    matching.push((
+                        id.clone(),
+                        item_id.clone(),
+                        state.active_item_id.as_ref() == Some(item_id),
+                    ));
+                }
+            }
+        }
+        let Some((tab_id, item_id, item_active)) = matching.first().cloned() else {
             return Ok(None);
         };
         let Some(editor) = self.file_editor_workspace.as_ref() else {
             return Err("The file editor is unavailable".to_owned());
         };
         let projection = editor.read(cx).workspace_projection();
-        let Some((index, tab)) = projection
+        let tabs = projection
             .tabs
             .iter()
-            .enumerate()
-            .find(|(_, tab)| tab.endpoint == endpoint && !tab.loading)
-        else {
+            .filter(|tab| tab.endpoint == endpoint)
+            .collect::<Vec<_>>();
+        if tabs.len() > 1 {
+            return Err("Fixture endpoint has duplicate editor buffers".into());
+        }
+        let Some(tab) = tabs.first().filter(|tab| !tab.loading) else {
             return Ok(None);
         };
         Ok(Some((
             tab_id.clone(),
             matching.len(),
-            index,
+            item_id,
             snapshot.active_tab_id.as_ref() == Some(&tab_id)
+                && item_active
                 && tab.active
                 && matches!(self.center_panel, super::CenterPanel::Editor),
             tab.dirty,
         )))
     }
 
-    /// 验证 fixture 文件在实际快照中相邻且顺序正确，拖拽后的后继不能靠索引猜测。
+    /// 最后文档关闭只能回到同一宿主的真实目录，不能用终端或共享传输台冒充成功。
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_file_directory_selected(&self, owner: &TabId) -> bool {
+        self.workspace_controller.as_ref().is_some_and(|controller| {
+            let snapshot = controller.snapshot();
+            snapshot.active_tab_id.as_ref() == Some(owner)
+                && matches!(self.center_panel, super::CenterPanel::Editor)
+                && snapshot.terminal_tabs.iter().any(|tab| matches!(tab,
+                    WorkspaceSessionTab::FileWorkspace { id, state, .. }
+                    if id == owner && matches!(state.active_item(), Some(kerminal_application::workspace::FileWorkspaceItem::Directory { .. }))
+                        && !state.items.iter().any(|item| matches!(item, kerminal_application::workspace::FileWorkspaceItem::Document { .. }))
+                ))
+        })
+    }
+
+    /// 核对同一宿主的内部文档顺序，不把逐文件顶层拖动当作文件工作区目标。
     ///
     /// @author kongweiguang
     pub fn right_rail_acceptance_file_tabs_adjacent(
@@ -198,16 +313,32 @@ impl RootView {
         let Some(controller) = self.workspace_controller.as_ref() else {
             return Ok(false);
         };
-        let tabs = &controller.snapshot().terminal_tabs;
-        let left_index = tabs
-            .iter()
-            .position(|tab| self.workspace_files.file_endpoint(tab.id()).as_ref() == Some(&left));
-        let right_index = tabs
-            .iter()
-            .position(|tab| self.workspace_files.file_endpoint(tab.id()).as_ref() == Some(&right));
-        Ok(left_index
-            .zip(right_index)
-            .is_some_and(|(left, right)| left + 1 == right))
+        for tab in &controller.snapshot().terminal_tabs {
+            let WorkspaceSessionTab::FileWorkspace {
+                target: WorkspaceTargetRef::Ssh { host_id: actual },
+                state,
+                ..
+            } = tab
+            else {
+                continue;
+            };
+            if actual != host_id {
+                continue;
+            }
+            let position = |endpoint: &FileEndpoint| {
+                state.items.iter().position(|item| {
+                matches!(item, kerminal_application::workspace::FileWorkspaceItem::Document { path, .. }
+                    if endpoint.remote_path().is_some_and(|expected| expected.as_str() == path))
+            })
+            };
+            if position(&left)
+                .zip(position(&right))
+                .is_some_and(|(left, right)| left + 1 == right)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 仅当快照仍选中原终端且中心确实显示终端时，才能认定关闭后的终端后继已生效。
@@ -316,23 +447,14 @@ impl RootView {
         let Some(controller) = self.workspace_controller.as_ref() else {
             return Ok(false);
         };
-        let nav_present = controller
-            .snapshot()
-            .terminal_tabs
-            .iter()
-            .any(|tab| match tab {
-                WorkspaceSessionTab::WorkspaceFile {
-                    target: WorkspaceTargetRef::Ssh { host_id: candidate },
-                    path,
-                    ..
-                } => {
-                    candidate == host_id
-                        && endpoint
-                            .remote_path()
-                            .is_some_and(|expected| expected.as_str() == path)
-                }
-                _ => false,
-            });
+        let nav_present = controller.snapshot().terminal_tabs.iter().any(|tab| {
+            matches!(tab, WorkspaceSessionTab::FileWorkspace {
+                target: WorkspaceTargetRef::Ssh { host_id: candidate }, state, ..
+            } if candidate == host_id && state.items.iter().any(|item| {
+                matches!(item, kerminal_application::workspace::FileWorkspaceItem::Document { path, .. }
+                    if endpoint.remote_path().is_some_and(|expected| expected.as_str() == path))
+            }))
+        });
         let editor_present = self.file_editor_workspace.as_ref().is_some_and(|editor| {
             editor
                 .read(cx)
@@ -342,6 +464,31 @@ impl RootView {
                 .any(|tab| tab.endpoint == endpoint)
         });
         Ok(!nav_present && !editor_present)
+    }
+
+    /// 失败证据只记录门禁类别，不展开持久化文档；区分真实关闭故障与磁盘提交未知，且不绕过恢复流程。
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_file_navigation_diagnostic(&self) -> serde_json::Value {
+        use crate::features::workspace_controller::WorkspacePersistenceState;
+
+        let state = self.workspace_controller.as_ref().map(|controller| {
+            match controller.persistence_state() {
+                WorkspacePersistenceState::Clean => "clean",
+                WorkspacePersistenceState::Dirty => "dirty",
+                WorkspacePersistenceState::Saving { .. } => "saving",
+                WorkspacePersistenceState::Conflict { .. } => "conflict",
+                WorkspacePersistenceState::OutcomeUnknown { .. } => "outcomeUnknown",
+                WorkspacePersistenceState::ReadbackConfirmedUncommitted { .. } => {
+                    "readbackConfirmedUncommitted"
+                }
+                WorkspacePersistenceState::Failed => "failed",
+            }
+        });
+        serde_json::json!({
+            "persistenceState": state,
+            "editorSyncPending": self.editor_navigation_sync_pending,
+            "resourcePending": self.workspace_controller.as_ref().is_some_and(|controller| controller.pending_resource_operation().is_some()),
+        })
     }
 
     /// 精确读取 fixture 文件的编辑器状态，失败或只读不能冒充可编辑就绪。
@@ -464,7 +611,7 @@ impl RootView {
         }))
     }
 
-    /// 只对当前活动 fixture 文件发起顶栏关闭，脏稿继续由生产关闭事务决定。
+    /// 精确关闭内部文档而不是宿主，保留目录并继续经过真实脏稿关闭事务。
     ///
     /// @author kongweiguang
     pub fn request_right_rail_acceptance_file_tab_close(
@@ -475,7 +622,7 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<bool, String> {
-        let Some((tab_id, count, _, active, _)) =
+        let Some((tab_id, count, item_id, active, _)) =
             self.right_rail_acceptance_file_tab_state(host_id, directory, name, cx)?
         else {
             return Ok(false);
@@ -483,7 +630,8 @@ impl RootView {
         if count != 1 || !active || self.root_confirmation_owner.is_some() {
             return Ok(false);
         }
-        Ok(self.handle_workspace_tab_event(&WorkspaceTabEvent::Close(tab_id), window, cx))
+        self.close_host_file_item(&tab_id, &item_id, window, cx);
+        Ok(true)
     }
 
     /// 只取消当前 fixture 文件拥有的编辑器确认，保留脏正文和导航标签。

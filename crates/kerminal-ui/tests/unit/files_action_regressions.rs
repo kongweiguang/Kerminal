@@ -264,6 +264,9 @@ fn compact_file_rows_and_toolbar_follow_reference_geometry(app: &mut TestAppCont
     let new_folder = visual
         .debug_bounds("files-new-folder-1")
         .expect("folder-plus toolbar button is visible");
+    let navigation_divider = visual
+        .debug_bounds("files-navigation-divider-1")
+        .expect("navigation group divider is visible");
     let divider = visual
         .debug_bounds("files-download-divider-1")
         .expect("download group divider is visible for remote hosts");
@@ -275,7 +278,11 @@ fn compact_file_rows_and_toolbar_follow_reference_geometry(app: &mut TestAppCont
         .expect("compact list is enclosed in its own card");
     assert_eq!(new_folder.size.width.as_f32(), 32.0);
     assert_eq!(new_folder.size.height.as_f32(), 32.0);
+    assert_eq!(navigation_divider.size.width.as_f32(), 1.0);
+    assert_eq!(navigation_divider.size.height.as_f32(), 20.0);
+    assert!(new_folder.origin.x > navigation_divider.origin.x);
     assert_eq!(divider.size.width.as_f32(), 1.0);
+    assert_eq!(divider.size.height.as_f32(), 20.0);
     assert!(download.origin.x > divider.origin.x);
     assert!(card.size.width > download.size.width);
 
@@ -294,6 +301,71 @@ fn compact_file_rows_and_toolbar_follow_reference_geometry(app: &mut TestAppCont
         assert_eq!(row.size.height.as_f32(), expected_height);
     }
 
+    let _runtime = runtime;
+}
+
+/// 紧凑工具栏在已有目录计数旁追加已选数量；选择变化不增加工具栏高度，也不挤走“…”入口。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn compact_toolbar_keeps_selection_count_beside_directory_counts(app: &mut TestAppContext) {
+    use gpui_kit::px;
+
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv/app");
+    let entry = support::remote_entry(&directory, "selected.txt", FileEntryKind::File);
+    let selected = entry.clone();
+    let (runtime, pane, _, visual) = support::window_fixture(app, directory, move |pane| {
+        pane.compact_layout = true;
+        pane.show_hidden_files = true;
+        pane.current_terminal_endpoint = Some(pane.panels[1].endpoint.clone());
+        support::seed_listing(pane, 1, 2, vec![entry]);
+    });
+    support::draw(visual);
+    assert!(
+        visual.debug_bounds("files-toolbar-selection-1").is_none(),
+        "empty selection must not reserve a stale selected badge"
+    );
+    let bar_before = visual
+        .debug_bounds("rr-files-actions-1")
+        .expect("toolbar is visible");
+    let count_before = visual
+        .debug_bounds("files-toolbar-count-1")
+        .expect("directory counts are visible");
+
+    visual.update(|_, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.panels[1].selection.select_only("selected.txt");
+            pane.panels[1].selected = Some(selected);
+            cx.notify();
+        });
+    });
+    support::draw(visual);
+
+    let bar = visual
+        .debug_bounds("rr-files-actions-1")
+        .expect("toolbar stays visible after selection");
+    let count = visual
+        .debug_bounds("files-toolbar-count-1")
+        .expect("directory counts stay visible");
+    let selection = visual
+        .debug_bounds("files-toolbar-selection-1")
+        .expect("selected count joins the directory counts");
+    let more = visual
+        .debug_bounds("rr-files-view-menu")
+        .expect("view menu stays visible");
+    assert_eq!(
+        bar.size.height, bar_before.size.height,
+        "selection count must not add a toolbar row"
+    );
+    assert_eq!(count.size.height, count_before.size.height);
+    assert!(selection.size.width > px(0.));
+    assert!(count.origin.x >= bar.origin.x && count.right() <= bar.right());
+    assert!(
+        selection.right() + px(4.) <= more.origin.x,
+        "selected count and menu need distinct visual boundaries"
+    );
+    assert!(more.origin.x >= bar.origin.x && more.right() <= bar.right());
     let _runtime = runtime;
 }
 
@@ -375,7 +447,7 @@ fn scaled_file_rows_keep_virtual_geometry_and_page_navigation_aligned(app: &mut 
     let _runtime = runtime;
 }
 
-/// 文件动作在窄栏和大字号下可以换行，但每个主要入口都必须留在容器内。
+/// 文件动作、目录计数和已选数量在窄栏与大字号下可以换行，但都必须留在工具栏内。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]
@@ -385,10 +457,13 @@ fn scaled_file_actions_remain_reachable_in_a_narrow_panel(app: &mut TestAppConte
     let host = HostId::new();
     let directory = support::remote_endpoint(&host, "/srv/app");
     let seeded_directory = directory.clone();
+    let seeded_entry = support::remote_entry(&directory, "narrow.txt", FileEntryKind::File);
     let (runtime, pane, _, visual) = support::window_fixture(app, directory, move |pane| {
         pane.compact_layout = true;
         pane.queue_watch_started = true;
-        support::seed_compact_listing(pane, seeded_directory, Vec::new());
+        support::seed_compact_listing(pane, seeded_directory, vec![seeded_entry.clone()]);
+        pane.panels[1].selection.select_only(&seeded_entry.name);
+        pane.panels[1].selected = Some(seeded_entry);
     });
     visual.simulate_resize(size(px(296.), px(600.)));
     visual.update(|window, cx| {
@@ -404,6 +479,8 @@ fn scaled_file_actions_remain_reachable_in_a_narrow_panel(app: &mut TestAppConte
         "rr-files-upload-menu",
         "files-new-folder-1",
         "files-download-1",
+        "files-toolbar-count-1",
+        "files-toolbar-selection-1",
         "rr-files-view-menu",
     ] {
         let bounds = visual.debug_bounds(selector).expect("file action");
@@ -575,6 +652,7 @@ fn compact_file_panel_hides_transfers_without_a_current_target(app: &mut TestApp
     visual.update(|_, cx| {
         pane.update(cx, |pane, cx| {
             pane.current_terminal_endpoint = Some(pane.panels[1].endpoint.clone());
+            support::seed_compact_context(pane);
             cx.notify();
         });
     });
@@ -1085,6 +1163,64 @@ fn delete_and_f2_keep_the_entry_selected_when_the_key_was_pressed(app: &mut Test
                     .map(|entry| &entry.endpoint),
                 Some(&first.endpoint)
             );
+        });
+    });
+    let _runtime = runtime;
+}
+
+/// 紧凑右栏工具栏必须直接暴露删除入口；点击后冻结当前选择并打开生产删除确认。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn compact_toolbar_delete_opens_confirmation_for_selected_entries(app: &mut TestAppContext) {
+    let host = HostId::new();
+    let directory = support::remote_endpoint(&host, "/srv/app");
+    let entry = support::remote_entry(&directory, "obsolete.log", FileEntryKind::File);
+    let entry_for_seed = entry.clone();
+    let (runtime, pane, _mutations, visual) =
+        support::window_fixture(app, directory, move |pane| {
+            pane.compact_layout = true;
+            let target = pane.panels[1].endpoint.clone();
+            support::seed_compact_listing(pane, target, vec![entry_for_seed.clone()]);
+            pane.panels[1].selection.select_only(&entry_for_seed.name);
+            pane.panels[1].selected = Some(entry_for_seed);
+        });
+    support::draw(visual);
+    let delete = visual
+        .debug_bounds("rr-files-delete-1")
+        .expect("compact rail exposes its delete action");
+    // 无选中项时入口必须禁用：点击不弹出确认，也不产生“请先选择”这类噪声提示。
+    visual.update(|_, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.panels[1].selection.clear();
+            pane.panels[1].selected = None;
+            cx.notify();
+        });
+    });
+    support::draw(visual);
+    visual.simulate_click(delete.center(), Default::default());
+    visual.update(|_, cx| {
+        let pane = pane.read(cx);
+        assert!(pane.delete_confirmation.is_none());
+        assert!(pane.status.is_none());
+    });
+    visual.update(|_, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.panels[1].selection.select_only(&entry.name);
+            pane.panels[1].selected = Some(entry.clone());
+            cx.notify();
+        });
+    });
+    support::draw(visual);
+    visual.simulate_click(delete.center(), Default::default());
+    visual.update(|_, cx| {
+        pane.read_with(cx, |pane, _| {
+            let confirmation = pane
+                .delete_confirmation
+                .as_ref()
+                .expect("delete opens the confirmation for the selected entry");
+            assert_eq!(confirmation.len(), 1);
+            assert_eq!(confirmation[0].endpoint, entry.endpoint);
         });
     });
     let _runtime = runtime;

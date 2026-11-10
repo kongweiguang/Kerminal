@@ -10,7 +10,7 @@ use crate::PublicErrorCode;
 
 use super::{
     PI_AGENT_RESUME_COMMAND, builtin_resume_argv, initial_provider_session,
-    require_saved_resume_command, shell_command_target,
+    require_saved_resume_command, shell_command_target, validated_resume_command,
 };
 
 /// 固定恢复元数据与新建 provider 能力保持兼容，Custom 不从配置猜测可恢复性。
@@ -148,6 +148,22 @@ fn resume_requires_persisted_command_for_supported_providers() {
     let unsupported = require_saved_resume_command(&custom)
         .expect_err("Custom without a saved command is not resumable");
     assert_eq!(unsupported.public_code(), PublicErrorCode::Unsupported);
+}
+
+/// 升级前保存的 Pi 默认恢复命令仍按内建映射处理；否则带 provider ID 的旧会话会被误当自定义命令。
+#[test]
+fn legacy_pi_resume_default_stays_frozen() {
+    let mut pi = initial_provider_session(AgentProvider::Pi);
+    pi.resume_command = Some("pi --approve --continue".to_owned());
+
+    assert_eq!(
+        validated_resume_command(&pi).expect("legacy default still validates"),
+        "pi --approve --continue"
+    );
+
+    // 冻结映射会显式拒绝尚未定义语义的 Pi provider 会话 ID，可作为“仍被识别为内建默认”的判据。
+    pi.provider_session_id = Some("pi-session-42".to_owned());
+    assert!(validated_resume_command(&pi).is_err());
 }
 
 /// 构造只包含测试输入的 profile，不读取用户 shell 或机器配置。

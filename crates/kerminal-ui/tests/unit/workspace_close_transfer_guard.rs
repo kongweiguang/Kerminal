@@ -12,7 +12,8 @@ use crate::root::workspace_close::{
     transfer_close_targets_for_event, transfer_close_targets_for_operation,
 };
 use kerminal_application::workspace::{
-    WorkspaceFileAccess, WorkspaceFileSource, WorkspaceSessionTab, WorkspaceTargetRef,
+    FileWorkspaceItem, FileWorkspaceState, WorkspaceFileAccess, WorkspaceFileSource,
+    WorkspaceSessionTab, WorkspaceTargetRef,
 };
 use kerminal_domain::{
     identity::{PaneId, TabId},
@@ -134,6 +135,47 @@ fn batch_close_freezes_all_persistent_transfer_origins() {
         file_targets[0].origin,
         kerminal_application::transfers::TransferOrigin::WorkspaceFile(file_id)
     );
+}
+
+/// 宿主关闭必须沿用请求时冻结的来源集合，包含旧别名且不依赖之后的运行态投影。
+///
+/// @author kongweiguang
+#[test]
+fn file_workspace_close_uses_frozen_owner_and_aliases() {
+    use kerminal_application::transfers::TransferOrigin;
+
+    let owner = TabId::new();
+    let alias = TabId::new();
+    let directory = TabId::new();
+    let tab = WorkspaceSessionTab::FileWorkspace {
+        id: owner.clone(),
+        tab_group_id: None,
+        title: "Files".to_owned(),
+        machine_id: "local".to_owned(),
+        target: WorkspaceTargetRef::Local { profile_id: None },
+        state: FileWorkspaceState {
+            items: vec![FileWorkspaceItem::Directory {
+                id: directory.clone(),
+                path: ".".to_owned(),
+            }],
+            active_item_id: Some(directory),
+            source_tab_ids: vec![alias.clone(), owner.clone(), alias.clone()],
+        },
+    };
+    let operation = WorkspaceResourceOperation::CloseTab {
+        operation_id: "close-file-workspace".to_owned(),
+        tab_id: owner.clone(),
+        tab: Box::new(tab.clone()),
+        pane_ids: Vec::new(),
+    };
+    let targets = transfer_close_targets_for_operation(&operation, &[]);
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0].origin, TransferOrigin::WorkspaceFile(owner));
+    assert_eq!(targets[1].origin, TransferOrigin::WorkspaceFile(alias));
+    assert!(targets.iter().all(|target| matches!(
+        &target.descriptor,
+        super::TransferCloseDescriptor::Tab(captured) if captured == &tab
+    )));
 }
 
 /// 异步回执只有同一代次与仍存在的完整 descriptor 才能继续关闭。

@@ -30,6 +30,7 @@ struct ThemeReport {
     config_directory: String,
     terminal_session_id: String,
     terminal_settings_unchanged: bool,
+    quick_open_focus_verified: bool,
     cases: Vec<ThemeCase>,
     rapid_selection: RapidCheck,
     keyboard: KeyboardCheck,
@@ -138,6 +139,7 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
 }
 
 /// 为真实本地 PTY 建立唯一默认 Profile，并预设不同的浅深终端色盘以检测误联动。
+/// 可选壁纸只写入本轮新建的隔离配置，让同一主题验收覆盖透明材质而不读取用户配置。
 ///
 /// @author kongweiguang
 async fn prepare_fixture(
@@ -188,6 +190,18 @@ async fn prepare_fixture(
             settings.terminal.color_scheme = TerminalColorScheme::TokyoNight;
             settings.terminal.light_color_scheme = TerminalColorScheme::Github;
             settings.terminal.dark_color_scheme = TerminalColorScheme::Solarized;
+            if let Some(path) = std::env::var_os("KERMINAL_APP_THEME_ACCEPTANCE_WALLPAPER") {
+                let path = fs::canonicalize(path).map_err(|error| {
+                    kerminal_application::AppError::Infrastructure {
+                        context: "acceptance wallpaper is unavailable",
+                        source: Some(Arc::new(error)),
+                    }
+                })?;
+                settings.background_enabled = true;
+                settings.background_image_path = path.to_string_lossy().into_owned();
+                settings.background_opacity = 100;
+                settings.window_opacity = 74;
+            }
             preferences
                 .save_settings(settings, versioned.revision)
                 .await?;
@@ -322,6 +336,7 @@ async fn capture_theme(
         window,
         context.output_directory.join("workbench-initial.png"),
     )?];
+    verify_quick_open_focus(cx, window, &context, &mut screenshots).await?;
     press_key(cx, window, "ctrl-alt-s")?;
     wait_for_state(
         cx,
@@ -465,6 +480,12 @@ async fn capture_theme(
                 window,
                 context.output_directory.join(&workbench_file),
             )?);
+            if scheme == AppColorScheme::Kerminal
+                && std::env::var_os("KERMINAL_APP_THEME_ACCEPTANCE_WALLPAPER").is_some()
+            {
+                capture_material_tools(cx, &root, window, &context, mode_name, &mut screenshots)
+                    .await?;
+            }
             press_key(cx, window, "ctrl-alt-s")?;
             wait_for_state(
                 cx,
@@ -536,6 +557,7 @@ async fn capture_theme(
             .to_string(),
         terminal_session_id: session_id,
         terminal_settings_unchanged: true,
+        quick_open_focus_verified: true,
         cases,
         rapid_selection,
         keyboard,
@@ -546,6 +568,68 @@ async fn capture_theme(
         context.output_directory.join(APP_THEME_REPORT),
         serde_json::to_vec_pretty(&report)?,
     )?;
+    Ok(())
+}
+
+/// 原生窗口通过实际快捷键打开两种命令面板，覆盖焦点陷阱、取消和原控件恢复。
+/// 保留打开截图，Tab 双向检查不依赖查询结果数量或后台服务速度。
+///
+/// @author kongweiguang
+async fn verify_quick_open_focus(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    context: &ThemeContext,
+    screenshots: &mut Vec<CaptureRecord>,
+) -> Result<(), Box<dyn Error>> {
+    for (key, name) in [
+        ("ctrl-p", "quick-open"),
+        ("ctrl-shift-p", "command-palette"),
+    ] {
+        let origin = window.update(cx, |_, window, app| {
+            ensure_hidden_window(window)?;
+            draw_acceptance_frame(window, app);
+            window
+                .focused(app)
+                .ok_or_else(|| io::Error::other("missing palette trigger focus"))
+        })??;
+        press_key(cx, window, key)?;
+        let deadline = Instant::now() + ACTION_TIMEOUT;
+        loop {
+            let opened = window.update(cx, |_, window, app| {
+                draw_acceptance_frame(window, app);
+                selector_bounds(window, "quick-open-modal").is_ok()
+                    && gpui_kit::base::active_focus_trap(window, app).is_some()
+            })?;
+            if opened {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    io::Error::other(format!("{name} did not open with a focus trap")).into(),
+                );
+            }
+            cx.background_executor().timer(POLL_INTERVAL).await;
+        }
+        for tab in ["tab", "shift-tab", "tab", "shift-tab"] {
+            press_key(cx, window, tab)?;
+            window.update(cx, |_, window, app| {
+                draw_acceptance_frame(window, app);
+                if gpui_kit::base::active_focus_trap(window, app).is_none()
+                    || origin.is_focused(window)
+                {
+                    return Err(io::Error::other(format!("{tab} escaped {name}")));
+                }
+                Ok::<_, io::Error>(())
+            })??;
+        }
+        screenshots.push(save_frame(
+            cx,
+            window,
+            context.output_directory.join(format!("{name}-focus.png")),
+        )?);
+        press_key(cx, window, "escape")?;
+        wait_for_window_focus(cx, window, &origin, Instant::now() + ACTION_TIMEOUT).await?;
+    }
     Ok(())
 }
 
@@ -658,6 +742,84 @@ fn assert_choice_checked(
 ) -> Result<(), Box<dyn Error>> {
     if !choice_observation(cx, window, scheme)?.0 {
         return Err(io::Error::other(format!("{} radio is not checked", scheme.as_str())).into());
+    }
+    Ok(())
+}
+
+/// 用真实 Rail 按钮覆盖不同内容实体；每次回读活动 owner，最后恢复片段以维持主题验收前置条件。
+/// 系统面板必须等真实快照出现后取图，避免空面板掩盖卡片材质错误。
+/// 本地终端下不可用的远程功能只覆盖空态与切换，不声称已经联调。
+///
+/// @author kongweiguang
+async fn capture_material_tools(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    context: &ThemeContext,
+    mode: &str,
+    screenshots: &mut Vec<CaptureRecord>,
+) -> Result<(), Box<dyn Error>> {
+    use kerminal_application::preferences::settings::ToolRailToolId;
+
+    // 配置序列化标识与 UI 元素标识不是同一契约，显式使用生产按钮 ID。
+    for (tool, selector) in [
+        (ToolRailToolId::System, "workbench-tool-system"),
+        (ToolRailToolId::Logs, "workbench-tool-logs"),
+        (
+            ToolRailToolId::AgentLauncher,
+            "workbench-tool-agent-launcher",
+        ),
+        (ToolRailToolId::Sftp, "workbench-tool-sftp"),
+        (ToolRailToolId::Containers, "workbench-tool-containers"),
+        (ToolRailToolId::Tmux, "workbench-tool-tmux"),
+        (ToolRailToolId::Ports, "workbench-tool-ports"),
+        (ToolRailToolId::Snippets, "workbench-tool-snippets"),
+    ] {
+        click_selector(cx, window, selector)?;
+        let deadline = Instant::now() + ACTION_TIMEOUT;
+        loop {
+            let active = window.update(cx, |_, window, app| {
+                ensure_hidden_window(window)?;
+                draw_acceptance_frame(window, app);
+                Ok::<_, io::Error>(root.read(app).right_rail_acceptance_active_tool())
+            })??;
+            if active == Some(tool) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other("material tool did not become active").into());
+            }
+            cx.background_executor().timer(POLL_INTERVAL).await;
+        }
+        if tool == ToolRailToolId::System {
+            let deadline = Instant::now() + READY_TIMEOUT;
+            loop {
+                let populated = window.update(cx, |_, window, app| {
+                    draw_acceptance_frame(window, app);
+                    selector_bounds(window, "operations-server-overview-content").is_ok()
+                })?;
+                if populated {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(
+                        io::Error::other("system material capture has no real snapshot").into(),
+                    );
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+        }
+        // 切换即时改变布局；等待既有 140ms 视觉过渡结束再取图，避免把中间帧当成最终材质。
+        cx.background_executor()
+            .timer(Duration::from_millis(180))
+            .await;
+        screenshots.push(save_frame(
+            cx,
+            window,
+            context
+                .output_directory
+                .join(format!("material-{mode}-{}.png", tool.as_str())),
+        )?);
     }
     Ok(())
 }

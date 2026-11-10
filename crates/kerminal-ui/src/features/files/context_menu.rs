@@ -57,6 +57,7 @@ pub(super) struct FileMenuSnapshot {
 enum FileMenuAction {
     CopyToOther,
     Open,
+    OpenInWorkspace,
     Edit,
     Download,
     UploadFiles,
@@ -223,6 +224,7 @@ fn file_menu_items(
             items.push(item(Action::UploadFiles, !busy));
             items.push(item(Action::UploadDirectories, !busy));
         }
+        items.push(item(Action::OpenInWorkspace, true));
         items.push(item(Action::NewDirectory, true));
         items.push(separator());
         items.push(item(Action::Refresh, true));
@@ -249,6 +251,7 @@ fn file_menu_items(
     };
     if entry.kind == FileEntryKind::Directory {
         items.push(item(Action::Open, true));
+        items.push(item(Action::OpenInWorkspace, true));
     } else {
         items.push(item(Action::Edit, entry.kind == FileEntryKind::File));
     }
@@ -331,7 +334,7 @@ pub(super) fn build_file_context_menu(
     let can_copy = copy_reason.is_none() && target.is_some();
     let items = file_menu_items(
         &snapshot,
-        pane.compact_layout,
+        pane.compact_layout || pane.file_workspace_layout,
         can_copy,
         pane.transfer_submission_busy,
     );
@@ -347,7 +350,14 @@ pub(super) fn build_file_context_menu(
         let action_entity = entity.clone();
         let action_snapshot = snapshot.clone();
         let action_target = target.clone();
-        let item = render_file_menu_item(spec, &snapshot, &pane.panels[1 - snapshot.side].endpoint)
+        let item =
+            if spec.action == FileMenuAction::OpenInWorkspace && pane.file_workspace_layout {
+                PopupMenuItem::new(locale::text("在新标签打开", "Open in new tab"))
+                    .icon(IconName::FolderOpen)
+                    .disabled(!spec.enabled)
+            } else {
+                render_file_menu_item(spec, &snapshot, &pane.panels[1 - snapshot.side].endpoint)
+            }
             .on_click(move |_, window, app| {
                 action_entity.update(app, |pane, cx| {
                     dispatch_file_menu_action(
@@ -443,6 +453,10 @@ fn render_file_menu_item(
             })
         }
         Action::Open => PopupMenuItem::new(locale::text("打开", "Open")).icon(IconName::FolderOpen),
+        Action::OpenInWorkspace => {
+            PopupMenuItem::new(locale::text("在文件工作区打开", "Open in file workspace"))
+                .icon(IconName::FolderOpen)
+        }
         Action::Edit => PopupMenuItem::new(locale::text("打开编辑器", "Open in editor"))
             .icon(Icon::new(AssetIconName::FileSearch)),
         Action::Download => {
@@ -590,6 +604,12 @@ fn dispatch_file_menu_action(
                 pane.open_entry(snapshot.side, entry.clone(), cx);
             }
         }
+        Action::OpenInWorkspace => pane.request_open_directory_in_workspace(
+            entry
+                .map(|entry| entry.endpoint.clone())
+                .unwrap_or_else(|| snapshot.directory.clone()),
+            cx,
+        ),
         Action::Edit => {
             if let Some(entry) = entry {
                 pane.request_open_file(entry.endpoint.clone(), cx);

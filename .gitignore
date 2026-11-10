@@ -32,8 +32,10 @@ dist
 # @author kongweiguang
 /.agents/
 /.codex/
+/.claude/
 /.updeng/
 /AGENTS.md
+/CLAUDE.md
 .env
 .env.*
 !.env.example

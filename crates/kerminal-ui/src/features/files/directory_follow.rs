@@ -13,7 +13,8 @@ impl FilesPane {
     /// @author kongweiguang
     pub(crate) fn set_follow_terminal_directory(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if enabled
-            && (!self.compact_layout
+            && (self.current_terminal_binding.is_none()
+                || !self.compact_layout
                 || !matches!(
                     self.current_terminal_endpoint.as_ref(),
                     Some(FileEndpoint::Remote { .. })

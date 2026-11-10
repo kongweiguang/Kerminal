@@ -29,7 +29,10 @@ struct MemoryFile;
 impl FileAccessProvider for MemoryFile {
     /// 仅接受当前回归的隔离端点，意外目标不能触及实际文件。
     fn supports(&self, endpoint: &FileEndpoint) -> bool {
-        endpoint == &file_endpoint()
+        matches!(
+            endpoint,
+            FileEndpoint::Local { path } if path.starts_with("C:/plugin-close-fixture/")
+        )
     }
 
     /// 本回归只打开文本，不用虚假的目录快照影响 Root 的关闭选择。
@@ -203,6 +206,13 @@ fn file_endpoint() -> FileEndpoint {
     }
 }
 
+/// 同一宿主内的第二个文档证明多文档组关闭失败时不能只恢复首个缓冲。
+fn second_file_endpoint() -> FileEndpoint {
+    FileEndpoint::Local {
+        path: "C:/plugin-close-fixture/second.txt".into(),
+    }
+}
+
 /// 从 Root 的正规事件入口发起关闭，不直接调用 editor guard 或工具收尾辅助函数。
 fn request_close(root: &Entity<RootView>, tab_id: &TabId, visual: &mut VisualTestContext) {
     visual.update(|window, app| {
@@ -338,6 +348,156 @@ fn cancelling_dirty_file_close_keeps_tab_tool_open_until_confirmed(app: &mut Tes
                 .terminal_tabs
                 .iter()
                 .any(|tab| tab.id() == &tab_id)
+        );
+    });
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
+}
+
+/// 工具关闭失败时文件工作区与全部正文必须原样保留；准备回执不能提前释放缓冲。
+struct FailingCloseProbe {
+    view: Entity<ToolView>,
+    closes: Arc<AtomicUsize>,
+}
+
+impl ToolInstance for FailingCloseProbe {
+    /// 仍使用原实体，失败路径不能靠重建视图掩盖提前移除。
+    fn view(&self) -> AnyView {
+        self.view.clone().into()
+    }
+
+    /// 明确返回失败，验证 Root 不会把“已准备”当成“已可释放”。
+    fn begin_close(&mut self, _: Instant, _: &mut App) -> AppResult<ToolCloseFuture> {
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(async {
+            Err(AppError::conflict("fixture tool close failure"))
+        }))
+    }
+}
+
+struct FailingProbeFactory(Arc<AtomicUsize>);
+
+impl ToolFactory for FailingProbeFactory {
+    /// 与成功夹具使用不同工具身份，避免注册表误复用旧实例。
+    fn tool_id(&self) -> &str {
+        "fixture.file-close-failing-tool"
+    }
+
+    fn presentation(&self) -> ToolPresentation {
+        ToolPresentation::new(
+            self.tool_id(),
+            "fixture failing",
+            gpui_kit::assets::IconName::FileText,
+        )
+    }
+
+    fn scope(&self) -> ToolScope {
+        ToolScope::Tab
+    }
+
+    fn create(
+        &self,
+        _: &ToolContext,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> AppResult<Box<dyn ToolInstance>> {
+        Ok(Box::new(FailingCloseProbe {
+            view: cx.new(|_| ToolView),
+            closes: self.0.clone(),
+        }))
+    }
+}
+
+/// 同一文件工作区的两个文档在工具关闭失败后都必须保留正文与标签，供用户重试。
+#[gpui_kit::test]
+fn failed_tool_close_preserves_file_workspace_buffers(app: &mut TestAppContext) {
+    let files = FileService::new(vec![Arc::new(MemoryFile)], Arc::new(NoBookmarks))
+        .expect("memory file ports");
+    let (runtime, root, _, _, visual) = fixture_with_configuration_and_services(
+        app,
+        Arc::new(EmptyConfiguration),
+        move |mut services| {
+            services.file_editor = Some(FileEditorService::new(files.clone()));
+            services.files = Some(files);
+            services
+        },
+    );
+    visual.update(|window, app| {
+        window.activate_window();
+        root.update(app, |root, cx| {
+            let controller = WorkspaceController::from_missing().unwrap();
+            root.workspace_files = WorkspaceFileRuntime::from_snapshot(controller.snapshot());
+            root.workspace_controller = Some(controller);
+            assert!(root.open_file_endpoint_with_lease(file_endpoint(), None, window, cx));
+        });
+    });
+    settle(&runtime, visual);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            assert!(root.open_file_endpoint_with_lease(second_file_endpoint(), None, window, cx));
+        });
+    });
+    settle(&runtime, visual);
+    let (_editor, tab_id) = root.read_with(visual, |root, cx| {
+        let editor = root
+            .file_editor_workspace
+            .clone()
+            .expect("production editor");
+        assert_eq!(editor.read(cx).workspace_projection().tabs.len(), 2);
+        let tab_id = root
+            .workspace_controller
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .active_tab_id
+            .clone()
+            .expect("file workspace tab");
+        (editor, tab_id)
+    });
+
+    let closes = Arc::new(AtomicUsize::new(0));
+    let factory = Arc::new(FailingProbeFactory(closes.clone()));
+    let provider = PluginId::new("fixture.file-close-failing-provider").unwrap();
+    let mut builder = PluginRegistryBuilder::new();
+    builder.register_provider(PluginDescriptor::new(provider.clone(), "Fixture", true));
+    builder.register_tool(ToolDescriptor::new(
+        ToolId::new(factory.tool_id()).unwrap(),
+        provider,
+        "Failing close probe",
+        None,
+    ));
+    let registry = builder.freeze().unwrap();
+    let tool = ToolRailToolId::from_id(factory.tool_id()).unwrap();
+    let context = ToolContext::new(Some(tab_id.clone()), None);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.plugin_tools.register(&registry, factory).unwrap();
+            root.plugin_tools
+                .ensure(tool, &context, window, cx)
+                .unwrap();
+        });
+    });
+
+    request_close(&root, &tab_id, visual);
+    settle(&runtime, visual);
+
+    root.read_with(visual, |root, cx| {
+        assert_eq!(
+            root.plugin_tools.phase(tool, &context),
+            Some(ToolPhase::CloseFailed)
+        );
+        let controller = root.workspace_controller.as_ref().unwrap();
+        assert!(
+            controller
+                .snapshot()
+                .terminal_tabs
+                .iter()
+                .any(|tab| tab.id() == &tab_id)
+        );
+        let editor = root.file_editor_workspace.as_ref().unwrap();
+        assert_eq!(
+            editor.read(cx).workspace_projection().tabs.len(),
+            2,
+            "prepared buffers must survive a failed tool close"
         );
     });
     assert_eq!(closes.load(Ordering::SeqCst), 1);

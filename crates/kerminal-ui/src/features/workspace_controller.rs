@@ -251,6 +251,9 @@ impl WorkspaceController {
                     WorkspaceSessionTab::SftpTransfer { .. } => {
                         (WorkspaceTabKind::SftpTransfer, None)
                     }
+                    WorkspaceSessionTab::FileWorkspace { .. } => {
+                        (WorkspaceTabKind::FileWorkspace, None)
+                    }
                     WorkspaceSessionTab::WorkspaceFile { .. } => {
                         (WorkspaceTabKind::WorkspaceFile, None)
                     }
@@ -324,7 +327,8 @@ impl WorkspaceController {
                         tab: Box::new(tab.clone()),
                     });
                 }
-                WorkspaceSessionTab::WorkspaceFile { .. } => {
+                WorkspaceSessionTab::FileWorkspace { .. }
+                | WorkspaceSessionTab::WorkspaceFile { .. } => {
                     items.push(WorkspaceRestoreItem::WorkspaceFile {
                         tab: Box::new(tab.clone()),
                     });
@@ -766,7 +770,9 @@ impl WorkspaceController {
         Ok(Some(request))
     }
 
-    /// 按 request ID 应用 CAS 回执；clean 判断使用完整来源快照，避免投影隐藏保存期间的新变更。
+    /// 只接受与提交意图一致的实际文档作为基线；无效回执进入未知门禁，避免丢弃外部扩展或盲写。
+    ///
+    /// @author kongweiguang
     pub fn finish_save(
         &mut self,
         request_id: &str,
@@ -780,8 +786,16 @@ impl WorkspaceController {
             .ok_or_else(|| AppError::conflict("工作区保存回执已过期"))?;
         self.in_flight_save = None;
         match outcome {
-            WorkspaceSessionSaveOutcome::Saved { revision } => {
-                self.base_document = request.candidate_document;
+            WorkspaceSessionSaveOutcome::Saved { revision, document } => {
+                if document.workspace_snapshot().ok().as_ref() != Some(&request.desired_snapshot) {
+                    self.save_state = WorkspacePersistenceState::OutcomeUnknown {
+                        request: Box::new(request),
+                    };
+                    return Err(AppError::outcome_unknown(
+                        "工作区保存回执与提交意图不一致，请先核对磁盘",
+                    ));
+                }
+                self.base_document = document;
                 self.base_revision = WorkspaceSessionExpectedRevision::Revision(revision);
                 self.base_snapshot = request.desired_snapshot;
                 self.clean_working_snapshot = request.source_snapshot;
@@ -856,6 +870,25 @@ impl WorkspaceController {
                 return Ok(());
             }
             _ => {}
+        }
+        self.save_state = WorkspacePersistenceState::Conflict {
+            latest: Box::new(latest),
+        };
+        Ok(())
+    }
+
+    /// 外部文件修复或再次变化后仅更新冲突证据，不替换当前快照或擅自解除写入门禁。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn refresh_conflicting_readback(
+        &mut self,
+        latest: WorkspaceSessionLoad,
+    ) -> AppResult<()> {
+        if !matches!(&self.save_state, WorkspacePersistenceState::Conflict { .. }) {
+            return Err(AppError::conflict("当前没有待核对的工作区冲突"));
+        }
+        if let WorkspaceSessionLoad::Loaded { document, .. } = &latest {
+            document.workspace_snapshot()?;
         }
         self.save_state = WorkspacePersistenceState::Conflict {
             latest: Box::new(latest),
@@ -1855,6 +1888,7 @@ impl WorkspaceController {
                     .or_else(|| Some(machine_id.clone()));
             }
             WorkspaceSessionTab::SftpTransfer { machine_id, .. }
+            | WorkspaceSessionTab::FileWorkspace { machine_id, .. }
             | WorkspaceSessionTab::WorkspaceFile { machine_id, .. } => {
                 self.snapshot.focused_pane_id = None;
                 self.snapshot.selected_machine_id = Some(machine_id.clone());
@@ -1931,8 +1965,9 @@ impl WorkspaceController {
         }
     }
 
-    /// 资源变更只允许一个 in-flight 候选，避免旧创建回执覆盖新 split/layout。
-    fn ensure_no_pending_resource(&self) -> AppResult<()> {
+    /// 资源变更只允许一个 in-flight 候选；内部文档关闭也须在释放缓冲前复用此门禁，避免描述仍保留却丢失正文。
+    /// @author kongweiguang
+    pub(crate) fn ensure_no_pending_resource(&self) -> AppResult<()> {
         if self.pending_resource.is_some() {
             return Err(AppError::conflict("请先完成或取消当前工作区资源操作"));
         }
@@ -2018,7 +2053,8 @@ fn initial_restore_status(
                     status.insert(WorkspaceRestoreItemId::Pane(pane_id), state);
                 }
             }
-            WorkspaceSessionTab::WorkspaceFile { id, target, .. } => {
+            WorkspaceSessionTab::FileWorkspace { id, target, .. }
+            | WorkspaceSessionTab::WorkspaceFile { id, target, .. } => {
                 status.insert(
                     WorkspaceRestoreItemId::Tab(id.clone()),
                     restore_status_for_target(Some(target)),
@@ -2093,6 +2129,10 @@ fn validate_new_runtime_targets(
             continue;
         }
         if let WorkspaceSessionTab::WorkspaceFile {
+            target: WorkspaceTargetRef::Unavailable { .. },
+            ..
+        }
+        | WorkspaceSessionTab::FileWorkspace {
             target: WorkspaceTargetRef::Unavailable { .. },
             ..
         } = tab
@@ -2182,6 +2222,7 @@ fn set_active_tab(snapshot: &mut WorkspaceSessionSnapshot, tab: &WorkspaceSessio
                 .or_else(|| Some(machine_id.clone()));
         }
         WorkspaceSessionTab::SftpTransfer { machine_id, .. }
+        | WorkspaceSessionTab::FileWorkspace { machine_id, .. }
         | WorkspaceSessionTab::WorkspaceFile { machine_id, .. } => {
             snapshot.focused_pane_id = None;
             snapshot.selected_machine_id = Some(machine_id.clone());
@@ -2199,6 +2240,7 @@ fn set_tab_group(tab: &mut WorkspaceSessionTab, group_id: Option<WorkspaceTabGro
     match tab {
         WorkspaceSessionTab::Terminal { tab_group_id, .. }
         | WorkspaceSessionTab::SftpTransfer { tab_group_id, .. }
+        | WorkspaceSessionTab::FileWorkspace { tab_group_id, .. }
         | WorkspaceSessionTab::WorkspaceFile { tab_group_id, .. }
         | WorkspaceSessionTab::Extension { tab_group_id, .. }
         | WorkspaceSessionTab::Unsupported { tab_group_id, .. } => *tab_group_id = group_id,
@@ -2282,6 +2324,7 @@ fn set_tab_title(tab: &mut WorkspaceSessionTab, title: String) {
     match tab {
         WorkspaceSessionTab::Terminal { title: current, .. }
         | WorkspaceSessionTab::SftpTransfer { title: current, .. }
+        | WorkspaceSessionTab::FileWorkspace { title: current, .. }
         | WorkspaceSessionTab::WorkspaceFile { title: current, .. }
         | WorkspaceSessionTab::Extension { title: current, .. }
         | WorkspaceSessionTab::Unsupported { title: current, .. } => *current = title,

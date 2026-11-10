@@ -60,7 +60,7 @@ fn dry_run_is_read_only_and_apply_is_idempotent() {
     fs::create_dir(&target).unwrap();
     fs::write(
         target.join(".kerminal-format.toml"),
-        b"data_format = 4\nmigration_contract = 3\n",
+        b"data_format = 4\nmigration_contract = 4\n",
     )
     .unwrap();
     fs::write(

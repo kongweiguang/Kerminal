@@ -17,7 +17,7 @@ use kerminal_domain::{
     sessions::{SessionTarget, SshInitialCommand},
 };
 
-use crate::features::{operations::OperationsView, workspace_tabs::WorkspaceTabEvent};
+use crate::features::operations::OperationsView;
 
 use crate::root::{RootView, RuntimePanePhase};
 
@@ -170,7 +170,7 @@ impl RootView {
         if matching.len() > 1 {
             return Err("同一 Compose 文件出现多个导航标签".to_owned());
         }
-        let Some((tab_id, access)) = matching.first().copied() else {
+        let Some((tab_id, item_id, access)) = matching.first().copied() else {
             return Ok(None);
         };
         let expected_access = if readonly {
@@ -178,7 +178,14 @@ impl RootView {
         } else {
             WorkspaceFileAccess::Editable
         };
-        if *access != expected_access
+        let item_active = snapshot.terminal_tabs.iter().any(|tab| {
+            matches!(tab,
+                WorkspaceSessionTab::FileWorkspace { id, state, .. }
+                    if id == tab_id && state.active_item_id.as_ref() == Some(item_id)
+            )
+        });
+        if !item_active
+            || *access != expected_access
             || snapshot.active_tab_id.as_ref() != Some(tab_id)
             || !matches!(self.center_panel, crate::root::CenterPanel::Editor)
             || self.workspace_files.file_endpoint(tab_id).as_ref() != Some(&endpoint)
@@ -218,7 +225,7 @@ impl RootView {
         Ok(ready.then(|| tab_id.clone()))
     }
 
-    /// 就绪后仅派发一次生产关闭；处理器的 bool 只用于激活，完成必须另由双投影消失证明。
+    /// 就绪后只关闭精确内部文档，不以关闭宿主冒充单文件关闭；完成仍由双投影消失证明。
     ///
     /// @author kongweiguang
     pub fn close_right_rail_acceptance_compose_fixture_file(
@@ -236,7 +243,18 @@ impl RootView {
         else {
             return Ok(false);
         };
-        self.handle_workspace_tab_event(&WorkspaceTabEvent::Close(tab_id), window, cx);
+        let endpoint = compose_fixture_endpoint(host, target)?;
+        let item_id = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| {
+                compose_fixture_tabs(&controller.snapshot().terminal_tabs, host, &endpoint)
+                    .into_iter()
+                    .find(|(owner, _, _)| *owner == &tab_id)
+                    .map(|(_, item, _)| item.clone())
+            })
+            .ok_or_else(|| "Compose 内部文档已关闭".to_owned())?;
+        self.close_host_file_item(&tab_id, &item_id, window, cx);
         Ok(true)
     }
 
@@ -575,27 +593,58 @@ fn compose_fixture_endpoint(
     })
 }
 
-/// 描述符按宿主和完整路径计数，避免只依赖运行态索引而漏掉重复或未恢复的标签。
+/// 嵌套描述同时核对宿主、路径、标题、目录和合法来源，重复文档不能被单一运行态索引掩盖。
 ///
 /// @author kongweiguang
 fn compose_fixture_tabs<'a>(
     tabs: &'a [WorkspaceSessionTab],
     host: &HostId,
     endpoint: &FileEndpoint,
-) -> Vec<(&'a TabId, &'a WorkspaceFileAccess)> {
+) -> Vec<(&'a TabId, &'a TabId, &'a WorkspaceFileAccess)> {
+    use kerminal_application::workspace::{FileWorkspaceItem, WorkspaceFileSource};
     let FileEndpoint::Remote { path, .. } = endpoint else {
         return Vec::new();
     };
-    tabs.iter()
-        .filter_map(|tab| match tab {
-            WorkspaceSessionTab::WorkspaceFile {
-                id,
-                target: WorkspaceTargetRef::Ssh { host_id },
+    let Some((root, name)) = path.as_str().rsplit_once('/') else {
+        return Vec::new();
+    };
+    let mut matching = Vec::new();
+    for tab in tabs {
+        let WorkspaceSessionTab::FileWorkspace {
+            id,
+            target: WorkspaceTargetRef::Ssh { host_id },
+            state,
+            ..
+        } = tab
+        else {
+            continue;
+        };
+        if host_id != host {
+            continue;
+        }
+        for item in &state.items {
+            if let FileWorkspaceItem::Document {
+                id: item_id,
+                title,
                 path: tab_path,
+                root_path,
                 access,
+                source,
                 ..
-            } if host_id == host && tab_path == path.as_str() => Some((id, access)),
-            _ => None,
-        })
-        .collect()
+            } = item
+                && tab_path == path.as_str()
+                && title == name
+                && match source {
+                    WorkspaceFileSource::Sftp => root_path.is_none(),
+                    WorkspaceFileSource::ComposeYaml => root_path.as_deref() == Some(root),
+                    WorkspaceFileSource::Container
+                    | WorkspaceFileSource::Workspace
+                    | WorkspaceFileSource::Local => false,
+                }
+            {
+                matching.push((id, item_id, access));
+            }
+        }
+    }
+    matching
 }

@@ -64,6 +64,11 @@ fn missing_and_null_fields_are_planned_without_mutating_source() {
 #[test]
 fn current_explicit_values_need_no_migration() {
     let mut value = current_fixture();
+    // 共享 fixture 的旧文件标签留给聚合迁移测试；这里只隔离 pane 缺省值边界。
+    value["terminalTabs"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|tab| tab.get("kind").and_then(Value::as_str) != Some("workspaceFile"));
     value["terminalPanes"][0]["prompt"] = json!("");
     value["terminalPanes"][0]["status"] = json!("online");
     value["terminalPanes"][1]["status"] = json!("warning");

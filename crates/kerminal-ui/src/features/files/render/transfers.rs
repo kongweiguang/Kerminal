@@ -5,10 +5,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use gpui_kit::{
-    AnyElement, ClickEvent, Context, InteractiveElement as _, IntoElement,
+    AnyElement, ClickEvent, Context, InteractiveElement as _, IntoElement, SharedString,
     StatefulInteractiveElement as _,
     component::{
-        Disableable as _, IconName, Sizable as _,
+        Disableable as _, IconName, Selectable as _, Sizable as _,
         button::{Button, ButtonVariants as _},
         tooltip::Tooltip,
     },
@@ -28,12 +28,13 @@ use crate::features::files::FilesPane;
 use crate::features::files::transfer_queue::is_clearable_history;
 
 /// 标题本身控制完整列表显隐，按钮保留键盘语义，清理动作与折叠点击各自独立。
-/// 折叠仍提示隐藏的活动及恢复事项；终态清理先释放资源，未知提交继续保留。
+/// 标题右侧汇总进行中、失败和已结束数量；折叠仍提示隐藏的活动及恢复事项。终态清理先释放资源，未知提交继续保留。
 /// 列表复用实际字节和提交状态计算百分比；上传下载标明方向，暂存只报告准备就绪，不冒充最终复制完成。
 /// 窄栏允许元数据换行以保留完整单位，临时拖出任务不暴露已回收路径的定位或重试。
 /// 系统目标尚未释放副本时，即使暂存成功也保留待处理提示并拒绝显示可清理历史。
 /// 日常列表仅显示传输与待处理恢复项，不提供归档材料浏览；底层恢复证据继续独立保存。
 /// 可恢复的取消显示为暂停并保留原任务；普通失败使用创建后继的重试。
+/// 队列与标题带透出文件浏览器的阅读面，避免在同一阅读区形成层叠色块。
 /// 失败卡片只提供有资格的单一重试或续传，未知提交不能触发重试。
 /// 失败与取消只显示业务结果和具体原因；内部清理由动作承接，终态不继续展示过期速率。
 /// 队列最多使用面板约三分之一的高度，短窗口优先保留文件浏览区；全部任务仍可滚动查看。
@@ -95,11 +96,25 @@ pub(super) fn render_transfers(
         .flex()
         .flex_col()
         .overflow_y_scroll();
-    let title = if !pane.transfer_rows.is_empty() {
-        let count = pane.transfer_rows.len();
-        locale::text(format!("传输 ({count})"), format!("Transfers ({count})"))
-    } else {
-        locale::text("传输", "Transfers")
+    let title = locale::text("传输", "Transfers");
+    let queue_counts = transfer_queue_count_label(&pane.transfer_rows);
+    let recovery_attention = pane
+        .transfer_recovery_rows
+        .iter()
+        .any(recovery_needs_attention);
+    let meta = |label: SharedString, tone: gpui_kit::Hsla| {
+        let tooltip = label.clone();
+        div()
+            .id("files-transfer-queue-meta")
+            .flex_1()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .text_ellipsis()
+            .font_weight(gpui_kit::FontWeight::NORMAL)
+            .text_color(tone)
+            .text_right()
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .child(label)
     };
     let mut history_content = div()
         .w_full()
@@ -108,67 +123,71 @@ pub(super) fn render_transfers(
         .items_center()
         .gap_2()
         .text_size(theme.text_xs)
-        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-        .child(div().flex_shrink_0().text_color(theme.accent).child(
-            if pane.queue.history_expanded {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            },
-        ))
-        .child(title);
+        .font_weight(gpui_kit::FontWeight::SEMIBOLD);
+    // 空队列没有可展开内容，不能保留会翻转却不打开任何内容的箭头承诺。
+    if !empty_queue {
+        history_content =
+            history_content.child(div().flex_shrink_0().text_color(theme.accent).child(
+                if pane.queue.history_expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                },
+            ));
+    }
+    history_content = history_content.child(title);
     history_content = if empty_queue {
-        history_content.child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .text_color(theme.muted)
-                .text_right()
-                .child(locale::text("暂无任务", "No tasks")),
-        )
+        history_content.child(meta(locale::text("暂无任务", "No tasks"), theme.muted))
     } else if !pane.queue.history_expanded && pane.queue.recovery_list_error.is_some() {
-        history_content.child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .overflow_hidden()
-                .text_ellipsis()
-                .text_color(theme.warning)
-                .text_right()
-                .child(locale::text("恢复列表读取失败", "Recovery list failed")),
-        )
+        history_content.child(meta(
+            locale::text("恢复列表读取失败", "Recovery list failed"),
+            theme.warning,
+        ))
     } else if !pane.queue.history_expanded && hidden_attention > 0 {
-        history_content.child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .overflow_hidden()
-                .text_ellipsis()
-                .text_color(theme.warning)
-                .text_right()
-                .child(locale::text(
-                    format!("{hidden_attention} 项进行中或待处理"),
-                    format!("{hidden_attention} active or needs attention"),
-                )),
-        )
+        history_content.child(meta(
+            locale::text(
+                format!("{hidden_attention} 项进行中或待处理"),
+                format!("{hidden_attention} active or needs attention"),
+            ),
+            theme.warning,
+        ))
+    } else if !pane.transfer_rows.is_empty() {
+        history_content.child(meta(queue_counts, theme.muted))
+    } else if recovery_attention {
+        history_content.child(meta(
+            locale::text("待处理恢复", "Recovery pending"),
+            theme.warning,
+        ))
     } else {
         history_content.child(div().flex_1())
     };
-    let history_button = Button::new("files-transfer-history")
-        .compact()
-        .ghost()
-        .flex_1()
-        .min_w(px(0.))
-        .h_full()
-        .debug_selector(|| "rr-files-transfer-history".into())
-        .toggled(pane.queue.history_expanded)
-        .accessibility_label(if pane.queue.history_expanded {
-            locale::text("收起传输列表", "Collapse transfers")
-        } else {
-            locale::text("展开传输列表", "Expand transfers")
-        })
-        .child(history_content)
-        .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| pane.toggle_transfer_history(cx)));
+    let history_control: AnyElement = if empty_queue {
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .flex()
+            .items_center()
+            .child(history_content)
+            .into_any_element()
+    } else {
+        Button::new("files-transfer-history")
+            .compact()
+            .ghost()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .debug_selector(|| "rr-files-transfer-history".into())
+            .toggled(pane.queue.history_expanded)
+            .accessibility_label(if pane.queue.history_expanded {
+                locale::text("收起传输列表", "Collapse transfers")
+            } else {
+                locale::text("展开传输列表", "Expand transfers")
+            })
+            .child(history_content)
+            .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| pane.toggle_transfer_history(cx)))
+            .into_any_element()
+    };
     let mut header = div()
         .id("files-transfer-queue-header")
         .w_full()
@@ -178,8 +197,54 @@ pub(super) fn render_transfers(
         .items_center()
         .border_b_1()
         .border_color(theme.border)
-        .bg(theme.secondary)
-        .child(history_button);
+        .child(history_control);
+    if pane.has_transfer_scope_selector() {
+        let all = matches!(
+            pane.transfer_query_scope,
+            kerminal_application::transfers::TransferQueryScope::All
+        );
+        header = header.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    Button::new("files-transfer-scope-all")
+                        .compact()
+                        .ghost()
+                        .label(locale::text("全部", "All"))
+                        .accessibility_label(locale::text(
+                            "显示全部来源的传输",
+                            "Show transfers from all sources",
+                        ))
+                        .debug_selector(|| "files-transfer-scope-all".into())
+                        .toggled(all)
+                        .selected(all)
+                        .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
+                            pane.set_transfer_query_scope(
+                                kerminal_application::transfers::TransferQueryScope::All,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::new("files-transfer-scope-current")
+                        .compact()
+                        .ghost()
+                        .label(locale::text("当前来源", "Current source"))
+                        .accessibility_label(locale::text(
+                            "仅显示当前来源的传输",
+                            "Show transfers from the current source",
+                        ))
+                        .debug_selector(|| "files-transfer-scope-current".into())
+                        .toggled(!all)
+                        .selected(!all)
+                        .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| {
+                            pane.set_transfer_query_scope(pane.current_source_scope.clone(), cx);
+                        })),
+                ),
+        );
+    }
     if clearing_history {
         header = header.child(
             Button::new("files-transfer-clear-completed-cancel")
@@ -195,7 +260,11 @@ pub(super) fn render_transfers(
                     pane.cancel_completed_transfer_history(cx)
                 })),
         );
-    } else if projection.clearable_history_count > 0 || has_clearable_recovery {
+    } else if !matches!(
+        pane.transfer_query_scope,
+        kerminal_application::transfers::TransferQueryScope::All
+    ) && (projection.clearable_history_count > 0 || has_clearable_recovery)
+    {
         header = header.child(
             Button::new("files-transfer-clear-completed")
                 .compact()
@@ -675,6 +744,38 @@ pub(super) fn render_transfers(
             label
         };
         let destination_tooltip = pane.target_names.endpoint_detail(&destination);
+        let dismiss_id = id.clone();
+        let dismissing = pane.queue.is_dismissing_recovery(&id);
+        let dismiss_label = if dismissing {
+            locale::text("正在删除记录…", "Deleting record…")
+        } else if recovery.can_dismiss_without_live_task() {
+            locale::text(
+                "删除该恢复记录；证据仍保留在归档",
+                "Delete this recovery record; evidence stays archived",
+            )
+        } else {
+            locale::text(
+                "删除该恢复记录；仍含待处理材料，证据保留在归档",
+                "Delete this recovery record; unfinished material remains and evidence stays archived",
+            )
+        };
+        // 人工删除只收起单条证据，未知提交、断点和待清理事实仍留在冷档；运行中 owner 由应用层拒绝。
+        let dismiss_button = Button::new(format!("files-transfer-dismiss-{id}"))
+            .compact()
+            .ghost()
+            .flex_shrink_0()
+            .debug_selector({
+                let selector = format!("rr-files-transfer-dismiss-{id}");
+                move || selector.clone()
+            })
+            .icon(gpui_kit::assets::IconName::Trash)
+            .tooltip(dismiss_label.clone())
+            .accessibility_label(dismiss_label)
+            .loading(dismissing)
+            .disabled(dismissing)
+            .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
+                pane.dismiss_transfer_recovery(dismiss_id.clone(), cx)
+            }));
         list = list.child(
             div()
                 .px_3()
@@ -709,7 +810,8 @@ pub(super) fn render_transfers(
                                     Tooltip::new(destination_tooltip.clone()).build(window, cx)
                                 })
                                 .child(label),
-                        ),
+                        )
+                        .child(dismiss_button),
                 )
                 .child(
                     div()
@@ -740,12 +842,69 @@ pub(super) fn render_transfers(
         .overflow_hidden()
         .border_t_1()
         .border_color(theme.border)
-        .bg(theme.panel)
         .child(header)
         .when(pane.queue.history_expanded && !empty_queue, |queue| {
             queue.child(list)
         })
         .into_any_element()
+}
+
+/// 标题右侧把每个任务只归入进行中、失败、暂停、取消或完成之一；
+/// 暂停的可续传任务仍需要用户处理，不能与终态混计。零值不占位，空队列明确显示暂无任务。
+///
+/// @author kongweiguang
+fn transfer_queue_count_label(summaries: &[TransferSummary]) -> SharedString {
+    let mut active = 0usize;
+    let mut failed = 0usize;
+    let mut paused = 0usize;
+    let mut cancelled = 0usize;
+    let mut completed = 0usize;
+    for summary in summaries {
+        match summary.status {
+            TransferStatus::Failed => failed += 1,
+            TransferStatus::Cancelled if is_paused(summary) => paused += 1,
+            TransferStatus::Cancelled => cancelled += 1,
+            TransferStatus::Succeeded | TransferStatus::Skipped | TransferStatus::Unchanged => {
+                completed += 1;
+            }
+            _ => active += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if active > 0 {
+        parts
+            .push(locale::text(format!("{active} 进行中"), format!("{active} active")).to_string());
+    }
+    if failed > 0 {
+        parts.push(locale::text(format!("{failed} 失败"), format!("{failed} failed")).to_string());
+    }
+    if paused > 0 {
+        parts
+            .push(locale::text(format!("{paused} 已暂停"), format!("{paused} paused")).to_string());
+    }
+    if cancelled > 0 {
+        parts.push(
+            locale::text(
+                format!("{cancelled} 已取消"),
+                format!("{cancelled} canceled"),
+            )
+            .to_string(),
+        );
+    }
+    if completed > 0 {
+        parts.push(
+            locale::text(
+                format!("{completed} 已完成"),
+                format!("{completed} completed"),
+            )
+            .to_string(),
+        );
+    }
+    if parts.is_empty() {
+        locale::text("暂无任务", "No tasks")
+    } else {
+        parts.join(" · ").into()
+    }
 }
 
 /// 收敛数量与状态统计，展示顺序沿用队列的权威入队序号。

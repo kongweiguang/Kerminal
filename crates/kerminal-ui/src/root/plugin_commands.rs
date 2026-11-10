@@ -451,7 +451,8 @@ impl RootView {
                         Some(host)
                     }
                 }
-                WorkspaceSessionTab::WorkspaceFile { target, .. } => target_host_id(target),
+                WorkspaceSessionTab::FileWorkspace { target, .. }
+                | WorkspaceSessionTab::WorkspaceFile { target, .. } => target_host_id(target),
                 WorkspaceSessionTab::SftpTransfer { .. }
                 | WorkspaceSessionTab::Extension { .. }
                 | WorkspaceSessionTab::Unsupported { .. } => None,

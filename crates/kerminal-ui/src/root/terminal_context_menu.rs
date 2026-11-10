@@ -35,10 +35,6 @@ pub(crate) enum TerminalContextMenuAction {
         direction: SplitDirection,
         before: bool,
     },
-    ChooseSplitTarget {
-        direction: SplitDirection,
-        before: bool,
-    },
 }
 
 /// 菜单闭包要区分目标过期与动作不再适用，避免静默拒绝或把失败说成已执行。
@@ -50,7 +46,7 @@ enum TerminalContextMenuOutcome {
     InputRejected,
 }
 
-/// 创建 kit popup 的实际菜单项；分屏动作明确携带四向位置，按主机入口使用同一冻结来源 pane。
+/// 创建 kit popup 的实际菜单项；分屏动作明确携带四向位置，并沿用菜单打开时冻结的来源 pane。
 ///
 /// @author kongweiguang
 pub(crate) fn build_terminal_context_menu(
@@ -134,10 +130,10 @@ pub(crate) fn build_terminal_context_menu(
     menu
 }
 
-/// 右键菜单把四向直接分屏和四向主机选择放在一起，避免只支持两个默认插入方向。
+/// 右键菜单只保留四向直接分屏；选主机分屏仍由 pane 分屏按钮入口提供，避免同一菜单两套重复入口。
 ///
 /// @author kongweiguang
-fn terminal_split_menu_actions() -> [(TerminalContextMenuAction, &'static str, &'static str); 8] {
+fn terminal_split_menu_actions() -> [(TerminalContextMenuAction, &'static str, &'static str); 4] {
     use SplitDirection::{Horizontal, Vertical};
     [
         (
@@ -171,38 +167,6 @@ fn terminal_split_menu_actions() -> [(TerminalContextMenuAction, &'static str, &
             },
             "向上分屏",
             "Split above",
-        ),
-        (
-            TerminalContextMenuAction::ChooseSplitTarget {
-                direction: Horizontal,
-                before: false,
-            },
-            "选择主机并向右分屏…",
-            "Choose host and split right…",
-        ),
-        (
-            TerminalContextMenuAction::ChooseSplitTarget {
-                direction: Horizontal,
-                before: true,
-            },
-            "选择主机并向左分屏…",
-            "Choose host and split left…",
-        ),
-        (
-            TerminalContextMenuAction::ChooseSplitTarget {
-                direction: Vertical,
-                before: false,
-            },
-            "选择主机并向下分屏…",
-            "Choose host and split below…",
-        ),
-        (
-            TerminalContextMenuAction::ChooseSplitTarget {
-                direction: Vertical,
-                before: true,
-            },
-            "选择主机并向上分屏…",
-            "Choose host and split above…",
         ),
     ]
 }
@@ -359,7 +323,6 @@ impl RootView {
                 | TerminalContextMenuAction::SelectAll
                 | TerminalContextMenuAction::Search
                 | TerminalContextMenuAction::Split { .. }
-                | TerminalContextMenuAction::ChooseSplitTarget { .. }
         );
         let target_is_active = if read_only_action {
             terminal_context_view_target_is_active(self, &binding, &tools, cx)
@@ -431,8 +394,7 @@ impl RootView {
                     TerminalContextMenuOutcome::TargetChanged
                 }
             }
-            TerminalContextMenuAction::Split { .. }
-            | TerminalContextMenuAction::ChooseSplitTarget { .. } => {
+            TerminalContextMenuAction::Split { .. } => {
                 let SessionOwner::Ui { tab_id, pane_id } = &binding.owner else {
                     return TerminalContextMenuOutcome::InputRejected;
                 };
@@ -471,8 +433,7 @@ impl RootView {
                     | TerminalContextMenuAction::SelectAll => {
                         return TerminalContextMenuOutcome::InputRejected;
                     }
-                    TerminalContextMenuAction::Split { .. }
-                    | TerminalContextMenuAction::ChooseSplitTarget { .. } => {
+                    TerminalContextMenuAction::Split { .. } => {
                         return TerminalContextMenuOutcome::InputRejected;
                     }
                 };
@@ -748,7 +709,7 @@ fn terminal_right_click_requires_focus(action: TerminalRightClickAction) -> bool
     action != TerminalRightClickAction::Menu
 }
 
-/// 分屏上下文菜单按来源 pane 将四向布局或选择主机意图转为既有工作区事件。
+/// 分屏上下文菜单按来源 pane 将四向布局意图转为既有工作区事件。
 ///
 /// @author kongweiguang
 fn workspace_pane_event_for_menu_action(
@@ -761,13 +722,6 @@ fn workspace_pane_event_for_menu_action(
             direction,
             before,
         }),
-        TerminalContextMenuAction::ChooseSplitTarget { direction, before } => {
-            Some(WorkspacePaneEvent::ChooseSplitTarget {
-                pane_id,
-                direction,
-                before,
-            })
-        }
         _ => None,
     }
 }
@@ -776,11 +730,7 @@ fn workspace_pane_event_for_menu_action(
 ///
 /// @author kongweiguang
 fn split_menu_action_requires_terminal_focus(action: TerminalContextMenuAction) -> bool {
-    matches!(
-        action,
-        TerminalContextMenuAction::Split { .. }
-            | TerminalContextMenuAction::ChooseSplitTarget { .. }
-    )
+    matches!(action, TerminalContextMenuAction::Split { .. })
 }
 
 /// 菜单动作可作用于同一活动 tab 中的任意分屏；不得要求右键打开时先切换 pane 焦点。

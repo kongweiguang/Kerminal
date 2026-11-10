@@ -731,15 +731,20 @@ fn render_pane_projection(
             "正在校验分屏布局；持续未完成时可取消后重试。",
             "Checking the split layout; cancel and retry if it does not finish.",
         );
-        let cancel_preview = projection
-            .split_candidate_cancelable
-            .then(|| (probe_context.preview.clone(), reconnect_emitter));
+        // 无论测量是否已经准入，待创建分屏都必须留一个可见出口：未准入直接撤销候选，
+        // 已准入则走正常关闭入口，由 Root 取消在途创建并等待清理回执，避免占位页无法收尾。
+        let cancel = Some(PlaceholderCancel {
+            pane_id: pane_id.clone(),
+            preview: probe_context.preview.clone(),
+            discard_candidate: projection.split_candidate_cancelable,
+            emitter: reconnect_emitter,
+        });
         let probe = renderer(&projection, Some(probe_context), window, cx);
         return render_placeholder_with_probe(
             PlaceholderProbePresentation {
                 pane_id,
                 message,
-                cancel: cancel_preview,
+                cancel,
                 tab_id,
                 retry_emitter,
             },
@@ -894,13 +899,23 @@ fn render_ready_pane(
         .into_any_element()
 }
 
+/// 待创建分屏的退出动作；决定是撤销未准入候选还是走关闭入口取消在途创建。
+///
+/// @author kongweiguang
+struct PlaceholderCancel<'a> {
+    pane_id: PaneId,
+    preview: SplitCandidatePreview,
+    discard_candidate: bool,
+    emitter: &'a Rc<ReconnectEmitter>,
+}
+
 /// 将测量状态卡、候选身份与取消事件桥成组传递，避免拆分参数后发生目标串用。
 ///
 /// @author kongweiguang
 struct PlaceholderProbePresentation<'a> {
     pane_id: &'a PaneId,
     message: SharedString,
-    cancel: Option<(SplitCandidatePreview, &'a Rc<ReconnectEmitter>)>,
+    cancel: Option<PlaceholderCancel<'a>>,
     tab_id: &'a TabId,
     retry_emitter: &'a Rc<RetryEmitter>,
 }
@@ -934,8 +949,9 @@ fn render_placeholder_with_probe(
             window,
             cx,
         ));
-    if let Some((preview, emitter)) = cancel {
-        let emitter = Rc::clone(emitter);
+    if let Some(cancel) = cancel {
+        let emitter = Rc::clone(cancel.emitter);
+        let tab_id = tab_id.clone();
         body = body.child(
             div()
                 .absolute()
@@ -947,17 +963,23 @@ fn render_placeholder_with_probe(
                 .child(
                     Button::new(format!(
                         "workspace-pane-cancel-split-{}",
-                        preview.pane_id.as_str()
+                        cancel.pane_id.as_str()
                     ))
                     .compact()
                     .label(crate::locale::text("取消分屏", "Cancel split"))
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                        emitter(
+                        let event = if cancel.discard_candidate {
                             WorkspaceRenderEvent::CancelSplitCandidate {
-                                preview: preview.clone(),
-                            },
-                            cx,
-                        );
+                                preview: cancel.preview.clone(),
+                            }
+                        } else {
+                            // 已准入的创建必须经关闭入口取消，Root 才能收回在途资源并保留关闭意图。
+                            WorkspaceRenderEvent::Pane {
+                                tab_id: tab_id.clone(),
+                                event: WorkspacePaneEvent::Close(cancel.pane_id.clone()),
+                            }
+                        };
+                        emitter(event, cx);
                     })),
                 ),
         );

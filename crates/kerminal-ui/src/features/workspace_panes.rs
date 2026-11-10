@@ -200,6 +200,7 @@ pub struct WorkspacePanes {
     candidate_preview: Option<SplitCandidatePreview>,
     candidate_split_id: Option<String>,
     candidate_seed_extent: Option<Pixels>,
+    /// 只在候选尚未测量完成时抑制分隔线拖拽；它不再屏蔽标题栏或取消入口，避免卡住后无法收尾。
     candidate_interaction_locked: bool,
     pane_bounds: PaneBoundsCache,
     pane_renderer: Box<PaneRenderer>,
@@ -240,7 +241,7 @@ impl WorkspacePanes {
         }
     }
 
-    /// 切换 committed 或 view-only candidate 投影；锁只遮挡 pending 期输入，不参与 candidate 身份判断。
+    /// 切换 committed 或 view-only candidate 投影；锁只抑制 pending 期分隔线拖拽，不参与 candidate 身份判断。
     ///
     /// source_bounds 必须来自切换前同一 layout generation 的实际 pane prepaint。
     ///
@@ -474,6 +475,8 @@ impl WorkspacePanes {
     /// 关闭与目标勾选不冒泡激活 pane；群发勾选与重新打开入口共用固定槽位，保持窄分屏控制区可达。
     /// 键盘关闭只从按钮原生回调带回真实焦点来源，供 Root 在 ACK 后做受限交接。
     /// 重连和目录换代只禁用固定分屏槽位，不插入占位文字或改变终端几何。
+    /// 候选创建期间同样保留整套标题按钮：只有分屏按钮临时禁用，启动状态用固定徽标表达，
+    /// 这样工具栏不横跳，且关闭/取消分屏的入口始终可达，不会出现测量卡住后无法收尾的情况。
     ///
     /// @author kongweiguang
     fn render_pane(
@@ -505,6 +508,21 @@ impl WorkspacePanes {
         };
         let border = if active { theme.selected } else { theme.border };
 
+        // 候选创建期间分屏入口只禁用、不消失：保持槽位不变可避免窄分屏横向跳动，
+        // 同时关闭按钮继续可用，用户在测量或连接迟迟不收敛时始终能取消这次分屏。
+        let split_enabled = header_projection.split_enabled && !preview_locked;
+        let split_disabled_reason = if preview_locked {
+            crate::locale::text(
+                "分屏正在准备，请稍后再试",
+                "A split is being prepared; retry shortly",
+            )
+        } else {
+            crate::locale::text(
+                "终端目录同步中，请稍后分屏",
+                "Terminal directory syncing; split shortly",
+            )
+        };
+
         let mut header =
             div()
                 .id(format!("workspace-pane-header-{}", pane_id.as_str()))
@@ -522,7 +540,8 @@ impl WorkspacePanes {
                     theme.muted
                 })
                 .text_size(px(12.))
-                .children((pane_count >= 2 && !preview_locked).then(|| {
+                // 群发勾选属于已有会话的目标选择；候选 pane 尚无会话，只让其它 pane 的槽位保持不动。
+                .children((pane_count >= 2 && !candidate_pane).then(|| {
                     pane_broadcast_control(pane_id.clone(), header_projection.broadcast, cx)
                 }))
                 .child(
@@ -544,88 +563,99 @@ impl WorkspacePanes {
         }
 
         if candidate_pane {
-            header = header.child(crate::locale::text(
-                "正在准备新分屏…",
-                "Preparing new pane…",
-            ));
-        } else if !preview_locked {
-            header = header
-                .child(pane_session_action_button(
-                    pane_id.clone(),
-                    header_projection.session_action,
-                    header_projection.session_disconnected,
-                    cx,
-                ))
-                .child(split_button(
-                    SplitButtonSpec {
-                        id: format!("pane-split-horizontal-after-{}", pane_id.as_str()),
-                        icon: split_button_icon(SplitDirection::Horizontal),
-                        label: crate::locale::text("在右侧分屏", "Split right"),
-                        tooltip: crate::locale::text(
-                            "向右分屏；右键选择要加入的主机",
-                            "Split right with a host selected by right-click",
-                        ),
-                        pane_id: pane_id.clone(),
-                        enabled: header_projection.split_enabled,
-                        primary: SplitDirectionIntent {
-                            direction: SplitDirection::Horizontal,
-                            before: false,
-                        },
-                    },
-                    header_projection.host_picker.clone(),
-                    cx,
-                ))
-                .child(split_button(
-                    SplitButtonSpec {
-                        id: format!("pane-split-vertical-after-{}", pane_id.as_str()),
-                        icon: split_button_icon(SplitDirection::Vertical),
-                        label: crate::locale::text("在下方分屏", "Split below"),
-                        tooltip: crate::locale::text(
-                            "向下分屏；右键选择要加入的主机",
-                            "Split below with a host selected by right-click",
-                        ),
-                        pane_id: pane_id.clone(),
-                        enabled: header_projection.split_enabled,
-                        primary: SplitDirectionIntent {
-                            direction: SplitDirection::Vertical,
-                            before: false,
-                        },
-                    },
-                    header_projection.host_picker,
-                    cx,
-                ));
-
-            let close_label = if pane_count > 1 {
-                crate::locale::text("关闭分屏", "Close pane")
-            } else {
-                crate::locale::text("关闭终端标签", "Close terminal tab")
-            };
+            // 用固定宽度的短徽标代替整句占位，避免提示语挤走右侧操作按钮。
             header = header.child(
-                Button::new(format!("pane-close-{}", pane_id.as_str()))
-                    .compact()
-                    .ghost()
-                    .icon(IconName::Close)
-                    .w(px(22.))
-                    .h(px(22.))
-                    .accessibility_label(close_label.clone())
-                    .tooltip(close_label)
-                    .tab_stop(true)
-                    .on_click(cx.listener(move |_, event: &ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        if event.is_keyboard() {
-                            // GPUI 已核对按钮的按下/释放焦点代次；只在这个关闭回调读取来源，不接受 Root 对任意按钮的猜测。
-                            if let Some(close_focus) = window.focused(cx) {
-                                cx.emit(WorkspacePaneEvent::CloseFromKeyboard {
-                                    pane_id: pane_for_close.clone(),
-                                    close_focus,
-                                });
-                            }
-                        } else {
-                            cx.emit(WorkspacePaneEvent::Close(pane_for_close.clone()));
-                        }
-                    })),
+                div()
+                    .id(format!("workspace-pane-prepare-{}", pane_id.as_str()))
+                    .flex_none()
+                    .px(px(4.))
+                    .text_size(px(11.))
+                    .text_color(theme.muted)
+                    .child(crate::locale::text("准备中…", "Preparing…")),
             );
         }
+
+        header = header
+            .child(pane_session_action_button(
+                pane_id.clone(),
+                header_projection.session_action,
+                header_projection.session_disconnected,
+                cx,
+            ))
+            .child(split_button(
+                SplitButtonSpec {
+                    id: format!("pane-split-horizontal-after-{}", pane_id.as_str()),
+                    icon: split_button_icon(SplitDirection::Horizontal),
+                    label: crate::locale::text("在右侧分屏", "Split right"),
+                    tooltip: crate::locale::text(
+                        "向右分屏；右键选择要加入的主机",
+                        "Split right with a host selected by right-click",
+                    ),
+                    pane_id: pane_id.clone(),
+                    enabled: split_enabled,
+                    disabled_reason: split_disabled_reason.clone(),
+                    primary: SplitDirectionIntent {
+                        direction: SplitDirection::Horizontal,
+                        before: false,
+                    },
+                },
+                header_projection.host_picker.clone(),
+                cx,
+            ))
+            .child(split_button(
+                SplitButtonSpec {
+                    id: format!("pane-split-vertical-after-{}", pane_id.as_str()),
+                    icon: split_button_icon(SplitDirection::Vertical),
+                    label: crate::locale::text("在下方分屏", "Split below"),
+                    tooltip: crate::locale::text(
+                        "向下分屏；右键选择要加入的主机",
+                        "Split below with a host selected by right-click",
+                    ),
+                    pane_id: pane_id.clone(),
+                    enabled: split_enabled,
+                    disabled_reason: split_disabled_reason,
+                    primary: SplitDirectionIntent {
+                        direction: SplitDirection::Vertical,
+                        before: false,
+                    },
+                },
+                header_projection.host_picker,
+                cx,
+            ));
+
+        // 候选 pane 的关闭就是撤销这次未提交的分屏；Root 会先取消创建再回收占位。
+        let close_label = if candidate_pane {
+            crate::locale::text("取消分屏", "Cancel split")
+        } else if pane_count > 1 {
+            crate::locale::text("关闭分屏", "Close pane")
+        } else {
+            crate::locale::text("关闭终端标签", "Close terminal tab")
+        };
+        header = header.child(
+            Button::new(format!("pane-close-{}", pane_id.as_str()))
+                .compact()
+                .ghost()
+                .icon(IconName::Close)
+                .w(px(22.))
+                .h(px(22.))
+                .accessibility_label(close_label.clone())
+                .tooltip(close_label)
+                .tab_stop(true)
+                .on_click(cx.listener(move |_, event: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    if event.is_keyboard() {
+                        // GPUI 已核对按钮的按下/释放焦点代次；只在这个关闭回调读取来源，不接受 Root 对任意按钮的猜测。
+                        if let Some(close_focus) = window.focused(cx) {
+                            cx.emit(WorkspacePaneEvent::CloseFromKeyboard {
+                                pane_id: pane_for_close.clone(),
+                                close_focus,
+                            });
+                        }
+                    } else {
+                        cx.emit(WorkspacePaneEvent::Close(pane_for_close.clone()));
+                    }
+                })),
+        );
 
         let renderer = (self.pane_renderer)(pane_id, probe_context, window, cx);
         let preview_title = title;
@@ -740,7 +770,7 @@ fn pane_broadcast_control(
 }
 
 impl Render for WorkspacePanes {
-    /// 无效恢复布局展示可见错误；候选局部透明盾拦截分隔线，配色与工作台共享 main 投影。
+    /// 无效恢复布局展示可见错误；候选期不再覆盖整块透明盾，配色与工作台共享 main 投影。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -762,25 +792,10 @@ impl Render for WorkspacePanes {
                 .into_any_element();
         }
         let pane_count = self.layout.pane_ids().len();
-        let content = self.render_node(&self.layout.clone(), pane_count, theme, None, window, cx);
-        if self.candidate_interaction_locked {
-            div()
-                .size_full()
-                .relative()
-                .child(content)
-                .child(
-                    div()
-                        .id("workspace-candidate-interaction-shield")
-                        .absolute()
-                        .inset_0()
-                        .bg(theme.materials.workspace.opacity(0.))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(|_, _, cx| cx.stop_propagation()),
-                )
-                .into_any_element()
-        } else {
-            content
-        }
+        // 候选测量期的输入隔离由分隔线与 pane 交互的按元素禁用来完成；覆盖整块工作区的盾会连
+        // 取消分屏和标题栏关闭一起吞掉，正是卡住后无法收尾的原因，因此不再使用。
+        self.render_node(&self.layout.clone(), pane_count, theme, None, window, cx)
+            .into_any_element()
     }
 }
 
@@ -982,6 +997,8 @@ struct SplitButtonSpec {
     tooltip: SharedString,
     pane_id: PaneId,
     enabled: bool,
+    /// 禁用原因由调用方给出：目录同步和分屏准备共用同一槽位，但不能互相冒充对方的提示。
+    disabled_reason: SharedString,
     primary: SplitDirectionIntent,
 }
 
@@ -1001,6 +1018,7 @@ fn split_button(
         tooltip,
         pane_id,
         enabled,
+        disabled_reason,
         primary,
     } = spec;
     let view = cx.entity();
@@ -1028,10 +1046,7 @@ fn split_button(
             .tooltip(if enabled {
                 tooltip
             } else {
-                crate::locale::text(
-                    "终端目录同步中，请稍后分屏",
-                    "Terminal directory syncing; split shortly",
-                )
+                disabled_reason
             })
             .tab_stop(true)
             .disabled(!enabled)

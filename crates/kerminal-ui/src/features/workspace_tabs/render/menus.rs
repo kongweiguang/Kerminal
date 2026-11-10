@@ -453,6 +453,7 @@ pub(super) fn tab_kind_label(kind: &WorkspaceTabKind) -> SharedString {
         WorkspaceTabKind::Terminal => crate::locale::text("终端", "Terminal"),
         WorkspaceTabKind::SftpTransfer => crate::locale::text("传输", "Transfer"),
         WorkspaceTabKind::SftpWorkbench => crate::locale::text("SFTP", "SFTP"),
+        WorkspaceTabKind::FileWorkspace => crate::locale::text("文件工作区", "File workspace"),
         WorkspaceTabKind::WorkspaceFile => crate::locale::text("文件", "File"),
         WorkspaceTabKind::Extension(name) => {
             crate::locale::text(format!("扩展：{name}"), format!("Extension: {name}"))

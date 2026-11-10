@@ -71,7 +71,7 @@ struct TreeEntryRowView<'a> {
 
 /// 将当前 endpoint 根目录投影为 GPUI Kit 虚拟树；直接使用 Base Tree 时显式让内部列表与外层树填满浏览区域。
 /// 这样保留虚拟列表自身的滚动布局，不依赖组件兼容层隐式补充的尺寸样式。
-/// 浏览实底与普通列表保持一致，不让壁纸穿透目录文字。
+/// 树内容沿用浏览器根层的单次阅读面，行背景只表达焦点、悬停与选择状态。
 /// 加载和未读取状态不复用紧凑列表专属的主机信任操作，避免在树模式暴露不匹配的入口。
 /// 已有同目录清单时继续呈现树；首次读取只保留框架，刷新图标承担唯一的加载反馈。
 ///
@@ -159,7 +159,6 @@ pub(super) fn render_tree_content(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .bg(theme.panel)
         .on_key_down(cx.listener(move |pane, event: &KeyDownEvent, window, cx| {
             let key = event.keystroke.key.to_ascii_lowercase();
             let modifiers = event.keystroke.modifiers;
@@ -299,7 +298,7 @@ fn render_tree_row(
 }
 
 /// 树节点按完整 endpoint 展示；非目录在展开位保留同宽空白，让文件类型图标只出现一次且名称对齐。
-/// 默认行、选中和悬停均使用成对主题令牌；右键菜单与列表共用精简后的命令范围。
+/// 默认行透出父层，选中表面优先于悬停；右键菜单与列表共用精简后的命令范围。
 /// 复选框整个命中区由 Kit Base 处理单次切换并隔离树行事件，指示器显式沿用文件面板主题。
 /// 展开箭头保留 Kit 的按下展开与聚焦，只阻断点击冒泡，避免同次操作再触发行的批量选择。
 /// 三类树行共用密度和 rem 投影，虚拟树按首行测量时不会发生高度偏移。
@@ -438,14 +437,12 @@ fn render_entry_row(view: TreeEntryRowView<'_>) -> AnyElement {
         .border_b_1()
         .border_color(theme.border)
         .rounded_sm()
-        .bg(if selected {
-            theme.selected
-        } else if focused.is_selected() {
-            theme.hover
-        } else {
-            theme.panel
-        })
-        .hover(|style| style.bg(theme.hover))
+        .bg(browser::file_entry_surface(
+            theme,
+            selected,
+            focused.is_selected(),
+        ))
+        .hover(|style| style.bg(browser::file_entry_surface(theme, selected, true)))
         .when(focused.is_selected(), |style| {
             style.border_color(theme.accent.opacity(0.65))
         })
@@ -468,11 +465,7 @@ fn render_entry_row(view: TreeEntryRowView<'_>) -> AnyElement {
                 .text_ellipsis()
                 .text_size(theme.text_body)
                 .font_weight(gpui_kit::FontWeight::MEDIUM)
-                .text_color(if selected {
-                    theme.selected_foreground
-                } else {
-                    theme.foreground
-                })
+                .text_color(theme.foreground)
                 .child(entry.name.clone()),
         );
 
@@ -541,7 +534,7 @@ fn render_entry_row(view: TreeEntryRowView<'_>) -> AnyElement {
     .into_any_element()
 }
 
-/// 失败目录行只提供明确重试，并与虚拟树的其他行保持同高。
+/// 失败目录行只提供明确重试，并与虚拟树的其他行保持同高；悬停沿用轻叠层，不加实底。
 ///
 /// @author kongweiguang
 fn render_retry_row(
@@ -565,7 +558,7 @@ fn render_retry_row(
         .items_center()
         .gap_2()
         .cursor_pointer()
-        .hover(|style| style.bg(theme.hover))
+        .hover(|style| style.bg(theme.surface_hover()))
         .text_size(theme.text_sm)
         .text_color(theme.warning)
         .child(IconName::RefreshCw)

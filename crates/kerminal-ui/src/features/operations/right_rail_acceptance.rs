@@ -22,6 +22,37 @@ use super::{
 };
 
 impl OperationsView {
+    /// 布局验收允许正常周期采样，但要求保留同目标快照和监控世代，防止把重绑或重启当成正常 tick。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn right_rail_acceptance_server_lifecycle(
+        &self,
+        host_id: &HostId,
+    ) -> Result<(u64, u64, u64), String> {
+        self.validate_acceptance_target(OperationsSection::ServerInfo, host_id)?;
+        let expected = ServerInfoTarget::Ssh {
+            host_id: host_id.clone(),
+        };
+        let retained = self.active
+            && self.server_info_target == expected
+            && self.server.error().is_none()
+            && matches!(
+                self.server.phase(),
+                SectionPhase::Ready | SectionPhase::Loading
+            )
+            && self.server.data().is_some_and(|snapshot| {
+                snapshot.target == expected && snapshot.sample_times.fast_at_unix_ms.is_some()
+            });
+        if !retained {
+            return Err("布局变化期间服务器采样目标或已有快照丢失".to_owned());
+        }
+        Ok((
+            self.target_generation,
+            self.server_generation,
+            self.server_monitor_revision,
+        ))
+    }
+
     /// 只对当前固定 SSH 面板返回完成态，避免验收把 dashboard 或旧目标快照当作右栏结果。
     ///
     /// @author kongweiguang

@@ -116,7 +116,8 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     }
     let catalogs = startup.catalogs("zh-CN")?;
     let migration = bootstrap::migration_service(&config, None, catalogs.1.clone());
-    bootstrap::run_after_migration(&migration, |_| ()).inspect_err(report_migration_io_error)?;
+    bootstrap::run_after_migration(&migration, false, |_| ())
+        .inspect_err(report_migration_io_error)?;
     let mut composition = runtime.block_on(DesktopComposition::build_with_plugin_catalogs(
         runtime.handle(),
         &config,

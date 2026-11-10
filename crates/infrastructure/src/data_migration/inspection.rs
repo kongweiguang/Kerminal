@@ -32,6 +32,7 @@ const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const CURRENT_SQLITE_SCHEMA: u32 = 3;
 
 /// 已知上一契约走显式 planner，当前契约校验新增持久状态；所有检查保持无写入与无数据库连接。
+/// @author kongweiguang
 pub(super) fn inspect_root(
     root: &Path,
     legacy_window_state: Option<&Path>,
@@ -68,6 +69,7 @@ pub(super) fn inspect_root(
             if let Err(blocker) = operational_state::validate_current_operational_state(root) {
                 blockers.push(blocker);
             }
+            inspect_current_workspace(root, &mut blockers)?;
             return Ok(inspection(
                 if blockers.is_empty() {
                     DataMigrationReadiness::Current
@@ -191,6 +193,7 @@ pub(super) fn inspect_root(
 }
 
 /// 当前 marker 快速路径仍验证新增恢复文档；上一契约绝不通过该路径启动普通 runtime。
+/// @author kongweiguang
 pub(super) fn inspect_current_fast_path(root: &Path) -> AppResult<Option<DataMigrationInspection>> {
     if !path_exists_without_following(root)? {
         return Ok(None);
@@ -213,6 +216,7 @@ pub(super) fn inspect_current_fast_path(root: &Path) -> AppResult<Option<DataMig
             if let Err(blocker) = operational_state::validate_current_operational_state(root) {
                 journal_scan.blockers.push(blocker);
             }
+            inspect_current_workspace(root, &mut journal_scan.blockers)?;
             let readiness = if journal_scan.blockers.is_empty() {
                 DataMigrationReadiness::Current
             } else {
@@ -567,6 +571,24 @@ fn inspect_old_storage_transactions(
         } else {
             legacy_transactions::inspect_archives(root, blockers)?;
         }
+    }
+    Ok(())
+}
+
+/// 当前 marker 仍只读核对工作区；损坏、未来内部状态或旧顶层描述不能随 runtime 启动被覆盖。
+/// @author kongweiguang
+fn inspect_current_workspace(
+    root: &Path,
+    blockers: &mut Vec<DataMigrationBlocker>,
+) -> AppResult<()> {
+    let relative = Path::new("workspace/session.json");
+    let Some(bytes) = read_optional_regular_file(root, relative, MAX_DOCUMENT_BYTES)? else {
+        return Ok(());
+    };
+    if workspace::validate_current_workspace_bytes(&bytes).is_err() {
+        blockers.push(DataMigrationBlocker::ManagedDataInvalid {
+            relative_path: "workspace/session.json".to_owned(),
+        });
     }
     Ok(())
 }

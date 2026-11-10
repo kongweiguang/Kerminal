@@ -334,6 +334,16 @@ impl RootView {
                         return Err(AppError::not_found("文件编辑服务尚未配置"));
                     }
                     self.set_center_panel(CenterPanel::Editor, window, cx);
+                    // 独立编辑页仍保留原文档导航；文件宿主只使用外层一条标签带。
+                    let embedded = self.workspace_controller.as_ref().is_some_and(|controller| {
+                        let snapshot = controller.snapshot();
+                        snapshot.terminal_tabs.iter().any(|tab| snapshot.active_tab_id.as_ref() == Some(tab.id()) && matches!(tab, kerminal_application::workspace::WorkspaceSessionTab::FileWorkspace { .. }))
+                    });
+                    if let Some(editor) = self.file_editor_workspace.clone() {
+                        editor.update(cx, |editor, cx| {
+                            editor.set_embedded_navigation(embedded, cx)
+                        });
+                    }
                 }
                 BuiltinPageRoute::Preferences => {
                     self.set_center_panel(CenterPanel::Preferences, window, cx);
@@ -390,7 +400,8 @@ impl RootView {
                                             WorkspaceSessionTab::SftpTransfer { .. }
                                         ) | (
                                             BuiltinPageRoute::WorkspaceFile,
-                                            WorkspaceSessionTab::WorkspaceFile { .. }
+                                            WorkspaceSessionTab::FileWorkspace { .. }
+                                                | WorkspaceSessionTab::WorkspaceFile { .. }
                                         )
                                     )
                                 })
@@ -435,6 +446,10 @@ impl RootView {
                                     .find(|tab| tab.id() == &tab_id)
                             })
                             .is_some_and(|tab| match tab {
+                                WorkspaceSessionTab::FileWorkspace { state, .. } => matches!(
+                                    state.active_item(),
+                                    Some(kerminal_application::workspace::FileWorkspaceItem::Document { .. })
+                                ),
                                 WorkspaceSessionTab::WorkspaceFile { .. } => true,
                                 WorkspaceSessionTab::Terminal { .. }
                                 | WorkspaceSessionTab::SftpTransfer { .. }

@@ -134,12 +134,27 @@ impl RootView {
                                 | WorkspaceSessionTab::Extension { .. }
                         )
                     {
-                        // 文件草稿门禁已通过；不能重入通用路径再次发出可取消的询问。
-                        root.complete_nonterminal_workspace_tab_close(
-                            operation_id.clone(),
-                            tab.id().clone(),
-                            cx,
-                        );
+                        // 文件编辑组仅在准备态保留正文；工具全部成功后才进入工作区提交。
+                        let prepared_group =
+                            root.file_editor_workspace.as_ref().is_some_and(|editor| {
+                                editor
+                                    .read(cx)
+                                    .has_prepared_workspace_group_close(operation_id)
+                            });
+                        if prepared_group {
+                            root.finish_prepared_file_workspace_group_close(
+                                operation_id.clone(),
+                                tab.id().clone(),
+                                cx,
+                            );
+                        } else {
+                            // 文件草稿门禁已通过；不能重入通用路径再次发出可取消的询问。
+                            root.complete_nonterminal_workspace_tab_close(
+                                operation_id.clone(),
+                                tab.id().clone(),
+                                cx,
+                            );
+                        }
                     } else {
                         root.apply_workspace_resource_operation_with_focus(
                             operation,
@@ -180,6 +195,90 @@ impl RootView {
         };
         if !self.defer_plugin_tool_tab_close(&operation, None, None, cx) {
             self.complete_nonterminal_workspace_tab_close(operation_id, tab_id, cx);
+        }
+    }
+
+    /// 编辑器组只完成授权准备；先释放工具，再由同一同步回合核对正文、提交工作区并释放缓冲。
+    ///
+    /// @author kongweiguang
+    pub(super) fn handle_workspace_file_group_prepared(
+        &mut self,
+        operation_id: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let operation = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.pending_resource_operation())
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    WorkspaceResourceOperation::CloseTab {
+                        operation_id: current,
+                        tab,
+                        ..
+                    } if current == &operation_id
+                        && matches!(tab.as_ref(), WorkspaceSessionTab::FileWorkspace { .. })
+                )
+            })
+            .cloned();
+        let Some(operation) = operation else {
+            return;
+        };
+        if !self.defer_plugin_tool_tab_close(&operation, None, None, cx)
+            && let WorkspaceResourceOperation::CloseTab {
+                operation_id,
+                tab_id,
+                ..
+            } = operation
+        {
+            self.finish_prepared_file_workspace_group_close(operation_id, tab_id, cx);
+        }
+    }
+
+    /// 工具关闭完成后线性复核准备票据：正文变化即撤销，工作区未提交则原样保留全部缓冲。
+    ///
+    /// @author kongweiguang
+    pub(super) fn finish_prepared_file_workspace_group_close(
+        &mut self,
+        operation_id: String,
+        tab_id: TabId,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.file_editor_workspace.clone();
+        if let Some(editor) = &editor
+            && !editor
+                .read(cx)
+                .revalidate_workspace_group_close(&operation_id, cx)
+        {
+            editor.update(cx, |editor, cx| {
+                editor.abort_prepared_workspace_group_close(&operation_id, cx);
+            });
+            self.complete_workspace_resource_failure(
+                &operation_id,
+                crate::locale::text(
+                    "文件内容在关闭核对后已变化，关闭未执行。",
+                    "A document changed after the close check; nothing was closed.",
+                ),
+                cx,
+            );
+            return;
+        }
+        self.complete_nonterminal_workspace_tab_close(operation_id.clone(), tab_id, cx);
+        let still_pending = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.pending_resource_operation())
+            .is_some_and(|current| current.operation_id() == operation_id);
+        if still_pending {
+            // 工作区没有提交成功，准备票据和正文都留给用户显式重试。
+            return;
+        }
+        if let Some(editor) = editor {
+            editor.update(cx, |editor, cx| {
+                editor.release_workspace_group_close(&operation_id, cx);
+            });
         }
     }
 

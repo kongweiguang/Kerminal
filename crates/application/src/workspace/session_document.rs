@@ -12,6 +12,9 @@ use serde_json::{Map, Value, json};
 
 use super::WorkspaceSessionInvalidReason;
 
+mod file_workspace;
+pub use file_workspace::{FileWorkspaceItem, FileWorkspaceState};
+
 /// 标签组 ID 在冻结的 v3 中是对象键；应用层 newtype 防止误与 tab/pane 身份互换。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WorkspaceTabGroupId(String);
@@ -185,6 +188,15 @@ pub enum WorkspaceSessionTab {
         initial_right_path: Option<String>,
         initial_right_selection: Option<String>,
     },
+    /// 同一文件系统的唯一持久 owner；WorkspaceFile 仅保留为内部描述和迁移输入。
+    FileWorkspace {
+        id: TabId,
+        tab_group_id: Option<WorkspaceTabGroupId>,
+        title: String,
+        machine_id: String,
+        target: WorkspaceTargetRef,
+        state: FileWorkspaceState,
+    },
     WorkspaceFile {
         id: TabId,
         tab_group_id: Option<WorkspaceTabGroupId>,
@@ -222,6 +234,7 @@ impl WorkspaceSessionTab {
         match self {
             Self::Terminal { id, .. }
             | Self::SftpTransfer { id, .. }
+            | Self::FileWorkspace { id, .. }
             | Self::WorkspaceFile { id, .. }
             | Self::Extension { id, .. }
             | Self::Unsupported { id, .. } => id,
@@ -234,6 +247,7 @@ impl WorkspaceSessionTab {
         match self {
             Self::Terminal { title, .. }
             | Self::SftpTransfer { title, .. }
+            | Self::FileWorkspace { title, .. }
             | Self::WorkspaceFile { title, .. }
             | Self::Extension { title, .. }
             | Self::Unsupported { title, .. } => title,
@@ -246,6 +260,7 @@ impl WorkspaceSessionTab {
         match self {
             Self::Terminal { tab_group_id, .. }
             | Self::SftpTransfer { tab_group_id, .. }
+            | Self::FileWorkspace { tab_group_id, .. }
             | Self::WorkspaceFile { tab_group_id, .. }
             | Self::Extension { tab_group_id, .. }
             | Self::Unsupported { tab_group_id, .. } => tab_group_id.as_ref(),
@@ -276,6 +291,29 @@ pub enum WorkspaceFileSource {
     ComposeYaml,
     Workspace,
     Local,
+}
+
+impl WorkspaceFileSource {
+    /// 明确协议来源必须与文件系统目标一致；语义入口不限定协议，不可用目标仍保留原有恢复错误。
+    /// @author kongweiguang
+    fn validate_target(
+        self,
+        target: &WorkspaceTargetRef,
+    ) -> Result<(), WorkspaceSessionInvalidReason> {
+        match (self, target) {
+            (Self::Workspace | Self::ComposeYaml, _)
+            | (Self::Local, WorkspaceTargetRef::Local { .. })
+            | (Self::Sftp, WorkspaceTargetRef::Ssh { .. })
+            | (Self::Container, WorkspaceTargetRef::DockerContainer { .. })
+            | (
+                _,
+                WorkspaceTargetRef::Unavailable { .. }
+                | WorkspaceTargetRef::Telnet { .. }
+                | WorkspaceTargetRef::Serial { .. },
+            ) => Ok(()),
+            _ => Err(WorkspaceSessionInvalidReason::InvalidSchema),
+        }
+    }
 }
 
 /// 完整终端工作区的 typed 投影；shell/sidebar 等其他上下文仍留在原 JSON。
@@ -317,7 +355,7 @@ impl WorkspacePinnedContainer {
 }
 
 impl WorkspaceSessionSnapshot {
-    /// 持久化前集中验证 IDs、组引用和每个递归 layout，避免 Root/UI 缓存越界。
+    /// 统一验证运行态和持久态的结构，临时资源经投影剔除前仍可携带运行态占位目标。
     /// @author kongweiguang
     pub fn validate(&self) -> Result<(), WorkspaceSessionInvalidReason> {
         let mut pinned_container_ids = BTreeSet::new();
@@ -361,7 +399,27 @@ impl WorkspaceSessionSnapshot {
         }
 
         let mut referenced_panes = BTreeSet::new();
+        let mut file_source_ids = BTreeSet::new();
+        let mut file_item_ids = BTreeSet::new();
         for tab in &self.terminal_tabs {
+            if let WorkspaceSessionTab::FileWorkspace { id, state, .. } = tab {
+                state.validate()?;
+                for item in &state.items {
+                    if !file_item_ids.insert(item.id().clone())
+                        || (item.id() != id && tab_ids.contains(item.id()))
+                    {
+                        return Err(WorkspaceSessionInvalidReason::InvalidSchema);
+                    }
+                }
+                for source_id in &state.source_tab_ids {
+                    // 来源别名只能属于一个 owner，且不能冒用另一项仍存活的顶层身份。
+                    if !file_source_ids.insert(source_id.clone())
+                        || (source_id != id && tab_ids.contains(source_id))
+                    {
+                        return Err(WorkspaceSessionInvalidReason::InvalidSchema);
+                    }
+                }
+            }
             if let WorkspaceSessionTab::Extension { content_id, .. } = tab
                 && (content_id.trim().is_empty() || content_id.chars().any(char::is_control))
             {
@@ -393,6 +451,27 @@ impl WorkspaceSessionSnapshot {
                 .and_then(WorkspaceSessionTab::terminal_layout);
             if !active_layout.is_some_and(|layout| layout.contains_pane(focused_pane_id)) {
                 return Err(WorkspaceSessionInvalidReason::InvalidSchema);
+            }
+        }
+        Ok(())
+    }
+
+    /// codec 读写和迁移共用持久目标门禁；临时容器的运行态占位目标不参与此校验。
+    /// @author kongweiguang
+    fn validate_persistent_file_sources(&self) -> Result<(), WorkspaceSessionInvalidReason> {
+        for tab in &self.terminal_tabs {
+            match tab {
+                WorkspaceSessionTab::FileWorkspace { target, state, .. } => {
+                    for item in &state.items {
+                        if let FileWorkspaceItem::Document { source, .. } = item {
+                            source.validate_target(target)?;
+                        }
+                    }
+                }
+                WorkspaceSessionTab::WorkspaceFile { target, source, .. } => {
+                    source.validate_target(target)?;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -469,6 +548,7 @@ impl WorkspaceSessionDocument {
         snapshot: &WorkspaceSessionSnapshot,
     ) -> Result<(), WorkspaceSessionInvalidReason> {
         snapshot.validate()?;
+        snapshot.validate_persistent_file_sources()?;
         let mut next = self.value.clone();
         let root = next
             .as_object_mut()
@@ -593,6 +673,7 @@ fn decode_workspace_snapshot(
         tab_groups: groups,
     };
     snapshot.validate()?;
+    snapshot.validate_persistent_file_sources()?;
     Ok(snapshot)
 }
 
@@ -1023,6 +1104,20 @@ fn decode_tab(value: &Value) -> Result<WorkspaceSessionTab, WorkspaceSessionInva
             initial_right_path: optional_string(object.get("initialRightPath"))?,
             initial_right_selection: optional_string(object.get("initialRightSelection"))?,
         }),
+        Some("fileWorkspace") => Ok(WorkspaceSessionTab::FileWorkspace {
+            id,
+            tab_group_id,
+            title,
+            machine_id: required_string(object.get("machineId"))?,
+            target: object
+                .get("target")
+                .map(decode_target)
+                .transpose()?
+                .unwrap_or_else(|| {
+                    unavailable_target(&Value::Null, WorkspaceTargetUnavailableReason::Malformed)
+                }),
+            state: file_workspace::decode_state(object)?,
+        }),
         Some("workspaceFile") => Ok(WorkspaceSessionTab::WorkspaceFile {
             id,
             tab_group_id,
@@ -1437,6 +1532,22 @@ fn merge_tab(
                 "initialRightSelection",
                 initial_right_selection.as_deref(),
             );
+        }
+        WorkspaceSessionTab::FileWorkspace {
+            id,
+            tab_group_id,
+            title,
+            machine_id,
+            target,
+            state,
+        } => {
+            set_common_tab_fields(object, id, tab_group_id.as_ref(), title, Some(machine_id));
+            object.insert("kind".to_owned(), json!("fileWorkspace"));
+            object.insert("stateVersion".to_owned(), json!(1));
+            let target_value = merge_target(object.get("target"), target);
+            object.insert("target".to_owned(), target_value);
+            let state_value = file_workspace::merge_state(object.get("state"), state)?;
+            object.insert("state".to_owned(), state_value);
         }
         WorkspaceSessionTab::WorkspaceFile {
             id,

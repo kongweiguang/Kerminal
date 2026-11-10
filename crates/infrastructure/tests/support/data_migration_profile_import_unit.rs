@@ -30,6 +30,7 @@ fn legacy_source(root: &Path) -> String {
 }
 
 /// 预演不落盘，提交保留分组和密文，重复导入复用来源身份而不是重复创建主机。
+/// @author kongweiguang
 #[test]
 fn import_is_read_only_when_previewed_and_idempotent_after_commit() {
     let parent = tempfile::tempdir().unwrap();
@@ -40,7 +41,7 @@ fn import_is_read_only_when_previewed_and_idempotent_after_commit() {
     let original = legacy_source(&source);
     fs::write(
         target.join(".kerminal-format.toml"),
-        b"data_format = 4\nmigration_contract = 3\n",
+        b"data_format = 4\nmigration_contract = 4\n",
     )
     .unwrap();
     let repository = FileDataMigrationRepository::new(&target);
@@ -93,6 +94,7 @@ fn import_is_read_only_when_previewed_and_idempotent_after_commit() {
 }
 
 /// 同来源主机编辑后不能被后续导入覆盖，也不能换一个 ID 重复创建。
+/// @author kongweiguang
 #[test]
 fn edited_imported_host_blocks_repeat_without_overwriting() {
     let parent = tempfile::tempdir().unwrap();
@@ -103,7 +105,7 @@ fn edited_imported_host_blocks_repeat_without_overwriting() {
     legacy_source(&source);
     fs::write(
         target.join(".kerminal-format.toml"),
-        b"data_format = 4\nmigration_contract = 3\n",
+        b"data_format = 4\nmigration_contract = 4\n",
     )
     .unwrap();
     let repository = FileDataMigrationRepository::new(&target);
@@ -122,6 +124,7 @@ fn edited_imported_host_blocks_repeat_without_overwriting() {
 }
 
 /// 来源和目标指向相同或嵌套目录时阻止自导入和复制环。
+/// @author kongweiguang
 #[test]
 fn import_rejects_same_or_nested_roots() {
     let root = tempfile::tempdir().unwrap();
@@ -129,7 +132,7 @@ fn import_rejects_same_or_nested_roots() {
     fs::create_dir(&nested).unwrap();
     fs::write(
         root.path().join(".kerminal-format.toml"),
-        b"data_format = 4\nmigration_contract = 3\n",
+        b"data_format = 4\nmigration_contract = 4\n",
     )
     .unwrap();
     let repository = FileDataMigrationRepository::new(root.path());

@@ -852,6 +852,10 @@ pub struct RootView {
     _updates_event_subscription: gpui_kit::Subscription,
     workspace_session_state: Option<kerminal_application::workspace::WorkspaceSessionLoad>,
     workspace_session_error: Option<SharedString>,
+    /// 保留保存或只读核对失败，避免普通短时提示消失后失去恢复入口。
+    workspace_persistence_error: Option<SharedString>,
+    /// 只允许一笔只读核对；回执仍须匹配发起时的持久化状态。
+    workspace_persistence_readback_in_flight: bool,
     /// 已验证的 v3 typed reducer 与运行态 pane 映射共同决定恢复、布局和持久化。
     workspace_controller: Option<WorkspaceController>,
     workspace_runtime: WorkspaceRuntime,
@@ -2770,7 +2774,24 @@ impl RootView {
                     }
                 }
             }
+            WorkspaceSessionTab::FileWorkspace { .. } => {
+                self.center_panel = CenterPanel::Editor;
+                self.ensure_workspace_file_tab(tab_id, window, cx);
+                self.activate_host_file_workspace(tab_id, window, cx);
+                if request_focus
+                    && !self.tool_panel_overlay_focus_is_blocked(window, cx)
+                    && let Some(editor) = self.file_editor_workspace.clone()
+                {
+                    editor.update(cx, |editor, cx| {
+                        editor.focus_active_editor(window, cx);
+                    });
+                }
+                self.set_reported_focus_session(None, cx);
+            }
             WorkspaceSessionTab::WorkspaceFile { .. } => {
+                if let Some(editor) = self.file_editor_workspace.clone() {
+                    editor.update(cx, |editor, cx| editor.set_embedded_navigation(false, cx));
+                }
                 self.center_panel = CenterPanel::Editor;
                 self.ensure_workspace_file_tab(tab_id, window, cx);
                 self.activate_workspace_file_tab(tab_id, cx);
@@ -3778,6 +3799,20 @@ impl RootView {
                         let projection = editor.read(cx).workspace_projection();
                         root.push_editor_workspace_projection(projection, window, cx);
                     }
+                    FileEditorWorkspaceEvent::WorkspaceGroupClosePrepared { operation_id } => {
+                        root.handle_workspace_file_group_prepared(operation_id.clone(), window, cx);
+                    }
+                    FileEditorWorkspaceEvent::WorkspaceGroupCloseResolved {
+                        operation_id,
+                        closed,
+                    } => {
+                        root.handle_workspace_file_group_close_result(
+                            operation_id.clone(),
+                            *closed,
+                            window,
+                            cx,
+                        );
+                    }
                     FileEditorWorkspaceEvent::WorkspaceTabCloseResolved {
                         operation_id,
                         endpoint,
@@ -4002,6 +4037,8 @@ impl RootView {
             _updates_event_subscription: updates_event_subscription,
             workspace_session_state: None,
             workspace_session_error: None,
+            workspace_persistence_error: None,
+            workspace_persistence_readback_in_flight: false,
             workspace_controller: None,
             workspace_runtime: WorkspaceRuntime::default(),
             workspace_files: workspace_files::WorkspaceFileRuntime::default(),
@@ -7078,6 +7115,9 @@ impl Render for RootView {
                 .min_h(px(0.))
                 .child(workbench),
         );
+        if let Some(recovery) = self.render_workspace_persistence_recovery(window, cx) {
+            workbench_shell = workbench_shell.child(recovery);
+        }
         if !self.preferences_modal_open
             && !self.connections_modal_open
             && let Some(quick_open) = self.quick_open_view.clone()
@@ -7295,6 +7335,10 @@ fn recovery_banner_height(state: &ConfigurationRecoveryState) -> f32 {
     }
     RECOVERY_BANNER_HEADER_HEIGHT + RECOVERY_ISSUE_ROW_HEIGHT * state.issues.len() as f32
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/workspace_persistence_recovery_extra.rs"]
+mod workspace_persistence_recovery_extra_tests;
 
 #[cfg(test)]
 #[path = "../tests/unit/root_commands_session_binding.rs"]

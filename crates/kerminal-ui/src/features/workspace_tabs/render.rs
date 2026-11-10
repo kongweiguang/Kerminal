@@ -4,11 +4,12 @@
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
-use gpui_kit::base::ElementExt as _;
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable as _,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, Render, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Window, WindowControlArea,
+    StatefulInteractiveElement as _, StyleRefinement, TestSupportExt as _, Window,
+    WindowControlArea,
+    base::ElementExt as _,
     component::button::{Button, ButtonVariants as _},
     component::tooltip::Tooltip,
     component::{
@@ -459,8 +460,10 @@ impl WorkspaceTabs {
         let drag_over_bounds = drop_bounds.clone();
         let on_drop_bounds = drop_bounds.clone();
 
+        // 重启验收通过原生快照核对 Tab 语义与真实布局；test_support 在生产构建是零成本包装。
         let label = div()
             .id(format!("workspace-tab-label-{}", tab_id.as_str()))
+            .test_support()
             .track_focus(&focus_handle)
             .role(gpui_kit::Role::Tab)
             .aria_label(full_title.clone())

@@ -649,6 +649,137 @@ fn current_guide_transaction_recovers_after_pending_publish_interruption() {
     );
 }
 
+/// 契约 3 的在途计划先按原 after 前滚，再另立聚合事务，不能用新 planner 替换旧恢复材料。
+/// @author kongweiguang
+#[test]
+fn interrupted_file_tabs_contract_resumes_then_aggregates_with_both_backups() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("workspace")).unwrap();
+    let before = serde_json::to_vec(&serde_json::json!({
+        "version":3,"sidebarMachines":[],"terminalPanes":[],"activeTabId":"b","focusedPaneId":"",
+        "terminalTabs":[
+            {"kind":"workspaceFile","id":"a","title":"A","machineId":"host:server","target":{"kind":"ssh","hostId":"server"},"path":"/etc/a","access":"editable","source":"sftp"},
+            {"kind":"workspaceFile","id":"b","title":"B","machineId":"host:server","target":{"kind":"ssh","hostId":"server"},"path":"/etc/b","access":"readonly","source":"composeYaml"}
+        ]
+    })).unwrap();
+    fs::write(root.path().join("workspace/session.json"), &before).unwrap();
+    let mut original_after: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    original_after["oldJournalEvidence"] = serde_json::json!({"keep":true});
+    let after = serde_json::to_vec(&original_after).unwrap();
+    let operation_id = Uuid::new_v4().to_string();
+    journal::ensure_directory(
+        root.path(),
+        &journal::operation_directory(root.path(), &operation_id),
+    )
+    .unwrap();
+    let mut previous = prepare_file_journal(
+        root.path(),
+        &operation_id,
+        vec![
+            FileEdit {
+                relative_path: "workspace/session.json".into(),
+                before: Some(before.clone()),
+                after: after.clone(),
+            },
+            FileEdit {
+                relative_path: marker::MARKER_FILE_NAME.into(),
+                before: None,
+                after: marker::file_tabs_marker_bytes(),
+            },
+        ],
+        None,
+    )
+    .unwrap();
+    journal::write_journal(root.path(), &previous, true).unwrap();
+    assert!(
+        resume_journal_with_hook(root.path(), &mut previous, |point| {
+            if point == FaultPoint::AfterManagedPending(0) {
+                Err(AppError::conflict("注入契约 3 中断"))
+            } else {
+                Ok(())
+            }
+        })
+        .is_err()
+    );
+    assert_eq!(
+        journal::inspect_journals(root.path())
+            .unwrap()
+            .target_migration_contract,
+        Some(3)
+    );
+    let repository = FileDataMigrationRepository::new(root.path());
+    let report = repository.migrate().expect("旧事务恢复后升级聚合契约");
+    assert!(report.resumed);
+    assert_eq!(report.backup_relative_paths.len(), 2);
+    assert_eq!(
+        fs::read(
+            root.path()
+                .join(&report.backup_relative_paths[0])
+                .join("before/managed/workspace/session.json")
+        )
+        .unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read(
+            root.path()
+                .join(&report.backup_relative_paths[1])
+                .join("before/managed/workspace/session.json")
+        )
+        .unwrap(),
+        after
+    );
+    let current: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("workspace/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(current["terminalTabs"].as_array().unwrap().len(), 1);
+    assert_eq!(current["terminalTabs"][0]["id"], "b");
+    assert_eq!(
+        current["terminalTabs"][0]["state"]["sourceTabIds"],
+        serde_json::json!(["a", "b"])
+    );
+    assert_eq!(current["oldJournalEvidence"]["keep"], true);
+    assert_eq!(
+        repository.inspect().unwrap().readiness,
+        DataMigrationReadiness::Current
+    );
+    assert_eq!(
+        repository.migrate().unwrap().outcome,
+        DataMigrationOutcome::AlreadyCurrent
+    );
+}
+
+/// 工作区 CAS 冲突保留第三方改动与原 journal，不能发布 marker 冒称聚合完成。
+/// @author kongweiguang
+#[test]
+fn file_workspace_transaction_cas_conflict_preserves_external_bytes_and_journal() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("workspace")).unwrap();
+    let before =
+        br#"{"version":3,"sidebarMachines":[],"terminalPanes":[],"terminalTabs":[]}"#.to_vec();
+    fs::write(root.path().join("workspace/session.json"), &before).unwrap();
+    let operation_id = Uuid::new_v4().to_string();
+    journal::ensure_directory(
+        root.path(),
+        &journal::operation_directory(root.path(), &operation_id),
+    )
+    .unwrap();
+    let active = prepare_file_journal(root.path(), &operation_id, vec![
+        FileEdit { relative_path:"workspace/session.json".into(), before:Some(before), after:br#"{"version":3,"sidebarMachines":[],"terminalPanes":[],"terminalTabs":[],"planned":true}"#.to_vec() },
+        FileEdit { relative_path:marker::MARKER_FILE_NAME.into(), before:None, after:marker::current_marker_bytes() },
+    ], None).unwrap();
+    journal::write_journal(root.path(), &active, true).unwrap();
+    let third = b"third-party workspace bytes";
+    fs::write(root.path().join("workspace/session.json"), third).unwrap();
+    assert!(resume_journal(root.path(), active).is_err());
+    assert_eq!(
+        fs::read(root.path().join("workspace/session.json")).unwrap(),
+        third
+    );
+    assert!(!root.path().join(marker::MARKER_FILE_NAME).exists());
+    assert!(journal::read_active_journal(root.path()).unwrap().is_some());
+}
+
 /// 使用完整有效配置准备 contract 1 原计划，避免新版 planner 替代中断事务已经发布的 after。
 fn previous_contract_transaction(root: &Path) -> MigrationJournal {
     fs::create_dir_all(root).expect("创建隔离迁移根");

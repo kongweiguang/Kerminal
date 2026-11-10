@@ -25,9 +25,13 @@ use super::{
 };
 use crate::features::files::FileTargetNameLookup;
 
+#[path = "editor_workspace_group_close.rs"]
+mod group_close_tests;
+
 /// 监听真实 Entity 事件并读取当时投影，避免只断言内部字段而漏掉 Root 接收的变化。
 struct ProjectionObserver {
     snapshots: Vec<EditorWorkspaceProjection>,
+    events: Vec<FileEditorWorkspaceEvent>,
     _subscription: Subscription,
 }
 
@@ -37,6 +41,7 @@ impl ProjectionObserver {
     /// @author kongweiguang
     fn new(editor: &Entity<FileEditorWorkspace>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(editor, |observer, editor, event, cx| {
+            observer.events.push(event.clone());
             if matches!(event, FileEditorWorkspaceEvent::WorkspaceProjectionChanged) {
                 observer
                     .snapshots
@@ -45,6 +50,7 @@ impl ProjectionObserver {
         });
         Self {
             snapshots: Vec::new(),
+            events: Vec::new(),
             _subscription: subscription,
         }
     }

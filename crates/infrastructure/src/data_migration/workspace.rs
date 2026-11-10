@@ -9,9 +9,11 @@ use serde_json::{Value, json};
 
 use super::FileEdit;
 
+mod file_workspace;
+
 const SESSION_RELATIVE_PATH: &str = "workspace/session.json";
 
-/// 只补已知旧 v3 缺失/null 字段，再由当前 codec 完整校验；未知值和扩展字段原样保留。
+/// 只在独立迁移中补齐已知缺省并聚合旧文件标签；普通 reader 不承担兼容写入。
 ///
 /// @author kongweiguang
 pub(super) fn normalize_workspace_bytes(source: &[u8]) -> AppResult<Option<Vec<u8>>> {
@@ -43,12 +45,39 @@ pub(super) fn normalize_workspace_bytes(source: &[u8]) -> AppResult<Option<Vec<u
 
     WorkspaceSessionDocument::try_from_value(value.clone())
         .map_err(|_| AppError::configuration_corrupt("工作区会话"))?;
+    changed |= file_workspace::aggregate(&mut value)?;
     if !changed {
         return Ok(None);
     }
     let after = serde_json::to_vec(&value)
         .map_err(|_| AppError::infrastructure("无法编码迁移后的工作区会话"))?;
     Ok(Some(after))
+}
+
+/// 当前 marker 不允许夹带旧顶层文件标签；失败保留原文，必须显式运行迁移而非 reader 自动归拢。
+/// @author kongweiguang
+pub(super) fn validate_current_workspace_bytes(source: &[u8]) -> AppResult<()> {
+    let mut value: Value = serde_json::from_slice(source)
+        .map_err(|_| AppError::configuration_corrupt("工作区会话"))?;
+    let document = WorkspaceSessionDocument::try_from_value(value.clone())
+        .map_err(|_| AppError::configuration_corrupt("工作区会话"))?;
+    if document
+        .workspace_snapshot()?
+        .terminal_tabs
+        .iter()
+        .any(|tab| {
+            matches!(
+                tab,
+                kerminal_application::workspace::WorkspaceSessionTab::WorkspaceFile { .. }
+            )
+        })
+    {
+        return Err(AppError::configuration_corrupt(
+            "当前工作区仍包含旧文件标签",
+        ));
+    }
+    file_workspace::aggregate(&mut value)?;
+    Ok(())
 }
 
 /// 将一次性归一化结果封装为固定路径 CAS 编辑，规划阶段不访问磁盘或创建目录。
@@ -191,3 +220,7 @@ fn remap_prefixed_field(
 #[cfg(test)]
 #[path = "../../tests/support/data_migration_workspace_unit.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/support/data_migration_file_workspace_unit.rs"]
+mod file_workspace_tests;

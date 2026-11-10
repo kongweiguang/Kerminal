@@ -25,7 +25,8 @@ mod session_service;
 mod workspace_documents;
 pub use launch::{
     AgentLaunchResolver, AgentLauncherInstallationProbe, ResolvedAgentLauncher,
-    builtin_resume_argv, initial_provider_session, resolve_agent_launcher,
+    builtin_launch_command_line, builtin_resume_argv, initial_provider_session,
+    resolve_agent_launcher,
 };
 pub use repository::{
     AgentProviderSessionSnapshot, AgentProviderSessionStatus, AgentResumeCheckpoint,

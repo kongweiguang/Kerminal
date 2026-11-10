@@ -231,4 +231,4 @@ fn should_offer_password_retry(
 
 #[cfg(test)]
 #[path = "../../tests/unit/root_external_auth.rs"]
-mod tests;
+pub(in crate::root) mod tests;

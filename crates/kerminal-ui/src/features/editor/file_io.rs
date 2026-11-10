@@ -103,6 +103,9 @@ impl FileEditorWorkspace {
         {
             pending.load_generation = Some(generation);
         }
+        if close_intent_bound {
+            self.bind_workspace_group_readback(&endpoint, generation);
+        }
         self.spawn_load(endpoint, generation, cx);
         self.publish_workspace_projection_if_changed(cx);
         cx.notify();
@@ -154,7 +157,7 @@ impl FileEditorWorkspace {
     /// 仅接收当前 generation；失败读回清关闭意图并为原 Root close owner 回报 false。
     ///
     /// @author kongweiguang
-    fn finish_load(
+    pub(super) fn finish_load(
         &mut self,
         endpoint: FileEndpoint,
         generation: u64,
@@ -315,7 +318,7 @@ impl FileEditorWorkspace {
         );
     }
 
-    /// 保存快照沿用 revision CAS；取消只触发业务 token，结果 owner 等待实际文件收据。
+    /// 保存快照沿用 revision CAS；组代次使被抢占的迟到保存只结算写入，不再物理关闭正文。
     ///
     /// @author kongweiguang
     pub(super) fn save_endpoint(
@@ -327,35 +330,46 @@ impl FileEditorWorkspace {
         cx: &mut Context<Self>,
     ) {
         let save_generation = self.reserve_save_generation();
+        let workspace_group_generation = self.workspace_group_save_generation(&endpoint);
         let Some(tab) = self
             .tabs
             .iter_mut()
             .find(|tab| tab.endpoint == endpoint && !tab.loading)
         else {
+            if workspace_group_generation.is_some() {
+                self.cancel_workspace_group_close(cx);
+            }
             return;
         };
         let Some(editor) = tab.editor.as_ref() else {
+            if workspace_group_generation.is_some() {
+                self.cancel_workspace_group_close(cx);
+            }
             return;
         };
         let content = editor.update(cx, |state, _| state.text().to_string());
         let Some(session) = tab.session.as_mut() else {
+            if workspace_group_generation.is_some() {
+                self.cancel_workspace_group_close(cx);
+            }
             return;
         };
         let command = match session.begin_save(&content, resolution) {
             Ok(command) => command,
             Err(error) => {
                 self.status = Some(EditorStatus::Message(transition_message(error)));
+                let load_generation = tab.load_generation;
+                self.resolve_workspace_close(&endpoint, Some(load_generation), false, cx);
                 cx.notify();
                 return;
             }
         };
         tab.error = None;
         let cancellation = CancellationToken::new();
-        tab.save_operation = Some(PendingEditorSave::new(
-            endpoint.clone(),
-            save_generation,
-            cancellation.clone(),
-        ));
+        let mut operation =
+            PendingEditorSave::new(endpoint.clone(), save_generation, cancellation.clone());
+        operation.workspace_group_generation = workspace_group_generation;
+        tab.save_operation = Some(operation);
         self.status = Some(EditorStatus::Message(
             crate::locale::text("正在保存…", "Saving…").to_string(),
         ));
@@ -419,7 +433,7 @@ impl FileEditorWorkspace {
     /// 只消费相同文件和保存代次的实际回执；取消后的结果也必须经过统一后续动作决策。
     ///
     /// @author kongweiguang
-    fn finish_save(
+    pub(super) fn finish_save(
         &mut self,
         endpoint: FileEndpoint,
         save_generation: u64,
@@ -442,6 +456,14 @@ impl FileEditorWorkspace {
             .save_operation
             .as_ref()
             .is_some_and(PendingEditorSave::cancel_requested);
+        let group_generation = self.tabs[index]
+            .save_operation
+            .as_ref()
+            .and_then(|operation| operation.workspace_group_generation);
+        let close_after_success = close_after_success
+            && group_generation.is_none_or(|generation| {
+                self.workspace_group_save_generation(&endpoint) == Some(generation)
+            });
         let load_generation = self.tabs[index].load_generation;
         self.tabs[index].save_operation = None;
 

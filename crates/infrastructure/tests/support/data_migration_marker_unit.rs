@@ -1,10 +1,11 @@
-//! 当前格式只接受契约 3；契约 1、2 只能通过显式迁移，未知代不猜测。
+//! 当前格式只接受契约 4；契约 1、2、3 只能通过显式迁移，未知代不猜测。
 //!
 //! @author kongweiguang
 
 use super::*;
 
 /// 精确列举支持边界，防止用小于当前版本的宽泛判断放行未知旧契约。
+/// @author kongweiguang
 #[test]
 fn only_known_previous_contracts_are_migratable() {
     assert_eq!(
@@ -19,6 +20,10 @@ fn only_known_previous_contracts_are_migratable() {
         classify_marker_bytes(&earliest_marker_bytes()).expect("最早已发布 marker 可分类"),
         MarkerRead::PreviousSupported(1)
     );
+    assert_eq!(
+        classify_marker_bytes(&file_tabs_marker_bytes()).expect("旧文件标签契约可分类"),
+        MarkerRead::PreviousSupported(3)
+    );
     for (format, contract, expected) in [
         (
             4,
@@ -29,9 +34,9 @@ fn only_known_previous_contracts_are_migratable() {
         ),
         (
             4,
-            4,
+            5,
             DataMigrationBlocker::FutureMigrationContract {
-                migration_contract: 4,
+                migration_contract: 5,
             },
         ),
         (

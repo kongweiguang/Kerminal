@@ -6,8 +6,7 @@ use std::{error::Error, fs, io, io::Write, path::Path};
 
 use gpui_kit::{
     AnyWindowHandle, AsyncApp, Bounds, Entity, InputEvent, KeyDownEvent, KeyUpEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    Pixels, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
 };
 use kerminal_application::{
     ApplicationTaskExecutor,
@@ -595,7 +594,7 @@ fn capture_file_tabs_diagnostic(
                 let state = root.right_rail_acceptance_file_tab_state(host_id, directory, name, cx);
                 let ready = root.right_rail_acceptance_file_ready(host_id, directory, name, text, cx);
                 let editor_tab_bounds = state.as_ref().ok().and_then(|state| state.as_ref())
-                    .and_then(|state| window.debug_selector_bounds(&format!("rr-file-editor-tab-{}", state.2)));
+                    .and_then(|state| window.debug_selector_bounds(&format!("host-file-item-{}", state.2)));
                 serde_json::json!({
                     "name": name, "tabState": format!("{state:?}"), "ready": format!("{ready:?}"),
                     "editorTabBounds": format!("{editor_tab_bounds:?}"),
@@ -603,6 +602,7 @@ fn capture_file_tabs_diagnostic(
             }).collect::<Vec<_>>();
             serde_json::json!({
                 "files": file_states,
+                "navigationGate": root.right_rail_acceptance_file_navigation_diagnostic(),
                 "activeTool": format!("{:?}", root.right_rail_acceptance_active_tool()),
                 "drawerBounds": format!("{:?}", window.debug_selector_bounds("workbench-compact-tool-drawer-surface")),
                 "focus": format!("{:?}", window.focused(cx)),
@@ -645,26 +645,27 @@ async fn verify_workspace_file_tabs(
     let first = wait_fixture_file(cx, root, window, host_id, directory, files[0], false).await?;
     open_fixture_file(cx, root, window, host_id, directory, files[0].0).await?;
     let reopened = wait_fixture_file(cx, root, window, host_id, directory, files[0], false).await?;
-    if first.0 != reopened.0 || reopened.1 != 1 {
+    if first.0 != reopened.0 || first.2 != reopened.2 || reopened.1 != 1 {
         return Err(
             io::Error::other("Reopening the same file created a duplicate workspace tab").into(),
         );
     }
     open_fixture_file(cx, root, window, host_id, directory, files[1].0).await?;
     let second = wait_fixture_file(cx, root, window, host_id, directory, files[1], false).await?;
-    if first.0 == second.0 {
-        return Err(io::Error::other("Different fixture files share a workspace tab").into());
+    if first.0 != second.0 || first.2 == second.2 {
+        return Err(io::Error::other(
+            "Same-host files must share one owner and have distinct internal IDs",
+        )
+        .into());
     }
-
-    drag_workspace_tab_before(cx, window, &second.0, &first.0)?;
     functional::poll_root(
         cx,
         root,
         window,
-        "reordered fixture file tabs",
+        "same-owner internal fixture file tabs",
         |root, _, _| {
             root.right_rail_acceptance_file_tabs_adjacent(
-                host_id, directory, files[1].0, files[0].0,
+                host_id, directory, files[0].0, files[1].0,
             )
             .map(|adjacent| adjacent.then_some(()))
         },
@@ -686,17 +687,9 @@ async fn verify_workspace_file_tabs(
         super::functional_transfer_workspace::close_fixture_rail_for_narrow(cx, root, window)
             .await?;
     }
-    super::menus::click_selector(cx, window, &format!("rr-file-editor-tab-{}", first.2))?;
+    click_fixture_file_item(cx, window, &first.2, false)?;
     wait_fixture_file(cx, root, window, host_id, directory, files[0], false).await?;
-    click_visible_workspace_tab(
-        cx,
-        window,
-        capture,
-        &second.0,
-        false,
-        "second-file-activate",
-    )
-    .await?;
+    click_fixture_file_item(cx, window, &second.2, false)?;
     wait_fixture_file(cx, root, window, host_id, directory, files[1], false).await?;
     functional::checkpoint(
         cx,
@@ -704,9 +697,48 @@ async fn verify_workspace_file_tabs(
         capture,
         records,
         "sftp-file-tabs",
-        "continuous_sftp_browser_reopen_dedup_and_distinct_file_tab_activation",
+        "continuous_sftp_browser_reopen_dedup_and_distinct_internal_document_activation",
     )
     .await?;
+
+    for (mode, operation) in [
+        (
+            kerminal_application::preferences::ThemeMode::Light,
+            "sftp-file-workspace-theme-light",
+        ),
+        (
+            kerminal_application::preferences::ThemeMode::Dark,
+            "sftp-file-workspace-theme-dark",
+        ),
+        (
+            kerminal_application::preferences::ThemeMode::System,
+            "sftp-file-workspace-theme-system",
+        ),
+    ] {
+        window.update(cx, |_, _, app| {
+            root.update(app, |root, cx| {
+                root.set_right_rail_acceptance_theme(mode, cx)
+            })
+        })?;
+        wait_fixture_file(cx, root, window, host_id, directory, files[1], false).await?;
+        functional::checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            operation,
+            "same_host_internal_file_workspace_surface_in_requested_theme",
+        )
+        .await?;
+    }
+    window.update(cx, |_, _, app| {
+        root.update(app, |root, cx| {
+            root.set_right_rail_acceptance_theme(
+                kerminal_application::preferences::ThemeMode::Light,
+                cx,
+            )
+        })
+    })?;
 
     let modified = format!("{}unsaved fixture change\n", files[1].1);
     functional::poll_root(
@@ -737,7 +769,7 @@ async fn verify_workspace_file_tabs(
         true,
     )
     .await?;
-    click_visible_workspace_tab(cx, window, capture, &second.0, true, "dirty-file").await?;
+    click_fixture_file_item(cx, window, &second.2, true)?;
     functional::poll_root(
         cx,
         root,
@@ -814,7 +846,7 @@ async fn verify_workspace_file_tabs(
     )
     .await?;
     wait_fixture_file(cx, root, window, host_id, directory, files[1], false).await?;
-    click_visible_workspace_tab(cx, window, capture, &second.0, true, "saved-file").await?;
+    click_fixture_file_item(cx, window, &second.2, true)?;
     wait_fixture_file_closed(cx, root, window, host_id, directory, files[1].0).await?;
     wait_fixture_file(cx, root, window, host_id, directory, files[0], false).await?;
     functional::checkpoint(
@@ -823,7 +855,7 @@ async fn verify_workspace_file_tabs(
         capture,
         records,
         "sftp-file-successor",
-        "closing_reordered_file_selected_the_remaining_file_without_manual_activation",
+        "closing_internal_document_selected_remaining_document_without_closing_owner",
     )
     .await?;
 
@@ -872,14 +904,45 @@ async fn verify_workspace_file_tabs(
         super::functional_transfer_workspace::close_fixture_rail_for_narrow(cx, root, window)
             .await?;
     }
-    click_visible_workspace_tab(cx, window, capture, &second_again.0, true, "reopened-file")
-        .await?;
+    if second_again.0 != first.0 || second_again.2 == first.2 {
+        return Err(io::Error::other(
+            "Reopened document lost host owner or distinct internal identity",
+        )
+        .into());
+    }
+    click_fixture_file_item(cx, window, &second_again.2, true)?;
     wait_fixture_file_closed(cx, root, window, host_id, directory, files[1].0).await?;
+    wait_fixture_file(cx, root, window, host_id, directory, files[0], false).await?;
+    click_fixture_file_item(cx, window, &first.2, true)?;
+    wait_fixture_file_closed(cx, root, window, host_id, directory, files[0].0).await?;
     functional::poll_root(
         cx,
         root,
         window,
-        "SFTP workspace selected after file close",
+        "file owner returned to its retained directory",
+        |root, _, _| {
+            Ok(root
+                .right_rail_acceptance_file_directory_selected(&first.0)
+                .then_some(()))
+        },
+    )
+    .await?;
+    functional::checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "sftp-directory-successor",
+        "closing_last_document_retained_same_host_directory_and_owner",
+    )
+    .await?;
+
+    click_visible_workspace_tab(cx, window, capture, &first.0, true, "file-host-owner").await?;
+    functional::poll_root(
+        cx,
+        root,
+        window,
+        "SFTP workspace selected after host owner close",
         |root, _, _| {
             Ok(root
                 .right_rail_acceptance_sftp_workspace_tab_selected(host_id, &transfer_tab)
@@ -893,18 +956,15 @@ async fn verify_workspace_file_tabs(
         capture,
         records,
         "sftp-workspace-successor",
-        "closing_file_selected_sftp_center_while_another_editor_remained_open",
+        "closing_file_host_selected_independent_sftp_transfer_workspace",
     )
     .await?;
     click_visible_workspace_tab(cx, window, capture, &transfer_tab, true, "transfer").await?;
-    wait_fixture_file(cx, root, window, host_id, directory, files[0], false).await?;
-    click_visible_workspace_tab(cx, window, capture, &first.0, true, "first-file").await?;
-    wait_fixture_file_closed(cx, root, window, host_id, directory, files[0].0).await?;
     functional::poll_root(
         cx,
         root,
         window,
-        "fixture terminal selected after last file close",
+        "fixture terminal selected after owner and transfer close",
         |root, _, _| {
             Ok(root
                 .right_rail_acceptance_terminal_tab_selected(&fixture_tab)
@@ -918,7 +978,7 @@ async fn verify_workspace_file_tabs(
         capture,
         records,
         "sftp-terminal-successor",
-        "closing_last_file_selected_original_terminal_without_manual_restore",
+        "closing_host_and_transfer_selected_original_terminal_without_manual_restore",
     )
     .await?;
     Ok(())
@@ -1247,81 +1307,16 @@ async fn wait_fixture_conflict(
     .await
 }
 
-/// 从真实标签命中区域拖到目标左半边；每步绘制新帧以使 GPUI 完成拖动状态迁移。
-///
+/// 内部文档只通过真实控件激活或关闭，不能用宿主 Close 代替单文件事件。
 /// @author kongweiguang
-fn drag_workspace_tab_before(
+fn click_fixture_file_item(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
-    source: &kerminal_domain::identity::TabId,
-    target: &kerminal_domain::identity::TabId,
+    item_id: &kerminal_domain::identity::TabId,
+    close: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let _ = super::frame_signature(cx, window)?;
-    let (start, end) = window.update(cx, |_, window, _| {
-        let source = window
-            .debug_selector_bounds(&format!("workspace-tab-hitbox-{source}"))
-            .ok_or_else(|| io::Error::other("Fixture source tab is not mounted"))?;
-        let target = window
-            .debug_selector_bounds(&format!("workspace-tab-hitbox-{target}"))
-            .ok_or_else(|| io::Error::other("Fixture target tab is not mounted"))?;
-        let viewport = window.visual_viewport_bounds();
-        if !bounds_inside_clip(source, viewport) || !bounds_inside_clip(target, viewport) {
-            return Err(io::Error::other("Fixture tabs are outside the viewport"));
-        }
-        Ok((
-            source.center(),
-            point(target.origin.x + px(12.), target.center().y),
-        ))
-    })??;
-    window.update(cx, |_, window, app| {
-        let _ = window.dispatch_event(
-            MouseMoveEvent {
-                position: start,
-                ..MouseMoveEvent::default()
-            }
-            .to_platform_input(),
-            app,
-        );
-        let _ = window.dispatch_event(
-            MouseDownEvent {
-                button: MouseButton::Left,
-                position: start,
-                click_count: 1,
-                ..MouseDownEvent::default()
-            }
-            .to_platform_input(),
-            app,
-        );
-    })?;
-    let _ = super::frame_signature(cx, window)?;
-    for position in [point(start.x - px(10.), start.y), end] {
-        window.update(cx, |_, window, app| {
-            let _ = window.dispatch_event(
-                MouseMoveEvent {
-                    position,
-                    pressed_button: Some(MouseButton::Left),
-                    ..MouseMoveEvent::default()
-                }
-                .to_platform_input(),
-                app,
-            );
-        })?;
-        let _ = super::frame_signature(cx, window)?;
-    }
-    window.update(cx, |_, window, app| {
-        let _ = window.dispatch_event(
-            MouseUpEvent {
-                button: MouseButton::Left,
-                position: end,
-                click_count: 1,
-                ..MouseUpEvent::default()
-            }
-            .to_platform_input(),
-            app,
-        );
-    })?;
-    let _ = super::frame_signature(cx, window)?;
-    Ok(())
+    let control = if close { "close" } else { "item" };
+    super::menus::click_selector(cx, window, &format!("host-file-{control}-{item_id}"))
 }
 
 /// 尊重标签栏自身的裁切区域；活动的重开文件必须自动显露，其余标签可用真实横滚显露。
@@ -1450,7 +1445,7 @@ async fn open_fixture_file(
     .await
 }
 
-/// 等待同一 endpoint 的唯一顶栏和活动编辑缓冲同时稳定，避免异步加载中的假阳性。
+/// 等待精确 endpoint 的唯一内部文档和编辑缓冲稳定，宿主与文档均返回稳定 ID。
 ///
 /// @author kongweiguang
 async fn wait_fixture_file(
@@ -1461,7 +1456,16 @@ async fn wait_fixture_file(
     directory: &str,
     file: (&str, &str),
     dirty: bool,
-) -> Result<(kerminal_domain::identity::TabId, usize, usize, bool, bool), Box<dyn Error>> {
+) -> Result<
+    (
+        kerminal_domain::identity::TabId,
+        usize,
+        kerminal_domain::identity::TabId,
+        bool,
+        bool,
+    ),
+    Box<dyn Error>,
+> {
     functional::poll_root(
         cx,
         root,
@@ -1503,7 +1507,7 @@ async fn wait_fixture_file_closed(
         cx,
         root,
         window,
-        "closed fixture file tab",
+        &format!("closed fixture file tab {name}"),
         |root, _, cx| {
             root.right_rail_acceptance_file_closed(host_id, directory, name, cx)
                 .map(|closed| closed.then_some(()))

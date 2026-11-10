@@ -648,6 +648,17 @@ fn fixture_with_configuration_and_services(
     (runtime, root, sessions, temporary, visual)
 }
 
+/// 文件宿主回归复用真实 Root 装配与隔离端口，避免另一测试复制私有 fake 或启动真实资源。
+/// @author kongweiguang
+pub(in crate::root) fn host_file_workspace_fixture(
+    app: &mut TestAppContext,
+    configure: impl FnOnce(AppServices) -> AppServices,
+) -> (Runtime, Entity<RootView>, &mut VisualTestContext) {
+    let (runtime, root, _, _, visual) =
+        fixture_with_configuration_and_services(app, Arc::new(EmptyConfiguration), configure);
+    (runtime, root, visual)
+}
+
 /// 交替推进生产 GPUI 与 Tokio 回执，避免仅断言同步投递。
 ///
 /// @author kongweiguang
@@ -2075,16 +2086,32 @@ fn compact_sftp_file_navigation_reveals_editor_and_can_reopen(app: &mut TestAppC
             root.workspace_files.file_endpoint(&id),
             Some(entry.endpoint.clone())
         );
-        assert_eq!(controller.snapshot().terminal_tabs.len(), 2);
+        assert_eq!(controller.snapshot().terminal_tabs.len(), 1);
+        assert_eq!(id, initial_tab);
+        let kerminal_application::workspace::WorkspaceSessionTab::FileWorkspace { state, .. } =
+            &controller.snapshot().terminal_tabs[0]
+        else {
+            panic!("expected file workspace")
+        };
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    kerminal_application::workspace::FileWorkspaceItem::Document { .. }
+                ))
+                .count(),
+            2
+        );
         id
     });
     visual.update(|_, app| {
         source.update(app, |pane, cx| {
             file_support::request_fixture_open(
                 pane,
-                FileEndpoint::Local {
-                    path: "C:/fixture/stale.txt".into(),
-                },
+                // 同宿主不会换掉右栏 Entity；再次发布同一文件仍必须复用内部文档。
+                entry.endpoint.clone(),
                 cx,
             );
         });
@@ -2095,7 +2122,7 @@ fn compact_sftp_file_navigation_reveals_editor_and_can_reopen(app: &mut TestAppC
         let root = root.read(app);
         let snapshot = root.workspace_controller.as_ref().unwrap().snapshot();
         assert_eq!(snapshot.active_tab_id.as_ref(), Some(&target_tab));
-        assert_eq!(snapshot.terminal_tabs.len(), 2);
+        assert_eq!(snapshot.terminal_tabs.len(), 1);
         assert!(!root.compact_tool_drawer_open);
     });
     visual.update(|window, app| {
@@ -2131,7 +2158,7 @@ fn compact_sftp_file_navigation_reveals_editor_and_can_reopen(app: &mut TestAppC
         let root = root.read(app);
         let snapshot = root.workspace_controller.as_ref().unwrap().snapshot();
         assert_eq!(snapshot.active_tab_id.as_ref(), Some(&target_tab));
-        assert_eq!(snapshot.terminal_tabs.len(), 2);
+        assert_eq!(snapshot.terminal_tabs.len(), 1);
         assert_eq!(root.center_panel, CenterPanel::Editor);
         assert!(!root.compact_tool_drawer_open);
         assert!(
@@ -2169,7 +2196,13 @@ fn compact_sftp_file_navigation_reveals_editor_and_can_reopen(app: &mut TestAppC
         let root = root.read(app);
         let snapshot = root.workspace_controller.as_ref().unwrap().snapshot();
         assert_eq!(snapshot.active_tab_id.as_ref(), Some(&initial_tab));
-        assert_eq!(snapshot.terminal_tabs.len(), 2);
+        assert_eq!(snapshot.terminal_tabs.len(), 1);
+        assert_eq!(
+            root.workspace_files.file_endpoint(&initial_tab),
+            Some(FileEndpoint::Local {
+                path: "C:/fixture/initial.txt".into()
+            })
+        );
         assert!(!root.compact_tool_drawer_open);
     });
 }

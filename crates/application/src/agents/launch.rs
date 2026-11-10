@@ -23,8 +23,29 @@ type ProfileShellTarget = LocalSessionTarget;
 #[cfg(not(windows))]
 type ProfileShellTarget = ();
 
+/// Windows 本地会话由 ConPTY 承载：它自己消化应用的 DEC 鼠标跟踪模式（1000/1002/1003/1006），
+/// 终端侧永远读到 `mouse_tracking = None`，全屏 TUI 因此收不到滚轮报告，滚轮还会退化成方向键。
+/// Pi 固定以 regular 模式启动，把对话历史放进终端 scrollback，由 Kerminal 统一提供滚轮与滚动条；
+/// 其它平台的真实 PTY 会透传鼠标模式，保留 Pi 的全屏界面。
+/// 该参数要求 Pi CLI 支持 `--tui-mode`（v1.5.x 已实测）；不支持时 Pi 会以未知参数退出并留下可见回执。
+#[cfg(windows)]
+const PI_AGENT_LAUNCH_ARGS: [&str; 3] = ["--approve", "--tui-mode", "regular"];
+#[cfg(not(windows))]
 const PI_AGENT_LAUNCH_ARGS: [&str; 1] = ["--approve"];
+
+#[cfg(windows)]
+const PI_AGENT_RESUME_COMMAND: &str = "pi --approve --tui-mode regular --continue";
+#[cfg(not(windows))]
 const PI_AGENT_RESUME_COMMAND: &str = "pi --approve --continue";
+
+/// 升级前保存的 Pi 默认恢复命令；继续按内建默认处理，避免旧会话被当成用户自定义命令而失去恢复。
+const PI_AGENT_LEGACY_RESUME_COMMAND: &str = "pi --approve --continue";
+
+const CODEX_AGENT_LAUNCH_ARGS: [&str; 2] = [
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust",
+];
+const CLAUDE_AGENT_LAUNCH_ARGS: [&str; 1] = ["--dangerously-skip-permissions"];
 const MAX_SAVED_RESUME_COMMAND_BYTES: usize = 8 * 1024;
 const MAX_PROVIDER_SESSION_ID_BYTES: usize = 1024;
 
@@ -522,14 +543,35 @@ pub fn builtin_resume_argv(
     Ok((program.to_owned(), args))
 }
 
+/// 内置 provider 的默认启动命令行；UI 直接复用冻结 argv，避免技术提示与真实启动参数漂移。
+///
+/// @author kongweiguang
+pub fn builtin_launch_command_line(provider: AgentProvider) -> Option<String> {
+    let (program, args): (&str, &[&str]) = match provider {
+        AgentProvider::Codex => ("codex", &CODEX_AGENT_LAUNCH_ARGS),
+        AgentProvider::Claude => ("claude", &CLAUDE_AGENT_LAUNCH_ARGS),
+        AgentProvider::Pi => ("pi", &PI_AGENT_LAUNCH_ARGS),
+        AgentProvider::Custom => return None,
+    };
+    let mut command = program.to_owned();
+    for argument in args {
+        command.push(' ');
+        command.push_str(argument);
+    }
+    Some(command)
+}
+
 /// 只有与冻结默认命令完全相同的文本才走结构化内建参数映射。
+/// Pi 同时接受升级前保存的旧默认（无 `--tui-mode`），避免历史会话被误判成用户自定义命令。
 fn is_frozen_default_resume_command(provider: AgentProvider, command: &str) -> bool {
-    matches!(
-        (provider, command),
-        (AgentProvider::Codex, "codex resume --last")
-            | (AgentProvider::Claude, "claude --continue")
-            | (AgentProvider::Pi, PI_AGENT_RESUME_COMMAND)
-    )
+    match provider {
+        AgentProvider::Pi => {
+            command == PI_AGENT_RESUME_COMMAND || command == PI_AGENT_LEGACY_RESUME_COMMAND
+        }
+        AgentProvider::Codex => command == "codex resume --last",
+        AgentProvider::Claude => command == "claude --continue",
+        AgentProvider::Custom => false,
+    }
 }
 
 /// 为 UI 提供稳定 provider 标签，不把可能含用户数据的恢复命令复制到 label。
@@ -659,17 +701,20 @@ fn resolve_agent_launcher_inner(
             selected.to_owned(),
             "Codex".to_owned(),
             "codex".to_owned(),
-            vec![
-                "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-                "--dangerously-bypass-hook-trust".to_owned(),
-            ],
+            CODEX_AGENT_LAUNCH_ARGS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
         ),
         "builtin:claude" => (
             AgentProvider::Claude,
             selected.to_owned(),
             "Claude Code".to_owned(),
             "claude".to_owned(),
-            vec!["--dangerously-skip-permissions".to_owned()],
+            CLAUDE_AGENT_LAUNCH_ARGS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
         ),
         "builtin:pi" => (
             AgentProvider::Pi,

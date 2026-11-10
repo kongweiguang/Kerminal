@@ -18,6 +18,91 @@ use tokio_util::sync::CancellationToken;
 const CURRENT_WORKSPACE_FIXTURE: &str =
     include_str!("../../../tests/fixtures/workspace_session_v3.json");
 
+/// 当前契约不能夹带旧顶层文件标签，inspection 与失败迁移都必须只读保留原文。
+/// @author kongweiguang
+#[test]
+fn current_marker_with_legacy_file_tabs_is_blocked_without_rewriting() {
+    let root = tempfile::tempdir().expect("创建隔离根");
+    fs::create_dir_all(root.path().join("workspace")).unwrap();
+    let bytes = CURRENT_WORKSPACE_FIXTURE.as_bytes();
+    fs::write(root.path().join("workspace/session.json"), bytes).unwrap();
+    fs::write(
+        root.path().join(".kerminal-format.toml"),
+        b"data_format = 4\nmigration_contract = 4\n",
+    )
+    .unwrap();
+    let repository = FileDataMigrationRepository::new(root.path());
+    let inspection = repository.inspect().unwrap();
+    assert_eq!(inspection.readiness, DataMigrationReadiness::Blocked);
+    assert!(!inspection.blockers.is_empty());
+    assert!(repository.migrate().is_err());
+    assert_eq!(
+        fs::read(root.path().join("workspace/session.json")).unwrap(),
+        bytes
+    );
+    assert!(!root.path().join(".kerminal-migration").exists());
+    assert!(!root.path().join(".storage.lock").exists());
+}
+
+/// 契约 3 的预检只读规划，显式迁移才聚合旧文件标签并留下精确 before 备份。
+/// @author kongweiguang
+#[test]
+fn previous_file_contract_is_read_only_until_explicit_migration() {
+    let root = tempfile::tempdir().expect("创建隔离根");
+    fs::create_dir_all(root.path().join("workspace")).unwrap();
+    let bytes = CURRENT_WORKSPACE_FIXTURE.as_bytes();
+    fs::write(root.path().join("workspace/session.json"), bytes).unwrap();
+    fs::write(
+        root.path().join(".kerminal-format.toml"),
+        b"data_format = 4\nmigration_contract = 3\n",
+    )
+    .unwrap();
+    let repository = FileDataMigrationRepository::new(root.path());
+    assert_eq!(
+        repository.inspect().unwrap().readiness,
+        DataMigrationReadiness::Legacy
+    );
+    assert_eq!(
+        fs::read(root.path().join("workspace/session.json")).unwrap(),
+        bytes
+    );
+    assert!(!root.path().join(".kerminal-migration").exists());
+    assert!(!root.path().join(".storage.lock").exists());
+    let report = repository.migrate().expect("显式升级契约 3");
+    let after: Value =
+        serde_json::from_slice(&fs::read(root.path().join("workspace/session.json")).unwrap())
+            .unwrap();
+    assert!(
+        after["terminalTabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tab| tab["kind"] != "workspaceFile")
+    );
+    let file = after["terminalTabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tab| tab["kind"] == "fileWorkspace")
+        .unwrap();
+    assert_eq!(file["id"], "tab-file");
+    assert_eq!(file["state"]["items"][1]["futureFile"], 2);
+    assert_eq!(file["state"]["sourceTabIds"], json!(["tab-file"]));
+    assert_eq!(
+        fs::read(
+            root.path()
+                .join(report.backup_relative_path.unwrap())
+                .join("before/managed/workspace/session.json")
+        )
+        .unwrap(),
+        bytes
+    );
+    assert_eq!(
+        repository.migrate().unwrap().outcome,
+        DataMigrationOutcome::AlreadyCurrent
+    );
+}
+
 /// 从完整当前 fixture 生成仅缺少已知旧 v3 pane 字段的原始输入，避免测试越过真实迁移入口。
 fn workspace_bytes_missing_legacy_defaults() -> Vec<u8> {
     let mut value: Value = serde_json::from_str(CURRENT_WORKSPACE_FIXTURE)
@@ -34,6 +119,7 @@ fn workspace_bytes_missing_legacy_defaults() -> Vec<u8> {
 }
 
 /// 通过公开 migration repository 迁移、检查 marker 和原始备份，再经当前 workspace service 读回。
+/// @author kongweiguang
 #[tokio::test]
 async fn workspace_migration_commits_journal_and_reads_back_current_document() {
     let root = tempfile::tempdir().expect("创建隔离数据根");
@@ -56,7 +142,7 @@ async fn workspace_migration_commits_journal_and_reads_back_current_document() {
     );
     assert_eq!(
         fs::read(root.path().join(".kerminal-format.toml")).expect("迁移应提交当前格式 marker"),
-        b"data_format = 4\nmigration_contract = 3\n"
+        b"data_format = 4\nmigration_contract = 4\n"
     );
     assert_eq!(
         migration

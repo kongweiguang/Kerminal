@@ -35,75 +35,7 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.file_editor_workspace.is_none() {
-            self.status = Some(crate::locale::text(
-                "文件编辑服务尚未配置。",
-                "The file editor is unavailable.",
-            ));
-            cx.notify();
-            return false;
-        }
-        if let Some(id) = self.workspace_files.tab_for_endpoint(&endpoint) {
-            if self.handle_workspace_tab_event(&WorkspaceTabEvent::Activate(id.clone()), window, cx)
-            {
-                self.activate_workspace_tab(&id, window, cx);
-                return true;
-            }
-            return false;
-        }
-        let result = file_navigation_descriptor(&endpoint, external_target_lease.as_ref());
-        let (tab, transient) = match result {
-            Ok(value) => value,
-            Err(error) => {
-                self.status = Some(error.public_message().into());
-                cx.notify();
-                return false;
-            }
-        };
-        let Some(controller) = self.workspace_controller.as_ref() else {
-            self.status = Some(crate::locale::text(
-                "工作区尚未就绪，请稍后重试。",
-                "The workspace is not ready. Try again shortly.",
-            ));
-            cx.notify();
-            return false;
-        };
-        let id = tab.id().clone();
-        let mut snapshot = controller.snapshot().clone();
-        if let WorkspaceSessionTab::WorkspaceFile { machine_id, .. } = &tab {
-            snapshot.selected_machine_id = Some(machine_id.clone());
-        }
-        snapshot.terminal_tabs.push(tab.clone());
-        snapshot.active_tab_id = Some(id.clone());
-        snapshot.focused_pane_id = None;
-        if !self.workspace_files.register_open_file_tab(
-            tab,
-            endpoint,
-            external_target_lease,
-            transient,
-        ) {
-            self.status = Some(crate::locale::text(
-                "文件工作区尚未就绪，请重试。",
-                "The file workspace is not ready. Try again.",
-            ));
-            cx.notify();
-            return false;
-        }
-        let result = self
-            .workspace_controller
-            .as_mut()
-            .ok_or_else(|| AppError::conflict("工作区状态已失效"))
-            .and_then(|controller| controller.synchronize_snapshot(snapshot));
-        if let Err(error) = result {
-            self.remove_workspace_file_tab_after_close(&id);
-            self.status = Some(error.public_message().into());
-            cx.notify();
-            return false;
-        }
-        self.refresh_workspace_views(cx);
-        self.activate_workspace_tab(&id, window, cx);
-        self.persist_workspace_snapshot(cx);
-        true
+        self.open_file_in_host_workspace(endpoint, external_target_lease, window, cx)
     }
 
     /// 内部标签先完成自己的脏稿关闭门禁，Root 再关闭对应导航；后台加载和退出不抢用户导航。
@@ -133,6 +65,7 @@ impl RootView {
             });
         self.editor_navigation_sync_pending = resource_pending;
         if !resource_pending {
+            self.sync_host_editor_projection(projection, window, cx);
             let active_before_close = self
                 .workspace_controller
                 .as_ref()
@@ -277,16 +210,55 @@ impl RootView {
         tabs: &mut [WorkspaceTabProjection],
         cx: &Context<Self>,
     ) {
+        if let Some(controller) = self.workspace_controller.as_ref() {
+            for projection in tabs.iter_mut() {
+                let target = controller
+                    .snapshot()
+                    .terminal_tabs
+                    .iter()
+                    .find_map(|tab| match tab {
+                        WorkspaceSessionTab::FileWorkspace { id, target, .. }
+                            if id == &projection.id =>
+                        {
+                            Some(target)
+                        }
+                        _ => None,
+                    });
+                let resolved = match target {
+                    Some(WorkspaceTargetRef::Ssh { host_id }) => self
+                        .host_navigation
+                        .as_ref()
+                        .and_then(|navigation| navigation.read(cx).display_name_for(host_id))
+                        .map(|name| (host_id.as_str(), name.to_string())),
+                    Some(WorkspaceTargetRef::DockerContainer {
+                        container_id,
+                        container_name: Some(name),
+                        ..
+                    }) => Some((container_id.as_str(), name.clone())),
+                    _ => None,
+                };
+                if let Some((identity, name)) = resolved
+                    && let Some(suffix) = projection.title.as_ref().strip_prefix(identity)
+                    && matches!(suffix, " · 文件" | " · Files")
+                {
+                    // 只替换迁移生成的 ID 占位名，自定义宿主标题和持久原文均保持不动。
+                    projection.title = format!("{name}{suffix}").into();
+                }
+            }
+        }
         let Some(editor) = self.file_editor_workspace.as_ref() else {
             return;
         };
         let projection = editor.read(cx).workspace_projection();
         for tab in tabs {
-            if let Some(endpoint) = self.workspace_files.file_endpoint(&tab.id)
-                && projection
-                    .tabs
-                    .iter()
-                    .any(|file| file.endpoint == endpoint && file.dirty)
+            let mut endpoints = self.workspace_files.host_document_endpoints(&tab.id);
+            if let Some(endpoint) = self.workspace_files.file_endpoint(&tab.id) {
+                endpoints.push(endpoint);
+            }
+            if projection
+                .tabs
+                .iter()
+                .any(|file| file.dirty && endpoints.contains(&file.endpoint))
             {
                 tab.title = format!("{} •", tab.title).into();
             }
@@ -298,7 +270,7 @@ impl RootView {
 /// 标题按端点平台提取名称，保留 POSIX 文件名中的反斜杠，避免导航后名称被截断。
 ///
 /// @author kongweiguang
-fn file_navigation_descriptor(
+pub(super) fn file_navigation_descriptor(
     endpoint: &FileEndpoint,
     lease: Option<&ExternalTargetLease>,
 ) -> AppResult<(WorkspaceSessionTab, bool)> {

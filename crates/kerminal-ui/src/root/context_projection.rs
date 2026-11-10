@@ -12,7 +12,8 @@ use crate::features::context::{
     ContextTerminalLinkIndex, ContextWorkspaceProjection, terminal_link_identity_matches,
 };
 use kerminal_application::workspace::{
-    WorkspacePaneMode, WorkspaceSessionPane, WorkspaceSessionTab, WorkspaceTargetRef,
+    FileWorkspaceItem, WorkspacePaneMode, WorkspaceSessionPane, WorkspaceSessionTab,
+    WorkspaceTargetRef,
 };
 use kerminal_domain::{
     identity::{HostId, PaneId, TabId},
@@ -95,6 +96,26 @@ impl RootView {
                 persisted_pane
                     .and_then(|pane| pane.target.as_ref())
                     .map(workspace_target_summary)
+            })
+            .or_else(|| {
+                let tab = active_tab
+                    .filter(|tab| matches!(tab, WorkspaceSessionTab::FileWorkspace { .. }))?;
+                let kerminal_domain::files::FileEndpoint::Container {
+                    host_id: None,
+                    container_id,
+                    ..
+                } = self.workspace_files.host_workspace_anchor(tab.id())?
+                else {
+                    return None;
+                };
+                // 本机容器只能靠运行态锚点保留完整身份，不能把不可持久化的占位 target 当成本机终端。
+                Some(target_summary(
+                    ContextConnectionKind::Container,
+                    "本机容器",
+                    None,
+                    Some(container_id.clone()),
+                    Some(format!("container:{container_id}")),
+                ))
             })
             .or_else(|| active_tab.and_then(tab_target_summary));
         let location = match (persisted_pane, active_pane.as_ref()) {
@@ -439,7 +460,10 @@ fn workspace_target_summary(target: &WorkspaceTargetRef) -> ContextTargetSummary
 /// @author kongweiguang
 fn tab_target_summary(tab: &WorkspaceSessionTab) -> Option<ContextTargetSummary> {
     match tab {
-        WorkspaceSessionTab::WorkspaceFile { target, .. } => Some(workspace_target_summary(target)),
+        WorkspaceSessionTab::FileWorkspace { target, .. }
+        | WorkspaceSessionTab::WorkspaceFile { target, .. } => {
+            Some(workspace_target_summary(target))
+        }
         WorkspaceSessionTab::SftpTransfer {
             left_host_id,
             locked_left_host_id,
@@ -469,9 +493,9 @@ fn tab_target_summary(tab: &WorkspaceSessionTab) -> Option<ContextTargetSummary>
 fn tab_kind(tab: &WorkspaceSessionTab) -> ContextConnectionKind {
     match tab {
         WorkspaceSessionTab::Terminal { .. } => ContextConnectionKind::Terminal,
-        WorkspaceSessionTab::SftpTransfer { .. } | WorkspaceSessionTab::WorkspaceFile { .. } => {
-            ContextConnectionKind::FileWorkspace
-        }
+        WorkspaceSessionTab::SftpTransfer { .. }
+        | WorkspaceSessionTab::FileWorkspace { .. }
+        | WorkspaceSessionTab::WorkspaceFile { .. } => ContextConnectionKind::FileWorkspace,
         WorkspaceSessionTab::Extension { .. } | WorkspaceSessionTab::Unsupported { .. } => {
             ContextConnectionKind::Unsupported
         }
@@ -496,6 +520,7 @@ fn tab_machine_id(tab: &WorkspaceSessionTab) -> Option<&str> {
     match tab {
         WorkspaceSessionTab::Terminal { machine_id, .. }
         | WorkspaceSessionTab::SftpTransfer { machine_id, .. }
+        | WorkspaceSessionTab::FileWorkspace { machine_id, .. }
         | WorkspaceSessionTab::WorkspaceFile { machine_id, .. } => Some(machine_id),
         WorkspaceSessionTab::Extension { .. } | WorkspaceSessionTab::Unsupported { .. } => None,
     }
@@ -556,6 +581,14 @@ fn persisted_shell(pane: &WorkspaceSessionPane) -> Option<String> {
 /// @author kongweiguang
 fn active_tab_location(tab: Option<&WorkspaceSessionTab>) -> ContextLocationSummary {
     let path = match tab {
+        Some(WorkspaceSessionTab::FileWorkspace { state, .. }) => {
+            state.active_path().or_else(|| {
+                state.items.iter().find_map(|item| match item {
+                    FileWorkspaceItem::Directory { path, .. } => Some(path.as_str()),
+                    FileWorkspaceItem::Document { .. } => None,
+                })
+            })
+        }
         Some(WorkspaceSessionTab::WorkspaceFile { path, .. }) => Some(path.as_str()),
         Some(
             WorkspaceSessionTab::Terminal { .. }
@@ -674,3 +707,7 @@ fn safe_display_text(value: &str) -> String {
         .take(512)
         .collect()
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/root_context_projection.rs"]
+mod tests;

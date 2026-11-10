@@ -149,7 +149,9 @@ fn initial_workspace_file_center_panel(
 
     match active_tab? {
         WorkspaceSessionTab::SftpTransfer { .. } => Some(CenterPanel::Files),
-        WorkspaceSessionTab::WorkspaceFile { .. } => Some(CenterPanel::Editor),
+        WorkspaceSessionTab::FileWorkspace { .. } | WorkspaceSessionTab::WorkspaceFile { .. } => {
+            Some(CenterPanel::Editor)
+        }
         WorkspaceSessionTab::Extension { .. } => Some(CenterPanel::Contributed),
         WorkspaceSessionTab::Terminal { .. } | WorkspaceSessionTab::Unsupported { .. } => None,
     }

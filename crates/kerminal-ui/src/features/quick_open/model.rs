@@ -4,7 +4,7 @@
 
 use kerminal_application::{
     sessions::{TerminalCommandContext, UiSessionBinding},
-    workspace::{WorkspaceSessionSnapshot, WorkspaceSessionTab},
+    workspace::{FileWorkspaceItem, WorkspaceSessionSnapshot, WorkspaceSessionTab},
 };
 use kerminal_domain::identity::{AgentSessionId, HostId, PaneId, TabId};
 
@@ -219,6 +219,40 @@ pub(super) fn workspace_entries(
                 },
                 query,
             ),
+            WorkspaceSessionTab::FileWorkspace {
+                id,
+                title,
+                machine_id,
+                state,
+                ..
+            } => {
+                let path = state.active_path().or_else(|| {
+                    state.items.iter().find_map(|item| match item {
+                        FileWorkspaceItem::Directory { path, .. } => Some(path.as_str()),
+                        FileWorkspaceItem::Document { .. } => None,
+                    })
+                });
+                let mut keywords = vec![id.to_string(), machine_id.clone()];
+                for item in &state.items {
+                    keywords.push(item.path().to_owned());
+                    if let FileWorkspaceItem::Document { title, .. } = item {
+                        keywords.push(title.clone());
+                    }
+                }
+                push_matching(
+                    &mut entries,
+                    QuickOpenEntry {
+                        label: title.clone(),
+                        detail: path
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| text("文件工作区", "File workspace")),
+                        keywords,
+                        selection: Some(QuickOpenSelection::WorkspaceFile(id.clone())),
+                        disabled: false,
+                    },
+                    query,
+                );
+            }
             WorkspaceSessionTab::WorkspaceFile {
                 id, title, path, ..
             } => push_matching(

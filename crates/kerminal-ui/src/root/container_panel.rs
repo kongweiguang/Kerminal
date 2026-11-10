@@ -164,7 +164,8 @@ impl RootView {
 /// @author kongweiguang
 fn workspace_file_host_context(tab: &WorkspaceSessionTab) -> Option<ContainerPanelContext> {
     let (id, target) = match tab {
-        WorkspaceSessionTab::WorkspaceFile { id, target, .. } => (id, target),
+        WorkspaceSessionTab::FileWorkspace { id, target, .. }
+        | WorkspaceSessionTab::WorkspaceFile { id, target, .. } => (id, target),
         WorkspaceSessionTab::Terminal { .. }
         | WorkspaceSessionTab::SftpTransfer { .. }
         | WorkspaceSessionTab::Extension { .. }

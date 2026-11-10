@@ -16,7 +16,7 @@ use kerminal_domain::{
 use super::{
     can_pause_transfer, can_resume_transfer, hidden_attention_count, is_clearable_history,
     is_paused, needs_attention_or_is_active, orphan_recovery_records, project_transfer_queue,
-    transfer_percent,
+    transfer_percent, transfer_queue_count_label,
 };
 
 /// 通过真实领域摘要保留 UI 投影依赖的字段形状，避免手工构造不一致 DTO。
@@ -45,6 +45,45 @@ fn summary(
     summary.failure_kind = failure_kind;
     summary.cleanup_pending = cleanup_pending;
     summary
+}
+
+/// 传输标题右侧按活动、失败和已结束汇总；零值不占位，空队列明确显示暂无任务。
+///
+/// @author kongweiguang
+#[test]
+fn transfer_queue_counts_partition_each_terminal_state() {
+    assert_eq!(
+        transfer_queue_count_label(&[]),
+        crate::locale::text("暂无任务", "No tasks")
+    );
+
+    let summaries = [
+        summary(TransferStatus::Transferring, None, false),
+        summary(TransferStatus::Succeeded, None, false),
+        summary(TransferStatus::Failed, None, false),
+        summary(TransferStatus::Succeeded, None, false),
+        summary(TransferStatus::Cancelled, None, false),
+    ];
+    assert_eq!(
+        transfer_queue_count_label(&summaries),
+        crate::locale::text(
+            "1 进行中 · 1 失败 · 1 已取消 · 2 已完成",
+            "1 active · 1 failed · 1 canceled · 2 completed"
+        )
+    );
+
+    let mut paused = summary(TransferStatus::Cancelled, None, false);
+    paused.resumable = true;
+    assert_eq!(
+        transfer_queue_count_label(&[paused]),
+        crate::locale::text("1 已暂停", "1 paused")
+    );
+
+    let finished_only = [summary(TransferStatus::Skipped, None, false)];
+    assert_eq!(
+        transfer_queue_count_label(&finished_only),
+        crate::locale::text("1 已完成", "1 completed")
+    );
 }
 
 /// 折叠隐藏所有任务行，但不改变可清理任务和进行中任务的统计。

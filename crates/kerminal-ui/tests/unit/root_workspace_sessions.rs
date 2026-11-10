@@ -451,6 +451,46 @@ fn startup_workspace_file_tab_respects_existing_navigation_generation() {
     );
 }
 
+/// 目录宿主与文档共用 Editor，首次启动可恢复但后台安装和显式导航不抢中央传输台。
+/// @author kongweiguang
+#[test]
+fn file_workspace_startup_uses_editor_without_overriding_transfer_navigation() {
+    use kerminal_application::workspace::{FileWorkspaceItem, FileWorkspaceState};
+
+    let directory_id = TabId::new();
+    let workspace = WorkspaceSessionTab::FileWorkspace {
+        id: TabId::new(),
+        tab_group_id: None,
+        title: "Files".into(),
+        machine_id: "local".into(),
+        target: WorkspaceTargetRef::Local { profile_id: None },
+        state: FileWorkspaceState {
+            items: vec![FileWorkspaceItem::Directory {
+                id: directory_id.clone(),
+                path: "C:/project".into(),
+            }],
+            active_item_id: Some(directory_id),
+            source_tab_ids: Vec::new(),
+        },
+    };
+    assert_eq!(
+        initial_workspace_file_center_panel(true, 0, CenterPanel::Terminal, Some(&workspace)),
+        Some(CenterPanel::Editor),
+    );
+    assert_eq!(
+        initial_workspace_file_center_panel(true, 0, CenterPanel::Files, Some(&workspace)),
+        None,
+    );
+    assert_eq!(
+        initial_workspace_file_center_panel(false, 0, CenterPanel::Terminal, Some(&workspace)),
+        None,
+    );
+    assert_eq!(
+        initial_workspace_file_center_panel(true, 1, CenterPanel::Terminal, Some(&workspace)),
+        None,
+    );
+}
+
 /// 成功读取不长期占用工作区高度，分类异常和读取错误仍明确提示且保留原数据边界。
 ///
 /// @author kongweiguang
@@ -745,6 +785,7 @@ fn renamed_tab_split_ack_saves_committed_layout_and_rejects_conflicts() {
             &initial_save.request_id,
             WorkspaceSessionSaveOutcome::Saved {
                 revision: WorkspaceSessionRevision::new("split-baseline"),
+                document: initial_save.candidate_document.clone(),
             },
         )
         .expect("initial save acknowledgement establishes the CAS baseline");
@@ -852,6 +893,7 @@ fn renamed_tab_split_ack_saves_committed_layout_and_rejects_conflicts() {
             &rename_save.request_id,
             WorkspaceSessionSaveOutcome::Saved {
                 revision: WorkspaceSessionRevision::new("split-after-rename"),
+                document: rename_save.candidate_document.clone(),
             },
         )
         .expect("the older rename CAS acknowledgement is accepted by request ID");
@@ -891,6 +933,7 @@ fn renamed_tab_split_ack_saves_committed_layout_and_rejects_conflicts() {
             &split_save.request_id,
             WorkspaceSessionSaveOutcome::Saved {
                 revision: WorkspaceSessionRevision::new("split-saved"),
+                document: split_save.candidate_document.clone(),
             },
         )
         .expect("the exact CAS save acknowledgement is accepted");

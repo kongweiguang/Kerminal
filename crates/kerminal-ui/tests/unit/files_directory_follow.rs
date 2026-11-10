@@ -119,11 +119,13 @@ fn reconnecting_same_directory_supersedes_manual_request(app: &mut TestAppContex
     });
 }
 
-/// 文件 Tab 的父目录同步独立于隐藏的终端跟随开关；重复渲染同一文件仍保留手动浏览位置。
+/// 文件工作区同文件系统保留手动导航与在途请求；切内部文档不借用隐藏跟随开关。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]
-fn file_tab_parent_navigation_ignores_hidden_follow_setting(app: &mut TestAppContext) {
+fn file_workspace_activation_preserves_browser_with_either_follow_setting(
+    app: &mut TestAppContext,
+) {
     for (enabled, local) in [(false, false), (true, false), (false, true), (true, true)] {
         let host = HostId::new();
         let endpoint = |path: &str| {
@@ -142,9 +144,10 @@ fn file_tab_parent_navigation_ignores_hidden_follow_setting(app: &mut TestAppCon
         app.update(|cx| {
             fixture.pane.update(cx, |pane, cx| {
                 pane.follow_terminal_directory = enabled;
-                pane.set_current_terminal_target(Some(a.clone()), None, None, cx);
+                let workspace_id = TabId::new();
+                pane.set_file_workspace_target(workspace_id.clone(), a.clone(), None, cx);
                 pane.open_endpoint_on_side(1, manual.clone(), cx);
-                pane.set_current_terminal_target(Some(a), None, None, cx);
+                pane.set_file_workspace_target(workspace_id.clone(), a, None, cx);
                 assert_eq!(pane.panels[1].requested_endpoint.as_ref(), Some(&manual));
                 let token = pane.panels[1]
                     .root_request_cancellation
@@ -152,9 +155,11 @@ fn file_tab_parent_navigation_ignores_hidden_follow_setting(app: &mut TestAppCon
                     .unwrap()
                     .cancellation
                     .clone();
-                pane.set_current_terminal_target(Some(b.clone()), None, None, cx);
-                assert!(token.is_cancelled());
-                assert_eq!(pane.panels[1].requested_endpoint.as_ref(), Some(&b));
+                let generation = pane.panels[1].generation;
+                pane.set_file_workspace_target(workspace_id, b, None, cx);
+                assert!(!token.is_cancelled());
+                assert_eq!(pane.panels[1].generation, generation);
+                assert_eq!(pane.panels[1].requested_endpoint.as_ref(), Some(&manual));
                 assert!(pane.current_terminal_binding.is_none());
             })
         });
@@ -337,13 +342,12 @@ fn unavailable_target_cancels_follow_and_recovery_rebinds(app: &mut TestAppConte
     let fixture = fixture(app, a);
     app.update(|cx| {
         fixture.pane.update(cx, |pane, cx| {
+            let binding = pane
+                .current_terminal_binding
+                .clone()
+                .expect("fixture has a trusted terminal binding");
             pane.set_follow_terminal_directory(true, cx);
-            pane.set_current_terminal_target(
-                Some(b.clone()),
-                None,
-                pane.current_terminal_binding.clone(),
-                cx,
-            );
+            pane.set_current_terminal_target(Some(b.clone()), None, Some(binding.clone()), cx);
             let token = pane.panels[1]
                 .root_request_cancellation
                 .as_ref()
@@ -355,12 +359,7 @@ fn unavailable_target_cancels_follow_and_recovery_rebinds(app: &mut TestAppConte
             assert!(pane.panels[1].listing.is_none());
             assert!(pane.current_terminal_endpoint.is_none());
             assert!(!pane.compact_target_is_available());
-            pane.set_current_terminal_target(
-                Some(b.clone()),
-                None,
-                pane.current_terminal_binding.clone(),
-                cx,
-            );
+            pane.set_current_terminal_target(Some(b.clone()), None, Some(binding), cx);
             assert_eq!(pane.panels[1].requested_endpoint.as_ref(), Some(&b));
             assert!(pane.compact_target_is_available());
         })

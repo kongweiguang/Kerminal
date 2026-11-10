@@ -2612,10 +2612,7 @@ fn launcher_status_descriptor(provider: AgentProvider, installation: Option<bool
         AgentProvider::Claude => {
             crate::locale::text("内置启动器 · claude", "Built-in launcher · claude")
         }
-        AgentProvider::Pi => crate::locale::text(
-            "内置启动器 · pi --approve",
-            "Built-in launcher · pi --approve",
-        ),
+        AgentProvider::Pi => crate::locale::text("内置启动器 · pi", "Built-in launcher · pi"),
         AgentProvider::Custom => {
             crate::locale::text("已保存 · 自定义命令", "Saved · Custom command")
         }
@@ -2633,7 +2630,7 @@ fn launcher_menu_descriptor(provider: AgentProvider, installation: Option<bool>)
     match provider {
         AgentProvider::Codex => crate::locale::text("内置 · codex", "Built-in · codex"),
         AgentProvider::Claude => crate::locale::text("内置 · claude", "Built-in · claude"),
-        AgentProvider::Pi => crate::locale::text("内置 · pi --approve", "Built-in · pi --approve"),
+        AgentProvider::Pi => crate::locale::text("内置 · pi", "Built-in · pi"),
         AgentProvider::Custom => {
             crate::locale::text("已保存 · 自定义命令", "Saved · custom command")
         }
@@ -2651,7 +2648,7 @@ fn launcher_installation_descriptor(
     let command = match provider {
         AgentProvider::Codex => "codex",
         AgentProvider::Claude => "claude",
-        AgentProvider::Pi => "pi --approve",
+        AgentProvider::Pi => "pi",
         AgentProvider::Custom => return None,
     };
     let installed = installation?;
@@ -2666,19 +2663,13 @@ fn launcher_installation_descriptor(
 /// 技术提示里的默认命令与应用层首次启动 argv 保持一致；可运行状态仍不由静态目录推断。
 /// @author kongweiguang
 fn launcher_command_detail(provider: AgentProvider) -> String {
-    match provider {
-        AgentProvider::Codex => {
-            "codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust"
-                .to_owned()
-        }
-        AgentProvider::Claude => "claude --dangerously-skip-permissions".to_owned(),
-        AgentProvider::Pi => "pi --approve".to_owned(),
-        AgentProvider::Custom => crate::locale::text(
+    kerminal_application::agents::builtin_launch_command_line(provider).unwrap_or_else(|| {
+        crate::locale::text(
             "自定义命令（在管理器中查看）",
             "Custom command (see manager)",
         )
-        .to_string(),
-    }
+        .to_string()
+    })
 }
 
 /// 仅对明确探测结果使用语义色；无探测时以中性点保留原有外观。

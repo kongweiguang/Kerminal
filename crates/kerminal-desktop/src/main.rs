@@ -476,7 +476,9 @@ fn run_application(
                 legacy_window_state.as_deref(),
                 catalogs.1.clone(),
             );
-            bootstrap::run_after_migration(&migration, |_| {
+            let allow_beta_contract =
+                !crate::config_root::ConfigRoot::points_to_formal_default(config_root.as_path());
+            bootstrap::run_after_migration(&migration, allow_beta_contract, |_| {
                 // 先建立已验证的数据格式，避免新建日志目录让干净根变成未知非空根。
                 *log_guard = Some(logging::initialize(config_root.as_path()).map_err(|error| {
                     io::Error::other(format!("Kerminal 无法初始化诊断日志：{error}"))

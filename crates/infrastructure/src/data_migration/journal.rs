@@ -63,6 +63,7 @@ pub(super) struct JournalScan {
 }
 
 /// 只接受唯一 active 与有不可变完成收据的历史 UUID 目录，保留连续契约升级的所有备份。
+/// @author kongweiguang
 pub(super) fn inspect_journals(root: &Path) -> AppResult<JournalScan> {
     let migration_root = root.join(MIGRATION_DIRECTORY);
     let metadata = match fs::symlink_metadata(&migration_root) {
@@ -127,6 +128,8 @@ pub(super) fn inspect_journals(root: &Path) -> AppResult<JournalScan> {
                         marker::EARLIEST_MIGRATION_CONTRACT
                     } else if entry.after_sha256 == sha256(&marker::previous_marker_bytes()) {
                         marker::PREVIOUS_MIGRATION_CONTRACT
+                    } else if entry.after_sha256 == sha256(&marker::file_tabs_marker_bytes()) {
+                        marker::FILE_TABS_MIGRATION_CONTRACT
                     } else {
                         marker::CURRENT_MIGRATION_CONTRACT
                     }
@@ -349,7 +352,8 @@ pub(super) fn require_operation_directory(root: &Path, operation_id: &str) -> Ap
     Ok(path)
 }
 
-/// 保留已发布 contract 1、2 的精确摘要，以便旧计划前滚后再进入当前契约。
+/// 保留已发布 contract 1、2、3 的精确摘要，以便旧计划前滚后再进入当前契约。
+/// @author kongweiguang
 pub(super) fn validate_journal(journal: &MigrationJournal) -> bool {
     let operation_id = Uuid::parse_str(&journal.operation_id);
     if journal.schema_version != JOURNAL_SCHEMA
@@ -391,9 +395,10 @@ pub(super) fn validate_journal(journal: &MigrationJournal) -> bool {
     };
     let current_after = marker_entry.after_sha256 == sha256(&marker::current_marker_bytes());
     let previous_after = marker_entry.after_sha256 == sha256(&marker::previous_marker_bytes());
+    let file_tabs_after = marker_entry.after_sha256 == sha256(&marker::file_tabs_marker_bytes());
     let earliest_after = marker_entry.after_sha256 == sha256(&marker::earliest_marker_bytes());
     if marker_entry.relative_path != marker::MARKER_FILE_NAME
-        || !current_after && !previous_after && !earliest_after
+        || !current_after && !previous_after && !earliest_after && !file_tabs_after
         || earliest_after && marker_entry.before_sha256.is_some()
     {
         return false;

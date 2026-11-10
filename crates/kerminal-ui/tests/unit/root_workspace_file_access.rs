@@ -18,7 +18,10 @@ use kerminal_domain::files::{
 use tokio::runtime::{Builder, Runtime};
 
 use super::*;
-use crate::features::{files::FileTargetNameLookup, workspace_tabs::WorkspaceTabEvent};
+use crate::features::{
+    editor::FileEditorWorkspace, files::FileTargetNameLookup,
+    workspace_controller::WorkspaceController, workspace_tabs::WorkspaceTabEvent,
+};
 
 /// 真实编辑器只使用隔离的内存文件端口，保存保持在途以验证权限不能越过写入回执。
 fn editor_fixture(

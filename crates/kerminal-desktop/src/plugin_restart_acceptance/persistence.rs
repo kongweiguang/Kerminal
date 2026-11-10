@@ -633,6 +633,7 @@ async fn wait_tab_control(
             return Ok(control);
         }
         if Instant::now() >= deadline {
+            // 失败回执沿 source 链保留控件证据，用于区分未挂载与屏外裁切。
             return Err(AppError::timeout("等待可点击的工作区标签控件")
                 .with_source(std::io::Error::other(control.to_string())));
         }

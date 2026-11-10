@@ -3256,7 +3256,8 @@ fn project_workbench_viewport(
             .iter()
             .find(|tab| tab.id() == tab_id)?;
         let expected_panel = match tab {
-            WorkspaceSessionTab::WorkspaceFile { .. } => CenterPanel::Editor,
+            WorkspaceSessionTab::FileWorkspace { .. }
+            | WorkspaceSessionTab::WorkspaceFile { .. } => CenterPanel::Editor,
             WorkspaceSessionTab::SftpTransfer { .. } => {
                 if root.files_workspace_selection
                     != super::workspace_files::FilesWorkspaceSelection::TransferTab(tab_id.clone())

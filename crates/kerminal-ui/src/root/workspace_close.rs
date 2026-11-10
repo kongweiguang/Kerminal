@@ -112,6 +112,15 @@ fn transfer_close_targets_for_tab(tab: &WorkspaceSessionTab) -> Vec<TransferClos
             origin: TransferOrigin::SftpWorkspace(tab.id().clone()),
             descriptor: TransferCloseDescriptor::Tab(tab.clone()),
         }],
+        WorkspaceSessionTab::FileWorkspace { id, state, .. } => {
+            super::workspace_files::workspace_origins(id, state)
+                .into_iter()
+                .map(|origin| TransferCloseTarget {
+                    origin,
+                    descriptor: TransferCloseDescriptor::Tab(tab.clone()),
+                })
+                .collect()
+        }
         WorkspaceSessionTab::WorkspaceFile { .. } => vec![TransferCloseTarget {
             origin: TransferOrigin::WorkspaceFile(tab.id().clone()),
             descriptor: TransferCloseDescriptor::Tab(tab.clone()),
@@ -1669,19 +1678,26 @@ impl RootView {
     ) -> bool {
         let panes = tab_ids
             .iter()
-            .filter_map(|tab_id| {
-                if *tab_id == self.sftp_workbench_tab_id {
+            .flat_map(|tab_id| {
+                let mut panes = if *tab_id == self.sftp_workbench_tab_id {
                     self.sftp_workbench_tab_open
                         .then(|| self.files_pane.clone())
                         .flatten()
+                        .into_iter()
+                        .collect::<Vec<_>>()
                 } else {
-                    self.workspace_files.files_pane(tab_id)
-                }
+                    self.workspace_files
+                        .files_pane(tab_id)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                };
+                panes.extend(self.workspace_files.host_directory_panes(tab_id));
+                panes
             })
             .collect::<Vec<_>>();
         if panes
             .iter()
-            .any(|pane| pane.read(cx).transfer_enqueue_in_progress())
+            .any(|pane| pane.read(cx).file_workspace_directory_close_blocked())
         {
             self.status = Some(crate::locale::text(
                 "传输任务正在加入队列，请等待受理结果后再关闭。",
@@ -1866,7 +1882,7 @@ impl RootView {
         if compact_enqueue_pending
             || panes
                 .iter()
-                .any(|pane| pane.read(cx).transfer_enqueue_in_progress())
+                .any(|pane| pane.read(cx).file_workspace_directory_close_blocked())
         {
             self.status = Some(crate::locale::text(
                 "传输任务正在加入队列，请等待受理结果后再关闭。",
@@ -2006,7 +2022,11 @@ impl RootView {
                 }
                 (_, TransferCloseDescriptor::Tab(tab)) => {
                     self.activate_workspace_tab_surface(tab.id(), true, window, cx);
-                    if matches!(tab, WorkspaceSessionTab::WorkspaceFile { .. }) {
+                    if matches!(
+                        tab,
+                        WorkspaceSessionTab::WorkspaceFile { .. }
+                            | WorkspaceSessionTab::FileWorkspace { .. }
+                    ) {
                         self.reveal_sftp_tool_if_needed(window, cx);
                         self.try_bind_files_from_active_terminal(cx);
                     }
@@ -3065,6 +3085,17 @@ impl RootView {
             );
             return;
         }
+        if matches!(tab, WorkspaceSessionTab::FileWorkspace { .. }) {
+            let endpoints = self.workspace_files.host_document_endpoints(&tab_id);
+            if let Some(editor) = self.file_editor_workspace.clone() {
+                editor.update(cx, |editor, cx| {
+                    editor.request_workspace_group_close(operation_id, endpoints, cx)
+                });
+            } else {
+                self.close_guarded_nonterminal_tab(operation_id, tab_id, cx);
+            }
+            return;
+        }
         let endpoint = self.workspace_files.file_endpoint(&tab_id);
         let needs_editor_guard = matches!(&tab, WorkspaceSessionTab::WorkspaceFile { .. })
             && endpoint.as_ref().is_some_and(|endpoint| {
@@ -3138,6 +3169,55 @@ impl RootView {
         let was_active = self.nonterminal_workspace_tab_is_visible(tab.id());
         self.close_guarded_nonterminal_tab(operation_id, tab.id().clone(), cx);
         if was_active {
+            self.activate_current_workspace_surface_after_close(window, cx);
+        }
+    }
+
+    /// 整组关闭回执只结算原宿主资源操作，取消不能留下阻断导航的候选。
+    /// @author kongweiguang
+    pub(super) fn handle_workspace_file_group_close_result(
+        &mut self,
+        operation_id: String,
+        closed: bool,
+        window: &mut Window,
+        cx: &mut Context<RootView>,
+    ) {
+        let pending = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.pending_resource_operation())
+            .cloned();
+        let Some(WorkspaceResourceOperation::CloseTab {
+            operation_id: current,
+            tab,
+            ..
+        }) = pending
+        else {
+            return;
+        };
+        if current != operation_id
+            || !matches!(tab.as_ref(), WorkspaceSessionTab::FileWorkspace { .. })
+        {
+            return;
+        }
+        if !closed {
+            self.plugin_tab_close_deadlines.remove(tab.id());
+            if let Some(controller) = self.workspace_controller.as_mut() {
+                cancel_unclosed_file_tab_operation(controller, &operation_id, tab.id());
+            }
+            self.pending_close_batch_focus = None;
+            self.sftp_workbench_close_after_batch = None;
+            self.status = Some(crate::locale::text(
+                "文件工作区关闭已取消或未完成，内容仍保留。",
+                "Closing the file workspace was cancelled or did not complete. Its contents were kept.",
+            ));
+            self.refresh_workspace_views(cx);
+            cx.notify();
+            return;
+        }
+        let visible = self.nonterminal_workspace_tab_is_visible(tab.id());
+        self.close_guarded_nonterminal_tab(operation_id, tab.id().clone(), cx);
+        if visible {
             self.activate_current_workspace_surface_after_close(window, cx);
         }
     }
@@ -3726,7 +3806,8 @@ impl RootView {
         snapshot.terminal_tabs.iter().any(|tab| {
             tab.id() == tab_id
                 && match tab {
-                    WorkspaceSessionTab::WorkspaceFile { .. } => {
+                    WorkspaceSessionTab::WorkspaceFile { .. }
+                    | WorkspaceSessionTab::FileWorkspace { .. } => {
                         self.center_panel == CenterPanel::Editor
                     }
                     WorkspaceSessionTab::SftpTransfer { .. } => {
@@ -3989,7 +4070,7 @@ fn cancel_unclosed_file_tab_operation(
     if !matches!(controller.pending_resource_operation(),
         Some(WorkspaceResourceOperation::CloseTab { operation_id: current, tab, .. })
             if current == operation_id && tab.id() == tab_id
-                && matches!(tab.as_ref(), WorkspaceSessionTab::WorkspaceFile { .. }))
+                && matches!(tab.as_ref(), WorkspaceSessionTab::WorkspaceFile { .. } | WorkspaceSessionTab::FileWorkspace { .. }))
     {
         return false;
     }

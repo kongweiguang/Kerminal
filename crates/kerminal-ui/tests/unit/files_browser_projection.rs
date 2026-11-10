@@ -6,9 +6,10 @@ use crate::features::files::{
     FileSort, FileSortColumn, bookmark_response_is_current, bookmark_target,
     permissions::{PermissionEditor, supports_posix_mode_endpoint},
     transfer_queue::TransferQueueUi,
-    view_mode::FileEntryFilter,
+    view_mode::{FileEntryFilter, FilesViewMode},
 };
-use kerminal_application::preferences::InterfaceDensity;
+use gpui_kit::WindowAppearance;
+use kerminal_application::preferences::{AppColorScheme, InterfaceDensity, ThemeMode};
 use kerminal_domain::{
     files::{
         BookmarkTarget, ConflictPolicy, ContainerRuntime, FileBookmark, FileEntryKind, RemotePath,
@@ -39,6 +40,104 @@ fn browser_toolbar_projects_two_rows_and_compact_ssh_follow() {
     assert!(compact_remote.show_terminal_follow);
     assert!(!wide_remote.show_terminal_follow);
     assert!(!compact_local.show_terminal_follow);
+}
+
+/// 普通文件行透出内容面，悬停行显示轻叠层，且已选行在悬停时仍保留选中表面。
+///
+/// @author kongweiguang
+#[test]
+fn file_entry_surfaces_keep_selection_above_hover() {
+    let theme = ThemeTokens::for_scheme(
+        WindowAppearance::Dark,
+        ThemeMode::Dark,
+        AppColorScheme::ALL[0],
+    );
+    let selected_surface = file_entry_surface(theme, true, false);
+
+    assert_eq!(
+        file_entry_surface(theme, false, false),
+        theme.panel.opacity(0.)
+    );
+    assert_eq!(
+        file_entry_surface(theme, false, true),
+        theme.surface_hover()
+    );
+    assert_eq!(selected_surface, theme.surface_selected());
+    assert_eq!(file_entry_surface(theme, true, true), selected_surface);
+}
+
+/// 工具栏计数在列表模式保留可见与目录总量，树形只报展开节点；
+/// 悬停说明补充目录总量和已选数量，筛选不会把子集误当整目录。
+///
+/// @author kongweiguang
+#[test]
+fn file_toolbar_counts_keep_total_and_tree_scope() {
+    assert_eq!(
+        file_toolbar_count_label(FilesViewMode::List, 12, 31, false),
+        crate::locale::text("12 / 31 项", "12 / 31 items")
+    );
+    assert_eq!(
+        file_toolbar_count_label(FilesViewMode::List, 31, 31, false),
+        crate::locale::text("31 项", "31 items")
+    );
+    assert_eq!(
+        file_toolbar_count_label(FilesViewMode::List, 5, 31, false),
+        crate::locale::text("5 / 31 项", "5 / 31 items")
+    );
+    assert_eq!(
+        file_toolbar_count_label(FilesViewMode::Tree, 8, 31, false),
+        crate::locale::text("8 项", "8 items")
+    );
+    assert_eq!(
+        file_toolbar_selection_label(5, false),
+        crate::locale::text("已选 5", "Selected 5")
+    );
+    assert_eq!(
+        file_toolbar_count_label(FilesViewMode::List, 21, 21, true),
+        crate::locale::text("21项", "21 items")
+    );
+    assert_eq!(
+        file_toolbar_count_label(FilesViewMode::List, 5, 31, true),
+        crate::locale::text("5/31项", "5 / 31 items")
+    );
+    assert_eq!(
+        file_toolbar_selection_label(5, true),
+        crate::locale::text("已选5", "Selected 5")
+    );
+
+    let unfiltered_tooltip =
+        file_toolbar_count_tooltip(FilesViewMode::List, FileEntryFilter::All, 31, 31, 0);
+    assert_eq!(
+        unfiltered_tooltip.to_string(),
+        format!(
+            "{}{}",
+            crate::locale::text("当前显示项数：", "Visible items: "),
+            31
+        )
+    );
+
+    let list_tooltip =
+        file_toolbar_count_tooltip(FilesViewMode::List, FileEntryFilter::Files, 5, 31, 2);
+    let expected_list_tooltip = format!(
+        "{}{}{}{}{}",
+        crate::locale::text("显示文件数：", "Visible files: "),
+        5,
+        crate::locale::text(" · 目录项目：31", " · Directory items: 31"),
+        crate::locale::text(" · 已选项数：", " · Selected items: "),
+        2
+    );
+    assert_eq!(list_tooltip.to_string(), expected_list_tooltip);
+
+    let tree_tooltip =
+        file_toolbar_count_tooltip(FilesViewMode::Tree, FileEntryFilter::All, 8, 31, 0);
+    assert_eq!(
+        tree_tooltip.to_string(),
+        format!(
+            "{}{}",
+            crate::locale::text("展开项数：", "Expanded items: "),
+            8
+        )
+    );
 }
 
 /// 表格列按实际宽度切换；动作条固定为同一组高频按钮，不再按宽度换组。

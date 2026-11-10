@@ -44,7 +44,9 @@ pub(crate) struct FilesPaneFixture {
     pub(crate) mutations: Arc<MutationCalls>,
 }
 
-/// 创建未启动后台 IO 的 FilesPane entity，测试通过原生产状态入口驱动生命周期。
+/// 创建未启动后台 IO 的 FilesPane entity，显式来源种子让测试不依赖被删除的隐式上下文。
+///
+/// @author kongweiguang
 pub(crate) fn entity_fixture(
     app: &mut TestAppContext,
     endpoint: FileEndpoint,
@@ -62,7 +64,12 @@ pub(crate) fn entity_fixture(
                 endpoint,
             );
             pane.initialized = true;
+            pane.transfer_query_scope =
+                kerminal_application::transfers::TransferQueryScope::origins(
+                    pane.transfer_origin.clone(),
+                );
             seed(&mut pane);
+            seed_compact_context(&mut pane);
             pane
         })
     });
@@ -73,7 +80,9 @@ pub(crate) fn entity_fixture(
     }
 }
 
-/// 创建带真实 GPUI 窗口的 FilesPane，保留列表按键事件及其焦点路由。
+/// 创建带真实 GPUI 窗口的 FilesPane，显式来源与列表焦点一起保留以验证生产事件路由。
+///
+/// @author kongweiguang
 pub(crate) fn window_fixture(
     app: &mut TestAppContext,
     endpoint: FileEndpoint,
@@ -101,7 +110,12 @@ pub(crate) fn window_fixture(
                 endpoint,
             );
             pane.initialized = true;
+            pane.transfer_query_scope =
+                kerminal_application::transfers::TransferQueryScope::origins(
+                    pane.transfer_origin.clone(),
+                );
             seed(&mut pane);
+            seed_compact_context(&mut pane);
             pane
         });
         *mounted_pane.borrow_mut() = Some(pane.clone());
@@ -113,6 +127,21 @@ pub(crate) fn window_fixture(
         .expect("FilesPane window fixture mounted");
     draw(visual);
     (runtime, pane, mutations, visual)
+}
+
+/// 旧 fixture 的端点种子显式标明来源，避免测试继续依赖生产已删除的无 binding 推断。
+///
+/// @author kongweiguang
+pub(crate) fn seed_compact_context(pane: &mut FilesPane) {
+    if pane.current_terminal_endpoint.is_some() {
+        pane.compact_context = pane
+            .current_terminal_binding
+            .clone()
+            .map(super::CompactFilesContext::Terminal)
+            .unwrap_or_else(|| {
+                super::CompactFilesContext::FileWorkspace(kerminal_domain::identity::TabId::new())
+            });
+    }
 }
 
 /// 绘制两帧以完成文件列表焦点与测试辅助节点注册。
@@ -174,6 +203,7 @@ pub(crate) fn seed_compact_listing(
 ) {
     pane.initialized = true;
     pane.current_terminal_endpoint = Some(endpoint.clone());
+    seed_compact_context(pane);
     pane.panels[1].endpoint = endpoint;
     pane.panels[1].requested_endpoint = None;
     seed_listing(pane, 1, 1, entries);

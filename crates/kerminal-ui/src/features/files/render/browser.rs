@@ -440,6 +440,7 @@ fn render_file_more_menu(
 
 /// 路径和操作统一为两排；紧凑模式仅显示当前终端目标，工具栏和列按当前面板实际 bounds 分档。
 /// 紧凑右栏复用 rail 自身外壳，独立边框只属于文件列表卡；中央工作区继续用 endpoint 边界显示活动面板。
+/// 浏览器根层只绘制一次内容阅读面，路径、表头和目录行透出该面以避免透明度重复累积。
 /// 键盘焦点留在列表 owner；实际行、虚拟尺寸和翻页共用当前帧的缩放行高。
 /// 同目录刷新保留已提交清单；导航到其它目录时不冒用旧清单，忙态只由原刷新图标表达。
 /// 删除忙态仅投影到对应菜单，避免阻止用户在后台删除时继续浏览。
@@ -607,7 +608,7 @@ pub(super) fn render_browser(
         Vec::new()
     };
 
-    let endpoint_heading: AnyElement = if pane.compact_layout {
+    let endpoint_heading: AnyElement = if pane.compact_layout || pane.file_workspace_layout {
         div().h(px(0.)).into_any_element()
     } else if let Some(header) = host_picker_header {
         header
@@ -640,7 +641,7 @@ pub(super) fn render_browser(
                 theme.border
             })
         })
-        .bg(theme.panel);
+        .bg(theme.content_surface());
     let drop_endpoint_for_validation = endpoint.clone();
     let drop_endpoint_for_external = endpoint.clone();
     let drop_endpoint_for_internal = endpoint.clone();
@@ -748,8 +749,9 @@ pub(super) fn render_browser(
             endpoint: &endpoint,
             path_input: &path_input,
             side,
-            compact_layout: pane.compact_layout,
-            show_scheme: !pane.compact_layout || columns.size,
+            compact_layout: pane.compact_layout || pane.file_workspace_layout,
+            // 文件工作区是单栏文件管理器，不显示 SFTP 协议前缀；工作台宽栏仍按列密度决定。
+            show_scheme: !pane.file_workspace_layout && (!pane.compact_layout || columns.size),
             show_terminal_follow: toolbar_projection.show_terminal_follow
                 && pane.current_terminal_binding.is_some(),
             bookmarks: path_bookmarks,
@@ -782,7 +784,7 @@ pub(super) fn render_browser(
             file_count,
             directory_count,
             entry_filter: panel.entry_filter,
-            compact_layout: pane.compact_layout,
+            compact_layout: pane.compact_layout || pane.file_workspace_layout,
             show_hidden_files,
             view_mode: pane.view_mode,
             loading,
@@ -960,8 +962,7 @@ pub(super) fn render_browser(
                 pane.prepare_rename(window, cx);
                 cx.stop_propagation();
             }
-        }))
-        .bg(theme.panel);
+        }));
 
     let trust_request = pane.current_host_key_trust_request();
     let host_key_trust_busy = trust_request.as_ref().is_some_and(|request| {
@@ -1153,7 +1154,6 @@ pub(super) fn render_browser(
                 .rounded_md()
                 .border_1()
                 .border_color(theme.border)
-                .bg(theme.panel)
                 .child(table_heading)
                 .child(list),
         )
@@ -1162,7 +1162,7 @@ pub(super) fn render_browser(
     }
 }
 
-/// 端点身份留在面板标题，当前路径另放路径栏；侧栏序号提供稳定唯一 ID，使完整身份可作无障碍名称。
+/// 端点身份留在面板标题，当前路径另放路径栏；标题透出根阅读面，侧栏序号提供稳定无障碍名称。
 ///
 /// @author kongweiguang
 fn render_endpoint_heading(
@@ -1187,7 +1187,6 @@ fn render_endpoint_heading(
         .gap_2()
         .border_b_1()
         .border_color(theme.border)
-        .bg(theme.secondary)
         .aria_label(accessibility_label)
         .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
         .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(if active {
@@ -1236,7 +1235,7 @@ fn endpoint_short_label(
 /// 按钮和 Enter 共用导航校验，窄栏仍可通过编辑与完整路径提示访问长路径。
 /// 书签空态保留保存路径的提示，使图标操作在无数据时也可发现。
 /// 路径栏只保留目录跟随开关并暴露其开关状态；Shell 上报由会话集成负责，不在此写入远端启动文件。
-/// InputGroup 独占地址边框和焦点态；组合输入优先消费 Enter/Escape，避免误提交或清空路径。
+/// 路径带透出浏览器根阅读面；InputGroup 独占地址边框和焦点态，组合输入优先消费 Enter/Escape。
 ///
 /// @author kongweiguang
 fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> impl IntoElement {
@@ -1539,12 +1538,11 @@ fn render_path_bar(view: FilePathBarView<'_>, cx: &mut Context<FilesPane>) -> im
         .when(!compact_layout, |bar| {
             bar.border_b_1().border_color(theme.border)
         })
-        .bg(theme.panel)
         .child(path_controls)
         .into_any_element()
 }
 
-/// GPUI Kit 的 ghost+outline 默认背景和边框透明；局部覆盖语义中性令牌并淡化禁用态以匹配 main。
+/// GPUI Kit 的 ghost+outline 默认背景和边框透明；工具条透出浏览器根表面，按钮本身仍有中性底色与禁用态。
 /// @author kongweiguang
 fn compact_toolbar_button(button: Button, theme: ThemeTokens, disabled: bool) -> Button {
     button
@@ -1555,9 +1553,98 @@ fn compact_toolbar_button(button: Button, theme: ThemeTokens, disabled: bool) ->
         .when(disabled, |button| button.opacity(0.45))
 }
 
+/// 目录工具栏右侧只在筛选时展示比例；未筛选列表和树形直接显示当前项数，
+/// 避免“31 / 31 项”这类冗余在紧凑栏挤占已选数量。
+///
+/// @author kongweiguang
+fn file_toolbar_count_label(
+    view_mode: super::super::view_mode::FilesViewMode,
+    visible_count: usize,
+    total_entry_count: usize,
+    compact_layout: bool,
+) -> SharedString {
+    if view_mode == super::super::view_mode::FilesViewMode::Tree
+        || visible_count == total_entry_count
+    {
+        let zh_cn = if compact_layout {
+            format!("{visible_count}项")
+        } else {
+            format!("{visible_count} 项")
+        };
+        locale::text(zh_cn, format!("{visible_count} items"))
+    } else {
+        let zh_cn = if compact_layout {
+            format!("{visible_count}/{total_entry_count}项")
+        } else {
+            format!("{visible_count} / {total_entry_count} 项")
+        };
+        locale::text(
+            zh_cn,
+            format!("{visible_count} / {total_entry_count} items"),
+        )
+    }
+}
+
+/// 已选数量独立成段，使用与目录计数不同的强调色，避免与总数混读。
+///
+/// @author kongweiguang
+fn file_toolbar_selection_label(selected_count: usize, compact_layout: bool) -> SharedString {
+    let zh_cn = if compact_layout {
+        format!("已选{selected_count}")
+    } else {
+        format!("已选 {selected_count}")
+    };
+    locale::text(zh_cn, format!("Selected {selected_count}"))
+}
+
+/// 悬停说明补足计数口径；目录总量只在列表模式展示，树形不与单层目录项目作比。
+///
+/// @author kongweiguang
+fn file_toolbar_count_tooltip(
+    view_mode: super::super::view_mode::FilesViewMode,
+    entry_filter: super::super::view_mode::FileEntryFilter,
+    visible_count: usize,
+    total_entry_count: usize,
+    selected_count: usize,
+) -> SharedString {
+    let (count_scope, total_scope) = if view_mode == super::super::view_mode::FilesViewMode::Tree {
+        (
+            locale::text("展开项数：", "Expanded items: "),
+            SharedString::default(),
+        )
+    } else {
+        let scope = match entry_filter {
+            super::super::view_mode::FileEntryFilter::All => {
+                locale::text("当前显示项数：", "Visible items: ")
+            }
+            super::super::view_mode::FileEntryFilter::Files => {
+                locale::text("显示文件数：", "Visible files: ")
+            }
+            super::super::view_mode::FileEntryFilter::Directories => {
+                locale::text("显示目录数：", "Visible folders: ")
+            }
+        };
+        let total_scope = if visible_count == total_entry_count {
+            SharedString::default()
+        } else {
+            locale::text(
+                format!(" · 目录项目：{total_entry_count}"),
+                format!(" · Directory items: {total_entry_count}"),
+            )
+        };
+        (scope, total_scope)
+    };
+    if selected_count == 0 {
+        format!("{count_scope}{visible_count}{total_scope}").into()
+    } else {
+        let selection_scope = locale::text(" · 已选项数：", " · Selected items: ");
+        format!("{count_scope}{visible_count}{total_scope}{selection_scope}{selected_count}").into()
+    }
+}
+
 /// 宽窄工作台共用上级、刷新、隐藏、上传、新建、传输、计数和更多动作。
-/// 紧凑动作槽从同一密度投影计算，刷新时保留原有命中区；窄栏放大字号时换行以保留所有操作。
-/// 两种布局始终只显示当前投影项数；类型、树展开范围和已选数在悬停说明中明确区分。
+/// 动作组之间以细分隔线分组；右侧固定显示目录计数和已选数量，空间不足先压缩目录计数。
+/// 工具条本身透出浏览器根阅读面；紧凑动作槽从同一密度投影计算，窄栏放大字号时换行以保留操作。
 ///
 /// @author kongweiguang
 fn render_file_actions(
@@ -1576,10 +1663,13 @@ fn render_file_actions(
         has_transferable_selection,
         has_remote_selection,
         visible_count,
+        total_entry_count,
         entry_filter,
         compact_layout,
         show_hidden_files,
         view_mode,
+        delete_confirmation,
+        delete_action_busy,
         ..
     } = view;
     let can_upload = !matches!(endpoint, FileEndpoint::Local { .. });
@@ -1656,28 +1746,17 @@ fn render_file_actions(
         .loading_icon(IconName::RefreshCw)
         .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| pane.refresh_panel(side, cx)));
 
-    let count_scope = if view_mode == super::super::view_mode::FilesViewMode::Tree {
-        locale::text("展开项数：", "Expanded items: ")
-    } else {
-        match entry_filter {
-            super::super::view_mode::FileEntryFilter::All => {
-                locale::text("当前显示项数：", "Visible items: ")
-            }
-            super::super::view_mode::FileEntryFilter::Files => {
-                locale::text("显示文件数：", "Visible files: ")
-            }
-            super::super::view_mode::FileEntryFilter::Directories => {
-                locale::text("显示目录数：", "Visible folders: ")
-            }
-        }
-    };
-    let count_tooltip: SharedString = if selected_count == 0 {
-        format!("{count_scope}{visible_count}").into()
-    } else {
-        let selection_scope = locale::text(" · 已选项数：", " · Selected items: ");
-        format!("{count_scope}{visible_count}{selection_scope}{selected_count}").into()
-    };
-    let count_label: SharedString = visible_count.to_string().into();
+    let count_label =
+        file_toolbar_count_label(view_mode, visible_count, total_entry_count, compact_layout);
+    let count_tooltip = file_toolbar_count_tooltip(
+        view_mode,
+        entry_filter,
+        visible_count,
+        total_entry_count,
+        selected_count,
+    );
+    let selection_label =
+        (selected_count > 0).then(|| file_toolbar_selection_label(selected_count, compact_layout));
 
     let mut actions = div()
         .id(format!("files-actions-{side}"))
@@ -1693,7 +1772,6 @@ fn render_file_actions(
         .gap(theme.metrics.gap / 4.)
         .border_b_1()
         .border_color(theme.border)
-        .bg(theme.panel)
         .child(parent)
         .child(refresh);
     actions = actions
@@ -1726,7 +1804,16 @@ fn render_file_actions(
             })
             .on_click(cx.listener(|pane, _: &ClickEvent, _, cx| pane.toggle_hidden_files(cx))),
         )
-        .child(div().w(px(1.)).h(px(16.)).flex_shrink_0().bg(theme.border));
+        .child(
+            div()
+                .id(format!("files-navigation-divider-{side}"))
+                .debug_selector(move || format!("files-navigation-divider-{side}"))
+                .w(px(1.))
+                .h(theme.metrics.control_height * 0.625)
+                .mx(px(2.))
+                .flex_shrink_0()
+                .bg(theme.border),
+        );
     if can_upload {
         let upload_files_entity = cx.entity().clone();
         let upload_directories_entity = cx.entity().clone();
@@ -1795,6 +1882,34 @@ fn render_file_actions(
             pane.prepare_create_directory(window, cx);
         })),
     );
+    // 删除必须与新建同级可见；紧凑右栏没有宽栏的更多菜单，只有右键和 Delete 键会让选中项无从发现删除入口。
+    let delete_label = if delete_action_busy {
+        locale::text("删除中…", "Deleting…")
+    } else if delete_confirmation {
+        locale::text("确认删除所选项目", "Confirm deletion")
+    } else {
+        locale::text("删除所选项目", "Delete selected items")
+    };
+    let delete_disabled = delete_action_busy || selected_count == 0;
+    actions = actions.child(
+        compact_toolbar_button(
+            asset_icon_button(
+                format!("files-delete-{side}"),
+                AssetIconName::Trash,
+                delete_label,
+                delete_disabled,
+            ),
+            theme,
+            delete_disabled,
+        )
+        .size(theme.metrics.control_height)
+        .flex_shrink_0()
+        .debug_selector(move || format!("rr-files-delete-{side}"))
+        .on_click(cx.listener(move |pane, _: &ClickEvent, _, cx| {
+            pane.activate_side(side, cx);
+            pane.delete_selected(cx);
+        })),
+    );
     if compact_layout {
         if can_upload {
             actions = actions.child(
@@ -1802,7 +1917,8 @@ fn render_file_actions(
                     .id(format!("files-download-divider-{side}"))
                     .debug_selector(move || format!("files-download-divider-{side}"))
                     .w(px(1.))
-                    .h(px(16.))
+                    .h(theme.metrics.control_height * 0.625)
+                    .mx(px(2.))
                     .flex_shrink_0()
                     .bg(theme.border),
             );
@@ -1849,7 +1965,8 @@ fn render_file_actions(
                 .id(format!("files-transfer-divider-{side}"))
                 .debug_selector(move || format!("files-transfer-divider-{side}"))
                 .w(px(1.))
-                .h(px(16.))
+                .h(theme.metrics.control_height * 0.625)
+                .mx(px(2.))
                 .flex_shrink_0()
                 .bg(theme.border),
         );
@@ -1881,36 +1998,59 @@ fn render_file_actions(
             })),
         );
     }
-    // 计数沿用左栏分组徽标的胶囊样式：使用固定最小尺寸而非随文本伸缩，
-    // 目录项数变化时不会带动右侧“更多”入口位移，超长计数仍按上限省略。
-    let count_pill = div()
+    // 右侧统计使用可压缩文本而非胶囊：目录比例与已选数量分区，
+    // 计数增长只挤占自身左侧的空白，“…”入口和动作组保持原位。
+    // 选中数和菜单之间保留最小呼吸空间，紧凑栏优先压缩目录计数而不是把操作挤成一团。
+    let summary_gap = theme.metrics.gap / 2.;
+    let count_summary = div()
         .id(format!("files-toolbar-count-{side}"))
         .debug_selector(move || format!("files-toolbar-count-{side}"))
-        .min_w(px(22.))
-        .h(px(22.))
-        .mx(px(2.))
-        .flex_shrink_0()
+        .flex_shrink_1()
+        .min_w(px(0.))
         .flex()
         .items_center()
-        .justify_center()
-        .px_1()
-        .rounded_full()
-        .bg(theme.secondary)
-        .text_center()
-        .text_color(theme.muted)
+        .justify_end()
+        .gap(summary_gap)
         .text_size(theme.text_xs)
-        .max_w(theme.metrics.control_height * 5.)
-        .overflow_hidden()
+        .text_color(theme.muted)
         .whitespace_nowrap()
-        .text_ellipsis()
+        .overflow_hidden()
         .aria_label(count_tooltip.clone())
-        .tooltip(move |window, cx| Tooltip::new(count_tooltip.clone()).build(window, cx))
-        .child(count_label);
+        .child(
+            div()
+                .id(format!("files-toolbar-visible-count-{side}"))
+                .min_w(px(0.))
+                .flex_shrink_1()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .tooltip(move |window, cx| Tooltip::new(count_tooltip.clone()).build(window, cx))
+                .child(count_label),
+        )
+        .when_some(selection_label, |summary, label| {
+            summary.child(
+                div()
+                    .id(format!("files-toolbar-selection-{side}"))
+                    .debug_selector(move || format!("files-toolbar-selection-{side}"))
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .text_color(theme.accent)
+                    .child(label),
+            )
+        });
 
     actions
-        .child(div().flex_1().min_w(px(0.)))
-        .child(count_pill)
-        .child(more)
+        .child(
+            div()
+                .flex_1()
+                .min_w(theme.metrics.control_height + theme.metrics.gap / 2.)
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(summary_gap)
+                .child(count_summary)
+                .child(more),
+        )
         .into_any_element()
 }
 
@@ -1957,7 +2097,8 @@ fn upload_menu_item(
     .on_click(on_click)
 }
 
-/// 表头与目录行共享固定元数据宽度；紧凑右栏跟随 main 的本机时间格式，中央工作区保留 UTC 标示。
+/// 表头与目录行共享固定元数据宽度；标题行透出浏览器根表面，避免遮住宿主材质。
+/// 紧凑右栏跟随 main 的本机时间格式，中央工作区保留 UTC 标示。
 ///
 /// @author kongweiguang
 fn render_table_heading(
@@ -2006,7 +2147,6 @@ fn render_table_heading(
         .gap_2()
         .border_b_1()
         .border_color(theme.border)
-        .bg(theme.secondary)
         .text_size(px(12.))
         .text_color(theme.subtle)
         .child(name_heading);
@@ -2055,7 +2195,7 @@ fn render_table_heading(
     heading
 }
 
-/// 可排序表头提供鼠标与键盘入口，并用方向符号说明当前顺序。
+/// 可排序表头提供鼠标与键盘入口，并用方向符号说明当前顺序；悬停叠层不覆盖阅读底色。
 ///
 /// @author kongweiguang
 fn sortable_heading(view: SortableHeadingView, cx: &mut Context<FilesPane>) -> impl IntoElement {
@@ -2093,7 +2233,7 @@ fn sortable_heading(view: SortableHeadingView, cx: &mut Context<FilesPane>) -> i
         .aria_label(accessible)
         .aria_keyshortcuts("Enter Space")
         .text_color(theme.subtle)
-        .hover(|style| style.bg(theme.hover).text_color(theme.foreground))
+        .hover(|style| style.bg(theme.surface_hover()).text_color(theme.foreground))
         .on_key_down(cx.listener(move |pane, event: &KeyDownEvent, _, cx| {
             if matches!(
                 event.keystroke.key.to_ascii_lowercase().as_str(),
@@ -2109,7 +2249,25 @@ fn sortable_heading(view: SortableHeadingView, cx: &mut Context<FilesPane>) -> i
         .child(displayed)
 }
 
+/// 文件与树行共用一套状态投影：未选行透明、悬停使用轻叠层，已选行不被悬停降级。
+///
+/// @author kongweiguang
+pub(super) fn file_entry_surface(
+    theme: ThemeTokens,
+    selected: bool,
+    hovered: bool,
+) -> gpui_kit::Hsla {
+    if selected {
+        theme.surface_selected()
+    } else if hovered {
+        theme.surface_hover()
+    } else {
+        theme.panel.opacity(0.)
+    }
+}
+
 /// 元数据列挤压文件名时保留完整名称提示；紧凑行跟随 main 的本机时间，中央工作区继续显示 UTC。
+/// 行基态透出父层，悬停与选择使用独立叠层且选择优先，避免多选反馈被指针状态覆盖。
 /// 实际行与虚拟列表共用同一密度行高，防止滚动几何错位；右键仅保留直接作用于文件的常用命令。
 ///
 /// @author kongweiguang
@@ -2177,6 +2335,7 @@ fn render_entry(view: FileEntryRowView, cx: &mut Context<FilesPane>) -> AnyEleme
         format!("central-files-row-{side}-{name}")
     };
     let click_entry = entry.clone();
+    let toggle_entry = entry.clone();
     let double_click_entry = entry.clone();
     let click_names = Arc::clone(&ordered_names);
     let click_directory = source_directory.clone();
@@ -2198,12 +2357,8 @@ fn render_entry(view: FileEntryRowView, cx: &mut Context<FilesPane>) -> AnyEleme
             theme.border
         })
         .rounded_sm()
-        .bg(if selected {
-            theme.selected
-        } else {
-            theme.panel
-        })
-        .hover(|style| style.bg(theme.hover))
+        .bg(file_entry_surface(theme, selected, false))
+        .hover(|style| style.bg(file_entry_surface(theme, selected, true)))
         .cursor_pointer()
         .role(gpui_kit::Role::ListItem)
         .aria_label(accessible_name)
@@ -2235,24 +2390,46 @@ fn render_entry(view: FileEntryRowView, cx: &mut Context<FilesPane>) -> AnyEleme
                 pane.open_entry(side, double_click_entry.clone(), cx);
             }
         }))
-        .child(
+        .child({
+            let toggle_names = Arc::clone(&ordered_names);
+            let toggle_directory = source_directory.clone();
+            let toggle_generation = source_generation;
+            // 复选框必须只切换本行；整行 Replace 手势会把用户的多选静默清空。
             div()
-                .w(px(14.))
-                .h(px(14.))
-                .ml(px(4.))
-                .mr(px(2.))
+                .id(format!("files-entry-toggle-{name}"))
+                .w(px(24.))
+                .h_full()
                 .flex_shrink_0()
                 .flex()
                 .items_center()
                 .justify_center()
+                .cursor_pointer()
                 .text_size(theme.text_xs)
                 .text_color(if selected { theme.accent } else { theme.subtle })
                 .child(if selected {
                     IconName::Check
                 } else {
                     IconName::Square
-                }),
-        )
+                })
+                .on_click(cx.listener(move |pane, _: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    if !pane.browser_action_snapshot_is_current(
+                        side,
+                        toggle_generation,
+                        &toggle_directory,
+                    ) {
+                        return;
+                    }
+                    pane.select_entry(
+                        side,
+                        toggle_entry.clone(),
+                        super::super::selection::SelectionGesture::Toggle,
+                        toggle_names.as_slice(),
+                        cx,
+                    );
+                    pane.focus_browser_list(side, window, cx);
+                }))
+        })
         .child(
             div()
                 .w(px(16.))
@@ -2268,11 +2445,7 @@ fn render_entry(view: FileEntryRowView, cx: &mut Context<FilesPane>) -> AnyEleme
                 .overflow_hidden()
                 .text_size(theme.text_body)
                 .font_weight(gpui_kit::FontWeight::MEDIUM)
-                .text_color(if selected {
-                    theme.selected_foreground
-                } else {
-                    theme.foreground
-                })
+                .text_color(theme.foreground)
                 .whitespace_nowrap()
                 .text_ellipsis()
                 .tooltip(move |window, cx| Tooltip::new(name_tooltip.clone()).build(window, cx))
