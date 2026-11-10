@@ -14,19 +14,20 @@ use kerminal_domain::files::{DirectoryListing, FileEntryKind};
 #[path = "../support/root_commands_service.rs"]
 mod root_commands_service;
 
-/// 使用内存命令服务创建真实 CommandsView，验证时不读取用户目录。
-///
-/// @author kongweiguang
-fn fixture_with_commands(
-    app: &mut TestAppContext,
-) -> (
+/// 宿主命令 fixture 的返回部件较多，用别名保持函数签名可读。
+type CommandsFixture<'a> = (
     Runtime,
     Entity<RootView>,
     Arc<CapturingSessions>,
     Arc<TemporaryTargets>,
-    &mut VisualTestContext,
+    &'a mut VisualTestContext,
     Arc<root_commands_service::CatalogCalls>,
-) {
+);
+
+/// 使用内存命令服务创建真实 CommandsView，验证时不读取用户目录。
+///
+/// @author kongweiguang
+fn fixture_with_commands(app: &mut TestAppContext) -> CommandsFixture<'_> {
     let calls = Rc::new(RefCell::new(None));
     let calls_slot = calls.clone();
     let fixture = fixture_with_configuration_and_services(

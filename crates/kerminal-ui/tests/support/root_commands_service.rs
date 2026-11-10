@@ -41,6 +41,8 @@ pub struct CatalogCalls {
 }
 
 /// 构造不访问磁盘的 CommandsService；fake session 不提供可信 prompt，历史仓储不会被调用。
+/// 保留无计数入口供不观察目录的宿主测试复用，避免每个调用方都处理计数句柄。
+#[allow(dead_code)]
 pub fn empty_commands_service(sessions: Arc<dyn SessionService>) -> CommandsService {
     empty_commands_service_with_calls(sessions).0
 }
