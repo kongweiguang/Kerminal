@@ -4,7 +4,7 @@
 
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, EntityInputHandler, EventEmitter, IntoElement,
-    MouseButton, Render, StyleRefinement, Subscription, Window,
+    MouseButton, Render, SharedString, StyleRefinement, Subscription, Window,
     assets::IconName,
     base::Selectable as _,
     component::{
@@ -92,6 +92,17 @@ pub(crate) enum WorkspaceBroadcastBarEvent {
     },
 }
 
+/// 模式名集中在一处解析，弹层选项与无障碍描述共用，避免两处文案各自漂移。
+///
+/// @author kongweiguang
+fn target_mode_name(mode: WorkspaceBroadcastTargetMode) -> SharedString {
+    match mode {
+        WorkspaceBroadcastTargetMode::Current => crate::locale::text("当前分屏", "Current pane"),
+        WorkspaceBroadcastTargetMode::All => crate::locale::text("全部分屏", "All panes"),
+        WorkspaceBroadcastTargetMode::Custom => crate::locale::text("自定义", "Custom"),
+    }
+}
+
 /// 左列表达模式，右列只显示该模式的目标标题或数量，避免长标题挤压用户可比较的模式名。
 ///
 /// @author kongweiguang
@@ -114,12 +125,12 @@ fn target_mode_option_labels(
     [
         (
             WorkspaceBroadcastTargetMode::Current,
-            crate::locale::text("当前分屏", "Current pane").to_string(),
+            target_mode_name(WorkspaceBroadcastTargetMode::Current).to_string(),
             current_title,
         ),
         (
             WorkspaceBroadcastTargetMode::All,
-            crate::locale::text("全部分屏", "All panes").to_string(),
+            target_mode_name(WorkspaceBroadcastTargetMode::All).to_string(),
             crate::locale::text(
                 format!("{all_count} 个目标"),
                 format!("{all_count} targets"),
@@ -128,7 +139,7 @@ fn target_mode_option_labels(
         ),
         (
             WorkspaceBroadcastTargetMode::Custom,
-            crate::locale::text("自定义", "Custom").to_string(),
+            target_mode_name(WorkspaceBroadcastTargetMode::Custom).to_string(),
             crate::locale::text(
                 format!("{} 个已选", projection.selected_count),
                 format!("{} selected", projection.selected_count),
@@ -138,30 +149,43 @@ fn target_mode_option_labels(
     ]
 }
 
-/// 触发区保持短且稳定，当前 pane 的完整标题放在弹层选项中以免挤压命令输入。
+/// 触发区只显示布局分屏数与当前模式的选中数，模式名和 pane 标题留给弹层与提示，
+/// 这样宽屏下命令输入不必为目标摘要让位，计数也不会与右侧重复。
 ///
 /// @author kongweiguang
 fn target_mode_trigger_label(projection: &WorkspaceBroadcastBarProjection) -> String {
-    let count = match projection.mode {
-        WorkspaceBroadcastTargetMode::All => projection
-            .targets
-            .iter()
-            .filter(|target| target.enabled)
-            .count(),
-        WorkspaceBroadcastTargetMode::Current | WorkspaceBroadcastTargetMode::Custom => {
+    crate::locale::text(
+        format!(
+            "分屏 {}/{}",
+            projection.pane_count, projection.selected_count
+        ),
+        format!(
+            "Panes {}/{}",
+            projection.pane_count, projection.selected_count
+        ),
+    )
+    .to_string()
+}
+
+/// 简化触发区后仍要在提示与无障碍描述中说明模式身份和两项计数的来源，
+/// 否则用户无法从短标签区分“全部”与“自定义”模式。
+///
+/// @author kongweiguang
+fn target_mode_trigger_accessibility(projection: &WorkspaceBroadcastBarProjection) -> SharedString {
+    crate::locale::text(
+        format!(
+            "发送目标：{} · 共 {} 个分屏，已选 {} 个",
+            target_mode_name(projection.mode),
+            projection.pane_count,
             projection.selected_count
-        }
-    };
-    let mode = match projection.mode {
-        WorkspaceBroadcastTargetMode::All => {
-            crate::locale::text("全部分屏", "All panes").to_string()
-        }
-        WorkspaceBroadcastTargetMode::Current => {
-            crate::locale::text("当前分屏", "Current pane").to_string()
-        }
-        WorkspaceBroadcastTargetMode::Custom => crate::locale::text("自定义", "Custom").to_string(),
-    };
-    format!("{mode} · {count}")
+        ),
+        format!(
+            "Broadcast targets: {} · {} panes, {} selected",
+            target_mode_name(projection.mode),
+            projection.pane_count,
+            projection.selected_count
+        ),
+    )
 }
 
 /// 输入实体可以跨 workspace render 重用；projection 的 Tab id 门禁阻止旧 UI 回调污染新草稿。
@@ -330,10 +354,7 @@ impl WorkspaceBroadcastBar {
                 "Broadcast targets; the last result has errors, open to review details",
             )
         } else {
-            crate::locale::text(
-                format!("发送目标：{trigger_label}"),
-                format!("Broadcast targets: {trigger_label}"),
-            )
+            target_mode_trigger_accessibility(&self.projection)
         };
         Popover::new("workspace-broadcast-mode-picker")
             .appearance(false)
@@ -778,22 +799,6 @@ impl Render for WorkspaceBroadcastBar {
                         ),
                     ),
             )
-            .when(window.bounds().size.width >= px(1280.), |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .rounded_lg()
-                        .px_2()
-                        .py_1()
-                        .text_xs()
-                        .bg(theme.surface_hover())
-                        .text_color(theme.muted)
-                        .child(crate::locale::text(
-                            format!("{} 个目标", projection.selected_count),
-                            format!("{} targets", projection.selected_count),
-                        )),
-                )
-            })
             .child(
                 div()
                     .debug_selector(|| "workspace-broadcast-actions".to_owned())

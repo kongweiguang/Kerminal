@@ -7,7 +7,9 @@ use kerminal_domain::identity::PaneId;
 use crate::features::workspace_broadcast::{
     WorkspaceBroadcastBarProjection, WorkspaceBroadcastTargetMode,
     WorkspaceBroadcastTargetProjection,
-    toolbar::{target_mode_option_labels, target_mode_trigger_label},
+    toolbar::{
+        target_mode_option_labels, target_mode_trigger_accessibility, target_mode_trigger_label,
+    },
 };
 
 /// 夹具显式区分可发送、当前和已选择 pane，防止布局数被误当作目标数。
@@ -60,11 +62,12 @@ fn mode_menu_explains_current_target_and_effective_counts() {
     assert!(options[2].2.contains("1"));
 }
 
-/// 触发标题保留短摘要，避免长主机名挤压命令输入。
+/// 触发标题只显示布局分屏数与当前选中数，模式由弹层选中态和提示承担，
+/// 长主机名也不进入主行，避免挤压命令输入。
 ///
 /// @author kongweiguang
 #[test]
-fn trigger_label_stays_compact_for_current_and_custom_modes() {
+fn trigger_label_stays_compact_and_uses_pane_and_selection_counts() {
     let mut projection = WorkspaceBroadcastBarProjection {
         pane_count: 2,
         selected_count: 1,
@@ -83,12 +86,62 @@ fn trigger_label_stays_compact_for_current_and_custom_modes() {
 
     projection.mode = WorkspaceBroadcastTargetMode::Current;
     let current = target_mode_trigger_label(&projection);
+    assert_eq!(
+        current,
+        crate::locale::text("分屏 2/1", "Panes 2/1").to_string()
+    );
     assert!(!current.contains("extremely-long"));
+    assert!(!current.contains("当前分屏"));
+    assert!(!current.contains("Current pane"));
     let options = target_mode_option_labels(&projection);
     assert!(options[0].2.contains("an-extremely-long-host-name"));
 
     projection.mode = WorkspaceBroadcastTargetMode::Custom;
-    assert!(target_mode_trigger_label(&projection).contains('1'));
+    assert_eq!(
+        target_mode_trigger_label(&projection),
+        crate::locale::text("分屏 2/1", "Panes 2/1").to_string()
+    );
+
+    projection.mode = WorkspaceBroadcastTargetMode::All;
+    projection.selected_count = 2;
+    assert_eq!(
+        target_mode_trigger_label(&projection),
+        crate::locale::text("分屏 2/2", "Panes 2/2").to_string()
+    );
+}
+
+/// 简化标签后，提示与无障碍描述仍说明当前模式和两项计数，避免模式身份只剩弹层。
+///
+/// @author kongweiguang
+#[test]
+fn trigger_accessibility_keeps_mode_and_counts() {
+    let mut projection = WorkspaceBroadcastBarProjection {
+        pane_count: 2,
+        selected_count: 1,
+        targets: vec![
+            target("pane-current", "本地终端", true, true, true),
+            target("pane-ready", "172.16.41.45", false, false, true),
+        ],
+        ..WorkspaceBroadcastBarProjection::default()
+    };
+
+    projection.mode = WorkspaceBroadcastTargetMode::All;
+    assert_eq!(
+        target_mode_trigger_accessibility(&projection),
+        crate::locale::text(
+            "发送目标：全部分屏 · 共 2 个分屏，已选 1 个",
+            "Broadcast targets: All panes · 2 panes, 1 selected",
+        )
+    );
+
+    projection.mode = WorkspaceBroadcastTargetMode::Custom;
+    assert_eq!(
+        target_mode_trigger_accessibility(&projection),
+        crate::locale::text(
+            "发送目标：自定义 · 共 2 个分屏，已选 1 个",
+            "Broadcast targets: Custom · 2 panes, 1 selected",
+        )
+    );
 }
 
 /// Kit Popover 保留 Custom 连续选择目标，并在 Current 或 All 选定后收起。
@@ -363,6 +416,42 @@ mod toolbar_interaction_gpui {
                 },
             ],
         );
+    }
+
+    /// 宽窗删除重复目标数量后，触发区、弹性命令输入和右端动作仍在同一行内且不互相重叠。
+    ///
+    /// @author kongweiguang
+    #[gpui::test]
+    fn wide_window_keeps_trigger_input_and_actions_in_bounds(cx: &mut TestAppContext) {
+        let projection = WorkspaceBroadcastBarProjection {
+            tab_id: Some(kerminal_domain::identity::TabId::new()),
+            pane_count: 2,
+            selected_count: 2,
+            targets: vec![
+                target("pane-one", "本地主机", true, true, true),
+                target("pane-two", "172.16.41.45", false, true, true),
+            ],
+            draft: "echo hello".to_owned(),
+            ..WorkspaceBroadcastBarProjection::default()
+        };
+        let (_, visual) = fixture(cx, projection);
+        visual.simulate_resize(gpui::size(gpui::px(1440.), gpui::px(400.)));
+        draw(visual);
+
+        let trigger = visual
+            .debug_bounds("workspace-broadcast-mode-trigger")
+            .expect("mode trigger visible at wide width");
+        let input = visual
+            .debug_bounds("workspace-broadcast-draft-input-slot")
+            .expect("input visible at wide width");
+        let actions = visual
+            .debug_bounds("workspace-broadcast-actions")
+            .expect("actions visible at wide width");
+        assert!(trigger.size.width >= gpui::px(36.));
+        assert!(trigger.right() <= input.left());
+        assert!(input.size.width >= gpui::px(80.));
+        assert!(input.right() <= actions.left());
+        assert!(actions.right() <= gpui::px(1440.));
     }
 
     /// 打开目标弹层查看大量异常明细；三种主题和窄窗均保留主行输入与发送位置。
