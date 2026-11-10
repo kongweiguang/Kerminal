@@ -1,3 +1,6 @@
 # @author kongweiguang
 !/dist/
 !/dist/main.js
+
+# kerminal-plugin build output
+.kerminal/

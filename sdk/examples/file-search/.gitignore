@@ -1,2 +1,5 @@
 # @author kongweiguang
 /bin/
+
+# kerminal-plugin build output
+.kerminal/
