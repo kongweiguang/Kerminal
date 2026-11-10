@@ -17,7 +17,7 @@ use gpui_kit::{
     base::Selectable as _,
     component::{
         Disableable as _, Icon, Sizable as _, WindowExt as _,
-        button::{Button, ButtonVariants as _},
+        button::{Button, ButtonCustomVariant, ButtonVariants as _},
         input::Input,
         menu::{DropdownMenu as _, PopupMenuItem},
         scroll::ScrollableElement as _,
@@ -749,12 +749,13 @@ impl ExtensionsPage {
             }
         }
         // 本地包首次安装尚未重启时没有 installed 条目，仍需展示排队事实。
+        // 这类行不计入“已安装”计数，只在“全部”出现；否则筛选标签与可见行会互相矛盾。
         if let Some(state) = state {
             for change in &state.pending {
                 let id = change.plugin_id();
                 if state.plugins.contains_key(id)
                     || plugins.iter().any(|plugin| &plugin.id == id)
-                    || !matches!(&self.filter, Filter::All | Filter::Installed)
+                    || !matches!(&self.filter, Filter::All)
                     || (!query.is_empty() && !id.as_str().contains(query))
                 {
                     continue;
@@ -943,6 +944,18 @@ impl ExtensionsPage {
                                 .child(crate::locale::text(
                                     "变更已提交，重启后生效。",
                                     "The change is committed and takes effect after restart.",
+                                )),
+                        );
+                    }
+                    // 离线会禁用安装按钮；在同一动作下方说明原因，避免按钮变灰却没有解释。
+                    if self.offline {
+                        actions = actions.child(
+                            div()
+                                .text_size(theme.text_xs)
+                                .text_color(theme.muted)
+                                .child(crate::locale::text(
+                                    "离线时不能安装或更新；刷新目录后重试",
+                                    "Can’t install or update while offline; refresh the catalog and retry.",
                                 )),
                         );
                     }
@@ -1730,6 +1743,11 @@ fn render_extension_row(
         })
     };
     let second_line = progress.unwrap_or(description);
+    // 名称按钮铺满剩余宽度；自定义变体的透明 hover 避免在整行 hover 底色上再叠一层按钮矩形。
+    let select_variant = ButtonCustomVariant::new(cx)
+        .foreground(theme.foreground)
+        .hover(theme.foreground.opacity(0.))
+        .active(theme.foreground.opacity(0.));
 
     div()
         .id(format!("extension-row-{id_text}"))
@@ -1754,25 +1772,19 @@ fn render_extension_row(
                 .items_center()
                 .gap_2()
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .flex()
-                        .items_center()
-                        .overflow_hidden()
-                        .child(
-                            Button::new(format!("extension-select-{id_text}"))
-                                .compact()
-                                .ghost()
-                                .w_full()
-                                .px_0()
-                                .py_0()
-                                .max_w_full()
-                                .child(div().w_full().min_w(px(0.)).truncate().child(name))
-                                .on_click(
-                                    cx.listener(move |page, _, _, cx| page.select(id.clone(), cx)),
-                                ),
-                        ),
+                    div().flex_1().min_w(px(0.)).flex().items_center().child(
+                        Button::new(format!("extension-select-{id_text}"))
+                            .compact()
+                            .custom(select_variant)
+                            .w_full()
+                            .px_0()
+                            .py_0()
+                            .max_w_full()
+                            .child(div().w_full().min_w(px(0.)).truncate().child(name))
+                            .on_click(
+                                cx.listener(move |page, _, _, cx| page.select(id.clone(), cx)),
+                            ),
+                    ),
                 )
                 .when_some(action_button, |line, action| line.child(action)),
         )

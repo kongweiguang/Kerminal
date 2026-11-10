@@ -147,6 +147,19 @@ impl ExtensionsPage {
         }
     }
 
+    /// 语言切换只更新占位符，不重建搜索实体，避免用户输入与焦点被重置。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn refresh_locale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.update(cx, |input, cx| {
+            input.set_placeholder(
+                crate::locale::text("搜索扩展", "Search extensions"),
+                window,
+                cx,
+            )
+        });
+    }
+
     /// 首次进入先读可信缓存与权威状态；失败保留现有展示并提供重试。
     pub fn activate(&mut self, cx: &mut Context<Self>) {
         self.active = true;
@@ -397,6 +410,8 @@ impl ExtensionsPage {
 
     /// README 只能通过签名目录对应的应用接口读取，迟到结果不得覆盖新选中的插件。
     fn select(&mut self, id: PluginId, cx: &mut Context<Self>) {
+        // 详情内容随选择整体替换，沿用上一个插件的滚动位置会让人误以为没切换成功。
+        self.detail_scroll.set_offset(Default::default());
         if let Some(previous) = self.readme_cancel.take() {
             previous.cancel();
         }

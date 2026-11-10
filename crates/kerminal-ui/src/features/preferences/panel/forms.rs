@@ -233,6 +233,9 @@ impl PreferencesPanel {
             window,
             cx,
         );
+
+        // 扩展页只在进入分类时创建；已创建时同步搜索占位符，未创建时留待首次构建读取新语言。
+        self.extensions.refresh_locale(window, cx);
     }
 }
 

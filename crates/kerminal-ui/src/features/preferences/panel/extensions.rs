@@ -105,6 +105,19 @@ impl ExtensionsPreferencesState {
         }
     }
 
+    /// 语言切换时把占位符更新转发给已创建页面；尚未进入扩展分类时无页面，直接忽略。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn refresh_locale(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<PreferencesPanel>,
+    ) {
+        if let Some(page) = self.page.clone() {
+            page.update(cx, |page, cx| page.refresh_locale(window, cx));
+        }
+    }
+
     /// 只读访问已创建页面；未进入扩展分类时保持 None。
     fn page(&self) -> Option<Entity<ExtensionsPage>> {
         self.page.clone()
