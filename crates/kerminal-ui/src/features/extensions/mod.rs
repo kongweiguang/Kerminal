@@ -2,7 +2,8 @@
 //! @author kongweiguang
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, PathPromptOptions, Subscription, Window,
+    AppContext as _, Context, Entity, EventEmitter, FocusHandle, PathPromptOptions, Subscription,
+    Window,
     component::input::{InputEvent, InputState},
 };
 use kerminal_application::{
@@ -19,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 mod markdown;
 mod render;
+mod sample;
 
 /// 重启由 Root 按会话关闭契约处理，页面不能自行结束进程。
 #[derive(Clone, Debug)]
@@ -45,6 +47,24 @@ enum Confirmation {
     DeleteData(PluginId),
 }
 
+/// 确认弹层需要稳定的容器与按钮焦点身份，Tab 循环和默认确认都靠它维持。
+struct ConfirmationFocus {
+    container: FocusHandle,
+    confirm: FocusHandle,
+    cancel: FocusHandle,
+}
+
+impl ConfirmationFocus {
+    /// 焦点句柄生命周期跟随页面，弹层每次重建仍复用同一身份，避免迟到回调抢走焦点。
+    fn new(cx: &mut Context<ExtensionsPage>) -> Self {
+        Self {
+            container: cx.focus_handle(),
+            confirm: cx.focus_handle().tab_stop(true),
+            cancel: cx.focus_handle().tab_stop(true),
+        }
+    }
+}
+
 /// 实例拥有搜索焦点与异步代次；服务和 executor 由组合根注入。
 pub struct ExtensionsPage {
     service: Arc<ExtensionsService>,
@@ -61,7 +81,11 @@ pub struct ExtensionsPage {
     readme_cancel: Option<CancellationToken>,
     readme_generation: u64,
     status: Option<String>,
+    /// 清理残留属于可继续使用的警告，不能与失败错误共用同一种语义色。
+    status_is_warning: bool,
     busy: bool,
+    /// 只有目录读取显示刷新转圈；安装和文件预检不冒充目录刷新。
+    refreshing: bool,
     /// 只有安装、更新、启停或卸载等会改插件目录的操作才阻止退出；只读加载不阻止。
     writing: bool,
     cancel: Option<CancellationToken>,
@@ -70,6 +94,9 @@ pub struct ExtensionsPage {
     active_install: Option<PluginId>,
     retry_operation: Option<Operation>,
     confirmation: Option<Confirmation>,
+    confirmation_focus: ConfirmationFocus,
+    /// 确认弹层首次绘制后再聚焦，避免焦点先落在遮罩下方的原页面控件。
+    confirmation_focus_pending: bool,
 }
 impl EventEmitter<ExtensionsEvent> for ExtensionsPage {}
 
@@ -89,6 +116,7 @@ impl ExtensionsPage {
                 cx.notify();
             }
         });
+        let confirmation_focus = ConfirmationFocus::new(cx);
         Self {
             service,
             executor,
@@ -104,7 +132,9 @@ impl ExtensionsPage {
             readme_cancel: None,
             readme_generation: 0,
             status: None,
+            status_is_warning: false,
             busy: false,
+            refreshing: false,
             writing: false,
             cancel: None,
             generation: 0,
@@ -112,6 +142,8 @@ impl ExtensionsPage {
             active_install: None,
             retry_operation: None,
             confirmation: None,
+            confirmation_focus,
+            confirmation_focus_pending: false,
         }
     }
 
@@ -121,6 +153,7 @@ impl ExtensionsPage {
             return;
         }
         self.busy = true;
+        self.refreshing = true;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let service = self.service.clone();
@@ -138,16 +171,25 @@ impl ExtensionsPage {
                     return;
                 }
                 page.busy = false;
+                page.refreshing = false;
                 match result {
                     Ok((state, catalog)) => {
                         page.state = Some(state);
                         page.offline = catalog.as_ref().is_some_and(|snapshot| snapshot.stale);
                         page.catalog = catalog;
                         page.status = None;
+                        page.status_is_warning = false;
+                        page.prune_selection(cx);
                         // 每次进入分类都会 activate；日常刷新按 24 小时缓存判断，不能重复打网络。
                         page.refresh_if_due(cx);
                     }
-                    Err(error) => page.status = Some(error.public_message().to_owned()),
+                    Err(error) => {
+                        // 取消属于页面的正常空闲路径，不留下错误文案、离线标记或重试入口。
+                        if error.public_code() != PublicErrorCode::Cancelled {
+                            page.status = Some(error.public_message().to_owned());
+                            page.status_is_warning = false;
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -172,6 +214,7 @@ impl ExtensionsPage {
             return;
         }
         self.busy = true;
+        self.refreshing = true;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let cancel = CancellationToken::new();
@@ -193,18 +236,23 @@ impl ExtensionsPage {
                     return;
                 }
                 page.busy = false;
+                page.refreshing = false;
                 page.cancel = None;
                 match result {
                     Ok(catalog) => {
                         page.offline = catalog.stale;
                         page.catalog = Some(catalog);
                         page.status = None;
+                        page.status_is_warning = false;
+                        page.prune_selection(cx);
                     }
                     Err(error) => {
+                        // 用户取消刷新时静默回到空闲；只有真实失败才把页面标成离线并保留重试文案。
                         if error.public_code() != PublicErrorCode::Cancelled {
                             page.offline = true;
+                            page.status = Some(error.public_message().to_owned());
+                            page.status_is_warning = false;
                         }
-                        page.status = Some(error.public_message().to_owned());
                     }
                 }
                 cx.notify();
@@ -245,7 +293,8 @@ impl ExtensionsPage {
                                 "Unable to read the selected path",
                             )
                             .to_string(),
-                        )
+                        );
+                        page.status_is_warning = false;
                     }
                 }
                 cx.notify();
@@ -261,7 +310,9 @@ impl ExtensionsPage {
         }
         self.busy = true;
         self.status = None;
+        self.status_is_warning = false;
         self.confirmation = None;
+        self.confirmation_focus_pending = false;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let cancellation = CancellationToken::new();
@@ -285,10 +336,13 @@ impl ExtensionsPage {
                 page.cancel = None;
                 match result {
                     Ok((path, inspection)) => {
-                        page.confirmation = Some(Confirmation::File(path, inspection))
+                        page.open_confirmation(Confirmation::File(path, inspection), cx)
                     }
                     Err(error) if error.public_code() == PublicErrorCode::Cancelled => {}
-                    Err(error) => page.status = Some(error.public_message().to_owned()),
+                    Err(error) => {
+                        page.status = Some(error.public_message().to_owned());
+                        page.status_is_warning = false;
+                    }
                 }
                 cx.notify();
             });
@@ -322,6 +376,11 @@ impl ExtensionsPage {
         self.readme_generation = self.readme_generation.wrapping_add(1);
         let generation = self.readme_generation;
         self.readme = None;
+        // 示例条目只带内嵌元数据，没有可验签的 README 地址，不能为预览发起网络请求。
+        if self.catalog.is_none() && sample::contains(&id) {
+            cx.notify();
+            return;
+        }
         let token = CancellationToken::new();
         self.readme_cancel = Some(token.clone());
         let service = self.service.clone();
@@ -356,7 +415,9 @@ impl ExtensionsPage {
         // 写操作尚未收到权威回读时退出会丢失提交结果，只有这一阶段需要阻止退出。
         self.writing = true;
         self.status = None;
+        self.status_is_warning = false;
         self.retry_operation = None;
+        self.confirmation_focus_pending = false;
         self.active_install = match &operation {
             Operation::Install(selection) => Some(selection.id.clone()),
             _ => None,
@@ -419,18 +480,28 @@ impl ExtensionsPage {
                 match result {
                     Ok(Ok((state, warning))) => {
                         page.state = Some(state);
+                        page.status_is_warning = warning.is_some();
                         page.status = warning.map(|error| error.public_message().to_owned());
                     }
                     Ok(Err((error, committed, warning))) => {
-                        if !committed && !matches!(error.public_code(), PublicErrorCode::OutcomeUnknown | PublicErrorCode::Cancelled)
-                            && !matches!(retry_candidate, Operation::Delete(_) | Operation::File(_, _) | Operation::Change(ExtensionChange::CancelFailedChange { .. })) {
-                            page.retry_operation = Some(retry_candidate);
+                        // 取消安装属于用户主动结束，不写错误、不提供重试，也不把页面标成失败。
+                        if error.public_code() != PublicErrorCode::Cancelled {
+                            if !committed && !matches!(error.public_code(), PublicErrorCode::OutcomeUnknown)
+                                && !matches!(retry_candidate, Operation::Delete(_) | Operation::File(_, _) | Operation::Change(ExtensionChange::CancelFailedChange { .. })) {
+                                page.retry_operation = Some(retry_candidate);
+                            }
+                            page.status_is_warning = false;
+                            page.status = Some(if committed {
+                                format!("{}{}", crate::locale::text("操作已提交，但读取状态失败；请刷新状态。", "The operation was committed, but its state could not be read. Refresh the state."), warning.map(|value| format!(" {}", value.public_message())).unwrap_or_default())
+                            } else { error.public_message().to_owned() });
                         }
-                        page.status = Some(if committed {
-                            format!("{}{}", crate::locale::text("操作已提交，但读取状态失败；请刷新状态。", "The operation was committed, but its state could not be read. Refresh the state."), warning.map(|value| format!(" {}", value.public_message())).unwrap_or_default())
-                        } else { error.public_message().to_owned() });
                     }
-                    Err(error) => page.status = Some(error.public_message().to_owned()),
+                    Err(error) => {
+                        if error.public_code() != PublicErrorCode::Cancelled {
+                            page.status = Some(error.public_message().to_owned());
+                            page.status_is_warning = false;
+                        }
+                    }
                 }
                 // 页面实体只重绘自身；父面板依赖写入状态控制提示显隐，必须显式通知。
                 cx.emit(ExtensionsEvent::WriteFinished);
@@ -508,15 +579,70 @@ impl ExtensionsPage {
         }
     }
 
+    /// 打开确认的唯一入口：所有安装、文件和删除确认都在同一处绑定焦点与状态。
+    fn open_confirmation(&mut self, confirmation: Confirmation, cx: &mut Context<Self>) {
+        self.confirmation = Some(confirmation);
+        self.confirmation_focus_pending = true;
+        cx.notify();
+    }
+
+    /// 关闭确认只恢复页面状态，不触发任何业务操作；焦点在下一帧回到页面控件。
+    fn dismiss_confirmation(&mut self, cx: &mut Context<Self>) {
+        self.confirmation = None;
+        self.confirmation_focus_pending = false;
+        cx.notify();
+    }
+
+    /// 目录替换后留下的选择会展示另一份目录的旧详情，必须按当前目录与安装集合重新核对。
+    /// 无真实目录时示例就是当前展示源，示例选择仍然有效。
+    fn prune_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selected.as_ref() else {
+            return;
+        };
+        let in_catalog = match &self.catalog {
+            Some(catalog) => catalog
+                .catalog
+                .plugins
+                .iter()
+                .any(|plugin| &plugin.id == id),
+            None => sample::contains(id),
+        };
+        let in_store = self.state.as_ref().is_some_and(|state| {
+            state.plugins.contains_key(id)
+                || state.pending.iter().any(|change| change.plugin_id() == id)
+        });
+        if in_catalog || in_store {
+            return;
+        }
+        if let Some(token) = self.readme_cancel.take() {
+            token.cancel();
+        }
+        self.selected = None;
+        self.readme = None;
+        self.readme_generation = self.readme_generation.wrapping_add(1);
+        cx.notify();
+    }
+
     /// 列表和详情共用同一受信目录记录，避免使用未校验的界面 URL 作为安装目标。
+    /// 仅在真实目录缺席时回退到内嵌示例，示例永远不会成为安装目标。
     fn selected_plugin(&self) -> Option<&CatalogPlugin> {
         let id = self.selected.as_ref()?;
-        self.catalog
-            .as_ref()?
-            .catalog
-            .plugins
-            .iter()
-            .find(|plugin| &plugin.id == id)
+        if let Some(plugin) = self.catalog.as_ref().and_then(|catalog| {
+            catalog
+                .catalog
+                .plugins
+                .iter()
+                .find(|plugin| &plugin.id == id)
+        }) {
+            return Some(plugin);
+        }
+        if self.catalog.is_none() {
+            return sample::catalog()
+                .plugins
+                .iter()
+                .find(|plugin| &plugin.id == id);
+        }
+        None
     }
 }
 
