@@ -2602,6 +2602,21 @@ impl ConnectionsPanel {
     pub(crate) fn cancel_pending_deletion_confirmation(&mut self, cx: &mut Context<Self>) {
         if self.local_hosts.pending_delete.is_some() {
             self.cancel_delete_local_host(cx);
+            // 本地删除读取中的取消会直接清掉检查状态；保存/未知回执仍保留确认，不能误报已取消。
+            self.status = Some(if self.local_hosts.pending_delete.is_some() {
+                crate::locale::text(
+                    "本地主机删除正在提交，完成前不能取消确认。",
+                    "The local host deletion is being submitted; its confirmation cannot be cancelled yet.",
+                )
+                .to_string()
+            } else {
+                crate::locale::text(
+                    "已取消本地主机删除确认。",
+                    "Local host deletion confirmation cancelled.",
+                )
+                .to_string()
+            });
+            cx.notify();
         } else if self.pending_host_deletion.is_some() {
             if self.configuration_mutation_busy {
                 self.status = Some(
