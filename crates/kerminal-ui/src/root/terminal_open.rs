@@ -647,6 +647,9 @@ impl RootView {
             let mut cleanup_pending = None;
             let mut external_sftp_after_ready = None;
             let mut initial_proxy_after_ready = None;
+            // 批量分屏中止摘要必须保留到 cleanup 回投之后；用本任务内的标记区分，
+            // 避免异步关闭结果把带真实原因的摘要覆盖成单条清理文案。
+            let mut split_batch_aborted = false;
             let accepted = this.update(cx, |root, cx| {
                 if !root.workspace_restore_is_current(&pane_id, generation) {
                     return false;
@@ -695,15 +698,21 @@ impl RootView {
                         if prepared.snapshot.session_id != session_id
                             || prepared.snapshot.size != session_size
                         {
+                            let message = crate::locale::text(
+                                "终端首帧与 session 身份或尺寸不一致；资源保留供清理。",
+                                "The terminal's first frame does not match its session identity or size; the resource is retained for cleanup.",
+                            );
                             cleanup_pending = Some((
                                 prepared.session,
                                 Some(prepared.snapshot),
-                                crate::locale::text(
-                                    "终端首帧与 session 身份或尺寸不一致；资源保留供清理。",
-                                    "The terminal's first frame does not match its session identity or size; the resource is retained for cleanup.",
-                                ),
+                                message.clone(),
                             ));
-                            root.fail_workspace_split_after_ready(&tab_id, &pane_id, cx);
+                            split_batch_aborted |= root.fail_workspace_split_after_ready(
+                                &tab_id,
+                                &pane_id,
+                                message,
+                                cx,
+                            );
                             return true;
                         }
                         if root.workspace_runtime.install_session(
@@ -712,15 +721,21 @@ impl RootView {
                             target.clone(),
                             session_size,
                         ).is_err() {
+                            let message = crate::locale::text(
+                                "终端已启动，但 pane 已被另一会话占用。",
+                                "The terminal started, but the pane is occupied by another session.",
+                            );
                             cleanup_pending = Some((
                                 prepared.session,
                                 Some(prepared.snapshot),
-                                crate::locale::text(
-                                    "终端已启动，但 pane 已被另一会话占用。",
-                                    "The terminal started, but the pane is occupied by another session.",
-                                ),
+                                message.clone(),
                             ));
-                            root.fail_workspace_split_after_ready(&tab_id, &pane_id, cx);
+                            split_batch_aborted |= root.fail_workspace_split_after_ready(
+                                &tab_id,
+                                &pane_id,
+                                message,
+                                cx,
+                            );
                             return true;
                         }
                         let accepted_snapshot = root.workspace_runtime.accept_initial_snapshot(
@@ -749,6 +764,7 @@ impl RootView {
                                 || base_message.clone(),
                                 |error| SharedString::from(format!("{base_message} {error}")),
                             );
+                            let abort_reason = message.clone();
                             if root
                                 .workspace_runtime
                                 .set_status(&pane_id, Some(message.clone()))
@@ -761,16 +777,27 @@ impl RootView {
                             } else {
                                 root.status = Some(message);
                             }
-                            root.fail_workspace_split_after_ready(&tab_id, &pane_id, cx);
+                            split_batch_aborted |= root.fail_workspace_split_after_ready(
+                                &tab_id,
+                                &pane_id,
+                                abort_reason,
+                                cx,
+                            );
                             return true;
                         }
 
                         if root.workspace_runtime.set_status(&pane_id, None).is_err() {
-                            root.status = Some(crate::locale::text(
+                            let message = crate::locale::text(
                                 "终端已就绪，但无法更新 pane 状态。",
                                 "The terminal is ready, but pane state could not be updated.",
-                            ));
-                            root.fail_workspace_split_after_ready(&tab_id, &pane_id, cx);
+                            );
+                            root.status = Some(message.clone());
+                            split_batch_aborted |= root.fail_workspace_split_after_ready(
+                                &tab_id,
+                                &pane_id,
+                                message,
+                                cx,
+                            );
                             return true;
                         }
                         let Some(_layout) = root.workspace_runtime.tab_layout(&tab_id).cloned() else {
@@ -794,6 +821,7 @@ impl RootView {
                                 || message.clone(),
                                 |error| SharedString::from(format!("{message} {error}")),
                             );
+                            let abort_reason = message.clone();
                             if root
                                 .workspace_runtime
                                 .set_status(&pane_id, Some(message.clone()))
@@ -806,7 +834,12 @@ impl RootView {
                             } else {
                                 root.status = Some(message);
                             }
-                            root.fail_workspace_split_after_ready(&tab_id, &pane_id, cx);
+                            split_batch_aborted |= root.fail_workspace_split_after_ready(
+                                &tab_id,
+                                &pane_id,
+                                abort_reason,
+                                cx,
+                            );
                             return true;
                         };
 
@@ -1236,33 +1269,37 @@ impl RootView {
                             snapshot.clone(),
                             message.clone(),
                         );
-                        root.status = Some(match retained {
-                            Ok(()) => message,
-                            Err(_) => {
-                                let retained = root.workspace_runtime.retain_orphan_cleanup(
-                                    OrphanCleanupInput {
-                                        tab_id: tab_id.clone(),
-                                        pane_id: pane_id.clone(),
-                                        session_id,
-                                        target,
-                                        size: session_size,
-                                        snapshot,
-                                        status: message.clone(),
-                                        external_lease: orphan_lease.clone(),
-                                        transient,
-                                    },
-                                );
-                                root.refresh_workspace_orphan_cleanup(cx);
-                                if retained.is_ok() {
-                                    message
-                                } else {
-                                    crate::locale::text(
-                                        "终端已创建，但清理 owner 无法登记；关闭不会提交。",
-                                        "The terminal was created, but its cleanup owner could not be retained; close will not commit.",
-                                    )
+                        // 批量分屏已用真实原因生成中止摘要；本次 cleanup 回投只负责保留资源 owner，
+                        // 不能再把用户需要看到的摘要覆盖成单条清理文案。
+                        if !split_batch_aborted {
+                            root.status = Some(match retained {
+                                Ok(()) => message,
+                                Err(_) => {
+                                    let retained = root.workspace_runtime.retain_orphan_cleanup(
+                                        OrphanCleanupInput {
+                                            tab_id: tab_id.clone(),
+                                            pane_id: pane_id.clone(),
+                                            session_id,
+                                            target,
+                                            size: session_size,
+                                            snapshot,
+                                            status: message.clone(),
+                                            external_lease: orphan_lease.clone(),
+                                            transient,
+                                        },
+                                    );
+                                    root.refresh_workspace_orphan_cleanup(cx);
+                                    if retained.is_ok() {
+                                        message
+                                    } else {
+                                        crate::locale::text(
+                                            "终端已创建，但清理 owner 无法登记；关闭不会提交。",
+                                            "The terminal was created, but its cleanup owner could not be retained; close will not commit.",
+                                        )
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
                         root.refresh_workspace_views(cx);
                         cx.notify();
                     });

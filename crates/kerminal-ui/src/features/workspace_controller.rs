@@ -504,9 +504,9 @@ impl WorkspaceController {
         &mut self,
         event: WorkspaceTabEvent,
     ) -> AppResult<WorkspaceControllerEffect> {
-        // 失败的分屏候选仍占用资源槽，但用户必须能切换标签查看失败原因；
+        // 失败的分屏候选或关闭操作仍占用资源槽，但用户必须能切换标签查看失败原因；
         // 只放行纯选择事件，布局、关闭、分组等结构性变更继续等待重试或放弃。
-        self.ensure_selection_allowed_during_failed_split(matches!(
+        self.ensure_selection_allowed_during_failed_resource(matches!(
             &event,
             WorkspaceTabEvent::Activate(_)
         ))?;
@@ -569,7 +569,7 @@ impl WorkspaceController {
         tab_id: &TabId,
         event: WorkspacePaneEvent,
     ) -> AppResult<WorkspaceControllerEffect> {
-        self.ensure_selection_allowed_during_failed_split(matches!(
+        self.ensure_selection_allowed_during_failed_resource(matches!(
             &event,
             WorkspacePaneEvent::Activate(_)
         ))?;
@@ -2140,10 +2140,14 @@ impl WorkspaceController {
         }
     }
 
-    /// 失败的 CreatePane 仍保留候选供重试，但把整个工作区锁死会让用户看不到失败标签；
-    /// 因此只放行选择，保存冲突等其它门禁照旧生效，结构性事件仍由原资源门禁拒绝。
-    fn ensure_selection_allowed_during_failed_split(&self, selection_event: bool) -> AppResult<()> {
-        if selection_event && self.failed_create_pane_pending() {
+    /// 失败的 CreatePane/ClosePane/CloseTab 都会保留资源槽等待显式重试；把整个工作区锁死
+    /// 会让用户看不到失败标签或无法发起重试。因此仅在已收到失败回执时放行纯选择，
+    /// 保存冲突等其它门禁照旧生效，布局、关闭、分组等结构性事件仍由原资源门禁拒绝。
+    fn ensure_selection_allowed_during_failed_resource(
+        &self,
+        selection_event: bool,
+    ) -> AppResult<()> {
+        if selection_event && self.failed_resource_operation_pending() {
             if matches!(
                 &self.save_state,
                 WorkspacePersistenceState::Conflict { .. }
@@ -2155,6 +2159,14 @@ impl WorkspaceController {
             return Ok(());
         }
         self.ensure_no_pending_resource()
+    }
+
+    /// 只认已收到失败回执的资源操作；仍在等待 ACK 的候选不能放行选择，
+    /// 避免把尚未收敛的真实资源误当成可重试状态。
+    fn failed_resource_operation_pending(&self) -> bool {
+        self.pending_resource
+            .as_ref()
+            .is_some_and(|pending| pending.failed.is_some())
     }
 
     /// 只识别已完成失败回执的分屏候选；仍等待 ACK 的候选不能放行选择，避免提交错位布局。
@@ -2169,6 +2181,7 @@ impl WorkspaceController {
     }
 
     /// 用户切走失败候选后，重试成功应提交用户当前所在位置，而不是把视图拉回失败发生时的标签；
+    /// 只有 CreatePane 持有候选布局可镜像，ClosePane/CloseTab 没有候选树，保持无操作。
     /// 只镜像三个选择字段，布局与候选 pane 仍由原操作独占。
     fn mirror_selection_into_failed_split_candidate(&mut self) {
         if !self.failed_create_pane_pending() {

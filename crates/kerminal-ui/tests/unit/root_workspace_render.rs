@@ -70,6 +70,7 @@ fn projection(pane_id: PaneId, session_id: SessionId) -> WorkspacePaneProjection
         is_closing: false,
         split_candidate_cancelable: false,
         close_operation_pending: false,
+        close_operation_retryable: false,
         split_enabled: true,
         session_action: None,
         session_disconnected: false,

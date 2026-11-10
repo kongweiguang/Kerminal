@@ -877,6 +877,8 @@ impl RootView {
                     return;
                 };
                 let label = split_batch_progress_label(1, total);
+                // 新批次开始时不能沿用上一次中止摘要，否则失败候选丢弃时会误清当前提示。
+                self.split_batch_abort_status = None;
                 self.split_open_batch = Some(PendingSplitBatch {
                     tab_id: request.tab_id,
                     source_pane_id: request.pane_id,
@@ -1132,12 +1134,12 @@ impl RootView {
             return false;
         };
         let cancelled = usize::from(batch.current_pane.is_some()) + batch.remaining.len();
-        self.status = Some(split_batch_failure_label(
-            batch.opened,
-            batch.total,
-            cancelled,
-            reason.as_deref(),
-        ));
+        let label =
+            split_batch_failure_label(batch.opened, batch.total, cancelled, reason.as_deref());
+        // 只记录本次中止摘要；自动丢弃失败候选时按同一字符串精确清理，
+        // 不再依赖易漂移的文案前缀判断。
+        self.split_batch_abort_status = Some(label.clone());
+        self.status = Some(label);
         self.refresh_workspace_views(cx);
         cx.notify();
         true

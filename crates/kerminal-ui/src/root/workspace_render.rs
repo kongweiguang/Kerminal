@@ -49,6 +49,9 @@ pub(super) struct WorkspacePaneProjection {
     pub split_candidate_cancelable: bool,
     /// ClosePane/CloseTab 已拥有该 pane 时禁止把同一错误状态误呈现为恢复重试。
     pub close_operation_pending: bool,
+    /// 失败 ClosePane 仍保留真实资源；占位必须给出“重试恢复”入口回到同一关闭操作，
+    /// 而不是只提示用户自行寻找关闭控件。
+    pub close_operation_retryable: bool,
     /// 换代目录未确认时保持动作槽位，防止复制上一进程的目录。
     pub split_enabled: bool,
     /// 当前 pane 唯一的重新连接动作；稳定态来自服务观察，进行中携带同一 attempt。
@@ -666,13 +669,20 @@ fn render_pane_projection(
     };
 
     if close_operation_blocks_retry_or_measurement(&projection, probe_context.is_some()) {
+        // 失败 ClosePane 已拥有该 pane 但资源仍在；给回同一重试按钮，Root 会重新派发
+        // 原 ClosePane。仍在途的关闭没有失败回执，继续保持不可重试的等待占位。
+        let retry_pane = projection
+            .close_operation_retryable
+            .then(|| projection.pane_id.clone());
         return render_placeholder(
             pane_id,
-            crate::locale::text(
-                "此分屏仍由关闭操作处理，请从关闭/清理入口继续。",
-                "This pane is still owned by a close operation. Continue from the close or cleanup controls.",
-            ),
-            None,
+            projection.status.clone().unwrap_or_else(|| {
+                crate::locale::text(
+                    "此分屏仍由关闭操作处理，请从关闭/清理入口继续。",
+                    "This pane is still owned by a close operation. Continue from the close or cleanup controls.",
+                )
+            }),
+            retry_pane,
             tab_id,
             retry_emitter,
             window,
@@ -847,6 +857,22 @@ pub(super) fn close_operation_targets_pane(
         }
         Some(WorkspaceResourceOperation::CreatePane { .. }) | None => false,
     }
+}
+
+/// 失败 ClosePane 才能从占位直接重试；仍未收到失败回执的关闭仍只能等待真实 ACK。
+///
+/// @author kongweiguang
+pub(super) fn close_operation_retryable(
+    failed_operation: Option<&WorkspaceResourceOperation>,
+    pane_id: &PaneId,
+) -> bool {
+    matches!(
+        failed_operation,
+        Some(WorkspaceResourceOperation::ClosePane {
+            pane_id: closing_pane,
+            ..
+        }) if closing_pane == pane_id
+    )
 }
 
 /// 只给失败的真实恢复或分屏创建重试；Close owner 必须沿关闭/清理入口收敛。

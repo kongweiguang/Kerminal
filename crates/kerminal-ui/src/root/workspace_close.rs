@@ -341,6 +341,20 @@ pub(super) fn is_removed_uncommitted_workspace_pane(
     !runtime_has_pane && !layout.is_some_and(|layout| layout.contains_pane(pane_id))
 }
 
+/// 创建/取消分屏的过渡文案在候选退役或自动丢弃后不再对应可操作对象；
+/// 集中判定避免两处收尾逻辑各写一份中英文列表。
+///
+/// @author kongweiguang
+fn is_split_creation_status(status: &str) -> bool {
+    matches!(
+        status,
+        "正在创建分屏终端…"
+            | "Creating split terminal…"
+            | "正在取消分屏创建；收到资源清理回执后继续关闭。"
+            | "Cancelling split creation; close will continue after its cleanup receipt."
+    )
+}
+
 /// 在既有 pane→操作映射项中合并准入、取消和关闭焦点意图，不另建队列或状态机。
 ///
 /// @author kongweiguang
@@ -2926,9 +2940,18 @@ impl RootView {
                                         let marked = root
                                             .workspace_runtime
                                             .mark_close_failed(&pane_id, &session_id);
+                                        // CloseFailed 仍保留 session，关闭按钮和标签关闭都会重试同一操作；
+                                        // 在 pane 文案里指明入口，避免用户只看到失败原因却找不到重试动作。
+                                        let retry_message = SharedString::from(format!(
+                                            "{visible}{}",
+                                            crate::locale::text(
+                                                "；请再次关闭该标签重试。",
+                                                "; close this tab again to retry.",
+                                            )
+                                        ));
                                         let status_set = root
                                             .workspace_runtime
-                                            .set_status(&pane_id, Some(visible.clone()));
+                                            .set_status(&pane_id, Some(retry_message));
                                         if !matches!(marked, Ok(true)) || status_set.is_err() {
                                             root.status = Some(crate::locale::text(
                                                 "终端关闭失败，原 pane 仍保留会话，但重试状态更新未完成。",
@@ -3024,6 +3047,21 @@ impl RootView {
                             format!(
                                 " Batch close stopped with {remaining} targets retained; run the same close action again to retry the remaining targets."
                             ),
+                        ));
+                    }
+                    // 失败 ClosePane 的显式重试入口就是再次关闭该标签；摘要必须指向它，
+                    // 否则用户只能看到失败原因却不知道如何继续真实资源回收。
+                    if root
+                        .workspace_controller
+                        .as_ref()
+                        .and_then(|controller| controller.pending_resource_operation())
+                        .is_some_and(|operation| {
+                            matches!(operation, WorkspaceResourceOperation::ClosePane { .. })
+                        })
+                    {
+                        message.push_str(&crate::locale::text(
+                            " 请再次关闭该标签重试。",
+                            " Close this tab again to retry.",
                         ));
                     }
                     root.status = Some(SharedString::from(message));
@@ -3377,14 +3415,17 @@ impl RootView {
 
     /// Ready 后的收尾失败已经结束 CreatePane 的资源创建，不会再产生清理 ACK。
     /// 写回 controller 失败并停止批量队列，让候选显示可关闭/可重试状态而不是锁住宿主。
+    /// 批量摘要使用调用方传入的真实失败原因，而不是调用时可能仍是“正在启动”的旧 status。
+    /// 返回是否确实中止了批量队列，调用方据此避免后续 cleanup 回投覆盖批量摘要。
     ///
     /// @author kongweiguang
     pub(super) fn fail_workspace_split_after_ready(
         &mut self,
         tab_id: &TabId,
         pane_id: &PaneId,
+        reason: SharedString,
         cx: &mut Context<RootView>,
-    ) {
+    ) -> bool {
         if let Some(controller) = self.workspace_controller.as_mut() {
             controller.fail_pending_create_pane(
                 tab_id,
@@ -3392,9 +3433,10 @@ impl RootView {
                 WorkspaceRestoreFailure::ResourceFailure,
             );
         }
-        self.abort_split_batch_for_pane(pane_id, self.status.clone(), cx);
+        let batch_aborted = self.abort_split_batch_for_pane(pane_id, Some(reason), cx);
         self.refresh_workspace_views(cx);
         cx.notify();
+        batch_aborted
     }
 
     /// 已结束失败的 CreatePane 候选若只剩界面占位，就不再以“未完成资源”阻塞其它结构操作。
@@ -3431,11 +3473,13 @@ impl RootView {
                 return false;
             }
         }
+        let mut failed_candidate_status = None;
         let pane_is_failed_candidate = match self.workspace_runtime.pane(&pane_id) {
             None => false,
             Some(pane)
                 if pane.tab_id == tab_id && pane.phase == RuntimePanePhase::RestoreFailed =>
             {
+                failed_candidate_status = pane.status.clone();
                 true
             }
             Some(_) => return false,
@@ -3465,9 +3509,52 @@ impl RootView {
             self.workspace_resource_operations.remove(&pane_id);
         }
         self.discard_split_batch_for_pane(&pane_id, cx);
+        // 失败候选被自动丢弃后，原 pane 的创建/取消文案与批量中止摘要都不再指向可达对象；
+        // 只清精确匹配的文案，避免抹掉用户后来触发的其它操作提示。
+        self.clear_discarded_split_status(failed_candidate_status.as_ref());
         self.refresh_workspace_views(cx);
         cx.notify();
         true
+    }
+
+    /// 丢弃空白失败候选后清掉同一候选留下的分屏摘要；共享批次中止摘要单独记录，
+    /// 以免仅凭字符串前缀猜测而误清其它状态。
+    ///
+    /// @author kongweiguang
+    fn clear_discarded_split_status(&mut self, candidate_status: Option<&SharedString>) {
+        let abort_status = self.split_batch_abort_status.take();
+        let matches = self.status.as_ref().is_some_and(|status| {
+            candidate_status.is_some_and(|candidate| candidate == status)
+                || abort_status.as_ref().is_some_and(|abort| abort == status)
+                || is_split_creation_status(status.as_ref())
+        });
+        if matches {
+            self.status = None;
+        }
+    }
+
+    /// 失败 ClosePane 放弃分屏后，占位“重试恢复”、pane 关闭和 tab 关闭必须回到同一失败操作，
+    /// 不能新建第二条关闭管线；未收到失败回执的在途关闭仍只能等待，避免并发重复关闭。
+    ///
+    /// @author kongweiguang
+    pub(super) fn retry_failed_close_pane_for_target(
+        &self,
+        tab_id: &TabId,
+        pane_id: &PaneId,
+    ) -> Option<WorkspaceResourceOperation> {
+        self.workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.retry_pending_resource_operation())
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    WorkspaceResourceOperation::ClosePane {
+                        tab_id: pending_tab,
+                        pane_id: pending_pane,
+                        ..
+                    } if pending_tab == tab_id && pending_pane == pane_id
+                )
+            })
     }
 
     /// 只读核对失败 CreatePane 的完整身份；Ready 收尾失败与 deferred close 共用同一判定，
@@ -3620,6 +3707,8 @@ impl RootView {
                     source_pane_id.clone(),
                     pane.id.clone(),
                 )),
+                // 只有尚未完成的 CreatePane 需要在这里保存关闭意图；failed ClosePane/CloseTab
+                // 已由显式重试入口接管，重复关闭不能再次替换为另一项操作。
                 WorkspaceResourceOperation::ClosePane { .. }
                 | WorkspaceResourceOperation::CloseTab { .. } => None,
             });
@@ -3824,15 +3913,11 @@ impl RootView {
                 entry.take_deferred_close_after_cleanup_with_focus(operation_id, true)
             });
         self.workspace_resource_operations.remove(pane_id);
-        if self.status.as_ref().is_some_and(|status| {
-            matches!(
-                status.as_ref(),
-                "正在创建分屏终端…"
-                    | "Creating split terminal…"
-                    | "正在取消分屏创建；收到资源清理回执后继续关闭。"
-                    | "Cancelling split creation; close will continue after its cleanup receipt."
-            )
-        }) {
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|status| is_split_creation_status(status.as_ref()))
+        {
             self.status = None;
         }
         self.refresh_workspace_views(cx);

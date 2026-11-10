@@ -37,7 +37,10 @@ use super::*;
 use std::{
     cell::RefCell,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -320,6 +323,8 @@ struct CapturingSessions {
     creates: Mutex<Vec<CreateSessionRequest>>,
     live: Mutex<Option<split_lifecycle::LiveSession>>,
     closed: Mutex<Vec<SessionId>>,
+    /// 关闭重试回归需要先记录必然失败，再切换为成功验证 pending/entry 收敛。
+    close_succeeds: AtomicBool,
 }
 
 #[async_trait]
@@ -507,15 +512,23 @@ impl SessionService for CapturingSessions {
         }
         unavailable()
     }
-    /// 记录关闭尝试供 split 收尾回归断言；仍返回不可用以保留清理 owner 重试路径。
+    /// 记录关闭尝试供 split 收尾回归断言；默认保留清理 owner 重试路径，显式切换后模拟真实成功。
     async fn close(&self, session_id: SessionId) -> AppResult<()> {
         self.closed.lock().unwrap().push(session_id);
-        unavailable()
+        if self.close_succeeds.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            unavailable()
+        }
     }
     /// 记录按时限关闭尝试；真实关闭失败由调用方降级为可重试清理。
     async fn close_until(&self, session_id: SessionId, _: SessionDeadline) -> AppResult<()> {
         self.closed.lock().unwrap().push(session_id);
-        unavailable()
+        if self.close_succeeds.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            unavailable()
+        }
     }
     /// 不操作进程外的会话。
     async fn close_all(&self) -> AppResult<()> {

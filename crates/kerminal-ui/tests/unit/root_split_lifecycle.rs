@@ -548,7 +548,12 @@ fn ready_writeback_failure_stays_retryable_and_activation_is_allowed(app: &mut T
             root.workspace_runtime
                 .mark_restore_failed(&candidate)
                 .unwrap();
-            root.fail_workspace_split_after_ready(&tab_id, &candidate, cx);
+            root.fail_workspace_split_after_ready(
+                &tab_id,
+                &candidate,
+                crate::locale::text("fixture ready failure", "fixture ready failure"),
+                cx,
+            );
             assert!(
                 matches!(
                     root.workspace_controller
@@ -653,6 +658,240 @@ fn closing_failed_split_with_session_launches_close_session(app: &mut TestAppCon
         sessions.closed.lock().unwrap().contains(&session_id),
         "带 session 的失败候选必须实际启动关闭"
     );
+}
+
+/// failed ClosePane 放弃分屏后仍占用真实 session；标签选择必须放行，pane/tab 关闭
+/// 必须回到同一 ClosePane 重试，成功后才移除 pending 与状态记录。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn failed_close_pane_keeps_selection_and_retries_same_operation(app: &mut TestAppContext) {
+    use std::sync::atomic::Ordering;
+
+    let (runtime, root, sessions, _, visual) = fixture(app);
+    let (tab_id, source_pane, operation) =
+        ready_split_candidate(&root, visual, &runtime, &sessions);
+    let session_id = SessionId::new();
+    let (candidate, close_operation_id) = visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            let WorkspaceResourceOperation::CreatePane {
+                operation_id, pane, ..
+            } = &operation
+            else {
+                panic!("split must create a pane");
+            };
+            let candidate = pane.id.clone();
+            let target = SessionTarget::Local(LocalSessionTarget {
+                program: OsString::from("fixture-close-failure"),
+                args: Vec::new(),
+                working_directory: None,
+                environment: BTreeMap::new(),
+            });
+            root.workspace_runtime
+                .retain_cleanup_session(
+                    &candidate,
+                    session_id.clone(),
+                    target,
+                    TerminalSize::default(),
+                    None,
+                    "fixture retained session".into(),
+                )
+                .unwrap();
+            root.workspace_controller
+                .as_mut()
+                .unwrap()
+                .fail_pending_create_pane(
+                    &tab_id,
+                    &candidate,
+                    WorkspaceRestoreFailure::ResourceFailure,
+                );
+            root.workspace_resource_operations
+                .get_mut(&candidate)
+                .expect("split resource entry")
+                .try_admit_split_measurement(operation_id, 1);
+            // 无关资源记录必须跨重试/成功收尾保持不变。
+            root.workspace_resource_operations.insert(
+                source_pane.clone(),
+                WorkspaceResourceOperationEntry::new("unrelated-operation".into()),
+            );
+            assert!(root.defer_workspace_split_close_intent(
+                WorkspaceDeferredCloseIntent::Pane {
+                    tab_id: tab_id.clone(),
+                    pane_id: candidate.clone(),
+                },
+                true,
+                None,
+                None,
+                window,
+                cx,
+            ));
+            let pending = root
+                .workspace_controller
+                .as_ref()
+                .unwrap()
+                .pending_resource_operation()
+                .cloned()
+                .expect("replacing failed split must keep a close operation");
+            let WorkspaceResourceOperation::ClosePane {
+                operation_id: close_id,
+                pane_id,
+                ..
+            } = pending
+            else {
+                panic!("failed split must be replaced with ClosePane");
+            };
+            assert_eq!(pane_id, candidate);
+            (candidate, close_id)
+        })
+    });
+    settle(&runtime, visual);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            assert!(
+                matches!(
+                    root.workspace_controller
+                        .as_ref()
+                        .unwrap()
+                        .retry_pending_resource_operation(),
+                    Some(WorkspaceResourceOperation::ClosePane {
+                        operation_id,
+                        pane_id,
+                        ..
+                    }) if operation_id.as_str() == close_operation_id.as_str() && pane_id == candidate
+                ),
+                "close failure must leave the same ClosePane retryable"
+            );
+            let pane = root.workspace_runtime.pane(&candidate).unwrap();
+            assert_eq!(
+                pane.phase,
+                crate::root::workspace_runtime::RuntimePanePhase::CloseFailed
+            );
+            assert!(
+                pane.status
+                    .as_ref()
+                    .is_some_and(|status| {
+                    let status = status.as_ref();
+                    status.contains("再次关闭该标签重试") || status.contains("close this tab again to retry")
+                }),
+                "close failure must point at the retry entry, status={:?}",
+                pane.status
+            );
+            assert!(
+                root.handle_workspace_tab_event(
+                    &WorkspaceTabEvent::Activate(tab_id.clone()),
+                    window,
+                    cx,
+                ),
+                "failed ClosePane must not lock tab activation"
+            );
+            // 重复关闭不能把 failed ClosePane 再替换成另一项操作。
+            assert!(!root.defer_workspace_split_close_intent(
+                WorkspaceDeferredCloseIntent::Pane {
+                    tab_id: tab_id.clone(),
+                    pane_id: candidate.clone(),
+                },
+                true,
+                None,
+                None,
+                window,
+                cx,
+            ));
+            assert_eq!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .pending_resource_operation()
+                    .unwrap()
+                    .operation_id(),
+                close_operation_id
+            );
+        });
+    });
+
+    // 标签关闭应重新派发同一 ClosePane；替身仍失败，关闭调用次数必须增加。
+    let closes_before_retry = sessions.closed.lock().unwrap().len();
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_tab_event(&WorkspaceTabEvent::Close(tab_id.clone()), window, cx);
+        })
+    });
+    settle(&runtime, visual);
+    {
+        let closed = sessions.closed.lock().unwrap();
+        assert!(closed.len() > closes_before_retry);
+        assert_eq!(closed.last(), Some(&session_id));
+    }
+    visual.update(|_, app| {
+        root.update(app, |root, _| {
+            assert!(
+                matches!(
+                    root.workspace_controller
+                        .as_ref()
+                        .unwrap()
+                        .retry_pending_resource_operation(),
+                    Some(WorkspaceResourceOperation::ClosePane { operation_id, .. })
+                        if operation_id.as_str() == close_operation_id.as_str()
+                ),
+                "failed retry must keep the original ClosePane"
+            );
+        })
+    });
+
+    // CloseFailed 占位的“重试恢复”按钮也必须回到同一 ClosePane，而不是报“不是分屏创建”。
+    let closes_before_placeholder_retry = sessions.closed.lock().unwrap().len();
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_render_event(
+                WorkspaceRenderEvent::RetryPane {
+                    tab_id: tab_id.clone(),
+                    pane_id: candidate.clone(),
+                },
+                window,
+                cx,
+            );
+        })
+    });
+    settle(&runtime, visual);
+    {
+        let closed = sessions.closed.lock().unwrap();
+        assert!(closed.len() > closes_before_placeholder_retry);
+        assert_eq!(closed.last(), Some(&session_id));
+    }
+
+    // 替身改为成功后，从 pane 关闭入口重试同一操作，pending 与 entry 才收敛。
+    sessions.close_succeeds.store(true, Ordering::Relaxed);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.handle_workspace_render_event(
+                WorkspaceRenderEvent::Pane {
+                    tab_id: tab_id.clone(),
+                    event: WorkspacePaneEvent::Close(candidate.clone()),
+                },
+                window,
+                cx,
+            );
+        })
+    });
+    settle(&runtime, visual);
+    visual.update(|_, app| {
+        root.update(app, |root, _| {
+            assert!(
+                root.workspace_controller
+                    .as_ref()
+                    .unwrap()
+                    .pending_resource_operation()
+                    .is_none(),
+                "successful retry must clear the pending close"
+            );
+            assert!(!root.workspace_resource_operations.contains_key(&candidate));
+            assert!(root.workspace_runtime.pane(&candidate).is_none());
+            assert!(root.workspace_runtime.pane(&source_pane).is_some());
+            assert!(
+                root.workspace_resource_operations
+                    .contains_key(&source_pane)
+            );
+        })
+    });
 }
 
 /// 无 session/orphan 的失败候选在新建终端前被精确丢弃，不删除其它资源记录。

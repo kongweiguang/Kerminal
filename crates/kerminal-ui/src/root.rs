@@ -846,6 +846,8 @@ pub struct RootView {
     split_target_picker_generation: u64,
     /// 多选分屏按 ACK 串行启动；一次只占用 controller 的单个候选资源槽位。
     split_open_batch: Option<split_target_picker::PendingSplitBatch>,
+    /// 批量分屏中止后写入的摘要；失败候选被自动丢弃时据此精确清理，避免残留状态。
+    split_batch_abort_status: Option<SharedString>,
     _split_target_picker_event_subscription: gpui_kit::Subscription,
     _agent_event_subscription: Option<gpui_kit::Subscription>,
     _updates_event_subscription: gpui_kit::Subscription,
@@ -1773,6 +1775,11 @@ impl RootView {
             .workspace_controller
             .as_ref()
             .and_then(|controller| controller.pending_resource_operation());
+        // 失败 ClosePane 的占位按钮需要知道可重试；仍在途的关闭不进入该状态。
+        let failed_operation = self
+            .workspace_controller
+            .as_ref()
+            .and_then(|controller| controller.retry_pending_resource_operation());
         layout
             .pane_ids()
             .into_iter()
@@ -1811,6 +1818,10 @@ impl RootView {
                     split_candidate_cancelable,
                     close_operation_pending: workspace_render::close_operation_targets_pane(
                         pending_operation,
+                        &pane_id,
+                    ),
+                    close_operation_retryable: workspace_render::close_operation_retryable(
+                        failed_operation.as_ref(),
                         &pane_id,
                     ),
                     split_enabled: self.workspace_pane_can_split(&pane_id),
@@ -2872,7 +2883,8 @@ impl RootView {
 
     /// 处理递归布局事件；最后一个 pane 的关闭复用标签确认门禁，资源回收仍由 controller ACK 提交。
     /// 关闭按钮的瞬时键盘来源只在此核对并归一，controller 不持有焦点句柄，也不能据此跳过 modal/quit 门禁。
-    /// 迟到的 RetryPane 事件若已被 ClosePane/CloseTab 接管，只提示回到关闭/清理入口，不重开会话。
+    /// 迟到的 RetryPane 事件对失败 ClosePane 复用同一关闭重试；仍在途的 ClosePane/CloseTab
+    /// 只提示等待回执，不重开会话。Pane Close 对失败 ClosePane 同样回到该重试入口。
     /// 左键分屏在事件边界冻结明确来源 pane 的本代实时目录，换代同步中拒绝旧帧和旧启动目录回退。
     /// 右键另选目标不进入目录继承路径。
     ///
@@ -2897,6 +2909,13 @@ impl RootView {
                 if pane_tab_id != tab_id {
                     self.status = Some("分屏重试目标已变化。".into());
                     cx.notify();
+                    return;
+                }
+                // failed ClosePane 的占位按钮必须回到同一失败关闭操作，而不是被
+                // “不是分屏创建”挡回；仍等待回执的 ClosePane 继续走下面的等待提示。
+                if let Some(operation) = self.retry_failed_close_pane_for_target(&tab_id, &pane_id)
+                {
+                    self.handle_workspace_resource_operation(operation, cx);
                     return;
                 }
                 let pending_operation = self
@@ -3101,6 +3120,23 @@ impl RootView {
                     return;
                 }
                 if let WorkspacePaneEvent::Close(pane_id) = &event {
+                    // failed ClosePane 已放弃分屏但仍保留真实资源；再次点关闭必须重试同一
+                    // ClosePane，并沿用按钮来源的焦点票据，不能落回被资源门禁拒绝的普通关闭。
+                    if let Some(operation) =
+                        self.retry_failed_close_pane_for_target(&tab_id, pane_id)
+                    {
+                        if let Some(close_focus) = keyboard_close_focus {
+                            self.handle_workspace_resource_operation_from_window(
+                                operation,
+                                Some(close_focus),
+                                window,
+                                cx,
+                            );
+                        } else {
+                            self.handle_workspace_resource_operation(operation, cx);
+                        }
+                        return;
+                    }
                     let committed_layout =
                         self.workspace_controller.as_ref().and_then(|controller| {
                             controller
@@ -4048,6 +4084,7 @@ impl RootView {
             split_target_picker,
             split_target_picker_generation: 0,
             split_open_batch: None,
+            split_batch_abort_status: None,
             _split_target_picker_event_subscription: split_target_picker_event_subscription,
             _agent_event_subscription: agent_event_subscription,
             updates_panel,
