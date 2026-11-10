@@ -104,13 +104,16 @@ fn trigger_label_stays_compact_and_uses_pane_and_selection_counts() {
 
     projection.mode = WorkspaceBroadcastTargetMode::All;
     projection.selected_count = 2;
+    // All 模式在生产中会纳入所有可发送分屏，夹具同步选中以保持不变量。
+    projection.targets[1].selected = true;
     assert_eq!(
         target_mode_trigger_label(&projection),
         crate::locale::text("分屏 2/2", "Panes 2/2").to_string()
     );
 }
 
-/// 简化标签后，提示与无障碍描述仍说明当前模式和两项计数，避免模式身份只剩弹层。
+/// 简化标签后，提示与无障碍描述仍说明当前模式和两项计数，避免模式身份只剩弹层；
+/// 异常态必须保留同一目标说明并追加结果提示，不能整体替换成错误文案。
 ///
 /// @author kongweiguang
 #[test]
@@ -125,21 +128,31 @@ fn trigger_accessibility_keeps_mode_and_counts() {
         ..WorkspaceBroadcastBarProjection::default()
     };
 
-    projection.mode = WorkspaceBroadcastTargetMode::All;
-    assert_eq!(
-        target_mode_trigger_accessibility(&projection),
-        crate::locale::text(
-            "发送目标：全部分屏 · 共 2 个分屏，已选 1 个",
-            "Broadcast targets: All panes · 2 panes, 1 selected",
-        )
-    );
-
     projection.mode = WorkspaceBroadcastTargetMode::Custom;
     assert_eq!(
-        target_mode_trigger_accessibility(&projection),
+        target_mode_trigger_accessibility(&projection, false),
         crate::locale::text(
             "发送目标：自定义 · 共 2 个分屏，已选 1 个",
             "Broadcast targets: Custom · 2 panes, 1 selected",
+        )
+    );
+
+    // All 模式在生产中会选中所有可发送分屏，夹具同步更新选中数。
+    projection.mode = WorkspaceBroadcastTargetMode::All;
+    projection.selected_count = 2;
+    projection.targets[1].selected = true;
+    assert_eq!(
+        target_mode_trigger_accessibility(&projection, false),
+        crate::locale::text(
+            "发送目标：全部分屏 · 共 2 个分屏，已选 2 个",
+            "Broadcast targets: All panes · 2 panes, 2 selected",
+        )
+    );
+    assert_eq!(
+        target_mode_trigger_accessibility(&projection, true),
+        crate::locale::text(
+            "发送目标：全部分屏 · 共 2 个分屏，已选 2 个；群发结果有异常，打开查看详情",
+            "Broadcast targets: All panes · 2 panes, 2 selected; the last result has errors, open to review details",
         )
     );
 }
@@ -447,11 +460,19 @@ mod toolbar_interaction_gpui {
         let actions = visual
             .debug_bounds("workspace-broadcast-actions")
             .expect("actions visible at wide width");
-        assert!(trigger.size.width >= gpui::px(36.));
+        assert!(trigger.size.width >= gpui::px(64.));
         assert!(trigger.right() <= input.left());
         assert!(input.size.width >= gpui::px(80.));
         assert!(input.right() <= actions.left());
         assert!(actions.right() <= gpui::px(1440.));
+        // 行内只用统一 gap 连接目标选择、输入和动作；若宽屏“N 个目标”标签
+        // 被重新插到输入与动作之间，两段间距会不再相等。
+        let trigger_to_input = (input.left() - trigger.right()).to_f64();
+        let input_to_actions = (actions.left() - input.right()).to_f64();
+        assert!(
+            (trigger_to_input - input_to_actions).abs() <= 1.,
+            "inconsistent row gaps: trigger-input={trigger_to_input}, input-actions={input_to_actions}"
+        );
     }
 
     /// 打开目标弹层查看大量异常明细；三种主题和窄窗均保留主行输入与发送位置。

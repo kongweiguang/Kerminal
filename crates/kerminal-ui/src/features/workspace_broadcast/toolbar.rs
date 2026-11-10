@@ -168,19 +168,33 @@ fn target_mode_trigger_label(projection: &WorkspaceBroadcastBarProjection) -> St
 }
 
 /// 简化触发区后仍要在提示与无障碍描述中说明模式身份和两项计数的来源，
-/// 否则用户无法从短标签区分“全部”与“自定义”模式。
+/// 否则用户无法从短标签区分“全部”与“自定义”模式；异常态只追加结果提示，
+/// 不丢弃模式与计数，避免提示语义随发送结果切换而缺失目标信息。
 ///
 /// @author kongweiguang
-fn target_mode_trigger_accessibility(projection: &WorkspaceBroadcastBarProjection) -> SharedString {
+fn target_mode_trigger_accessibility(
+    projection: &WorkspaceBroadcastBarProjection,
+    has_error: bool,
+) -> SharedString {
+    let error_suffix_zh = if has_error {
+        "；群发结果有异常，打开查看详情"
+    } else {
+        ""
+    };
+    let error_suffix_en = if has_error {
+        "; the last result has errors, open to review details"
+    } else {
+        ""
+    };
     crate::locale::text(
         format!(
-            "发送目标：{} · 共 {} 个分屏，已选 {} 个",
+            "发送目标：{} · 共 {} 个分屏，已选 {} 个{error_suffix_zh}",
             target_mode_name(projection.mode),
             projection.pane_count,
             projection.selected_count
         ),
         format!(
-            "Broadcast targets: {} · {} panes, {} selected",
+            "Broadcast targets: {} · {} panes, {} selected{error_suffix_en}",
             target_mode_name(projection.mode),
             projection.pane_count,
             projection.selected_count
@@ -348,14 +362,7 @@ impl WorkspaceBroadcastBar {
             .foreground(theme.foreground)
             .hover(theme.surface_hover())
             .active(theme.surface_selected());
-        let trigger_accessibility = if has_error {
-            crate::locale::text(
-                "发送目标；群发结果有异常，打开查看详情",
-                "Broadcast targets; the last result has errors, open to review details",
-            )
-        } else {
-            target_mode_trigger_accessibility(&self.projection)
-        };
+        let trigger_accessibility = target_mode_trigger_accessibility(&self.projection, has_error);
         Popover::new("workspace-broadcast-mode-picker")
             .appearance(false)
             .trigger(
