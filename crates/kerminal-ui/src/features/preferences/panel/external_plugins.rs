@@ -124,6 +124,8 @@ impl PreferencesPanel {
             Ok(page) => {
                 self.hide_external_plugin(cx);
                 self.cancel_shortcut_capture(cx);
+                // 外部插件页接管正文后扩展页不再可见，迟到的预检确认必须在窗口级弹层之前失效。
+                self.extensions.deactivate(cx);
                 self.external_plugins.selected = Some(id.clone());
                 self.selected_navigation_target = None;
                 page.update(cx, |page, cx| page.visibility_changed(true, false, cx));

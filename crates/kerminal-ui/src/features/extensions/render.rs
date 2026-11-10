@@ -37,6 +37,8 @@ impl Render for ExtensionsPage {
     /// 页头与单张主从卡片共同承担设置页的既有留白，卡片内部各自滚动。
     /// 确认交给窗口级 Kit Dialog，页面不再自行绘制遮罩或手写焦点陷阱。
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 页面正在绘制即视为可见；退出在门禁之后被中止时下一次重绘自动恢复可操作状态。
+        self.active = true;
         let theme = ThemeTokens::current(window, cx).for_settings();
         let query = self.search.read(cx).value().trim().to_lowercase();
         let state = self.state.as_ref();
@@ -1306,42 +1308,38 @@ impl ExtensionsPage {
         let pending = state
             .pending
             .iter()
-            .find(|change| change.plugin_id() == id)?
-            .clone();
+            .find(|change| change.plugin_id() == id)
+            .cloned();
         let revision = state.revision;
-        Some(
+        let mut block = div().w_full().flex().flex_col().gap_2().child(
             div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
-                    div()
-                        .text_size(theme.text_sm)
-                        .text_color(theme.error)
-                        .child(failure),
-                )
-                .child(
-                    Button::new("extension-cancel-failed")
-                        .compact()
-                        .ghost()
-                        .label(crate::locale::text(
-                            "撤销失败的变更",
-                            "Cancel failed change",
-                        ))
-                        .disabled(self.busy)
-                        .on_click(cx.listener(move |page, _, _, cx| {
-                            page.run_operation(
-                                Operation::Change(ExtensionChange::CancelFailedChange {
-                                    expected_revision: revision,
-                                    pending: pending.clone(),
-                                }),
-                                cx,
-                            )
-                        })),
-                )
-                .into_any_element(),
-        )
+                .text_size(theme.text_sm)
+                .text_color(theme.error)
+                .child(failure),
+        );
+        // 无 pending 的失败只保留原因；只有可绑定的完整意图才提供撤销，避免错误撤销别的变更。
+        if let Some(pending) = pending {
+            block = block.child(
+                Button::new("extension-cancel-failed")
+                    .compact()
+                    .ghost()
+                    .label(crate::locale::text(
+                        "撤销失败的变更",
+                        "Cancel failed change",
+                    ))
+                    .disabled(self.busy)
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        page.run_operation(
+                            Operation::Change(ExtensionChange::CancelFailedChange {
+                                expected_revision: revision,
+                                pending: pending.clone(),
+                            }),
+                            cx,
+                        )
+                    })),
+            );
+        }
+        Some(block.into_any_element())
     }
 
     /// 使用窗口级 Kit Dialog 呈现确认：焦点、Escape 和关闭后的焦点恢复由 Kit 统一负责。
