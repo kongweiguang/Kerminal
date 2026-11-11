@@ -15,6 +15,7 @@ use kerminal_application::{
     ApplicationTaskExecutor,
     agents::{AgentHistoryMode, AgentResumeCapability, AgentSessionView},
     preferences::ThemeMode,
+    sessions::TerminalPalette,
 };
 use kerminal_domain::{
     agents::{
@@ -359,6 +360,28 @@ fn row_actions_and_return_keep_the_same_running_chat(app: &mut TestAppContext) {
     button_bounds(visual, &primary);
 }
 
+/// 构造与真实 Tab 切换同形的目标候选；测试借此区分“只更新候选”和隐式重读历史。
+///
+/// @author kongweiguang
+fn switched_target_candidate() -> AgentTargetCandidate {
+    AgentTargetCandidate {
+        binding: AgentTargetBinding {
+            binding_id: Some("fixture-target-switch".to_owned()),
+            generation: 7,
+            pane_id: Some(PaneId::new()),
+            tab_id: Some(TabId::new()),
+            terminal_session_id: Some(SessionId::new()),
+            target_ref: Some("local:fixture".to_owned()),
+            target_kind: Some("local".to_owned()),
+            cwd: Some("workspace".to_owned()),
+            shell: Some("bash".to_owned()),
+            live_status: AgentTargetLiveStatus::Ready,
+            last_seen_at: None,
+        },
+        label: "Fixture target".to_owned(),
+    }
+}
+
 /// 启动器菜单图标与触发器图标共用左侧对齐线，在浅、深和跟随系统主题均验证。
 #[gpui_kit::test]
 fn launcher_menu_content_aligns_with_picker(app: &mut TestAppContext) {
@@ -447,22 +470,7 @@ fn candidate_change_updates_target_without_reloading_history(app: &mut TestAppCo
     let rename_before = visual.update(|_, app| panel.read(app).rename_target.clone());
     assert!(rename_before.is_some(), "rename editor must be open");
 
-    let candidate = AgentTargetCandidate {
-        binding: AgentTargetBinding {
-            binding_id: Some("fixture-target-switch".to_owned()),
-            generation: 7,
-            pane_id: Some(PaneId::new()),
-            tab_id: Some(TabId::new()),
-            terminal_session_id: Some(SessionId::new()),
-            target_ref: Some("local:fixture".to_owned()),
-            target_kind: Some("local".to_owned()),
-            cwd: Some("workspace".to_owned()),
-            shell: Some("bash".to_owned()),
-            live_status: AgentTargetLiveStatus::Ready,
-            last_seen_at: None,
-        },
-        label: "Fixture target".to_owned(),
-    };
+    let candidate = switched_target_candidate();
     visual.update(|_, app| {
         panel.update(app, |panel, cx| {
             panel.set_target_candidate(Some(candidate), cx);
@@ -502,5 +510,60 @@ fn candidate_change_updates_target_without_reloading_history(app: &mut TestAppCo
             "real filter scope changes must still reload history"
         );
         assert_eq!(panel.history_mode, AgentHistoryMode::CurrentTarget);
+    });
+}
+
+/// 保活标签重新挂载只刷新主题、色盘、候选和摘要投影；不重读历史，也不重置筛选、改名草稿或当前会话选择。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn kept_alive_tab_remount_updates_only_projection(app: &mut TestAppContext) {
+    let (runtime, service, panel, id, visual) = fixture(app);
+
+    click(visual, "agents-history-all");
+    pump(&runtime, visual);
+    let rename = format!("agent-session-rename-{}", id.as_str());
+    click(visual, &rename);
+
+    // 选中会话会切换到终端视图，因此先打开改名草稿再恢复选择，才能同时观察两类非默认状态。
+    visual.update(|_, app| {
+        panel.update(app, |panel, cx| panel.select_agent(id.clone(), cx));
+    });
+    draw(visual);
+
+    let (loads_before, rename_before) = visual.update(|_, app| {
+        let panel = panel.read(app);
+        assert_eq!(panel.history_mode, AgentHistoryMode::All);
+        assert_eq!(panel.selected_agent_session_id(), Some(id.clone()));
+        let rename_before = panel.rename_target.clone();
+        assert!(rename_before.is_some(), "rename editor must be open");
+        (service.history_loads(), rename_before)
+    });
+
+    let candidate = switched_target_candidate();
+    visual.update(|_, app| {
+        panel.update(app, |panel, cx| {
+            panel.set_theme_mode(ThemeMode::Dark, cx);
+            panel.set_terminal_palette(TerminalPalette::default(), cx);
+            panel.set_target_candidate(Some(candidate.clone()), cx);
+            panel.set_target_summary(Some("Another terminal".to_owned()), cx);
+        });
+    });
+    pump(&runtime, visual);
+
+    visual.update(|_, app| {
+        let panel = panel.read(app);
+        assert_eq!(
+            service.history_loads(),
+            loads_before,
+            "re-mounting a retained tab must not reload history"
+        );
+        assert_eq!(panel.history_mode, AgentHistoryMode::All);
+        assert_eq!(panel.rename_target, rename_before);
+        assert_eq!(panel.selected_agent_session_id(), Some(id.clone()));
+        assert_eq!(panel.theme_mode, ThemeMode::Dark);
+        assert_eq!(panel.terminal_palette, Some(TerminalPalette::default()));
+        assert_eq!(panel.candidate.as_ref(), Some(&candidate));
+        assert_eq!(panel.target_summary.as_deref(), Some("Another terminal"));
     });
 }
