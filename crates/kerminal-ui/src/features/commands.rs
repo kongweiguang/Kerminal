@@ -610,6 +610,10 @@ pub struct CommandsView {
     /// 目标 generation 改变时通知用例停止排队；writer 已接纳后必须等真实回执收敛。
     pub(super) command_send_cancellation: Option<CancellationToken>,
     pub(super) status: Option<String>,
+    /// 整页和历史两类自动读取各自记录自己写入的状态条，普通读取完成时
+    /// 不能抹掉用户刚看到的目标切换、发送、广播或片段/工作流结果。
+    panel_status_slot: ReadStatusSlot,
+    history_status_slot: ReadStatusSlot,
     pub(super) session_view_generation: u64,
     /// Root 仅在真实 UI pane/session binding 更新时刷新此快照。
     pub(super) ui_session_binding: Option<UiSessionBinding>,
@@ -642,6 +646,75 @@ type PanelLoad = (
     Option<Result<Vec<CommandWorkflow>, AppError>>,
     Result<Vec<SessionInfo>, AppError>,
 );
+
+/// 读取类异步回执对状态条的所有权：成功回执只清除本读取自己写入的提示，
+/// 不能把目标切换、发送、广播或片段/工作流结果当成“过期读取提示”抹掉；
+/// 读取失败仍属于当前目标的结果，必须覆盖显示并接管状态条。
+///
+/// @author kongweiguang
+#[derive(Default)]
+struct ReadStatusSlot {
+    /// 本读取最近一次写入状态条的原文；只有当前状态仍等于它时才允许被成功回执结算。
+    owned: Option<String>,
+}
+
+impl ReadStatusSlot {
+    /// 失败或需要提示时总是写入并接管，避免把真实读取错误静默丢弃。
+    ///
+    /// @author kongweiguang
+    fn publish(&mut self, status: &mut Option<String>, message: String) {
+        *status = Some(message.clone());
+        self.owned = Some(message);
+    }
+
+    /// 成功且无错误时只结算自己的提示；其它操作写入的状态保持原样，回退值用于
+    /// 让配置冲突等与读取无关但由本面板持有的提示继续可见。
+    ///
+    /// @author kongweiguang
+    fn settle(&mut self, status: &mut Option<String>, fallback: Option<String>) {
+        if status.as_deref() == self.owned.as_deref() {
+            *status = fallback.clone();
+        }
+        // 只有回退提示仍可见时才记为本读取拥有；其它操作已接管状态条时放弃所有权，
+        // 后续成功回执也不会再清除那条新提示。
+        self.owned = fallback.filter(|fallback| status.as_deref() == Some(fallback.as_str()));
+    }
+
+    /// 用户主动发起的查询成功时可以替换任何旧提示，但仍只接管“本次查询写过的提示”；
+    /// 这样手动搜索保留原有清空语义，而自动回读不会误清目标切换或操作结果。
+    ///
+    /// @author kongweiguang
+    fn replace(&mut self, status: &mut Option<String>) {
+        *status = None;
+        self.owned = None;
+    }
+}
+
+/// 整页读取回执的状态落盘：无错误时只结算本读取写过的提示，避免读取成功抹掉
+/// 目标切换、发送/广播或片段/工作流结果；读取失败是当前目标的真实结果，覆盖显示。
+///
+/// @author kongweiguang
+fn settle_panel_load_status(
+    status: &mut Option<String>,
+    errors: Vec<String>,
+    conflict: Option<String>,
+    slot: &mut ReadStatusSlot,
+) {
+    if errors.is_empty() {
+        slot.settle(status, conflict);
+    } else {
+        slot.publish(status, errors.join("；"));
+    }
+}
+
+/// 历史回读对状态条的处理方式：用户主动搜索可替换旧提示，其余回读只结算自己写过的提示。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryReloadStatusPolicy {
+    Replace,
+    Settle,
+}
 
 impl CommandsView {
     /// 稳定输入和选择实体与历史读取槽由视图持有；重绘不重建草稿或在途查询。
@@ -858,6 +931,8 @@ impl CommandsView {
             send_operation: SendOperationState::default(),
             command_send_cancellation: None,
             status: None,
+            panel_status_slot: ReadStatusSlot::default(),
+            history_status_slot: ReadStatusSlot::default(),
             configuration_conflict: None,
             session_view_generation: 0,
             ui_session_binding: None,
@@ -1669,13 +1744,18 @@ impl CommandsView {
                     Ok(sessions) => self.ui_sessions = sessions,
                     Err(error) => errors.push(error.public_message()),
                 }
-                self.status = if errors.is_empty() {
-                    self.configuration_conflict.clone()
-                } else {
-                    Some(errors.join("；"))
-                };
+                // 成功回执只结算本读取写过的提示，避免把切换目标、发送/广播或片段/工作流结果抹掉；
+                // 读取失败属于当前目标的真实结果，必须覆盖并接管状态条。
+                settle_panel_load_status(
+                    &mut self.status,
+                    errors,
+                    self.configuration_conflict.clone(),
+                    &mut self.panel_status_slot,
+                );
             }
-            Err(error) => self.status = Some(error.public_message().to_owned()),
+            Err(error) => self
+                .panel_status_slot
+                .publish(&mut self.status, error.public_message().to_owned()),
         }
         cx.notify();
     }
@@ -1687,13 +1767,26 @@ impl CommandsView {
         if self.loading || self.history_read.is_loading() {
             return;
         }
-        self.reload_history(cx);
+        // 用户主动搜索是新交互，允许替换旧提示；自动回读则只结算自己写过的提示。
+        self.reload_history_with_status_policy(HistoryReloadStatusPolicy::Replace, cx);
     }
 
     /// 强制刷新冻结会话与查询，取消旧读；失败同样释放忙态以保留重试入口。
     ///
     /// @author kongweiguang
     pub(super) fn reload_history(&mut self, cx: &mut Context<Self>) {
+        self.reload_history_with_status_policy(HistoryReloadStatusPolicy::Settle, cx);
+    }
+
+    /// 回读共用实现：只有用户主动搜索才替换状态条；删除/清理、发送、广播和工作流
+    /// 触发或紧随其后的权威回读必须保留刚写入的确认与目标切换警告。
+    ///
+    /// @author kongweiguang
+    fn reload_history_with_status_policy(
+        &mut self,
+        policy: HistoryReloadStatusPolicy,
+        cx: &mut Context<Self>,
+    ) {
         let (generation, cancellation) = self.history_read.begin();
         let service = self.commands.clone();
         let executor = self.executor.clone();
@@ -1723,9 +1816,20 @@ impl CommandsView {
                 match result {
                     Ok(history) => {
                         view.history = history;
-                        view.status = None;
+                        // 历史读取成功只结算自己写过的提示；不能抹掉紧随其后的删除/清理、
+                        // 发送、广播或工作流确认，也不能清除目标切换警告。
+                        match policy {
+                            HistoryReloadStatusPolicy::Replace => {
+                                view.history_status_slot.replace(&mut view.status)
+                            }
+                            HistoryReloadStatusPolicy::Settle => {
+                                view.history_status_slot.settle(&mut view.status, None)
+                            }
+                        }
                     }
-                    Err(error) => view.status = Some(error.public_message().to_owned()),
+                    Err(error) => view
+                        .history_status_slot
+                        .publish(&mut view.status, error.public_message().to_owned()),
                 }
                 cx.notify();
             });
