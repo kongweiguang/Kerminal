@@ -326,47 +326,6 @@ impl Render for FileEditorWorkspace {
                     .is_some_and(|operation| operation.cancel_requested()),
             )
         });
-        let can_save = active
-            .as_ref()
-            .is_some_and(|(_, _, session, loading, dirty, _)| {
-                *dirty
-                    && !*loading
-                    && session.is_some_and(|(phase, _, readonly)| {
-                        !readonly
-                            && phase != EditorPhase::Saving
-                            && phase != EditorPhase::Conflict
-                            && phase != EditorPhase::OutcomeUnknown
-                    })
-            });
-        let save_label = active
-            .as_ref()
-            .and_then(|(_, _, session, _, _, _)| *session)
-            .map(|(phase, _, _)| match phase {
-                EditorPhase::Saving => crate::locale::text("保存中…", "Saving…").to_string(),
-                EditorPhase::Conflict => {
-                    crate::locale::text("保存冲突", "Save conflict").to_string()
-                }
-                EditorPhase::OutcomeUnknown => {
-                    crate::locale::text("结果待确认", "Result unknown").to_string()
-                }
-                EditorPhase::Failed => crate::locale::text("重试保存", "Retry save").to_string(),
-                EditorPhase::Ready => crate::locale::text("保存", "Save").to_string(),
-            })
-            .unwrap_or_else(|| crate::locale::text("保存", "Save").to_string());
-        let saving = active
-            .as_ref()
-            .and_then(|(_, _, session, _, _, _)| *session)
-            .is_some_and(|(phase, _, _)| phase == EditorPhase::Saving);
-        let reading = active
-            .as_ref()
-            .is_some_and(|(_, _, _, loading, _, _)| *loading);
-        let cancel_requested = active
-            .as_ref()
-            .is_some_and(|(_, _, _, _, _, requested)| *requested);
-        let save_endpoint = active
-            .as_ref()
-            .map(|(endpoint, _, _, _, _, _)| endpoint.clone());
-
         let mut content = div()
             .id("file-editor-workspace")
             .size_full()
@@ -374,34 +333,26 @@ impl Render for FileEditorWorkspace {
             .flex_col()
             .overflow_hidden()
             .bg(theme.materials.workspace)
-            .text_color(theme.foreground)
-            .child(self.render_toolbar(
-                SaveToolbarState {
-                    label: save_label,
-                    can_save,
-                    saving,
-                    reading,
-                    cancel_requested,
-                    endpoint: save_endpoint,
-                },
-                theme,
-                cx,
-            ));
+            .text_color(theme.foreground);
+        // 嵌入宿主时文件上下文行与标签带统一由宿主绘制；编辑器自身的渲染不得再输出
+        // 工具栏，否则同一帧会出现两份保存入口并在标签带上下争抢位置。
         if !self.embedded_navigation {
-            content = content.child(
-                div()
-                    .id("file-editor-tabs-scroll")
-                    .h(px(38.))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .bg(theme.panel)
-                    .overflow_x_scroll()
-                    .track_scroll(&self.tabs_scroll_handle)
-                    .children(tabs),
-            );
+            content = content
+                .child(self.render_toolbar(self.save_toolbar_state(), theme, cx))
+                .child(
+                    div()
+                        .id("file-editor-tabs-scroll")
+                        .h(px(38.))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .bg(theme.panel)
+                        .overflow_x_scroll()
+                        .track_scroll(&self.tabs_scroll_handle)
+                        .children(tabs),
+                );
         }
 
         // 查询文本可跨文件保留，但没有已创建的编辑器时没有可操作目标，因此不显示无效输入与替换按钮。
@@ -551,6 +502,125 @@ fn tab_is_fully_visible(scroll_handle: &ScrollHandle, index: usize) -> bool {
 }
 
 impl FileEditorWorkspace {
+    /// 保存按钮的可用性、文案和在途状态只能从活动文档会话推导一次；宿主绘制上下文行与
+    /// 独立编辑页共用该快照，避免两处入口对同一文档给出不同保存语义。
+    ///
+    /// @author kongweiguang
+    fn save_toolbar_state(&self) -> SaveToolbarState {
+        let active = self.active_tab().map(|tab| {
+            (
+                tab.session
+                    .as_ref()
+                    .map(|session| (session.phase(), session.is_truncated(), tab.is_readonly())),
+                tab.loading,
+                tab.dirty,
+                tab.save_operation
+                    .as_ref()
+                    .is_some_and(|operation| operation.cancel_requested()),
+            )
+        });
+        let can_save = active.as_ref().is_some_and(|(session, loading, dirty, _)| {
+            *dirty
+                && !*loading
+                && session.is_some_and(|(phase, _, readonly)| {
+                    !readonly
+                        && phase != EditorPhase::Saving
+                        && phase != EditorPhase::Conflict
+                        && phase != EditorPhase::OutcomeUnknown
+                })
+        });
+        let save_label = active
+            .as_ref()
+            .and_then(|(session, _, _, _)| *session)
+            .map(|(phase, _, _)| match phase {
+                EditorPhase::Saving => crate::locale::text("保存中…", "Saving…").to_string(),
+                EditorPhase::Conflict => {
+                    crate::locale::text("保存冲突", "Save conflict").to_string()
+                }
+                EditorPhase::OutcomeUnknown => {
+                    crate::locale::text("结果待确认", "Result unknown").to_string()
+                }
+                EditorPhase::Failed => crate::locale::text("重试保存", "Retry save").to_string(),
+                EditorPhase::Ready => crate::locale::text("保存", "Save").to_string(),
+            })
+            .unwrap_or_else(|| crate::locale::text("保存", "Save").to_string());
+        let saving = active
+            .as_ref()
+            .and_then(|(session, _, _, _)| *session)
+            .is_some_and(|(phase, _, _)| phase == EditorPhase::Saving);
+        let reading = active.as_ref().is_some_and(|(_, loading, _, _)| *loading);
+        let cancel_requested = active
+            .as_ref()
+            .is_some_and(|(_, _, _, requested)| *requested);
+        let endpoint = self.active_tab().map(|tab| tab.endpoint.clone());
+
+        SaveToolbarState {
+            label: save_label,
+            can_save,
+            saving,
+            reading,
+            cancel_requested,
+            endpoint,
+        }
+    }
+
+    /// 宿主需要把文件上下文行画在文档标签带上方，但保存语义仍归编辑器所有；嵌入模式下
+    /// 由宿主调用这一入口复用唯一工具栏，编辑器自身不再重复绘制。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn render_context_toolbar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = ThemeTokens::current(window, cx);
+        self.render_toolbar(self.save_toolbar_state(), theme, cx)
+            .into_any_element()
+    }
+
+    /// 目录活动而文档标签仍存在时，用与编辑器工具栏同规格的一行显示宿主与目录；保存不
+    /// 作用于目录，因此只保留路径说明。占用相同高度可避免目录/文档切换时标签带跳动。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn render_directory_context(
+        &self,
+        endpoint: &FileEndpoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = ThemeTokens::current(window, cx);
+        let target = self.target_names.display(endpoint);
+        let path_label = editor_visible_context_label(endpoint, &target.compact);
+        let tooltip_label = endpoint_target_label(endpoint, &self.target_names);
+        div()
+            .id("file-editor-directory-context")
+            .debug_selector(|| "host-file-directory-context".into())
+            .w_full()
+            .h(theme.metrics.toolbar_height)
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .bg(theme.materials.chrome)
+            .child(
+                div()
+                    .id("file-editor-directory-path-label")
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(12.))
+                    .text_color(theme.muted)
+                    .aria_label(tooltip_label.clone())
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(tooltip_label.clone()).build(window, cx)
+                    })
+                    .child(path_label),
+            )
+            .into_any_element()
+    }
+
     /// 顶部使用 chrome 材料并允许路径收缩；验收定位真实保存按钮，不引入额外操作路径。
     ///
     /// @author kongweiguang

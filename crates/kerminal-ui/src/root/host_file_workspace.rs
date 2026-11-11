@@ -145,6 +145,26 @@ impl WorkspaceFileRuntime {
         self.host_document_endpoint(owner, state.active_item_id.as_ref()?)
     }
 
+    /// 目录活动时给宿主上下文行提供完整端点；锚点或路径无效时宁可不画，也不能把
+    /// 另一个目录或文档目标冒充成当前选择。
+    ///
+    /// @author kongweiguang
+    pub(in crate::root) fn host_active_directory_endpoint(
+        &self,
+        owner: &TabId,
+    ) -> Option<FileEndpoint> {
+        let WorkspaceSessionTab::FileWorkspace { state, .. } = &self.tabs.get(owner)?.tab else {
+            return None;
+        };
+        let active = state.active_item_id.as_ref()?;
+        let FileWorkspaceItem::Directory { path, .. } =
+            state.items.iter().find(|item| item.id() == active)?
+        else {
+            return None;
+        };
+        endpoint_at_path(&self.host_workspace_anchor(owner)?, path).ok()
+    }
+
     /// 关闭宿主核对全部文档，不能只给当前文档执行脏稿保护。
     pub(in crate::root) fn host_document_endpoints(&self, owner: &TabId) -> Vec<FileEndpoint> {
         let Some(WorkspaceFileTabRuntime {
@@ -256,9 +276,11 @@ impl WorkspaceFileRuntime {
         let selection = |tab: &WorkspaceSessionTab| match tab {
             WorkspaceSessionTab::FileWorkspace { state, .. } => {
                 state.active_item_id.as_ref().and_then(|active| {
+                    // 宿主标签带只渲染文档，滚动索引必须使用文档序号，目录项不应把索引顶偏。
                     state
                         .items
                         .iter()
+                        .filter(|item| matches!(item, FileWorkspaceItem::Document { .. }))
                         .position(|item| item.id() == active)
                         .map(|index| (active.clone(), index))
                 })

@@ -1,4 +1,4 @@
-//! 文件宿主只画一条内部标签带；目录与编辑器正文保留各自实体。
+//! 文件宿主统一绘制文件上下文行与唯一内部标签带；目录与编辑器正文保留各自实体。
 //!
 //! @author kongweiguang
 
@@ -7,89 +7,11 @@ use std::collections::{BTreeSet, HashMap};
 use super::*;
 use crate::theme::ThemeTokens;
 use gpui_kit::component::{
-    Disableable as _, IconName, Selectable as _,
+    IconName, Selectable as _,
     button::{Button, ButtonVariants as _},
     menu::ContextMenuExt as _,
 };
 use gpui_kit::{AnyElement, ClickEvent, IntoElement, div, prelude::*, px};
-
-/// 目录标签只显示基名与最短唯一后缀；同路径的加号副本用稳定序号区分，完整路径留给 tooltip。
-///
-/// @author kongweiguang
-fn host_directory_labels(entries: &[(&TabId, &str)], local: bool) -> HashMap<TabId, String> {
-    let parts = |path: &str| {
-        if local {
-            std::path::Path::new(path)
-                .iter()
-                .map(|part| part.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-        } else {
-            path.split('/')
-                .filter(|part| !part.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        }
-    };
-    let separator = if local {
-        std::path::MAIN_SEPARATOR_STR
-    } else {
-        "/"
-    };
-    let mut by_base = HashMap::<String, Vec<(&TabId, Vec<String>)>>::new();
-    for (id, path) in entries {
-        let components = parts(path);
-        let base = components
-            .last()
-            .cloned()
-            .filter(|part| !part.is_empty())
-            .unwrap_or_else(|| path.to_string());
-        by_base.entry(base).or_default().push((*id, components));
-    }
-    let mut labels = HashMap::new();
-    for (base, group) in by_base {
-        if group.len() == 1 {
-            labels.insert(group[0].0.clone(), base);
-            continue;
-        }
-        let max_depth = group
-            .iter()
-            .map(|(_, components)| components.len())
-            .max()
-            .unwrap_or(1)
-            .max(2);
-        let mut resolved = None;
-        for depth in 2..=max_depth {
-            let suffixes = group
-                .iter()
-                .map(|(_, components)| {
-                    components[components.len().saturating_sub(depth)..].join(separator)
-                })
-                .collect::<BTreeSet<_>>();
-            if suffixes.len() == group.len() {
-                resolved = Some(depth);
-                break;
-            }
-        }
-        // 完全相同的路径无法靠后缀区分；按稳定项序补序号，避免关闭/切换时无对象可辨。
-        let mut same_path_seen = HashMap::<String, usize>::new();
-        for (id, components) in group {
-            let label = if let Some(depth) = resolved {
-                components[components.len().saturating_sub(depth)..].join(separator)
-            } else {
-                let whole = components.join(separator);
-                let ordinal = same_path_seen.entry(whole).or_insert(0);
-                *ordinal += 1;
-                if *ordinal == 1 {
-                    base.clone()
-                } else {
-                    format!("{base} · {ordinal}")
-                }
-            };
-            labels.insert(id.clone(), label);
-        }
-    }
-    labels
-}
 
 /// 同名文档复用本帧分组，仍按完整同名集合求最短唯一后缀；远端反斜杠不是分隔符。
 /// @author kongweiguang
@@ -167,11 +89,6 @@ impl RootView {
                 .find(|item| matches!(item, FileWorkspaceItem::Directory { .. }))
                 .map(FileWorkspaceItem::id)
         });
-        let directory_count = state
-            .items
-            .iter()
-            .filter(|item| matches!(item, FileWorkspaceItem::Directory { .. }))
-            .count();
         // 同名判断只服务本帧显示，完整端点和读取代次仍由原运行态校验。
         let mut paths_by_title = HashMap::<&str, Vec<&str>>::new();
         for item in &state.items {
@@ -186,19 +103,14 @@ impl RootView {
             self.workspace_files.host_workspace_anchor(id),
             Some(FileEndpoint::Local { .. })
         );
-        let directory_entries = state
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                FileWorkspaceItem::Directory { id, path } => Some((id, path.as_str())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let directory_labels = host_directory_labels(&directory_entries, local);
+        // 中间标签只承载文档；目录浏览属于右侧文件面板，避免在文件标签里再出现 SFTP 目录项。
         let buttons = state
             .items
             .iter()
-            .map(|item| {
+            .filter_map(|item| {
+                let FileWorkspaceItem::Document { .. } = item else {
+                    return None;
+                };
                 let item_id = item.id().clone();
                 let owner = id.clone();
                 let close_owner = owner.clone();
@@ -206,29 +118,18 @@ impl RootView {
                 let activate_selector = format!("host-file-item-{}", item_id.as_str());
                 let close_selector = format!("host-file-close-{}", item_id.as_str());
                 let selected = effective_active == Some(&item_id);
-                let (name, dirty) = match item {
-                    FileWorkspaceItem::Directory { path, .. } => (
-                        directory_labels
-                            .get(&item_id)
-                            .cloned()
-                            .unwrap_or_else(|| path.clone()),
-                        false,
-                    ),
-                    FileWorkspaceItem::Document { .. } => {
-                        let dirty = self
-                            .workspace_files
-                            .host_document_endpoint(id, item.id())
-                            .is_some_and(|endpoint| {
-                                projection.as_ref().is_some_and(|projection| {
-                                    projection
-                                        .tabs
-                                        .iter()
-                                        .any(|tab| tab.endpoint == endpoint && tab.dirty)
-                                })
-                            });
-                        (host_document_label(item, &paths_by_title, local), dirty)
-                    }
-                };
+                let dirty = self
+                    .workspace_files
+                    .host_document_endpoint(id, item.id())
+                    .is_some_and(|endpoint| {
+                        projection.as_ref().is_some_and(|projection| {
+                            projection
+                                .tabs
+                                .iter()
+                                .any(|tab| tab.endpoint == endpoint && tab.dirty)
+                        })
+                    });
+                let name = host_document_label(item, &paths_by_title, local);
                 // 脏标记必须固定在最前，否则长标题被省略号截断时未保存状态会消失。
                 let label = if dirty {
                     format!("● {name}")
@@ -236,14 +137,6 @@ impl RootView {
                     name.clone()
                 };
                 let close_label = format!("{}{}", crate::locale::text("关闭 ", "Close "), name);
-                let close_tooltip = if matches!(item, FileWorkspaceItem::Directory { .. })
-                    && directory_count <= 1
-                {
-                    crate::locale::text("至少保留一个目录标签", "Keep at least one directory tab")
-                        .to_string()
-                } else {
-                    close_label.clone()
-                };
                 let tooltip = item.path().to_owned();
                 let menu_target = self.file_editor_workspace.as_ref().and_then(|editor| {
                     let endpoint = self.workspace_files.host_document_endpoint(id, item.id())?;
@@ -272,11 +165,7 @@ impl RootView {
                             .ghost()
                             .selected(selected)
                             .toggled(selected)
-                            .icon(if matches!(item, FileWorkspaceItem::Directory { .. }) {
-                                IconName::FolderOpen
-                            } else {
-                                IconName::FileText
-                            })
+                            .icon(IconName::FileText)
                             .label(label)
                             .tooltip(tooltip)
                             .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
@@ -290,18 +179,14 @@ impl RootView {
                             .compact()
                             .ghost()
                             .icon(IconName::Close)
-                            .disabled(
-                                matches!(item, FileWorkspaceItem::Directory { .. })
-                                    && directory_count <= 1,
-                            )
-                            .accessibility_label(close_label)
-                            .tooltip(close_tooltip)
+                            .accessibility_label(close_label.clone())
+                            .tooltip(close_label)
                             .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
                                 cx.stop_propagation();
                                 root.close_host_file_item(&close_owner, &close_id, window, cx);
                             })),
                     );
-                if let Some((editor, endpoint, generation)) = menu_target {
+                Some(if let Some((editor, endpoint, generation)) = menu_target {
                     tab.context_menu(move |menu, _, _| {
                         crate::features::editor::editor_tab_context_menu(
                             menu,
@@ -313,23 +198,44 @@ impl RootView {
                     .into_any_element()
                 } else {
                     tab.into_any_element()
-                }
+                })
             })
             .collect::<Vec<_>>();
-        let add_owner = id.clone();
-        let locate_owner = id.clone();
-        // 目录态没有可定位的文档，禁用以避免点击后静默无效。
-        let locate_available =
-            self.workspace_files.host_active_document(id).is_some() && self.sftp_panel.is_some();
         let active_directory = effective_active.and_then(|active| {
             self.workspace_files
                 .directories
                 .get(&(id.clone(), active.clone()))
                 .map(|(pane, _)| pane.clone())
         });
+        // 宿主是唯一绘制方：先切换嵌入模式，再让上下文行和正文按同一帧状态组装，避免编辑器
+        // 与宿主各画一份工具栏。
+        if let Some(editor) = self.file_editor_workspace.clone()
+            && !editor.read(cx).is_embedded_navigation()
+        {
+            editor.update(cx, |editor, cx| editor.set_embedded_navigation(true, cx));
+        }
+        // 活动文档只从已提交状态计算一次，上下文行和正文共用结论，避免同帧两处判断漂移。
+        let active_document = self.workspace_files.host_active_document(id);
+        // 文件上下文行固定位于文档标签带上方：文档活动时复用编辑器的保存工具栏，目录活动
+        // 时用同规格的宿主/目录说明占位。目录没有文档标签时不画这一行，避免空标签带下多出
+        // 一条无对象说明。
+        let context_toolbar = match self.file_editor_workspace.clone() {
+            Some(editor) if active_document.is_some() => {
+                Some(editor.update(cx, |editor, cx| editor.render_context_toolbar(window, cx)))
+            }
+            Some(editor) if !buttons.is_empty() => self
+                .workspace_files
+                .host_active_directory_endpoint(id)
+                .map(|endpoint| {
+                    editor.update(cx, |editor, cx| {
+                        editor.render_directory_context(&endpoint, window, cx)
+                    })
+                }),
+            _ => None,
+        };
         let body = if let Some(pane) = active_directory {
             pane.into_any_element()
-        } else if self.workspace_files.host_active_document(id).is_some() {
+        } else if active_document.is_some() {
             self.file_editor_workspace
                 .clone()
                 .map(|editor| editor.into_any_element())
@@ -368,15 +274,11 @@ impl RootView {
                 )
                 .into_any_element()
         };
-        div()
-            .id(format!("host-file-workspace-{}", id.as_str()))
-            .size_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .bg(theme.materials.workspace)
-            .text_color(theme.foreground)
-            .child(
+        // 上下文行在最上，文档标签带紧随其下，最后是正文；目录不进入标签带。
+        let tab_strip = if buttons.is_empty() {
+            None
+        } else {
+            Some(
                 div()
                     .h(theme.metrics.toolbar_height)
                     .w_full()
@@ -384,6 +286,8 @@ impl RootView {
                     .items_center()
                     .flex_shrink_0()
                     .bg(theme.panel)
+                    .border_b_1()
+                    .border_color(theme.border)
                     .child(
                         div()
                             .id(format!("host-file-items-{}", id.as_str()))
@@ -402,68 +306,19 @@ impl RootView {
                                 |view, handle| view.track_scroll(&handle),
                             )
                             .children(buttons),
-                    )
-                    .child(
-                        // 尾部动作与可滚动标签带用分隔线分组，窄窗口下也保持入口归属清楚。
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .pl_1()
-                            .border_l_1()
-                            .border_color(theme.border)
-                            .child(
-                                Button::new("file-workspace-new-directory")
-                                    .debug_selector(|| "host-file-new-directory".into())
-                                    .compact()
-                                    .ghost()
-                                    .icon(IconName::Plus)
-                                    .accessibility_label(crate::locale::text(
-                                        "新建目录标签",
-                                        "New directory tab",
-                                    ))
-                                    .tooltip(crate::locale::text(
-                                        "新建目录标签",
-                                        "New directory tab",
-                                    ))
-                                    .on_click(cx.listener(
-                                        move |root, _: &ClickEvent, window, cx| {
-                                            root.new_host_directory_tab(&add_owner, window, cx);
-                                        },
-                                    )),
-                            )
-                            .child(
-                                Button::new("file-workspace-locate-file")
-                                    .debug_selector(|| "host-file-locate-file".into())
-                                    .compact()
-                                    .label(crate::locale::text("定位文件", "Locate file"))
-                                    .disabled(!locate_available)
-                                    .tooltip(if locate_available {
-                                        crate::locale::text(
-                                            "在右侧文件面板定位当前文件",
-                                            "Locate the current file in the right panel",
-                                        )
-                                    } else {
-                                        crate::locale::text(
-                                            "先打开一个文件才能定位",
-                                            "Open a file to locate it",
-                                        )
-                                    })
-                                    .on_click(cx.listener(move |root, _: &ClickEvent, _, cx| {
-                                        if let Some(endpoint) =
-                                            root.workspace_files.host_active_document(&locate_owner)
-                                            && let Some(parent) =
-                                                crate::features::files::parent_endpoint(&endpoint)
-                                            && let Some(pane) = root.sftp_panel.clone()
-                                        {
-                                            pane.update(cx, |pane, cx| {
-                                                pane.locate_file_workspace_directory(parent, cx)
-                                            });
-                                        }
-                                    })),
-                            ),
                     ),
             )
+        };
+        div()
+            .id(format!("host-file-workspace-{}", id.as_str()))
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(theme.materials.workspace)
+            .text_color(theme.foreground)
+            .when_some(context_toolbar, |view, toolbar| view.child(toolbar))
+            .when_some(tab_strip, |view, strip| view.child(strip))
             .child(div().flex_1().min_h(px(0.)).min_w(px(0.)).child(body))
             .into_any_element()
     }
