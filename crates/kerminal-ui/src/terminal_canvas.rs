@@ -2926,6 +2926,10 @@ mod tests;
 mod selection_geometry_tests;
 
 #[cfg(test)]
+#[path = "../tests/unit/terminal_selection_native.rs"]
+mod terminal_selection_native_tests;
+
+#[cfg(test)]
 #[path = "../tests/unit/terminal_canvas_split_candidate_geometry.rs"]
 mod split_candidate_geometry_tests;
 
