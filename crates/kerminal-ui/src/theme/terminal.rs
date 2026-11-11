@@ -205,8 +205,8 @@ fn selection_endpoint(background: TerminalRgb) -> TerminalRgb {
 /// 把初始混入比例调进可辨认但不抢眼的对比度区间，循环上限固定为 8 次。
 ///
 /// 对比度随混入比例单调上升，因此取区间内侧 1.45 作为二分目标；命中时越过 1.35 下限，
-/// 且离 2.0 上限仍有明显余量。参考色本身达不到下限时返回最大混合，调用方会改用
-/// 黑白端点，避免死循环或伪造一个不存在的颜色。
+/// 且离 2.0 上限仍有明显余量。达不到 1.45 二分目标时返回最大混合；调用方仅在结果
+/// 仍低于 1.35 下限时才改用黑白端点，避免死循环或伪造一个不存在的颜色。
 ///
 /// @author kongweiguang
 fn bounded_selection_ratio(background: TerminalRgb, reference: TerminalRgb, initial: f32) -> f32 {

@@ -1,9 +1,9 @@
-//! 选区原生视觉探针：在隐藏窗口中用生产几何与文字颜色绘制样张，读取真实 renderer 像素。
+//! 选区原生视觉探针：在屏幕外窗口中用生产几何与文字颜色绘制样张，读取真实 renderer 像素。
 //!
-//! 探针不创建终端会话、不读取用户配置、不显示或聚焦窗口；PNG 只作为人工复核材料，
-//! 不把截图等同于审美验收或真实终端功能验收。DirectX 需要可创建渲染目标的桌面环境：
-//! 探针把窗口放到屏幕外并允许显示一帧，若平台夹回可见区域会短暂露出并立即关闭；隐藏
-//! 窗口在本机可能一直返回 1×1 render target，失败时 report 记录真实尺寸且不写占位图。
+//! 探针不创建终端会话、不读取用户配置、不聚焦窗口（窗口放到屏幕外并允许显示一帧，
+//! 退出前移除）；PNG 只作为人工复核材料，不把截图等同于审美验收或真实终端功能验收。
+//! DirectX 需要可创建渲染目标的桌面环境：若平台把窗口夹回可见区域会短暂露出并立即关闭；
+//! 隐藏窗口在本机可能一直返回 1×1 render target，失败时 report 记录真实尺寸且不写占位图。
 //!
 //! @author kongweiguang
 
@@ -667,7 +667,7 @@ fn terminal_selection_native_acceptance() {
     assert_eq!(reports.len(), 8, "one image for each scheme and mode");
 }
 
-/// 串行覆盖四套终端配色与浅深外观，每张图都基于同一隐藏窗口的真实场景。
+/// 串行覆盖四套终端配色与浅深外观，每张图都基于同一屏幕外窗口的真实场景。
 ///
 /// @author kongweiguang
 async fn run_native_selection(
@@ -772,7 +772,7 @@ fn render_report(
     let image_aspect = image.width() as f32 / image.height() as f32;
     if image.width() < 2 || image.height() < 2 || (image_aspect - logical_aspect).abs() > 0.01 {
         return Err(format!(
-            "native renderer returned {}x{} for a {}x{} logical canvas (scale {:.3}, window_active={}); hidden window did not receive a paint/resize",
+            "native renderer returned {}x{} for a {}x{} logical canvas (scale {:.3}, window_active={}); native window did not receive a paint/resize",
             image.width(),
             image.height(),
             facts.width,
@@ -806,6 +806,7 @@ fn render_report(
         content_top + facts.line_height * 2.5,
     );
     let corner_outside = (single_x0 - 0.2, single_y0 - 0.2);
+    let corner_arc_outside = (single_x0 + 0.4, single_y0 + 0.4);
     let corner_inside = (single_x0 + 4.0, single_y0 + 4.0);
     let terminal_blank = (
         content_left + facts.cell_width * 80.5,
@@ -839,6 +840,16 @@ fn render_report(
         actual,
         None,
         "outside the selection corner",
+        !close_rgba(actual, selection_rgba),
+    ));
+
+    let actual = sample_pixel(image, corner_arc_outside, scale_x, scale_y);
+    samples.push(sample(
+        "rounded_corner_arc_outside",
+        corner_arc_outside,
+        actual,
+        None,
+        "inside selection bounds but outside rounded arc",
         !close_rgba(actual, selection_rgba),
     ));
 

@@ -435,17 +435,17 @@ fn selection_style_decouples_from_cursor_for_degenerate_palette() {
     assert!(contrast_ratio(white.foreground_fallback, white.background) >= 4.5);
 }
 
-/// 前景/背景对比约 1.32 时前景参考达不到 1.45 目标，必须改用黑白端点并保持光标无关。
+/// 前景/背景对比约 1.32（低于 1.35 下限）时改用黑白端点，并保持光标无关。
 ///
 /// @author kongweiguang
 #[test]
-fn selection_style_recovers_when_foreground_reference_cannot_reach_target() {
+fn selection_style_uses_endpoint_when_foreground_candidate_below_minimum() {
     let background = gray(0x80);
     let foreground = gray(0x95);
     let foreground_contrast = contrast_ratio(foreground, background);
     assert!(
         (1.30..1.35).contains(&foreground_contrast),
-        "fixture should sit below the 1.45 reference target: {foreground_contrast}"
+        "fixture should sit below the 1.35 foreground candidate minimum: {foreground_contrast}"
     );
 
     let white_cursor = terminal_selection_style(&palette_with(foreground, background, gray(0xff)));
