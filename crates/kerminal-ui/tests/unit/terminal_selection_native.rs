@@ -1,8 +1,9 @@
 //! 选区原生视觉探针：在隐藏窗口中用生产几何与文字颜色绘制样张，读取真实 renderer 像素。
 //!
 //! 探针不创建终端会话、不读取用户配置、不显示或聚焦窗口；PNG 只作为人工复核材料，
-//! 不把截图等同于审美验收或真实终端功能验收。该入口需要可见/私有桌面 runner：隐藏窗口
-//! 在本机可能一直返回 1×1 render target，失败时 report 记录真实尺寸且不写占位图。
+//! 不把截图等同于审美验收或真实终端功能验收。DirectX 需要可创建渲染目标的桌面环境：
+//! 探针把窗口放到屏幕外并允许显示一帧，若平台夹回可见区域会短暂露出并立即关闭；隐藏
+//! 窗口在本机可能一直返回 1×1 render target，失败时 report 记录真实尺寸且不写占位图。
 //!
 //! @author kongweiguang
 
@@ -587,14 +588,14 @@ fn terminal_selection_native_acceptance() {
         .run(move |cx| {
             crate::init(cx);
             let window_options = WindowOptions {
-                // 隐藏窗口不会收到 WM_PAINT，渲染目标必须在创建时就具备最终尺寸，
-                // 否则会一直停留在平台默认的 1×1。
+                // 隐藏窗口不会收到 WM_PAINT；测试性放到屏幕外并允许显示一帧，
+                // 让平台创建真实渲染目标。若系统夹回可见区域，测试会立即关闭窗口。
                 window_bounds: Some(WindowBounds::Windowed(gpui_kit::bounds(
-                    point(px(0.0), px(0.0)),
+                    point(px(-4000.0), px(-4000.0)),
                     size(px(900.0), px(520.0)),
                 ))),
                 window_min_size: Some(size(px(900.0), px(520.0))),
-                show: false,
+                show: true,
                 focus: false,
                 ..TitleBar::window_options()
             };
