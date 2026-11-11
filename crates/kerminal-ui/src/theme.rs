@@ -16,7 +16,10 @@ mod terminal;
 
 pub(crate) use materials::{BackgroundMaterialSettings, BackgroundMaterials};
 pub(crate) use metrics::{ActiveInterfaceDensity, UiMetrics};
-pub(crate) use terminal::{terminal_background_color, terminal_palette_for_mode};
+pub(crate) use terminal::{
+    TerminalSelectionStyle, terminal_background_color, terminal_palette_for_mode,
+    terminal_selection_style,
+};
 
 /// 共享短过渡仅表达表面关系，不参与终端测量或阻塞业务完成。
 pub(crate) const UI_TRANSITION_DURATION: Duration = Duration::from_millis(140);

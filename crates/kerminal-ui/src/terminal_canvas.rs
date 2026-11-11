@@ -9,6 +9,7 @@ mod geometry;
 mod interaction;
 mod links;
 mod overlay;
+mod selection_geometry;
 mod style;
 
 pub(crate) use links::{
@@ -65,7 +66,7 @@ use crate::root::{
 use crate::terminal_input_handler::TerminalImePreferenceHandler;
 use crate::terminal_interaction::TerminalRightClickAction;
 use crate::terminal_metrics::{TerminalMetrics, cursor_visible_in_phase, effective_cursor_shape};
-use crate::theme::ThemeTokens;
+use crate::theme::{TerminalSelectionStyle, ThemeTokens, terminal_selection_style};
 #[cfg(feature = "acceptance-metrics")]
 use kerminal_terminal::snapshot::TerminalRow;
 
@@ -80,8 +81,10 @@ use self::overlay::{
     CellOverlayPaint, CellOverlaySpan, CellTextSegment, spans_for_row, style_sort_key,
     text_overlay_segments,
 };
+use self::selection_geometry::{SelectionRowSpan, selection_paths};
 use self::style::{
-    apply_overlay_paint, apply_terminal_style, default_overlay_colors, hide_text, terminal_rgb,
+    apply_overlay_paint, apply_terminal_style, effective_terminal_foreground, hide_text,
+    highlight_colors, terminal_rgb,
 };
 
 /// 用无输入行为的 Canvas 测量真实首帧网格；弱 Root 与恢复代次阻止迟到 prepaint 复活旧 pane。
@@ -658,6 +661,8 @@ struct TerminalPaintState {
     runs: Vec<PaintedRun>,
     terminal_backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
     overlay_backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
+    /// 选区连续轮廓单独一次填充，必须在搜索/关键词背景之上、文字之下。
+    selection_backgrounds: Vec<(gpui_kit::Path<Pixels>, Hsla)>,
     cursor_backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
     cursor_glyphs: Vec<PaintedRun>,
     cursor_marks: Vec<(Bounds<Pixels>, Hsla)>,
@@ -868,6 +873,7 @@ pub(crate) fn terminal_canvas(
             let mut runs = Vec::new();
             let mut terminal_backgrounds = Vec::new();
             let mut overlay_backgrounds = Vec::new();
+            let mut selection_backgrounds = Vec::new();
             let mut cursor_backgrounds = Vec::new();
             let mut cursor_glyphs = Vec::new();
             let mut cursor_marks = Vec::new();
@@ -922,6 +928,9 @@ pub(crate) fn terminal_canvas(
 
             if let Some(snapshot) = paint_snapshot.as_ref() {
                 let visible_columns = snapshot.size.columns().min(column_limit);
+                // 每帧只根据终端 palette 计算一次选区颜色；同一帧所有行和文字 run 共用。
+                let selection_style = terminal_selection_style(&snapshot.palette);
+                let mut selection_spans: Vec<SelectionRowSpan> = Vec::new();
                 #[cfg(feature = "acceptance-metrics")]
                 {
                     echo_candidate = prepaint_echo_binding.as_ref().and_then(|binding| {
@@ -936,6 +945,15 @@ pub(crate) fn terminal_canvas(
                         metrics.cell_origin(bounds.origin, row.viewport_row, 0, cell_width);
                     let row_spans =
                         spans_for_row(row, visible_columns, snapshot.selection, overlays);
+                    for span in &row_spans {
+                        if span.kind == TerminalOverlayKind::Selection {
+                            selection_spans.push(SelectionRowSpan {
+                                viewport_row: row.viewport_row,
+                                start_column: span.start_column,
+                                end_column: span.end_column,
+                            });
+                        }
+                    }
                     collect_overlay_backgrounds(
                         &row_spans,
                         row_origin,
@@ -1025,6 +1043,7 @@ pub(crate) fn terminal_canvas(
                                         &text_style,
                                         run.style,
                                         &snapshot.palette,
+                                        selection_style,
                                     );
                                 }
                                 continue;
@@ -1045,6 +1064,7 @@ pub(crate) fn terminal_canvas(
                                 run.style,
                                 segment.paint,
                                 &snapshot.palette,
+                                selection_style,
                             );
                             if let Some(clip) =
                                 cell_clip(&grid, row.viewport_row, segment.visible_columns.clone())
@@ -1085,6 +1105,16 @@ pub(crate) fn terminal_canvas(
                             window,
                             &mut runs,
                         );
+                    }
+                }
+
+                // 行循环只收集半开区间；这里一次生成连续轮廓，避免逐 cell/逐行重复构建路径。
+                if !selection_spans.is_empty() {
+                    let background = terminal_rgb(selection_style.background);
+                    for path in
+                        selection_paths(&selection_spans, bounds, cell_width, line_height, inset)
+                    {
+                        selection_backgrounds.push((path, background));
                     }
                 }
 
@@ -1292,6 +1322,7 @@ pub(crate) fn terminal_canvas(
                 runs,
                 terminal_backgrounds,
                 overlay_backgrounds,
+                selection_backgrounds,
                 cursor_backgrounds,
                 cursor_glyphs,
                 cursor_marks,
@@ -1319,6 +1350,9 @@ pub(crate) fn terminal_canvas(
                 }
                 for (background, color) in state.overlay_backgrounds {
                     window.paint_quad(fill(background, color));
+                }
+                for (path, color) in state.selection_backgrounds {
+                    window.paint_path(path, color);
                 }
                 for run in state.runs {
                     #[cfg(feature = "acceptance-metrics")]
@@ -2619,7 +2653,7 @@ fn run_selection_autoscroll_frame(
     }
 }
 
-/// 依据同一帧网格补齐搜索、关键词和选择背景；沿用覆盖排序与整段矩形批次，不新增逐 cell 分配。
+/// 依据同一帧网格补齐搜索和关键词背景；选区由连续轮廓单独绘制，不在这里生成矩形。
 ///
 /// @author kongweiguang
 fn collect_overlay_backgrounds(
@@ -2641,11 +2675,14 @@ fn collect_overlay_backgrounds(
     let mut spans = spans.to_vec();
     spans.sort_by_key(|span| (span.kind, style_sort_key(span.style)));
     for span in spans {
-        let background = span.style.and_then(|style| style.background).or_else(|| {
-            span.style
-                .is_none()
-                .then(|| default_overlay_colors(span.kind, palette).1)
-        });
+        // 选区没有通用覆盖色，且逐行矩形会在轮廓下透出接缝，直接从背景批次排除。
+        if span.kind == TerminalOverlayKind::Selection {
+            continue;
+        }
+        let background = match span.style {
+            Some(style) => style.background,
+            None => highlight_colors(span.kind, palette).map(|(_, background)| background),
+        };
         let Some(background) = background else {
             continue;
         };
@@ -2752,6 +2789,9 @@ fn shape_cached_line(
 
 /// 从同一终端样式和覆盖层创建 GPUI glyph run，隐藏属性最后应用以防高亮重新显示文本。
 ///
+/// 选区前景判断使用 effective 前景而非原始语义色，保证 inverse/dim cell 与普通 cell
+/// 在同一选区背景下都按用户实际看到的颜色决定是否启用兜底色。
+///
 /// @author kongweiguang
 fn text_run_for_segment(
     text_style: &TextStyle,
@@ -2759,11 +2799,13 @@ fn text_run_for_segment(
     terminal_style: kerminal_terminal::snapshot::TerminalStyle,
     paint: Option<CellOverlayPaint>,
     palette: &TerminalPalette,
+    selection: TerminalSelectionStyle,
 ) -> TextRun {
     let mut run = text_style.to_run(byte_len);
     apply_terminal_style(&mut run, terminal_style, palette);
     if let Some(paint) = paint {
-        apply_overlay_paint(&mut run, paint, palette);
+        let effective_foreground = effective_terminal_foreground(terminal_style, palette);
+        apply_overlay_paint(&mut run, paint, palette, effective_foreground, selection);
     }
     if terminal_style.attributes.hidden {
         hide_text(&mut run);
@@ -2780,6 +2822,7 @@ fn append_text_segment(
     text_style: &TextStyle,
     terminal_style: kerminal_terminal::snapshot::TerminalStyle,
     palette: &TerminalPalette,
+    selection: TerminalSelectionStyle,
 ) {
     let length = segment.byte_range.len();
     if batch.last_paint == Some(segment.paint) {
@@ -2793,6 +2836,7 @@ fn append_text_segment(
             terminal_style,
             segment.paint,
             palette,
+            selection,
         ));
         batch.last_paint = Some(segment.paint);
     }
@@ -2876,6 +2920,10 @@ fn utf8_safe_range(text: &str, range: Range<usize>) -> (usize, usize) {
 #[cfg(test)]
 #[path = "../tests/unit/terminal_canvas_context_menu.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/terminal_canvas_selection_geometry.rs"]
+mod selection_geometry_tests;
 
 #[cfg(test)]
 #[path = "../tests/unit/terminal_canvas_split_candidate_geometry.rs"]

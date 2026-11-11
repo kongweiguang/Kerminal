@@ -121,6 +121,150 @@ pub(crate) fn terminal_background_color(palette: TerminalPalette) -> Hsla {
         .into()
 }
 
+/// 选区底色与前景兜底只在 UI 内派生，终端引擎、持久化与 MCP 都不需要理解选择外观。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TerminalSelectionStyle {
+    /// 选区使用不透明实色；透明叠色会和任意 ANSI cell 背景组合出不可预测的最终对比度。
+    pub(crate) background: TerminalRgb,
+    /// 原始 ANSI 前景在选区底上不足 3:1 时改用的可读前景。
+    pub(crate) foreground_fallback: TerminalRgb,
+}
+
+impl TerminalSelectionStyle {
+    /// 文本优先：只有前景与选区底对比不足 3:1 才换兜底色，避免正常彩色文本被统一成白或黑。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn foreground_for(&self, effective: TerminalRgb) -> TerminalRgb {
+        if contrast_ratio(effective, self.background) >= 3.0 {
+            effective
+        } else {
+            self.foreground_fallback
+        }
+    }
+}
+
+/// 从终端 palette 派生选区外观：底色看终端自身明暗，不跟随 UI ThemeMode。
+///
+/// 用户可以让界面保持深色却选择浅色终端方案；只用 UI 主题判断深浅会把选区画到相反的
+/// 明暗方向。选区底色采用不透明实色，一次填充连续轮廓，避免与图片背景和 ANSI 底色
+/// 做透明度合成后难以保证文字可读性。
+///
+/// @author kongweiguang
+pub(crate) fn terminal_selection_style(palette: &TerminalPalette) -> TerminalSelectionStyle {
+    let background = palette.background;
+    let dark = relative_luminance(background) < 0.5;
+    // 退化色盘的前景几乎与底色同色时，cursor 仍能提供比噪声更可靠的参考方向；
+    // 它只作为混合参考，不让选区直接等于光标色。
+    let reference = if contrast_ratio(palette.foreground, background) >= 1.3 {
+        palette.foreground
+    } else {
+        palette.cursor
+    };
+    // 深色底混入更多参考色保证可见，浅色底比例更低以免选区像刺眼的实心色块。
+    let initial = if dark { 0.16 } else { 0.12 };
+    let ratio = bounded_selection_ratio(background, reference, initial);
+    let selection_background = mix_srgb(background, reference, ratio);
+    let foreground_fallback = selection_foreground_fallback(palette, selection_background);
+    TerminalSelectionStyle {
+        background: selection_background,
+        foreground_fallback,
+    }
+}
+
+/// 把初始混入比例调进可辨认但不抢眼的对比度区间，循环上限固定为 8 次。
+///
+/// 对比度随混入比例单调上升，因此取区间中部 1.5 作为二分目标：命中时必然越过 1.25 下限，
+/// 且离 2.0 上限仍有明显余量。参考色本身达不到下限时只能返回最大混合，避免死循环或
+/// 伪造一个不存在的颜色。
+///
+/// @author kongweiguang
+fn bounded_selection_ratio(background: TerminalRgb, reference: TerminalRgb, initial: f32) -> f32 {
+    let contrast_at = |ratio| contrast_ratio(mix_srgb(background, reference, ratio), background);
+    if (1.25..=2.0).contains(&contrast_at(initial)) {
+        return initial;
+    }
+    let mut low = 0.0_f32;
+    let mut high = 1.0_f32;
+    for _ in 0..8 {
+        let middle = (low + high) * 0.5;
+        if contrast_at(middle) >= 1.5 {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    high
+}
+
+/// 从 palette 前景向远离选区底的方向退到白或黑，保证兜底文字仍有 4.5:1 可读性。
+///
+/// 固定步长最多推进 8 次；浅色选区底向黑、深色选区底向白，避免兜底文字和选区底同向
+/// 混合后又回到低对比度。palette 前景已经达标时直接沿用，保持原有配色习惯。
+///
+/// @author kongweiguang
+fn selection_foreground_fallback(
+    palette: &TerminalPalette,
+    selection_background: TerminalRgb,
+) -> TerminalRgb {
+    let mut foreground = palette.foreground;
+    if contrast_ratio(foreground, selection_background) >= 4.5 {
+        return foreground;
+    }
+    let target = if relative_luminance(selection_background) < 0.5 {
+        TerminalRgb::new(0xff, 0xff, 0xff)
+    } else {
+        TerminalRgb::new(0x00, 0x00, 0x00)
+    };
+    for _ in 0..8 {
+        foreground = mix_srgb(foreground, target, 0.2);
+        if contrast_ratio(foreground, selection_background) >= 4.5 {
+            break;
+        }
+    }
+    foreground
+}
+
+/// 按 WCAG 相对亮度把选区明暗判断绑定到真实感知亮度，而不是简单比较通道均值。
+///
+/// @author kongweiguang
+pub(crate) fn relative_luminance(color: TerminalRgb) -> f32 {
+    let linear = |channel: u8| {
+        let value = f32::from(channel) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(color.red) + 0.7152 * linear(color.green) + 0.0722 * linear(color.blue)
+}
+
+/// 用 WCAG 对比度衡量选区与底色、文字与选区底的关系，测试与生产共用同一公式。
+///
+/// @author kongweiguang
+pub(crate) fn contrast_ratio(left: TerminalRgb, right: TerminalRgb) -> f32 {
+    let left = relative_luminance(left);
+    let right = relative_luminance(right);
+    (left.max(right) + 0.05) / (left.min(right) + 0.05)
+}
+
+/// 在 sRGB 通道上做线性混合并四舍五入回 8 位色，保持与终端 palette 的离散色值一致。
+///
+/// @author kongweiguang
+fn mix_srgb(from: TerminalRgb, to: TerminalRgb, ratio: f32) -> TerminalRgb {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let channel = |from: u8, to: u8| {
+        (f32::from(from) * (1.0 - ratio) + f32::from(to) * ratio)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    TerminalRgb::new(
+        channel(from.red, to.red),
+        channel(from.green, to.green),
+        channel(from.blue, to.blue),
+    )
+}
+
 /// 把已校验的 RGB 字面量转换为纯终端模型颜色，不引入 UI 色彩表示。
 ///
 /// @author kongweiguang

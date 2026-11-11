@@ -12,6 +12,7 @@ use kerminal_terminal::snapshot::{
 };
 
 use super::overlay::{CellOverlayPaint, TerminalOverlayKind};
+use crate::theme::TerminalSelectionStyle;
 
 /// 将终端样式映射到文字属性，网格背景由独立 cell quad 绘制以填满空白列。
 ///
@@ -21,16 +22,7 @@ pub(super) fn apply_terminal_style(
     style: TerminalStyle,
     palette: &TerminalPalette,
 ) {
-    let (foreground, _) = if style.attributes.inverse {
-        (style.background, style.foreground)
-    } else {
-        (style.foreground, style.background)
-    };
-    run.color = terminal_rgb(resolve_foreground(
-        foreground,
-        style.attributes.dim,
-        palette,
-    ));
+    run.color = terminal_rgb(effective_terminal_foreground(style, palette));
     run.background_color = None;
     if style.attributes.bold {
         run.font.weight = FontWeight::BOLD;
@@ -76,6 +68,24 @@ pub(super) fn apply_terminal_style(
     }
 }
 
+/// 提取 cell 在 inverse 与 dim 之后的实际前景，供普通文字和选区兜底共用同一判断。
+///
+/// 选区需要知道用户真正看到的前景色，而不是 style.foreground 的原始语义；这样
+/// inverse cell 在选区中仍保持反色语义，dim 文本也不会被误判为高对比。
+///
+/// @author kongweiguang
+pub(super) fn effective_terminal_foreground(
+    style: TerminalStyle,
+    palette: &TerminalPalette,
+) -> TerminalRgb {
+    let foreground = if style.attributes.inverse {
+        style.background
+    } else {
+        style.foreground
+    };
+    resolve_foreground(foreground, style.attributes.dim, palette)
+}
+
 /// 根据 cell 的颜色语义处理 dim；已 dim 的 ANSI 颜色不会被重复压暗。
 ///
 /// @author kongweiguang
@@ -106,13 +116,18 @@ pub(super) fn hide_text(run: &mut TextRun) {
     run.strikethrough = None;
 }
 
-/// 应用搜索、选择或主题化关键词样式；仅覆盖调用方显式配置的颜色分量。
+/// 应用搜索、关键词或选择样式；显式主题色优先，否则只读取对应覆盖类型的默认色。
+///
+/// 选区背景已由连续轮廓统一绘制，这里只决定文字颜色且不重复写入 background，
+/// 避免每个 glyph 再画一块与轮廓错位的矩形。
 ///
 /// @author kongweiguang
 pub(super) fn apply_overlay_paint(
     run: &mut TextRun,
     paint: CellOverlayPaint,
     palette: &TerminalPalette,
+    effective_foreground: TerminalRgb,
+    selection: TerminalSelectionStyle,
 ) {
     if let Some(style) = paint.style {
         if let Some(foreground) = style.foreground {
@@ -124,31 +139,35 @@ pub(super) fn apply_overlay_paint(
         return;
     }
 
-    let (foreground, background) = default_overlay_colors(paint.kind, palette);
-    run.color = terminal_rgb(foreground);
-    run.background_color = Some(terminal_rgb(background));
+    if paint.kind == TerminalOverlayKind::Selection {
+        run.color = terminal_rgb(selection.foreground_for(effective_foreground));
+        run.background_color = None;
+        return;
+    }
+
+    if let Some((foreground, background)) = highlight_colors(paint.kind, palette) {
+        run.color = terminal_rgb(foreground);
+        run.background_color = Some(terminal_rgb(background));
+    }
 }
 
-/// 选择/搜索默认色复用终端 palette，主题关键词颜色由 overlay 显式提供。
+/// 搜索与关键词仍复用终端 palette；选区由连续几何单独绘制，因此不提供通用覆盖色。
 ///
 /// @author kongweiguang
-pub(super) fn default_overlay_colors(
+pub(super) fn highlight_colors(
     kind: TerminalOverlayKind,
     palette: &TerminalPalette,
-) -> (TerminalRgb, TerminalRgb) {
+) -> Option<(TerminalRgb, TerminalRgb)> {
     match kind {
-        TerminalOverlayKind::Keyword | TerminalOverlayKind::Search => (
+        TerminalOverlayKind::Keyword | TerminalOverlayKind::Search => Some((
             palette.resolve(TerminalColor::DefaultForeground),
             palette.resolve(TerminalColor::Ansi(3)),
-        ),
-        TerminalOverlayKind::ActiveSearch => (
+        )),
+        TerminalOverlayKind::ActiveSearch => Some((
             palette.resolve(TerminalColor::DefaultBackground),
             palette.resolve(TerminalColor::Ansi(3)),
-        ),
-        TerminalOverlayKind::Selection => (
-            palette.resolve(TerminalColor::DefaultBackground),
-            palette.resolve(TerminalColor::Cursor),
-        ),
+        )),
+        TerminalOverlayKind::Selection => None,
     }
 }
 

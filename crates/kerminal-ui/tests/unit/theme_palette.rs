@@ -4,7 +4,9 @@
 
 use gpui_kit::{Hsla, Rgba, WindowAppearance};
 use kerminal_application::preferences::{AppColorScheme, TerminalColorScheme, ThemeMode};
+use kerminal_terminal::snapshot::TerminalRgb;
 
+use super::terminal::{contrast_ratio, relative_luminance, terminal_selection_style};
 use super::{ThemeTokens, terminal_palette_for_mode};
 
 /// 用线性 RGB 测量真实对比度，透明色先按指定表面合成。
@@ -267,6 +269,85 @@ fn auxiliary_surfaces_remain_distinct_after_material_compositing() {
                     "{scheme:?} {mode:?}: auxiliary surface merges into workspace ({difference})"
                 );
             }
+        }
+    }
+}
+
+/// 选区底色跟随终端 palette 自身明暗，和 UI ThemeMode、光标色解耦，并守住文字可读性。
+///
+/// @author kongweiguang
+#[test]
+fn terminal_selection_style_adapts_to_terminal_palette_without_cursor_or_ui_mode() {
+    for scheme in [
+        TerminalColorScheme::Kerminal,
+        TerminalColorScheme::TokyoNight,
+        TerminalColorScheme::Solarized,
+        TerminalColorScheme::Github,
+    ] {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let palette = terminal_palette_for_mode(WindowAppearance::Dark, mode, scheme);
+            let style = terminal_selection_style(&palette);
+
+            let selection_contrast = contrast_ratio(style.background, palette.background);
+            assert!(
+                (1.25..=2.0).contains(&selection_contrast),
+                "{scheme:?} {mode:?}: selection contrast {selection_contrast}"
+            );
+
+            let background_luminance = relative_luminance(palette.background);
+            let selection_luminance = relative_luminance(style.background);
+            if mode == ThemeMode::Dark {
+                assert!(
+                    selection_luminance > background_luminance,
+                    "{scheme:?}: dark selection should be lighter than terminal background"
+                );
+            } else {
+                assert!(
+                    selection_luminance < background_luminance,
+                    "{scheme:?}: light selection should be darker than terminal background"
+                );
+            }
+
+            // 原始前景足够清晰时保留 ANSI 色；需要兜底时则必须达到 4.5:1 正文对比。
+            let resolved = style.foreground_for(palette.foreground);
+            if resolved == palette.foreground {
+                assert!(
+                    contrast_ratio(resolved, style.background) >= 3.0,
+                    "{scheme:?} {mode:?}: kept foreground lost contrast"
+                );
+            } else {
+                assert!(
+                    contrast_ratio(resolved, style.background) >= 4.5,
+                    "{scheme:?} {mode:?}: fallback foreground lost contrast"
+                );
+            }
+
+            // 与选区底几乎同色的 ANSI 前景必须切换到兜底色，而不是继续隐身。
+            let near_background = TerminalRgb::new(
+                style.background.red.saturating_add(2),
+                style.background.green.saturating_add(2),
+                style.background.blue.saturating_add(2),
+            );
+            assert!(contrast_ratio(near_background, style.background) < 3.0);
+            let fallback = style.foreground_for(near_background);
+            assert_eq!(fallback, style.foreground_fallback);
+            assert!(
+                contrast_ratio(fallback, style.background) >= 4.5,
+                "{scheme:?} {mode:?}: fallback is still unreadable"
+            );
+
+            // 光标色只是退化色盘的参考方向，不能直接决定选区底色。
+            let mut cursor_changed = palette;
+            cursor_changed.cursor = if background_luminance < 0.5 {
+                TerminalRgb::new(0xff, 0xff, 0xff)
+            } else {
+                TerminalRgb::new(0x00, 0x00, 0x00)
+            };
+            assert_eq!(
+                terminal_selection_style(&cursor_changed).background,
+                style.background,
+                "{scheme:?} {mode:?}: selection background must not depend on cursor"
+            );
         }
     }
 }
