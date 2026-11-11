@@ -4,7 +4,7 @@
 
 use gpui_kit::{Hsla, Rgba, WindowAppearance};
 use kerminal_application::preferences::{AppColorScheme, TerminalColorScheme, ThemeMode};
-use kerminal_terminal::snapshot::TerminalRgb;
+use kerminal_terminal::snapshot::{TerminalPalette, TerminalRgb};
 
 use super::terminal::{contrast_ratio, relative_luminance, terminal_selection_style};
 use super::{ThemeTokens, terminal_palette_for_mode};
@@ -290,7 +290,7 @@ fn terminal_selection_style_adapts_to_terminal_palette_without_cursor_or_ui_mode
 
             let selection_contrast = contrast_ratio(style.background, palette.background);
             assert!(
-                (1.25..=2.0).contains(&selection_contrast),
+                (1.35..=2.0).contains(&selection_contrast),
                 "{scheme:?} {mode:?}: selection contrast {selection_contrast}"
             );
 
@@ -322,6 +322,19 @@ fn terminal_selection_style_adapts_to_terminal_palette_without_cursor_or_ui_mode
                 );
             }
 
+            // 高对比 ANSI/默认前景必须原样保留，防止 foreground_for 退化成“永远兜底”。
+            let mut kept_high_contrast = 0;
+            for color in std::iter::once(palette.foreground).chain(palette.ansi) {
+                if contrast_ratio(color, style.background) >= 3.0 {
+                    assert_eq!(style.foreground_for(color), color);
+                    kept_high_contrast += 1;
+                }
+            }
+            assert!(
+                kept_high_contrast > 0,
+                "{scheme:?} {mode:?}: no high-contrast color remained unchanged"
+            );
+
             // 与选区底几乎同色的 ANSI 前景必须切换到兜底色，而不是继续隐身。
             let near_background = TerminalRgb::new(
                 style.background.red.saturating_add(2),
@@ -336,7 +349,7 @@ fn terminal_selection_style_adapts_to_terminal_palette_without_cursor_or_ui_mode
                 "{scheme:?} {mode:?}: fallback is still unreadable"
             );
 
-            // 光标色只是退化色盘的参考方向，不能直接决定选区底色。
+            // 光标色完全不参与选区底色，退化前景也只向黑白端点回退。
             let mut cursor_changed = palette;
             cursor_changed.cursor = if background_luminance < 0.5 {
                 TerminalRgb::new(0xff, 0xff, 0xff)
@@ -350,4 +363,101 @@ fn terminal_selection_style_adapts_to_terminal_palette_without_cursor_or_ui_mode
             );
         }
     }
+}
+
+/// 构造只覆盖默认前景/背景/光标的 palette，模拟 OSC 10/11/12 覆盖后的实际色盘。
+///
+/// @author kongweiguang
+fn palette_with(
+    foreground: TerminalRgb,
+    background: TerminalRgb,
+    cursor: TerminalRgb,
+) -> TerminalPalette {
+    TerminalPalette::from_ansi(
+        foreground,
+        background,
+        cursor,
+        TerminalPalette::default().ansi,
+    )
+}
+
+/// 生成中性灰样本，便于精确复现中灰背景和近同色前景。
+///
+/// @author kongweiguang
+fn gray(value: u8) -> TerminalRgb {
+    TerminalRgb::new(value, value, value)
+}
+
+/// OSC 11 把背景覆盖成中灰后，选区仍须可见，低对比默认前景仍须有正文级兜底。
+///
+/// @author kongweiguang
+#[test]
+fn selection_style_handles_osc_overridden_mid_gray_background() {
+    let palette = palette_with(gray(0xe4), gray(0x80), gray(0x80));
+    let style = terminal_selection_style(&palette);
+
+    let selection_contrast = contrast_ratio(style.background, palette.background);
+    assert!(
+        (1.35..=2.0).contains(&selection_contrast),
+        "mid-gray selection contrast {selection_contrast}"
+    );
+
+    let resolved = style.foreground_for(palette.foreground);
+    assert_eq!(resolved, style.foreground_fallback);
+    assert!(
+        contrast_ratio(resolved, style.background) >= 4.5,
+        "mid-gray fallback contrast {}",
+        contrast_ratio(resolved, style.background)
+    );
+    assert!(
+        contrast_ratio(resolved, style.background)
+            >= contrast_ratio(palette.foreground, palette.background),
+        "fallback must not be less readable than the unselected default foreground"
+    );
+}
+
+/// 前景与背景几乎同色时，选区参考色不能依赖 cursor；两种光标必须得到相同底色。
+///
+/// @author kongweiguang
+#[test]
+fn selection_style_decouples_from_cursor_for_degenerate_palette() {
+    let background = gray(0x66);
+    let foreground = gray(0x6e);
+    let white = terminal_selection_style(&palette_with(foreground, background, gray(0xff)));
+    let black = terminal_selection_style(&palette_with(foreground, background, gray(0x00)));
+
+    assert_eq!(white.background, black.background);
+    let selection_contrast = contrast_ratio(white.background, background);
+    assert!(
+        (1.35..=2.0).contains(&selection_contrast),
+        "degenerate selection contrast {selection_contrast}"
+    );
+    assert!(contrast_ratio(white.foreground_fallback, white.background) >= 4.5);
+}
+
+/// 前景/背景对比约 1.32 时前景参考达不到 1.45 目标，必须改用黑白端点并保持光标无关。
+///
+/// @author kongweiguang
+#[test]
+fn selection_style_recovers_when_foreground_reference_cannot_reach_target() {
+    let background = gray(0x80);
+    let foreground = gray(0x95);
+    let foreground_contrast = contrast_ratio(foreground, background);
+    assert!(
+        (1.30..1.35).contains(&foreground_contrast),
+        "fixture should sit below the 1.45 reference target: {foreground_contrast}"
+    );
+
+    let white_cursor = terminal_selection_style(&palette_with(foreground, background, gray(0xff)));
+    let black_cursor = terminal_selection_style(&palette_with(foreground, background, gray(0x00)));
+    assert_eq!(white_cursor.background, black_cursor.background);
+
+    let selection_contrast = contrast_ratio(white_cursor.background, background);
+    assert!(
+        (1.35..=2.0).contains(&selection_contrast),
+        "near-reference selection contrast {selection_contrast}"
+    );
+    let resolved = white_cursor.foreground_for(foreground);
+    assert_eq!(resolved, white_cursor.foreground_fallback);
+    assert!(contrast_ratio(resolved, white_cursor.background) >= 4.5);
 }

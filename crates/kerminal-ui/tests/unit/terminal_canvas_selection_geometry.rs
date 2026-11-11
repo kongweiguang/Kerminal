@@ -222,3 +222,113 @@ fn reversed_rows_sort_stably_and_duplicate_rows_keep_last_sorted_span() {
     assert_eq!(regions[0][0].start_column, 5);
     assert_eq!(regions[0][0].end_column, 7);
 }
+
+/// 用填充三角化后的真实顶点判断点是否被选区覆盖，而不是只看包围盒。
+///
+/// @author kongweiguang
+fn point_in_any_path(paths: &[Path<Pixels>], x: f32, y: f32) -> bool {
+    let point = (x, y);
+    paths.iter().any(|path| {
+        path.vertices.as_chunks::<3>().0.iter().any(|triangle| {
+            let a = triangle[0].xy_position;
+            let b = triangle[1].xy_position;
+            let c = triangle[2].xy_position;
+            point_in_triangle(
+                point,
+                (a.x.as_f32(), a.y.as_f32()),
+                (b.x.as_f32(), b.y.as_f32()),
+                (c.x.as_f32(), c.y.as_f32()),
+            )
+        })
+    })
+}
+
+/// 重心符号法判断点是否在三角形内；容差只吸收 lyon 三角化后的浮点误差。
+///
+/// @author kongweiguang
+fn point_in_triangle(point: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
+    let edge = |start: (f32, f32), end: (f32, f32)| {
+        (point.0 - start.0) * (end.1 - start.1) - (point.1 - start.1) * (end.0 - start.0)
+    };
+    let ab = edge(a, b);
+    let bc = edge(b, c);
+    let ca = edge(c, a);
+    const TOLERANCE: f32 = 0.01;
+    (ab >= -TOLERANCE && bc >= -TOLERANCE && ca >= -TOLERANCE)
+        || (ab <= TOLERANCE && bc <= TOLERANCE && ca <= TOLERANCE)
+}
+
+/// 顶行窄、下行宽：顶行未选列不在填充内，重叠列与仅下行命中的列都在填充内。
+///
+/// @author kongweiguang
+#[test]
+fn filled_path_excludes_unselected_cells_when_rows_widen_downward() {
+    let paths = selection_paths(
+        &[row_span(0, 0, 4), row_span(1, 0, 10)],
+        canvas(0.0, 0.0, 200.0, 100.0),
+        px(10.0),
+        px(20.0),
+        px(0.0),
+    );
+    assert_eq!(paths.len(), 1);
+    assert!(!point_in_any_path(&paths, 75.0, 10.0));
+    assert!(point_in_any_path(&paths, 25.0, 30.0));
+    assert!(point_in_any_path(&paths, 75.0, 30.0));
+}
+
+/// 顶行宽、下行窄：仅顶行命中的列保留，下行缩回后的未选列不得残留填充。
+///
+/// @author kongweiguang
+#[test]
+fn filled_path_excludes_unselected_cells_when_rows_narrow_downward() {
+    let paths = selection_paths(
+        &[row_span(0, 0, 10), row_span(1, 0, 4)],
+        canvas(0.0, 0.0, 200.0, 100.0),
+        px(10.0),
+        px(20.0),
+        px(0.0),
+    );
+    assert_eq!(paths.len(), 1);
+    assert!(point_in_any_path(&paths, 75.0, 10.0));
+    assert!(!point_in_any_path(&paths, 75.0, 30.0));
+}
+
+/// 相邻行只有窄重叠时仍合并为一个区域，非重叠两侧各自留在路径外。
+///
+/// @author kongweiguang
+#[test]
+fn filled_path_keeps_only_the_narrow_overlap_connected() {
+    let paths = selection_paths(
+        &[row_span(0, 0, 6), row_span(1, 5, 10)],
+        canvas(0.0, 0.0, 200.0, 100.0),
+        px(10.0),
+        px(20.0),
+        px(0.0),
+    );
+    assert_eq!(paths.len(), 1);
+    assert!(point_in_any_path(&paths, 55.0, 10.0));
+    assert!(point_in_any_path(&paths, 55.0, 30.0));
+    assert!(!point_in_any_path(&paths, 85.0, 10.0));
+    assert!(!point_in_any_path(&paths, 25.0, 30.0));
+}
+
+/// 两个独立区域之间的空隙不属于任何路径，不能因包围盒重叠被误判为选中。
+///
+/// @author kongweiguang
+#[test]
+fn filled_paths_leave_the_gap_between_regions_unpainted() {
+    let paths = selection_paths(
+        &[row_span(0, 0, 2), row_span(2, 4, 6)],
+        canvas(0.0, 0.0, 100.0, 100.0),
+        px(10.0),
+        px(20.0),
+        px(0.0),
+    );
+    assert_eq!(paths.len(), 2);
+    assert!(point_in_any_path(&paths, 15.0, 10.0));
+    assert!(point_in_any_path(&paths, 55.0, 50.0));
+    assert!(!point_in_any_path(&paths, 35.0, 30.0));
+    assert!(!point_in_any_path(&paths, 55.0, 30.0));
+    assert!(!point_in_any_path(&paths, 35.0, 10.0));
+    assert!(!point_in_any_path(&paths, 35.0, 50.0));
+}
