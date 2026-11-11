@@ -112,6 +112,8 @@ struct SceneFacts {
     inset: f32,
     path_count: usize,
     left_boundary_corners_sharp: bool,
+    scale_factor: f32,
+    window_active: bool,
 }
 
 /// 与生产 `TerminalMetrics::cell_origin` 同源的样张网格，仅用于探针坐标换算。
@@ -272,6 +274,8 @@ fn build_scene(
         inset: inset.as_f32(),
         path_count: paths.len(),
         left_boundary_corners_sharp,
+        scale_factor: window.scale_factor(),
+        window_active: window.is_window_active(),
     };
 
     SelectionScene {
@@ -519,6 +523,8 @@ struct ImageReport {
     render_size: [u32; 2],
     image_size: [u32; 2],
     scale: [f32; 2],
+    window_active: bool,
+    physical_scale: f32,
     palette_background: [u8; 4],
     selection_background: [u8; 4],
     foreground_fallback: [u8; 4],
@@ -586,6 +592,7 @@ fn terminal_selection_native_acceptance() {
                     point(px(0.0), px(0.0)),
                     size(px(900.0), px(520.0)),
                 ))),
+                window_min_size: Some(size(px(900.0), px(520.0))),
                 show: false,
                 focus: false,
                 ..TitleBar::window_options()
@@ -668,18 +675,18 @@ async fn run_native_selection(
     output: PathBuf,
     reports: Arc<Mutex<Vec<ImageReport>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    window.update(cx, |_, window, _| {
+    window.update(cx, |_, window, app| {
         window.resize(size(px(900.0), px(520.0)));
-        // 标记脏帧让平台在下一次 frame 回调中处理 WM_SIZE 并重建渲染目标。
+        // 先绘制并模拟两帧，让平台处理 WM_SIZE 后再读取渲染目标。
+        draw_simulated_frames(window, app);
         window.refresh();
     })?;
     cx.background_executor()
-        .timer(Duration::from_millis(300))
+        .timer(Duration::from_millis(200))
         .await;
-    // 再绘制一帧，确保截图读取的是已经重建尺寸的渲染目标。
-    window.update(cx, |_, window, app| draw_frame(window, app))?;
+    window.update(cx, |_, window, app| draw_simulated_frames(window, app))?;
     cx.background_executor()
-        .timer(Duration::from_millis(120))
+        .timer(Duration::from_millis(80))
         .await;
 
     let schemes = [
@@ -697,7 +704,7 @@ async fn run_native_selection(
                     harness.selection = terminal_selection_style(&palette);
                     cx.notify();
                 });
-                draw_frame(window, app);
+                draw_simulated_frames(window, app);
             })?;
             // 平台在下一帧消费 resize 请求；等待后再次绘制，截图才对应目标尺寸。
             cx.background_executor()
@@ -706,7 +713,7 @@ async fn run_native_selection(
             let report = window.update(cx, |_, window, app| {
                 let palette = terminal_palette_for_mode(window.appearance(), mode, scheme);
                 let selection = terminal_selection_style(&palette);
-                draw_frame(window, app);
+                draw_simulated_frames(window, app);
                 let image = window.render_to_image().map_err(io::Error::other)?;
                 let facts = *harness
                     .read(app)
@@ -763,11 +770,13 @@ fn render_report(
     let image_aspect = image.width() as f32 / image.height() as f32;
     if image.width() < 2 || image.height() < 2 || (image_aspect - logical_aspect).abs() > 0.01 {
         return Err(format!(
-            "native renderer returned {}x{} for a {}x{} logical canvas; hidden window did not receive a paint/resize",
+            "native renderer returned {}x{} for a {}x{} logical canvas (scale {:.3}, window_active={}); hidden window did not receive a paint/resize",
             image.width(),
             image.height(),
             facts.width,
-            facts.height
+            facts.height,
+            facts.scale_factor,
+            facts.window_active
         ));
     }
 
@@ -858,6 +867,8 @@ fn render_report(
         render_size: [image.width(), image.height()],
         image_size: [OUTPUT_WIDTH, OUTPUT_HEIGHT],
         scale: [scale_x, scale_y],
+        window_active: facts.window_active,
+        physical_scale: facts.scale_factor,
         palette_background: background_rgba,
         selection_background: selection_rgba,
         foreground_fallback: rgb_bytes(selection.foreground_fallback),
@@ -922,7 +933,17 @@ fn save_normalized(image: &RgbaImage, path: &FilePath) -> Result<(), String> {
         .map_err(|error| format!("save {}: {error}", path.display()))
 }
 
-/// 空场景也必须能绘制并保存；返回时保留实际值供失败报告使用。
+/// 同步绘制一帧并模拟两次下一帧回调，给平台机会消费尺寸事件和重建渲染目标。
+///
+/// @author kongweiguang
+fn draw_simulated_frames(window: &mut Window, app: &mut App) {
+    draw_frame(window, app);
+    window.simulate_next_frame(app);
+    draw_frame(window, app);
+    window.simulate_next_frame(app);
+}
+
+/// 同一帧的布局脏标记只服务测试；清理后返回，避免 arena 在后续断言期间累积。
 ///
 /// @author kongweiguang
 fn draw_frame(window: &mut Window, app: &mut App) {
@@ -1041,4 +1062,62 @@ fn wcag_contrast(left: TerminalRgb, right: TerminalRgb) -> f32 {
     let left = luminance(left);
     let right = luminance(right);
     (left.max(right) + 0.05) / (left.min(right) + 0.05)
+}
+
+/// Selection overlay 只改写文字色并清空 run 背景；背景已由连续轮廓统一填充。
+///
+/// @author kongweiguang
+#[test]
+fn selection_overlay_paint_clears_background_and_uses_contrast_fallback() {
+    let palette = terminal_palette_for_mode(
+        WindowAppearance::Dark,
+        ThemeMode::Dark,
+        TerminalColorScheme::Kerminal,
+    );
+    let selection = terminal_selection_style(&palette);
+    let low_contrast = TerminalRgb::new(
+        selection.background.red.saturating_add(2),
+        selection.background.green.saturating_add(2),
+        selection.background.blue.saturating_add(2),
+    );
+    let terminal_style = TerminalStyle {
+        foreground: TerminalColor::Rgb {
+            red: low_contrast.red,
+            green: low_contrast.green,
+            blue: low_contrast.blue,
+        },
+        background: TerminalColor::DefaultBackground,
+        underline_color: None,
+        attributes: TerminalAttributes::default(),
+    };
+    let effective = effective_terminal_foreground(terminal_style, &palette);
+
+    let mut run = TextStyle::default().to_run(1);
+    run.background_color = Some(gpui_kit::rgb(0x00ff00).into());
+    apply_overlay_paint(
+        &mut run,
+        CellOverlayPaint {
+            kind: TerminalOverlayKind::Selection,
+            style: None,
+        },
+        &palette,
+        effective,
+        selection,
+    );
+    assert!(run.background_color.is_none());
+    assert_eq!(run.color, terminal_rgb(selection.foreground_fallback));
+
+    // 搜索等其它覆盖层仍需要逐 run 背景，不能被 Selection 的清空逻辑误伤。
+    let mut search = TextStyle::default().to_run(1);
+    apply_overlay_paint(
+        &mut search,
+        CellOverlayPaint {
+            kind: TerminalOverlayKind::Search,
+            style: None,
+        },
+        &palette,
+        effective,
+        selection,
+    );
+    assert!(search.background_color.is_some());
 }
