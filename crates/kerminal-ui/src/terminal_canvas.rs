@@ -2926,6 +2926,10 @@ mod tests;
 mod selection_geometry_tests;
 
 #[cfg(test)]
+#[path = "../tests/unit/terminal_canvas_selection_paint.rs"]
+mod selection_paint_tests;
+
+#[cfg(test)]
 #[path = "../tests/unit/terminal_selection_native.rs"]
 mod terminal_selection_native_tests;
 

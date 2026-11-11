@@ -135,8 +135,6 @@ const SELECTION_MIN_CONTRAST: f32 = 1.35;
 const SELECTION_MAX_CONTRAST: f32 = 2.0;
 /// 二分目标取窗口内侧，给 sRGB 取整和色盘差异留出上下余量。
 const SELECTION_TARGET_CONTRAST: f32 = 1.45;
-/// 前景参考色达不到该对比时无法稳定命中目标，改用黑白端点重新计算。
-const SELECTION_REFERENCE_MIN_CONTRAST: f32 = 1.45;
 /// 文本优先：原始前景达到 3:1 就保留 ANSI 色。
 const SELECTION_FOREGROUND_MIN_CONTRAST: f32 = 3.0;
 /// 兜底前景需要达到正文级 4.5:1，避免选区内的低对比色文字消失。
@@ -161,8 +159,8 @@ impl TerminalSelectionStyle {
 ///
 /// 用户可以让界面保持深色却选择浅色终端方案；只用 UI 主题判断深浅会把选区画到相反的
 /// 明暗方向。选区底色采用不透明实色，一次填充连续轮廓，避免与图片背景和 ANSI 底色
-/// 做透明度合成后难以保证文字可读性。参考色优先取 palette 前景；前景与底色的对比
-/// 不足 1.45 时无法命中目标，改用按底色亮度选出的白/黑端点，避免与 cursor 色彩绑定。
+/// 做透明度合成后难以保证文字可读性。先以前景计算，保留可达的前景色调；只有候选结果
+/// 仍低于 1.35 时才改用按底色亮度选出的白/黑端点，避免与 cursor 色彩绑定。
 ///
 /// @author kongweiguang
 pub(crate) fn terminal_selection_style(palette: &TerminalPalette) -> TerminalSelectionStyle {
@@ -170,39 +168,20 @@ pub(crate) fn terminal_selection_style(palette: &TerminalPalette) -> TerminalSel
     let dark = relative_luminance(background) < 0.5;
     // 深色底混入更多参考色保证可见，浅色底比例更低以免选区像刺眼的实心色块。
     let initial = if dark { 0.16 } else { 0.12 };
-    let foreground_contrast = contrast_ratio(palette.foreground, background);
     let mut selection_background = mix_srgb(
         background,
         palette.foreground,
         bounded_selection_ratio(background, palette.foreground, initial),
     );
 
-    // OSC 10 可把前景调到与底色仅 1.32–1.44 的对比，这时再混前景也到不了 1.45；
-    // 改用底色远端的白/黑端点，保证选区本身始终可见。
-    if foreground_contrast < SELECTION_REFERENCE_MIN_CONTRAST
-        || contrast_ratio(selection_background, background) < SELECTION_MIN_CONTRAST
-    {
+    // 前景本身可达 1.35–1.45 时仍保留其色相；只有候选低于下限才换用端点。
+    if contrast_ratio(selection_background, background) < SELECTION_MIN_CONTRAST {
         let reference = selection_endpoint(background);
         selection_background = mix_srgb(
             background,
             reference,
             bounded_selection_ratio(background, reference, initial),
         );
-    }
-
-    // 极端输入的兜底：若首选端点仍不足下限，比较另一端点，取实际对比更高者。
-    if contrast_ratio(selection_background, background) < SELECTION_MIN_CONTRAST {
-        let alternative = opposite_endpoint(selection_endpoint(background));
-        let alternative_background = mix_srgb(
-            background,
-            alternative,
-            bounded_selection_ratio(background, alternative, initial),
-        );
-        if contrast_ratio(alternative_background, background)
-            > contrast_ratio(selection_background, background)
-        {
-            selection_background = alternative_background;
-        }
     }
 
     let foreground_fallback = selection_foreground_fallback(palette, selection_background);
@@ -212,7 +191,7 @@ pub(crate) fn terminal_selection_style(palette: &TerminalPalette) -> TerminalSel
     }
 }
 
-/// 按底色亮度选择远端黑白端点；只用于退化前景，不读取 cursor。
+/// 按底色亮度选择远端黑白端点；只用于前景候选不可达的情况，不读取 cursor。
 ///
 /// @author kongweiguang
 fn selection_endpoint(background: TerminalRgb) -> TerminalRgb {
@@ -221,13 +200,6 @@ fn selection_endpoint(background: TerminalRgb) -> TerminalRgb {
     } else {
         BLACK
     }
-}
-
-/// 返回黑白中的另一端；仅在首选端点仍异常时尝试。
-///
-/// @author kongweiguang
-fn opposite_endpoint(endpoint: TerminalRgb) -> TerminalRgb {
-    if endpoint == WHITE { BLACK } else { WHITE }
 }
 
 /// 把初始混入比例调进可辨认但不抢眼的对比度区间，循环上限固定为 8 次。

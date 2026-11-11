@@ -28,7 +28,6 @@ pub(super) struct SelectionRowSpan {
 /// 已裁剪到内容边界的单行选区矩形，坐标以 Canvas 像素表示，供轮廓与测试共用。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct SelectionBand {
-    pub(super) viewport_row: u16,
     pub(super) x0: f32,
     pub(super) x1: f32,
     pub(super) y0: f32,
@@ -172,13 +171,7 @@ pub(super) fn selection_bands(
             let (x0, x1) = column_interval(*span, left, cell_width, right)?;
             let y0 = (top + line_height * f32::from(span.viewport_row)).max(top);
             let y1 = (y0 + line_height).min(bottom);
-            (y1 - y0 > EDGE_EPSILON).then_some(SelectionBand {
-                viewport_row: span.viewport_row,
-                x0,
-                x1,
-                y0,
-                y1,
-            })
+            (y1 - y0 > EDGE_EPSILON).then_some(SelectionBand { x0, x1, y0, y1 })
         })
         .collect()
 }

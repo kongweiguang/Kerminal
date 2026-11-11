@@ -461,3 +461,59 @@ fn selection_style_recovers_when_foreground_reference_cannot_reach_target() {
     assert_eq!(resolved, white_cursor.foreground_fallback);
     assert!(contrast_ratio(resolved, white_cursor.background) >= 4.5);
 }
+
+/// 灰度背景全区间都必须得到可辨认的选区，并且 cursor 白/黑不改变结果。
+///
+/// @author kongweiguang
+#[test]
+fn selection_style_holds_contrast_across_all_gray_backgrounds() {
+    for value in 0..=255_u16 {
+        let background = gray(value as u8);
+        let palette = palette_with(gray(0xe4), background, gray(0x80));
+        let style = terminal_selection_style(&palette);
+
+        let selection_contrast = contrast_ratio(style.background, background);
+        assert!(
+            (1.35..=2.0).contains(&selection_contrast),
+            "gray {value}: selection contrast {selection_contrast}"
+        );
+        assert!(
+            contrast_ratio(style.foreground_fallback, style.background) >= 4.5,
+            "gray {value}: fallback contrast {}",
+            contrast_ratio(style.foreground_fallback, style.background)
+        );
+
+        let white_cursor =
+            terminal_selection_style(&palette_with(gray(0xe4), background, gray(0xff)));
+        let black_cursor =
+            terminal_selection_style(&palette_with(gray(0xe4), background, gray(0x00)));
+        assert_eq!(style.background, white_cursor.background, "gray {value}");
+        assert_eq!(style.background, black_cursor.background, "gray {value}");
+    }
+}
+
+/// 前景/背景约 1.40 时候选仍可达 1.35，必须保留更暗的前景色调而不是切到白色端点。
+///
+/// @author kongweiguang
+#[test]
+fn selection_style_keeps_reachable_foreground_hue_below_endpoint_target() {
+    let background = gray(0x80);
+    let foreground = gray(0x68);
+    let foreground_contrast = contrast_ratio(foreground, background);
+    assert!(
+        (1.38..=1.42).contains(&foreground_contrast),
+        "fixture should be close to 1.40: {foreground_contrast}"
+    );
+
+    let style = terminal_selection_style(&palette_with(foreground, background, gray(0x80)));
+    let selection_contrast = contrast_ratio(style.background, background);
+    assert!(
+        (1.35..=2.0).contains(&selection_contrast),
+        "near-1.40 selection contrast {selection_contrast}"
+    );
+    // 底色亮度低于 0.5 时端点是白色；保留更暗的前景方向即可证明走了 candidate 路径。
+    assert!(
+        relative_luminance(style.background) < relative_luminance(background),
+        "candidate path should keep the darker foreground direction"
+    );
+}
