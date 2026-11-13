@@ -1,5 +1,8 @@
 # @author kongweiguang
 # cargo-about 只选择经过审查的许可证；未识别或未批准的表达式必须阻断报告生成。
+# 下列三项同样是已审查的宽松许可证，仅因个别依赖引入才加入全局接受集：
+#   MIT-0（borrow-or-share）、Apache-2.0 WITH LLVM-exception（target-lexicon）、
+#   CDLA-Permissive-2.0（webpki-roots）。新增条目仍须逐项核对来源后再放行。
 
 accepted = [
     "Apache-2.0",
@@ -13,6 +16,9 @@ accepted = [
     "CC0-1.0",
     "MPL-2.0",
     "Unlicense",
+    "MIT-0",
+    "Apache-2.0 WITH LLVM-exception",
+    "CDLA-Permissive-2.0",
 ]
 
 targets = [
@@ -50,4 +56,14 @@ accepted = ["GPL-3.0-or-later"]
 accepted = ["GPL-3.0-or-later"]
 
 [xtask]
+accepted = ["GPL-3.0-or-later"]
+
+# 插件 SDK 的三个 crate 同属本仓库、与主工作区共用 GPL 版本，按名称放行而不放宽第三方全局规则。
+[kerminal-plugin-protocol]
+accepted = ["GPL-3.0-or-later"]
+
+[kerminal-plugin-sdk]
+accepted = ["GPL-3.0-or-later"]
+
+[kerminal-plugin-cli]
 accepted = ["GPL-3.0-or-later"]
