@@ -560,38 +560,19 @@ try {
     Assert-True ($inner.Count -eq 2 -and $inner[0].Message.Contains('CLI packaging failed') -and $inner[1].Message.Contains('synthetic cleanup dispose')) ("Packaging failure is masked or its cleanup failure is lost: "+(($inner | ForEach-Object Message) -join ' | '))
 } finally {Remove-Item -LiteralPath $packageRoot -Recurse -Force}
 
-# 从两代真实 fixture 提取函数执行边界样本，确认截断以 Unicode 码点计且不产生孤立代理。
-$node=Get-Command node -ErrorAction Stop
-$expected='Unicode scalar truncation boundary failed'
-foreach($fixturePath in @('notes-1.0','notes-1.1')){
-    $source=[IO.File]::ReadAllText((Join-Path $PSScriptRoot "../../tests/fixtures/plugins/restart/$fixturePath/dist/main.js"))
-    $function=[regex]::Match($source,'(?ms)^function noteText\(value[^\r\n]*\)[^\r\n]*\{.*?^\}')
-    Assert-True ($function.Success -and $function.Value.Contains('Array.from(value)') -and $function.Value.Contains('points.slice(0, limit)')) "$fixturePath does not use code-point-safe noteText truncation."
-    $javascript=@"
-$($function.Value)
-function hasLone(value) {
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (code >= 0xD800 && code <= 0xDBFF) {
-      if (i + 1 >= value.length) return true;
-      const next = value.charCodeAt(i + 1);
-      if (next < 0xDC00 || next > 0xDFFF) return true;
-      i++;
-    } else if (code >= 0xDC00 && code <= 0xDFFF) return true;
-  }
-  return false;
-}
-const exact = "😀".repeat(31999) + "🙂";
-const over = "😀".repeat(31999) + "猫" + "🙂";
-const exactOut = noteText(exact);
-const overOut = noteText(over);
-if (typeof noteText(null) !== "string" || noteText(null) !== "") throw new Error("${expected}: non-string");
-if (exactOut !== exact) throw new Error("${expected}: exact boundary changed");
-if (Array.from(overOut).length !== 32000 || overOut.slice(-1) !== "猫") throw new Error("${expected}: scalar limit");
-if (hasLone(exactOut) || hasLone(overOut)) throw new Error("${expected}: lone surrogate");
-"@
-    $javascript | & $node.Source -
-    Assert-True ($LASTEXITCODE -eq 0) "$fixturePath Unicode scalar runtime boundary test failed."
+# 两代夹具共用同一 Rust 截断实现；直接编译并执行其单元测试，避免另写一份 JS 逻辑。
+$fixtureSource = Join-Path $PSScriptRoot '../../tests/support/sidecars/note_text.rs'
+Assert-True ([IO.File]::ReadAllText($fixtureSource).Contains('chars().take(MAX_NOTE_TEXT)')) 'Restart fixture does not use code-point-safe noteText truncation.'
+$fixtureTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('kerminal-note-text-test-' + [Guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($fixtureTestRoot)
+try {
+    $fixtureTestExe = Join-Path $fixtureTestRoot 'note_text_tests.exe'
+    & rustc --edition 2024 --test $fixtureSource -o $fixtureTestExe
+    Assert-True ($LASTEXITCODE -eq 0) 'Restart fixture Unicode scalar test does not compile.'
+    & $fixtureTestExe
+    Assert-True ($LASTEXITCODE -eq 0) 'Restart fixture Unicode scalar runtime boundary test failed.'
+} finally {
+    Remove-Item -LiteralPath $fixtureTestRoot -Recurse -Force
 }
 
 Assert-True ($scriptText.Contains("'asynchronousSideEffects') 'not-observed'")) 'Missing asynchronous side-effect boundary gate.'

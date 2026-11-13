@@ -1,4 +1,4 @@
-# 插件主机类型表单的三主题私有桌面验收；真实 http-check 脚本插件、生产面板与结果 Tab。
+# 插件主机类型表单的三主题私有桌面验收；真实 http-check Sidecar 插件、生产面板与结果 Tab。
 # @author kongweiguang
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,

@@ -2,8 +2,9 @@
 #Requires -Version 7.0
 param(
     [Parameter(Mandatory)][string]$ExecutablePath,
-    [Parameter(Mandatory)][string]$ExpectedHostSha256,
+    [string]$ExpectedSidecarSha256,
     [string]$PluginPath,
+    [string]$PluginCliPath,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [ValidateSet('light','dark','system','all')][string]$Theme='light',
     [ValidateRange(60,900)][int]$TimeoutSeconds=300
@@ -75,7 +76,7 @@ function Get-ListProcessSample {
 
 function Get-ListProcessTreeSample {
     # 只沿当前候选 PID 的父子关系采集，并保存映像路径与文件 SHA256；短命退出竞态可能
-    # 让个别行缺少路径，因此采样阶段保留完整行、门禁只接受带路径的真实宿主进程。
+    # 让个别行缺少路径，因此采样阶段保留完整行、门禁只接受带路径且归属副本的真实 Sidecar 进程。
     # @author kongweiguang
     param([int]$RootProcessId, [long]$ElapsedMilliseconds, [hashtable]$ImageHashes)
     $rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine, CreationDate)
@@ -118,10 +119,10 @@ function Get-ListProcessTreeSample {
 }
 
 function Assert-PluginListProcessTree {
-    # 宿主进程必须来自候选桌面进程树，映像位于候选目录，采样与文件 SHA 均等于候选构建
-    # receipt 提供的期望值，命令行还必须引用本轮输出根副本或插件身份；只凭进程名不能通过。
+    # Sidecar 进程必须来自候选桌面进程树，映像位于本轮只读插件副本，采样与文件 SHA
+    # 必须一致；可选期望摘要再绑定候选构建 receipt，只凭进程名不能通过。
     # @author kongweiguang
-    param($Samples, [string]$CandidatePath, [string]$CandidateSha256, [int]$RootProcessId, [string]$ExpectedHostSha256, [string]$PluginCopyPath, [string]$PluginId)
+    param($Samples, [string]$CandidatePath, [string]$CandidateSha256, [int]$RootProcessId, [string]$ExpectedSidecarSha256, [string]$PluginCopyPath, [string]$PluginId)
     if ($null -eq $Samples -or @($Samples).Count -lt 1) { throw 'Plugin list process tree samples are missing.' }
     $root = $null
     $hosts = [ordered]@{}
@@ -136,15 +137,17 @@ function Assert-PluginListProcessTree {
             $line = "$processId`t$name`t$imageSha"
             $null = $treeLines.Add($line)
             if ($processId -eq $RootProcessId) { $root = $process }
-            if ($name -ieq 'kerminal-plugin-host.exe' -or $name -ieq 'kerminal-plugin-host') {
-                $hostPath = Get-RequiredString $process 'executablePath'
+            # Sidecar 由插件包内的独立二进制启动；用映像路径归属本轮只读副本，
+            # 进程名只用于缩小候选，不能单独证明执行的是本插件的二进制。
+            if ($name -ieq 'sidecar.exe' -or $name -ieq 'sidecar') {
+                $hostPath = ConvertTo-NormalListPath (Get-RequiredString $process 'executablePath')
                 $hostSha = Get-RequiredString $process 'imageSha256'
-                $commandLine = Get-RequiredString $process 'commandLine'
-                if ($hostSha -cne $ExpectedHostSha256) { throw 'Plugin host sampled image hash does not match the expected build identity.' }
-                if (-not ($commandLine.Contains($copyPath, [StringComparison]::OrdinalIgnoreCase) -or $commandLine.Contains($PluginId, [StringComparison]::OrdinalIgnoreCase))) { throw 'Plugin host command line does not reference this run plugin copy or plugin identity.' }
+                $prefix = $copyPath.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+                if (-not $hostPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw "Plugin sidecar image is outside this run plugin copy: $hostPath" }
+                if (-not [string]::IsNullOrWhiteSpace($ExpectedSidecarSha256) -and $hostSha -cne $ExpectedSidecarSha256) { throw 'Plugin sidecar sampled image hash does not match the expected build identity.' }
                 $key = "$processId|$hostPath|$hostSha"
                 if (-not $hosts.Contains($key)) {
-                    $hosts[$key] = [pscustomobject]@{ProcessId = $processId; Name = $name; ImagePath = $hostPath; ImageSha256 = $hostSha; CommandLine = $commandLine }
+                    $hosts[$key] = [pscustomobject]@{ProcessId = $processId; Name = $name; ImagePath = $hostPath; ImageSha256 = $hostSha; PluginId = $PluginId }
                 }
             }
         }
@@ -155,16 +158,14 @@ function Assert-PluginListProcessTree {
     if (-not $rootPath.Equals($candidatePath, [StringComparison]::OrdinalIgnoreCase)) { throw 'Candidate desktop image path does not match the launched executable.' }
     $rootSha = (Get-FileHash -LiteralPath $rootPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($rootSha -cne $CandidateSha256 -or (Get-RequiredString $root 'imageSha256') -cne $rootSha) { throw 'Candidate desktop image hash mismatch.' }
-    if (@($hosts.Keys).Count -lt 1) { throw 'kerminal-plugin-host was not observed in the candidate process tree.' }
-    $candidateDirectory = [IO.Path]::GetDirectoryName($candidatePath)
+    if (@($hosts.Keys).Count -lt 1) { throw 'Plugin sidecar process was not observed in the candidate process tree.' }
     $verified = @()
     foreach ($hostEntry in $hosts.Values) {
         $path = ConvertTo-NormalListPath $hostEntry.ImagePath
-        $directory = [IO.Path]::GetDirectoryName($path)
-        if (-not $directory.Equals($candidateDirectory, [StringComparison]::OrdinalIgnoreCase)) { throw "Plugin host image is outside the candidate directory: $path" }
         $sha = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($sha -cne $ExpectedHostSha256 -or $sha -cne $hostEntry.ImageSha256) { throw "Plugin host image hash does not match the expected build identity: $path" }
-        $verified += [pscustomobject]@{ProcessId = $hostEntry.ProcessId; Name = $hostEntry.Name; ImagePath = $path; ImageSha256 = $sha; CommandLine = $hostEntry.CommandLine }
+        if ($sha -cne $hostEntry.ImageSha256) { throw "Plugin sidecar image hash does not match the sampled bytes: $path" }
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedSidecarSha256) -and $sha -cne $ExpectedSidecarSha256) { throw "Plugin sidecar image hash does not match the expected build identity: $path" }
+        $verified += [pscustomobject]@{ProcessId = $hostEntry.ProcessId; Name = $hostEntry.Name; ImagePath = $path; ImageSha256 = $sha; PluginId = $hostEntry.PluginId }
     }
     $treeText = ((@($treeLines) | Sort-Object -CaseSensitive) -join "`n")
     $treeSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($treeText))).ToLowerInvariant()
@@ -172,8 +173,8 @@ function Assert-PluginListProcessTree {
         RootProcessId = $RootProcessId
         RootImagePath = $rootPath
         RootImageSha256 = $rootSha
-        ExpectedHostSha256 = $ExpectedHostSha256
-        HostProcesses = $verified
+        ExpectedSidecarSha256 = $ExpectedSidecarSha256
+        SidecarProcesses = $verified
         ProcessTreeSha256 = $treeSha
         SampleCount = @($Samples).Count
     }
@@ -352,8 +353,8 @@ function Compare-Utf8Ordinal {
 }
 
 function Get-PluginContentDigest {
-    # 独立枚举插件目录的实际普通文件并按共享规则重算摘要；清单、main.js 与 views
-    # 都会进入摘要，任何脚本或视图字节变化都会与 Rust 报告不一致。
+    # 独立枚举插件目录的实际普通文件并按共享规则重算摘要；清单、Sidecar 二进制与 views
+    # 都会进入摘要，任何二进制或视图字节变化都会与 Rust 报告不一致。
     # @author kongweiguang
     param([string]$PluginPath)
     $root = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $PluginPath).Path)
@@ -424,7 +425,7 @@ function Assert-PluginListEvidence {
     # 缺失、旧帧、原地目标和错误类型都必须失败关闭，不能用滚动请求冒充可视结果。
     # 同时绑定来源、私有桌面、主题、平台、进程树和采样时间窗，避免只凭列表形状通过。
     # @author kongweiguang
-    param($Report, $Observations, $Frames, $Samples, $ProcessTree, [string]$CurrentTheme, [string]$ExpectedDesktop, [string]$CandidatePath, [string]$CandidateSha256, [string]$ExpectedHostSha256, [string]$PluginCopyPath, [string]$PluginId)
+    param($Report, $Observations, $Frames, $Samples, $ProcessTree, [string]$CurrentTheme, [string]$ExpectedDesktop, [string]$CandidatePath, [string]$CandidateSha256, [string]$ExpectedSidecarSha256, [string]$PluginCopyPath, [string]$PluginId)
 
     if ((Get-RequiredNumber $Report 'schemaVersion') -ne 3) { throw 'Plugin list report schema is invalid.' }
     if ((Get-RequiredString $Report 'theme') -cne $CurrentTheme) { throw 'Plugin list report theme does not match this run.' }
@@ -445,8 +446,8 @@ function Assert-PluginListEvidence {
     $sourcePlugin = Get-RequiredString $source 'plugin'
     $sourceView = Get-RequiredString $source 'view'
     $sourceRuntime = Get-RequiredString $source 'runtime'
-    if ($contentId -ceq 'acceptance.host-list' -or $sourcePlugin -ceq 'fixture.host-list' -or $sourceRuntime -cne 'script' -or $sourcePlugin -ceq 'fixture.host-list') { throw 'Host-list fixture or non-script runtime cannot satisfy the external plugin list gate.' }
-    if ($contentId -cne 'test.list-performance/records' -or $sourcePlugin -cne 'test.list-performance' -or $sourceView -cne 'records' -or $sourceRuntime -cne 'script') { throw 'Plugin list report source identity is invalid.' }
+    if ($contentId -ceq 'acceptance.host-list' -or $sourcePlugin -ceq 'fixture.host-list' -or $sourceRuntime -cne 'sidecar' -or $sourcePlugin -ceq 'fixture.host-list') { throw 'Host-list fixture or non-sidecar runtime cannot satisfy the external plugin list gate.' }
+    if ($contentId -cne 'test.list-performance/records' -or $sourcePlugin -cne 'test.list-performance' -or $sourceView -cne 'records' -or $sourceRuntime -cne 'sidecar') { throw 'Plugin list report source identity is invalid.' }
     if (!(Get-RequiredBoolean $source 'externalPlugin') -or !(Get-RequiredBoolean $source 'activeBindingVerified')) { throw 'Plugin list source is not a verified active external plugin content.' }
     $sourceTabId = Get-RequiredString $source 'tabId'
     if ((Get-RequiredString $source 'activeTabId') -cne $sourceTabId) { throw 'Plugin list source active tab is not the opened content tab.' }
@@ -519,7 +520,7 @@ function Assert-PluginListEvidence {
             if ($listError.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($listError.Value)) { throw "Plugin list renderer error is invalid for $Context." }
             throw "Plugin list renderer error for $Context`: $($listError.Value)"
         }
-        if ((Get-RequiredString $List 'plugin') -cne 'test.list-performance' -or (Get-RequiredString $List 'view') -cne 'records' -or (Get-RequiredString $List 'runtime') -cne 'script' -or !(Get-RequiredBoolean $List 'external')) { throw "Plugin list renderer source identity is invalid for $Context." }
+        if ((Get-RequiredString $List 'plugin') -cne 'test.list-performance' -or (Get-RequiredString $List 'view') -cne 'records' -or (Get-RequiredString $List 'runtime') -cne 'sidecar' -or !(Get-RequiredBoolean $List 'external')) { throw "Plugin list renderer source identity is invalid for $Context." }
     }
 
     $assertCollectionError = {
@@ -672,9 +673,9 @@ function Assert-PluginListEvidence {
     if ($draw -lt 100 -or $present -lt 100) { throw 'Plugin list has fewer than one hundred real draw and present samples.' }
     if ($drawFirst -lt 50 -or $drawSecond -lt 50 -or $presentFirst -lt 50 -or $presentSecond -lt 50) { throw 'Plugin list draw or present samples are missing from one half of the sampling window.' }
     if ($null -eq $Samples -or @($Samples).Count -lt 2) { throw 'Plugin list process samples are incomplete.' }
-    # 进程树证据绑定真实桌面与脚本宿主；缺失宿主、映像目录不符或文件摘要不符都不能通过。
+    # 进程树证据绑定真实桌面与本轮 Sidecar；缺失进程、映像不在只读副本或文件摘要不符都不能通过。
     if ([string]::IsNullOrWhiteSpace($CandidatePath) -or [string]::IsNullOrWhiteSpace($CandidateSha256)) { throw 'Plugin list candidate identity is missing.' }
-    $processEvidence = Assert-PluginListProcessTree $ProcessTree $CandidatePath $CandidateSha256 ([int](Get-RequiredNumber $Report 'processId')) $ExpectedHostSha256 $PluginCopyPath $PluginId
+    $processEvidence = Assert-PluginListProcessTree $ProcessTree $CandidatePath $CandidateSha256 ([int](Get-RequiredNumber $Report 'processId')) $ExpectedSidecarSha256 $PluginCopyPath $PluginId
 
     return [pscustomobject]@{
         Observations = $rows.Count
@@ -707,12 +708,22 @@ $executable=(Resolve-Path -LiteralPath $ExecutablePath).Path
 $repositoryRoot=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 if(-not $PluginPath){$PluginPath=Join-Path $repositoryRoot 'tests/fixtures/plugins/list-performance'}
 $plugin=(Resolve-Path -LiteralPath $PluginPath).Path
+if(-not $PluginCliPath){$PluginCliPath=Join-Path (Split-Path $executable) 'kerminal-plugin.exe'}
+if(Test-Path -LiteralPath (Join-Path $plugin 'Cargo.toml') -PathType Leaf){
+    # 源码夹具必须先用同一 CLI 构建；宿主只加载已验证包，不能直接运行 main.rs。
+    $cli=(Resolve-Path -LiteralPath $PluginCliPath).Path
+    & $cli build --project $plugin --platform windows-x86_64
+    if($LASTEXITCODE -ne 0){throw 'Plugin list fixture build failed.'}
+    $plugin=(Resolve-Path -LiteralPath (Join-Path $plugin '.kerminal/build')).Path
+}
 $base=[IO.Path]::GetFullPath($OutputDirectory)
 if(Test-Path -LiteralPath $base){throw 'The output root must not exist.'}
 [void][IO.Directory]::CreateDirectory($base)
 $candidate=(Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
-$ExpectedHostSha256=$ExpectedHostSha256.ToLowerInvariant()
-if($ExpectedHostSha256 -notmatch '^[0-9a-f]{64}$'){throw 'ExpectedHostSha256 must be a lowercase or uppercase SHA256 hex digest.'}
+if(-not [string]::IsNullOrWhiteSpace($ExpectedSidecarSha256)){
+    $ExpectedSidecarSha256=$ExpectedSidecarSha256.ToLowerInvariant()
+    if($ExpectedSidecarSha256 -notmatch '^[0-9a-f]{64}$'){throw 'ExpectedSidecarSha256 must be a lowercase or uppercase SHA256 hex digest.'}
+}
 $copyDigest=$null
 Get-ListHardwareMetadata | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $base 'hardware.json') -Encoding utf8
 $previous=[Environment]::GetEnvironmentVariable('KERMINAL_PLUGIN_WEBVIEW_DIRECTORY','Process')
@@ -758,7 +769,7 @@ try {
         # 先在候选仍可回收时完成全部证据核对；任何歧义都进入finally统一清理。
         $copyPath=[IO.Path]::GetFullPath((Join-Path $output 'plugin'))
         # 宿主实际读取的是输出根内只读副本；摘要与路径都由同一函数从该副本重算。
-        $summary=Assert-PluginListEvidence $report $rows $frames $samples $treeSamples $currentTheme $desktop $executable $candidate $ExpectedHostSha256 $copyPath 'test.list-performance'
+        $summary=Assert-PluginListEvidence $report $rows $frames $samples $treeSamples $currentTheme $desktop $executable $candidate $ExpectedSidecarSha256 $copyPath 'test.list-performance'
         $copyEvidence=Assert-PluginListPluginCopy $report $output $plugin
         $copyDigest=$copyEvidence.Digest
         if((Get-RequiredNumber $report 'processId') -ne $process.ProcessId -or (Get-RequiredString $report 'candidateSha256') -cne $candidate){throw 'Native list candidate or process identity mismatch.'}
@@ -772,7 +783,7 @@ try {
         $owned.Dispose()
         $process=$null
         if(-not $owned.DesktopClosed){throw 'The private desktop did not close.'}
-        $receipts+=[pscustomobject]@{Theme=$currentTheme;ProcessId=$processId;Report="$currentTheme/report.json";MemorySamples="$currentTheme/memory-samples.json";ProcessTree="$currentTheme.process-tree.json";Observations=$summary.Observations;TargetSequence=$summary.TargetSequence;Instance=$summary.Instance;Generation=$summary.Generation;ContentId=$summary.ContentId;SourcePlugin=$summary.SourcePlugin;SourceView=$summary.SourceView;SourceRuntime=$summary.SourceRuntime;SourceTabId=$summary.SourceTabId;PluginCopyPath=$copyEvidence.CopyPath;PluginSha256=$copyDigest;ExpectedHostSha256=$ExpectedHostSha256;CandidateImagePath=$summary.ProcessTree.RootImagePath;CandidateImageSha256=$summary.ProcessTree.RootImageSha256;HostProcesses=$summary.ProcessTree.HostProcesses;ProcessTreeSha256=$summary.ProcessTree.ProcessTreeSha256;ProcessTreeSamples=$summary.ProcessTree.SampleCount;ActiveAtSamplingStart=$summary.ActiveAtSamplingStart;DarkMode=$summary.DarkMode;MinimumObservedSpan=$summary.MinimumObservedSpan;FetchWindow=$summary.FetchWindow;ContinuousStepRule=(Get-RequiredString $report 'continuousStepRule');NormalExitJob=$job;DesktopHandleClosed=$true}
+        $receipts+=[pscustomobject]@{Theme=$currentTheme;ProcessId=$processId;Report="$currentTheme/report.json";MemorySamples="$currentTheme/memory-samples.json";ProcessTree="$currentTheme.process-tree.json";Observations=$summary.Observations;TargetSequence=$summary.TargetSequence;Instance=$summary.Instance;Generation=$summary.Generation;ContentId=$summary.ContentId;SourcePlugin=$summary.SourcePlugin;SourceView=$summary.SourceView;SourceRuntime=$summary.SourceRuntime;SourceTabId=$summary.SourceTabId;PluginCopyPath=$copyEvidence.CopyPath;PluginSha256=$copyDigest;ExpectedSidecarSha256=$ExpectedSidecarSha256;CandidateImagePath=$summary.ProcessTree.RootImagePath;CandidateImageSha256=$summary.ProcessTree.RootImageSha256;SidecarProcesses=$summary.ProcessTree.SidecarProcesses;ProcessTreeSha256=$summary.ProcessTree.ProcessTreeSha256;ProcessTreeSamples=$summary.ProcessTree.SampleCount;ActiveAtSamplingStart=$summary.ActiveAtSamplingStart;DarkMode=$summary.DarkMode;MinimumObservedSpan=$summary.MinimumObservedSpan;FetchWindow=$summary.FetchWindow;ContinuousStepRule=(Get-RequiredString $report 'continuousStepRule');NormalExitJob=$job;DesktopHandleClosed=$true}
     }
     if((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant() -cne $candidate){throw 'Candidate changed during sampling.'}
     [pscustomobject]@{SchemaVersion=3;CandidateSha256=$candidate;PluginSha256=$copyDigest;PluginDigestRule=(Get-PluginDigestRule);Runs=$receipts;Mode='private-desktop-native-list';PhysicalInputTested=$false;DisplayLatencyMeasured=$false;FrameCountClaimed=$false;PhysicalDisplayMeasured=$false;EvidenceScope='production native renderer row construction and visible-range changes; active state sampled once at start; not system compositing, physical display, focus continuity or input-to-display latency';MemoryScope='candidate desktop process; excludes child process memory';Hardware='hardware.json';PluginCopyScope='each run executes the immutable copy under its output root and the runner recomputes the same full-file digest'}| ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $base 'acceptance-report.json') -Encoding utf8

@@ -584,13 +584,22 @@ if(Test-Path -LiteralPath $base){throw 'Output root must not exist.'}
 [void][IO.Directory]::CreateDirectory($base)
 $candidate=(Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
 $fixture=Join-Path $repositoryRoot 'tests/fixtures/plugins/restart'
+# 两代 Sidecar 必须先由同一 CLI 构建并校验；package 只接受已验证平台二进制目录。
+$initialProject=Join-Path $fixture 'notes-1.0'
+$updateProject=Join-Path $fixture 'notes-1.1'
+& $cli build --project $initialProject --platform windows-x86_64
+if($LASTEXITCODE -ne 0){throw 'Initial restart fixture build failed.'}
+& $cli build --project $updateProject --platform windows-x86_64
+if($LASTEXITCODE -ne 0){throw 'Update restart fixture build failed.'}
+$initialBuild=Join-Path $initialProject '.kerminal/build'
+$updateBuild=Join-Path $updateProject '.kerminal/build'
 Initialize-RestartLauncher
-Invoke-RestartPackage -Cli $cli -WorkingDirectory $repositoryRoot -Base $base -Name 'initial-package' -InputDirectory (Join-Path $fixture 'notes-1.0') -Timeout $TimeoutSeconds
+Invoke-RestartPackage -Cli $cli -WorkingDirectory $repositoryRoot -Base $base -Name 'initial-package' -InputDirectory $initialBuild -Timeout $TimeoutSeconds
 $initialPackages=@(Get-ChildItem -LiteralPath (Join-Path $base 'initial-package') -Filter '*.kplugin')
 if($initialPackages.Count -ne 1){throw 'Expected one exact local initial package.'}
 $initialPackage=$initialPackages[0].FullName
 $initialPackageHash=(Get-FileHash -LiteralPath $initialPackage -Algorithm SHA256).Hash.ToLowerInvariant()
-Invoke-RestartPackage -Cli $cli -WorkingDirectory $repositoryRoot -Base $base -Name 'update-package' -InputDirectory (Join-Path $fixture 'notes-1.1') -Timeout $TimeoutSeconds
+Invoke-RestartPackage -Cli $cli -WorkingDirectory $repositoryRoot -Base $base -Name 'update-package' -InputDirectory $updateBuild -Timeout $TimeoutSeconds
 $packages=@(Get-ChildItem -LiteralPath (Join-Path $base 'update-package') -Filter '*.kplugin')
 if($packages.Count -ne 1){throw 'Expected one exact local update package.'}
 $package=$packages[0].FullName

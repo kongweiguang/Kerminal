@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory)][string]$EmptyConfigTemplate,
     [Parameter(Mandatory)][string]$ThreePluginConfigTemplate,
     [Parameter(Mandatory)][string]$OutputDirectory,
+    [string]$PluginCliPath,
     [ValidateRange(5, 300)][int]$WarmupSeconds = 5,
     # 515 个固定采样槽、列表前的三插件激活、两段 warmup 和 13 秒洪泛结算必须同时落入帧窗。
     # 上限绑定桌面端 10,000 个 raw 帧容量与 16ms 刷新节拍；120 秒约 7500 帧，
@@ -18,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 
 # raw 帧容量为 10,000；按 16ms 刷新节拍 120 秒约 7500 帧，加 515 槽仍低于容量。
 $MaximumDurationSeconds = 120
-# fixture main.js 的发送窗口与速率常量；短于该值的 burst 不能代表持续插件负载。
+# fixture Sidecar 的发送窗口与速率常量；短于该值的 burst 不能代表持续插件负载。
 $FloodMinimumSendMs = 12000
 $FloodMinimumAttempts = 12000
 $ActivationReserveMs = 6000
@@ -192,27 +193,37 @@ function Install-PerformanceFixture {
     foreach ($path in @($Config, (Join-Path $Config 'plugins'), (Join-Path $Config 'plugins/packages'), (Join-Path $Config 'plugins/packages/acme.notes'), $package)) {
         if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Fixture path must not be a reparse point: $path" }
     }
-    $views = Join-Path $package 'views'
-    if (Test-Path -LiteralPath $views) {
-        if ((Get-Item -LiteralPath $views -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Fixture views directory must not be a reparse point.' }
-    } else { New-Item -ItemType Directory -Path $views | Out-Null }
     $fixture = Join-Path $PSScriptRoot '../../tests/fixtures/plugins/performance'
-    foreach ($name in @('kerminal-plugin.json', 'main.js', 'views/renderer.json')) {
-        $destination = Join-Path $package $name
-        if ((Test-Path -LiteralPath $destination) -and ((Get-Item -LiteralPath $destination -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Fixture destination must not be a reparse point.' }
-        Copy-Item -LiteralPath (Join-Path $fixture $name) -Destination $destination -Force
+    if ($null -eq $script:PerformanceFixtureBuild) {
+        # 源码夹具只构建一次；所有主题和配置副本复用同一已验证包，避免运行时读取未校验源码。
+        if (-not $PluginCliPath) { $PluginCliPath = Join-Path (Split-Path $ExecutablePath) 'kerminal-plugin.exe' }
+        $cli = (Resolve-Path -LiteralPath $PluginCliPath).Path
+        & $cli build --project $fixture --platform windows-x86_64
+        if ($LASTEXITCODE -ne 0) { throw 'Performance fixture build failed.' }
+        $script:PerformanceFixtureBuild = (Resolve-Path -LiteralPath (Join-Path $fixture '.kerminal/build')).Path
     }
-    $scriptPath = Join-Path $package 'main.js'
-    $source = Get-Content -Raw -LiteralPath $scriptPath
-    # 洪泛门禁的 12 秒/至少 12,000 次必须与 fixture 常量同源；fixture 被改动时
-    # 直接拒绝，避免短 burst 或降速版本冒充持续负载。
-    $sendMarker = "sendElapsed >= $FloodMinimumSendMs"
-    if ($source.Split([string[]]@($sendMarker), [StringSplitOptions]::None).Count -ne 2 -or $source.Split([string[]]@('UPDATES_PER_TICK = 24'), [StringSplitOptions]::None).Count -ne 2) {
+    $source = Get-Content -Raw -LiteralPath (Join-Path $fixture 'resources/performance.json') | ConvertFrom-Json
+    if ($source.startDelayMs -ne 8000) { throw 'Performance fixture warmup marker changed.' }
+    $shared = Get-Content -Raw -LiteralPath (Join-Path $fixture '../../../support/sidecars/performance_impl.rs')
+    # 洪泛门禁的 12 秒/至少 12,000 次必须与 fixture 常量同源；源码被改动时直接拒绝。
+    if (-not $shared.Contains("SEND_WINDOW_MS: u64 = $FloodMinimumSendMs") -or -not $shared.Contains('UPDATES_PER_TICK: usize = 24')) {
         throw 'Performance fixture flood constants changed; the sustained send window and update rate no longer match the acceptance gate.'
     }
-    $delay = 'const START_DELAY_MS = 8000;'
-    if ($source.Split([string[]]@($delay), [StringSplitOptions]::None).Count -ne 2) { throw 'Fixture warmup marker changed.' }
-    $source.Replace($delay, "const START_DELAY_MS = $($WarmupSeconds * 1000 + 1000);") | Set-Content -Encoding utf8 -LiteralPath $scriptPath
+    foreach ($child in @(Get-ChildItem -LiteralPath $script:PerformanceFixtureBuild -Force)) {
+        $destination = Join-Path $package $child.Name
+        if ((Test-Path -LiteralPath $destination) -and ((Get-Item -LiteralPath $destination -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Fixture destination must not be a reparse point.' }
+        if ($child.PSIsContainer) {
+            # 目录只合并内容；直接复制目录会在重复运行时生成 bin/bin 或 views/views。
+            [void][IO.Directory]::CreateDirectory($destination)
+            Copy-Item -Path (Join-Path $child.FullName '*') -Destination $destination -Recurse -Force
+        } else {
+            Copy-Item -LiteralPath $child.FullName -Destination $destination -Force
+        }
+    }
+    # 预热延迟写入副本资源，Sidecar 从自身包位置读取；不改写源码或用户模板。
+    $configPath = Join-Path $package 'performance.json'
+    $source.startDelayMs = $WarmupSeconds * 1000 + 1000
+    $source | ConvertTo-Json -Compress | Set-Content -Encoding utf8 -LiteralPath $configPath
 }
 
 function Get-PerformanceProcessSample {
@@ -561,7 +572,7 @@ function Get-PluginProcessEvidence {
     if ($inside.Count -eq 0) { throw 'No process tree sample intersects the host list window.' }
     $hostCount = {
         param($Sample)
-        @($Sample.processes | Where-Object { $_.name -ieq 'kerminal-plugin-host.exe' -or $_.name -ieq 'kerminal-plugin-host' }).Count
+        @($Sample.processes | Where-Object { $_.name -ieq 'sidecar.exe' -or $_.name -ieq 'sidecar' }).Count
     }
     $counts = @($inside | ForEach-Object { & $hostCount $_ })
     $ordered = @($inside | Sort-Object { [double]$_.unixMs })
@@ -569,13 +580,13 @@ function Get-PluginProcessEvidence {
     $maxHosts = ($counts | Measure-Object -Maximum).Maximum
     if ($Expected -eq 0) {
         # 0 组没有外部插件：仍要求窗口内有进程树样本，并确认没有插件宿主混入该负载。
-        if ($maxHosts -ne 0) { throw 'Zero-plugin case ran plugin host processes during the host list window.' }
-        return [pscustomobject][ordered]@{ expected = 0; applicable = $false; status = 'not-applicable'; reason = 'no external plugins are declared for this case'; samplesInWindow = $inside.Count; pluginHostProcessesMin = 0; pluginHostProcessesMax = 0; windowStartUnixMs = $start; windowEndUnixMs = $end; fieldMeaning = 'idle resident plugin host process count in periodic process-tree samples; not plugin RPC concurrency or per-request load' }
+        if ($maxHosts -ne 0) { throw 'Zero-plugin case ran plugin sidecar processes during the host list window.' }
+        return [pscustomobject][ordered]@{ expected = 0; applicable = $false; status = 'not-applicable'; reason = 'no external plugins are declared for this case'; samplesInWindow = $inside.Count; pluginSidecarProcessesMin = 0; pluginSidecarProcessesMax = 0; windowStartUnixMs = $start; windowEndUnixMs = $end; fieldMeaning = 'idle resident plugin sidecar process count in periodic process-tree samples; not plugin RPC concurrency or per-request load' }
     }
     if ($Expected -ne 3) { throw 'Plugin process evidence requires an explicit 0 or 3 plugin expectation.' }
     # 窗口内每个进程树样本都必须含 3 个宿主进程；只看首末会漏掉中途退出或重启。
-    if ($minHosts -lt 3) { throw 'Three live plugin host processes were not present across every process tree sample inside the host list window.' }
-    return [pscustomobject][ordered]@{ expected = 3; applicable = $true; status = 'observed'; reason = 'every process tree sample inside the host list window contains three plugin host processes'; samplesInWindow = $inside.Count; pluginHostProcessesMin = $minHosts; pluginHostProcessesMax = $maxHosts; firstSampleUnixMs = [double]$ordered[0].unixMs; lastSampleUnixMs = [double]$ordered[-1].unixMs; windowStartUnixMs = $start; windowEndUnixMs = $end; fieldMeaning = 'idle resident plugin host process count in periodic process-tree samples; not plugin RPC concurrency or per-request load' }
+    if ($minHosts -lt 3) { throw 'Three live plugin sidecar processes were not present across every process tree sample inside the host list window.' }
+    return [pscustomobject][ordered]@{ expected = 3; applicable = $true; status = 'observed'; reason = 'every process tree sample inside the host list window contains three plugin sidecar processes'; samplesInWindow = $inside.Count; pluginSidecarProcessesMin = $minHosts; pluginSidecarProcessesMax = $maxHosts; firstSampleUnixMs = [double]$ordered[0].unixMs; lastSampleUnixMs = [double]$ordered[-1].unixMs; windowStartUnixMs = $start; windowEndUnixMs = $end; fieldMeaning = 'idle resident plugin sidecar process count in periodic process-tree samples; not plugin RPC concurrency or per-request load' }
 }
 
 function Assert-ListLoadComparison {
@@ -584,11 +595,11 @@ function Assert-ListLoadComparison {
     param($Zero, $Three)
     if ($null -eq $Zero -or $null -eq $Three) { throw 'List load comparison requires both process evidence records.' }
     if ($Zero.expected -ne 0 -or $Zero.applicable -isnot [bool] -or $Zero.applicable -or $Zero.status -cne 'not-applicable') { throw 'Zero-plugin list load evidence is invalid or fabricated.' }
-    if ($Three.expected -ne 3 -or $Three.applicable -isnot [bool] -or !$Three.applicable -or $Three.status -cne 'observed' -or (Get-RequiredNumber $Three 'pluginHostProcessesMin') -lt 3) { throw 'Three-plugin list load evidence does not prove three live plugin hosts in every sample during the list window.' }
+    if ($Three.expected -ne 3 -or $Three.applicable -isnot [bool] -or !$Three.applicable -or $Three.status -cne 'observed' -or (Get-RequiredNumber $Three 'pluginSidecarProcessesMin') -lt 3) { throw 'Three-plugin list load evidence does not prove three live plugin sidecars in every sample during the list window.' }
     return [ordered]@{
         comparable = $true
-        scope = 'host list sampling window only; zero case has no external plugin processes, three case requires three live plugin host processes in every intersecting process tree sample'
-        fieldMeaning = 'idle resident plugin host process count; this is not plugin RPC concurrency or per-request load, and the plugin flood runs after the list window'
+        scope = 'host list sampling window only; zero case has no external plugin processes, three case requires three live plugin sidecar processes in every intersecting process tree sample'
+        fieldMeaning = 'idle resident plugin sidecar process count; this is not plugin RPC concurrency or per-request load, and the plugin flood runs after the list window'
         zero = $Zero; three = $Three
     }
 }
@@ -611,11 +622,11 @@ function Get-StartupMemoryComparison {
     }
     return [ordered]@{
         applicable = $true; budgetEvaluated = $false
-        methodology = 'same private-desktop launcher, same 100ms process polling and first-frame state polling; root application process only; no plugin host working sets included; descriptive values only'
+        methodology = 'same private-desktop launcher, same 100ms process polling and first-frame state polling; root application process only; no plugin sidecar working sets included; descriptive values only'
         firstFrameObservedMs = [ordered]@{ zero = $zeroFirst; three = $threeFirst; delta = $threeFirst - $zeroFirst }
         workingSetBytes = [ordered]@{ zero = (& $statistics $zeroSamples 'workingSetBytes'); three = (& $statistics $threeSamples 'workingSetBytes') }
         privateBytes = [ordered]@{ zero = (& $statistics $zeroSamples 'privateBytes'); three = (& $statistics $threeSamples 'privateBytes') }
-        limitations = @('Polling intervals include observation latency and asynchronous state commit.', 'Root process memory excludes plugin host processes; it is not a total workload memory comparison.')
+        limitations = @('Polling intervals include observation latency and asynchronous state commit.', 'Root process memory excludes plugin sidecar processes; it is not a total workload memory comparison.')
     }
 }
 

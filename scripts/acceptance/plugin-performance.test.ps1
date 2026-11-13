@@ -116,8 +116,8 @@ $data.send_finished_unix_ms = $data.started_unix_ms + 5000; $data.finished_unix_
 Assert-Throws { Get-FloodThroughput $data } 'rejects short bursts'
 $data = New-TestFlood; $data.attempted = 11000; $data.acknowledged = 11000; $data.seq = 11000
 Assert-Throws { Get-FloodThroughput $data } 'at least 12000'
-$fixtureSource = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '../../tests/fixtures/plugins/performance/main.js')
-Assert-True ($fixtureSource.Contains('sendElapsed >= 12000') -and $fixtureSource.Contains('UPDATES_PER_TICK = 24') -and $fixtureSource.Split([string[]]@('sendElapsed >= 12000'), [StringSplitOptions]::None).Count -eq 2) 'The fixture must keep the 12-second send window and update-rate constants that the flood gates rely on.'
+$fixtureSource = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '../../tests/support/sidecars/performance_impl.rs')
+Assert-True ($fixtureSource.Contains('SEND_WINDOW_MS: u64 = 12000') -and $fixtureSource.Contains('UPDATES_PER_TICK: usize = 24') -and $fixtureSource.Split([string[]]@('SEND_WINDOW_MS: u64 = 12000'), [StringSplitOptions]::None).Count -eq 2) 'The fixture must keep the 12-second send window and update-rate constants that the flood gates rely on.'
 
 $report = New-TestReport; $report.status = 'insufficient_frame_samples'
 Assert-Throws { Assert-RawFrameIntegrity $report } 'histogram has insufficient samples'

@@ -86,6 +86,14 @@ if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw "Executabl
 if (-not (Test-Path -LiteralPath (Join-Path $plugin 'kerminal-plugin.json') -PathType Leaf)) {
     throw "Plugin manifest not found: $plugin"
 }
+# 源码目录不能直接交给宿主：桌面验收要求清单声明的平台二进制已经存在。
+if (Test-Path -LiteralPath (Join-Path $plugin 'Cargo.toml') -PathType Leaf) {
+    $pluginCli = Join-Path (Split-Path $executable) 'kerminal-plugin.exe'
+    if (-not (Test-Path -LiteralPath $pluginCli -PathType Leaf)) { throw "Plugin CLI not found for source fixture build: $pluginCli" }
+    & $pluginCli build --project $plugin --platform windows-x86_64
+    if ($LASTEXITCODE -ne 0) { throw "Plugin fixture build failed: $plugin" }
+    $plugin = (Resolve-Path -LiteralPath (Join-Path $plugin '.kerminal/build')).Path
+}
 $candidateHash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
 $runId = [Guid]::NewGuid().ToString('N')
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {

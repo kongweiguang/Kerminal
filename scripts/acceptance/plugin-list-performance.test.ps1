@@ -56,22 +56,23 @@ foreach ($name in @('Get-RequiredNumber', 'Get-RequiredBoolean', 'Get-RequiredFi
 $script:CandidateRoot = Join-Path ([IO.Path]::GetTempPath()) ('kerminal-list-process-' + [Guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($script:CandidateRoot)
 $script:CandidatePath = Join-Path $script:CandidateRoot 'kerminal-desktop.exe'
-$script:HostPath = Join-Path $script:CandidateRoot 'kerminal-plugin-host.exe'
+$script:PluginCopyPath = Join-Path $script:CandidateRoot 'output/plugin'
+[void][IO.Directory]::CreateDirectory((Join-Path $script:PluginCopyPath 'bin'))
+$script:SidecarPath = Join-Path $script:PluginCopyPath 'bin/sidecar.exe'
 [IO.File]::WriteAllText($script:CandidatePath, 'synthetic desktop image')
-[IO.File]::WriteAllText($script:HostPath, 'synthetic plugin host image')
+[IO.File]::WriteAllText($script:SidecarPath, 'synthetic plugin sidecar image')
 $script:CandidateSha256 = (Get-FileHash -LiteralPath $script:CandidatePath -Algorithm SHA256).Hash.ToLowerInvariant()
-$script:HostSha256 = (Get-FileHash -LiteralPath $script:HostPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$script:SidecarSha256 = (Get-FileHash -LiteralPath $script:SidecarPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $script:DesktopName = 'KerminalRail-settings-test'
 $script:TestTheme = 'light'
 $script:InputMode = 'production VirtualListScrollHandle.scroll_to_item'
 $script:PluginId = 'test.list-performance'
-$script:PluginCopyPath = Join-Path $script:CandidateRoot 'output/plugin'
-$script:ExpectedHostSha256 = $script:HostSha256
+$script:ExpectedSidecarSha256 = $script:SidecarSha256
 $script:ImmutableMode = 'all acceptance-copy files set read-only before startup; full-tree digest recomputed after sampling'
 $script:ThemeScope = 'darkMode read from the live GPUI Theme at sampling start; system mode is not forced to a specific appearance'
 $script:Source = [pscustomobject]@{
     tabId = 'fixture-tab'; activeTabId = 'fixture-tab'; contentId = 'test.list-performance/records'
-    plugin = 'test.list-performance'; view = 'records'; runtime = 'script'
+    plugin = 'test.list-performance'; view = 'records'; runtime = 'sidecar'
     externalPlugin = $true; activeBindingVerified = $true
 }
 
@@ -91,18 +92,18 @@ function New-ListSnapshot {
     param($Collection, $ErrorMessage = $null)
     return [pscustomobject]@{
         instance = 'fixture-instance'; generation = 1; status = 'Ready'; visible = $true
-        error = $ErrorMessage; plugin = 'test.list-performance'; view = 'records'; runtime = 'script'; external = $true
+        error = $ErrorMessage; plugin = 'test.list-performance'; view = 'records'; runtime = 'sidecar'; external = $true
         collection = $Collection
     }
 }
 
 function New-ListProcessTree {
-    # 默认样本包含候选桌面与同一目录下的脚本宿主；反向用例可去掉宿主或替换路径/摘要。
+    # 默认样本包含候选桌面与本轮插件副本中的 Sidecar；反向用例可去掉进程或替换副本内路径/摘要。
     # @author kongweiguang
-    param([bool]$IncludeHost = $true, [string]$HostPath = $script:HostPath, [string]$HostSha256 = $script:HostSha256, [int]$RootProcessId = 100)
+    param([bool]$IncludeSidecar = $true, [string]$SidecarPath = $script:SidecarPath, [string]$SidecarSha256 = $script:SidecarSha256, [int]$RootProcessId = 100)
     $processes = @([pscustomobject]@{ pid = $RootProcessId; parentPid = 1; name = 'kerminal-desktop.exe'; executablePath = $script:CandidatePath; imageSha256 = $script:CandidateSha256; created = $null })
-    if ($IncludeHost) {
-        $processes += [pscustomobject]@{ pid = $RootProcessId + 1; parentPid = $RootProcessId; name = 'kerminal-plugin-host.exe'; executablePath = $HostPath; imageSha256 = $HostSha256; commandLine = "`"$HostPath`" `"$script:PluginCopyPath`""; created = $null }
+    if ($IncludeSidecar) {
+        $processes += [pscustomobject]@{ pid = $RootProcessId + 1; parentPid = $RootProcessId; name = 'sidecar.exe'; executablePath = $SidecarPath; imageSha256 = $SidecarSha256; created = $null }
     }
     return @([pscustomobject]@{ elapsedMs = 100; unixMs = 1000000; processes = $processes })
 }
@@ -182,7 +183,7 @@ function New-ListFixture {
         warmupTargets = @(50000, 20000); warmupObservations = $warmupObservations; firstScreen = $firstScreen
         source = [pscustomobject]@{
             tabId = 'fixture-tab'; activeTabId = 'fixture-tab'; contentId = 'test.list-performance/records'
-            plugin = 'test.list-performance'; view = 'records'; runtime = 'script'
+            plugin = 'test.list-performance'; view = 'records'; runtime = 'sidecar'
             externalPlugin = $true; activeBindingVerified = $true
         }
         metadata = [pscustomobject]@{
@@ -217,7 +218,7 @@ function Assert-ListFixture {
     # 统一提供本轮主题、桌面、候选路径和摘要，反向用例只需改夹具字段。
     # @author kongweiguang
     param($Fixture, [string]$Theme = $script:TestTheme)
-    return Assert-PluginListEvidence $Fixture.Report $Fixture.Observations $Fixture.Frames $Fixture.Samples $Fixture.ProcessTree $Theme $script:DesktopName $script:CandidatePath $script:CandidateSha256 $script:ExpectedHostSha256 $script:PluginCopyPath $script:PluginId
+    return Assert-PluginListEvidence $Fixture.Report $Fixture.Observations $Fixture.Frames $Fixture.Samples $Fixture.ProcessTree $Theme $script:DesktopName $script:CandidatePath $script:CandidateSha256 $script:ExpectedSidecarSha256 $script:PluginCopyPath $script:PluginId
 }
 
 $valid = New-ListFixture
@@ -467,22 +468,22 @@ $fixture = New-ListFixture
 $fixture.Frames[0].endNs = ($fixture.Report.samplingElapsedMs + 2) * 1000000
 Assert-Throws { Assert-ListFixture $fixture } 'outside the sampling window'
 
-# 宿主身份：缺失宿主、候选目录外路径、摘要不符或候选映像路径被替换都必须失败。
+# Sidecar 身份：缺失进程、副本外路径、摘要不符或候选映像路径被替换都必须失败。
 $fixture = New-ListFixture
-$fixture.ProcessTree = New-ListProcessTree -IncludeHost $false
-Assert-Throws { Assert-ListFixture $fixture } 'kerminal-plugin-host was not observed'
+$fixture.ProcessTree = New-ListProcessTree -IncludeSidecar $false
+Assert-Throws { Assert-ListFixture $fixture } 'Plugin sidecar process was not observed'
 $script:OutsideRoot = Join-Path ([IO.Path]::GetTempPath()) ('kerminal-list-outside-' + [Guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($script:OutsideRoot)
-$outsideHost = Join-Path $script:OutsideRoot 'kerminal-plugin-host.exe'
-[IO.File]::WriteAllBytes($outsideHost, [IO.File]::ReadAllBytes($script:HostPath))
+$outsideHost = Join-Path $script:OutsideRoot 'sidecar.exe'
+[IO.File]::WriteAllBytes($outsideHost, [IO.File]::ReadAllBytes($script:SidecarPath))
 $fixture = New-ListFixture
-$fixture.ProcessTree = New-ListProcessTree -HostPath $outsideHost -HostSha256 ((Get-FileHash -LiteralPath $outsideHost -Algorithm SHA256).Hash.ToLowerInvariant())
-Assert-Throws { Assert-ListFixture $fixture } 'outside the candidate directory'
+$fixture.ProcessTree = New-ListProcessTree -SidecarPath $outsideHost -SidecarSha256 ((Get-FileHash -LiteralPath $outsideHost -Algorithm SHA256).Hash.ToLowerInvariant())
+Assert-Throws { Assert-ListFixture $fixture } 'outside this run plugin copy'
 $fixture = New-ListFixture
-$fixture.ProcessTree = New-ListProcessTree -HostSha256 ([string]::new([char]'0', 64))
+$fixture.ProcessTree = New-ListProcessTree -SidecarSha256 ([string]::new([char]'0', 64))
 Assert-Throws { Assert-ListFixture $fixture } 'expected build identity'
 $fixture = New-ListFixture
-$fixture.ProcessTree[0].processes[0].executablePath = $script:HostPath
+$fixture.ProcessTree[0].processes[0].executablePath = $script:SidecarPath
 Assert-Throws { Assert-ListFixture $fixture } 'Candidate desktop image path does not match'
 
 # 插件摘要必须由 PS 按共享规则从实际目录独立重算；与 Rust 单元测试共用同一已知向量。
@@ -531,23 +532,17 @@ Assert-True ($acceptance.Contains('mark_copy_read_only') -and $acceptance.Contai
 
 # 生产门禁必须与驱动同源声明；脚本不能只校验列表形状而漏掉副本摘要、进程树和平台门禁。
 $gateScript = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'plugin-list-performance.ps1')
-Assert-True ($gateScript.Contains('#Requires -Version 7.0') -and $gateScript.Contains('pluginCopyPath') -and $gateScript.Contains('pluginCopyStable') -and $gateScript.Contains('Assert-PluginListProcessTree') -and $gateScript.Contains('Assert-PluginListPluginCopy') -and $gateScript.Contains('ExpectedHostSha256') -and $gateScript.Contains('Get-ListTargetArch')) 'Acceptance runner must enforce the copy, process-tree and platform gates.'
+Assert-True ($gateScript.Contains('#Requires -Version 7.0') -and $gateScript.Contains('pluginCopyPath') -and $gateScript.Contains('pluginCopyStable') -and $gateScript.Contains('Assert-PluginListProcessTree') -and $gateScript.Contains('Assert-PluginListPluginCopy') -and $gateScript.Contains('ExpectedSidecarSha256') -and $gateScript.Contains('Get-ListTargetArch')) 'Acceptance runner must enforce the copy, process-tree and platform gates.'
 
-# 宿主期望摘要由候选构建 receipt 提供，采样与文件摘要都必须等于它，不能只自洽。
-$savedExpectedHostSha = $script:ExpectedHostSha256
+# Sidecar 期望摘要由候选构建 receipt 提供，采样与文件摘要都必须等于它，不能只自洽。
+$savedExpectedSidecarSha = $script:ExpectedSidecarSha256
 $fixture = New-ListFixture
-$script:ExpectedHostSha256 = [string]::new([char]'0', 64)
+$script:ExpectedSidecarSha256 = [string]::new([char]'0', 64)
 Assert-Throws { Assert-ListFixture $fixture } 'expected build identity'
-$script:ExpectedHostSha256 = $savedExpectedHostSha
+$script:ExpectedSidecarSha256 = $savedExpectedSidecarSha
 $fixture = New-ListFixture
-$fixture.ProcessTree[0].processes[1].PSObject.Properties.Remove('commandLine')
-Assert-Throws { Assert-ListFixture $fixture } 'Missing string field'
-$fixture = New-ListFixture
-$fixture.ProcessTree[0].processes[1].commandLine = 'other-host --flag'
-Assert-Throws { Assert-ListFixture $fixture } 'does not reference this run'
-$fixture = New-ListFixture
-$fixture.ProcessTree = New-ListProcessTree -IncludeHost $false
-Assert-Throws { Assert-ListFixture $fixture } 'kerminal-plugin-host was not observed'
+$fixture.ProcessTree = New-ListProcessTree -IncludeSidecar $false
+Assert-Throws { Assert-ListFixture $fixture } 'Plugin sidecar process was not observed'
 
 # 帧必须覆盖采样窗前后两半，集中在一半的帧不能证明整窗活动。
 $fixture = New-ListFixture

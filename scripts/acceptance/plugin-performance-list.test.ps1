@@ -151,22 +151,22 @@ function New-TreeSample {
     # @author kongweiguang
     param([long]$UnixMs, [int]$PluginHosts)
     $processes = @([pscustomobject]@{ name = 'kerminal-desktop.exe' })
-    for ($i = 0; $i -lt $PluginHosts; $i++) { $processes += [pscustomobject]@{ name = 'kerminal-plugin-host.exe' } }
+    for ($i = 0; $i -lt $PluginHosts; $i++) { $processes += [pscustomobject]@{ name = 'sidecar.exe' } }
     return [pscustomobject]@{ unixMs = $UnixMs; elapsedMs = 0; processes = $processes }
 }
 
 $listSummary = Get-HostListSummary (New-HostList) (New-ListReport)
 $threeTree = @((New-TreeSample 1005100 3), (New-TreeSample 1030000 3), (New-TreeSample 1056000 3))
 $evidence3 = Get-PluginProcessEvidence $threeTree $listSummary 3
-Assert-True ($evidence3.applicable -and $evidence3.status -eq 'observed' -and $evidence3.pluginHostProcessesMax -eq 3 -and $evidence3.pluginHostProcessesMin -eq 3 -and $evidence3.samplesInWindow -eq 3 -and $evidence3.fieldMeaning.Contains('idle resident') -and $evidence3.fieldMeaning.Contains('not plugin RPC')) 'Three live plugin hosts must be present in every list-window sample and the field must state it is resident process count, not RPC load.'
+Assert-True ($evidence3.applicable -and $evidence3.status -eq 'observed' -and $evidence3.pluginSidecarProcessesMax -eq 3 -and $evidence3.pluginSidecarProcessesMin -eq 3 -and $evidence3.samplesInWindow -eq 3 -and $evidence3.fieldMeaning.Contains('idle resident') -and $evidence3.fieldMeaning.Contains('not plugin RPC')) 'Three live plugin sidecars must be present in every list-window sample and the field must state it is resident process count, not RPC load.'
 Assert-Throws { Get-PluginProcessEvidence @((New-TreeSample 900000 3)) $listSummary 3 } 'No process tree sample'
 Assert-Throws { Get-PluginProcessEvidence @((New-TreeSample 1005100 2), (New-TreeSample 1056000 3)) $listSummary 3 } 'not present across'
 Assert-Throws { Get-PluginProcessEvidence @((New-TreeSample 1005100 3), (New-TreeSample 1030000 2), (New-TreeSample 1056000 3)) $listSummary 3 } 'not present across every process tree sample'
 Assert-Throws { Get-PluginProcessEvidence $threeTree $listSummary 2 } 'explicit 0 or 3'
 $zeroTree = @((New-TreeSample 1010000 0), (New-TreeSample 1050000 0))
 $evidence0 = Get-PluginProcessEvidence $zeroTree $listSummary 0
-Assert-True (!$evidence0.applicable -and $evidence0.status -eq 'not-applicable' -and $evidence0.pluginHostProcessesMax -eq 0 -and $evidence0.samplesInWindow -eq 2) 'The zero-plugin case must record explicit not-applicable load evidence with no plugin hosts.'
-Assert-Throws { Get-PluginProcessEvidence @((New-TreeSample 1010000 1)) $listSummary 0 } 'Zero-plugin case ran plugin host'
+Assert-True (!$evidence0.applicable -and $evidence0.status -eq 'not-applicable' -and $evidence0.pluginSidecarProcessesMax -eq 0 -and $evidence0.samplesInWindow -eq 2) 'The zero-plugin case must record explicit not-applicable load evidence with no plugin sidecars.'
+Assert-Throws { Get-PluginProcessEvidence @((New-TreeSample 1010000 1)) $listSummary 0 } 'Zero-plugin case ran plugin sidecar'
 
 $load = Assert-ListLoadComparison $evidence0 $evidence3
 Assert-True ($load.comparable -and $load.zero.status -eq 'not-applicable' -and $load.three.status -eq 'observed' -and $load.fieldMeaning.Contains('not plugin RPC') -and $load.fieldMeaning.Contains('flood runs after the list window') -and $load.scope.Contains('host list sampling window only')) 'Plan-comparable and load-comparable must remain separate but both evidenced, and load must not be described as RPC concurrency.'
