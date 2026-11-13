@@ -5,8 +5,7 @@
 use chrono::{DateTime, Datelike, Local, Utc};
 use gpui_kit::{
     AnyElement, App, ClickEvent, Context, ExternalPaths, InteractiveElement as _, IntoElement,
-    KeyDownEvent, Pixels, SharedString, StatefulInteractiveElement as _, TestSupportExt as _,
-    Window,
+    KeyDownEvent, Pixels, SharedString, StatefulInteractiveElement as _, Window,
     base::v_virtual_list,
     canvas,
     component::{
@@ -876,8 +875,6 @@ pub(super) fn render_browser(
     };
     let mut list = div()
         .id(format!("files-browser-list-{side}"))
-        // 错误卡和空状态的几何验收需要真实布局边界；生产构建下 test_support 是零成本包装。
-        .test_support()
         .debug_selector(move || list_debug_selector.clone())
         .flex_1()
         .min_h(px(0.))
@@ -2650,8 +2647,8 @@ pub(super) fn render_empty_directory(
 }
 
 /// 未读取状态不伪装为空目录，提示用户从路径栏刷新重试。
-/// 说明与恢复动作同属一张居中状态卡：动作跟在说明下方居中，避免按钮被推到
-/// 整行最右端而与居中的失败文案脱节；说明限定在面板宽度内，窄栏长句换行后仍居中。
+/// 说明与恢复动作同属一张居中状态卡：动作保持在状态卡中心轴上并保留原有
+/// 8px 间距；说明限定在面板宽度内，窄栏长句换行后仍居中。
 ///
 /// @author kongweiguang
 pub(super) fn render_directory_state(
@@ -2707,9 +2704,7 @@ pub(super) fn render_directory_state(
                 .child(detail),
         )
         .when_some(action, |state, action| {
-            // 状态卡的恢复动作必须与说明同轴居中；沿用空目录的视觉范式，
-            // 不再用 w_full + justify_end 把单个按钮甩到面板边缘。
-            state.child(div().pt_2().flex().justify_center().child(action))
+            state.child(div().pt_2().child(action))
         })
 }
 

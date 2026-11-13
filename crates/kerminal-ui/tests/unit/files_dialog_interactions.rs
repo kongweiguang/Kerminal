@@ -547,46 +547,43 @@ fn directory_error_renders_single_inline_failure_with_retry(app: &mut TestAppCon
     });
     visual.simulate_resize(size(px(800.), px(600.)));
     settle(&runtime, visual);
-    visual.update(|window, _| {
+    let retry = visual.update(|window, _| {
         let visible = |id: &str| {
             gpui_kit::base::test_support::find(window, &[], &id.to_owned().into())
                 .filter(|element| element.visible())
                 .is_some()
         };
         assert!(
-            visible("files-directory-error-retry-1"),
-            "the inline error card keeps the retry entry"
-        );
-        assert!(
             !visible("files-retry-directory"),
             "the bottom bar must not repeat the same directory error"
         );
-        // 错误卡整体居中，恢复动作必须与说明同轴：只断言可见会漏掉按钮被推到右缘的错位。
-        let list = gpui_kit::base::test_support::find(
-            window,
-            &[],
-            &"files-browser-list-1".to_owned().into(),
-        )
-        .expect("the list container is rendered")
-        .bounds();
         let retry = gpui_kit::base::test_support::find(
             window,
             &[],
             &"files-directory-error-retry-1".to_owned().into(),
         )
-        .expect("the inline retry entry is rendered")
-        .bounds();
-        let list_center = list.center();
-        let retry_center = retry.center();
+        .expect("the inline retry entry is rendered");
         assert!(
-            (retry_center.x - list_center.x).abs() <= px(1.),
-            "retry must share the error card's horizontal center: retry={retry:?}, list={list:?}"
+            retry.visible(),
+            "the inline error card keeps the retry entry"
         );
-        assert!(
-            retry_center.y > list_center.y,
-            "retry must sit below the centered failure copy instead of beside it: retry={retry:?}, list={list:?}"
-        );
+        retry
     });
+    // 水平中心断言守住按钮被推到右缘的回归；垂直断言只确认按钮仍在卡片下半部。
+    let retry_bounds = retry.bounds();
+    let list_bounds = visual
+        .debug_bounds("files-browser-list-1")
+        .expect("the list container is rendered");
+    let list_center = list_bounds.center();
+    let retry_center = retry_bounds.center();
+    assert!(
+        (retry_center.x - list_center.x).abs() <= px(1.),
+        "retry must share the error card's horizontal center: retry={retry_bounds:?}, list={list_bounds:?}"
+    );
+    assert!(
+        retry_center.y > list_center.y,
+        "retry must sit in the lower half of the card, below the list center: retry={retry_bounds:?}, list={list_bounds:?}"
+    );
     visual.update(|_, cx| {
         pane.update(cx, |pane, _| {
             let message = pane.panels[1]
