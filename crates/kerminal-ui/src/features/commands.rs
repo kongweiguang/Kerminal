@@ -1713,17 +1713,19 @@ impl CommandsView {
         self.loading_includes_workflows = false;
         match result {
             Ok((session, history, workflows, ui_sessions)) => {
-                let mut errors = Vec::new();
+                // 显式标注为 String：public_message() 返回 &'static str，而
+                // settle_panel_load_status 按 Vec<String> 拼接多条读取失败原因。
+                let mut errors: Vec<String> = Vec::new();
                 if let Some(session) = session {
                     match session {
                         Ok(session) => self.session_info = Some(session),
-                        Err(error) => errors.push(error.public_message()),
+                        Err(error) => errors.push(error.public_message().to_owned()),
                     }
                 }
                 if self.history_read.generation() == history_generation {
                     match history {
                         Ok(history) => self.history = history,
-                        Err(error) => errors.push(error.public_message()),
+                        Err(error) => errors.push(error.public_message().to_owned()),
                     }
                 }
                 if let Some(workflows) = workflows {
@@ -1736,13 +1738,13 @@ impl CommandsView {
                             // 失败后允许下一次会话或 Catalogs 重读补读；旧列表继续保留，
                             // 避免“首次成功后一次失败就长期陈旧且没有刷新入口”。
                             self.workflows_loaded = false;
-                            errors.push(error.public_message());
+                            errors.push(error.public_message().to_owned());
                         }
                     }
                 }
                 match ui_sessions {
                     Ok(sessions) => self.ui_sessions = sessions,
-                    Err(error) => errors.push(error.public_message()),
+                    Err(error) => errors.push(error.public_message().to_owned()),
                 }
                 // 成功回执只结算本读取写过的提示，避免把切换目标、发送/广播或片段/工作流结果抹掉；
                 // 读取失败属于当前目标的真实结果，必须覆盖并接管状态条。
