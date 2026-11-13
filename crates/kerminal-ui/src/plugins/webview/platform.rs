@@ -361,7 +361,8 @@ pub(super) fn parent_id(window: &Window) -> AppResult<u64> {
     {
         RawWindowHandle::Win32(handle) => Ok(handle.hwnd.get() as u64),
         RawWindowHandle::Xcb(handle) => Ok(handle.window.get().into()),
-        RawWindowHandle::Xlib(handle) => Ok(handle.window as u64),
+        // 用 From 而不是 as 转换：c_ulong 在 64 位 Unix 上本身就是 u64，as 会被 clippy 判为多余转换，而 32 位仍需提升位宽，From 同时覆盖两种位宽。
+        RawWindowHandle::Xlib(handle) => Ok(u64::from(handle.window)),
         RawWindowHandle::AppKit(handle) => Ok(handle.ns_view.as_ptr() as usize as u64),
         _ => Err(AppError::unsupported("当前窗口系统不支持内嵌 WebView")),
     }
