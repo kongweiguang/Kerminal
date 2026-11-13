@@ -54,7 +54,8 @@ fn service() -> Arc<dyn SessionService> {
 }
 
 /// 轮询 bounded engine snapshot 直到标记真实输出或在有限时间内报告失败。
-/// 交互命令已确认完成后再等终端文本；CI 冷启动可能慢于本机，deadline 与命令 timeout 对齐。
+/// 交互命令已确认完成后再等终端文本；真实 PowerShell/PSReadLine 在慢速 CI 上回显可能明显晚于命令完成，
+/// 因此这里只把等待上限放宽到 45 秒，断言内容保持不变，避免把慢机时序抖动误判为失败。
 ///
 /// @author kongweiguang
 async fn wait_for_text(
@@ -62,7 +63,7 @@ async fn wait_for_text(
     session_id: SessionId,
     marker: &str,
 ) -> String {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let snapshot = service
                 .plaintext_snapshot(
