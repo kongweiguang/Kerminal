@@ -561,6 +561,31 @@ fn directory_error_renders_single_inline_failure_with_retry(app: &mut TestAppCon
             !visible("files-retry-directory"),
             "the bottom bar must not repeat the same directory error"
         );
+        // 错误卡整体居中，恢复动作必须与说明同轴：只断言可见会漏掉按钮被推到右缘的错位。
+        let list = gpui_kit::base::test_support::find(
+            window,
+            &[],
+            &"files-browser-list-1".to_owned().into(),
+        )
+        .expect("the list container is rendered")
+        .bounds();
+        let retry = gpui_kit::base::test_support::find(
+            window,
+            &[],
+            &"files-directory-error-retry-1".to_owned().into(),
+        )
+        .expect("the inline retry entry is rendered")
+        .bounds();
+        let list_center = list.center();
+        let retry_center = retry.center();
+        assert!(
+            (retry_center.x - list_center.x).abs() <= px(1.),
+            "retry must share the error card's horizontal center: retry={retry:?}, list={list:?}"
+        );
+        assert!(
+            retry_center.y > list_center.y,
+            "retry must sit below the centered failure copy instead of beside it: retry={retry:?}, list={list:?}"
+        );
     });
     visual.update(|_, cx| {
         pane.update(cx, |pane, _| {
