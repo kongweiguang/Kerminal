@@ -13,7 +13,7 @@ use kerminal_terminal::{
     ShellIntegrationMarker, TerminalEngine, TerminalLimits,
     shell_editing::{EditingMessage, ShellEditingFrameFilter, parse_editing_message},
 };
-use std::{collections::BTreeMap, ffi::OsString, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, ffi::OsString, path::Path, pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{Mutex, mpsc},
@@ -125,6 +125,27 @@ async fn wait_prompt(
         ));
     }
     Ok(())
+}
+
+/// 比较 shell 报告的工作目录与测试目录。
+///
+/// Windows CI 的临时目录常以 8.3 短名暴露（如 `C:\Users\RUNNER~1\...`），而测试
+/// 创建目录时持有长名；两者指向同一目录，直接比较字符串必然不等。因此先对两侧
+/// canonicalize 统一成长路径，规范化失败时回退到原字符串比较，避免目录被并发删除
+/// 等环境问题掩盖真实断言。Windows 路径大小写不敏感，规范化后仍按忽略 ASCII
+/// 大小写比较。
+fn cwd_matches(reported: Option<&str>, expected: &Path) -> bool {
+    let (Some(reported), Some(expected)) = (reported, expected.to_str()) else {
+        return false;
+    };
+    let normalize = |value: &str| std::fs::canonicalize(value).ok();
+    match (normalize(reported), normalize(expected)) {
+        (Some(reported), Some(expected)) if cfg!(windows) => reported
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected.to_string_lossy()),
+        (Some(reported), Some(expected)) => reported == expected,
+        _ => reported == expected,
+    }
 }
 
 /// 伪造的重绘标记先于真实快照到达时，非空缓冲仍必须阻止下一阶段。
@@ -341,8 +362,12 @@ async fn powershell_versions_read_real_unicode_buffer_without_executing() {
             send(&writer, command.as_bytes()).await?;
             wait_prompt(&writer, &mut receiver, "change directory").await?;
             let current = snapshot(&writer, &mut receiver, "changed directory").await?;
-            if current.2.as_deref() != folder.to_str() {
-                return Err("live cwd with punctuation differed".to_owned());
+            if !cwd_matches(current.2.as_deref(), &folder) {
+                return Err(format!(
+                    "live cwd with punctuation differed: reported {:?}, expected {:?}",
+                    current.2,
+                    folder.to_string_lossy()
+                ));
             }
             for (label, input, too_long) in [
                 ("ascii-4000", "x".repeat(4000), false),
